@@ -1,0 +1,26 @@
+# Adaptive concurrency — AIMD-based dynamic parallelism
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Adaptive concurrency: starts at concurrency=16 (ceiling),
+# auto-decreases on rate-limit/transient errors (AIMD halving),
+# auto-increases on consecutive successes.
+[pipeline.poc.execution]
+concurrency = 16
+fail_fast = false
+error_rate_abort_pct = 50
+table_retries = 2

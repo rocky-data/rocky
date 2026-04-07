@@ -1,0 +1,3 @@
+-- Reads amount and status from raw_orders.
+from raw_orders
+where status != "cancelled"

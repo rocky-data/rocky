@@ -1,0 +1,23 @@
+name = "stg_customers"
+depends_on = ["raw_customers"]
+intent = "Filters to active customers and derives the full name and tenure. One row per active customer."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "stg_customers"
+
+[[tests]]
+type = "not_null"
+column = "customer_id"
+
+[[tests]]
+type = "unique"
+column = "customer_id"
+
+[[tests]]
+type = "not_null"
+column = "full_name"

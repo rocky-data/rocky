@@ -1,0 +1,3 @@
+# Full refresh — stg_events is inlined as a CTE here, not read from a table.
+[strategy]
+type = "full_refresh"

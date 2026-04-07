@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "LoadFileOutput": {
+      "description": "A single file result within `LoadOutput`.",
+      "properties": {
+        "bytes_read": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "type": "string"
+        },
+        "rows_loaded": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bytes_read",
+        "duration_ms",
+        "file",
+        "rows_loaded",
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky load`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/definitions/LoadFileOutput"
+      },
+      "type": "array"
+    },
+    "files_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "files_loaded": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "format": {
+      "type": "string"
+    },
+    "source_dir": {
+      "type": "string"
+    },
+    "total_bytes": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total_rows": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "duration_ms",
+    "files",
+    "files_failed",
+    "files_loaded",
+    "format",
+    "source_dir",
+    "total_bytes",
+    "total_rows",
+    "version"
+  ],
+  "title": "LoadOutput",
+  "type": "object"
+}

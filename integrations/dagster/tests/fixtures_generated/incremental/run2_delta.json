@@ -1,0 +1,40 @@
+{
+  "version": "0.3.0",
+  "command": "run",
+  "filter": "source=events",
+  "duration_ms": 0,
+  "tables_copied": 1,
+  "tables_failed": 0,
+  "materializations": [
+    {
+      "asset_key": [
+        "staging__events",
+        "events"
+      ],
+      "rows_copied": null,
+      "duration_ms": 0,
+      "metadata": {
+        "strategy": "incremental",
+        "watermark": "2026-05-01T00:25:00Z"
+      }
+    }
+  ],
+  "check_results": [],
+  "execution": {
+    "concurrency": 8,
+    "tables_processed": 1,
+    "tables_failed": 0
+  },
+  "metrics": null,
+  "permissions": {
+    "grants_added": 0,
+    "grants_revoked": 0,
+    "catalogs_created": 0,
+    "schemas_created": 1
+  },
+  "drift": {
+    "tables_checked": 1,
+    "tables_drifted": 0,
+    "actions_taken": []
+  }
+}

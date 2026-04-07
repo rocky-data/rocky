@@ -1,0 +1,17 @@
+[strategy]
+type = "full_refresh"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__ad_report_daily"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__ad_history"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__campaign_history"

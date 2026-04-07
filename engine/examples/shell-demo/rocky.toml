@@ -1,0 +1,13 @@
+# Shell Demo — interactive REPL
+#
+# Demonstrates `rocky shell` for ad-hoc SQL queries against
+# the configured warehouse adapter.
+#
+# Usage:
+#   rocky --config engine/examples/shell-demo/rocky.toml shell
+
+[adapter.local]
+type = "duckdb"
+
+[state]
+backend = "local"

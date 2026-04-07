@@ -1,0 +1,32 @@
+[adapter.databricks_prod]
+type = "databricks"
+host = "${DATABRICKS_HOST}"
+http_path = "${DATABRICKS_HTTP_PATH}"
+token = "${DATABRICKS_TOKEN}"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "databricks_prod"
+catalog = "main"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "databricks_prod"
+catalog_template = "isolated_demo"
+schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+
+[pipeline.poc.target.governance.isolation]
+enabled = true
+[[pipeline.poc.target.governance.isolation.workspace_ids]]
+id = 1234567890123456
+binding_type = "BINDING_TYPE_READ_WRITE"

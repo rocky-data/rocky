@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "TestAdapterTestResult": {
+      "properties": {
+        "category": {
+          "description": "Stringified `TestCategory`: \"connection\", \"ddl\", \"dml\", \"query\", \"types\", \"dialect\", \"governance\", \"discovery\", \"batch_checks\".",
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "description": "Stringified `TestStatus`: \"passed\", \"failed\", \"skipped\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "duration_ms",
+        "name",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky test-adapter`.\n\nMirrors `rocky_adapter_sdk::conformance::ConformanceResult` with the status/category enums stringified, so we don't have to add `JsonSchema` to the SDK crate.",
+  "properties": {
+    "adapter": {
+      "type": "string"
+    },
+    "results": {
+      "items": {
+        "$ref": "#/definitions/TestAdapterTestResult"
+      },
+      "type": "array"
+    },
+    "sdk_version": {
+      "type": "string"
+    },
+    "tests_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_passed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_run": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_skipped": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "adapter",
+    "results",
+    "sdk_version",
+    "tests_failed",
+    "tests_passed",
+    "tests_run",
+    "tests_skipped"
+  ],
+  "title": "TestAdapterOutput",
+  "type": "object"
+}

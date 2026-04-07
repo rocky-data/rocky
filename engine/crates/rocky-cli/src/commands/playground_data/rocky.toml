@@ -1,0 +1,46 @@
+# Rocky Playground — DuckDB-based sample pipeline
+# No external credentials needed!
+#
+# `rocky test` runs models against an in-memory DuckDB and auto-loads
+# data/seed.sql.
+# `rocky discover/plan/run` use the file at `path` below — seed it once with:
+#   duckdb playground.duckdb < data/seed.sql
+
+[adapter.local]
+type = "duckdb"
+path = "playground.duckdb"
+
+[pipeline.playground]
+type = "replication"
+strategy = "full_refresh"
+timestamp_column = "_updated_at"
+
+[pipeline.playground.source]
+adapter = "local"
+
+[pipeline.playground.source.discovery]
+adapter = "local"
+
+[pipeline.playground.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.playground.target]
+adapter = "local"
+catalog_template = "playground"
+schema_template = "staging__{source}"
+
+[pipeline.playground.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.playground.checks]
+row_count = false
+column_match = false
+
+[pipeline.playground.execution]
+concurrency = 4
+
+[state]
+backend = "local"

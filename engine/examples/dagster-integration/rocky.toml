@@ -1,0 +1,35 @@
+# Rocky pipeline config for Dagster integration example
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.orders]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.orders.source]
+adapter = "local"
+
+[pipeline.orders.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.orders.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.orders.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.orders.checks]
+row_count = true
+column_match = false
+
+[pipeline.orders.execution]
+concurrency = 4
+
+[state]
+backend = "local"

@@ -1,0 +1,24 @@
+name: Rocky CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rocky-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rocky
+        run: |
+          curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/rocky-linux-x86_64 -o /usr/local/bin/rocky
+          chmod +x /usr/local/bin/rocky
+
+      - name: rocky doctor
+        run: rocky doctor
+
+      - name: rocky ci
+        run: rocky ci --models models --output json

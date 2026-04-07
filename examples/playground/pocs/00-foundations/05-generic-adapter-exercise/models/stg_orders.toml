@@ -1,0 +1,15 @@
+[strategy]
+type = "full_refresh"
+
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[tests]]
+type = "not_null"
+column = "customer_id"
+
+[[tests]]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "delivered"]

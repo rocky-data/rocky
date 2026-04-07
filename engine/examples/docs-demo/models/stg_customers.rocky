@@ -1,0 +1,15 @@
+-- Staging: filter to active customers, derive full name
+from raw_customers
+where is_active == true
+derive {
+    full_name: first_name || " " || last_name,
+    days_since_signup: current_date - signup_date
+}
+select {
+    customer_id,
+    full_name,
+    email,
+    country,
+    signup_date,
+    days_since_signup
+}

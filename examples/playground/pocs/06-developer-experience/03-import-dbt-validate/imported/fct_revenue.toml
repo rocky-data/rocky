@@ -1,0 +1,5 @@
+depends_on = []
+sources = []
+
+[strategy]
+type = "full_refresh"

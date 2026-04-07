@@ -1,0 +1,9 @@
+name = "running_totals_sql"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "running_totals_sql"

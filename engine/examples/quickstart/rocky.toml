@@ -1,0 +1,35 @@
+# Quickstart — minimal DuckDB-based pipeline
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.quickstart]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.quickstart.source]
+adapter = "local"
+
+[pipeline.quickstart.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.quickstart.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.quickstart.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.quickstart.checks]
+row_count = true
+column_match = false
+
+[pipeline.quickstart.execution]
+concurrency = 4
+
+[state]
+backend = "local"

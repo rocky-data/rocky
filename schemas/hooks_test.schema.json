@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky hooks test <event>`.",
+  "properties": {
+    "event": {
+      "type": "string"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "description": "Free-form Debug rendering of the hook result, when applicable.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "description": "One of \"no_hooks\", \"continue\", \"abort\".",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event",
+    "status"
+  ],
+  "title": "HooksTestOutput",
+  "type": "object"
+}

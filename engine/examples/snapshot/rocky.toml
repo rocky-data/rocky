@@ -1,0 +1,31 @@
+# Snapshot POC — SCD Type 2 with DuckDB
+#
+# Demonstrates the `rocky snapshot` command tracking historical changes
+# to a customers table using the timestamp strategy.
+#
+# Usage:
+#   rocky --config engine/examples/snapshot/rocky.toml snapshot --dry-run
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.customers_history]
+type = "snapshot"
+unique_key = ["customer_id"]
+updated_at = "updated_at"
+invalidate_hard_deletes = true
+
+[pipeline.customers_history.source]
+adapter = "local"
+catalog = "main"
+schema = "raw"
+table = "customers"
+
+[pipeline.customers_history.target]
+adapter = "local"
+catalog = "main"
+schema = "history"
+table = "customers_history"
+
+[state]
+backend = "local"

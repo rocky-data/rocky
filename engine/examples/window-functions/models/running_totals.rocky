@@ -1,0 +1,21 @@
+-- Running totals and cumulative aggregations per account.
+-- Demonstrates: sum with frame specification (rows unbounded..current),
+-- count as a running count, and a grand total via empty over().
+from source.raw.transactions
+derive {
+    -- Cumulative sum of amount per account, ordered by transaction date
+    running_total: sum(amount) over (partition account_id, sort txn_date, rows unbounded..current),
+    -- Running count of transactions per account
+    running_count: count() over (partition account_id, sort txn_date, rows unbounded..current),
+    -- Grand total across all rows (empty partition = entire result set)
+    grand_total: sum(amount) over ()
+}
+select {
+    txn_id,
+    account_id,
+    txn_date,
+    amount,
+    running_total,
+    running_count,
+    grand_total
+}

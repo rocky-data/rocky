@@ -1,0 +1,19 @@
+{
+  "version": "0.3.0",
+  "command": "discover",
+  "sources": [
+    {
+      "id": "raw__orders",
+      "components": {
+        "source": "orders"
+      },
+      "source_type": "duckdb",
+      "last_sync_at": null,
+      "tables": [
+        {
+          "name": "orders"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+[strategy]
+type = "materialized_view"
+
+[target]
+catalog = "rocky_demo"
+schema = "marts"

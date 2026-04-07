@@ -1,0 +1,26 @@
+[package]
+name = "rocky-engine"
+version = "1.0.0"
+description = "Rocky local execution engine: DataFusion-based testing, branching, CI"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-compiler = { path = "../rocky-compiler" }
+rocky-core = { path = "../rocky-core" }
+rocky-duckdb = { path = "../rocky-duckdb", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+default = ["duckdb"]
+duckdb = ["dep:rocky-duckdb"]
+
+[lints]
+workspace = true

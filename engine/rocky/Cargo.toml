@@ -1,0 +1,25 @@
+[package]
+name = "rocky"
+version = "1.0.0"
+description = "Rust SQL transformation engine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["duckdb"]
+duckdb = ["rocky-cli/duckdb"]
+
+[dependencies]
+rocky-cli = { path = "../crates/rocky-cli", default-features = false }
+rocky-core = { path = "../crates/rocky-core" }
+rocky-observe = { path = "../crates/rocky-observe" }
+anyhow = { workspace = true }
+miette = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

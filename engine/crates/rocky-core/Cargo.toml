@@ -1,0 +1,38 @@
+[package]
+name = "rocky-core"
+version = "1.0.0"
+description = "Core SQL transformation engine for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-sql = { path = "../rocky-sql" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+indexmap = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+redb = { workspace = true }
+redis = { workspace = true }
+regex = { workspace = true }
+csv = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+lasso = { version = "0.7", features = ["multi-threaded"] }
+memmap2 = "0.9"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+rocky-duckdb = { path = "../rocky-duckdb" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

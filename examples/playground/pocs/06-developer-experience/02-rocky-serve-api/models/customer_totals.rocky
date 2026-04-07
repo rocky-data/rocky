@@ -1,0 +1,4 @@
+from raw_orders
+group customer_id {
+    total: sum(amount)
+}

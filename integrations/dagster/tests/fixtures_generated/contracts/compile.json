@@ -1,0 +1,68 @@
+{
+  "version": "0.3.0",
+  "command": "compile",
+  "models": 3,
+  "execution_layers": 2,
+  "diagnostics": [
+    {
+      "severity": "Error",
+      "code": "E010",
+      "message": "required column 'customer_id' missing from model output",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": null
+    },
+    {
+      "severity": "Error",
+      "code": "E013",
+      "message": "protected column 'customer_id' has been removed",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": null
+    }
+  ],
+  "has_errors": true,
+  "compile_timings": {
+    "project_load_ms": 0,
+    "semantic_graph_ms": 0,
+    "typecheck_ms": 0,
+    "typecheck_join_keys_ms": 0,
+    "contracts_ms": 0,
+    "total_ms": 0
+  },
+  "models_detail": [
+    {
+      "name": "broken_metrics",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "poc",
+        "schema": "demo",
+        "table": "broken_metrics"
+      }
+    },
+    {
+      "name": "good_metrics",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "poc",
+        "schema": "demo",
+        "table": "good_metrics"
+      }
+    },
+    {
+      "name": "raw_orders",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "poc",
+        "schema": "staging",
+        "table": "raw_orders"
+      }
+    }
+  ]
+}

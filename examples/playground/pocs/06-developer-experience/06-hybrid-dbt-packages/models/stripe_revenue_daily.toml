@@ -1,0 +1,7 @@
+[strategy]
+type = "full_refresh"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_stripe"
+table = "stg_stripe__charges"

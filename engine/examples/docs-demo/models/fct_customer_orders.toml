@@ -1,0 +1,19 @@
+name = "fct_customer_orders"
+depends_on = ["raw_orders", "stg_customers"]
+intent = "Aggregates order metrics per customer. Joins with staging customers to include profile data. Excludes cancelled orders."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "fct_customer_orders"
+
+[[tests]]
+type = "not_null"
+column = "customer_id"
+
+[[tests]]
+type = "unique"
+column = "customer_id"

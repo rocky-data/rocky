@@ -1,0 +1,28 @@
+# POC: time_interval materialization (partition checksums)
+#
+# Demonstrates Rocky's time_interval strategy by promoting the
+# raw__orders.orders DuckDB table into a daily fct_daily_orders fact
+# via the @start_date / @end_date placeholder mechanism.
+#
+# This POC has no replication step — the model reads directly from a
+# raw DuckDB table seeded by data/seed.sql. We declare a minimal
+# replication pipeline only because rocky.toml requires one; the demo
+# runs the transformation models via `rocky run --models models/`.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# A trivial replication pipeline. Not exercised by this POC's run.sh,
+# but rocky.toml currently requires a [pipeline.*] block.
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"

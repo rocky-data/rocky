@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AiExplanation": {
+      "properties": {
+        "intent": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "saved": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "intent",
+        "model",
+        "saved"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky ai explain`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "explanations": {
+      "items": {
+        "$ref": "#/definitions/AiExplanation"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "explanations",
+    "version"
+  ],
+  "title": "AiExplainOutput",
+  "type": "object"
+}

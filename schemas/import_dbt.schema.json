@@ -1,0 +1,161 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ImportDbtFailure": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ImportDbtWarning": {
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "suggestion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "category",
+        "message",
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky import-dbt`.\n\nThe `report` field is the per-model migration report from `rocky_compiler::import::report::generate_report`. We hold it as `serde_json::Value` (typed as `any` in JSON Schema) to avoid pulling `JsonSchema` derives all the way through `rocky-compiler::import`. The downstream Pydantic/TS bindings will see it as a free-form object.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dbt_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "failed_details": {
+      "items": {
+        "$ref": "#/definitions/ImportDbtFailure"
+      },
+      "type": "array"
+    },
+    "import_method": {
+      "type": "string"
+    },
+    "imported": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "imported_models": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "macros_detected": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "project_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "report": {
+      "description": "Free-form per-model migration report payload."
+    },
+    "sources_found": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "sources_mapped": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_converted": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_converted_custom": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_found": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_skipped": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    },
+    "warning_details": {
+      "items": {
+        "$ref": "#/definitions/ImportDbtWarning"
+      },
+      "type": "array"
+    },
+    "warnings": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "command",
+    "failed",
+    "failed_details",
+    "import_method",
+    "imported",
+    "imported_models",
+    "macros_detected",
+    "report",
+    "sources_found",
+    "sources_mapped",
+    "tests_converted",
+    "tests_converted_custom",
+    "tests_found",
+    "tests_skipped",
+    "version",
+    "warning_details",
+    "warnings"
+  ],
+  "title": "ImportDbtOutput",
+  "type": "object"
+}

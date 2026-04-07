@@ -1,0 +1,9 @@
+name = "orders_summary"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "orders_summary"

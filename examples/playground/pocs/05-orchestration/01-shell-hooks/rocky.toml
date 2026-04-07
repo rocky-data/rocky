@@ -1,0 +1,26 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Lifecycle hooks (keys are `on_<event>` per rocky-core/src/hooks/mod.rs)
+[[hook.on_pipeline_start]]
+command = "scripts/notify_start.sh"
+timeout_ms = 5000
+on_failure = "warn"
+
+[[hook.on_pipeline_complete]]
+command = "scripts/notify_success.sh"
+timeout_ms = 5000
+on_failure = "warn"

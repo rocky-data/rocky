@@ -1,0 +1,11 @@
+# Generated benchmark projects
+rocky_*/
+dbt_*/
+
+# Benchmark results (regenerated on each run)
+results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

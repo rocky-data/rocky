@@ -1,0 +1,54 @@
+#!/bin/sh
+# .git-hooks/pre-commit
+# Runs linting and formatting on staged files before commit
+
+# Enable strict mode
+set -euo pipefail
+
+# Check if uv is available
+if ! command -v uv &>/dev/null; then
+    echo "Error: uv is not installed or not in PATH"
+    echo "Install uv: https://docs.astral.sh/uv/getting-started/installation/"
+    exit 1
+fi
+
+# Record the start time
+START_TIME=$(date +%s)
+
+# Get list of staged Python files
+PY_FILES=$(git diff --cached --name-only --diff-filter=ACM "*.py" || true)
+
+# Lint and format Python files
+if [ -n "$PY_FILES" ]; then
+    echo "Checking Python files..."
+
+    # Run ruff format on staged files
+    echo "  Formatting with ruff..."
+    echo "$PY_FILES" | xargs uv run python -m ruff format --quiet || {
+        echo "Ruff formatting failed"
+        exit 1
+    }
+
+    # Run ruff check with auto-fix on staged files
+    echo "  Linting with ruff..."
+    echo "$PY_FILES" | xargs uv run python -m ruff check --fix --quiet || {
+        echo "Ruff linting failed"
+        exit 1
+    }
+
+    # Re-add formatted files
+    echo "$PY_FILES" | xargs git add
+
+    echo "Python files checked"
+else
+    echo "No Python files to check"
+fi
+
+# Calculate and show execution time
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo ""
+echo "Pre-commit checks passed! (${DURATION}s)"
+
+exit 0

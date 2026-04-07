@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "NamedStatement": {
+      "description": "Named SQL statement (purpose + sql), reused by compact and archive.",
+      "properties": {
+        "purpose": {
+          "type": "string"
+        },
+        "sql": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "purpose",
+        "sql"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky archive`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "older_than": {
+      "type": "string"
+    },
+    "older_than_days": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "statements": {
+      "items": {
+        "$ref": "#/definitions/NamedStatement"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "dry_run",
+    "older_than",
+    "older_than_days",
+    "statements",
+    "version"
+  ],
+  "title": "ArchiveOutput",
+  "type": "object"
+}

@@ -1,0 +1,9 @@
+name = "customer_orders"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "playground"
+schema = "silver"
+table = "customer_orders"

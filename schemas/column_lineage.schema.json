@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "LineageEdgeRecord": {
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "target": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "transform": {
+          "description": "Transform kind: \"direct\", \"cast\", \"expression\", etc. Stringified from `rocky_sql::lineage::TransformKind` to avoid pulling schemars into rocky-sql.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "transform"
+      ],
+      "type": "object"
+    },
+    "LineageQualifiedColumn": {
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky lineage <model> --column <col>`.",
+  "properties": {
+    "column": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "trace": {
+      "items": {
+        "$ref": "#/definitions/LineageEdgeRecord"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "column",
+    "command",
+    "model",
+    "trace",
+    "version"
+  ],
+  "title": "ColumnLineageOutput",
+  "type": "object"
+}

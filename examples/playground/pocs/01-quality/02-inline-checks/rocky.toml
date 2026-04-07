@@ -1,0 +1,26 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Inline data quality checks
+[pipeline.poc.checks]
+enabled = true
+row_count = true
+column_match = true
+# freshness = { threshold_seconds = 86400 }
+# null_rate = { threshold_pct = 5 }
+
+[pipeline.poc.execution]
+concurrency = 4

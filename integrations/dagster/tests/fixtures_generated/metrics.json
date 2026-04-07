@@ -1,0 +1,8 @@
+{
+  "version": "0.3.0",
+  "command": "metrics",
+  "model": "revenue_summary",
+  "snapshots": [],
+  "count": 0,
+  "message": "no quality metrics available"
+}

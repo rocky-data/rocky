@@ -1,0 +1,9 @@
+depends_on = []
+
+[strategy]
+type = "full_refresh"
+
+[[sources]]
+catalog = "warehouse"
+schema = "raw"
+table = "orders"

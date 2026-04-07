@@ -1,0 +1,138 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Rocky",
+  "scopeName": "source.rocky",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#pipeline-steps" },
+    { "include": "#expressions" }
+  ],
+  "repository": {
+    "comments": {
+      "match": "--.*$",
+      "name": "comment.line.double-dash.rocky"
+    },
+    "pipeline-steps": {
+      "patterns": [
+        {
+          "match": "\\b(from|where|group|derive|select|join|sort|take|distinct|replicate)\\b",
+          "name": "keyword.control.rocky"
+        },
+        {
+          "match": "\\b(as|on|keep|asc|desc|inner|left|right|cross|full)\\b",
+          "name": "keyword.other.rocky"
+        }
+      ]
+    },
+    "expressions": {
+      "patterns": [
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#dates" },
+        { "include": "#booleans" },
+        { "include": "#operators" },
+        { "include": "#functions" },
+        { "include": "#match-expr" },
+        { "include": "#identifiers" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.rocky",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.rocky",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.rocky",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.rocky",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "match": "\\b\\d[\\d_]*(\\.[\\d_]+)?\\b",
+      "name": "constant.numeric.rocky"
+    },
+    "dates": {
+      "match": "@\\d{4}-\\d{2}-\\d{2}(T[\\d:]+Z?)?",
+      "name": "constant.other.date.rocky"
+    },
+    "booleans": {
+      "match": "\\b(true|false|null)\\b",
+      "name": "constant.language.rocky"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "\\b(and|or|not|in|is)\\b",
+          "name": "keyword.operator.logical.rocky"
+        },
+        {
+          "match": "==|!=|<=|>=|<|>",
+          "name": "keyword.operator.comparison.rocky"
+        },
+        {
+          "match": "=>",
+          "name": "keyword.operator.arrow.rocky"
+        },
+        {
+          "match": "[+\\-*/%]",
+          "name": "keyword.operator.arithmetic.rocky"
+        },
+        {
+          "match": "\\|\\|",
+          "name": "keyword.operator.concat.rocky"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "match": "\\b(count|sum|avg|min|max|coalesce|nullif|cast|if)\\s*(?=\\()",
+          "name": "support.function.aggregate.rocky"
+        },
+        {
+          "match": "\\b(concat|length|lower|upper|trim|substring|replace|position|strpos)\\s*(?=\\()",
+          "name": "support.function.string.rocky"
+        },
+        {
+          "match": "\\b(round|abs|floor|ceil)\\s*(?=\\()",
+          "name": "support.function.numeric.rocky"
+        },
+        {
+          "match": "\\b(now|current_date|current_timestamp|date_trunc|dateadd|datediff|year|month|day|hour|minute|second)\\s*(?=\\()",
+          "name": "support.function.datetime.rocky"
+        },
+        {
+          "match": "\\b(row_number|rank|dense_rank|ntile|percent_rank|cume_dist|lag|lead|first_value|last_value|nth_value)\\s*(?=\\()",
+          "name": "support.function.window.rocky"
+        }
+      ]
+    },
+    "match-expr": {
+      "match": "\\b(match)\\b",
+      "name": "keyword.control.conditional.rocky"
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "match": "\\b_\\b",
+          "name": "variable.language.wildcard.rocky"
+        }
+      ]
+    }
+  }
+}

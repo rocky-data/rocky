@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "WatermarkEntry": {
+      "properties": {
+        "last_value": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "last_value",
+        "table",
+        "updated_at"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky state show`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "watermarks": {
+      "items": {
+        "$ref": "#/definitions/WatermarkEntry"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "command",
+    "version",
+    "watermarks"
+  ],
+  "title": "StateOutput",
+  "type": "object"
+}

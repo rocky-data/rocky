@@ -1,0 +1,5 @@
+type: dagster_rocky.RockyComponent
+attributes:
+  binary_path: rocky
+  config_path: rocky.toml
+  state_path: .rocky-state.redb

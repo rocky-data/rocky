@@ -1,0 +1,6 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "playground"
+schema = "gold"

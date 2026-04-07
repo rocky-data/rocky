@@ -1,0 +1,15 @@
+# 01-dsl-pipeline-syntax — every Rocky DSL operator in one model
+[adapter]
+type = "duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "demo"

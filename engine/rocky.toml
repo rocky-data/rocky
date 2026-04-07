@@ -1,0 +1,54 @@
+# Rocky pipeline configuration (v2 format)
+
+# --- Adapter ---
+
+[adapter.databricks_prod]
+type = "databricks"
+host = "${DATABRICKS_HOST}"
+http_path = "${DATABRICKS_HTTP_PATH}"
+# token = "${DATABRICKS_TOKEN}"
+client_id = "${DATABRICKS_CLIENT_ID}"
+client_secret = "${DATABRICKS_CLIENT_SECRET}"
+
+[adapter.fivetran_main]
+type = "fivetran"
+destination_id = "${FIVETRAN_DESTINATION_ID}"
+api_key = "${FIVETRAN_API_KEY}"
+api_secret = "${FIVETRAN_API_SECRET}"
+
+# --- Pipeline ---
+
+[pipeline.raw_replication]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "_fivetran_synced"
+metadata_columns = [
+    { name = "_loaded_by", type = "STRING", value = "NULL" }
+]
+
+[pipeline.raw_replication.source]
+adapter = "databricks_prod"
+catalog = "${FIVETRAN_SOURCE_CATALOG:-}"
+
+[pipeline.raw_replication.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw_replication.source.discovery]
+adapter = "fivetran_main"
+
+[pipeline.raw_replication.target]
+adapter = "databricks_prod"
+catalog_template = "warehouse"
+schema_template = "stage__{source}"
+
+[pipeline.raw_replication.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+
+[pipeline.raw_replication.checks]
+enabled = true
+row_count = true
+column_match = true
+freshness = { threshold_seconds = 86400 }

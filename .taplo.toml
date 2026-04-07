@@ -1,0 +1,14 @@
+# Taplo configuration — provides schema validation for Rocky TOML files
+# in the Even Better TOML extension.
+
+# Main project config: rocky.toml
+[[rule]]
+include = ["**/rocky.toml"]
+[rule.schema]
+path = "editors/vscode/schemas/rocky-project.schema.json"
+
+# Model sidecar configs: *.rocky.toml and models/_defaults.toml
+[[rule]]
+include = ["**/*.rocky.toml", "**/models/_defaults.toml"]
+[rule.schema]
+path = "editors/vscode/schemas/rocky-config.schema.json"

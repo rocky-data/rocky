@@ -1,0 +1,27 @@
+[adapter.fivetran_main]
+type = "fivetran"
+destination_id = "${FIVETRAN_DESTINATION_ID}"
+api_key = "${FIVETRAN_API_KEY}"
+api_secret = "${FIVETRAN_API_SECRET}"
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.discovery]
+adapter = "fivetran_main"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["tenant", "source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{tenant}_warehouse"
+schema_template = "staging__{source}"

@@ -1,0 +1,11 @@
+-- Fact table: per-customer order summary
+from stg_orders
+where is_refunded == false
+group customer_id {
+    total_spent: sum(order_amount),
+    order_count: count(),
+    first_order_date: min(order_date),
+    last_order_date: max(order_date)
+}
+where order_count >= 1
+sort total_spent desc

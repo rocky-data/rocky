@@ -1,0 +1,4 @@
+-- Rocky DSL `!=` lowers to `IS DISTINCT FROM`, which treats NULL as a value.
+-- Rows with status = NULL ARE kept (because NULL is distinct from "cancelled").
+from raw_orders
+where status != "cancelled"

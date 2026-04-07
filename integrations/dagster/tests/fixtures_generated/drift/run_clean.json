@@ -1,0 +1,40 @@
+{
+  "version": "0.3.0",
+  "command": "run",
+  "filter": "source=orders",
+  "duration_ms": 0,
+  "tables_copied": 1,
+  "tables_failed": 0,
+  "materializations": [
+    {
+      "asset_key": [
+        "staging__orders",
+        "orders"
+      ],
+      "rows_copied": null,
+      "duration_ms": 0,
+      "metadata": {
+        "strategy": "incremental",
+        "watermark": "2026-04-01T01:40:00Z"
+      }
+    }
+  ],
+  "check_results": [],
+  "execution": {
+    "concurrency": 8,
+    "tables_processed": 1,
+    "tables_failed": 0
+  },
+  "metrics": null,
+  "permissions": {
+    "grants_added": 0,
+    "grants_revoked": 0,
+    "catalogs_created": 0,
+    "schemas_created": 1
+  },
+  "drift": {
+    "tables_checked": 0,
+    "tables_drifted": 0,
+    "actions_taken": []
+  }
+}

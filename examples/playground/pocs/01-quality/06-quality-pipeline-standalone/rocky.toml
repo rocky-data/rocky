@@ -1,0 +1,42 @@
+# Quality pipeline — standalone data quality checks (no data movement)
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# Replication pipeline to set up data first
+[pipeline.ingest]
+strategy = "full_refresh"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Quality pipeline — runs checks against existing tables
+[pipeline.nightly_dq]
+type = "quality"
+depends_on = ["ingest"]
+
+[pipeline.nightly_dq.target]
+adapter = "default"
+
+[[pipeline.nightly_dq.tables]]
+catalog = "poc"
+schema = "staging__orders"
+
+[[pipeline.nightly_dq.tables]]
+catalog = "poc"
+schema = "staging__customers"
+
+[pipeline.nightly_dq.checks]
+enabled = true
+row_count = true
+column_match = true
+freshness = { threshold_seconds = 86400 }
+null_rate = { threshold_pct = 5 }
+anomaly_threshold_pct = 30.0

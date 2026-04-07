@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "SeedTableOutput": {
+      "description": "A single seed table result within `SeedOutput`.",
+      "properties": {
+        "columns": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "rows": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "columns",
+        "duration_ms",
+        "name",
+        "rows",
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky seed`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "seeds_dir": {
+      "type": "string"
+    },
+    "tables": {
+      "items": {
+        "$ref": "#/definitions/SeedTableOutput"
+      },
+      "type": "array"
+    },
+    "tables_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_loaded": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "duration_ms",
+    "seeds_dir",
+    "tables",
+    "tables_failed",
+    "tables_loaded",
+    "version"
+  ],
+  "title": "SeedOutput",
+  "type": "object"
+}

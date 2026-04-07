@@ -1,0 +1,9 @@
+name = "raw_events"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "bronze"
+table = "raw_events"

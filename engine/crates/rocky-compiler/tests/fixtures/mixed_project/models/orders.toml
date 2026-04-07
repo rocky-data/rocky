@@ -1,0 +1,9 @@
+name = "orders"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "orders"

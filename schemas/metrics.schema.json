@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ColumnTrendPoint": {
+      "properties": {
+        "null_rate": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "row_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "row_count",
+        "run_id",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "MetricsAlert": {
+      "properties": {
+        "column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "run_id",
+        "severity",
+        "type"
+      ],
+      "type": "object"
+    },
+    "MetricsSnapshotEntry": {
+      "properties": {
+        "freshness_lag_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "null_rates": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "object"
+        },
+        "row_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "null_rates",
+        "row_count",
+        "run_id",
+        "timestamp"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky metrics`.\n\nAll optional fields are present-or-absent depending on the flags (`--trend`, `--alerts`, `--column`). The empty case (no snapshots available) sets `message` and leaves the collections empty.",
+  "properties": {
+    "alerts": {
+      "items": {
+        "$ref": "#/definitions/MetricsAlert"
+      },
+      "type": "array"
+    },
+    "column": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "column_trend": {
+      "items": {
+        "$ref": "#/definitions/ColumnTrendPoint"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "count": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": "string"
+    },
+    "snapshots": {
+      "items": {
+        "$ref": "#/definitions/MetricsSnapshotEntry"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "alerts",
+    "column_trend",
+    "command",
+    "count",
+    "model",
+    "snapshots",
+    "version"
+  ],
+  "title": "MetricsOutput",
+  "type": "object"
+}

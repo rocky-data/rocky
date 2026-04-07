@@ -1,0 +1,7 @@
+-- Rocky DSL model referencing a SQL model
+from orders
+where status != "cancelled"
+group customer_id {
+    total: sum(amount),
+    cnt: count()
+}

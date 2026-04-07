@@ -1,0 +1,69 @@
+{
+  "version": "0.3.0",
+  "command": "lineage",
+  "model": "revenue_summary",
+  "columns": [
+    {
+      "name": "customer_id"
+    },
+    {
+      "name": "total_revenue"
+    },
+    {
+      "name": "order_count"
+    },
+    {
+      "name": "first_order"
+    }
+  ],
+  "upstream": [
+    "customer_orders"
+  ],
+  "downstream": [],
+  "edges": [
+    {
+      "source": {
+        "model": "customer_orders",
+        "column": "customer_id"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "customer_id"
+      },
+      "transform": "direct"
+    },
+    {
+      "source": {
+        "model": "customer_orders",
+        "column": "total_revenue"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "total_revenue"
+      },
+      "transform": "direct"
+    },
+    {
+      "source": {
+        "model": "customer_orders",
+        "column": "order_count"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "order_count"
+      },
+      "transform": "direct"
+    },
+    {
+      "source": {
+        "model": "customer_orders",
+        "column": "first_order"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "first_order"
+      },
+      "transform": "direct"
+    }
+  ]
+}

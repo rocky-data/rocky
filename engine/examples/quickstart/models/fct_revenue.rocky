@@ -1,0 +1,9 @@
+-- Fact table: daily revenue aggregation
+from stg_orders
+where is_completed == true
+group order_date {
+    total_revenue: sum(order_amount_usd),
+    order_count: count(),
+    avg_order_value: sum(order_amount_usd) / count()
+}
+sort order_date desc

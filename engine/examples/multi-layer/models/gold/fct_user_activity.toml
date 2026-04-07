@@ -1,0 +1,10 @@
+name = "fct_user_activity"
+intent = "Per-user activity summary. Joins events with user profiles. One row per user. Includes total events, page views, purchases, and date range."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "gold"
+table = "fct_user_activity"

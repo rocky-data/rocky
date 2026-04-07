@@ -1,0 +1,9 @@
+name = "raw_orders"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "playground"
+schema = "staging"
+table = "raw_orders"

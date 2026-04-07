@@ -1,0 +1,16 @@
+-- Silver: clean user profiles
+from source.raw.users
+where user_id is not null
+where email is not null
+derive {
+    full_name: first_name,
+    signup_date: created_at
+}
+select {
+    user_id,
+    full_name,
+    email,
+    country,
+    signup_date,
+    is_active
+}

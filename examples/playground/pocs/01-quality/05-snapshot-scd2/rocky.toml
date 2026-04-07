@@ -1,0 +1,22 @@
+# Snapshot pipeline — SCD Type 2 (slowly-changing dimension)
+# Tracks historical changes to a source table via valid_from / valid_to columns.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.customer_history]
+type = "snapshot"
+unique_key = ["customer_id"]
+updated_at = "updated_at"
+invalidate_hard_deletes = true
+
+[pipeline.customer_history.source]
+catalog = "poc"
+schema = "raw__crm"
+table = "customers"
+
+[pipeline.customer_history.target]
+catalog = "poc"
+schema = "snapshots"
+table = "customers_history"

@@ -1,0 +1,13 @@
+-- Fact table: per-customer order summary
+from raw_orders
+join stg_customers as c on customer_id {
+    keep full_name, country
+}
+where status != "cancelled"
+group customer_id, full_name, country {
+    total_orders: count(),
+    total_spent: sum(amount),
+    first_order_date: min(order_date),
+    last_order_date: max(order_date)
+}
+sort total_spent desc

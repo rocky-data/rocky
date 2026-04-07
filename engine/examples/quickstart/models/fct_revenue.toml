@@ -1,0 +1,9 @@
+name = "fct_revenue"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "fct_revenue"

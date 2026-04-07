@@ -1,0 +1,51 @@
+{
+  "version": "0.3.0",
+  "command": "compile",
+  "models": 3,
+  "execution_layers": 3,
+  "diagnostics": [],
+  "has_errors": false,
+  "compile_timings": {
+    "project_load_ms": 0,
+    "semantic_graph_ms": 0,
+    "typecheck_ms": 0,
+    "typecheck_join_keys_ms": 0,
+    "contracts_ms": 0,
+    "total_ms": 0
+  },
+  "models_detail": [
+    {
+      "name": "raw_orders",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "playground",
+        "schema": "staging",
+        "table": "raw_orders"
+      }
+    },
+    {
+      "name": "revenue_summary",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "playground",
+        "schema": "gold",
+        "table": "revenue_summary"
+      }
+    },
+    {
+      "name": "customer_orders",
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "target": {
+        "catalog": "playground",
+        "schema": "silver",
+        "table": "customer_orders"
+      }
+    }
+  ]
+}

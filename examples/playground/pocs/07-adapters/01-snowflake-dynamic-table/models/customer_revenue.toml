@@ -1,0 +1,10 @@
+# Materialize as a Snowflake Dynamic Table.
+# Snowflake auto-refreshes the table to keep it within target_lag.
+[strategy]
+type = "dynamic_table"
+target_lag = "1 hour"
+warehouse = "ANALYTICS_WH"
+
+[target]
+catalog = "ANALYTICS"
+schema = "MARTS"

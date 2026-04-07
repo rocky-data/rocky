@@ -1,0 +1,19 @@
+[strategy]
+type = "full_refresh"
+
+# External sources — tables managed by dbt, not by Rocky.
+# Listed here for lineage documentation; Rocky does not create or refresh them.
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__campaign_history"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__ad_history"
+
+[[sources]]
+catalog = "poc"
+schema = "dbt_fivetran"
+table = "stg_facebook_ads__ad_report_daily"

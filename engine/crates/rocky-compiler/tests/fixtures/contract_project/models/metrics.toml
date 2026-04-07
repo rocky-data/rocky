@@ -1,0 +1,9 @@
+name = "metrics"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "gold"
+table = "metrics"

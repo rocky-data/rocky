@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "HealthCheck": {
+      "description": "A single health check result.",
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/HealthStatus"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "message",
+        "name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "HealthStatus": {
+      "description": "Health check status.",
+      "enum": [
+        "healthy",
+        "warning",
+        "critical"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "Doctor output structure.",
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/definitions/HealthCheck"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "overall": {
+      "type": "string"
+    },
+    "suggestions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "checks",
+    "command",
+    "overall",
+    "suggestions"
+  ],
+  "title": "DoctorOutput",
+  "type": "object"
+}

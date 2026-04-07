@@ -1,0 +1,9 @@
+-- Customer orders aggregation (Rocky DSL)
+from raw_orders
+where status != "cancelled"
+group customer_id {
+    total_revenue: sum(amount),
+    order_count: count(),
+    first_order: min(order_date)
+}
+where total_revenue > 0

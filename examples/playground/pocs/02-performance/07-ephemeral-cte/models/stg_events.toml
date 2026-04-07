@@ -1,0 +1,4 @@
+# Ephemeral: this model is inlined as a CTE in downstream consumers.
+# No table is created — saves storage and avoids unnecessary I/O.
+[strategy]
+type = "ephemeral"

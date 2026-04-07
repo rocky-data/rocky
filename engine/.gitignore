@@ -1,0 +1,34 @@
+# Rust
+/target/
+/target-linux/
+**/*.rs.bk
+# Cargo.lock is committed (workspace includes a binary crate)
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# State
+*.redb
+
+# Docs
+docs/node_modules/
+docs/dist/
+docs/.astro/
+
+# Claude — track shared skills + settings.json, ignore per-user state
+.claude/projects/
+.claude/worktrees/
+.claude/settings.local.json
+plans/

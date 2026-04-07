@@ -1,0 +1,6 @@
+# Delete+Insert: deletes all rows for the partition key(s), then inserts fresh data.
+# Safer than MERGE for late-arriving data — no duplicate risk.
+# Faster than full_refresh — only touches affected partitions.
+[strategy]
+type = "delete_insert"
+partition_by = ["region"]

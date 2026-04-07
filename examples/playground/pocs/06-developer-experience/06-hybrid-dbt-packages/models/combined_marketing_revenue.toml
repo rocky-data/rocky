@@ -1,0 +1,5 @@
+[strategy]
+type = "full_refresh"
+
+# These are Rocky models — they become DAG dependencies.
+depends_on = ["stripe_revenue_daily", "facebook_daily_trends"]

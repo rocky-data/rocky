@@ -1,0 +1,730 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AnomalyOutput": {
+      "description": "Row count anomaly detected by historical baseline comparison.",
+      "properties": {
+        "baseline_avg": {
+          "format": "double",
+          "type": "number"
+        },
+        "current_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deviation_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "baseline_avg",
+        "current_count",
+        "deviation_pct",
+        "reason",
+        "table"
+      ],
+      "type": "object"
+    },
+    "CheckResult": {
+      "anyOf": [
+        {
+          "description": "Row count comparison between source and target tables.",
+          "properties": {
+            "source_count": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "target_count": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "source_count",
+            "target_count"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Column presence comparison between source and target schemas.",
+          "properties": {
+            "extra": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "missing": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "extra",
+            "missing"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Data freshness measured as lag from the max timestamp to now.",
+          "properties": {
+            "lag_seconds": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "threshold_seconds": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "lag_seconds",
+            "threshold_seconds"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Null rate for a specific column, sampled via TABLESAMPLE.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "null_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "threshold": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "column",
+            "null_rate",
+            "threshold"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "User-defined SQL check evaluated against a threshold.",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "result_value": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "threshold": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query",
+            "result_value",
+            "threshold"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Result of a single data quality check.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "DriftActionOutput": {
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "reason",
+        "table"
+      ],
+      "type": "object"
+    },
+    "DriftSummary": {
+      "properties": {
+        "actions_taken": {
+          "items": {
+            "$ref": "#/definitions/DriftActionOutput"
+          },
+          "type": "array"
+        },
+        "tables_checked": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_drifted": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "actions_taken",
+        "tables_checked",
+        "tables_drifted"
+      ],
+      "type": "object"
+    },
+    "ExcludedTableOutput": {
+      "description": "A table that the discovery adapter reported but that is missing from the source warehouse, so the run skipped it. Tracked separately from `errors` because it is not a runtime failure — the row never made it past the pre-flight existence check.",
+      "properties": {
+        "asset_key": {
+          "description": "Dagster-style asset key path (`[source_type, ...components, table]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "description": "Why the table was excluded. Currently always `\"missing_from_source\"` but kept as a free-form field so future causes (disabled, sync_paused, ...) can be added without a schema break.",
+          "type": "string"
+        },
+        "source_schema": {
+          "description": "Source schema the table was expected to live in.",
+          "type": "string"
+        },
+        "table_name": {
+          "description": "Bare table name as reported by the discovery adapter.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "asset_key",
+        "reason",
+        "source_schema",
+        "table_name"
+      ],
+      "type": "object"
+    },
+    "ExecutionSummary": {
+      "description": "Summary of execution parallelism and throughput.",
+      "properties": {
+        "adaptive_concurrency": {
+          "description": "Whether adaptive concurrency (AIMD throttle) was enabled for this run.",
+          "type": "boolean"
+        },
+        "concurrency": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "final_concurrency": {
+          "description": "Final concurrency level at end of run (may differ from initial if adaptive concurrency adjusted it). Only present when adaptive concurrency is enabled.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rate_limits_detected": {
+          "description": "Number of rate-limit signals (HTTP 429 / UC_REQUEST_LIMIT_EXCEEDED) that triggered concurrency reduction. Only present when adaptive concurrency is enabled.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tables_failed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_processed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adaptive_concurrency",
+        "concurrency",
+        "tables_failed",
+        "tables_processed"
+      ],
+      "type": "object"
+    },
+    "MaterializationMetadata": {
+      "properties": {
+        "column_count": {
+          "description": "Number of columns in the materialized table's typed schema. Populated for derived models (where the compiler resolved a typed schema); `None` for source-replication tables that inherit their schema from upstream.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "compile_time_ms": {
+          "description": "Compile time in milliseconds for the model that produced this materialization. Populated only for derived models. Mirrors the relevant slice of `PhaseTimings.total_ms`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sql_hash": {
+          "description": "Short hash (16 hex chars) of the generated SQL string. Lets orchestrators detect \"what changed?\" between runs without diffing full SQL bodies. Computed via `xxh3_64` of the canonical SQL the engine sent to the warehouse.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strategy": {
+          "type": "string"
+        },
+        "target_table_full_name": {
+          "description": "Fully-qualified target table identifier in `catalog.schema.table` format. Useful for click-through links to the warehouse UI from the Dagster asset detail page. Always set when the materialization targets a known table.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "watermark": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "MaterializationOutput": {
+      "properties": {
+        "asset_key": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "metadata": {
+          "$ref": "#/definitions/MaterializationMetadata"
+        },
+        "partition": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PartitionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge)."
+        },
+        "rows_copied": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "asset_key",
+        "duration_ms",
+        "metadata"
+      ],
+      "type": "object"
+    },
+    "MetricsSnapshot": {
+      "description": "Serializable metrics summary for JSON output.",
+      "properties": {
+        "anomalies_detected": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error_rate_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "query_duration_max_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "query_duration_p50_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "query_duration_p95_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retries_attempted": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retries_succeeded": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "statements_executed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_duration_max_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_duration_p50_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_duration_p95_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_failed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_processed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "anomalies_detected",
+        "error_rate_pct",
+        "query_duration_max_ms",
+        "query_duration_p50_ms",
+        "query_duration_p95_ms",
+        "retries_attempted",
+        "retries_succeeded",
+        "statements_executed",
+        "table_duration_max_ms",
+        "table_duration_p50_ms",
+        "table_duration_p95_ms",
+        "tables_failed",
+        "tables_processed"
+      ],
+      "type": "object"
+    },
+    "PartitionInfo": {
+      "description": "Partition window information for a single `time_interval` materialization.\n\n`key` is the canonical Rocky partition key (e.g. `\"2026-04-07\"` for daily; `\"2026-04-07T13\"` for hourly). `start` / `end` are the half-open `[start, end)` window the SQL substituted for `@start_date` / `@end_date`. `batched_with` lists any additional partition keys that were merged into this batch when `batch_size > 1` — empty for the default one-partition-per-statement case.",
+      "properties": {
+        "batched_with": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "end": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "start": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "batched_with",
+        "end",
+        "key",
+        "start"
+      ],
+      "type": "object"
+    },
+    "PartitionSummary": {
+      "description": "Per-model summary of `time_interval` partition execution.\n\nOne entry per partitioned model touched by the run. Lets dagster-rocky (and other orchestrators) display per-model partition stats without re-counting the per-partition `MaterializationOutput.partition` entries.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "partitions_failed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "partitions_planned": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "partitions_skipped": {
+          "description": "Partitions that were already `Computed` in the state store and skipped by the runtime (currently always 0; reserved for the `--missing` change-detection optimization).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "partitions_succeeded": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model",
+        "partitions_failed",
+        "partitions_planned",
+        "partitions_skipped",
+        "partitions_succeeded"
+      ],
+      "type": "object"
+    },
+    "PermissionSummary": {
+      "properties": {
+        "catalogs_created": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grants_added": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grants_revoked": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemas_created": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "catalogs_created",
+        "grants_added",
+        "grants_revoked",
+        "schemas_created"
+      ],
+      "type": "object"
+    },
+    "TableCheckOutput": {
+      "properties": {
+        "asset_key": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/definitions/CheckResult"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "asset_key",
+        "checks"
+      ],
+      "type": "object"
+    },
+    "TableErrorOutput": {
+      "description": "Error from a table that failed during parallel processing.",
+      "properties": {
+        "asset_key": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "asset_key",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky run`.",
+  "properties": {
+    "anomalies": {
+      "items": {
+        "$ref": "#/definitions/AnomalyOutput"
+      },
+      "type": "array"
+    },
+    "check_results": {
+      "items": {
+        "$ref": "#/definitions/TableCheckOutput"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "drift": {
+      "$ref": "#/definitions/DriftSummary"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "errors": {
+      "items": {
+        "$ref": "#/definitions/TableErrorOutput"
+      },
+      "type": "array"
+    },
+    "excluded_tables": {
+      "description": "Tables that the discovery adapter reported as enabled but that do not exist in the source warehouse (e.g. Fivetran has them configured but hasn't synced them, or they carry the `do_not_alter__` broken-table marker). Surfaced so orchestrators can flag the gap in their UIs instead of silently dropping the assets.",
+      "items": {
+        "$ref": "#/definitions/ExcludedTableOutput"
+      },
+      "type": "array"
+    },
+    "execution": {
+      "$ref": "#/definitions/ExecutionSummary"
+    },
+    "filter": {
+      "type": "string"
+    },
+    "materializations": {
+      "items": {
+        "$ref": "#/definitions/MaterializationOutput"
+      },
+      "type": "array"
+    },
+    "metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MetricsSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "partition_summaries": {
+      "description": "Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.",
+      "items": {
+        "$ref": "#/definitions/PartitionSummary"
+      },
+      "type": "array"
+    },
+    "permissions": {
+      "$ref": "#/definitions/PermissionSummary"
+    },
+    "pipeline_type": {
+      "description": "Pipeline type that was executed (e.g., \"replication\").",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resumed_from": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "shadow": {
+      "description": "True when running in shadow mode (targets rewritten).",
+      "type": "boolean"
+    },
+    "tables_copied": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_skipped": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "anomalies",
+    "check_results",
+    "command",
+    "drift",
+    "duration_ms",
+    "errors",
+    "excluded_tables",
+    "execution",
+    "filter",
+    "materializations",
+    "partition_summaries",
+    "permissions",
+    "shadow",
+    "tables_copied",
+    "tables_failed",
+    "tables_skipped",
+    "version"
+  ],
+  "title": "RunOutput",
+  "type": "object"
+}

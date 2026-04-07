@@ -1,0 +1,10 @@
+name = "fct_daily_revenue"
+intent = "Daily revenue metrics aggregated from completed orders only. One row per calendar date. total_revenue must be positive. order_date is the unique grain."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "fct_daily_revenue"

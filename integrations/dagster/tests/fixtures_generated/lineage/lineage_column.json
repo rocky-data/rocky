@@ -1,0 +1,41 @@
+{
+  "version": "0.3.0",
+  "command": "lineage",
+  "model": "fct_revenue",
+  "column": "total",
+  "trace": [
+    {
+      "source": {
+        "model": "stg_orders",
+        "column": "amount"
+      },
+      "target": {
+        "model": "fct_revenue",
+        "column": "total"
+      },
+      "transform": "aggregation(\"sum\")"
+    },
+    {
+      "source": {
+        "model": "raw_orders",
+        "column": "amount"
+      },
+      "target": {
+        "model": "stg_orders",
+        "column": "amount"
+      },
+      "transform": "direct"
+    },
+    {
+      "source": {
+        "model": "seeds.orders",
+        "column": "amount"
+      },
+      "target": {
+        "model": "raw_orders",
+        "column": "amount"
+      },
+      "transform": "direct"
+    }
+  ]
+}

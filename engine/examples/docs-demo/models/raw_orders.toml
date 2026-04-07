@@ -1,0 +1,22 @@
+name = "raw_orders"
+intent = "Ingests the raw orders table from the source system. Contains one row per order with status and amount fields."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "raw_orders"
+
+[[tests]]
+type = "not_null"
+column = "order_id"
+
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[tests]]
+type = "not_null"
+column = "customer_id"

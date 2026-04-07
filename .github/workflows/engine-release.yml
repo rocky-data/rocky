@@ -1,0 +1,187 @@
+name: engine-release
+
+# Full cross-platform release matrix. Builds binaries for all supported
+# platforms and attaches them to the GitHub Release created by the tag push.
+#
+# scripts/release.sh remains as a local-build hotfix fallback.
+
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Limit parallelism — DuckDB C++ compilation is extremely memory-intensive
+  # and OOMs the GitHub Actions runner (~7GB RAM) at default parallelism
+  CARGO_BUILD_JOBS: 4
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    needs: ensure-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: rocky-aarch64-apple-darwin.tar.gz
+            ext: tar.gz
+
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            archive: rocky-x86_64-apple-darwin.tar.gz
+            ext: tar.gz
+
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: rocky-x86_64-unknown-linux-gnu.tar.gz
+            ext: tar.gz
+            zigbuild: true
+
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            archive: rocky-aarch64-unknown-linux-gnu.tar.gz
+            ext: tar.gz
+            zigbuild: true
+            cross: true
+
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: rocky-x86_64-pc-windows-msvc.zip
+            ext: zip
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: engine
+          key: release-${{ matrix.target }}
+
+      # Linux: free disk space and add swap (DuckDB C++ is memory-hungry)
+      - name: Free disk space and add swap
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
+
+      # Linux: install zig + cargo-zigbuild for portable glibc builds
+      - name: Install zig
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2.1.0
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      # Linux cross-compile: install the cross-compilation toolchain
+      - name: Install cross-compilation toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Linux: build with cargo-zigbuild (portable glibc)
+      - name: Build release binary (zigbuild)
+        if: matrix.zigbuild
+        run: cargo zigbuild --release --bin rocky --target ${{ matrix.target }}
+
+      # macOS / Windows: build with plain cargo
+      - name: Build release binary (cargo)
+        if: ${{ !matrix.zigbuild }}
+        run: cargo build --release --bin rocky --target ${{ matrix.target }}
+
+      # Unix: package as .tar.gz
+      - name: Package binary (tar.gz)
+        if: matrix.ext == 'tar.gz'
+        run: tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release rocky
+
+      # Windows: package as .zip
+      - name: Package binary (zip)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/rocky.exe -DestinationPath ${{ matrix.archive }}
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: engine/${{ matrix.archive }}
+
+  # Generate checksums.txt from all platform archives and attach to the release.
+  # Runs after all build jobs so every archive is present before hashing.
+  checksums:
+    name: Generate checksums
+    needs: [ensure-release, build]
+    runs-on: ubuntu-24.04
+    # Override the workflow-level `working-directory: engine` — this job
+    # operates at the repo root and needs no Cargo workspace.
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "rocky-*.tar.gz" \
+            --pattern "rocky-*.zip" \
+            --dir release-artifacts
+
+      - name: Generate checksums.txt
+        run: |
+          cd release-artifacts
+          sha256sum rocky-*.tar.gz rocky-*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" release-artifacts/checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  # Create the GitHub Release if it doesn't already exist (supports both
+  # CI-only releases and the local scripts/release.sh workflow where the
+  # release is created before the tag push).
+  ensure-release:
+    name: Ensure GitHub Release exists
+    runs-on: ubuntu-24.04
+    # Run before build so artifacts have a release to attach to
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (created by scripts/release.sh)"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              --title "$TAG"
+          fi

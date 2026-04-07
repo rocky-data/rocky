@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ValidateAdapterStatus": {
+      "description": "Status of a single adapter in the validate output.",
+      "properties": {
+        "adapter_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "adapter_type",
+        "name",
+        "ok"
+      ],
+      "type": "object"
+    },
+    "ValidateMessage": {
+      "description": "A structured diagnostic message from `rocky validate`.",
+      "properties": {
+        "code": {
+          "description": "Machine-readable code (e.g. \"V001\", \"L001\").",
+          "type": "string"
+        },
+        "field": {
+          "description": "Config field path associated with this message, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "File path associated with this message, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "severity": {
+          "description": "One of \"ok\", \"warn\", \"error\", \"lint\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "ValidateModelsStatus": {
+      "description": "Status of the models directory in the validate output.",
+      "properties": {
+        "count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "dag_valid": {
+          "type": "boolean"
+        },
+        "found": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "count",
+        "dag_valid",
+        "found"
+      ],
+      "type": "object"
+    },
+    "ValidatePipelineStatus": {
+      "description": "Status of a single pipeline in the validate output.",
+      "properties": {
+        "catalog_template": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "pipeline_type": {
+          "type": "string"
+        },
+        "schema_template": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog_template",
+        "name",
+        "ok",
+        "pipeline_type",
+        "schema_template",
+        "strategy"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky validate`.",
+  "properties": {
+    "adapters": {
+      "items": {
+        "$ref": "#/definitions/ValidateAdapterStatus"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "messages": {
+      "items": {
+        "$ref": "#/definitions/ValidateMessage"
+      },
+      "type": "array"
+    },
+    "models": {
+      "$ref": "#/definitions/ValidateModelsStatus"
+    },
+    "pipelines": {
+      "items": {
+        "$ref": "#/definitions/ValidatePipelineStatus"
+      },
+      "type": "array"
+    },
+    "valid": {
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "adapters",
+    "command",
+    "messages",
+    "models",
+    "pipelines",
+    "valid",
+    "version"
+  ],
+  "title": "ValidateOutput",
+  "type": "object"
+}

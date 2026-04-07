@@ -1,0 +1,31 @@
+[package]
+name = "rocky-compiler"
+version = "1.0.0"
+description = "Rocky SQL compiler: dependency resolution, semantic analysis, type checking, contracts"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-lang = { path = "../rocky-lang" }
+rocky-sql = { path = "../rocky-sql" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+indexmap = { workspace = true }
+regex = { workspace = true }
+sqlparser = { workspace = true }
+bumpalo = "3"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

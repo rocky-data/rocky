@@ -1,0 +1,54 @@
+name: engine-bench
+
+# Runs only on PRs labeled "perf" to avoid expensive benchmark builds on
+# every engine PR. Add the label to trigger; removing it cancels the run.
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+    paths:
+      - 'engine/crates/**'
+      - 'engine/Cargo.toml'
+      - 'engine/Cargo.lock'
+      - '.github/workflows/engine-bench.yml'
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  bench:
+    name: Performance Benchmarks
+    if: contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: engine
+          key: bench
+
+      # DuckDB C++ compilation needs swap on CI
+      - name: Configure swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Run benchmarks
+        run: cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1
+        with:
+          tool: 'cargo'
+          output-file-path: engine/bench-output.txt
+          alert-threshold: '120%'
+          comment-on-alert: true
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

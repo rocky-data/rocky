@@ -1,0 +1,38 @@
+# Watch Demo — auto-recompile on file changes
+#
+# Demonstrates `rocky watch` monitoring .rocky files and re-compiling
+# whenever a change is saved.
+#
+# Usage:
+#   rocky --config engine/examples/watch-demo/rocky.toml watch \
+#     --models engine/examples/watch-demo/models/
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.watch_demo]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.watch_demo.source]
+adapter = "local"
+
+[pipeline.watch_demo.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.watch_demo.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.watch_demo.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.watch_demo.execution]
+concurrency = 4
+
+[state]
+backend = "local"

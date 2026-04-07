@@ -1,0 +1,26 @@
+[package]
+name = "rocky-observe"
+version = "1.0.0"
+description = "Observability for Rocky (structured logging, metrics, events)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "metrics"] }
+
+[lints]
+workspace = true

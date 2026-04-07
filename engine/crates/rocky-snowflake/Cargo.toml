@@ -1,0 +1,38 @@
+[package]
+name = "rocky-snowflake"
+version = "1.0.0"
+description = "Snowflake warehouse adapter for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-sql = { path = "../rocky-sql" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
+rsa = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+[features]
+test-support = []
+
+[[test]]
+name = "wiremock_tests"
+required-features = ["test-support"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

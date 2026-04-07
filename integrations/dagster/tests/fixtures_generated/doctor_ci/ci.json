@@ -1,0 +1,12 @@
+{
+  "version": "0.3.0",
+  "command": "ci",
+  "compile_ok": true,
+  "tests_ok": true,
+  "models_compiled": 1,
+  "tests_passed": 1,
+  "tests_failed": 0,
+  "exit_code": 0,
+  "diagnostics": [],
+  "failures": []
+}

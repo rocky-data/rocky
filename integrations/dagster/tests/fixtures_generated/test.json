@@ -1,0 +1,8 @@
+{
+  "version": "0.3.0",
+  "command": "test",
+  "total": 3,
+  "passed": 3,
+  "failed": 0,
+  "failures": []
+}

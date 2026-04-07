@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Rocky Model Configuration",
+  "description": "Schema for .rocky.toml sidecar configuration files and _defaults.toml directory defaults",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Model name (defaults to file name stem if omitted)"
+    },
+    "depends_on": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Explicit model dependencies (auto-detected from SQL if omitted)"
+    },
+    "strategy": {
+      "$ref": "#/definitions/strategy_config",
+      "description": "Materialization strategy (defaults to full_refresh)"
+    },
+    "target": {
+      "type": "object",
+      "description": "Target table coordinates",
+      "properties": {
+        "catalog": {
+          "type": "string",
+          "description": "Target catalog name"
+        },
+        "schema": {
+          "type": "string",
+          "description": "Target schema name"
+        },
+        "table": {
+          "type": "string",
+          "description": "Target table name (defaults to model name)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["catalog", "schema", "table"],
+        "properties": {
+          "catalog": {
+            "type": "string",
+            "description": "Source catalog name"
+          },
+          "schema": {
+            "type": "string",
+            "description": "Source schema name"
+          },
+          "table": {
+            "type": "string",
+            "description": "Source table name"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "External source table references"
+    },
+    "intent": {
+      "type": "string",
+      "description": "Natural language description of what this model does. Used by 'rocky ai sync' to propose updates when upstream schemas change"
+    },
+    "freshness": {
+      "type": "object",
+      "description": "Per-model freshness expectation (metadata only — consumed by downstream observability tools)",
+      "required": ["max_lag_seconds"],
+      "properties": {
+        "max_lag_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum lag in seconds before the model is considered stale"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "strategy_config": {
+      "description": "Materialization strategy — tagged union on the 'type' field",
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "Full refresh — drop and recreate the target table each run",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "full_refresh"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Incremental — append rows past a watermark column",
+          "required": ["type", "timestamp_column"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "incremental"
+            },
+            "timestamp_column": {
+              "type": "string",
+              "description": "Column used for incremental watermark"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Merge (upsert) — match on unique key, update or insert",
+          "required": ["type", "unique_key"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "merge"
+            },
+            "unique_key": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1,
+              "description": "Columns forming the merge key"
+            },
+            "update_columns": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Columns to update on merge (all non-key columns if omitted)"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Time-interval — partition-keyed materialization with @start_date/@end_date placeholders",
+          "required": ["type", "time_column", "granularity"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "time_interval"
+            },
+            "time_column": {
+              "type": "string",
+              "description": "Column on the model output that holds the partition value"
+            },
+            "granularity": {
+              "type": "string",
+              "enum": ["hour", "day", "month", "year"],
+              "description": "Partition granularity"
+            },
+            "lookback": {
+              "type": "integer",
+              "default": 0,
+              "minimum": 0,
+              "description": "Recompute the previous N partitions on each run (handles late-arriving data)"
+            },
+            "batch_size": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1,
+              "description": "Combine N consecutive partitions into one SQL statement when backfilling"
+            },
+            "first_partition": {
+              "type": "string",
+              "description": "Lower bound for --missing discovery, in canonical key format (e.g., '2024-01-01' for daily)"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

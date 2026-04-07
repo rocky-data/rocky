@@ -1,0 +1,123 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ModelValidationOutput": {
+      "properties": {
+        "compile_ok": {
+          "type": "boolean"
+        },
+        "contracts_generated": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "dbt_description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "present_in_dbt": {
+          "type": "boolean"
+        },
+        "present_in_rocky": {
+          "type": "boolean"
+        },
+        "rocky_intent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "test_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "compile_ok",
+        "contracts_generated",
+        "model",
+        "present_in_dbt",
+        "present_in_rocky",
+        "test_count",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky validate-migration`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dbt_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "models_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "models_imported": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "project_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "total_contracts": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total_tests": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total_warnings": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "validations": {
+      "items": {
+        "$ref": "#/definitions/ModelValidationOutput"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "models_failed",
+    "models_imported",
+    "total_contracts",
+    "total_tests",
+    "total_warnings",
+    "validations",
+    "version"
+  ],
+  "title": "ValidateMigrationOutput",
+  "type": "object"
+}

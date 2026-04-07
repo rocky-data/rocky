@@ -1,0 +1,7 @@
+-- Orders summary: total orders and revenue by status
+from raw_orders
+group status {
+    order_count: count(),
+    total_revenue: sum(amount)
+}
+sort total_revenue desc

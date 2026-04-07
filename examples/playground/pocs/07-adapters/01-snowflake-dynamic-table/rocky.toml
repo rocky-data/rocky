@@ -1,0 +1,20 @@
+[adapter.snowflake]
+type = "snowflake"
+# Snowflake adapter fields are picked up from env vars by the connector
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "snowflake"
+catalog = "ANALYTICS"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "RAW__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "snowflake"
+catalog_template = "ANALYTICS"
+schema_template = "STAGING__{source}"

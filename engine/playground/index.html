@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rocky Playground</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---- Header ---- */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .header-left {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+  }
+  .header h1 {
+    font-size: 1.125rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .header .subtitle {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+  #wasm-status {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .status-loading {
+    background: rgba(210,153,34,0.15);
+    color: var(--orange);
+  }
+  .status-ready {
+    background: rgba(63,185,80,0.15);
+    color: var(--green);
+  }
+  .status-error {
+    background: rgba(248,81,73,0.15);
+    color: var(--red);
+  }
+
+  /* ---- Toolbar ---- */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .toolbar-group {
+    display: flex;
+    gap: 0.375rem;
+  }
+  .toolbar-sep {
+    width: 1px;
+    height: 1.5rem;
+    background: var(--border);
+    margin: 0 0.25rem;
+  }
+  .toolbar label {
+    font-size: 0.6875rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-right: 0.25rem;
+    align-self: center;
+  }
+  button {
+    font-family: inherit;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.375rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  button:hover:not(:disabled) {
+    background: var(--bg);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  button:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  button.primary {
+    background: rgba(88,166,255,0.15);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  button.primary:hover:not(:disabled) {
+    background: rgba(88,166,255,0.25);
+  }
+  select {
+    font-family: inherit;
+    font-size: 0.75rem;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+  }
+  select:hover {
+    border-color: var(--accent);
+  }
+
+  /* ---- Main split pane ---- */
+  .main {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+  .pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .pane-header {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .divider {
+    width: 3px;
+    background: var(--border);
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .divider:hover, .divider.dragging {
+    background: var(--accent);
+  }
+
+  /* ---- Editor ---- */
+  #editor {
+    flex: 1;
+    width: 100%;
+    resize: none;
+    border: none;
+    outline: none;
+    padding: 1rem;
+    font-family: inherit;
+    font-size: 0.8125rem;
+    line-height: 1.65;
+    background: var(--bg);
+    color: var(--text);
+    tab-size: 2;
+  }
+  #editor::placeholder {
+    color: var(--text-dim);
+  }
+
+  /* ---- Output ---- */
+  .output-wrap {
+    flex: 1;
+    overflow: auto;
+    background: var(--bg);
+  }
+  #output {
+    margin: 0;
+    padding: 1rem;
+    font-family: inherit;
+    font-size: 0.8125rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: var(--text);
+  }
+
+  /* ---- Syntax highlighting classes inside output ---- */
+  .out-key { color: var(--accent); }
+  .out-string { color: var(--green); }
+  .out-number { color: var(--orange); }
+  .out-bool { color: var(--orange); }
+  .out-null { color: var(--text-dim); }
+  .out-error { color: var(--red); }
+  .out-keyword { color: #d2a8ff; }  /* SQL keywords */
+  .out-comment { color: var(--text-dim); font-style: italic; }
+  .out-success { color: var(--green); }
+  .out-fail { color: var(--red); }
+
+  /* ---- Footer ---- */
+  .footer {
+    font-size: 0.625rem;
+    color: var(--text-dim);
+    text-align: center;
+    padding: 0.4rem;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+
+  /* ---- Responsive ---- */
+  @media (max-width: 700px) {
+    .main { flex-direction: column; }
+    .divider { width: auto; height: 3px; cursor: row-resize; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <h1>Rocky Playground</h1>
+    <span class="subtitle">in-browser compiler explorer</span>
+  </div>
+  <span id="wasm-status" class="status-loading">Loading WASM...</span>
+</div>
+
+<!-- Toolbar -->
+<div class="toolbar">
+  <label>Snippets</label>
+  <select id="snippet-picker" title="Load a sample snippet">
+    <option value="">-- choose --</option>
+    <option value="rocky-dsl">Rocky DSL: from / select</option>
+    <option value="rocky-filter">Rocky DSL: filter + derive</option>
+    <option value="sql-lineage">SQL: column lineage</option>
+    <option value="sql-join">SQL: JOIN lineage</option>
+    <option value="identifier-valid">Identifier: valid</option>
+    <option value="identifier-invalid">Identifier: invalid</option>
+  </select>
+  <div class="toolbar-sep"></div>
+  <label>Actions</label>
+  <div class="toolbar-group">
+    <button id="btn-compile" class="primary" disabled title="Extract column-level lineage from SQL (compile_sql)">Compile SQL</button>
+    <button id="btn-parse" disabled title="Parse Rocky DSL into JSON AST (parse_rocky)">Parse Rocky</button>
+    <button id="btn-lower" disabled title="Lower Rocky DSL to SQL (lower_rocky_to_sql)">Lower to SQL</button>
+    <button id="btn-validate" disabled title="Check if text is a valid SQL identifier (validate_identifier)">Validate</button>
+  </div>
+  <div class="toolbar-sep"></div>
+  <button id="btn-clear" title="Clear the output panel">Clear Output</button>
+</div>
+
+<!-- Split pane -->
+<div class="main">
+  <div class="pane" id="pane-left" style="flex: 1">
+    <div class="pane-header">Editor</div>
+    <textarea id="editor" spellcheck="false" placeholder="Enter Rocky DSL or SQL here...">-- Column lineage demo
+-- Try clicking "Compile SQL" to extract lineage.
+SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_name,
+    o.total_amount * 1.1 AS total_with_tax,
+    o.order_date
+FROM catalog.sales.orders AS o
+JOIN catalog.sales.customers AS c
+    ON o.customer_id = c.customer_id
+WHERE o.order_date >= '2024-01-01'</textarea>
+  </div>
+  <div class="divider" id="divider"></div>
+  <div class="pane" id="pane-right" style="flex: 1">
+    <div class="pane-header">Output</div>
+    <div class="output-wrap">
+      <pre id="output"><span class="out-comment">-- Output will appear here after you click an action button.</span></pre>
+    </div>
+  </div>
+</div>
+
+<!-- Footer -->
+<div class="footer">rocky &mdash; rust sql transformation engine &mdash; WASM playground</div>
+
+<script type="module">
+  // ---- WASM loading ----
+  let wasm = null;
+  const statusEl = document.getElementById('wasm-status');
+  const buttons = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-validate'].map(
+    id => document.getElementById(id)
+  );
+
+  async function initWasm() {
+    try {
+      const mod = await import('./pkg/rocky_wasm.js');
+      await mod.default();  // wasm-pack --target web: default export is init()
+      wasm = mod;
+      statusEl.textContent = 'WASM Ready';
+      statusEl.className = 'status-ready';
+      buttons.forEach(b => b.disabled = false);
+    } catch (err) {
+      console.error('Failed to load WASM:', err);
+      statusEl.textContent = 'WASM not built yet';
+      statusEl.className = 'status-error';
+      setOutput(
+        '<span class="out-error">Could not load WASM module.</span>\n\n' +
+        '<span class="out-comment">To build it, run from the repository root:</span>\n\n' +
+        '  cd engine && bash ../scripts/build_wasm.sh\n' +
+        '  cp -r crates/rocky-wasm/pkg playground/pkg\n' +
+        '  cd playground && python3 -m http.server 8080\n\n' +
+        '<span class="out-comment">Then open http://localhost:8080</span>'
+      );
+    }
+  }
+
+  initWasm();
+
+  // ---- Helpers ----
+  const editorEl = document.getElementById('editor');
+  const outputEl = document.getElementById('output');
+
+  function setOutput(html) {
+    outputEl.innerHTML = html;
+  }
+
+  /** Syntax-highlight a JSON string for display. */
+  function highlightJson(jsonStr) {
+    try {
+      const obj = JSON.parse(jsonStr);
+      const pretty = JSON.stringify(obj, null, 2);
+      return pretty.replace(
+        /("(?:\\.|[^"\\])*")\s*:/g,
+        '<span class="out-key">$1</span>:'
+      ).replace(
+        /:\s*("(?:\\.|[^"\\])*")/g,
+        function(match, str) {
+          return ': <span class="out-string">' + str + '</span>';
+        }
+      ).replace(
+        /:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+        ': <span class="out-number">$1</span>'
+      ).replace(
+        /:\s*(true|false)/g,
+        ': <span class="out-bool">$1</span>'
+      ).replace(
+        /:\s*(null)/g,
+        ': <span class="out-null">$1</span>'
+      );
+    } catch {
+      return escHtml(jsonStr);
+    }
+  }
+
+  /** Highlight SQL keywords for display. */
+  function highlightSql(sql) {
+    const keywords = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AND|OR|NOT|AS|IN|IS|NULL|LIKE|BETWEEN|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|UNION|ALL|INSERT|INTO|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|VIEW|INDEX|IF|EXISTS|CASE|WHEN|THEN|ELSE|END|DISTINCT|COUNT|SUM|AVG|MIN|MAX|OVER|PARTITION|WINDOW|WITH|RECURSIVE|CAST|COALESCE|NULLIF)\b/gi;
+    const escaped = escHtml(sql);
+    return escaped.replace(keywords, '<span class="out-keyword">$&</span>');
+  }
+
+  function escHtml(s) {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function getInput() {
+    return editorEl.value;
+  }
+
+  function isJsonError(str) {
+    try {
+      const obj = JSON.parse(str);
+      return obj && typeof obj.error !== 'undefined';
+    } catch {
+      return false;
+    }
+  }
+
+  // ---- Button handlers ----
+  document.getElementById('btn-compile').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.compile_sql(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    const label = isJsonError(result)
+      ? '<span class="out-error">Error</span>'
+      : '<span class="out-success">Lineage Result</span>';
+    setOutput(
+      '<span class="out-comment">// compile_sql (' + ms + ' ms)</span>\n' +
+      label + '\n\n' +
+      highlightJson(result)
+    );
+  });
+
+  document.getElementById('btn-parse').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.parse_rocky(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    const label = isJsonError(result)
+      ? '<span class="out-error">Parse Error</span>'
+      : '<span class="out-success">Rocky AST</span>';
+    setOutput(
+      '<span class="out-comment">// parse_rocky (' + ms + ' ms)</span>\n' +
+      label + '\n\n' +
+      highlightJson(result)
+    );
+  });
+
+  document.getElementById('btn-lower').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.lower_rocky_to_sql(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    if (isJsonError(result)) {
+      setOutput(
+        '<span class="out-comment">// lower_rocky_to_sql (' + ms + ' ms)</span>\n' +
+        '<span class="out-error">Error</span>\n\n' +
+        highlightJson(result)
+      );
+    } else {
+      setOutput(
+        '<span class="out-comment">// lower_rocky_to_sql (' + ms + ' ms)</span>\n' +
+        '<span class="out-success">Generated SQL</span>\n\n' +
+        highlightSql(result)
+      );
+    }
+  });
+
+  document.getElementById('btn-validate').addEventListener('click', () => {
+    const input = getInput().trim();
+    const t0 = performance.now();
+    const valid = wasm.validate_identifier(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    if (valid) {
+      setOutput(
+        '<span class="out-comment">// validate_identifier (' + ms + ' ms)</span>\n\n' +
+        '<span class="out-success">Valid identifier:</span> ' + escHtml(input)
+      );
+    } else {
+      setOutput(
+        '<span class="out-comment">// validate_identifier (' + ms + ' ms)</span>\n\n' +
+        '<span class="out-fail">Invalid identifier:</span> ' + escHtml(input) + '\n\n' +
+        '<span class="out-comment">Identifiers must match ^[a-zA-Z0-9_]+$</span>'
+      );
+    }
+  });
+
+  document.getElementById('btn-clear').addEventListener('click', () => {
+    setOutput('<span class="out-comment">-- Output cleared.</span>');
+  });
+
+  // ---- Snippet picker ----
+  const snippets = {
+    'rocky-dsl':
+`from catalog.sales.orders
+select {
+    order_id,
+    customer_id,
+    total_amount,
+    order_date
+}`,
+    'rocky-filter':
+`from catalog.sales.orders
+filter order_date >= @2024-01-01
+derive {
+    total_with_tax = total_amount * 1.1,
+    is_large = total_amount > 1000
+}
+select {
+    order_id,
+    total_with_tax,
+    is_large
+}`,
+    'sql-lineage':
+`SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_name,
+    o.total_amount * 1.1 AS total_with_tax,
+    o.order_date
+FROM catalog.sales.orders AS o
+JOIN catalog.sales.customers AS c
+    ON o.customer_id = c.customer_id
+WHERE o.order_date >= '2024-01-01'`,
+    'sql-join':
+`SELECT
+    p.product_id,
+    p.product_name,
+    SUM(oi.quantity) AS total_sold,
+    SUM(oi.quantity * oi.unit_price) AS revenue
+FROM catalog.inventory.products AS p
+JOIN catalog.sales.order_items AS oi
+    ON p.product_id = oi.product_id
+GROUP BY p.product_id, p.product_name
+ORDER BY revenue DESC`,
+    'identifier-valid': 'my_table_name',
+    'identifier-invalid': 'DROP TABLE users--'
+  };
+
+  document.getElementById('snippet-picker').addEventListener('change', (e) => {
+    const key = e.target.value;
+    if (key && snippets[key]) {
+      editorEl.value = snippets[key];
+    }
+  });
+
+  // ---- Keyboard shortcut ----
+  editorEl.addEventListener('keydown', (e) => {
+    // Ctrl/Cmd + Enter = Compile SQL
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      document.getElementById('btn-compile').click();
+    }
+    // Tab inserts two spaces
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = editorEl.selectionStart;
+      const end = editorEl.selectionEnd;
+      editorEl.value = editorEl.value.substring(0, start) + '  ' + editorEl.value.substring(end);
+      editorEl.selectionStart = editorEl.selectionEnd = start + 2;
+    }
+  });
+
+  // ---- Resizable divider ----
+  const divider = document.getElementById('divider');
+  const leftPane = document.getElementById('pane-left');
+  const rightPane = document.getElementById('pane-right');
+
+  let isDragging = false;
+  divider.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    isDragging = true;
+    divider.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const container = document.querySelector('.main');
+    const rect = container.getBoundingClientRect();
+    const pct = ((e.clientX - rect.left) / rect.width) * 100;
+    const clamped = Math.max(20, Math.min(80, pct));
+    leftPane.style.flex = 'none';
+    rightPane.style.flex = 'none';
+    leftPane.style.width = clamped + '%';
+    rightPane.style.width = (100 - clamped) + '%';
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (isDragging) {
+      isDragging = false;
+      divider.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  });
+</script>
+</body>
+</html>

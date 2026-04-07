@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(rustup *)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:doc.rust-lang.org)",
+      "WebFetch(domain:api.fivetran.com)",
+      "WebFetch(domain:docs.databricks.com)"
+    ],
+    "deny": []
+  }
+}

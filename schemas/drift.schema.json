@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DriftActionOutput": {
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "reason",
+        "table"
+      ],
+      "type": "object"
+    },
+    "DriftSummary": {
+      "properties": {
+        "actions_taken": {
+          "items": {
+            "$ref": "#/definitions/DriftActionOutput"
+          },
+          "type": "array"
+        },
+        "tables_checked": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_drifted": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "actions_taken",
+        "tables_checked",
+        "tables_drifted"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky drift`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "drift": {
+      "$ref": "#/definitions/DriftSummary"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "drift",
+    "version"
+  ],
+  "title": "DriftOutput",
+  "type": "object"
+}

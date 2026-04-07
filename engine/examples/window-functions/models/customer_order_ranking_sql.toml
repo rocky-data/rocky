@@ -1,0 +1,9 @@
+name = "customer_order_ranking_sql"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "customer_order_ranking_sql"

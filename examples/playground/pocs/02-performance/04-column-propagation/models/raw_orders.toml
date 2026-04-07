@@ -1,0 +1,5 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+schema = "staging"

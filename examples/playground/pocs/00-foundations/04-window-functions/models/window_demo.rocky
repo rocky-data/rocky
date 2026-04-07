@@ -1,0 +1,7 @@
+-- DSL window functions: partition, sort (with - for desc), and frame.
+from raw_orders
+derive {
+    running_total: sum(amount) over (partition customer_id, sort order_date, rows unbounded..current),
+    latest_per_customer: row_number() over (partition customer_id, sort -order_date),
+    prev_amount: lag(amount, 1) over (partition customer_id, sort order_date)
+}

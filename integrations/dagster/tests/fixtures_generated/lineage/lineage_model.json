@@ -1,0 +1,41 @@
+{
+  "version": "0.3.0",
+  "command": "lineage",
+  "model": "fct_revenue",
+  "columns": [
+    {
+      "name": "customer_id"
+    },
+    {
+      "name": "total"
+    }
+  ],
+  "upstream": [
+    "stg_orders"
+  ],
+  "downstream": [],
+  "edges": [
+    {
+      "source": {
+        "model": "stg_orders",
+        "column": "customer_id"
+      },
+      "target": {
+        "model": "fct_revenue",
+        "column": "customer_id"
+      },
+      "transform": "direct"
+    },
+    {
+      "source": {
+        "model": "stg_orders",
+        "column": "amount"
+      },
+      "target": {
+        "model": "fct_revenue",
+        "column": "total"
+      },
+      "transform": "aggregation(\"sum\")"
+    }
+  ]
+}

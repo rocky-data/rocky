@@ -1,0 +1,4 @@
+# Route customers seed into the raw__customers source schema
+# so that `rocky discover` picks it up via the schema_pattern.
+[target]
+schema = "raw__customers"

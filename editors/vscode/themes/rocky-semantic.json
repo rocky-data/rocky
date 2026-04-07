@@ -1,0 +1,26 @@
+{
+  "name": "Rocky Semantic Highlighting",
+  "semanticHighlighting": true,
+  "semanticTokenColors": {
+    "namespace:rocky": {
+      "foreground": "#4EC9B0",
+      "bold": true
+    },
+    "variable:rocky": {
+      "foreground": "#9CDCFE"
+    },
+    "function:rocky": {
+      "foreground": "#DCDCAA"
+    },
+    "keyword:rocky": {
+      "foreground": "#C586C0"
+    },
+    "macro:rocky": {
+      "foreground": "#4FC1FF",
+      "italic": true
+    },
+    "type:rocky": {
+      "foreground": "#4EC9B0"
+    }
+  }
+}

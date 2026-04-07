@@ -1,0 +1,20 @@
+-- Rank customers by order value within each region.
+-- Demonstrates: row_number, rank, dense_rank with partition and sort.
+from source.raw.orders
+derive {
+    -- Sequential number per customer within their region (no gaps)
+    rn: row_number() over (partition region, sort -amount),
+    -- Rank with gaps (tied amounts get same rank, next rank skips)
+    order_rank: rank() over (partition region, sort -amount),
+    -- Dense rank without gaps (tied amounts get same rank, next rank is +1)
+    order_dense_rank: dense_rank() over (partition region, sort -amount)
+}
+select {
+    order_id,
+    customer_id,
+    region,
+    amount,
+    rn,
+    order_rank,
+    order_dense_rank
+}

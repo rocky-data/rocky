@@ -1,0 +1,9 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.analytics]
+type = "transformation"
+
+[pipeline.analytics.target]
+adapter = "default"

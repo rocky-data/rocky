@@ -1,0 +1,13 @@
+[[columns]]
+name = "customer_id"
+type = "Int64"
+nullable = false
+
+[[columns]]
+name = "total_revenue"
+type = "Decimal"
+nullable = false
+
+[rules]
+required = ["customer_id", "total_revenue"]
+protected = ["customer_id"]

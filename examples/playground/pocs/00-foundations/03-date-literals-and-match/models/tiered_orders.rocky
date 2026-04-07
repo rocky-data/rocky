@@ -1,0 +1,14 @@
+-- Date literals (`@YYYY-MM-DD`) and IS NOT NULL filtering.
+-- Compiles to:
+--   SELECT order_id, amount, order_date
+--   FROM raw_orders
+--   WHERE order_date >= CAST('2025-06-01' AS DATE)
+--     AND amount IS NOT NULL
+--
+-- Note: `match { > X => "...", _ => "..." }` exists in the AST and lowering
+-- but the parser doesn't yet wire it up (rocky 0.1.x). Once that lands the
+-- model can swap in `derive { tier: match amount { > 500 => "premium", ... } }`.
+
+from raw_orders
+where order_date >= @2025-06-01
+where amount is not null

@@ -1,0 +1,162 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ChecksConfigOutput": {
+      "description": "Pipeline-level checks configuration projected into the discover output.\n\nThis is intentionally a thin projection of `rocky_core::config::ChecksConfig` — only the fields downstream orchestrators currently consume are exposed. Add fields as new integrations need them.",
+      "properties": {
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FreshnessConfigOutput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ExcludedTableOutput": {
+      "description": "A table that the discovery adapter reported but that is missing from the source warehouse, so the run skipped it. Tracked separately from `errors` because it is not a runtime failure — the row never made it past the pre-flight existence check.",
+      "properties": {
+        "asset_key": {
+          "description": "Dagster-style asset key path (`[source_type, ...components, table]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "description": "Why the table was excluded. Currently always `\"missing_from_source\"` but kept as a free-form field so future causes (disabled, sync_paused, ...) can be added without a schema break.",
+          "type": "string"
+        },
+        "source_schema": {
+          "description": "Source schema the table was expected to live in.",
+          "type": "string"
+        },
+        "table_name": {
+          "description": "Bare table name as reported by the discovery adapter.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "asset_key",
+        "reason",
+        "source_schema",
+        "table_name"
+      ],
+      "type": "object"
+    },
+    "FreshnessConfigOutput": {
+      "description": "Freshness check configuration projected into the discover output.\n\nPer-schema `overrides` from `rocky_core::config::FreshnessConfig` are intentionally not exposed yet — the override-key semantics need to be nailed down before integrations can rely on them.",
+      "properties": {
+        "threshold_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "threshold_seconds"
+      ],
+      "type": "object"
+    },
+    "SourceOutput": {
+      "description": "A discovered source (connector, schema, integration — terminology varies by adapter).",
+      "properties": {
+        "components": {
+          "additionalProperties": true,
+          "description": "Schema pattern components parsed from the source schema name. Keys are the component names from the schema pattern config. e.g., {\"tenant\": \"acme\", \"regions\": [\"us_west\"], \"source\": \"shopify\"}",
+          "type": "object"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_sync_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_type": {
+          "type": "string"
+        },
+        "tables": {
+          "items": {
+            "$ref": "#/definitions/TableOutput"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "components",
+        "id",
+        "source_type",
+        "tables"
+      ],
+      "type": "object"
+    },
+    "TableOutput": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky discover`.",
+  "properties": {
+    "checks": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ChecksConfigOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves."
+    },
+    "command": {
+      "type": "string"
+    },
+    "excluded_tables": {
+      "description": "Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.",
+      "items": {
+        "$ref": "#/definitions/ExcludedTableOutput"
+      },
+      "type": "array"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/definitions/SourceOutput"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "excluded_tables",
+    "sources",
+    "version"
+  ],
+  "title": "DiscoverOutput",
+  "type": "object"
+}

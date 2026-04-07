@@ -1,0 +1,43 @@
+#!/bin/sh
+# .git-hooks/pre-push
+# Runs tests before pushing to remote
+
+# Enable strict mode
+set -euo pipefail
+
+# Check if uv is available
+if ! command -v uv &>/dev/null; then
+    echo "Error: uv is not installed or not in PATH"
+    echo "Install uv: https://docs.astral.sh/uv/getting-started/installation/"
+    exit 1
+fi
+
+# Store the current directory
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT" || exit 1
+
+echo "Running tests before push..."
+echo ""
+
+# Record the start time
+START_TIME=$(date +%s)
+
+# Run pytest
+uv run python -m pytest tests/ --quiet || {
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    echo ""
+    echo "Tests failed. Push aborted."
+    echo "Fix failing tests before pushing"
+    echo "Total time: ${DURATION}s"
+    exit 1
+}
+
+# Calculate and show execution time
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo ""
+echo "All tests passed! (${DURATION}s)"
+
+exit 0

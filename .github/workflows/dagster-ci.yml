@@ -1,0 +1,31 @@
+name: dagster-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'integrations/dagster/**'
+      - 'schemas/**'
+      - '.github/workflows/dagster-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'integrations/dagster/**'
+      - 'schemas/**'
+      - '.github/workflows/dagster-ci.yml'
+
+defaults:
+  run:
+    working-directory: integrations/dagster
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - run: uv sync --dev
+      - run: uv run python -m pytest -v
+      - run: uv run python -m ruff check src/ tests/
+      - run: uv run python -m ruff format --check src/ tests/

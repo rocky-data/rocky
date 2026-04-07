@@ -1,0 +1,22 @@
+[package]
+name = "rocky-cache"
+version = "1.0.0"
+description = "Caching layer for Rocky (memory LRU + distributed cache)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+valkey = ["redis"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"], optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky ai \"<intent>\"`.",
+  "properties": {
+    "attempts": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "format": {
+      "type": "string"
+    },
+    "intent": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attempts",
+    "command",
+    "format",
+    "intent",
+    "name",
+    "source",
+    "version"
+  ],
+  "title": "AiGenerateOutput",
+  "type": "object"
+}

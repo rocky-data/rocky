@@ -1,0 +1,35 @@
+# Multi-layer medallion architecture — Bronze / Silver / Gold
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.events]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.events.source]
+adapter = "local"
+
+[pipeline.events.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.events.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.events.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.events.checks]
+row_count = true
+column_match = true
+
+[pipeline.events.execution]
+concurrency = 4
+
+[state]
+backend = "local"

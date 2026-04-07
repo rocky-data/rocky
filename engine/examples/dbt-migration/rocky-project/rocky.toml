@@ -1,0 +1,35 @@
+# Rocky equivalent of the dbt ecommerce project
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.ecommerce]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.ecommerce.source]
+adapter = "local"
+
+[pipeline.ecommerce.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ecommerce.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.ecommerce.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.ecommerce.checks]
+row_count = true
+column_match = false
+
+[pipeline.ecommerce.execution]
+concurrency = 4
+
+[state]
+backend = "local"

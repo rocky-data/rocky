@@ -1,0 +1,468 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Diagnostic": {
+      "description": "A compiler diagnostic (error, warning, or informational message).",
+      "properties": {
+        "code": {
+          "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Which model this diagnostic relates to.",
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ],
+          "description": "Severity level."
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source location (if available)."
+        },
+        "suggestion": {
+          "description": "Suggested fix (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "model",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "ModelDetail": {
+      "description": "Per-model summary projected from `rocky_core::models::ModelConfig`.\n\nIntentionally excludes fields that change run-to-run (timings, diagnostics) — those live on the run-level outputs. This is the stable, declarative shape of one compiled model, suitable for orchestrators that build asset definitions ahead of execution.",
+      "properties": {
+        "contract_source": {
+          "description": "How the contract was discovered: `\"auto\"` (sibling `.contract.toml`), `\"explicit\"` (via `--contracts` flag), or absent when no contract.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelFreshnessConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured."
+        },
+        "name": {
+          "type": "string"
+        },
+        "strategy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/StrategyConfig"
+            }
+          ],
+          "description": "Materialization strategy as the wire-shape `StrategyConfig` (`{\"type\": \"...\", ...}`)."
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TargetConfig"
+            }
+          ],
+          "description": "Target table coordinates."
+        }
+      },
+      "required": [
+        "name",
+        "strategy",
+        "target"
+      ],
+      "type": "object"
+    },
+    "ModelFreshnessConfig": {
+      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model. The compiler does not validate this — it's a metadata field consumed by downstream observability tools.",
+      "properties": {
+        "max_lag_seconds": {
+          "description": "Maximum lag in seconds before the model is considered stale.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_lag_seconds"
+      ],
+      "type": "object"
+    },
+    "PhaseTimings": {
+      "description": "Wall-clock duration of each compile phase.\n\nSurfaced in `CompileResult` so callers (CLI, Dagster, LSP) can attribute compile time to a specific stage instead of treating compile as a black box. `typecheck_join_keys_ms` is a sub-timer of `typecheck_ms` so we can decide whether the cross-model join-key check needs further optimization without re-instrumenting later.",
+      "properties": {
+        "contracts_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "project_load_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "semantic_graph_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "typecheck_join_keys_ms": {
+          "description": "Portion of `typecheck_ms` spent inside `check_join_keys`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "typecheck_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "contracts_ms",
+        "project_load_ms",
+        "semantic_graph_ms",
+        "total_ms",
+        "typecheck_join_keys_ms",
+        "typecheck_ms"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
+      "enum": [
+        "Error",
+        "Warning",
+        "Info"
+      ],
+      "type": "string"
+    },
+    "SourceSpan": {
+      "description": "Location in a source file.",
+      "properties": {
+        "col": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "file",
+        "line"
+      ],
+      "type": "object"
+    },
+    "StrategyConfig": {
+      "description": "Materialization strategy for a model, defaulting to full refresh.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "full_refresh"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "timestamp_column": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "incremental"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "timestamp_column",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "merge"
+              ],
+              "type": "string"
+            },
+            "unique_key": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "update_columns": {
+              "default": null,
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "unique_key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Partition-keyed materialization. Each run targets specific partitions rather than appending past a watermark. Idempotent and backfill-friendly.\n\nThe model SQL must reference `@start_date` and `@end_date` placeholders, which the runtime substitutes per partition with quoted timestamp literals.",
+          "properties": {
+            "batch_size": {
+              "default": 1,
+              "description": "Combine N consecutive partitions into one SQL statement when backfilling. Defaults to 1 (atomic per-partition replacement).",
+              "format": "uint32",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "first_partition": {
+              "default": null,
+              "description": "Lower bound for `--missing` discovery, in canonical key format (e.g., `\"2024-01-01\"` for daily). Required when `--missing` is used.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "granularity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimeGrain"
+                }
+              ],
+              "description": "Partition granularity (`hour`, `day`, `month`, `year`)."
+            },
+            "lookback": {
+              "default": 0,
+              "description": "Recompute the previous N partitions on each run, in addition to whatever the CLI selected. Standard handling for late-arriving data.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "time_column": {
+              "description": "Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "time_interval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "granularity",
+            "time_column",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral model — inlined as CTE in downstream queries, no table created.",
+          "properties": {
+            "type": {
+              "enum": [
+                "ephemeral"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Delete+Insert: delete matching rows by partition key, then insert.",
+          "properties": {
+            "partition_by": {
+              "description": "Column(s) used to identify the partition to delete.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "delete_insert"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "partition_by",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Microbatch: alias for time_interval with hourly defaults. dbt-compatible naming for partition-based incremental processing.",
+          "properties": {
+            "granularity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimeGrain"
+                }
+              ],
+              "default": "hour",
+              "description": "Batch granularity (default: Hour)."
+            },
+            "timestamp_column": {
+              "description": "Timestamp column for micro-batch boundaries.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "microbatch"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "timestamp_column",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TargetConfig": {
+      "description": "Target table coordinates for a model.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    },
+    "TimeGrain": {
+      "description": "Partition granularity for `time_interval` materialization.\n\nThe granularity determines: - The canonical partition key format (see [`TimeGrain::format_str`]). - How `@start_date` / `@end_date` placeholders are computed per partition. - What column types are valid (`hour` requires TIMESTAMP; others accept DATE).",
+      "enum": [
+        "hour",
+        "day",
+        "month",
+        "year"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "JSON output for `rocky compile`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "compile_timings": {
+      "$ref": "#/definitions/PhaseTimings"
+    },
+    "diagnostics": {
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      },
+      "type": "array"
+    },
+    "execution_layers": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "expanded_sql": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.",
+      "type": "object"
+    },
+    "has_errors": {
+      "type": "boolean"
+    },
+    "models": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "models_detail": {
+      "description": "Per-model details extracted from each model's TOML frontmatter. Empty when the project has no models. Downstream consumers (`dagster-rocky` to surface per-model freshness policies and partition-keyed assets) iterate this list rather than re-loading model frontmatter themselves.",
+      "items": {
+        "$ref": "#/definitions/ModelDetail"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "compile_timings",
+    "diagnostics",
+    "execution_layers",
+    "has_errors",
+    "models",
+    "version"
+  ],
+  "title": "CompileOutput",
+  "type": "object"
+}

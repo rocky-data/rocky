@@ -1,0 +1,24 @@
+-- Every Rocky DSL operator in one top-to-bottom pipeline.
+--
+-- Equivalent SQL:
+--   SELECT customer_id,
+--          SUM(amount) AS total_revenue,
+--          COUNT(*) AS order_count,
+--          SUM(amount) / COUNT(*) AS avg_order_value
+--   FROM raw_orders
+--   WHERE status != 'cancelled'
+--   GROUP BY customer_id
+--   HAVING SUM(amount) > 100
+--   ORDER BY SUM(amount) DESC
+--   LIMIT 10
+
+from raw_orders
+where status != "cancelled"
+group customer_id {
+    total_revenue: sum(amount),
+    order_count: count(),
+    avg_order_value: sum(amount) / count()
+}
+where total_revenue > 100
+sort total_revenue desc
+take 10

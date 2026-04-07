@@ -1,0 +1,48 @@
+[[columns]]
+name = "user_id"
+type = "Int64"
+nullable = false
+
+[[columns]]
+name = "full_name"
+type = "String"
+nullable = true
+
+[[columns]]
+name = "email"
+type = "String"
+nullable = true
+
+[[columns]]
+name = "country"
+type = "String"
+nullable = true
+
+[[columns]]
+name = "total_events"
+type = "Int64"
+nullable = false
+
+[[columns]]
+name = "page_views"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "purchases"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "first_event_date"
+type = "Date"
+nullable = false
+
+[[columns]]
+name = "last_event_date"
+type = "Date"
+nullable = false
+
+[rules]
+required = ["user_id", "total_events", "first_event_date", "last_event_date"]
+protected = ["user_id"]

@@ -1,0 +1,10 @@
+name = "fct_daily_orders"
+depends_on = ["stg_orders"]
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "fct_daily_orders"

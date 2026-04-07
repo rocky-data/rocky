@@ -1,0 +1,6 @@
+product_id,name,category,price,in_stock
+1,Widget A,widgets,29.99,true
+2,Widget B,widgets,49.50,true
+3,Gadget X,gadgets,15.00,false
+4,Gadget Y,gadgets,89.95,true
+5,Gizmo Z,gizmos,120.00,true

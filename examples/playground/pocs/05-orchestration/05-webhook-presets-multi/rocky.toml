@@ -1,0 +1,60 @@
+# Multi-preset webhooks — Slack, Teams, PagerDuty, Datadog, generic
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# --- Webhook presets ---
+
+# Slack: sends formatted block message on pipeline completion
+[hook.webhooks.on_pipeline_complete]
+url = "${SLACK_WEBHOOK_URL:-https://hooks.slack.com/services/T00/B00/placeholder}"
+preset = "slack"
+# secret = "${SLACK_HMAC}"
+
+# Microsoft Teams: sends adaptive card on pipeline errors
+[hook.webhooks.on_pipeline_error]
+url = "${TEAMS_WEBHOOK_URL:-https://outlook.office.com/webhook/placeholder}"
+preset = "teams"
+retry_count = 3
+retry_delay_ms = 2000
+
+# PagerDuty: triggers incident on materialize errors
+[hook.webhooks.on_materialize_error]
+url = "${PAGERDUTY_EVENTS_URL:-https://events.pagerduty.com/v2/enqueue}"
+preset = "pagerduty"
+timeout_ms = 5000
+
+# Datadog: sends event on drift detection
+[hook.webhooks.on_drift_detected]
+url = "${DATADOG_WEBHOOK_URL:-https://api.datadoghq.com/api/v1/events}"
+preset = "datadog"
+headers = { "DD-API-KEY" = "${DD_API_KEY:-placeholder}" }
+
+# Generic: custom template for anomaly alerts (e.g., custom alerting system)
+[hook.webhooks.on_anomaly_detected]
+url = "${ALERT_WEBHOOK_URL:-https://alerts.internal/api/v1/rocky}"
+preset = "generic"
+body_template = """
+{
+  "severity": "warning",
+  "source": "rocky",
+  "event": "{{event}}",
+  "pipeline": "{{pipeline}}",
+  "table": "{{table}}",
+  "message": "Anomaly detected: row count deviation exceeds threshold",
+  "duration_ms": {{duration_ms}}
+}
+"""

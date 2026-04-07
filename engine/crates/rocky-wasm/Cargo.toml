@@ -1,0 +1,20 @@
+[package]
+name = "rocky-wasm"
+version = "1.0.0"
+description = "WASM bindings for Rocky's pure-Rust compiler pipeline"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rocky-sql = { path = "../rocky-sql" }
+rocky-lang = { path = "../rocky-lang" }
+rocky-compiler = { path = "../rocky-compiler" }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[lints]
+workspace = true

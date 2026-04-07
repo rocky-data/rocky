@@ -1,0 +1,71 @@
+name: vscode-release
+
+# Builds, packages, and publishes the Rocky VS Code extension when a vscode-v*
+# tag is pushed. Creates the GitHub Release (if it doesn't already exist),
+# attaches the .vsix artifact, and publishes to the VS Code Marketplace when
+# the VSCE_PAT secret is configured. scripts/release.sh remains as a local
+# fallback.
+
+on:
+  push:
+    tags: ["vscode-v*"]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: editors/vscode
+
+jobs:
+  # Create the GitHub Release if it doesn't already exist (supports both
+  # CI-only releases and the local scripts/release.sh workflow where the
+  # release is created before the tag push).
+  ensure-release:
+    name: Ensure GitHub Release exists
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (created by scripts/release.sh)"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              --title "$TAG"
+          fi
+
+  build:
+    name: Build and publish
+    needs: ensure-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - run: npm ci
+      - run: npm run compile
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package
+
+      - name: Attach VSIX to GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: editors/vscode/*.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ secrets.VSCE_PAT != '' }}
+        run: npx @vscode/vsce publish --pat ${{ secrets.VSCE_PAT }}

@@ -1,0 +1,16 @@
+[package]
+name = "rocky-lang"
+version = "1.0.0"
+description = "Rocky DSL: pipeline-oriented language for SQL transformations"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+logos = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

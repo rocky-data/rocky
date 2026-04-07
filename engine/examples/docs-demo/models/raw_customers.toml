@@ -1,0 +1,18 @@
+name = "raw_customers"
+intent = "Ingests the raw customers table from the source system. Contains one row per customer with profile and signup information."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "raw_customers"
+
+[[tests]]
+type = "not_null"
+column = "customer_id"
+
+[[tests]]
+type = "unique"
+column = "customer_id"

@@ -1,0 +1,22 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Slack-style webhook on success.
+# Webhook event keys are `on_<event>` per rocky-core/src/hooks/mod.rs.
+[hook.webhooks.on_pipeline_complete]
+url = "https://webhook.site/00000000-0000-0000-0000-000000000000"
+preset = "slack"
+# hmac_secret = "${SLACK_HMAC}"   # optional signing

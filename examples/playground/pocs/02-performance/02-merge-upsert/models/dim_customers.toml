@@ -1,0 +1,8 @@
+[strategy]
+type = "merge"
+unique_key = ["customer_id"]
+update_columns = ["name", "email", "tier"]
+
+[target]
+catalog = "poc"
+schema = "demo"

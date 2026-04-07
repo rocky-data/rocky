@@ -1,0 +1,16 @@
+-- Staging: clean and filter raw orders
+from source.raw.orders
+where status != "cancelled"
+where amount > 0
+derive {
+    order_amount: amount,
+    is_refunded: status == "refunded"
+}
+select {
+    order_id,
+    customer_id,
+    order_date,
+    status,
+    order_amount,
+    is_refunded
+}

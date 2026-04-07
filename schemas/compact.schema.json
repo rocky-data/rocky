@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "NamedStatement": {
+      "description": "Named SQL statement (purpose + sql), reused by compact and archive.",
+      "properties": {
+        "purpose": {
+          "type": "string"
+        },
+        "sql": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "purpose",
+        "sql"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky compact`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": "string"
+    },
+    "statements": {
+      "items": {
+        "$ref": "#/definitions/NamedStatement"
+      },
+      "type": "array"
+    },
+    "target_size_mb": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "dry_run",
+    "model",
+    "statements",
+    "target_size_mb",
+    "version"
+  ],
+  "title": "CompactOutput",
+  "type": "object"
+}

@@ -1,0 +1,35 @@
+# Window Functions — Rocky DSL vs SQL side-by-side
+#
+# Demonstrates Rocky's window function syntax (Plan 11 feature):
+# row_number, rank, dense_rank, running sum with frame specification.
+#
+# Usage:
+#   rocky --config engine/examples/window-functions/rocky.toml compile
+#   rocky --config engine/examples/window-functions/rocky.toml plan
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.window_demo]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.window_demo.source]
+adapter = "local"
+
+[pipeline.window_demo.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.window_demo.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.window_demo.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[state]
+backend = "local"

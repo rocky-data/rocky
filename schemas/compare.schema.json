@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "TableCompareResult": {
+      "properties": {
+        "production_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "production_table": {
+          "type": "string"
+        },
+        "row_count_diff_pct": {
+          "format": "double",
+          "type": "number"
+        },
+        "row_count_match": {
+          "type": "boolean"
+        },
+        "schema_diffs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "schema_match": {
+          "type": "boolean"
+        },
+        "shadow_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "shadow_table": {
+          "type": "string"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "production_count",
+        "production_table",
+        "row_count_diff_pct",
+        "row_count_match",
+        "schema_diffs",
+        "schema_match",
+        "shadow_count",
+        "shadow_table",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky compare`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "filter": {
+      "type": "string"
+    },
+    "overall_verdict": {
+      "type": "string"
+    },
+    "results": {
+      "items": {
+        "$ref": "#/definitions/TableCompareResult"
+      },
+      "type": "array"
+    },
+    "tables_compared": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_passed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tables_warned": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "filter",
+    "overall_verdict",
+    "results",
+    "tables_compared",
+    "tables_failed",
+    "tables_passed",
+    "tables_warned",
+    "version"
+  ],
+  "title": "CompareOutput",
+  "type": "object"
+}

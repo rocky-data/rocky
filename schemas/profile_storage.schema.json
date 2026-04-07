@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "EncodingRecommendationOutput": {
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "data_type": {
+          "type": "string"
+        },
+        "estimated_cardinality": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "recommended_encoding": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "data_type",
+        "estimated_cardinality",
+        "reasoning",
+        "recommended_encoding"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky profile-storage`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "profile_sql": {
+      "type": "string"
+    },
+    "recommendations": {
+      "items": {
+        "$ref": "#/definitions/EncodingRecommendationOutput"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "model",
+    "profile_sql",
+    "recommendations",
+    "version"
+  ],
+  "title": "ProfileStorageOutput",
+  "type": "object"
+}

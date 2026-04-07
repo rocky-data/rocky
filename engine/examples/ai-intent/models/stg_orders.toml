@@ -1,0 +1,10 @@
+name = "stg_orders"
+intent = "Clean raw order data for downstream consumption. Exclude cancelled orders and orders with non-positive amounts. One row per order. order_id is the unique grain."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "stg_orders"

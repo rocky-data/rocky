@@ -1,0 +1,8 @@
+customer_id,name,email,tier,created_at
+1,Alice Johnson,alice@example.com,gold,2025-01-15
+2,Bob Smith,bob@example.com,silver,2025-02-20
+3,Carol White,carol@example.com,gold,2025-03-10
+4,Dan Brown,dan@example.com,bronze,2025-04-05
+5,Eve Davis,eve@example.com,silver,2025-05-18
+6,Frank Lee,frank@example.com,gold,2025-06-22
+7,Grace Kim,grace@example.com,bronze,2025-07-01

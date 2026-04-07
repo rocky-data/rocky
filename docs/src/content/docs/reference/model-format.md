@@ -1,0 +1,441 @@
+---
+title: Model Format
+description: SQL and TOML model file specification
+sidebar:
+  order: 4
+---
+
+Rocky models define SQL transformations and their materialization behavior. Each model is a SQL query paired with configuration that tells Rocky how to materialize it, what it depends on, and where to write the output.
+
+Rocky supports two model formats: **sidecar** (recommended) and **inline** (legacy).
+
+## Sidecar Format (Recommended)
+
+The sidecar format keeps SQL and configuration in separate files with matching names:
+
+```
+models/
+├── fct_orders.sql          <- pure SQL
+├── fct_orders.toml         <- configuration
+├── stg_customers.sql
+├── stg_customers.toml
+├── dim_products.sql
+└── dim_products.toml
+```
+
+This separation keeps SQL files clean and editable by any SQL tool without needing to understand Rocky-specific syntax.
+
+### SQL File
+
+The `.sql` file contains a plain SQL query. No templating, no Jinja, no special markers.
+
+```sql
+-- models/fct_orders.sql
+SELECT
+    o.order_id,
+    o.customer_id,
+    o.order_date,
+    o.total_amount,
+    c.customer_name,
+    c.segment
+FROM analytics.staging.orders AS o
+JOIN analytics.staging.customers AS c
+    ON o.customer_id = c.customer_id
+WHERE o.order_date >= '2024-01-01'
+```
+
+### TOML Config File
+
+The `.toml` file specifies the model name, dependencies, materialization strategy, and target table.
+
+**Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Model identifier. Must be unique across all models. |
+| `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
+
+**`[strategy]`** -- Materialization configuration:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | `"full_refresh"` | Materialization type: `"full_refresh"`, `"incremental"`, `"merge"`, `"materialized_view"`, `"dynamic_table"`, or `"time_interval"`. |
+| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"`. |
+| `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
+| `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
+| `target_lag` | string | | Target lag for dynamic tables (e.g., `"1 hour"`). Required when `type = "dynamic_table"`. Snowflake only. |
+| `time_column` | string | | Partition column for time-interval processing. Required when `type = "time_interval"`. |
+| `granularity` | string | | Partition granularity: `"hour"`, `"day"`, `"month"`, or `"year"`. Required when `type = "time_interval"`. |
+| `lookback` | integer | | Number of past partitions to reprocess. Optional for `"time_interval"`. |
+| `batch_size` | integer | | Max partitions per batch. Optional for `"time_interval"`. |
+| `first_partition` | string | | Earliest partition key (e.g., `"2024-01-01"`). Optional for `"time_interval"`. |
+
+**`[target]`** -- Output table:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `catalog` | string | Yes | Target catalog name. |
+| `schema` | string | Yes | Target schema name. |
+| `table` | string | Yes | Target table name. |
+
+**`[[sources]]`** -- Input tables (optional, for documentation and lineage):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `catalog` | string | Yes | Source catalog name. |
+| `schema` | string | Yes | Source schema name. |
+| `table` | string | Yes | Source table name. |
+
+---
+
+## Inline Format (Legacy)
+
+The inline format embeds TOML configuration directly in the SQL file using a `---toml` / `---` fenced block at the top of the file:
+
+```sql
+---toml
+name = "stg_orders"
+depends_on = []
+
+[target]
+catalog = "analytics"
+schema = "staging"
+table = "orders"
+---
+
+SELECT
+    order_id,
+    customer_id,
+    order_date,
+    total_amount
+FROM raw_catalog.src__acme__us_west__shopify.orders
+```
+
+The inline format uses the same fields as the sidecar TOML file. The SQL query follows the closing `---` marker.
+
+This format is supported for backward compatibility. The sidecar format is preferred because it keeps SQL files portable and free of non-SQL syntax.
+
+---
+
+## Strategy Examples
+
+### Full Refresh
+
+Drops and recreates the target table on every run. Use this for small dimension tables or when you need a clean rebuild.
+
+**SQL** (`models/dim_products.sql`):
+
+```sql
+SELECT
+    product_id,
+    product_name,
+    category,
+    price,
+    is_active
+FROM raw_catalog.src__acme__us_west__shopify.products
+WHERE _fivetran_deleted = false
+```
+
+**Config** (`models/dim_products.toml`):
+
+```toml
+name = "dim_products"
+depends_on = []
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "dim_products"
+
+[[sources]]
+catalog = "raw_catalog"
+schema = "src__acme__us_west__shopify"
+table = "products"
+```
+
+Generated SQL:
+
+```sql
+CREATE OR REPLACE TABLE analytics.warehouse.dim_products AS
+SELECT
+    product_id,
+    product_name,
+    category,
+    price,
+    is_active
+FROM raw_catalog.src__acme__us_west__shopify.products
+WHERE _fivetran_deleted = false
+```
+
+---
+
+### Incremental
+
+Appends only new rows based on a watermark column. Use this for large fact tables where full refresh is too slow.
+
+**SQL** (`models/fct_orders.sql`):
+
+```sql
+SELECT
+    order_id,
+    customer_id,
+    order_date,
+    total_amount,
+    _fivetran_synced
+FROM raw_catalog.src__acme__us_west__shopify.orders
+```
+
+**Config** (`models/fct_orders.toml`):
+
+```toml
+name = "fct_orders"
+depends_on = ["dim_products"]
+
+[strategy]
+type = "incremental"
+timestamp_column = "_fivetran_synced"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "fct_orders"
+
+[[sources]]
+catalog = "raw_catalog"
+schema = "src__acme__us_west__shopify"
+table = "orders"
+```
+
+Generated SQL (on incremental runs):
+
+```sql
+INSERT INTO analytics.warehouse.fct_orders
+SELECT
+    order_id,
+    customer_id,
+    order_date,
+    total_amount,
+    _fivetran_synced
+FROM raw_catalog.src__acme__us_west__shopify.orders
+WHERE _fivetran_synced > (
+    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
+    FROM analytics.warehouse.fct_orders
+)
+```
+
+On the first run (when the target table does not exist), Rocky performs a full refresh automatically.
+
+---
+
+### Merge
+
+Upserts rows based on a unique key. Matching rows are updated; non-matching rows are inserted. Use this for slowly changing dimensions or tables with late-arriving updates.
+
+**SQL** (`models/dim_customers.sql`):
+
+```sql
+SELECT
+    customer_id,
+    customer_name,
+    email,
+    segment,
+    lifetime_value,
+    updated_at
+FROM raw_catalog.src__acme__us_west__shopify.customers
+WHERE _fivetran_deleted = false
+```
+
+**Config** (`models/dim_customers.toml`):
+
+```toml
+name = "dim_customers"
+depends_on = []
+
+[strategy]
+type = "merge"
+unique_key = ["customer_id"]
+update_columns = ["customer_name", "email", "segment", "lifetime_value", "updated_at"]
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "dim_customers"
+
+[[sources]]
+catalog = "raw_catalog"
+schema = "src__acme__us_west__shopify"
+table = "customers"
+```
+
+Generated SQL:
+
+```sql
+MERGE INTO analytics.warehouse.dim_customers AS target
+USING (
+    SELECT
+        customer_id,
+        customer_name,
+        email,
+        segment,
+        lifetime_value,
+        updated_at
+    FROM raw_catalog.src__acme__us_west__shopify.customers
+    WHERE _fivetran_deleted = false
+) AS source
+ON target.customer_id = source.customer_id
+WHEN MATCHED THEN UPDATE SET
+    target.customer_name = source.customer_name,
+    target.email = source.email,
+    target.segment = source.segment,
+    target.lifetime_value = source.lifetime_value,
+    target.updated_at = source.updated_at
+WHEN NOT MATCHED THEN INSERT *
+```
+
+When `update_columns` is omitted, Rocky updates all non-key columns.
+
+---
+
+### Materialized View
+
+Creates a materialized view managed by the warehouse. Databricks only.
+
+**Config** (`models/mv_daily_revenue.toml`):
+
+```toml
+name = "mv_daily_revenue"
+depends_on = ["fct_orders"]
+
+[strategy]
+type = "materialized_view"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "mv_daily_revenue"
+```
+
+Generated SQL:
+
+```sql
+CREATE OR REPLACE MATERIALIZED VIEW analytics.warehouse.mv_daily_revenue AS
+SELECT
+    order_date,
+    SUM(total_amount) AS daily_revenue
+FROM analytics.warehouse.fct_orders
+GROUP BY order_date
+```
+
+---
+
+### Dynamic Table
+
+Creates a Snowflake dynamic table with automatic refresh based on a target lag.
+
+**Config** (`models/dt_customer_stats.toml`):
+
+```toml
+name = "dt_customer_stats"
+depends_on = ["stg_orders"]
+
+[strategy]
+type = "dynamic_table"
+target_lag = "1 hour"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "dt_customer_stats"
+```
+
+Generated SQL:
+
+```sql
+CREATE OR REPLACE DYNAMIC TABLE analytics.warehouse.dt_customer_stats
+TARGET_LAG = '1 hour'
+WAREHOUSE = my_warehouse
+AS SELECT
+    customer_id,
+    COUNT(*) AS order_count
+FROM analytics.staging.stg_orders
+GROUP BY customer_id
+```
+
+---
+
+### Time Interval
+
+Partition-keyed materialization for time-series data. The model SQL uses `@start_date` and `@end_date` placeholders that the runtime substitutes per partition.
+
+**SQL** (`models/fct_daily_events.sql`):
+
+```sql
+SELECT
+    event_date,
+    event_type,
+    COUNT(*) AS event_count
+FROM raw_catalog.events.page_views
+WHERE event_date >= @start_date
+  AND event_date < @end_date
+GROUP BY event_date, event_type
+```
+
+**Config** (`models/fct_daily_events.toml`):
+
+```toml
+name = "fct_daily_events"
+depends_on = []
+
+[strategy]
+type = "time_interval"
+time_column = "event_date"
+granularity = "day"
+lookback = 3
+first_partition = "2024-01-01"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "fct_daily_events"
+```
+
+**CLI flags** for time-interval models:
+
+```bash
+# Process a specific partition
+rocky run --partition 2026-04-01
+
+# Process a date range
+rocky run --from 2026-03-01 --to 2026-04-01
+
+# Process the latest partition
+rocky run --latest
+
+# Discover and process missing partitions
+rocky run --missing
+
+# Set lookback window
+rocky run --lookback 7
+
+# Parallelize partition processing
+rocky run --parallel 4
+```
+
+Per-partition state is tracked in the state store. The `--missing` flag consults stored partition records to discover gaps.
+
+---
+
+## DAG Resolution
+
+Rocky automatically resolves the execution order of models based on their `depends_on` declarations. Models are executed in topological order, meaning every upstream dependency runs before its downstream dependents.
+
+During `rocky validate`, the DAG is checked for cycles. If a cycle is detected (e.g., model A depends on B, B depends on A), validation fails with an error listing the cycle.
+
+```
+!!  dag_validation — cycle detected: fct_orders -> dim_customers -> fct_orders
+```
+
+Models with no dependencies run first. Models at the same depth in the DAG may run concurrently in future versions.

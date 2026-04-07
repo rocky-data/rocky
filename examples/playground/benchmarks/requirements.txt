@@ -1,0 +1,4 @@
+dbt-core>=1.11.8,<2.0
+dbt-duckdb>=1.10.0,<2.0
+matplotlib>=3.8
+psutil>=5.9

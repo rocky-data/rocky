@@ -1,0 +1,144 @@
+[workspace]
+members = [
+    "crates/rocky-core",
+    "crates/rocky-sql",
+    "crates/rocky-compiler",
+    "crates/rocky-lang",
+    "crates/rocky-snowflake",
+    "crates/rocky-ai",
+    "crates/rocky-server",
+    "crates/rocky-engine",
+    "crates/rocky-adapter-sdk",
+    "crates/rocky-bigquery",
+    "crates/rocky-databricks",
+    "crates/rocky-fivetran",
+    "crates/rocky-airbyte",
+    "crates/rocky-iceberg",
+    "crates/rocky-cache",
+    "crates/rocky-duckdb",
+    "crates/rocky-observe",
+    "crates/rocky-cli",
+    "crates/rocky-wasm",
+    "rocky",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+homepage = "https://rocky-data.github.io/rocky/"
+repository = "https://github.com/rocky-data/rocky"
+
+[workspace.lints.clippy]
+# Correctness
+correctness = { level = "deny", priority = -1 }
+# Style
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+cloned_instead_of_copied = "warn"
+# Perf
+large_enum_variant = "warn"
+
+[workspace.dependencies]
+# Async traits
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serde_yaml = "0.9"
+indexmap = { version = "2", features = ["serde"] }
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+# JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
+schemars = { version = "0.8", features = ["chrono", "indexmap2"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+miette = { version = "7", features = ["fancy"] }
+
+# SQL parsing
+sqlparser = { version = "0.61", features = ["visitor"] }
+
+# State store
+redb = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
+
+# Async
+futures = "0.3"
+
+# Redis/Valkey
+redis = "1.2"
+
+# DuckDB
+duckdb = { version = "1", features = ["bundled"] }
+
+# CSV parsing
+csv = "1"
+
+# Regex
+regex = "1"
+
+# HMAC / SHA2
+hmac = "0.13"
+sha2 = "0.11"
+
+# JWT / RSA / Base64
+jsonwebtoken = "10"
+rsa = { version = "0.9", features = ["pem"] }
+base64 = "0.22"
+
+# String similarity
+strsim = "0.11"
+
+# Secret redaction — wraps credential strings so Debug impls print *** instead of raw values
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Lexer
+logos = "0.16"
+
+# Web server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# LSP
+tower-lsp = "0.20"
+
+# File watching
+notify = "8"
+
+# DataFusion
+datafusion = "45"
+arrow = "54"
+
+# WASM
+wasm-bindgen = "0.2"
+
+# Testing
+wiremock = "0.6"
+
+# OpenTelemetry (feature-gated in rocky-observe)
+opentelemetry = "0.28"
+opentelemetry_sdk = "0.28"
+opentelemetry-otlp = "0.28"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

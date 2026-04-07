@@ -1,0 +1,61 @@
+# Root .gitignore — cross-cutting safety nets for the Rocky monorepo.
+# Each subproject (engine/, integrations/dagster/, editors/vscode/, examples/playground/)
+# has its own .gitignore tuned to its build system. Patterns here are universal.
+
+# --- Secrets — never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+secrets.*
+credentials.*
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+
+# --- Rocky runtime state (any subproject) ---
+*.redb
+*.duckdb
+*.duckdb.wal
+.rocky-state*
+
+# --- Vendored binaries (downloaded by scripts/vendor_*.sh) ---
+vendor/
+
+# --- Per-user Claude state (skills + shared settings.json are committed) ---
+.claude/projects/
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# --- Defense-in-depth duplicates of subproject ignores ---
+# (in case someone runs cargo / npm / uv from the wrong directory)
+target/
+target-linux/
+node_modules/
+dist/
+out/
+build/
+*.vsix
+.vscode-test/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Astro build cache ---
+docs/.astro/
+
+# --- Logs and scratch ---
+*.log
+scratch/
+tmp/

@@ -1,0 +1,691 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Rocky Project Configuration",
+  "description": "Schema for the top-level rocky.toml project configuration file",
+  "type": "object",
+  "properties": {
+    "state": {
+      "type": "object",
+      "description": "State persistence configuration — where Rocky stores watermarks and anomaly history between runs",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["local", "s3", "valkey", "tiered"],
+          "default": "local",
+          "description": "Storage backend. 'tiered' uses Valkey (fast) with S3 fallback (durable)"
+        },
+        "s3_bucket": {
+          "type": "string",
+          "description": "S3 bucket for state persistence"
+        },
+        "s3_prefix": {
+          "type": "string",
+          "description": "S3 key prefix (default: 'rocky/state/')"
+        },
+        "valkey_url": {
+          "type": "string",
+          "description": "Valkey/Redis URL for state persistence"
+        },
+        "valkey_prefix": {
+          "type": "string",
+          "description": "Valkey key prefix (default: 'rocky:state:')"
+        }
+      },
+      "additionalProperties": false
+    },
+    "adapter": {
+      "type": "object",
+      "description": "Named adapter configurations — each key is an adapter name (e.g., [adapter.databricks], [adapter.fivetran])",
+      "additionalProperties": { "$ref": "#/definitions/adapter_config" }
+    },
+    "adapters": {
+      "type": "object",
+      "description": "Alias for 'adapter'",
+      "additionalProperties": { "$ref": "#/definitions/adapter_config" }
+    },
+    "pipeline": {
+      "type": "object",
+      "description": "Named pipeline configurations — each key is a pipeline name (e.g., [pipeline.raw_replication])",
+      "additionalProperties": { "$ref": "#/definitions/pipeline_config" }
+    },
+    "pipelines": {
+      "type": "object",
+      "description": "Alias for 'pipeline'",
+      "additionalProperties": { "$ref": "#/definitions/pipeline_config" }
+    },
+    "hook": {
+      "$ref": "#/definitions/hooks_config",
+      "description": "Lifecycle hooks — shell commands and webhooks fired on pipeline events"
+    },
+    "hooks": {
+      "$ref": "#/definitions/hooks_config",
+      "description": "Alias for 'hook'"
+    },
+    "cost": {
+      "type": "object",
+      "description": "Cost estimation parameters for materialization strategy recommendations",
+      "properties": {
+        "storage_cost_per_gb_month": {
+          "type": "number",
+          "default": 0.023,
+          "description": "Cost per GB of storage per month (default: $0.023)"
+        },
+        "compute_cost_per_dbu": {
+          "type": "number",
+          "default": 0.40,
+          "description": "Cost per DBU (default: $0.40)"
+        },
+        "warehouse_size": {
+          "type": "string",
+          "default": "Medium",
+          "description": "Warehouse size for cost estimation (e.g., 'Small', 'Medium', 'Large')"
+        },
+        "min_history_runs": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "description": "Minimum runs before making cost recommendations"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "adapter_config": {
+      "type": "object",
+      "description": "Configuration for a named adapter instance",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["databricks", "fivetran", "duckdb", "snowflake"],
+          "description": "Adapter type"
+        },
+        "host": {
+          "type": "string",
+          "description": "Databricks workspace host (e.g., 'adb-1234567890.12.azuredatabricks.net')"
+        },
+        "http_path": {
+          "type": "string",
+          "description": "Databricks SQL warehouse HTTP path"
+        },
+        "token": {
+          "type": "string",
+          "description": "Databricks Personal Access Token (use ${DATABRICKS_TOKEN} for env substitution)"
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Databricks OAuth M2M client ID"
+        },
+        "client_secret": {
+          "type": "string",
+          "description": "Databricks OAuth M2M client secret"
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "description": "Databricks SQL statement timeout in seconds"
+        },
+        "destination_id": {
+          "type": "string",
+          "description": "Fivetran destination ID"
+        },
+        "api_key": {
+          "type": "string",
+          "description": "Fivetran API key"
+        },
+        "api_secret": {
+          "type": "string",
+          "description": "Fivetran API secret"
+        },
+        "path": {
+          "type": "string",
+          "description": "DuckDB database file path (omit for in-memory)"
+        },
+        "retry": { "$ref": "#/definitions/retry_config" }
+      }
+    },
+    "retry_config": {
+      "type": "object",
+      "description": "Retry policy for transient errors (HTTP 429/503, rate limits, timeouts)",
+      "properties": {
+        "max_retries": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "description": "Maximum retry attempts. Set to 0 to disable retries"
+        },
+        "initial_backoff_ms": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 0,
+          "description": "Initial backoff in milliseconds before first retry"
+        },
+        "max_backoff_ms": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 0,
+          "description": "Maximum backoff in milliseconds (caps exponential growth)"
+        },
+        "backoff_multiplier": {
+          "type": "number",
+          "default": 2.0,
+          "description": "Multiplier applied after each retry (e.g., 2.0 = double each time)"
+        },
+        "jitter": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add random jitter to prevent thundering herd"
+        },
+        "circuit_breaker_threshold": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 0,
+          "description": "Trip circuit breaker after this many consecutive failures. Set to 0 to disable"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pipeline_config": {
+      "type": "object",
+      "description": "Pipeline configuration",
+      "required": ["source", "target"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["replication"],
+          "default": "replication",
+          "description": "Pipeline type (currently only 'replication')"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["incremental", "full_refresh"],
+          "default": "incremental",
+          "description": "Replication strategy"
+        },
+        "timestamp_column": {
+          "type": "string",
+          "default": "_fivetran_synced",
+          "description": "Column used for incremental watermark"
+        },
+        "metadata_columns": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/metadata_column" },
+          "description": "Metadata columns added during replication"
+        },
+        "source": { "$ref": "#/definitions/pipeline_source" },
+        "target": { "$ref": "#/definitions/pipeline_target" },
+        "checks": { "$ref": "#/definitions/checks_config" },
+        "execution": { "$ref": "#/definitions/execution_config" }
+      },
+      "additionalProperties": false
+    },
+    "metadata_column": {
+      "type": "object",
+      "description": "A metadata column added during replication",
+      "required": ["name", "type", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Column name (e.g., '_loaded_by')"
+        },
+        "type": {
+          "type": "string",
+          "description": "SQL data type (e.g., 'STRING', 'TIMESTAMP')"
+        },
+        "value": {
+          "type": "string",
+          "description": "SQL expression for the column value (e.g., 'NULL', \"'rocky'\")"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pipeline_source": {
+      "type": "object",
+      "description": "Pipeline source configuration",
+      "required": ["schema_pattern"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "default": "default",
+          "description": "Name of the adapter to use (references [adapter.NAME])"
+        },
+        "catalog": {
+          "type": "string",
+          "description": "Source catalog name"
+        },
+        "schema_pattern": { "$ref": "#/definitions/schema_pattern" },
+        "discovery": {
+          "type": "object",
+          "description": "Discovery configuration",
+          "properties": {
+            "adapter": {
+              "type": "string",
+              "default": "default",
+              "description": "Adapter to use for discovery"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "schema_pattern": {
+      "type": "object",
+      "description": "Schema pattern for parsing source schema names",
+      "required": ["prefix", "separator", "components"],
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "description": "Schema name prefix (e.g., 'raw__', 'src__')"
+        },
+        "separator": {
+          "type": "string",
+          "description": "Component separator (e.g., '__')"
+        },
+        "components": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Component names. Static ('source', 'client') match one segment; variable-length ('regions...') match multiple"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pipeline_target": {
+      "type": "object",
+      "description": "Pipeline target configuration",
+      "required": ["catalog_template", "schema_template"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "default": "default",
+          "description": "Name of the adapter to use (references [adapter.NAME])"
+        },
+        "catalog_template": {
+          "type": "string",
+          "description": "Template for target catalog name. Supports {component} placeholders that reference the schema_pattern components (e.g. 'warehouse' for a flat single-catalog shape, or '{tenant}_warehouse' for a multi-tenant per-client shape)."
+        },
+        "schema_template": {
+          "type": "string",
+          "description": "Template for target schema name. Supports {component} placeholders (e.g. 'stage__{source}' for a flat shape, or 'stage__{regions}__{source}' where regions is a multi-valued '...' component)."
+        },
+        "governance": { "$ref": "#/definitions/governance_config" }
+      },
+      "additionalProperties": false
+    },
+    "governance_config": {
+      "type": "object",
+      "description": "Governance settings (Databricks Unity Catalog)",
+      "properties": {
+        "auto_create_catalogs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically create target catalogs"
+        },
+        "auto_create_schemas": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically create target schemas"
+        },
+        "tags": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Tags applied to every managed catalog and schema"
+        },
+        "isolation": {
+          "type": "object",
+          "description": "Workspace isolation settings",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable workspace isolation"
+            },
+            "workspace_ids": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "description": "Databricks workspace ID"
+                  },
+                  "binding_type": {
+                    "type": "string",
+                    "enum": ["READ_WRITE", "READ_ONLY"],
+                    "default": "READ_WRITE",
+                    "description": "Access level for this workspace"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "description": "Workspace bindings for catalog isolation"
+            }
+          },
+          "additionalProperties": false
+        },
+        "grants": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/grant_config" },
+          "description": "Permissions granted on every managed catalog"
+        },
+        "schema_grants": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/grant_config" },
+          "description": "Permissions granted on every managed schema"
+        }
+      },
+      "additionalProperties": false
+    },
+    "grant_config": {
+      "type": "object",
+      "description": "A permission grant",
+      "required": ["principal", "permissions"],
+      "properties": {
+        "principal": {
+          "type": "string",
+          "description": "Grantee (e.g., 'group:data-readers', 'user@example.com')"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["BROWSE", "USE CATALOG", "USE SCHEMA", "SELECT", "MANAGE", "MODIFY", "CREATE SCHEMA"]
+          },
+          "description": "Permissions to grant"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checks_config": {
+      "type": "object",
+      "description": "Data quality checks configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable data quality checks"
+        },
+        "row_count": {
+          "type": "boolean",
+          "default": false,
+          "description": "Check row counts after replication"
+        },
+        "column_match": {
+          "type": "boolean",
+          "default": false,
+          "description": "Check that source and target columns match"
+        },
+        "freshness": {
+          "type": "object",
+          "description": "Freshness check configuration",
+          "required": ["threshold_seconds"],
+          "properties": {
+            "threshold_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum acceptable data age in seconds"
+            },
+            "overrides": {
+              "type": "object",
+              "additionalProperties": { "type": "integer" },
+              "description": "Per-schema freshness overrides (schema pattern → threshold seconds)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "null_rate": {
+          "type": "object",
+          "description": "Null rate check configuration",
+          "required": ["columns", "threshold"],
+          "properties": {
+            "columns": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Columns to check for null values"
+            },
+            "threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Maximum acceptable null percentage"
+            },
+            "sample_percent": {
+              "type": "integer",
+              "default": 10,
+              "minimum": 1,
+              "maximum": 100,
+              "description": "Percentage of rows to sample"
+            }
+          },
+          "additionalProperties": false
+        },
+        "custom": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "sql"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Check name"
+              },
+              "sql": {
+                "type": "string",
+                "description": "SQL query — should return a count; passes when result ≤ threshold"
+              },
+              "threshold": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum acceptable count from the SQL query"
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "Custom SQL-based data quality checks"
+        },
+        "anomaly_threshold_pct": {
+          "type": "number",
+          "default": 50.0,
+          "minimum": 0,
+          "description": "Row count anomaly detection threshold (percentage deviation). Set to 0 to disable"
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution_config": {
+      "type": "object",
+      "description": "Execution settings for parallelism and error handling",
+      "properties": {
+        "concurrency": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "description": "Maximum tables processed in parallel"
+        },
+        "fail_fast": {
+          "type": "boolean",
+          "default": false,
+          "description": "Abort all remaining tables on first error"
+        },
+        "error_rate_abort_pct": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Abort if error rate exceeds this percentage. Set to 0 to disable"
+        },
+        "table_retries": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 0,
+          "description": "Retry attempts for failed tables. Set to 0 to disable"
+        }
+      },
+      "additionalProperties": false
+    },
+    "hooks_config": {
+      "type": "object",
+      "description": "Lifecycle hooks — shell commands and webhooks fired on pipeline events",
+      "properties": {
+        "webhooks": {
+          "type": "object",
+          "description": "Webhook configurations keyed by event name",
+          "properties": {
+            "on_pipeline_start": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_discover_complete": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_compile_complete": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_pipeline_complete": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_pipeline_error": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_before_materialize": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_after_materialize": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_materialize_error": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_before_model_run": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_after_model_run": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_model_error": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_before_checks": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_check_result": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_after_checks": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_drift_detected": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_anomaly_detected": { "$ref": "#/definitions/webhook_config_or_list" },
+            "on_state_synced": { "$ref": "#/definitions/webhook_config_or_list" }
+          },
+          "additionalProperties": false
+        },
+        "on_pipeline_start": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_discover_complete": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_compile_complete": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_pipeline_complete": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_pipeline_error": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_before_materialize": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_after_materialize": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_materialize_error": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_before_model_run": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_after_model_run": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_model_error": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_before_checks": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_check_result": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_after_checks": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_drift_detected": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_anomaly_detected": { "$ref": "#/definitions/hook_config_or_list" },
+        "on_state_synced": { "$ref": "#/definitions/hook_config_or_list" }
+      },
+      "additionalProperties": false
+    },
+    "hook_config": {
+      "type": "object",
+      "description": "Shell command hook",
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute (passed to sh -c)"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 0,
+          "description": "Maximum time to wait in milliseconds"
+        },
+        "on_failure": {
+          "type": "string",
+          "enum": ["abort", "warn", "ignore"],
+          "default": "warn",
+          "description": "Action on hook failure"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra environment variables passed to the hook process"
+        }
+      },
+      "additionalProperties": false
+    },
+    "hook_config_or_list": {
+      "description": "Single hook or array of hooks for an event",
+      "oneOf": [
+        { "$ref": "#/definitions/hook_config" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/definitions/hook_config" }
+        }
+      ]
+    },
+    "webhook_config": {
+      "type": "object",
+      "description": "Webhook endpoint configuration",
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "Target URL for the webhook request"
+        },
+        "method": {
+          "type": "string",
+          "default": "POST",
+          "description": "HTTP method"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Additional HTTP headers"
+        },
+        "body_template": {
+          "type": "string",
+          "description": "Mustache-style body template. If omitted, the full HookContext is sent as JSON"
+        },
+        "secret": {
+          "type": "string",
+          "description": "HMAC-SHA256 signing secret (adds X-Rocky-Signature header)"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 0,
+          "description": "Request timeout in milliseconds"
+        },
+        "async": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fire-and-forget mode (don't await response)"
+        },
+        "on_failure": {
+          "type": "string",
+          "enum": ["abort", "warn", "ignore"],
+          "default": "warn",
+          "description": "Action on webhook failure"
+        },
+        "retry_count": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "Number of retry attempts on failure"
+        },
+        "retry_delay_ms": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 0,
+          "description": "Delay between retries in milliseconds"
+        },
+        "preset": {
+          "type": "string",
+          "enum": ["slack", "pagerduty"],
+          "description": "Preset name — merges preset defaults before execution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "webhook_config_or_list": {
+      "description": "Single webhook or array of webhooks for an event",
+      "oneOf": [
+        { "$ref": "#/definitions/webhook_config" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/definitions/webhook_config" }
+        }
+      ]
+    }
+  }
+}

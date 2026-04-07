@@ -1,0 +1,15 @@
+-- Staging: normalize orders and filter cancelled
+from raw_orders
+where status != "cancelled"
+derive {
+    order_amount_usd: amount,
+    is_completed: status == "completed"
+}
+select {
+    order_id,
+    customer_id,
+    order_date,
+    status,
+    order_amount_usd,
+    is_completed
+}

@@ -1,0 +1,5 @@
+-- Only reads `status` from stg_orders.
+from stg_orders
+group status {
+    n: count()
+}

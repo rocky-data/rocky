@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Diagnostic": {
+      "description": "A compiler diagnostic (error, warning, or informational message).",
+      "properties": {
+        "code": {
+          "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Which model this diagnostic relates to.",
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ],
+          "description": "Severity level."
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source location (if available)."
+        },
+        "suggestion": {
+          "description": "Suggested fix (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "model",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
+      "enum": [
+        "Error",
+        "Warning",
+        "Info"
+      ],
+      "type": "string"
+    },
+    "SourceSpan": {
+      "description": "Location in a source file.",
+      "properties": {
+        "col": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "file",
+        "line"
+      ],
+      "type": "object"
+    },
+    "TestFailure": {
+      "description": "One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky ci`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "compile_ok": {
+      "type": "boolean"
+    },
+    "diagnostics": {
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      },
+      "type": "array"
+    },
+    "exit_code": {
+      "format": "int32",
+      "type": "integer"
+    },
+    "failures": {
+      "items": {
+        "$ref": "#/definitions/TestFailure"
+      },
+      "type": "array"
+    },
+    "models_compiled": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tests_ok": {
+      "type": "boolean"
+    },
+    "tests_passed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "compile_ok",
+    "diagnostics",
+    "exit_code",
+    "failures",
+    "models_compiled",
+    "tests_failed",
+    "tests_ok",
+    "tests_passed",
+    "version"
+  ],
+  "title": "CiOutput",
+  "type": "object"
+}

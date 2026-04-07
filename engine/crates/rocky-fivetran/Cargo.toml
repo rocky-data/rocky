@@ -1,0 +1,34 @@
+[package]
+name = "rocky-fivetran"
+version = "1.0.0"
+description = "Fivetran source adapter for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+test-support = []
+
+[[test]]
+name = "wiremock_tests"
+required-features = ["test-support"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

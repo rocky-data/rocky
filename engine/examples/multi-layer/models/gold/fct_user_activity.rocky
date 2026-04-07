@@ -1,0 +1,17 @@
+-- Gold: per-user activity summary joining events and users
+from stg_events
+join stg_users as u on user_id {
+    keep u.full_name, u.email, u.country
+}
+group user_id {
+    full_name: max(u.full_name),
+    email: max(u.email),
+    country: max(u.country),
+    total_events: count(),
+    page_views: sum(is_page_view),
+    purchases: sum(is_purchase),
+    first_event_date: min(event_date),
+    last_event_date: max(event_date)
+}
+where total_events >= 1
+sort total_events desc

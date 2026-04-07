@@ -1,0 +1,10 @@
+name = "stg_events"
+intent = "Cleaned event stream. Removes records with null event_id, user_id, or event_type. Adds boolean flags for common event types. One row per event."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "silver"
+table = "stg_events"

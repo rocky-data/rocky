@@ -1,0 +1,35 @@
+[package]
+name = "rocky-databricks"
+version = "1.0.0"
+description = "Databricks warehouse adapter for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-observe = { path = "../rocky-observe" }
+rocky-sql = { path = "../rocky-sql" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+test-support = []
+
+[[test]]
+name = "wiremock_tests"
+required-features = ["test-support"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

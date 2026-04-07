@@ -1,0 +1,21 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[cost]
+storage_cost_per_gb_month = 0.023
+compute_cost_per_dbu = 0.40
+warehouse_size = "Medium"
+min_history_runs = 1

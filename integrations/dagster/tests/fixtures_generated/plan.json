@@ -1,0 +1,17 @@
+{
+  "version": "0.3.0",
+  "command": "plan",
+  "filter": "source=orders",
+  "statements": [
+    {
+      "purpose": "create_schema",
+      "target": "staging__orders",
+      "sql": "CREATE SCHEMA IF NOT EXISTS staging__orders"
+    },
+    {
+      "purpose": "full_refresh_copy",
+      "target": "staging__orders.orders",
+      "sql": "CREATE OR REPLACE TABLE staging__orders.orders AS\nSELECT *\nFROM raw__orders.orders"
+    }
+  ]
+}

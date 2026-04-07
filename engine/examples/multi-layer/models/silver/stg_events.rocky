@@ -1,0 +1,22 @@
+-- Silver: clean events, remove nulls, normalize types
+from raw_events
+where event_id is not null
+where user_id is not null
+where event_type is not null
+derive {
+    event_date: event_timestamp,
+    is_page_view: event_type == "page_view",
+    is_purchase: event_type == "purchase"
+}
+select {
+    event_id,
+    user_id,
+    event_type,
+    event_timestamp,
+    event_date,
+    page_url,
+    session_id,
+    device_type,
+    is_page_view,
+    is_purchase
+}

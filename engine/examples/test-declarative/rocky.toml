@@ -1,0 +1,35 @@
+# Declarative Tests — [[tests]] in TOML sidecars
+#
+# Demonstrates `rocky test --declarative` executing data quality assertions
+# defined directly in model sidecar files.
+#
+# Usage:
+#   rocky --config engine/examples/test-declarative/rocky.toml test \
+#     --declarative --models engine/examples/test-declarative/models/
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.test_demo]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.test_demo.source]
+adapter = "local"
+
+[pipeline.test_demo.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test_demo.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.test_demo.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[state]
+backend = "local"

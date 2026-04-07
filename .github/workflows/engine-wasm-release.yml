@@ -1,0 +1,116 @@
+name: engine-wasm-release
+
+# Build rocky-wasm and publish to npm.
+# Triggered by engine-wasm-v* tags (independent of CLI binary releases).
+
+on:
+  push:
+    tags: ["engine-wasm-v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  ensure-release:
+    name: Ensure GitHub Release exists
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              --title "$TAG"
+          fi
+
+  build-and-publish:
+    name: Build WASM and publish to npm
+    needs: ensure-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: engine
+          key: wasm
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Build WASM (web target)
+        run: wasm-pack build crates/rocky-wasm --target web
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#engine-wasm-v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Write package.json with tag version
+        working-directory: engine/crates/rocky-wasm/pkg
+        run: |
+          cat > package.json <<PKGJSON
+          {
+            "name": "@rocky-data/compiler",
+            "version": "${{ steps.version.outputs.version }}",
+            "description": "WASM bindings for Rocky's Rust compiler pipeline — SQL lineage, Rocky DSL parsing, and identifier validation",
+            "main": "rocky_wasm.js",
+            "types": "rocky_wasm.d.ts",
+            "files": [
+              "rocky_wasm_bg.wasm",
+              "rocky_wasm.js",
+              "rocky_wasm.d.ts",
+              "rocky_wasm_bg.wasm.d.ts"
+            ],
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/rocky-data/rocky",
+              "directory": "engine/crates/rocky-wasm"
+            },
+            "keywords": ["wasm", "sql", "lineage", "transformation", "rocky"],
+            "license": "Apache-2.0"
+          }
+          PKGJSON
+
+      - name: Archive WASM package
+        run: tar czf rocky-wasm.tar.gz -C crates/rocky-wasm/pkg .
+
+      - name: Attach to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" rocky-wasm.tar.gz \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+        working-directory: engine
+
+      - name: Publish to npm
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        working-directory: engine/crates/rocky-wasm/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
+          npm publish --access public

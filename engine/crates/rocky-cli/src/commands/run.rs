@@ -1,0 +1,3020 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{Instrument, debug, info, info_span, warn};
+
+use rocky_databricks::throttle::AdaptiveThrottle;
+
+use rocky_core::checks;
+use rocky_core::config::{GovernanceOverride, ReplicationPipelineConfig};
+use rocky_core::drift;
+use rocky_core::ir::*;
+use rocky_core::sql_gen;
+use rocky_core::state::StateStore;
+use rocky_core::traits::{GovernanceAdapter, TagTarget, WarehouseAdapter};
+use rocky_databricks::batch::{self, BatchTableRef};
+use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+use crate::output::*;
+use crate::registry::{self, AdapterRegistry};
+
+use super::{matches_filter, parse_filter, parsed_to_json_map};
+
+/// Accumulated check results for a table, assembled after batched execution.
+struct PendingCheck {
+    asset_key: Vec<String>,
+    checks: Vec<rocky_core::checks::CheckResult>,
+}
+
+/// Result of processing a single table (returned from parallel tasks).
+struct TableResult {
+    materialization: MaterializationOutput,
+    drift_checked: bool,
+    drift_detected: Option<DriftActionOutput>,
+    column_match_check: Option<rocky_core::checks::CheckResult>,
+    source_batch_ref: Option<BatchTableRef>,
+    target_batch_ref: Option<BatchTableRef>,
+    freshness_batch_ref: Option<BatchTableRef>,
+    asset_key: Vec<String>,
+    target_full_name: String,
+    /// Deferred governance tags — applied in a post-run batch phase instead
+    /// of inside the per-table concurrent loop, avoiding sequential SQL waits
+    /// that block the concurrency semaphore.
+    deferred_tags: Option<DeferredTagging>,
+    /// Deferred watermark — written in a single batch after all tables
+    /// complete, eliminating Mutex contention during concurrent processing.
+    deferred_watermark: Option<DeferredWatermark>,
+}
+
+/// Table tagging deferred to post-run phase.
+struct DeferredTagging {
+    catalog: String,
+    schema: String,
+    table: String,
+    tags: BTreeMap<String, String>,
+}
+
+/// Watermark update deferred to post-run phase.
+struct DeferredWatermark {
+    state_key: String,
+    timestamp: chrono::DateTime<Utc>,
+}
+
+/// Error from parallel table processing (partial failure mode).
+struct TableError {
+    asset_key: Vec<String>,
+    error: String,
+    /// Index into the original tables_to_process vec (for retry).
+    task_index: Option<usize>,
+}
+
+/// Input for a single table processing task.
+#[derive(Clone)]
+struct TableTask {
+    source_catalog: String,
+    source_schema: String,
+    target_catalog: String,
+    target_schema: String,
+    table_name: String,
+    asset_key_prefix: Vec<String>,
+    check_column_match: bool,
+    check_row_count: bool,
+    check_freshness: bool,
+    /// Column names to exclude from column_match check (metadata columns added by Rocky).
+    column_match_exclude: Vec<String>,
+    /// Metadata columns with template placeholders already resolved for this schema.
+    metadata_columns: Vec<MetadataColumn>,
+    governance_tags: BTreeMap<String, String>,
+    /// Pre-fetched column metadata from batch information_schema query.
+    /// When present, `process_table` skips individual DESCRIBE TABLE calls.
+    prefetched_source_cols: Option<Vec<ColumnInfo>>,
+    prefetched_target_cols: Option<Vec<ColumnInfo>>,
+}
+
+/// CLI selection state for `time_interval` partition execution.
+///
+/// Bundles the seven `--partition` / `--from` / `--to` / `--latest` /
+/// `--missing` / `--lookback` / `--parallel` flags so the run() signature
+/// stays manageable. Constructed from the parsed `clap` enum in `main.rs`
+/// and converted to a `rocky_core::plan_partition::PartitionSelection` per
+/// model when execution actually runs against a `time_interval` model.
+#[derive(Debug, Clone, Default)]
+pub struct PartitionRunOptions {
+    pub partition: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub latest: bool,
+    pub missing: bool,
+    pub lookback: Option<u32>,
+    pub parallel: u32,
+}
+
+impl PartitionRunOptions {
+    /// Convert the bundled CLI flags to a `PartitionSelection`, or `None` if
+    /// no selection flag is set (in which case the runtime defaults to
+    /// `PartitionSelection::Latest` for `time_interval` models).
+    ///
+    /// Mutual exclusion is enforced by `clap` at parse time, so at most one
+    /// of `partition`, `from`/`to`, `latest`, `missing` is set.
+    pub fn to_selection(&self) -> Option<rocky_core::plan_partition::PartitionSelection> {
+        use rocky_core::plan_partition::PartitionSelection;
+        if let Some(key) = &self.partition {
+            return Some(PartitionSelection::Single(key.clone()));
+        }
+        if let (Some(from), Some(to)) = (&self.from, &self.to) {
+            return Some(PartitionSelection::Range {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+        if self.latest {
+            return Some(PartitionSelection::Latest);
+        }
+        if self.missing {
+            return Some(PartitionSelection::Missing);
+        }
+        None
+    }
+
+    /// Returns true if the user passed any partition-related flag, signaling
+    /// that this run is targeting `time_interval` models specifically.
+    pub fn any_set(&self) -> bool {
+        self.partition.is_some()
+            || self.from.is_some()
+            || self.to.is_some()
+            || self.latest
+            || self.missing
+            || self.lookback.is_some()
+    }
+}
+
+/// Borrowed slice of compile-time facts that the per-model execution path
+/// needs at materialization time.
+///
+/// Bundles the typed-model schemas (for `column_count`) and per-model
+/// compile timings (for `compile_time_ms`) into one ref so call signatures
+/// stay manageable. Add fields here when more compile-time facts need to
+/// reach `process_table` / `run_one_partition` — every other plumbing
+/// touchpoint inherits the new field for free.
+///
+/// Borrows from `rocky_compiler::compile::CompileResult`; the lifetime
+/// matches the compile result's owning scope inside `execute_models()`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutionContext<'a> {
+    /// Per-model typed column schemas, keyed by model name.
+    pub typed_models: &'a indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    /// Per-model compile cost (currently `typecheck_ms` only).
+    pub model_timings:
+        &'a std::collections::HashMap<String, rocky_compiler::compile::ModelCompileTimings>,
+}
+
+impl<'a> ExecutionContext<'a> {
+    /// Look up the column count for a derived model. Returns `None` for
+    /// models the typechecker didn't see (e.g., source replication tables
+    /// whose schema is only known at runtime via `DESCRIBE TABLE`).
+    pub fn column_count_for(&self, model_name: &str) -> Option<u64> {
+        self.typed_models
+            .get(model_name)
+            .map(|cols| cols.len() as u64)
+    }
+
+    /// Look up the per-model compile time in milliseconds. Returns `None`
+    /// for models the typechecker didn't see.
+    pub fn compile_time_ms_for(&self, model_name: &str) -> Option<u64> {
+        self.model_timings.get(model_name).map(|t| t.total_ms)
+    }
+}
+
+/// Execute `rocky run` — full pipeline.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, name = "run")]
+pub async fn run(
+    config_path: &Path,
+    filter: &str,
+    pipeline_name_arg: Option<&str>,
+    state_path: &Path,
+    governance_override: Option<&GovernanceOverride>,
+    output_json: bool,
+    models_dir: Option<&Path>,
+    run_all: bool,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    partition_opts: &PartitionRunOptions,
+) -> Result<()> {
+    let start = Instant::now();
+
+    // Detect Dagster Pipes mode. When the parent process is a Dagster
+    // job that launched us via PipesSubprocessClient, both
+    // DAGSTER_PIPES_CONTEXT and DAGSTER_PIPES_MESSAGES are set; we
+    // emit structured events on the messages channel as the run
+    // progresses. Outside Pipes mode, this is a no-op.
+    let pipes = crate::pipes::PipesEmitter::detect();
+    if let Some(p) = &pipes {
+        p.log("INFO", "rocky run starting");
+    }
+
+    // Load config (v2 format)
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+    let (pipeline_name, pipeline_config) =
+        registry::resolve_pipeline(&rocky_cfg, pipeline_name_arg)?;
+
+    info!(
+        pipeline = pipeline_name,
+        pipeline_type = pipeline_config.pipeline_type_str(),
+        "resolved pipeline"
+    );
+
+    // Dispatch by pipeline type. Non-replication types have their own
+    // execution paths and don't fall through to the replication logic below.
+    match pipeline_config {
+        rocky_core::config::PipelineConfig::Transformation(t) => {
+            return super::run_local::run_transformation(
+                config_path,
+                t,
+                &rocky_cfg,
+                output_json,
+                partition_opts,
+            )
+            .await;
+        }
+        rocky_core::config::PipelineConfig::Quality(q) => {
+            return super::run_local::run_quality(config_path, q, &rocky_cfg, output_json).await;
+        }
+        rocky_core::config::PipelineConfig::Snapshot(s) => {
+            return super::run_local::run_snapshot(config_path, s, &rocky_cfg, output_json).await;
+        }
+        rocky_core::config::PipelineConfig::Replication(_) => {}
+        rocky_core::config::PipelineConfig::Load(_) => {
+            anyhow::bail!(
+                "load pipelines are not yet supported by `rocky run`; use the adapter SDK directly"
+            );
+        }
+    }
+
+    let pipeline = pipeline_config.as_replication().context("expected replication pipeline")?;
+
+    // All adapters flow through this production-grade execution path.
+    // Databricks-specific batch optimizations (batch describe, batch tagging,
+    // UNION ALL checks) activate only when a Databricks connector is available;
+    // non-Databricks adapters (DuckDB, Snowflake, BigQuery) get the same
+    // parallel execution, drift detection, governance, checkpoint/resume,
+    // retry, anomaly detection, and state sync — just with per-table fallbacks
+    // instead of batched queries.
+
+    let pattern = pipeline.schema_pattern()?;
+    let (filter_key, filter_value) = parse_filter(filter)?;
+
+    // Download state from remote storage (S3/Valkey) if configured
+    if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path) {
+        warn!(error = %e, "state download failed, continuing with local state");
+    }
+
+    // Build adapter registry and resolve adapters
+    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    // Databricks connector is optional — only present when the target adapter
+    // is Databricks. Used for batch operations (describe, row counts, freshness)
+    // and governance. Non-Databricks adapters fall back to per-table checks via
+    // WarehouseAdapter trait methods.
+    let db_connector = adapter_registry
+        .databricks_connector(&pipeline.target.adapter)
+        .ok();
+    let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
+
+    // Governance adapter: wraps catalog/permission/workspace managers behind
+    // the GovernanceAdapter trait. Workspace binding is best-effort (requires
+    // auth credentials). Plan 01: run.rs governance operations now go through
+    // this trait object instead of importing Databricks types directly.
+    // When the target adapter is not Databricks, use NoopGovernanceAdapter.
+    let governance_adapter: Box<dyn GovernanceAdapter + '_> =
+        if let Some(ref db_conn) = db_connector {
+            let adapter_cfg = adapter_registry.adapter_config(&pipeline.target.adapter);
+            let auth = adapter_cfg.and_then(|cfg| {
+                rocky_databricks::auth::Auth::from_config(rocky_databricks::auth::AuthConfig {
+                    host: cfg.host.clone().unwrap_or_default(),
+                    token: cfg.token.as_ref().map(|s| s.expose().to_string()),
+                    client_id: cfg.client_id.clone(),
+                    client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
+                })
+                .ok()
+            });
+            match auth {
+                Some(a) => {
+                    let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
+                    Box::new(DatabricksGovernanceAdapter::new(db_conn, host, a))
+                }
+                None => Box::new(DatabricksGovernanceAdapter::without_workspace(db_conn)),
+            }
+        } else {
+            Box::new(rocky_core::traits::NoopGovernanceAdapter)
+        };
+
+    let state_store = StateStore::open(state_path).context(format!(
+        "failed to open state store at {}",
+        state_path.display()
+    ))?;
+
+    // Discover sources
+    let connectors = async {
+        if let Some(ref disc) = pipeline.source.discovery {
+            let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
+            discovery_adapter
+                .discover(&pattern.prefix)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else {
+            anyhow::bail!("no discovery adapter configured for this pipeline")
+        }
+    }
+    .instrument(info_span!("discover_sources"))
+    .await?;
+
+    let concurrency = pipeline.execution.concurrency.max(1);
+    let mut output = RunOutput::new(filter.to_string(), 0, concurrency);
+    output.shadow = shadow_config.is_some();
+    let mut catalogs_created: usize = 0;
+    let mut schemas_created: usize = 0;
+    let mut created_catalogs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut source_batch_refs: Vec<BatchTableRef> = Vec::new();
+    let mut target_batch_refs: Vec<BatchTableRef> = Vec::new();
+    let mut freshness_batch_refs: Vec<BatchTableRef> = Vec::new();
+    let mut batch_asset_keys: Vec<(String, Vec<String>)> = Vec::new();
+    let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
+    let mut tables_to_process: Vec<TableTask> = Vec::new();
+
+    let governance = &pipeline.target.governance;
+    let target_catalog_template = &pipeline.target.catalog_template;
+    let target_schema_template = &pipeline.target.schema_template;
+    let target_sep = pipeline
+        .target
+        .separator
+        .as_deref()
+        .unwrap_or(&pattern.separator);
+
+    // --- Sequential: catalog/schema setup + table collection ---
+    // Governance operations route through the GovernanceAdapter trait
+    // (Plan 01: genericize run.rs). Catalog/schema creation uses
+    // SqlDialect + WarehouseAdapter for SQL generation + execution.
+    let _governance_span = info_span!("governance_setup").entered();
+    {
+        let dialect = warehouse_adapter.dialect();
+
+        for conn in &connectors {
+            let parsed = match pattern.parse(&conn.schema) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if !matches_filter(conn, &parsed, &filter_key, &filter_value) {
+                continue;
+            }
+
+            let components = parsed_to_json_map(&parsed);
+            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_schema = if let Some(shadow_cfg) = shadow_config {
+                shadow_cfg
+                    .schema_override
+                    .clone()
+                    .unwrap_or_else(|| parsed.resolve_template(target_schema_template, target_sep))
+            } else {
+                parsed.resolve_template(target_schema_template, target_sep)
+            };
+
+            // Create catalog + apply governance (once per catalog)
+            if governance.auto_create_catalogs && !created_catalogs.contains(&target_catalog) {
+                // Create catalog via generic dialect SQL
+                if let Some(sql_result) = dialect.create_catalog_sql(&target_catalog) {
+                    warehouse_adapter
+                        .execute_statement(&sql_result?)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                catalogs_created += 1;
+
+                // Tags via GovernanceAdapter trait
+                let tags = governance.build_tags(&components);
+                if let Err(e) = governance_adapter
+                    .set_tags(&TagTarget::Catalog(target_catalog.clone()), &tags)
+                    .await
+                {
+                    warn!(catalog = target_catalog, error = %e, "set catalog tags failed");
+                }
+
+                // Merge workspace bindings: config defaults + per-run override (override wins)
+                let mut binding_map: std::collections::HashMap<
+                    u64,
+                    rocky_core::config::WorkspaceBindingConfig,
+                > = std::collections::HashMap::new();
+                if let Some(isolation) = &governance.isolation {
+                    for b in &isolation.workspace_ids {
+                        binding_map.insert(b.id, b.clone());
+                    }
+                }
+                if let Some(ov) = governance_override {
+                    for b in &ov.workspace_ids {
+                        binding_map.insert(b.id, b.clone());
+                    }
+                }
+                let all_bindings: Vec<rocky_core::config::WorkspaceBindingConfig> = {
+                    let mut v: Vec<_> = binding_map.into_values().collect();
+                    v.sort_by_key(|b| b.id);
+                    v
+                };
+
+                // Workspace binding + isolation via GovernanceAdapter (best-effort)
+                for binding in &all_bindings {
+                    if let Err(e) = governance_adapter
+                        .bind_workspace(
+                            &target_catalog,
+                            binding.id,
+                            binding.binding_type.as_api_str(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            catalog = target_catalog,
+                            workspace_id = binding.id,
+                            binding_type = binding.binding_type.as_api_str(),
+                            error = %e,
+                            "workspace binding failed"
+                        );
+                    }
+                }
+
+                let should_isolate = governance.isolation.as_ref().is_some_and(|i| i.enabled);
+                if should_isolate {
+                    if let Err(e) = governance_adapter
+                        .set_isolation(&target_catalog, true)
+                        .await
+                    {
+                        warn!(catalog = target_catalog, error = %e, "catalog isolation failed");
+                    }
+                }
+
+                // Merge catalog grants: config defaults + per-run override
+                let mut all_grants = governance.grants.clone();
+                if let Some(ov) = governance_override {
+                    all_grants.extend(ov.grants.clone());
+                }
+
+                // Catalog-level grants via GovernanceAdapter (best-effort)
+                if !all_grants.is_empty() {
+                    let grants: Vec<Grant> = all_grants
+                        .iter()
+                        .flat_map(|grant_cfg| {
+                            grant_cfg.permissions.iter().filter_map(|perm_str| {
+                                let permission = match perm_str.as_str() {
+                                    "BROWSE" => Permission::Browse,
+                                    "USE CATALOG" => Permission::UseCatalog,
+                                    "USE SCHEMA" => Permission::UseSchema,
+                                    "SELECT" => Permission::Select,
+                                    "MODIFY" => Permission::Modify,
+                                    "MANAGE" => Permission::Manage,
+                                    other => {
+                                        warn!(permission = other, "unknown permission, skipping");
+                                        return None;
+                                    }
+                                };
+                                Some(Grant {
+                                    principal: grant_cfg.principal.clone(),
+                                    permission,
+                                    target: GrantTarget::Catalog(target_catalog.clone()),
+                                })
+                            })
+                        })
+                        .collect();
+
+                    if let Err(e) = governance_adapter.apply_grants(&grants).await {
+                        warn!(catalog = target_catalog, error = %e, "catalog grants failed");
+                    }
+                    output.permissions.grants_added += all_grants
+                        .iter()
+                        .map(|g| g.permissions.len())
+                        .sum::<usize>();
+                }
+
+                created_catalogs.insert(target_catalog.clone());
+            }
+
+            if governance.auto_create_schemas {
+                // Create schema via generic dialect SQL
+                if let Some(sql_result) = dialect.create_schema_sql(&target_catalog, &target_schema)
+                {
+                    warehouse_adapter
+                        .execute_statement(&sql_result?)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                schemas_created += 1;
+
+                // Schema tags via GovernanceAdapter
+                let tags = governance.build_tags(&components);
+                if let Err(e) = governance_adapter
+                    .set_tags(
+                        &TagTarget::Schema {
+                            catalog: target_catalog.clone(),
+                            schema: target_schema.clone(),
+                        },
+                        &tags,
+                    )
+                    .await
+                {
+                    warn!(
+                        schema = format!("{}.{}", target_catalog, target_schema),
+                        error = %e,
+                        "set schema tags failed"
+                    );
+                }
+
+                // Schema grants via GovernanceAdapter
+                let mut all_schema_grants = governance.schema_grants.clone();
+                if let Some(ov) = governance_override {
+                    all_schema_grants.extend(ov.schema_grants.clone());
+                }
+
+                if !all_schema_grants.is_empty() {
+                    let grants: Vec<Grant> = all_schema_grants
+                        .iter()
+                        .flat_map(|grant_cfg| {
+                            grant_cfg.permissions.iter().filter_map(|perm_str| {
+                                let permission = match perm_str.as_str() {
+                                    "USE SCHEMA" => Permission::UseSchema,
+                                    "SELECT" => Permission::Select,
+                                    "MODIFY" => Permission::Modify,
+                                    other => {
+                                        warn!(
+                                            permission = other,
+                                            "unknown schema permission, skipping"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                Some(Grant {
+                                    principal: grant_cfg.principal.clone(),
+                                    permission,
+                                    target: GrantTarget::Schema {
+                                        catalog: target_catalog.clone(),
+                                        schema: target_schema.clone(),
+                                    },
+                                })
+                            })
+                        })
+                        .collect();
+
+                    if let Err(e) = governance_adapter.apply_grants(&grants).await {
+                        warn!(
+                            schema = format!("{}.{}", target_catalog, target_schema),
+                            error = %e,
+                            "schema grants failed"
+                        );
+                    }
+                }
+            }
+
+            // Collect tables to process in parallel
+            let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+
+            // Pre-fetch source table list to skip tables that no longer exist
+            // in the source (e.g. Fivetran stopped syncing them). One
+            // information_schema query per schema avoids N wasted DESCRIBE +
+            // CTAS round-trips for stale tables.
+            // Use the generic WarehouseAdapter::list_tables (Plan 02 trait method)
+            let source_tables: std::collections::HashSet<String> = warehouse_adapter
+                .list_tables(&source_catalog, &conn.schema)
+                .await
+                .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect())
+                .unwrap_or_else(|e| {
+                    warn!(
+                        schema = conn.schema.as_str(),
+                        error = %e,
+                        "failed to list source tables, will process all discovered tables"
+                    );
+                    conn.tables.iter().map(|t| t.name.to_lowercase()).collect()
+                });
+
+            let mut skipped_source_missing = 0usize;
+            for table in &conn.tables {
+                if !source_tables.contains(&table.name.to_lowercase()) {
+                    // Build the same asset key the materialization path
+                    // would have used (`[source_type, ...components, table]`)
+                    // so downstream orchestrators can match excluded
+                    // entries against planned asset keys.
+                    let mut asset_key = vec![conn.source_type.clone()];
+                    for v in components.values() {
+                        match v {
+                            serde_json::Value::String(s) => asset_key.push(s.clone()),
+                            serde_json::Value::Array(arr) => {
+                                for item in arr {
+                                    if let Some(s) = item.as_str() {
+                                        asset_key.push(s.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    asset_key.push(table.name.clone());
+
+                    warn!(
+                        table = table.name.as_str(),
+                        schema = conn.schema.as_str(),
+                        "source table not found in destination catalog, excluding from run"
+                    );
+                    output.excluded_tables.push(ExcludedTableOutput {
+                        asset_key,
+                        source_schema: conn.schema.clone(),
+                        table_name: table.name.clone(),
+                        reason: "missing_from_source".to_string(),
+                    });
+                    skipped_source_missing += 1;
+                    continue;
+                }
+                // In shadow suffix mode, append suffix to table name
+                let target_table_name = if let Some(shadow_cfg) = shadow_config {
+                    if shadow_cfg.schema_override.is_none() {
+                        format!("{}{}", table.name, shadow_cfg.suffix)
+                    } else {
+                        table.name.clone()
+                    }
+                } else {
+                    table.name.clone()
+                };
+
+                tables_to_process.push(TableTask {
+                    source_catalog: source_catalog.clone(),
+                    source_schema: conn.schema.clone(),
+                    target_catalog: target_catalog.clone(),
+                    target_schema: target_schema.clone(),
+                    table_name: target_table_name,
+                    asset_key_prefix: {
+                        let mut prefix = vec![conn.source_type.clone()];
+                        for v in components.values() {
+                            match v {
+                                serde_json::Value::String(s) => prefix.push(s.clone()),
+                                serde_json::Value::Array(arr) => {
+                                    for item in arr {
+                                        if let Some(s) = item.as_str() {
+                                            prefix.push(s.to_string());
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        prefix
+                    },
+                    check_column_match: pipeline.checks.column_match,
+                    check_row_count: pipeline.checks.row_count,
+                    check_freshness: pipeline.checks.freshness.is_some(),
+                    column_match_exclude: pipeline
+                        .metadata_columns
+                        .iter()
+                        .map(|mc| mc.name.clone())
+                        .collect(),
+                    metadata_columns: pipeline
+                        .metadata_columns
+                        .iter()
+                        .map(|mc| MetadataColumn {
+                            name: mc.name.clone(),
+                            data_type: mc.data_type.clone(),
+                            value: parsed.resolve_template(&mc.value, &pattern.separator),
+                        })
+                        .collect(),
+                    governance_tags: governance.build_tags(&components),
+                    // Populated later by batch pre-fetch phase
+                    prefetched_source_cols: None,
+                    prefetched_target_cols: None,
+                });
+            }
+            if skipped_source_missing > 0 {
+                warn!(
+                    schema = conn.schema.as_str(),
+                    skipped = skipped_source_missing,
+                    "excluded tables missing from source — see `excluded_tables` in JSON output for details"
+                );
+            }
+        }
+    }
+    drop(_governance_span);
+
+    // --- Checkpoint / resume: filter already-completed tables ---
+    let run_id = format!("run-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+
+    let completed_keys: std::collections::HashSet<String> = if resume_latest {
+        if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
+            let keys: std::collections::HashSet<String> = prev
+                .tables
+                .iter()
+                .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+                .map(|t| t.table_key.clone())
+                .collect();
+            if !keys.is_empty() {
+                info!(
+                    resumed_from = prev.run_id,
+                    tables_skipped = keys.len(),
+                    "resuming from previous run"
+                );
+                output.resumed_from = Some(prev.run_id.clone());
+            }
+            keys
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else if let Some(rid) = resume_run_id {
+        if let Ok(Some(prev)) = state_store.get_run_progress(rid) {
+            let keys: std::collections::HashSet<String> = prev
+                .tables
+                .iter()
+                .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+                .map(|t| t.table_key.clone())
+                .collect();
+            if !keys.is_empty() {
+                output.resumed_from = Some(rid.to_string());
+            }
+            keys
+        } else {
+            warn!(run_id = rid, "no progress found for run, starting fresh");
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let original_count = tables_to_process.len();
+    if !completed_keys.is_empty() {
+        tables_to_process.retain(|task| {
+            let key = format!(
+                "{}.{}.{}",
+                task.target_catalog, task.target_schema, task.table_name
+            );
+            !completed_keys.contains(&key)
+        });
+        let skipped = original_count - tables_to_process.len();
+        output.tables_skipped = skipped;
+        info!(
+            skipped = skipped,
+            remaining = tables_to_process.len(),
+            "filtered resumed tables"
+        );
+    }
+
+    // Initialize run progress tracking
+    state_store
+        .init_run_progress(&run_id, tables_to_process.len())
+        .context("failed to initialize run progress")?;
+
+    // --- Process tables concurrently ---
+    let fail_fast = pipeline.execution.fail_fast;
+
+    info!(
+        tables = tables_to_process.len(),
+        concurrency = concurrency,
+        "processing tables"
+    );
+
+    // --- Batch column pre-fetch: replace N×2 DESCRIBE TABLE calls with
+    //     one information_schema query per unique schema pair. ---
+    // Only available when we have a Databricks connector; non-Databricks
+    // adapters fall back to per-table DESCRIBE via WarehouseAdapter in
+    // process_table().
+    if let Some(ref db_conn) = db_connector {
+        use rocky_databricks::batch::execute_batch_describe;
+
+        // Collect unique (catalog, schema) pairs for source and target
+        let source_schemas: std::collections::HashSet<(String, String)> = tables_to_process
+            .iter()
+            .map(|t| (t.source_catalog.clone(), t.source_schema.clone()))
+            .collect();
+        let target_schemas: std::collections::HashSet<(String, String)> = tables_to_process
+            .iter()
+            .map(|t| (t.target_catalog.clone(), t.target_schema.clone()))
+            .collect();
+
+        // Fetch all source + target schemas in parallel
+        let mut describe_futures = Vec::new();
+        for (cat, sch) in &source_schemas {
+            describe_futures.push(("source", cat.clone(), sch.clone()));
+        }
+        for (cat, sch) in &target_schemas {
+            describe_futures.push(("target", cat.clone(), sch.clone()));
+        }
+
+        // key: (catalog, schema) → HashMap<table_name, Vec<ColumnInfo>>
+        let mut prefetched: std::collections::HashMap<
+            (String, String),
+            std::collections::HashMap<String, Vec<ColumnInfo>>,
+        > = std::collections::HashMap::new();
+
+        type DescribeResult<'a> = (
+            &'a str,
+            String,
+            String,
+            Result<
+                std::collections::HashMap<String, Vec<ColumnInfo>>,
+                rocky_databricks::batch::BatchError,
+            >,
+        );
+
+        let describe_results: Vec<DescribeResult<'_>> =
+            futures::future::join_all(describe_futures.iter().map(|(side, cat, sch)| {
+                let cat = cat.clone();
+                let sch = sch.clone();
+                let connector = db_conn;
+                async move {
+                    let result = execute_batch_describe(connector, &cat, &sch).await;
+                    (*side, cat, sch, result)
+                }
+            }))
+            .await;
+
+        for (side, cat, sch, result) in describe_results {
+            match result {
+                Ok(cols_map) => {
+                    debug!(
+                        side,
+                        catalog = cat.as_str(),
+                        schema = sch.as_str(),
+                        tables = cols_map.len(),
+                        "batch describe complete"
+                    );
+                    prefetched.insert((cat, sch), cols_map);
+                }
+                Err(e) => {
+                    warn!(
+                        side,
+                        catalog = cat.as_str(),
+                        schema = sch.as_str(),
+                        error = %e,
+                        "batch describe failed, will fall back to per-table DESCRIBE"
+                    );
+                }
+            }
+        }
+
+        // Attach pre-fetched columns to each task
+        for task in &mut tables_to_process {
+            if let Some(src_map) =
+                prefetched.get(&(task.source_catalog.clone(), task.source_schema.clone()))
+            {
+                task.prefetched_source_cols = src_map.get(&task.table_name.to_lowercase()).cloned();
+            }
+            if let Some(tgt_map) =
+                prefetched.get(&(task.target_catalog.clone(), task.target_schema.clone()))
+            {
+                task.prefetched_target_cols = tgt_map.get(&task.table_name.to_lowercase()).cloned();
+            }
+        }
+    }
+
+    // Adaptive concurrency throttle — when enabled, dynamically adjusts the
+    // number of in-flight tasks based on rate-limit signals from the warehouse.
+    // When disabled (default), concurrency stays fixed at the configured level.
+    let adaptive = pipeline.execution.adaptive_concurrency;
+    let throttle = if adaptive {
+        // increase_interval = 10 means: after 10 consecutive successes,
+        // concurrency increases by 1 (or 2 during slow-start). This prevents
+        // oscillation by requiring sustained success before probing higher.
+        let t = AdaptiveThrottle::new(concurrency, 1, 10);
+        info!(
+            max = concurrency,
+            min = 1,
+            "adaptive concurrency enabled (AIMD throttle)"
+        );
+        Some(t)
+    } else {
+        None
+    };
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let shared_connector = db_connector.clone();
+    let shared_warehouse = warehouse_adapter.clone();
+    let shared_state = Arc::new(Mutex::new(state_store));
+    let shared_run_id = run_id.clone();
+    let shared_pipeline = Arc::new(pipeline.clone());
+    let mut join_set: JoinSet<(usize, Result<TableResult, anyhow::Error>)> = JoinSet::new();
+
+    // Background state sync — flush watermarks to remote storage every 30s
+    let state_sync_handle = {
+        let state_cfg = rocky_cfg.state.clone();
+        let state_p = state_path.to_path_buf();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if let Err(e) = rocky_core::state_sync::upload_state(&state_cfg, &state_p) {
+                    warn!(error = %e, "periodic state sync failed");
+                }
+            }
+        })
+    };
+
+    // Track the semaphore's effective capacity so we can adjust it when the
+    // throttle changes. Starts at `concurrency` and is adjusted after each
+    // completed task (only when adaptive concurrency is enabled).
+    let mut semaphore_capacity = concurrency;
+
+    // Mutable accumulators declared before the spawn loop so the inline
+    // result-drain path (adaptive concurrency) and the post-spawn
+    // collection loop can both append to them.
+    let mut table_errors: Vec<TableError> = Vec::new();
+    let mut deferred_tags: Vec<DeferredTagging> = Vec::new();
+    let mut deferred_watermarks: Vec<DeferredWatermark> = Vec::new();
+    let error_rate_abort_pct = pipeline.execution.error_rate_abort_pct;
+    let mut total_completed: usize = 0;
+
+    for (idx, task) in tables_to_process.iter().enumerate() {
+        // When adaptive concurrency is active, drain completed results before
+        // spawning so we can adjust the semaphore to match the throttle's
+        // recommendation before acquiring the next permit. This interleaves
+        // spawning and collection, enabling the AIMD feedback loop.
+        if throttle.is_some() {
+            while let Some(completed) = join_set.try_join_next() {
+                process_completed_result(
+                    completed,
+                    &tables_to_process,
+                    &throttle,
+                    &semaphore,
+                    &mut semaphore_capacity,
+                    &mut output,
+                    &mut pending_checks,
+                    &mut source_batch_refs,
+                    &mut target_batch_refs,
+                    &mut freshness_batch_refs,
+                    &mut batch_asset_keys,
+                    &mut table_errors,
+                    &mut deferred_tags,
+                    &mut deferred_watermarks,
+                    &shared_state,
+                    &shared_run_id,
+                    &mut total_completed,
+                )
+                .await;
+            }
+        }
+
+        let permit = semaphore.clone().acquire_owned().await?;
+        let warehouse = shared_warehouse.clone();
+        let state = shared_state.clone();
+        let pipeline_ref = shared_pipeline.clone();
+        let task = task.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit;
+            let result = process_table(warehouse.as_ref(), &state, &pipeline_ref, &task).await;
+            (idx, result)
+        });
+    }
+
+    // Collect remaining results with adaptive error rate monitoring
+    while let Some(result) = join_set.join_next().await {
+        total_completed += 1;
+
+        match result {
+            Ok((_, Ok(tr))) => {
+                // Signal success to the adaptive throttle
+                if let Some(t) = &throttle {
+                    t.on_success();
+                    adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
+                }
+                output.tables_copied += 1;
+                rocky_observe::metrics::METRICS.inc_tables_processed();
+                rocky_observe::metrics::METRICS
+                    .record_table_duration_ms(tr.materialization.duration_ms);
+                output.materializations.push(tr.materialization);
+
+                if tr.drift_checked {
+                    output.drift.tables_checked += 1;
+                }
+                if let Some(drift_action) = tr.drift_detected {
+                    output.drift.tables_drifted += 1;
+                    output.drift.actions_taken.push(drift_action);
+                }
+
+                if let Some(check) = tr.column_match_check {
+                    let entry = pending_checks
+                        .entry(tr.target_full_name.clone())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: tr.asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                    entry.checks.push(check);
+                }
+
+                if let Some(src_ref) = tr.source_batch_ref {
+                    source_batch_refs.push(src_ref);
+                }
+                if let Some(tgt_ref) = tr.target_batch_ref {
+                    target_batch_refs.push(tgt_ref);
+                }
+                batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key.clone()));
+
+                if let Some(fresh_ref) = tr.freshness_batch_ref {
+                    freshness_batch_refs.push(fresh_ref);
+                }
+
+                if let Some(tags) = tr.deferred_tags {
+                    deferred_tags.push(tags);
+                }
+                if let Some(wm) = tr.deferred_watermark {
+                    deferred_watermarks.push(wm);
+                }
+
+                // Checkpoint: record successful table progress
+                {
+                    let state = shared_state.lock().await;
+                    let _ = state.record_table_progress(
+                        &shared_run_id,
+                        &rocky_core::state::TableProgress {
+                            index: total_completed - 1,
+                            table_key: tr.target_full_name,
+                            asset_key: tr.asset_key,
+                            status: rocky_core::state::TableStatus::Success,
+                            error: None,
+                            duration_ms: output
+                                .materializations
+                                .last()
+                                .map_or(0, |m| m.duration_ms),
+                            completed_at: Utc::now(),
+                        },
+                    );
+                }
+            }
+            Ok((idx, Err(e))) => {
+                let msg = format!("{e:#}");
+                if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
+                    warn!(
+                        table_index = idx,
+                        error = msg.as_str(),
+                        "source table not found, skipping"
+                    );
+                    continue;
+                }
+
+                // Signal the adaptive throttle: rate limits reduce concurrency,
+                // other errors are treated as successes (they're permanent
+                // failures, not a signal to slow down).
+                if let Some(t) = &throttle {
+                    if is_rate_limit_error(&msg) {
+                        t.on_rate_limit();
+                        adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
+                    }
+                }
+
+                warn!(error = msg, "table processing failed");
+                rocky_observe::metrics::METRICS.inc_tables_failed();
+
+                // Checkpoint: record failed table progress
+                {
+                    let task = tables_to_process.get(idx);
+                    let table_key = task
+                        .map(|t| {
+                            format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name)
+                        })
+                        .unwrap_or_default();
+                    let state = shared_state.lock().await;
+                    let _ = state.record_table_progress(
+                        &shared_run_id,
+                        &rocky_core::state::TableProgress {
+                            index: idx,
+                            table_key,
+                            asset_key: vec![],
+                            status: rocky_core::state::TableStatus::Failed,
+                            error: Some(msg.clone()),
+                            duration_ms: 0,
+                            completed_at: Utc::now(),
+                        },
+                    );
+                }
+
+                table_errors.push(TableError {
+                    asset_key: vec![],
+                    error: msg,
+                    task_index: Some(idx),
+                });
+                if fail_fast {
+                    join_set.abort_all();
+                    break;
+                }
+            }
+            Err(e) => {
+                let msg = format!("task failed: {e}");
+                warn!(error = msg, "table task panicked");
+
+                // Checkpoint: record panicked task progress
+                {
+                    let state = shared_state.lock().await;
+                    let _ = state.record_table_progress(
+                        &shared_run_id,
+                        &rocky_core::state::TableProgress {
+                            index: 0,
+                            table_key: String::new(),
+                            asset_key: vec![],
+                            status: rocky_core::state::TableStatus::Failed,
+                            error: Some(msg.clone()),
+                            duration_ms: 0,
+                            completed_at: Utc::now(),
+                        },
+                    );
+                }
+
+                table_errors.push(TableError {
+                    asset_key: vec![],
+                    error: msg,
+                    task_index: None,
+                });
+                if fail_fast {
+                    join_set.abort_all();
+                    break;
+                }
+            }
+        }
+
+        // Adaptive error rate abort
+        if error_rate_abort_pct > 0 && total_completed >= 4 {
+            let current_rate = (table_errors.len() as f64 / total_completed as f64 * 100.0) as u32;
+            if current_rate >= error_rate_abort_pct {
+                warn!(
+                    error_rate = current_rate,
+                    threshold = error_rate_abort_pct,
+                    "error rate exceeded threshold, aborting remaining tables"
+                );
+                join_set.abort_all();
+                break;
+            }
+        }
+    }
+
+    // Auto-retry failed tables
+    let table_retries = pipeline.execution.table_retries;
+    if table_retries > 0 && !table_errors.is_empty() {
+        let retryable: Vec<usize> = table_errors.iter().filter_map(|e| e.task_index).collect();
+
+        if !retryable.is_empty() {
+            info!(
+                tables = retryable.len(),
+                "retrying failed tables (attempt 2)"
+            );
+            let mut still_failed = Vec::new();
+            for idx in retryable {
+                let task = &tables_to_process[idx];
+                match process_table(
+                    shared_warehouse.as_ref(),
+                    &shared_state,
+                    &shared_pipeline,
+                    task,
+                )
+                .await
+                {
+                    Ok(tr) => {
+                        output.tables_copied += 1;
+                        rocky_observe::metrics::METRICS.inc_tables_processed();
+                        output.materializations.push(tr.materialization);
+                        if tr.drift_checked {
+                            output.drift.tables_checked += 1;
+                        }
+                        if let Some(src_ref) = tr.source_batch_ref {
+                            source_batch_refs.push(src_ref);
+                        }
+                        if let Some(tgt_ref) = tr.target_batch_ref {
+                            target_batch_refs.push(tgt_ref);
+                        }
+                        batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key));
+                        if let Some(tags) = tr.deferred_tags {
+                            deferred_tags.push(tags);
+                        }
+                        if let Some(wm) = tr.deferred_watermark {
+                            deferred_watermarks.push(wm);
+                        }
+                        info!(table = task.table_name.as_str(), "retry succeeded");
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        warn!(
+                            table = task.table_name.as_str(),
+                            error = msg,
+                            "retry also failed"
+                        );
+                        still_failed.push(TableError {
+                            asset_key: vec![],
+                            error: msg,
+                            task_index: Some(idx),
+                        });
+                    }
+                }
+            }
+            table_errors.retain(|e| e.task_index.is_none());
+            table_errors.extend(still_failed);
+        }
+    }
+
+    // Stop background state sync and reclaim resources for post-run phase
+    state_sync_handle.abort();
+
+    // --- Batch watermark updates (no lock contention — sequential post-run) ---
+    {
+        let state = shared_state.lock().await;
+        for wm in &deferred_watermarks {
+            let _ = state.set_watermark(
+                &wm.state_key,
+                &WatermarkState {
+                    last_value: wm.timestamp,
+                    updated_at: wm.timestamp,
+                },
+            );
+        }
+    }
+
+    // --- Batch table tagging (concurrent, outside the main processing loop) ---
+    // Table tagging uses CatalogManager which requires the Databricks connector.
+    // For non-Databricks adapters, tagging was already handled via GovernanceAdapter
+    // (NoopGovernanceAdapter silently succeeds) so deferred_tags will be empty.
+    if !deferred_tags.is_empty() {
+        if let Some(ref db_conn) = shared_connector {
+            let tag_start = Instant::now();
+
+            let tag_results: Vec<_> = futures::future::join_all(deferred_tags.iter().map(|dt| {
+                let catalog_mgr = rocky_databricks::catalog::CatalogManager::new(db_conn);
+                async move {
+                    catalog_mgr
+                        .set_table_tags(&dt.catalog, &dt.schema, &dt.table, &dt.tags)
+                        .await
+                        .map_err(|e| (format!("{}.{}.{}", dt.catalog, dt.schema, dt.table), e))
+                }
+            }))
+            .await;
+
+            let mut tag_failures = 0usize;
+            for result in &tag_results {
+                if let Err((table, e)) = result {
+                    warn!(table, error = %e, "table tagging failed");
+                    tag_failures += 1;
+                }
+            }
+            debug!(
+                tables = deferred_tags.len(),
+                failures = tag_failures,
+                elapsed_ms = tag_start.elapsed().as_millis() as u64,
+                "batch tagging complete"
+            );
+        } else {
+            warn!(
+                tables = deferred_tags.len(),
+                "skipping batch table tagging — no Databricks connector available"
+            );
+        }
+    }
+
+    let state_store = Arc::try_unwrap(shared_state).ok().map(|m| m.into_inner());
+
+    // --- Batched checks ---
+    let _checks_span = info_span!("batched_checks").entered();
+    let checks_start = Instant::now();
+
+    let row_count_enabled = pipeline.checks.row_count && !source_batch_refs.is_empty();
+    let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
+
+    if row_count_enabled || freshness_enabled {
+        info!(
+            row_count_tables = source_batch_refs.len(),
+            freshness_tables = freshness_batch_refs.len(),
+            "running batched checks concurrently"
+        );
+    }
+
+    // Batch checks use the Databricks connector when available (UNION ALL
+    // batching). Otherwise, fall back to per-table queries via WarehouseAdapter.
+    let (source_counts, target_counts, freshness_results) = if let Some(ref db_conn) =
+        shared_connector
+    {
+        tokio::try_join!(
+            async {
+                if row_count_enabled {
+                    batch::execute_batch_row_counts(db_conn, &source_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if row_count_enabled {
+                    batch::execute_batch_row_counts(db_conn, &target_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if freshness_enabled {
+                    batch::execute_batch_freshness(
+                        db_conn,
+                        &freshness_batch_refs,
+                        &pipeline.timestamp_column,
+                    )
+                    .await
+                } else {
+                    Ok(vec![])
+                }
+            },
+        )?
+    } else {
+        // Per-table fallback via WarehouseAdapter for non-Databricks targets
+        let dialect = shared_warehouse.dialect();
+        let mut src_counts = Vec::new();
+        let mut tgt_counts = Vec::new();
+        let mut fresh_results: Vec<batch::FreshnessResult> = Vec::new();
+
+        if row_count_enabled {
+            for br in &source_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                match shared_warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let count = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        src_counts.push(batch::RowCountResult {
+                            catalog: br.catalog.clone(),
+                            schema: br.schema.clone(),
+                            table: br.table.clone(),
+                            count,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                    }
+                }
+            }
+            for br in &target_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                match shared_warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let count = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        tgt_counts.push(batch::RowCountResult {
+                            catalog: br.catalog.clone(),
+                            schema: br.schema.clone(),
+                            table: br.table.clone(),
+                            count,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                    }
+                }
+            }
+        }
+
+        if freshness_enabled {
+            for br in &freshness_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
+                match shared_warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let max_ts = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        fresh_results.push(batch::FreshnessResult {
+                            catalog: br.catalog.clone(),
+                            schema: br.schema.clone(),
+                            table: br.table.clone(),
+                            max_timestamp: max_ts,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
+                    }
+                }
+            }
+        }
+
+        (src_counts, tgt_counts, fresh_results)
+    };
+
+    // Process row count results
+    if row_count_enabled {
+        let source_map: HashMap<String, u64> = source_counts
+            .iter()
+            .map(|r| (format!("{}.{}.{}", r.catalog, r.schema, r.table), r.count))
+            .collect();
+        let target_map: HashMap<String, u64> = target_counts
+            .iter()
+            .map(|r| (format!("{}.{}.{}", r.catalog, r.schema, r.table), r.count))
+            .collect();
+
+        for (target_key, asset_key) in &batch_asset_keys {
+            let src_ref = &source_batch_refs
+                .iter()
+                .zip(target_batch_refs.iter())
+                .find(|(_, t)| format!("{}.{}.{}", t.catalog, t.schema, t.table) == *target_key)
+                .map(|(s, _)| format!("{}.{}.{}", s.catalog, s.schema, s.table));
+
+            if let Some(src_key) = src_ref {
+                let src_count = source_map.get(src_key).copied().unwrap_or(0);
+                let tgt_count = target_map.get(target_key).copied().unwrap_or(0);
+                let check = checks::check_row_count(src_count, tgt_count);
+                let entry =
+                    pending_checks
+                        .entry(target_key.clone())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.push(check);
+            }
+        }
+    }
+
+    // Anomaly detection
+    if row_count_enabled {
+        if let Some(ref store) = state_store {
+            for (target_key, _) in &batch_asset_keys {
+                let tgt_count = target_counts
+                    .iter()
+                    .find(|r| format!("{}.{}.{}", r.catalog, r.schema, r.table) == *target_key)
+                    .map(|r| r.count)
+                    .unwrap_or(0);
+
+                let _ = store.record_row_count(target_key, tgt_count, 10);
+
+                if let Ok(history) = store.get_check_history(target_key) {
+                    let anomaly = rocky_core::state::detect_anomaly(
+                        target_key,
+                        tgt_count,
+                        &history,
+                        pipeline.checks.anomaly_threshold_pct,
+                    );
+                    if anomaly.is_anomaly {
+                        warn!(
+                            table = target_key.as_str(),
+                            reason = anomaly.reason.as_str(),
+                            "row count anomaly detected"
+                        );
+                        rocky_observe::metrics::METRICS.inc_anomalies_detected();
+                        output.anomalies.push(AnomalyOutput {
+                            table: anomaly.table,
+                            current_count: anomaly.current_count,
+                            baseline_avg: anomaly.baseline_avg,
+                            deviation_pct: anomaly.deviation_pct,
+                            reason: anomaly.reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Process freshness results
+    if let Some(ref freshness_cfg) = pipeline.checks.freshness {
+        let now = Utc::now();
+        for fr in &freshness_results {
+            let key = format!("{}.{}.{}", fr.catalog, fr.schema, fr.table);
+            if let Some(ts_str) = &fr.max_timestamp {
+                // Try RFC 3339 first, then Databricks format ("YYYY-MM-DD HH:MM:SS.fff")
+                let parsed = ts_str.parse::<chrono::DateTime<Utc>>().or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f")
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+                        })
+                        .map(|naive| naive.and_utc())
+                });
+                if let Ok(ts) = parsed {
+                    let lag = (now - ts).num_seconds().unsigned_abs();
+                    let check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
+
+                    if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
+                        let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                        entry.checks.push(check);
+                    }
+                }
+            }
+        }
+    }
+
+    // Assemble check results
+    for (_table_key, pending) in pending_checks {
+        if !pending.checks.is_empty() {
+            output.check_results.push(TableCheckOutput {
+                asset_key: pending.asset_key,
+                checks: pending.checks,
+            });
+        }
+    }
+
+    if checks_start.elapsed().as_millis() > 0 {
+        info!(
+            duration_ms = checks_start.elapsed().as_millis() as u64,
+            tables = output.tables_copied,
+            "batched checks complete"
+        );
+    }
+    drop(_checks_span);
+
+    // --- Compiled model execution (--all or --models) ---
+    if run_all || models_dir.is_some() {
+        let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
+        if mdir.exists() {
+            let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
+            execute_models(
+                mdir,
+                warehouse.as_ref(),
+                state_store.as_ref(),
+                partition_opts,
+                &run_id,
+                &mut output,
+            )
+            .await?;
+        }
+    }
+
+    output.duration_ms = start.elapsed().as_millis() as u64;
+    output.permissions.catalogs_created = catalogs_created;
+    output.permissions.schemas_created = schemas_created;
+    output.metrics = Some(rocky_observe::metrics::METRICS.snapshot());
+
+    // Upload state to remote storage
+    if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path) {
+        warn!(error = %e, "state upload failed");
+    }
+
+    output.execution.tables_processed = output.tables_copied + table_errors.len();
+    output.execution.tables_failed = table_errors.len();
+    output.execution.adaptive_concurrency = adaptive;
+    if let Some(t) = &throttle {
+        output.execution.final_concurrency = Some(t.current());
+        output.execution.rate_limits_detected = Some(t.rate_limits_total());
+    }
+    output.tables_failed = table_errors.len();
+    output.errors = table_errors
+        .iter()
+        .map(|e| TableErrorOutput {
+            asset_key: e.asset_key.clone(),
+            error: e.error.clone(),
+        })
+        .collect();
+
+    // Dagster Pipes message emission. We emit at the END of the run
+    // (not per-event during) so the streaming is batch-at-the-end
+    // rather than truly live — that's a simplification of the full
+    // Pipes story (per-table events would require threading the
+    // emitter through the async parallel execution path, which is a
+    // larger refactor). Even batch-at-end gives Dagster's run viewer
+    // structured MaterializationEvent / AssetCheckEvaluation entries
+    // (instead of just stderr forwarding), which is the core T2
+    // contract.
+    if let Some(p) = &pipes {
+        emit_pipes_events(p, &output);
+        p.log(
+            "INFO",
+            &format!(
+                "rocky run complete: {} copied, {} failed in {}ms",
+                output.tables_copied, output.tables_failed, output.duration_ms,
+            ),
+        );
+        p.closed();
+    }
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        if let Some(ref resumed_from) = output.resumed_from {
+            println!(
+                "Resumed from {resumed_from} (skipped {} tables)",
+                output.tables_skipped
+            );
+        }
+        println!(
+            "Copied {} tables in {:.1}s (run_id: {run_id})",
+            output.tables_copied,
+            output.duration_ms as f64 / 1000.0
+        );
+        if output.drift.tables_drifted > 0 {
+            println!(
+                "Drift: {}/{} tables drifted",
+                output.drift.tables_drifted, output.drift.tables_checked
+            );
+        }
+    }
+
+    if !table_errors.is_empty() {
+        let count = table_errors.len();
+        for e in &table_errors {
+            warn!(error = e.error.as_str(), "table error");
+        }
+        anyhow::bail!(
+            "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Emit Dagster Pipes messages for every materialization, check, and
+/// drift action in a completed `RunOutput`.
+///
+/// This is the "batch at end of run" approach to Pipes streaming. The
+/// fully-streaming alternative (per-table events as they complete)
+/// would require threading the [`crate::pipes::PipesEmitter`] through
+/// the async parallel execution path in `process_table` and
+/// `run_one_partition`. That's a larger refactor; the batch approach
+/// gives Dagster's run viewer structured `MaterializationEvent` and
+/// `AssetCheckEvaluation` entries today and can be upgraded to
+/// per-event streaming in a follow-up without changing the wire
+/// protocol or the dagster-side consumer.
+///
+/// The `asset_key` for each event is slash-joined per the Dagster
+/// Pipes wire convention (e.g. `"fivetran/acme/orders"`), matching
+/// the `[Vec<String>]` paths the engine emits in `MaterializationOutput`.
+///
+/// `pub(super)` so the non-replication pipeline paths in `run_local.rs`
+/// can call it with the same wire format.
+pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &RunOutput) {
+    use serde_json::json;
+
+    // Materializations.
+    for mat in &output.materializations {
+        let asset_key = mat.asset_key.join("/");
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("strategy".into(), json!(mat.metadata.strategy));
+        metadata.insert("duration_ms".into(), json!(mat.duration_ms));
+        if let Some(rows) = mat.rows_copied {
+            metadata.insert("rows_copied".into(), json!(rows));
+        }
+        if let Some(ref tn) = mat.metadata.target_table_full_name {
+            metadata.insert("target_table_full_name".into(), json!(tn));
+        }
+        if let Some(ref hash) = mat.metadata.sql_hash {
+            metadata.insert("sql_hash".into(), json!(hash));
+        }
+        if let Some(ref watermark) = mat.metadata.watermark {
+            metadata.insert("watermark".into(), json!(watermark.to_rfc3339()));
+        }
+        if let Some(ref part) = mat.partition {
+            metadata.insert("partition_key".into(), json!(part.key));
+        }
+        pipes.report_asset_materialization(&asset_key, json!(metadata));
+    }
+
+    // Asset checks. Each TableCheckOutput has multiple per-check rows;
+    // we emit one Pipes message per check entry. CheckResult is an
+    // untagged enum (rocky_core::checks::CheckResult); for now we
+    // serialize whatever the engine produced and let Dagster type-infer.
+    for table_check in &output.check_results {
+        let asset_key = table_check.asset_key.join("/");
+        for check in &table_check.checks {
+            let check_value = serde_json::to_value(check).unwrap_or(json!({}));
+            // Extract `name` and `passed` from the serialized check
+            // BEFORE moving check_value into the report call. CheckResult
+            // variants use lowercase tagged keys; the common shape exposes
+            // a "name" field at the top level.
+            let check_name = check_value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let passed = check_value
+                .get("passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            pipes.report_asset_check(
+                &asset_key,
+                &check_name,
+                passed,
+                crate::pipes::PipesCheckSeverity::Error,
+                check_value,
+            );
+        }
+    }
+
+    // Drift actions: surface as log messages so they appear in the
+    // Dagster run viewer's structured logs. Drift is a structural
+    // event, not pass/fail; the dagster-rocky integration converts
+    // these to AssetObservation events on its own side.
+    for action in &output.drift.actions_taken {
+        pipes.log(
+            "WARN",
+            &format!(
+                "rocky drift on {}: {} ({})",
+                action.table, action.action, action.reason,
+            ),
+        );
+    }
+}
+
+/// Compile and execute every model in `models_dir` against the given
+/// warehouse adapter. Shared between `run()` (Databricks path) and
+/// `run_local()` (DuckDB / non-Databricks path) so the dispatch in `run()`
+/// doesn't have to duplicate the time_interval branching logic.
+///
+/// Dispatches per-model on the materialization strategy: `time_interval`
+/// goes through `execute_time_interval_model()` (per-partition path);
+/// everything else (full_refresh / incremental / merge / materialized_view)
+/// uses the single-statement path via `generate_transformation_sql`.
+#[tracing::instrument(skip_all, name = "execute_models")]
+pub(crate) async fn execute_models(
+    models_dir: &Path,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    output: &mut RunOutput,
+) -> Result<()> {
+    info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
+
+    let compile_config = rocky_compiler::compile::CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas: std::collections::HashMap::new(),
+        source_column_info: std::collections::HashMap::new(),
+    };
+
+    let compile_result = match rocky_compiler::compile::compile(&compile_config) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "model compilation failed — skipping model execution");
+            return Ok(());
+        }
+    };
+
+    if compile_result.has_errors {
+        for d in &compile_result.diagnostics {
+            if d.is_error() {
+                warn!(
+                    model = d.model.as_str(),
+                    code = d.code.as_str(),
+                    message = d.message.as_str(),
+                    "compile error"
+                );
+            }
+        }
+        warn!("model compilation had errors — skipping model execution");
+        return Ok(());
+    }
+
+    let dialect = warehouse.dialect();
+    let mut models_executed = 0usize;
+
+    // Bundle borrowed compile-time facts (typed schemas + per-model timings)
+    // into a single ExecutionContext that's threaded through every per-model
+    // execution path. Future compile-time fields (semantic info, optimize
+    // results, contract diagnostics) ride on this struct without further
+    // signature churn.
+    let exec_ctx = ExecutionContext {
+        typed_models: &compile_result.type_check.typed_models,
+        model_timings: &compile_result.model_timings,
+    };
+
+    for layer in &compile_result.project.layers {
+        for model_name in layer {
+            let Some(model) = compile_result.project.model(model_name) else {
+                continue;
+            };
+
+            // Dispatch on the materialization strategy. time_interval models
+            // take the per-partition path so the runtime can iterate
+            // partitions, populate the window per partition, and record
+            // state-store rows. Other strategies use the single-statement
+            // path via generate_transformation_sql.
+            if matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::TimeInterval { .. }
+            ) {
+                execute_time_interval_model(
+                    model,
+                    warehouse,
+                    dialect,
+                    state_store,
+                    partition_opts,
+                    run_id,
+                    output,
+                    &exec_ctx,
+                )
+                .await
+                .with_context(|| format!("model '{model_name}' failed"))?;
+                models_executed += 1;
+                continue;
+            }
+
+            let plan = model.to_plan();
+            let target_ref = dialect
+                .format_table_ref(
+                    &plan.target.catalog,
+                    &plan.target.schema,
+                    &plan.target.table,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql(&plan, dialect)?;
+
+            info!(
+                model = model_name.as_str(),
+                target = target_ref.as_str(),
+                statements = exec_stmts.len(),
+                "executing model"
+            );
+            for exec_sql in &exec_stmts {
+                warehouse
+                    .execute_statement(exec_sql)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("model '{model_name}' failed: {e}"))?;
+            }
+            models_executed += 1;
+        }
+    }
+
+    info!(models = models_executed, "model execution complete");
+    Ok(())
+}
+
+/// Execute a `time_interval` model: plan partitions, execute each, record
+/// state-store rows, and append per-partition entries to the run output.
+///
+/// This is the per-partition path the runtime takes for any model with
+/// `StrategyConfig::TimeInterval`. The flow:
+///
+/// 1. Resolve the user's CLI selection (`--partition` / `--from` /
+///    `--to` / `--latest` / `--missing`) into a `PartitionSelection`,
+///    defaulting to `Latest` if no flag was passed.
+/// 2. Call `plan_partitions()` to expand the selection (with lookback
+///    + batching) into a `Vec<PartitionPlan>`.
+/// 3. For each plan: populate `MaterializationStrategy::TimeInterval
+///    { window: Some(...) }`, generate SQL via
+///    `generate_transformation_sql()` (which calls
+///    `dialect.insert_overwrite_partition()` to get the warehouse-
+///    specific `Vec<String>`), execute each statement in order, and
+///    record the partition state in the `PARTITIONS` table.
+/// 4. Build a `PartitionInfo` per materialization and a single
+///    `PartitionSummary` per model and push them to the run output.
+///
+/// Errors propagate to the caller; the state-store row records the
+/// `Failed` status before bubbling so a subsequent `--missing` run can
+/// pick up where this one left off.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(model = %model.config.name))]
+async fn execute_time_interval_model(
+    model: &rocky_core::models::Model,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    output: &mut RunOutput,
+    exec_ctx: &ExecutionContext<'_>,
+) -> Result<()> {
+    use rocky_core::plan_partition::{PartitionSelection, plan_partitions};
+
+    let model_name = model.config.name.as_str();
+
+    // Sanity check the strategy. We accept the model as-is — granularity
+    // and other config flow through `model.to_plan()` below.
+    if !matches!(
+        model.config.strategy,
+        rocky_core::models::StrategyConfig::TimeInterval { .. }
+    ) {
+        anyhow::bail!(
+            "execute_time_interval_model called for non-time_interval model '{model_name}'"
+        );
+    }
+
+    // Default selection: --latest. Matches the plan: "Default behavior when
+    // running a time_interval model with no flags: --latest, with lookback
+    // from the TOML applied."
+    let selection = partition_opts
+        .to_selection()
+        .unwrap_or(PartitionSelection::Latest);
+
+    // plan_partitions needs a state-store reference for --missing discovery.
+    // For non-Missing selections it doesn't read state, but we still need
+    // a valid reference. If state_store is None (caller skipped state init)
+    // we open a fresh in-memory-ish store at a temp path. In practice
+    // state_store is always Some when reaching this code.
+    let temp_state_dir;
+    let local_state;
+    let state_ref: &StateStore = if let Some(s) = state_store {
+        s
+    } else {
+        temp_state_dir = tempfile::TempDir::new()
+            .context("failed to allocate temp state store for partition planning")?;
+        local_state = StateStore::open(&temp_state_dir.path().join("partitions.redb"))
+            .context("failed to open temp state store")?;
+        &local_state
+    };
+
+    let plans = plan_partitions(model, selection, partition_opts.lookback, state_ref)
+        .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
+
+    info!(
+        model = model_name,
+        partitions = plans.len(),
+        "planning partitions for time_interval model"
+    );
+
+    if plans.is_empty() {
+        // No partitions to run (e.g., --missing with everything already
+        // computed). Still emit an empty PartitionSummary so dagster can
+        // tell the model was considered.
+        output.partition_summaries.push(PartitionSummary {
+            model: model_name.into(),
+            partitions_planned: 0,
+            partitions_succeeded: 0,
+            partitions_failed: 0,
+            partitions_skipped: 0,
+        });
+        return Ok(());
+    }
+
+    let target_table = format!(
+        "{}.{}.{}",
+        model.config.target.catalog, model.config.target.schema, model.config.target.table
+    );
+    let asset_key = vec![
+        model.config.target.catalog.clone(),
+        model.config.target.schema.clone(),
+        model.config.target.table.clone(),
+    ];
+
+    // Bootstrap-on-first-run: the time_interval DELETE+INSERT cycle requires
+    // the target table to exist. If it doesn't (first run, or after manual
+    // cleanup), render the model SQL with an empty `[start, start)` window
+    // and wrap in CREATE OR REPLACE TABLE AS to materialize an empty table
+    // with the right output schema. Subsequent partition runs use the
+    // normal DELETE+INSERT path.
+    let target_ref_struct = rocky_core::ir::TableRef {
+        catalog: model.config.target.catalog.clone(),
+        schema: model.config.target.schema.clone(),
+        table: model.config.target.table.clone(),
+    };
+    let target_exists = warehouse.describe_table(&target_ref_struct).await.is_ok();
+    if !target_exists {
+        let bootstrap_plan = model.to_plan();
+        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_plan, dialect)
+            .with_context(|| format!("failed to render bootstrap SQL for model '{model_name}'"))?;
+        info!(
+            model = model_name,
+            target = target_table.as_str(),
+            "target table does not exist — bootstrapping empty table from model schema"
+        );
+        warehouse
+            .execute_statement(&bootstrap_sql)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "bootstrap of '{target_table}' failed for model '{model_name}': {e}"
+                )
+            })?;
+    }
+
+    let mut summary = PartitionSummary {
+        model: model_name.into(),
+        partitions_planned: plans.len(),
+        partitions_succeeded: 0,
+        partitions_failed: 0,
+        partitions_skipped: 0,
+    };
+
+    // --parallel N drives concurrency. The flag is parsed in main.rs and
+    // arrives here in `partition_opts.parallel`. The bootstrap above is
+    // already complete (sequential), so it's safe to fan out per-partition
+    // execution: each partition is independent SQL, the state-store writes
+    // serialize through redb's single writer lock, and warehouse-query
+    // parallelism is what the user asked for.
+    //
+    // We use `futures::stream::buffer_unordered` rather than
+    // tokio::task::JoinSet because the per-partition futures don't need
+    // to be Send / 'static — they're polled in the same task as
+    // `execute_time_interval_model`, just up to N at a time. This avoids
+    // having to wrap warehouse and state_ref in Arc.
+    let parallel_limit = (partition_opts.parallel as usize).max(1);
+    info!(
+        model = model_name,
+        partitions = plans.len(),
+        parallel = parallel_limit,
+        "executing partitions"
+    );
+
+    use futures::stream::StreamExt;
+    let mut results: Vec<PartitionExecutionResult> = futures::stream::iter(plans.into_iter())
+        .map(|partition_plan| {
+            run_one_partition(
+                partition_plan,
+                model,
+                warehouse,
+                dialect,
+                state_ref,
+                run_id,
+                model_name,
+                &asset_key,
+                exec_ctx,
+            )
+        })
+        .buffer_unordered(parallel_limit)
+        .collect()
+        .await;
+
+    // Re-sort chronologically so the JSON output is deterministic regardless
+    // of which partition's future completed first under the parallel scheduler.
+    results.sort_by(|a, b| a.partition_key.cmp(&b.partition_key));
+
+    // Walk results: push successes to output, surface the first failure.
+    // We collect ALL results before checking errors so other in-flight
+    // partitions complete cleanly (rather than being cancelled mid-flight).
+    let mut first_error: Option<(anyhow::Error, String)> = None;
+    for r in results {
+        match r.outcome {
+            Ok(materialization) => {
+                output.materializations.push(materialization);
+                summary.partitions_succeeded += 1;
+            }
+            Err(err) => {
+                summary.partitions_failed += 1;
+                if first_error.is_none() {
+                    first_error = Some((err, r.partition_key));
+                }
+            }
+        }
+    }
+
+    info!(
+        model = model_name,
+        target = target_table.as_str(),
+        succeeded = summary.partitions_succeeded,
+        failed = summary.partitions_failed,
+        "time_interval model execution complete"
+    );
+
+    output.partition_summaries.push(summary);
+
+    if let Some((err, key)) = first_error {
+        return Err(err.context(format!("partition '{key}' of model '{model_name}' failed")));
+    }
+    Ok(())
+}
+
+/// Result of running one partition. Returned from `run_one_partition` so the
+/// outer `execute_time_interval_model` can fan out via `buffer_unordered` and
+/// then collect results back into the run output sequentially.
+struct PartitionExecutionResult {
+    /// Canonical partition key, used for sorting and error messages.
+    partition_key: String,
+    /// Either the materialization to push into `RunOutput.materializations`,
+    /// or an error to surface after all partitions complete.
+    outcome: Result<MaterializationOutput, anyhow::Error>,
+}
+
+/// Execute exactly one partition: mark InProgress in the state store, generate
+/// SQL via `dialect.insert_overwrite_partition`, run the statements, and mark
+/// Computed (or Failed on error). Pure with respect to outer state — touches
+/// only the state store and the warehouse, never `RunOutput` directly.
+///
+/// Pulled out of `execute_time_interval_model` so it can be driven by
+/// `futures::stream::buffer_unordered` for `--parallel N` execution. The
+/// per-partition futures are polled concurrently in the same task as the
+/// caller; redb's single-writer lock serializes the state-store writes.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(model = %model_name, partition = %partition_plan.partition_key))]
+async fn run_one_partition(
+    partition_plan: rocky_core::plan_partition::PartitionPlan,
+    model: &rocky_core::models::Model,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    state_ref: &StateStore,
+    run_id: &str,
+    model_name: &str,
+    asset_key: &[String],
+    exec_ctx: &ExecutionContext<'_>,
+) -> PartitionExecutionResult {
+    use rocky_core::incremental::{PartitionRecord, PartitionStatus};
+    let key = partition_plan.partition_key.clone();
+    let partition_start = std::time::Instant::now();
+
+    // Mark InProgress before executing so a crashed runner leaves a
+    // diagnostic breadcrumb in the state store.
+    let mut record = PartitionRecord {
+        model_name: model_name.into(),
+        partition_key: key.clone(),
+        status: PartitionStatus::InProgress,
+        computed_at: chrono::Utc::now(),
+        row_count: 0,
+        duration_ms: 0,
+        run_id: run_id.into(),
+        checksum: None,
+    };
+    if let Err(e) = state_ref.record_partition(&record) {
+        return PartitionExecutionResult {
+            partition_key: key.clone(),
+            outcome: Err(anyhow::anyhow!(
+                "failed to record InProgress for {model_name}|{key}: {e}"
+            )),
+        };
+    }
+
+    // Build the per-partition plan: clone the base TransformationPlan and
+    // inject the PartitionWindow into the strategy.
+    let mut tplan = model.to_plan();
+    if let MaterializationStrategy::TimeInterval { window, .. } = &mut tplan.strategy {
+        *window = Some(partition_plan.window.clone());
+    }
+
+    // Generate SQL — this is where dialect.insert_overwrite_partition() gets
+    // called and the @start_date / @end_date placeholders are substituted
+    // (Phase 2D).
+    let stmts = match sql_gen::generate_transformation_sql(&tplan, dialect) {
+        Ok(s) => s,
+        Err(e) => {
+            return PartitionExecutionResult {
+                partition_key: key.clone(),
+                outcome: Err(anyhow::anyhow!(
+                    "SQL gen failed for {model_name}|{key}: {e}"
+                )),
+            };
+        }
+    };
+
+    info!(
+        model = model_name,
+        partition = key.as_str(),
+        statements = stmts.len(),
+        "executing partition"
+    );
+
+    // Execute each statement in order. On any failure, attempt ROLLBACK so
+    // transactional dialects (Snowflake / DuckDB) don't leave partial state
+    // visible.
+    let mut exec_err: Option<anyhow::Error> = None;
+    for stmt in &stmts {
+        if let Err(e) = warehouse.execute_statement(stmt).await {
+            exec_err = Some(anyhow::anyhow!("{e}"));
+            break;
+        }
+    }
+
+    if let Some(err) = exec_err {
+        // Best-effort rollback. Ignored for dialects that don't use
+        // transactions (Databricks REPLACE WHERE) — ROLLBACK errors there
+        // are expected.
+        let _ = warehouse.execute_statement("ROLLBACK").await;
+
+        record.status = PartitionStatus::Failed;
+        record.duration_ms = partition_start.elapsed().as_millis() as u64;
+        let _ = state_ref.record_partition(&record);
+
+        return PartitionExecutionResult {
+            partition_key: key,
+            outcome: Err(err),
+        };
+    }
+
+    // Success: mark Computed.
+    record.status = PartitionStatus::Computed;
+    record.duration_ms = partition_start.elapsed().as_millis() as u64;
+    if let Err(e) = state_ref.record_partition(&record) {
+        return PartitionExecutionResult {
+            partition_key: key.clone(),
+            outcome: Err(anyhow::anyhow!(
+                "failed to record Computed for {model_name}|{key}: {e}"
+            )),
+        };
+    }
+
+    let target_table_full_name = format!(
+        "{}.{}.{}",
+        model.config.target.catalog, model.config.target.schema, model.config.target.table,
+    );
+    let sql_hash = Some(crate::output::sql_fingerprint(&stmts));
+    let column_count = exec_ctx.column_count_for(model_name);
+    let compile_time_ms = exec_ctx.compile_time_ms_for(model_name);
+    PartitionExecutionResult {
+        partition_key: key.clone(),
+        outcome: Ok(MaterializationOutput {
+            asset_key: asset_key.to_vec(),
+            rows_copied: None,
+            duration_ms: record.duration_ms,
+            metadata: MaterializationMetadata {
+                strategy: "time_interval".to_string(),
+                watermark: None,
+                target_table_full_name: Some(target_table_full_name),
+                sql_hash,
+                column_count,
+                compile_time_ms,
+            },
+            partition: Some(PartitionInfo {
+                key,
+                start: partition_plan.window.start,
+                end: partition_plan.window.end,
+                batched_with: partition_plan.batch_with.clone(),
+            }),
+        }),
+    }
+}
+
+/// Processes a single table: drift detection + replication.
+///
+/// Uses `WarehouseAdapter` for all SQL execution and schema introspection,
+/// making this function adapter-agnostic (Databricks, Snowflake, BigQuery,
+/// DuckDB). Tagging and watermark updates are returned as deferred
+/// operations and applied in a post-run batch phase for better concurrency.
+#[tracing::instrument(skip_all, fields(table = %task.table_name))]
+async fn process_table(
+    warehouse: &dyn WarehouseAdapter,
+    _state: &Mutex<StateStore>,
+    pipeline: &ReplicationPipelineConfig,
+    task: &TableTask,
+) -> Result<TableResult> {
+    let table_start = Instant::now();
+    let dialect = warehouse.dialect();
+
+    let source_table = TableRef {
+        catalog: task.source_catalog.clone(),
+        schema: task.source_schema.clone(),
+        table: task.table_name.clone(),
+    };
+    let target_table = TableRef {
+        catalog: task.target_catalog.clone(),
+        schema: task.target_schema.clone(),
+        table: task.table_name.clone(),
+    };
+
+    let mut asset_key = task.asset_key_prefix.clone();
+    asset_key.push(task.table_name.clone());
+
+    // Drift detection — use pre-fetched columns when available (batch
+    // information_schema query), falling back to individual DESCRIBE TABLE
+    // via WarehouseAdapter.
+    let (source_cols, target_cols) =
+        if task.prefetched_source_cols.is_some() || task.prefetched_target_cols.is_some() {
+            (
+                task.prefetched_source_cols.clone().unwrap_or_default(),
+                task.prefetched_target_cols.clone().unwrap_or_default(),
+            )
+        } else {
+            let (src, tgt) = tokio::join!(
+                warehouse.describe_table(&source_table),
+                warehouse.describe_table(&target_table),
+            );
+            (src.unwrap_or_default(), tgt.unwrap_or_default())
+        };
+    let target_exists = !target_cols.is_empty();
+
+    let mut use_full_refresh = !target_exists;
+    let mut drift_action: Option<DriftActionOutput> = None;
+
+    if target_exists {
+        let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols);
+        if drift_result.action == DriftAction::DropAndRecreate {
+            info!(
+                table = target_table.full_name(),
+                drifted = drift_result.drifted_columns.len(),
+                "drift detected, dropping target"
+            );
+            let drop_sql = drift::generate_drop_table_sql(&target_table, dialect)?;
+            warehouse
+                .execute_statement(&drop_sql)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            use_full_refresh = true;
+
+            let reason = drift_result
+                .drifted_columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "column '{}' changed {} → {}",
+                        c.name, c.source_type, c.target_type
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            drift_action = Some(DriftActionOutput {
+                table: target_table.full_name(),
+                action: "drop_and_recreate".into(),
+                reason,
+            });
+        }
+    }
+
+    // Build replication plan
+    let replication = ReplicationPlan {
+        source: SourceRef {
+            catalog: task.source_catalog.clone(),
+            schema: task.source_schema.clone(),
+            table: task.table_name.clone(),
+        },
+        target: TargetRef {
+            catalog: task.target_catalog.clone(),
+            schema: task.target_schema.clone(),
+            table: task.table_name.clone(),
+        },
+        strategy: if pipeline.strategy == "incremental" {
+            MaterializationStrategy::Incremental {
+                timestamp_column: pipeline.timestamp_column.clone(),
+                watermark: None,
+            }
+        } else {
+            MaterializationStrategy::FullRefresh
+        },
+        columns: ColumnSelection::All,
+        metadata_columns: task.metadata_columns.clone(),
+        governance: GovernanceConfig {
+            permissions_file: None,
+            auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
+            auto_create_schemas: pipeline.target.governance.auto_create_schemas,
+        },
+    };
+
+    let strategy_name;
+    let sql = if use_full_refresh {
+        strategy_name = "full_refresh";
+        sql_gen::generate_create_table_as_sql(&replication, dialect)?
+    } else {
+        match &replication.strategy {
+            MaterializationStrategy::FullRefresh => {
+                strategy_name = "full_refresh";
+                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::Incremental { .. } => {
+                strategy_name = "incremental";
+                sql_gen::generate_insert_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::Merge { .. } => {
+                strategy_name = "merge";
+                sql_gen::generate_merge_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::MaterializedView => {
+                strategy_name = "materialized_view";
+                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::DynamicTable { .. } => {
+                strategy_name = "dynamic_table";
+                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::TimeInterval { .. } => {
+                // time_interval is a transformation strategy (silver-layer
+                // models), not a replication strategy. The replication
+                // pipeline cannot construct this variant from rocky.toml.
+                anyhow::bail!(
+                    "time_interval strategy is not supported on replication tables — \
+                     it only applies to transformation models"
+                );
+            }
+            MaterializationStrategy::Ephemeral => {
+                // Ephemeral models are never materialized — skip.
+                anyhow::bail!(
+                    "ephemeral strategy is not supported on replication tables — \
+                     it only applies to transformation models"
+                );
+            }
+            MaterializationStrategy::DeleteInsert { .. } => {
+                strategy_name = "delete_insert";
+                // For replication, delete+insert falls back to full refresh.
+                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+            }
+            MaterializationStrategy::Microbatch { .. } => {
+                strategy_name = "microbatch";
+                // Microbatch on replication tables falls back to incremental insert.
+                sql_gen::generate_insert_sql(&replication, dialect)?
+            }
+        }
+    };
+
+    debug!(
+        table = target_table.full_name(),
+        strategy = strategy_name,
+        sql = sql.as_str(),
+        "generated SQL"
+    );
+    info!(
+        table = target_table.full_name(),
+        strategy = strategy_name,
+        "copying data"
+    );
+    warehouse
+        .execute_statement(&sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Tagging and watermark updates are deferred to post-run batch phase
+    // to avoid blocking the concurrency semaphore with sequential SQL
+    // (tagging) and Mutex contention (watermark).
+    let now = Utc::now();
+
+    let deferred_tags = if !task.governance_tags.is_empty() {
+        Some(DeferredTagging {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+            tags: task.governance_tags.clone(),
+        })
+    } else {
+        None
+    };
+
+    let deferred_watermark = Some(DeferredWatermark {
+        state_key: target_table.state_key(),
+        timestamp: now,
+    });
+
+    let table_duration = table_start.elapsed().as_millis() as u64;
+
+    let column_match_check = if task.check_column_match {
+        Some(checks::check_column_match(
+            &source_cols,
+            &target_cols,
+            &task.column_match_exclude,
+        ))
+    } else {
+        None
+    };
+
+    let source_batch_ref = if task.check_row_count {
+        Some(BatchTableRef {
+            catalog: source_table.catalog.clone(),
+            schema: source_table.schema.clone(),
+            table: source_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    let target_batch_ref = if task.check_row_count {
+        Some(BatchTableRef {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    let freshness_batch_ref = if task.check_freshness {
+        Some(BatchTableRef {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    let target_table_full_name = target_table.full_name();
+    Ok(TableResult {
+        materialization: MaterializationOutput {
+            asset_key: asset_key.clone(),
+            rows_copied: None,
+            duration_ms: table_duration,
+            metadata: MaterializationMetadata {
+                strategy: strategy_name.to_string(),
+                watermark: Some(now),
+                target_table_full_name: Some(target_table_full_name.clone()),
+                sql_hash: None,
+                column_count: None,
+                compile_time_ms: None,
+            },
+            // Replication tables are never time_interval; no partition info.
+            partition: None,
+        },
+        drift_checked: true,
+        drift_detected: drift_action,
+        column_match_check,
+        source_batch_ref,
+        target_batch_ref,
+        freshness_batch_ref,
+        asset_key,
+        target_full_name: target_table_full_name,
+        deferred_tags,
+        deferred_watermark,
+    })
+}
+
+/// Adjusts the semaphore capacity to match the throttle's current recommendation.
+///
+/// When the throttle reduces concurrency (after a rate limit), we leave permits
+/// unreleased — the semaphore naturally blocks new tasks until enough in-flight
+/// tasks complete. When the throttle increases concurrency (after sustained
+/// success), we add permits so more tasks can be spawned immediately.
+fn adjust_semaphore(
+    throttle: &AdaptiveThrottle,
+    semaphore: &Semaphore,
+    semaphore_capacity: &mut usize,
+) {
+    let target = throttle.current();
+    if target > *semaphore_capacity {
+        let added = target - *semaphore_capacity;
+        semaphore.add_permits(added);
+        debug!(
+            from = *semaphore_capacity,
+            to = target,
+            "adaptive throttle: increased semaphore permits"
+        );
+        *semaphore_capacity = target;
+    } else if target < *semaphore_capacity {
+        // Reducing permits: we can't remove permits from a Tokio semaphore,
+        // but we can acquire and forget them to permanently consume them.
+        // However, this would block if no permits are available. Instead,
+        // we use try_acquire_many to consume only what's immediately free.
+        let reduce_by = *semaphore_capacity - target;
+        if let Ok(permit) = semaphore.try_acquire_many(reduce_by as u32) {
+            permit.forget();
+            debug!(
+                from = *semaphore_capacity,
+                to = target,
+                "adaptive throttle: reduced semaphore permits"
+            );
+        } else {
+            // Can't acquire all at once (tasks hold them). Acquire what we
+            // can — the rest will drain naturally as tasks complete.
+            for _ in 0..reduce_by {
+                if let Ok(p) = semaphore.try_acquire() {
+                    p.forget();
+                }
+            }
+            debug!(
+                from = *semaphore_capacity,
+                to = target,
+                "adaptive throttle: partially reduced semaphore permits"
+            );
+        }
+        *semaphore_capacity = target;
+    }
+}
+
+/// Processes a single completed task result during the spawn loop's inline
+/// drain pass (adaptive concurrency only). This avoids duplicating the
+/// result-handling logic from the main collection loop for results that
+/// arrive while we're still spawning tasks.
+#[allow(clippy::too_many_arguments)]
+async fn process_completed_result(
+    result: Result<(usize, Result<TableResult, anyhow::Error>), tokio::task::JoinError>,
+    tables_to_process: &[TableTask],
+    throttle: &Option<AdaptiveThrottle>,
+    semaphore: &Semaphore,
+    semaphore_capacity: &mut usize,
+    output: &mut RunOutput,
+    pending_checks: &mut HashMap<String, PendingCheck>,
+    source_batch_refs: &mut Vec<BatchTableRef>,
+    target_batch_refs: &mut Vec<BatchTableRef>,
+    freshness_batch_refs: &mut Vec<BatchTableRef>,
+    batch_asset_keys: &mut Vec<(String, Vec<String>)>,
+    table_errors: &mut Vec<TableError>,
+    deferred_tags: &mut Vec<DeferredTagging>,
+    deferred_watermarks: &mut Vec<DeferredWatermark>,
+    shared_state: &Mutex<StateStore>,
+    shared_run_id: &str,
+    total_completed: &mut usize,
+) {
+    *total_completed += 1;
+
+    match result {
+        Ok((_, Ok(tr))) => {
+            if let Some(t) = &throttle {
+                t.on_success();
+                adjust_semaphore(t, semaphore, semaphore_capacity);
+            }
+            output.tables_copied += 1;
+            rocky_observe::metrics::METRICS.inc_tables_processed();
+            rocky_observe::metrics::METRICS
+                .record_table_duration_ms(tr.materialization.duration_ms);
+            output.materializations.push(tr.materialization);
+
+            if tr.drift_checked {
+                output.drift.tables_checked += 1;
+            }
+            if let Some(drift_action) = tr.drift_detected {
+                output.drift.tables_drifted += 1;
+                output.drift.actions_taken.push(drift_action);
+            }
+
+            if let Some(check) = tr.column_match_check {
+                let entry = pending_checks
+                    .entry(tr.target_full_name.clone())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: tr.asset_key.clone(),
+                        checks: Vec::new(),
+                    });
+                entry.checks.push(check);
+            }
+
+            if let Some(src_ref) = tr.source_batch_ref {
+                source_batch_refs.push(src_ref);
+            }
+            if let Some(tgt_ref) = tr.target_batch_ref {
+                target_batch_refs.push(tgt_ref);
+            }
+            batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key.clone()));
+
+            if let Some(fresh_ref) = tr.freshness_batch_ref {
+                freshness_batch_refs.push(fresh_ref);
+            }
+
+            if let Some(tags) = tr.deferred_tags {
+                deferred_tags.push(tags);
+            }
+            if let Some(wm) = tr.deferred_watermark {
+                deferred_watermarks.push(wm);
+            }
+
+            // Checkpoint: record successful table progress
+            {
+                let state = shared_state.lock().await;
+                let _ = state.record_table_progress(
+                    shared_run_id,
+                    &rocky_core::state::TableProgress {
+                        index: *total_completed - 1,
+                        table_key: tr.target_full_name,
+                        asset_key: tr.asset_key,
+                        status: rocky_core::state::TableStatus::Success,
+                        error: None,
+                        duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
+                        completed_at: Utc::now(),
+                    },
+                );
+            }
+        }
+        Ok((idx, Err(e))) => {
+            let msg = format!("{e:#}");
+            if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
+                warn!(
+                    table_index = idx,
+                    error = msg.as_str(),
+                    "source table not found, skipping"
+                );
+                return;
+            }
+
+            // Signal the adaptive throttle
+            if let Some(t) = &throttle {
+                if is_rate_limit_error(&msg) {
+                    t.on_rate_limit();
+                    adjust_semaphore(t, semaphore, semaphore_capacity);
+                }
+            }
+
+            warn!(error = msg, "table processing failed");
+            rocky_observe::metrics::METRICS.inc_tables_failed();
+
+            // Checkpoint: record failed table progress
+            {
+                let task = tables_to_process.get(idx);
+                let table_key = task
+                    .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
+                    .unwrap_or_default();
+                let state = shared_state.lock().await;
+                let _ = state.record_table_progress(
+                    shared_run_id,
+                    &rocky_core::state::TableProgress {
+                        index: idx,
+                        table_key,
+                        asset_key: vec![],
+                        status: rocky_core::state::TableStatus::Failed,
+                        error: Some(msg.clone()),
+                        duration_ms: 0,
+                        completed_at: Utc::now(),
+                    },
+                );
+            }
+
+            table_errors.push(TableError {
+                asset_key: vec![],
+                error: msg,
+                task_index: Some(idx),
+            });
+        }
+        Err(e) => {
+            let msg = format!("task failed: {e}");
+            warn!(error = msg, "table task panicked");
+
+            // Checkpoint: record panicked task progress
+            {
+                let state = shared_state.lock().await;
+                let _ = state.record_table_progress(
+                    shared_run_id,
+                    &rocky_core::state::TableProgress {
+                        index: 0,
+                        table_key: String::new(),
+                        asset_key: vec![],
+                        status: rocky_core::state::TableStatus::Failed,
+                        error: Some(msg.clone()),
+                        duration_ms: 0,
+                        completed_at: Utc::now(),
+                    },
+                );
+            }
+
+            table_errors.push(TableError {
+                asset_key: vec![],
+                error: msg,
+                task_index: None,
+            });
+        }
+    }
+}
+
+/// Returns `true` if the error message indicates a warehouse rate limit.
+///
+/// Used by the adaptive concurrency controller to distinguish rate-limit
+/// errors (which should reduce concurrency) from other transient or
+/// permanent errors. Matches Databricks-specific signals: HTTP 429 and
+/// the Unity Catalog `UC_REQUEST_LIMIT_EXCEEDED` error code.
+fn is_rate_limit_error(error_msg: &str) -> bool {
+    let upper = error_msg.to_uppercase();
+    upper.contains("429")
+        || upper.contains("UC_REQUEST_LIMIT_EXCEEDED")
+        || upper.contains("RATE LIMIT")
+        || upper.contains("TOO MANY REQUESTS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocky_core::plan_partition::PartitionSelection;
+
+    #[test]
+    fn test_partition_options_default_no_selection() {
+        // No flags → to_selection returns None (caller defaults to Latest).
+        let opts = PartitionRunOptions::default();
+        assert!(opts.to_selection().is_none());
+        assert!(!opts.any_set());
+    }
+
+    #[test]
+    fn test_partition_options_single() {
+        let opts = PartitionRunOptions {
+            partition: Some("2026-04-07".into()),
+            ..Default::default()
+        };
+        match opts.to_selection() {
+            Some(PartitionSelection::Single(key)) => assert_eq!(key, "2026-04-07"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+        assert!(opts.any_set());
+    }
+
+    #[test]
+    fn test_partition_options_range() {
+        let opts = PartitionRunOptions {
+            from: Some("2026-04-01".into()),
+            to: Some("2026-04-07".into()),
+            ..Default::default()
+        };
+        match opts.to_selection() {
+            Some(PartitionSelection::Range { from, to }) => {
+                assert_eq!(from, "2026-04-01");
+                assert_eq!(to, "2026-04-07");
+            }
+            other => panic!("expected Range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_partition_options_latest() {
+        let opts = PartitionRunOptions {
+            latest: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            opts.to_selection(),
+            Some(PartitionSelection::Latest)
+        ));
+    }
+
+    #[test]
+    fn test_partition_options_missing() {
+        let opts = PartitionRunOptions {
+            missing: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            opts.to_selection(),
+            Some(PartitionSelection::Missing)
+        ));
+    }
+
+    #[test]
+    fn test_partition_options_lookback_alone_does_not_imply_selection() {
+        // --lookback without a primary selection flag is a no-op selection-wise;
+        // it modifies whichever default the runtime picks (Latest).
+        let opts = PartitionRunOptions {
+            lookback: Some(3),
+            ..Default::default()
+        };
+        assert!(opts.to_selection().is_none());
+        assert!(opts.any_set()); // any_set returns true so the runtime knows
+    }
+
+    #[test]
+    fn test_partition_options_priority_partition_over_range() {
+        // Defensive: if somehow both `partition` and `from`/`to` slip past
+        // clap's `conflicts_with`, partition wins.
+        let opts = PartitionRunOptions {
+            partition: Some("2026-04-07".into()),
+            from: Some("2026-04-01".into()),
+            to: Some("2026-04-08".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            opts.to_selection(),
+            Some(PartitionSelection::Single(_))
+        ));
+    }
+
+    #[test]
+    fn test_execution_context_lookups_known_model() {
+        // ExecutionContext::column_count_for and ::compile_time_ms_for both
+        // hit when the model is in the typecheck and timings maps. This is
+        // the happy path the run.rs paths take for derived models.
+        use indexmap::IndexMap;
+        use rocky_compiler::compile::ModelCompileTimings;
+        use rocky_compiler::types::{RockyType, TypedColumn};
+        use std::collections::HashMap;
+
+        let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
+        typed_models.insert(
+            "fct_orders".into(),
+            vec![
+                TypedColumn {
+                    name: "order_id".into(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                },
+                TypedColumn {
+                    name: "amount".into(),
+                    data_type: RockyType::Float64,
+                    nullable: true,
+                },
+                TypedColumn {
+                    name: "order_date".into(),
+                    data_type: RockyType::Date,
+                    nullable: false,
+                },
+            ],
+        );
+
+        let mut model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
+        model_timings.insert(
+            "fct_orders".into(),
+            ModelCompileTimings {
+                typecheck_ms: 17,
+                total_ms: 17,
+            },
+        );
+
+        let ctx = ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+        };
+
+        assert_eq!(ctx.column_count_for("fct_orders"), Some(3));
+        assert_eq!(ctx.compile_time_ms_for("fct_orders"), Some(17));
+    }
+
+    #[test]
+    fn test_execution_context_lookups_unknown_model_returns_none() {
+        // Source replication tables and any model the typechecker didn't see
+        // must miss cleanly with None — the run path leaves the metadata
+        // fields unpopulated rather than fabricating zeros.
+        use indexmap::IndexMap;
+        use rocky_compiler::compile::ModelCompileTimings;
+        use std::collections::HashMap;
+
+        let typed_models = IndexMap::new();
+        let model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
+        let ctx = ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+        };
+
+        assert_eq!(ctx.column_count_for("raw__shopify__orders"), None);
+        assert_eq!(ctx.compile_time_ms_for("raw__shopify__orders"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_rate_limit_error_http_429() {
+        assert!(is_rate_limit_error("API error 429: rate limited"));
+        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_uc_request_limit() {
+        assert!(is_rate_limit_error(
+            "statement stmt-1 failed: UC_REQUEST_LIMIT_EXCEEDED: rate limit"
+        ));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_generic_rate_limit() {
+        assert!(is_rate_limit_error("rate limit exceeded"));
+        assert!(is_rate_limit_error("Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_false_for_other_errors() {
+        assert!(!is_rate_limit_error("TABLE_OR_VIEW_NOT_FOUND"));
+        assert!(!is_rate_limit_error("PARSE_ERROR: syntax error"));
+        assert!(!is_rate_limit_error("connection refused"));
+        assert!(!is_rate_limit_error(
+            "statement stmt-1 failed: unauthorized"
+        ));
+    }
+
+    #[test]
+    fn test_adjust_semaphore_increase() {
+        let throttle = AdaptiveThrottle::new(8, 1, 1);
+        let semaphore = Semaphore::new(4);
+        let mut capacity = 4;
+
+        // Reduce throttle first, then increase
+        throttle.on_rate_limit(); // 8 -> 4
+        // At c=4 and half_max=4, c < half_max is false, so congestion
+        // avoidance applies: increase by 1 per success.
+        throttle.on_success(); // 4 -> 5
+
+        adjust_semaphore(&throttle, &semaphore, &mut capacity);
+        assert_eq!(capacity, 5);
+        // Semaphore should have 1 extra permit (4 original + 1 added)
+        assert_eq!(semaphore.available_permits(), 5);
+    }
+
+    #[test]
+    fn test_adjust_semaphore_decrease() {
+        let throttle = AdaptiveThrottle::new(8, 1, 10);
+        let semaphore = Semaphore::new(8);
+        let mut capacity = 8;
+
+        throttle.on_rate_limit(); // 8 -> 4
+
+        adjust_semaphore(&throttle, &semaphore, &mut capacity);
+        assert_eq!(capacity, 4);
+        // Semaphore should have fewer available permits
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[test]
+    fn test_adjust_semaphore_no_change() {
+        let throttle = AdaptiveThrottle::new(8, 1, 10);
+        let semaphore = Semaphore::new(8);
+        let mut capacity = 8;
+
+        // No rate limit, no change
+        adjust_semaphore(&throttle, &semaphore, &mut capacity);
+        assert_eq!(capacity, 8);
+        assert_eq!(semaphore.available_permits(), 8);
+    }
+
+    #[test]
+    fn test_throttle_wired_into_result_loop() {
+        // Verify that the AdaptiveThrottle clone/share semantics work
+        // correctly when used from the run loop pattern.
+        let throttle = AdaptiveThrottle::new(16, 1, 5);
+
+        // Simulate rate limits reducing concurrency
+        throttle.on_rate_limit(); // 16 -> 8
+        assert_eq!(throttle.current(), 8);
+        throttle.on_rate_limit(); // 8 -> 4
+        assert_eq!(throttle.current(), 4);
+
+        // Simulate sustained success increasing concurrency
+        for _ in 0..5 {
+            throttle.on_success();
+        }
+        // Below half of max (4 < 8), slow-start phase: increase by 2
+        assert_eq!(throttle.current(), 6);
+
+        // Verify metrics
+        assert_eq!(throttle.rate_limits_total(), 2);
+    }
+}

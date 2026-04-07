@@ -1,0 +1,5 @@
+from raw_orders
+group customer_id {
+    revenue: sum(amount),
+    n: count()
+}

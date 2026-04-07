@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "HookEntry": {
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "env_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "event": {
+          "type": "string"
+        },
+        "on_failure": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command",
+        "env_keys",
+        "event",
+        "on_failure",
+        "timeout_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky hooks list`.",
+  "properties": {
+    "hooks": {
+      "items": {
+        "$ref": "#/definitions/HookEntry"
+      },
+      "type": "array"
+    },
+    "total": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "hooks",
+    "total"
+  ],
+  "title": "HooksListOutput",
+  "type": "object"
+}

@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DeclarativeTestResult": {
+      "description": "Result of a single declarative test assertion.",
+      "properties": {
+        "column": {
+          "description": "Column under test, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "Human-readable detail (e.g., \"3 NULL rows found\" or execution error).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model name the test belongs to.",
+          "type": "string"
+        },
+        "severity": {
+          "description": "Severity declared in the sidecar (\"error\" or \"warning\").",
+          "type": "string"
+        },
+        "sql": {
+          "description": "The SQL that was executed.",
+          "type": "string"
+        },
+        "status": {
+          "description": "\"pass\", \"fail\", or \"error\".",
+          "type": "string"
+        },
+        "table": {
+          "description": "Fully-qualified target table (catalog.schema.table).",
+          "type": "string"
+        },
+        "test_type": {
+          "description": "Test type (e.g., \"not_null\", \"unique\", \"row_count_range\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "severity",
+        "sql",
+        "status",
+        "table",
+        "test_type"
+      ],
+      "type": "object"
+    },
+    "DeclarativeTestSummary": {
+      "description": "Summary of declarative test execution (from `[[tests]]` in model sidecars).",
+      "properties": {
+        "errored": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "passed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/definitions/DeclarativeTestResult"
+          },
+          "type": "array"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warned": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "errored",
+        "failed",
+        "passed",
+        "results",
+        "total",
+        "warned"
+      ],
+      "type": "object"
+    },
+    "TestFailure": {
+      "description": "One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky test`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "declarative": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DeclarativeTestSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used."
+    },
+    "failed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "failures": {
+      "items": {
+        "$ref": "#/definitions/TestFailure"
+      },
+      "type": "array"
+    },
+    "passed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "failed",
+    "failures",
+    "passed",
+    "total",
+    "version"
+  ],
+  "title": "TestOutput",
+  "type": "object"
+}

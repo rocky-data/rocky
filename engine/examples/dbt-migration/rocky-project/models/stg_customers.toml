@@ -1,0 +1,9 @@
+name = "stg_customers"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "stg_customers"

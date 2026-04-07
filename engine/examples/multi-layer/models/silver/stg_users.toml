@@ -1,0 +1,10 @@
+name = "stg_users"
+intent = "Cleaned user profiles. Excludes records missing user_id or email. One row per user."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "silver"
+table = "stg_users"

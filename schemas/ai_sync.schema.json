@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AiSyncProposal": {
+      "properties": {
+        "diff": {
+          "type": "string"
+        },
+        "intent": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "proposed_source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "diff",
+        "intent",
+        "model",
+        "proposed_source"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky ai sync`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "proposals": {
+      "items": {
+        "$ref": "#/definitions/AiSyncProposal"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "proposals",
+    "version"
+  ],
+  "title": "AiSyncOutput",
+  "type": "object"
+}

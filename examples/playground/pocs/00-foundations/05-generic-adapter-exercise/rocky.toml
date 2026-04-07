@@ -1,0 +1,28 @@
+# 05-generic-adapter-exercise — DuckDB generic adapter end-to-end
+# No external credentials needed!
+#
+# Exercises: validate, list, doctor, seed, discover, plan, run, test
+# Demonstrates the full generic adapter surface against a local DuckDB file.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.exercise]
+strategy = "full_refresh"
+
+[pipeline.exercise.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.exercise.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.exercise.checks]
+row_count = true
+column_match = true
+
+[pipeline.exercise.execution]
+concurrency = 4

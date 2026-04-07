@@ -1,0 +1,16 @@
+-- This file is already well-formatted (rocky fmt produces no diff)
+from raw_orders
+where status != "cancelled"
+derive {
+    order_amount_usd: amount,
+    is_high_value: amount > 100,
+    days_since_order: current_date - order_date
+}
+select {
+    order_id,
+    customer_id,
+    order_amount_usd,
+    is_high_value,
+    days_since_order
+}
+sort order_amount_usd desc

@@ -1,0 +1,188 @@
+{
+  "New model (from)": {
+    "prefix": "from",
+    "body": [
+      "from ${1:source_model}",
+      "${0}"
+    ],
+    "description": "Start a new Rocky pipeline"
+  },
+  "Filter (where)": {
+    "prefix": "where",
+    "body": "where ${1:column} ${2|==,!=,>,<,>=,<=|} ${3:value}",
+    "description": "Filter rows"
+  },
+  "Aggregate (group)": {
+    "prefix": "group",
+    "body": [
+      "group ${1:key_column} {",
+      "    ${2:metric}: ${3|count,sum,avg,min,max|}(${4:column})",
+      "}"
+    ],
+    "description": "Group and aggregate"
+  },
+  "Computed columns (derive)": {
+    "prefix": "derive",
+    "body": [
+      "derive {",
+      "    ${1:name}: ${2:expression}",
+      "}"
+    ],
+    "description": "Add computed columns"
+  },
+  "Column selection (select)": {
+    "prefix": "select",
+    "body": [
+      "select {",
+      "    ${1:col1},",
+      "    ${2:col2}",
+      "}"
+    ],
+    "description": "Select specific columns"
+  },
+  "Join": {
+    "prefix": "join",
+    "body": [
+      "join ${1:model} as ${2:alias} on ${3:key} {",
+      "    keep ${4:col1}, ${5:col2}",
+      "}"
+    ],
+    "description": "Join another model"
+  },
+  "Sort": {
+    "prefix": "sort",
+    "body": "sort ${1:column} ${2|asc,desc|}",
+    "description": "Sort results"
+  },
+  "Match expression": {
+    "prefix": "match",
+    "body": [
+      "match ${1:expr} {",
+      "    ${2:> 1000} => ${3:\"high\"},",
+      "    ${4:_} => ${5:\"low\"}",
+      "}"
+    ],
+    "description": "Match expression (CASE WHEN)"
+  },
+  "Window function": {
+    "prefix": "window",
+    "body": "${1|row_number,rank,dense_rank,lag,lead|}() over (partition by ${2:key} order by ${3:col} ${4|asc,desc|})",
+    "description": "Window function with OVER clause"
+  },
+  "Full model template": {
+    "prefix": "model",
+    "body": [
+      "-- ${1:Description}",
+      "from ${2:source}",
+      "where ${3:condition}",
+      "derive {",
+      "    ${4:computed}: ${5:expression}",
+      "}",
+      "select {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Full Rocky model template"
+  },
+  "Take (limit)": {
+    "prefix": "take",
+    "body": "take ${1:100}",
+    "description": "Limit output rows"
+  },
+  "Distinct": {
+    "prefix": "distinct",
+    "body": "distinct",
+    "description": "Remove duplicate rows"
+  },
+  "Replicate": {
+    "prefix": "replicate",
+    "body": "replicate ${1:source_table}",
+    "description": "Replicate a source table"
+  },
+  "Intent comment": {
+    "prefix": "intent",
+    "body": "-- @intent: ${1:Describe what this model produces and why}",
+    "description": "Intent comment used by Rocky AI features and docs"
+  },
+  "Depends-on hint": {
+    "prefix": "depends",
+    "body": "-- @depends_on: ${1:upstream_model}",
+    "description": "Explicit dependency hint"
+  },
+  "Incremental strategy": {
+    "prefix": "strategy-incremental",
+    "body": [
+      "[strategy]",
+      "type = \"incremental\"",
+      "timestamp_column = \"${1:updated_at}\""
+    ],
+    "description": "Incremental materialization in *.rocky.toml"
+  },
+  "Merge strategy": {
+    "prefix": "strategy-merge",
+    "body": [
+      "[strategy]",
+      "type = \"merge\"",
+      "unique_key = [\"${1:id}\"]",
+      "update_columns = [\"${2:updated_at}\"]"
+    ],
+    "description": "Merge materialization in *.rocky.toml"
+  },
+  "Full refresh strategy": {
+    "prefix": "strategy-full",
+    "body": [
+      "[strategy]",
+      "type = \"full_refresh\""
+    ],
+    "description": "Full refresh materialization in *.rocky.toml"
+  },
+  "Target block": {
+    "prefix": "target",
+    "body": [
+      "[target]",
+      "catalog = \"${1:main}\"",
+      "schema = \"${2:analytics}\"",
+      "table = \"${3:${TM_FILENAME_BASE}}\""
+    ],
+    "description": "Target table location in *.rocky.toml"
+  },
+  "Source declaration": {
+    "prefix": "source",
+    "body": [
+      "[[sources]]",
+      "name = \"${1:raw_orders}\"",
+      "catalog = \"${2:raw}\"",
+      "schema = \"${3:public}\"",
+      "table = \"${4:orders}\""
+    ],
+    "description": "External source table in *.rocky.toml"
+  },
+  "Match (multi-arm)": {
+    "prefix": "match-multi",
+    "body": [
+      "match ${1:expr} {",
+      "    ${2:condition_1} => ${3:value_1},",
+      "    ${4:condition_2} => ${5:value_2},",
+      "    ${6:condition_3} => ${7:value_3},",
+      "    _ => ${8:default}",
+      "}"
+    ],
+    "description": "Match expression with multiple arms"
+  },
+  "Aggregate window": {
+    "prefix": "agg-window",
+    "body": [
+      "${1:running_total}: sum(${2:amount}) over (",
+      "    partition by ${3:customer_id}",
+      "    order by ${4:order_date}",
+      "    rows between unbounded preceding and current row",
+      ")"
+    ],
+    "description": "Running aggregate window function"
+  },
+  "Date trunc": {
+    "prefix": "date-trunc",
+    "body": "${1:month}: date_trunc('${2|day,week,month,quarter,year|}', ${3:timestamp_column})",
+    "description": "Truncate timestamp to a date part"
+  }
+}

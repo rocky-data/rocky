@@ -1,0 +1,18 @@
+[[columns]]
+name = "order_id"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "customer_id"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "amount"
+type = "Decimal"
+nullable = true
+
+[rules]
+required = ["order_id", "customer_id", "amount"]
+protected = ["order_id"]

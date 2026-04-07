@@ -1,0 +1,35 @@
+name = "fct_orders"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "analytics"
+table = "fct_orders"
+
+# ---------------------------------------------------------------------------
+# Declarative tests — executed by `rocky test --declarative`
+# ---------------------------------------------------------------------------
+
+# 1. not_null: order_id must never be NULL
+[[tests]]
+type = "not_null"
+column = "order_id"
+
+# 2. unique: order_id is the grain — no duplicates allowed
+[[tests]]
+type = "unique"
+column = "order_id"
+
+# 3. accepted_values: status must be one of the known values (warning severity)
+[[tests]]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "completed", "returned"]
+severity = "warning"
+
+# 4. expression: custom SQL assertion — amount must be positive for every row
+[[tests]]
+type = "expression"
+expression = "amount > 0"

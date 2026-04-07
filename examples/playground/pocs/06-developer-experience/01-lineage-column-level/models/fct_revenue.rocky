@@ -1,0 +1,4 @@
+from stg_orders
+group customer_id {
+    total: sum(amount)
+}

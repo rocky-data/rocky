@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "LineageColumnDef": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "LineageEdgeRecord": {
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "target": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "transform": {
+          "description": "Transform kind: \"direct\", \"cast\", \"expression\", etc. Stringified from `rocky_sql::lineage::TransformKind` to avoid pulling schemars into rocky-sql.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "transform"
+      ],
+      "type": "object"
+    },
+    "LineageQualifiedColumn": {
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky lineage <model>` (model lineage shape).\n\nWhen invoked with `--column <col>` (or `model.column` syntax), the dispatch returns `ColumnLineageOutput` instead — the two shapes share version/command/model headers but otherwise differ enough to keep separate.",
+  "properties": {
+    "columns": {
+      "items": {
+        "$ref": "#/definitions/LineageColumnDef"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "downstream": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "edges": {
+      "items": {
+        "$ref": "#/definitions/LineageEdgeRecord"
+      },
+      "type": "array"
+    },
+    "model": {
+      "type": "string"
+    },
+    "upstream": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "columns",
+    "command",
+    "downstream",
+    "edges",
+    "model",
+    "upstream",
+    "version"
+  ],
+  "title": "LineageOutput",
+  "type": "object"
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "OptimizeRecommendation": {
+      "description": "One materialization-strategy recommendation. Mirrors `rocky_core::optimize::MaterializationCost` but lives in the CLI crate so we don't have to derive JsonSchema across the workspace.",
+      "properties": {
+        "current_strategy": {
+          "type": "string"
+        },
+        "estimated_monthly_savings": {
+          "format": "double",
+          "type": "number"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "recommended_strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "current_strategy",
+        "estimated_monthly_savings",
+        "model_name",
+        "reasoning",
+        "recommended_strategy"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky optimize`.\n\n`recommendations` is empty when no run history exists; `message` is populated in that case to explain why.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recommendations": {
+      "items": {
+        "$ref": "#/definitions/OptimizeRecommendation"
+      },
+      "type": "array"
+    },
+    "total_models_analyzed": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "recommendations",
+    "total_models_analyzed",
+    "version"
+  ],
+  "title": "OptimizeOutput",
+  "type": "object"
+}

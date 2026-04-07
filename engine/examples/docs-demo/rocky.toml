@@ -1,0 +1,38 @@
+# Docs Demo — generate an HTML documentation catalog
+#
+# Demonstrates `rocky docs` producing a self-contained HTML site
+# with model metadata, dependencies, tests, and search.
+#
+# Usage:
+#   rocky --config engine/examples/docs-demo/rocky.toml docs \
+#     --models engine/examples/docs-demo/models/
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.docs_demo]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.docs_demo.source]
+adapter = "local"
+
+[pipeline.docs_demo.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.docs_demo.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.docs_demo.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[pipeline.docs_demo.execution]
+concurrency = 4
+
+[state]
+backend = "local"

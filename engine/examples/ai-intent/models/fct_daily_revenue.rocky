@@ -1,0 +1,10 @@
+-- Fact table: daily revenue from completed orders only
+from stg_orders
+where status == "completed"
+group order_date {
+    total_revenue: sum(order_amount),
+    order_count: count(),
+    avg_order_value: sum(order_amount) / count()
+}
+where total_revenue > 0
+sort order_date desc

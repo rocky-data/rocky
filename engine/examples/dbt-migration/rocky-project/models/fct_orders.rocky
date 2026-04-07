@@ -1,0 +1,20 @@
+-- Equivalent of the dbt fct_orders model, rewritten in Rocky DSL
+-- Note: != is NULL-safe (compiles to IS DISTINCT FROM)
+from stg_orders
+join stg_customers as c on customer_id {
+    keep c.full_name, c.email
+}
+where status != "cancelled"
+derive {
+    customer_name: c.full_name,
+    customer_email: c.email
+}
+select {
+    order_id,
+    order_date,
+    status,
+    amount,
+    customer_id,
+    customer_name,
+    customer_email
+}

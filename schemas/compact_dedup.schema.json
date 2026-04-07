@@ -1,0 +1,236 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ByteCalibration": {
+      "description": "Byte-level calibration block populated by `--calibrate-bytes`.\n\nSamples a handful of tables (default: 3), pulls their rows via `SELECT *`, hashes each row group with blake3 in-process, and computes byte-level dedup on the sample. The `lower_bound_multiplier` is the ratio `byte_dedup_pct / partition_dedup_pct` — it tells you how much of a floor the cheap partition-level measurement actually is.",
+      "properties": {
+        "byte_dedup_pct": {
+          "description": "Byte-level blake3 dedup on the same sample.",
+          "format": "double",
+          "type": "number"
+        },
+        "lower_bound_multiplier": {
+          "description": "`byte_dedup_pct / partition_dedup_pct`. A value >1.0 means the cheap partition-level measurement is genuinely underestimating.",
+          "format": "double",
+          "type": "number"
+        },
+        "partition_dedup_pct": {
+          "description": "Partition-level `SUM(HASH())` dedup recomputed on the sample (so it's directly comparable to `byte_dedup_pct`).",
+          "format": "double",
+          "type": "number"
+        },
+        "tables_sampled": {
+          "description": "Which tables were hashed at byte level.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "byte_dedup_pct",
+        "lower_bound_multiplier",
+        "partition_dedup_pct",
+        "tables_sampled"
+      ],
+      "type": "object"
+    },
+    "DedupPair": {
+      "description": "A pair of tables that share duplicate partitions.",
+      "properties": {
+        "shared_partitions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "shared_rows": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_a": {
+          "type": "string"
+        },
+        "table_b": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "shared_partitions",
+        "shared_rows",
+        "table_a",
+        "table_b"
+      ],
+      "type": "object"
+    },
+    "DedupSummary": {
+      "description": "Summary of a single dedup measurement (raw or semantic).\n\n`dedup_ratio` is a **lower bound** on true byte-level dedup — see the docstring on [`CompactDedupOutput`].",
+      "properties": {
+        "dedup_ratio": {
+          "description": "0.0..=1.0. Partition-level lower bound on byte-level dedup.",
+          "format": "double",
+          "type": "number"
+        },
+        "duplicate_partitions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "estimated_savings_pct": {
+          "description": "0.0..=100.0. Estimated storage savings if duplicate partitions were collapsed to a single copy.",
+          "format": "double",
+          "type": "number"
+        },
+        "total_rows": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unique_partitions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dedup_ratio",
+        "duplicate_partitions",
+        "estimated_savings_pct",
+        "total_rows",
+        "unique_partitions"
+      ],
+      "type": "object"
+    },
+    "TableDedupContribution": {
+      "description": "Per-table contribution to the overall duplicate set.",
+      "properties": {
+        "contribution_pct": {
+          "description": "0.0..=100.0. Share of this table's partitions that are duplicates of some other table's partitions.",
+          "format": "double",
+          "type": "number"
+        },
+        "partitions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "partitions_shared_with_others": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "contribution_pct",
+        "partitions",
+        "partitions_shared_with_others",
+        "table"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky compact --measure-dedup` (Layer 0 storage experiment).\n\nMeasures cross-table partition dedup across all Rocky-managed tables in a project. The `raw` and `semantic` numbers are both **partition-level lower bounds** on byte-level dedup — two partitions that share 99% of their row groups but differ on a single row will appear fully distinct here. The optional `calibration` block (populated by `--calibrate-bytes`) hashes actual row-group bytes on a sampled subset of tables to give a sharper, more expensive second number.\n\nThe measurement is **engine-scoped**: warehouse-native `HASH()` is not portable across engines (Databricks ≠ Snowflake ≠ DuckDB), so the `engine` field must be carried with any published result.",
+  "properties": {
+    "calibration": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ByteCalibration"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Byte-level calibration on a sampled subset of tables. Present only when `--calibrate-bytes` was passed. Produces a sharper estimate at the cost of pulling raw rows and hashing them locally."
+    },
+    "command": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "engine": {
+      "description": "Warehouse engine identifier (`\"databricks\"`, `\"snowflake\"`, `\"duckdb\"`). Measurements are not comparable across engines because `HASH()` is not portable.",
+      "type": "string"
+    },
+    "excluded_columns": {
+      "description": "Columns excluded from the `semantic` hash.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "measured_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "partitions_scanned": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "per_table": {
+      "description": "Per-table breakdown showing which tables contribute most to the duplicate set.",
+      "items": {
+        "$ref": "#/definitions/TableDedupContribution"
+      },
+      "type": "array"
+    },
+    "project": {
+      "description": "Project name from `rocky.toml`.",
+      "type": "string"
+    },
+    "raw": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DedupSummary"
+        }
+      ],
+      "description": "Dedup computed over all columns (what a byte-level chunk store would actually deduplicate)."
+    },
+    "semantic": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DedupSummary"
+        }
+      ],
+      "description": "Dedup computed after excluding Rocky-owned metadata columns. The gap between `raw` and `semantic` is \"dedup we'd unlock if we ignored Rocky's own per-row metadata.\""
+    },
+    "tables_scanned": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "top_dedup_pairs": {
+      "description": "Top-N table pairs by shared partition count (from the `semantic` measurement).",
+      "items": {
+        "$ref": "#/definitions/DedupPair"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "duration_ms",
+    "engine",
+    "excluded_columns",
+    "measured_at",
+    "partitions_scanned",
+    "per_table",
+    "project",
+    "raw",
+    "semantic",
+    "tables_scanned",
+    "top_dedup_pairs",
+    "version"
+  ],
+  "title": "CompactDedupOutput",
+  "type": "object"
+}

@@ -1,0 +1,34 @@
+# Seed Demo — load CSV files into DuckDB
+#
+# Demonstrates `rocky seed` discovering CSV files in the seeds/ directory,
+# inferring column types, and loading them into the target warehouse.
+#
+# Usage:
+#   rocky --config engine/examples/seed-demo/rocky.toml seed --seeds-dir engine/examples/seed-demo/seeds/
+
+[adapter.local]
+type = "duckdb"
+
+[pipeline.seed_demo]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.seed_demo.source]
+adapter = "local"
+
+[pipeline.seed_demo.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.seed_demo.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "analytics"
+
+[pipeline.seed_demo.target.governance]
+auto_create_catalogs = false
+auto_create_schemas = false
+
+[state]
+backend = "local"

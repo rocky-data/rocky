@@ -1,0 +1,31 @@
+# Valkey distributed cache — multi-instance schema/metadata caching
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "incremental"
+timestamp_column = "occurred_at"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.poc.execution]
+concurrency = 4
+
+# Distributed cache — schema metadata + discovery results cached in Valkey
+[cache]
+valkey_url = "${VALKEY_URL:-redis://localhost:6379}"
+
+# Tiered state backend — local redb + Valkey for cross-instance coordination
+[state]
+backend = "tiered"
+valkey_url = "${VALKEY_URL:-redis://localhost:6379}"
+valkey_prefix = "rocky:state:poc:"

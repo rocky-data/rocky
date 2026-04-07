@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "RunHistoryRecord": {
+      "description": "One run from the state store, mirroring `rocky_core::state::RunRecord` with serializable field types (no enums or non-JSON-friendly Rust types).",
+      "properties": {
+        "duration_ms": {
+          "description": "Duration in milliseconds (`finished_at - started_at`).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "models": {
+          "description": "Per-model execution details for this run.",
+          "items": {
+            "$ref": "#/definitions/RunModelRecord"
+          },
+          "type": "array"
+        },
+        "models_executed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "models",
+        "models_executed",
+        "run_id",
+        "started_at",
+        "status",
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "RunModelRecord": {
+      "description": "Per-model execution record embedded in [`RunHistoryRecord`].",
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "model_name",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky history` (all runs view).\n\nWhen invoked with `--model <name>`, the dispatch returns `ModelHistoryOutput` instead. The two shapes share the version/command header but differ in their primary collection field, which is why they are separate types rather than one enum.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "count": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "runs": {
+      "items": {
+        "$ref": "#/definitions/RunHistoryRecord"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "count",
+    "runs",
+    "version"
+  ],
+  "title": "HistoryOutput",
+  "type": "object"
+}

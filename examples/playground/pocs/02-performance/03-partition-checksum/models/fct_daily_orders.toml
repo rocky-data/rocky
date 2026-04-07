@@ -1,0 +1,24 @@
+depends_on = []
+
+# Source table — raw__orders.orders is created by data/seed.sql.
+[[sources]]
+catalog = ""
+schema = "raw__orders"
+table = "orders"
+
+[strategy]
+type = "time_interval"
+# The model output has an `order_date` column derived from CAST(order_at AS DATE).
+time_column = "order_date"
+# Daily partitions: 2026-04-04, 2026-04-05, ... — keys in canonical YYYY-MM-DD format.
+granularity = "day"
+# Required for `--missing` discovery: the lower bound of the expected partition set.
+first_partition = "2026-04-04"
+# Recompute the previous N days on each run, for late-arriving data resilience.
+# Set to 0 here so the demo can isolate which partition each `rocky run`
+# invocation actually touched.
+lookback = 0
+
+[target]
+catalog = ""
+schema = "marts"

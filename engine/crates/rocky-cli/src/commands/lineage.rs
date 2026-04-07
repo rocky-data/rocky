@@ -1,0 +1,170 @@
+//! `rocky lineage` — column-level lineage explorer.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use rocky_compiler::compile::{self, CompilerConfig};
+
+use crate::output::{
+    ColumnLineageOutput, LineageColumnDef, LineageEdgeRecord, LineageOutput,
+    LineageQualifiedColumn, print_json,
+};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Convert a borrowed `LineageEdge` into a serializable record.
+fn to_edge_record(edge: &rocky_compiler::semantic::LineageEdge) -> LineageEdgeRecord {
+    LineageEdgeRecord {
+        source: LineageQualifiedColumn {
+            model: edge.source.model.to_string(),
+            column: edge.source.column.to_string(),
+        },
+        target: LineageQualifiedColumn {
+            model: edge.target.model.to_string(),
+            column: edge.target.column.to_string(),
+        },
+        transform: edge.transform.to_string(),
+    }
+}
+
+/// Execute `rocky lineage`.
+pub fn run_lineage(
+    models_dir: &Path,
+    target: &str,
+    column: Option<&str>,
+    format: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        source_column_info: HashMap::new(),
+    };
+
+    let result = compile::compile(&config)?;
+
+    // Parse target: "model" or "model.column"
+    let (model_name, col_name) = if let Some(col) = column {
+        (target, Some(col))
+    } else if target.contains('.') {
+        let parts: Vec<&str> = target.splitn(2, '.').collect();
+        (parts[0], Some(parts[1]))
+    } else {
+        (target, None)
+    };
+
+    let schema = result
+        .semantic_graph
+        .model_schema(model_name)
+        .context(format!("model '{model_name}' not found"))?;
+
+    if output_json {
+        if let Some(col) = col_name {
+            let trace: Vec<LineageEdgeRecord> = result
+                .semantic_graph
+                .trace_column(model_name, col)
+                .iter()
+                .map(|e| to_edge_record(e))
+                .collect();
+            let output = ColumnLineageOutput {
+                version: VERSION.to_string(),
+                command: "lineage".to_string(),
+                model: model_name.to_string(),
+                column: col.to_string(),
+                trace,
+            };
+            print_json(&output)?;
+        } else {
+            let edges: Vec<LineageEdgeRecord> = result
+                .semantic_graph
+                .edges
+                .iter()
+                .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
+                .map(to_edge_record)
+                .collect();
+            let columns: Vec<LineageColumnDef> = schema
+                .columns
+                .iter()
+                .map(|c| LineageColumnDef {
+                    name: c.name.clone(),
+                })
+                .collect();
+            let output = LineageOutput {
+                version: VERSION.to_string(),
+                command: "lineage".to_string(),
+                model: model_name.to_string(),
+                columns,
+                upstream: schema.upstream.clone(),
+                downstream: schema.downstream.clone(),
+                edges,
+            };
+            print_json(&output)?;
+        }
+    } else if matches!(format, Some("dot")) {
+        // Graphviz DOT output
+        println!("digraph lineage {{");
+        println!("  rankdir=LR;");
+
+        // Add edges
+        let edges: Vec<_> = if let Some(col) = col_name {
+            result.semantic_graph.trace_column(model_name, col)
+        } else {
+            result
+                .semantic_graph
+                .edges
+                .iter()
+                .filter(|e| &*e.target.model == model_name)
+                .collect()
+        };
+
+        for edge in &edges {
+            println!(
+                "  \"{}.{}\" -> \"{}.{}\";",
+                edge.source.model, edge.source.column, edge.target.model, edge.target.column
+            );
+        }
+        println!("}}");
+    } else {
+        // Human-readable
+        println!("Model: {model_name}");
+        println!("Upstream: {}", schema.upstream.join(", "));
+        println!("Downstream: {}", schema.downstream.join(", "));
+        println!();
+
+        if let Some(col) = col_name {
+            println!("Column trace: {model_name}.{col}");
+            let trace = result.semantic_graph.trace_column(model_name, col);
+            for (i, edge) in trace.iter().enumerate() {
+                let indent = "  ".repeat(i + 1);
+                println!(
+                    "{indent}<- {}.{} ({})",
+                    edge.source.model, edge.source.column, edge.transform
+                );
+            }
+        } else {
+            println!("Columns:");
+            for col_def in &schema.columns {
+                let incoming: Vec<_> = result
+                    .semantic_graph
+                    .edges
+                    .iter()
+                    .filter(|e| &*e.target.model == model_name && *e.target.column == *col_def.name)
+                    .collect();
+
+                if let Some(edge) = incoming.first() {
+                    println!(
+                        "  {} <- {}.{} ({})",
+                        col_def.name, edge.source.model, edge.source.column, edge.transform
+                    );
+                } else {
+                    println!("  {} (no lineage)", col_def.name);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
