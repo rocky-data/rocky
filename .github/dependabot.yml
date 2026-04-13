@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # --- Engine (Rust + Astro docs) ---
+  - package-ecosystem: cargo
+    directory: /engine
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /engine/docs
+    schedule:
+      interval: weekly
+
+  # --- Dagster integration (Python) ---
+  - package-ecosystem: pip
+    directory: /integrations/dagster
+    schedule:
+      interval: weekly
+
+  # --- VS Code extension (npm) ---
+  - package-ecosystem: npm
+    directory: /editors/vscode
+    schedule:
+      interval: weekly
+
+  # --- GitHub Actions (root workflows) ---
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
