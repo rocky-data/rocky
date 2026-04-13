@@ -133,8 +133,8 @@ wiremock = "0.6"
 
 # OpenTelemetry (feature-gated in rocky-observe)
 opentelemetry = "0.31"
-opentelemetry_sdk = "0.28"
-opentelemetry-otlp = "0.28"
+opentelemetry_sdk = "0.31"
+opentelemetry-otlp = "0.31"
 
 [profile.release]
 opt-level = 3

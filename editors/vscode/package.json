@@ -395,7 +395,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
-    "@types/vscode": "^1.110.0",
+    "@types/vscode": "^1.115.0",
     "@viz-js/viz": "^3.25.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.7.1",
@@ -404,7 +404,7 @@
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
     "typescript": "^6.0.2",
-    "typescript-eslint": "^8.58.0",
+    "typescript-eslint": "^8.58.2",
     "vitest": "^4.1.4"
   },
   "overrides_comment": "Force-patch transitive deps that mocha 11.x hasn't bumped yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion). Drop these once mocha upstreams the bumps.",
