@@ -132,7 +132,7 @@ wasm-bindgen = "0.2"
 wiremock = "0.6"
 
 # OpenTelemetry (feature-gated in rocky-observe)
-opentelemetry = "0.28"
+opentelemetry = "0.31"
 opentelemetry_sdk = "0.28"
 opentelemetry-otlp = "0.28"
 
