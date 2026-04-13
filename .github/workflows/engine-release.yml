@@ -82,7 +82,7 @@ jobs:
       # Linux: install zig + cargo-zigbuild for portable glibc builds
       - name: Install zig
         if: matrix.zigbuild
-        uses: mlugg/setup-zig@v2.1.0
+        uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.14.1
 
