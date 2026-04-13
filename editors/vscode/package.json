@@ -404,7 +404,7 @@
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
     "typescript": "^6.0.2",
-    "typescript-eslint": "^8.58.0",
+    "typescript-eslint": "^8.58.2",
     "vitest": "^4.1.4"
   },
   "overrides_comment": "Force-patch transitive deps that mocha 11.x hasn't bumped yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion). Drop these once mocha upstreams the bumps.",
