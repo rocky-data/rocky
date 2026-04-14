@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlparser::ast::{self, SetExpr, Statement};
 use sqlparser::parser::Parser;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -331,9 +331,28 @@ pub struct RockyLsp {
     documents: Arc<RwLock<HashMap<String, String>>>,
     /// Flag set when a recompile is pending (for debounced did_change).
     recompile_pending: Arc<AtomicBool>,
+    /// Set to `true` once the initial compile in `initialized()` has finished.
+    init_done: Arc<AtomicBool>,
+    /// Notifies request handlers blocked on the initial compile.
+    init_notify: Arc<Notify>,
 }
 
 impl RockyLsp {
+    /// Block until the initial compile triggered by `initialized()` completes.
+    ///
+    /// Uses a double-check pattern around `Notify` to avoid missing a
+    /// `notify_waiters()` call that fires between the flag check and the await.
+    async fn wait_for_init(&self) {
+        if self.init_done.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.init_notify.notified();
+        if self.init_done.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
     async fn recompile(&self) {
         let models_dir = self.models_dir.read().await;
         let Some(ref dir) = *models_dir else { return };
@@ -511,6 +530,8 @@ impl LanguageServer for RockyLsp {
     async fn initialized(&self, _: InitializedParams) {
         info!("Rocky LSP initialized");
         self.recompile().await;
+        self.init_done.store(true, Ordering::Release);
+        self.init_notify.notify_waiters();
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -616,6 +637,7 @@ impl LanguageServer for RockyLsp {
     // ── Completion ──────────────────────────────────────────────────────────
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        self.wait_for_init().await;
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
 
@@ -714,6 +736,7 @@ impl LanguageServer for RockyLsp {
     // ── Hover ───────────────────────────────────────────────────────────────
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -874,6 +897,7 @@ impl LanguageServer for RockyLsp {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -959,6 +983,7 @@ impl LanguageServer for RockyLsp {
     // ── Find References (Phase 1A) ──────────────────────────────────────────
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1005,6 +1030,7 @@ impl LanguageServer for RockyLsp {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1036,6 +1062,7 @@ impl LanguageServer for RockyLsp {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1107,6 +1134,7 @@ impl LanguageServer for RockyLsp {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1302,6 +1330,7 @@ impl LanguageServer for RockyLsp {
     // ── Code Actions (Phase 2E) ─────────────────────────────────────────────
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1378,6 +1407,7 @@ impl LanguageServer for RockyLsp {
     // ── Inlay Hints (Phase 2F) ──────────────────────────────────────────────
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1418,6 +1448,7 @@ impl LanguageServer for RockyLsp {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
+        self.wait_for_init().await;
         let lock = self.compile_result.read().await;
         let Some(ref result) = *lock else {
             return Ok(None);
@@ -1969,6 +2000,8 @@ pub async fn run_lsp() {
         models_dir: Arc::new(RwLock::new(None)),
         documents: Arc::new(RwLock::new(HashMap::new())),
         recompile_pending: Arc::new(AtomicBool::new(false)),
+        init_done: Arc::new(AtomicBool::new(false)),
+        init_notify: Arc::new(Notify::new()),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
