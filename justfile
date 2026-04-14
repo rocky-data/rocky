@@ -153,14 +153,17 @@ release-vscode version *args:
 # --- Convenience ---
 
 # Install the monorepo-root git hooks (.git-hooks/) as the active hooksPath.
-# The pre-commit hook runs `just codegen` and fails the commit if regenerated
-# bindings drift from what's staged — same invariant as the codegen-drift CI
-# workflow, caught locally before the push. Skip with
-# ROCKY_SKIP_CODEGEN_HOOK=1 in emergencies.
+#
+# pre-commit: cargo fmt, ruff format, eslint, codegen drift (fast, per-subproject)
+# pre-push:   cargo clippy, ruff check (heavier, per-subproject)
+#
+# Skip all hooks: ROCKY_SKIP_HOOKS=1
+# Skip codegen only: ROCKY_SKIP_CODEGEN_HOOK=1
 install-hooks:
     git config core.hooksPath .git-hooks
     @echo "Installed hooksPath=.git-hooks"
-    @echo "Skip the codegen check with ROCKY_SKIP_CODEGEN_HOOK=1 if needed."
+    @echo "Hooks: pre-commit (fmt + codegen) and pre-push (clippy + ruff check)"
+    @echo "Skip with ROCKY_SKIP_HOOKS=1 if needed."
 
 clean:
     cd engine && cargo clean

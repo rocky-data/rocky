@@ -2,97 +2,130 @@
 #
 # Rocky monorepo pre-commit hook.
 #
-# Runs the codegen pipeline when Rust files that source JSON output schemas
-# are staged, and fails the commit if the regenerated bindings drift from
-# what's staged. This is the local mirror of the `codegen-drift.yml` CI
-# workflow — catches mistakes before they hit the PR.
+# Runs fast checks on staged files before each commit:
+#   1. cargo fmt --check   (engine — instant, no compilation)
+#   2. ruff format --check (dagster)
+#   3. eslint              (vscode)
+#   4. Codegen drift check (only when schema source files are staged)
 #
-# Enable it:
+# Each check only runs if the staged changeset touches that subproject.
+#
+# Enable:
 #   git config core.hooksPath .git-hooks
-# or run `just install-hooks` from the monorepo root.
+#   (or `just install-hooks`)
 #
-# Skip in emergencies:
-#   ROCKY_SKIP_CODEGEN_HOOK=1 git commit …
-#
-# Trigger paths (any staged change under these runs codegen):
-#   engine/crates/rocky-cli/src/output.rs
-#   engine/crates/rocky-cli/src/commands/doctor.rs
-#   engine/crates/rocky-cli/src/commands/export_schemas.rs
+# Skip:
+#   ROCKY_SKIP_HOOKS=1 git commit …              # skip everything
+#   ROCKY_SKIP_CODEGEN_HOOK=1 git commit …        # skip codegen only
 
 set -euo pipefail
 
-if [[ "${ROCKY_SKIP_CODEGEN_HOOK:-}" == "1" ]]; then
-    echo "pre-commit: ROCKY_SKIP_CODEGEN_HOOK=1, skipping codegen check" >&2
+if [[ "${ROCKY_SKIP_HOOKS:-}" == "1" ]]; then
+    echo "pre-commit: ROCKY_SKIP_HOOKS=1, skipping all checks" >&2
     exit 0
 fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# Resolve the staged file list (added, copied, modified, renamed — skip deletes).
+# Staged files (added, copied, modified, renamed — skip deletes).
 STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
 
-# Does the staged set include any file that sources a schema?
-TRIGGER=0
-while IFS= read -r path; do
-    case "$path" in
-        engine/crates/rocky-cli/src/output.rs|\
-        engine/crates/rocky-cli/src/commands/doctor.rs|\
-        engine/crates/rocky-cli/src/commands/export_schemas.rs)
-            TRIGGER=1
-            break
-            ;;
-    esac
-done <<< "$STAGED"
-
-if [[ "$TRIGGER" == "0" ]]; then
+if [[ -z "$STAGED" ]]; then
     exit 0
 fi
 
-echo "pre-commit: output schema source modified — running codegen check" >&2
+# Detect which subprojects have staged changes.
+HAS_ENGINE=0
+HAS_DAGSTER=0
+HAS_VSCODE=0
+while IFS= read -r path; do
+    case "$path" in
+        engine/*) HAS_ENGINE=1 ;;
+        integrations/dagster/*) HAS_DAGSTER=1 ;;
+        editors/vscode/*) HAS_VSCODE=1 ;;
+    esac
+done <<< "$STAGED"
 
-if ! command -v just >/dev/null 2>&1; then
-    cat >&2 <<EOF
-pre-commit: \`just\` is required but not found.
-  Install it from https://github.com/casey/just, or skip this hook with:
-    ROCKY_SKIP_CODEGEN_HOOK=1 git commit …
-EOF
-    exit 1
+FAILED=0
+
+# ── Engine: cargo fmt ────────────────────────────────────────────────────
+if [[ "$HAS_ENGINE" == "1" ]] && command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: checking cargo fmt (engine)" >&2
+    if ! (cd engine && cargo fmt -- --check) >/dev/null 2>&1; then
+        echo "pre-commit: ✗ cargo fmt — run 'cd engine && cargo fmt' to fix" >&2
+        FAILED=1
+    fi
 fi
 
-# Run the full codegen pipeline. codegen-rust rebuilds the engine in release
-# mode (usually incremental + fast if you've been developing). codegen-dagster
-# and codegen-vscode are pure codegen — fast.
-if ! just codegen >&2; then
-    echo "pre-commit: \`just codegen\` failed — fix the build and retry" >&2
-    exit 1
+# ── Dagster: ruff format ─────────────────────────────────────────────────
+if [[ "$HAS_DAGSTER" == "1" ]] && command -v uv >/dev/null 2>&1; then
+    echo "pre-commit: checking ruff format (dagster)" >&2
+    if ! (cd integrations/dagster && uv run ruff format --check) >/dev/null 2>&1; then
+        echo "pre-commit: ✗ ruff format — run 'cd integrations/dagster && uv run ruff format' to fix" >&2
+        FAILED=1
+    fi
 fi
 
-# Now diff the working tree against the index. If codegen produced changes
-# that aren't staged, we have drift.
-DIRTY_PATHS=$(
-    git diff --name-only -- \
-        schemas/ \
-        integrations/dagster/src/dagster_rocky/types_generated/ \
-        editors/vscode/src/types/generated/
-)
+# ── VS Code: eslint ──────────────────────────────────────────────────────
+if [[ "$HAS_VSCODE" == "1" ]] && command -v npm >/dev/null 2>&1; then
+    echo "pre-commit: checking eslint (vscode)" >&2
+    if ! (cd editors/vscode && npm run lint --silent) >/dev/null 2>&1; then
+        echo "pre-commit: ✗ eslint — run 'cd editors/vscode && npm run lint' to fix" >&2
+        FAILED=1
+    fi
+fi
 
-if [[ -n "$DIRTY_PATHS" ]]; then
-    cat >&2 <<EOF
-pre-commit: codegen drift detected.
+# ── Codegen drift (only when schema source files are staged) ─────────────
+if [[ "${ROCKY_SKIP_CODEGEN_HOOK:-}" != "1" ]]; then
+    CODEGEN_TRIGGER=0
+    while IFS= read -r path; do
+        case "$path" in
+            engine/crates/rocky-cli/src/output.rs|\
+            engine/crates/rocky-cli/src/commands/doctor.rs|\
+            engine/crates/rocky-cli/src/commands/export_schemas.rs)
+                CODEGEN_TRIGGER=1
+                break
+                ;;
+        esac
+    done <<< "$STAGED"
+
+    if [[ "$CODEGEN_TRIGGER" == "1" ]]; then
+        echo "pre-commit: output schema source modified — running codegen check" >&2
+
+        if ! command -v just >/dev/null 2>&1; then
+            echo "pre-commit: ✗ \`just\` not found — install it or skip with ROCKY_SKIP_CODEGEN_HOOK=1" >&2
+            FAILED=1
+        elif ! just codegen >&2; then
+            echo "pre-commit: ✗ \`just codegen\` failed — fix the build and retry" >&2
+            FAILED=1
+        else
+            DIRTY_PATHS=$(
+                git diff --name-only -- \
+                    schemas/ \
+                    integrations/dagster/src/dagster_rocky/types_generated/ \
+                    editors/vscode/src/types/generated/
+            )
+            if [[ -n "$DIRTY_PATHS" ]]; then
+                cat >&2 <<EOF
+pre-commit: ✗ codegen drift detected.
 
 The following files were regenerated and are not staged:
 $DIRTY_PATHS
 
 Fix with:
   git add schemas/ integrations/dagster/src/dagster_rocky/types_generated/ editors/vscode/src/types/generated/
-  git commit …
-
-Or skip this hook (not recommended) with:
-  ROCKY_SKIP_CODEGEN_HOOK=1 git commit …
 EOF
+                FAILED=1
+            fi
+        fi
+    fi
+fi
+
+if [[ "$FAILED" == "1" ]]; then
+    echo "" >&2
+    echo "pre-commit: checks failed. Fix the issues above, or skip with ROCKY_SKIP_HOOKS=1" >&2
     exit 1
 fi
 
-echo "pre-commit: codegen clean" >&2
 exit 0

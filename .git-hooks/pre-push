@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Rocky monorepo pre-push hook.
+#
+# Runs heavier linter checks before pushing to the remote:
+#   1. cargo clippy --all-targets -- -D warnings  (engine)
+#   2. ruff check                                  (dagster)
+#
+# Each check only runs if the commits being pushed touch that subproject.
+# Compares HEAD against the remote tracking branch (or origin/main).
+#
+# Skip:
+#   ROCKY_SKIP_HOOKS=1 git push …
+
+set -euo pipefail
+
+if [[ "${ROCKY_SKIP_HOOKS:-}" == "1" ]]; then
+    echo "pre-push: ROCKY_SKIP_HOOKS=1, skipping all checks" >&2
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Determine what's being pushed by comparing HEAD to the remote branch.
+# Read the push info from stdin (git sends: <local ref> <local sha> <remote ref> <remote sha>).
+REMOTE_SHA=""
+while read -r _ LOCAL_SHA _ REMOTE_SHA_LINE; do
+    REMOTE_SHA="$REMOTE_SHA_LINE"
+done
+
+# If the remote SHA is all zeros, this is a new branch — compare against origin/main.
+ZERO="0000000000000000000000000000000000000000"
+if [[ -z "$REMOTE_SHA" || "$REMOTE_SHA" == "$ZERO" ]]; then
+    BASE="origin/main"
+else
+    BASE="$REMOTE_SHA"
+fi
+
+# Files changed in the commits being pushed.
+CHANGED=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only "$BASE" HEAD 2>/dev/null || echo "")
+
+if [[ -z "$CHANGED" ]]; then
+    exit 0
+fi
+
+# Detect which subprojects have changes.
+HAS_ENGINE=0
+HAS_DAGSTER=0
+while IFS= read -r path; do
+    case "$path" in
+        engine/*) HAS_ENGINE=1 ;;
+        integrations/dagster/*) HAS_DAGSTER=1 ;;
+    esac
+done <<< "$CHANGED"
+
+FAILED=0
+
+# ── Engine: cargo clippy ─────────────────────────────────────────────────
+if [[ "$HAS_ENGINE" == "1" ]] && command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: running cargo clippy (engine) — this may take a moment" >&2
+    if ! (cd engine && cargo clippy --all-targets -- -D warnings) 2>&1; then
+        echo "pre-push: ✗ cargo clippy failed" >&2
+        FAILED=1
+    fi
+fi
+
+# ── Dagster: ruff check ─────────────────────────────────────────────────
+if [[ "$HAS_DAGSTER" == "1" ]] && command -v uv >/dev/null 2>&1; then
+    echo "pre-push: running ruff check (dagster)" >&2
+    if ! (cd integrations/dagster && uv run ruff check) 2>&1; then
+        echo "pre-push: ✗ ruff check failed" >&2
+        FAILED=1
+    fi
+fi
+
+if [[ "$FAILED" == "1" ]]; then
+    echo "" >&2
+    echo "pre-push: checks failed. Fix the issues above, or skip with ROCKY_SKIP_HOOKS=1" >&2
+    exit 1
+fi
+
+exit 0
