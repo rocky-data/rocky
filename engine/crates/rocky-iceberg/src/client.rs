@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_debug_hides_secrets() {
         let client = IcebergCatalogClient::new(
-            "https://iceberg.example.com".into(),
+            "https://iceberg.example.com",
             Some("secret_token_value".into()),
         );
         let debug = format!("{client:?}");
