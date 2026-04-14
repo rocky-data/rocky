@@ -15,16 +15,23 @@ pub fn parse(source: &str) -> Result<RockyFile, ParseError> {
 struct Parser {
     tokens: Vec<(Token, usize)>,
     pos: usize,
+    /// Byte offsets of each `\n` character in the source, in ascending order.
+    /// Used to convert a byte offset into a (line, column) pair via binary search.
+    #[allow(dead_code)] // infrastructure for upcoming line:col error reporting
+    newline_offsets: Vec<usize>,
 }
 
 impl Parser {
     fn new(source: &str) -> Self {
         let mut tokens = Vec::new();
+        let mut newline_offsets = Vec::new();
         let mut lexer = Token::lexer(source);
         while let Some(result) = lexer.next() {
             match result {
                 Ok(token) => {
-                    if token != Token::Newline {
+                    if token == Token::Newline {
+                        newline_offsets.push(lexer.span().start);
+                    } else {
                         tokens.push((token, lexer.span().start));
                     }
                 }
@@ -33,7 +40,11 @@ impl Parser {
                 }
             }
         }
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            newline_offsets,
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -86,6 +97,23 @@ impl Parser {
             .get(self.pos)
             .map(|(_, offset)| *offset)
             .unwrap_or(0)
+    }
+
+    /// Convert a byte offset into a 1-indexed `(line, column)` pair.
+    ///
+    /// Uses binary search over the recorded newline positions. An offset
+    /// that falls exactly on a `\n` character is reported as the last
+    /// column of that line (not the first column of the next line).
+    #[allow(dead_code)] // infrastructure for upcoming line:col error reporting
+    fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
+        // Number of newlines strictly before `offset`.
+        let line_idx = self.newline_offsets.partition_point(|&nl| nl < offset);
+        let line_start = if line_idx == 0 {
+            0
+        } else {
+            self.newline_offsets[line_idx - 1] + 1
+        };
+        (line_idx + 1, offset - line_start + 1)
     }
 
     fn parse_file(&mut self) -> Result<RockyFile, ParseError> {
@@ -2447,5 +2475,87 @@ mod tests {
         } else {
             panic!("expected cross join in let binding");
         }
+    }
+
+    // --- Newline tracking / offset_to_line_col tests ---
+
+    #[test]
+    fn test_offset_to_line_col_offset_zero() {
+        let parser = Parser::new("from orders");
+        assert_eq!(parser.offset_to_line_col(0), (1, 1));
+    }
+
+    #[test]
+    fn test_offset_to_line_col_no_newlines() {
+        let parser = Parser::new("from orders");
+        // "orders" starts at byte 5
+        assert_eq!(parser.offset_to_line_col(5), (1, 6));
+    }
+
+    #[test]
+    fn test_offset_to_line_col_multiline() {
+        // "from orders\nwhere x == 1"
+        //  0123456789 10 11 = \n, 12 = 'w'
+        let input = "from orders\nwhere x == 1";
+        let parser = Parser::new(input);
+        // Newline at byte 11
+        assert_eq!(parser.newline_offsets, vec![11]);
+        // 'f' at offset 0 → line 1, col 1
+        assert_eq!(parser.offset_to_line_col(0), (1, 1));
+        // 'o' at offset 5 → line 1, col 6
+        assert_eq!(parser.offset_to_line_col(5), (1, 6));
+        // '\n' at offset 11 → line 1, col 12 (last col of line 1)
+        assert_eq!(parser.offset_to_line_col(11), (1, 12));
+        // 'w' at offset 12 → line 2, col 1
+        assert_eq!(parser.offset_to_line_col(12), (2, 1));
+        // 'x' at offset 18 → line 2, col 7
+        assert_eq!(parser.offset_to_line_col(18), (2, 7));
+    }
+
+    #[test]
+    fn test_offset_to_line_col_three_lines() {
+        // "a\nb\nc"
+        //  0  1=\n  2  3=\n  4
+        let input = "a\nb\nc";
+        let parser = Parser::new(input);
+        assert_eq!(parser.newline_offsets, vec![1, 3]);
+        assert_eq!(parser.offset_to_line_col(0), (1, 1)); // 'a'
+        assert_eq!(parser.offset_to_line_col(1), (1, 2)); // '\n' → last col of line 1
+        assert_eq!(parser.offset_to_line_col(2), (2, 1)); // 'b'
+        assert_eq!(parser.offset_to_line_col(3), (2, 2)); // '\n' → last col of line 2
+        assert_eq!(parser.offset_to_line_col(4), (3, 1)); // 'c' → line 3, col 1
+    }
+
+    #[test]
+    fn test_offset_to_line_col_empty_input() {
+        let parser = Parser::new("");
+        // No newlines recorded
+        assert!(parser.newline_offsets.is_empty());
+        assert_eq!(parser.offset_to_line_col(0), (1, 1));
+    }
+
+    #[test]
+    fn test_offset_to_line_col_offset_in_last_line() {
+        let input = "from orders\nwhere x == 1\nselect { id }";
+        let parser = Parser::new(input);
+        // Newlines at 11 and 24
+        assert_eq!(parser.newline_offsets.len(), 2);
+        // "select" starts at byte 25 → line 3, col 1
+        assert_eq!(parser.offset_to_line_col(25), (3, 1));
+        // "id" is deeper in line 3
+        let id_offset = input.rfind("id").unwrap();
+        assert_eq!(parser.offset_to_line_col(id_offset), (3, id_offset - 24));
+    }
+
+    #[test]
+    fn test_newline_offsets_collected() {
+        let input = "from orders\nwhere status == \"completed\"\nselect { id }";
+        let parser = Parser::new(input);
+        assert_eq!(parser.newline_offsets.len(), 2);
+        assert_eq!(parser.newline_offsets[0], 11);
+        // Second newline is after "completed\"
+        let second_nl = input.find('\n').unwrap();
+        let second_nl2 = input[second_nl + 1..].find('\n').unwrap() + second_nl + 1;
+        assert_eq!(parser.newline_offsets[1], second_nl2);
     }
 }
