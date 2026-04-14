@@ -257,10 +257,8 @@ mod tests {
 
     #[test]
     fn test_debug_hides_secrets() {
-        let client = AirbyteClient::new(
-            "https://api.airbyte.com".into(),
-            Some("secret_token_value".into()),
-        );
+        let client =
+            AirbyteClient::new("https://api.airbyte.com", Some("secret_token_value".into()));
         let debug = format!("{client:?}");
         assert!(!debug.contains("secret_token_value"));
         assert!(debug.contains("***"));

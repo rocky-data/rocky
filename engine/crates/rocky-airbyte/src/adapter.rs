@@ -144,7 +144,7 @@ mod tests {
             source_id: "src_test".into(),
             destination_id: "dst_test".into(),
             status,
-            namespace_format: namespace.map(|s| s.to_string()),
+            namespace_format: namespace.map(ToString::to_string),
             configurations: if streams.is_empty() {
                 None
             } else {
