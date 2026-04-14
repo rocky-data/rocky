@@ -1,24 +1,50 @@
 name: dagster-release
 
-# Publishes dagster-rocky to PyPI via OIDC when a dagster-v* tag is pushed.
-# The GitHub Release and wheel are created locally by scripts/release.sh.
-# This workflow only handles the PyPI publish (which requires OIDC identity
-# from GitHub Actions). Skip this if you published locally with --publish.
+# Publishes dagster-rocky to PyPI via OIDC and ensures a GitHub Release exists
+# when a dagster-v* tag is pushed. Supports both workflows:
+#   1. CI-only: push tag → this workflow creates the GH Release + publishes to PyPI
+#   2. Local-first: scripts/release.sh creates the GH Release, push tag → CI publishes to PyPI
+# The ensure-release job is idempotent — it skips if the release already exists.
 
 on:
   push:
     tags: ["dagster-v*"]
 
 permissions:
-  contents: read
+  contents: write
 
 defaults:
   run:
     working-directory: integrations/dagster
 
 jobs:
+  # Create the GitHub Release if it doesn't already exist (supports both
+  # CI-only releases and the local scripts/release.sh workflow where the
+  # release is created before the tag push).
+  ensure-release:
+    name: Ensure GitHub Release exists
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (created by scripts/release.sh)"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              --title "$TAG"
+          fi
+
   publish-pypi:
     name: Publish to PyPI
+    needs: ensure-release
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -31,3 +57,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: integrations/dagster/dist/
+
+      - name: Attach wheel and sdist to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
