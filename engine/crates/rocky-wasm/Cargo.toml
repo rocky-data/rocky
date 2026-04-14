@@ -12,9 +12,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rocky-sql = { path = "../rocky-sql" }
 rocky-lang = { path = "../rocky-lang" }
-rocky-compiler = { path = "../rocky-compiler" }
 serde_json = { workspace = true }
 wasm-bindgen = { workspace = true }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
 
 [lints]
 workspace = true

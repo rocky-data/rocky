@@ -3324,7 +3324,6 @@ dependencies = [
 name = "rocky-wasm"
 version = "1.0.0"
 dependencies = [
- "rocky-compiler",
  "rocky-lang",
  "rocky-sql",
  "serde_json",
