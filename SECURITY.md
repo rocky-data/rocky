@@ -8,6 +8,8 @@ We take the security of Rocky and its integrations seriously. If you discover a 
 2. Click "Report a vulnerability"
 3. Fill in the details of the vulnerability, including which subproject is affected
 
+Alternatively, you can email **security@rocky-data.dev** directly.
+
 **Please do not report security vulnerabilities through public GitHub issues.**
 
 ## Response Timeline
