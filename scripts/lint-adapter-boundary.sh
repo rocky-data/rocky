@@ -9,8 +9,7 @@
 #   - run.rs      — still uses rocky_databricks::batch for performance
 #                   optimisation (TODO: remove when batch is genericised)
 #
-# This enforces the boundary established by Plans 01 + 02 from
-# rocky-plans/rocky-improvements/ and prevents regression.
+# This enforces the adapter abstraction boundary and prevents regression.
 #
 # Usage: bash scripts/lint-adapter-boundary.sh
 # Exit 0 = clean, Exit 1 = forbidden imports found
@@ -45,7 +44,6 @@ if [ -n "$VIOLATIONS" ]; then
     echo "  - SqlDialect        (create_catalog_sql, create_schema_sql, ...)"
     echo
     echo "Trait definitions: engine/crates/rocky-core/src/traits.rs"
-    echo "See Plans 01 + 02 in rocky-plans/rocky-improvements/ for the refactoring pattern."
     exit 1
 fi
 

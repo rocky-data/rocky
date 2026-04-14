@@ -25,7 +25,7 @@
 #
 # Downstream consumers copy from vendor/rocky-linux-amd64 into their
 # own vendor/ directory:
-#   cp ~/Developer/rocky-data/vendor/rocky-linux-amd64 ./vendor/
+#   cp vendor/rocky-linux-amd64 /path/to/consumer/vendor/
 
 set -euo pipefail
 

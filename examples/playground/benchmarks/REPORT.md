@@ -362,7 +362,7 @@ To reproduce these exact results:
 
 ```bash
 # Build Rocky in release mode (must include commit 7fa9086 or later)
-cd ~/Developer/rocky-data/rocky
+cd engine
 git log --oneline | head -3   # confirm 7fa9086 is in history
 cargo build --release
 

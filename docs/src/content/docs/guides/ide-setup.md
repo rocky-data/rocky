@@ -24,7 +24,7 @@ npm install
 npm run compile
 ```
 
-Open the `rocky-vscode` folder in VS Code, then press **F5**. This launches a new VS Code window with the extension loaded. Changes to the TypeScript source are picked up on the next F5 launch.
+Open the `editors/vscode` folder in VS Code, then press **F5**. This launches a new VS Code window with the extension loaded. Changes to the TypeScript source are picked up on the next F5 launch.
 
 ### Method B: Install from VSIX
 
