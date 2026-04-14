@@ -237,6 +237,25 @@
     flex-shrink: 0;
   }
 
+  /* ---- Parse status indicator ---- */
+  #parse-status {
+    font-size: 0.625rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    margin-left: 0.5rem;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  #parse-status.parse-ok {
+    background: rgba(63,185,80,0.15);
+    color: var(--green);
+  }
+  #parse-status.parse-error {
+    background: rgba(248,81,73,0.15);
+    color: var(--red);
+  }
+
   /* ---- Responsive ---- */
   @media (max-width: 700px) {
     .main { flex-direction: column; }
@@ -259,13 +278,27 @@
 <div class="toolbar">
   <label>Snippets</label>
   <select id="snippet-picker" title="Load a sample snippet">
-    <option value="">-- choose --</option>
-    <option value="rocky-dsl">Rocky DSL: from / select</option>
-    <option value="rocky-filter">Rocky DSL: filter + derive</option>
-    <option value="sql-lineage">SQL: column lineage</option>
-    <option value="sql-join">SQL: JOIN lineage</option>
-    <option value="identifier-valid">Identifier: valid</option>
-    <option value="identifier-invalid">Identifier: invalid</option>
+    <option value="">-- choose a snippet --</option>
+    <optgroup label="Rocky DSL">
+      <option value="rocky-dsl">from / select</option>
+      <option value="rocky-filter">where + derive</option>
+      <option value="rocky-group">group + aggregate</option>
+      <option value="rocky-join">join (inner)</option>
+      <option value="rocky-left-join">left join</option>
+      <option value="rocky-window">window functions</option>
+      <option value="rocky-let">let bindings (CTEs)</option>
+      <option value="rocky-match">match expression (CASE)</option>
+      <option value="rocky-sort-take">sort + take + date literal</option>
+      <option value="rocky-null-safe">NULL-safe != operator</option>
+    </optgroup>
+    <optgroup label="SQL Lineage">
+      <option value="sql-lineage">column lineage (JOIN)</option>
+      <option value="sql-join">JOIN lineage (GROUP BY)</option>
+    </optgroup>
+    <optgroup label="Identifiers">
+      <option value="identifier-valid">valid identifier</option>
+      <option value="identifier-invalid">invalid identifier</option>
+    </optgroup>
   </select>
   <div class="toolbar-sep"></div>
   <label>Actions</label>
@@ -273,6 +306,7 @@
     <button id="btn-compile" class="primary" disabled title="Extract column-level lineage from SQL (compile_sql)">Compile SQL</button>
     <button id="btn-parse" disabled title="Parse Rocky DSL into JSON AST (parse_rocky)">Parse Rocky</button>
     <button id="btn-lower" disabled title="Lower Rocky DSL to SQL (lower_rocky_to_sql)">Lower to SQL</button>
+    <button id="btn-check" disabled title="Check Rocky DSL for parse errors (get_parse_errors)">Check Syntax</button>
     <button id="btn-validate" disabled title="Check if text is a valid SQL identifier (validate_identifier)">Validate</button>
   </div>
   <div class="toolbar-sep"></div>
@@ -282,7 +316,7 @@
 <!-- Split pane -->
 <div class="main">
   <div class="pane" id="pane-left" style="flex: 1">
-    <div class="pane-header">Editor</div>
+    <div class="pane-header">Editor <span id="parse-status"></span></div>
     <textarea id="editor" spellcheck="false" placeholder="Enter Rocky DSL or SQL here...">-- Column lineage demo
 -- Try clicking "Compile SQL" to extract lineage.
 SELECT
@@ -312,7 +346,7 @@ WHERE o.order_date >= '2024-01-01'</textarea>
   // ---- WASM loading ----
   let wasm = null;
   const statusEl = document.getElementById('wasm-status');
-  const buttons = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-validate'].map(
+  const buttons = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-check', 'btn-validate'].map(
     id => document.getElementById(id)
   );
 
@@ -379,7 +413,7 @@ WHERE o.order_date >= '2024-01-01'</textarea>
 
   /** Highlight SQL keywords for display. */
   function highlightSql(sql) {
-    const keywords = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AND|OR|NOT|AS|IN|IS|NULL|LIKE|BETWEEN|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|UNION|ALL|INSERT|INTO|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|VIEW|INDEX|IF|EXISTS|CASE|WHEN|THEN|ELSE|END|DISTINCT|COUNT|SUM|AVG|MIN|MAX|OVER|PARTITION|WINDOW|WITH|RECURSIVE|CAST|COALESCE|NULLIF)\b/gi;
+    const keywords = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AND|OR|NOT|AS|IN|IS|NULL|LIKE|BETWEEN|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|UNION|ALL|INSERT|INTO|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|VIEW|INDEX|IF|EXISTS|CASE|WHEN|THEN|ELSE|END|DISTINCT|COUNT|SUM|AVG|MIN|MAX|OVER|PARTITION|WINDOW|WITH|RECURSIVE|CAST|COALESCE|NULLIF|ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD|ROWS|RANGE|UNBOUNDED|PRECEDING|FOLLOWING|CURRENT|ROW|DATE|TRUE|FALSE)\b/gi;
     const escaped = escHtml(sql);
     return escaped.replace(keywords, '<span class="out-keyword">$&</span>');
   }
@@ -475,14 +509,41 @@ WHERE o.order_date >= '2024-01-01'</textarea>
     }
   });
 
+  document.getElementById('btn-check').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.get_parse_errors(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    const errors = JSON.parse(result);
+
+    if (errors.length === 0) {
+      setOutput(
+        '<span class="out-comment">// get_parse_errors (' + ms + ' ms)</span>\n\n' +
+        '<span class="out-success">No parse errors found.</span>'
+      );
+    } else {
+      const err = errors[0];
+      setOutput(
+        '<span class="out-comment">// get_parse_errors (' + ms + ' ms)</span>\n\n' +
+        '<span class="out-error">Parse error at line ' + err.line + ', column ' + err.column + ':</span>\n' +
+        '<span class="out-error">' + escHtml(err.message) + '</span>\n\n' +
+        '<span class="out-comment">Expected: ' + escHtml(err.expected) + '</span>\n' +
+        '<span class="out-comment">Found:    ' + escHtml(err.found) + '</span>'
+      );
+    }
+  });
+
   document.getElementById('btn-clear').addEventListener('click', () => {
     setOutput('<span class="out-comment">-- Output cleared.</span>');
   });
 
   // ---- Snippet picker ----
   const snippets = {
+    // -- Rocky DSL snippets --
     'rocky-dsl':
-`from catalog.sales.orders
+`-- Basic pipeline: from / select
+-- Try "Parse Rocky" or "Lower to SQL"
+from catalog.sales.orders
 select {
     order_id,
     customer_id,
@@ -490,19 +551,109 @@ select {
     order_date
 }`,
     'rocky-filter':
-`from catalog.sales.orders
-filter order_date >= @2024-01-01
+`-- Where clause + derived columns
+-- Try "Lower to SQL" to see the generated SQL
+from catalog.sales.orders
+where order_date >= @2024-01-01
 derive {
-    total_with_tax = total_amount * 1.1,
-    is_large = total_amount > 1000
+    total_with_tax: total_amount * 1.1,
+    is_large: total_amount > 1000
 }
 select {
     order_id,
     total_with_tax,
     is_large
 }`,
+    'rocky-group':
+`-- Group by with aggregation functions
+-- Try "Lower to SQL" to see GROUP BY output
+from catalog.sales.orders
+group customer_id {
+    order_count: count(),
+    total_revenue: sum(amount),
+    avg_order: avg(amount)
+}`,
+    'rocky-join':
+`-- Inner join with keep clause
+-- Try "Lower to SQL" to see the JOIN output
+from catalog.sales.orders as o
+join catalog.sales.customers as c on customer_id {
+    keep c.customer_name
+}
+select {
+    o.order_id,
+    c.customer_name,
+    o.amount
+}`,
+    'rocky-left-join':
+`-- Left join + IS NOT NULL filter
+-- Try "Lower to SQL" to see LEFT JOIN output
+from catalog.sales.orders as o
+left_join catalog.sales.customers as c on customer_id {
+    keep c.customer_name
+}
+where c.customer_name is not null`,
+    'rocky-window':
+`-- Window functions with partition + frame
+-- Try "Lower to SQL" to see OVER clauses
+from catalog.sales.orders
+derive {
+    rn: row_number() over (partition customer_id, sort -order_date),
+    running_total: sum(amount) over (partition customer_id, sort order_date, rows unbounded..current)
+}`,
+    'rocky-let':
+`-- Let bindings compile to CTEs (WITH clause)
+-- Try "Lower to SQL" to see the CTE output
+let active_customers = from catalog.sales.customers
+    where is_active == true
+
+from catalog.sales.orders as o
+join active_customers as c on customer_id {
+    keep c.customer_name
+}
+select {
+    o.order_id,
+    c.customer_name,
+    o.amount
+}`,
+    'rocky-match':
+`-- Match expression compiles to CASE WHEN
+-- Try "Lower to SQL" to see the CASE output
+from catalog.sales.orders
+derive {
+    tier: match amount {
+        > 10000 => "high",
+        > 5000 => "medium",
+        _ => "low"
+    }
+}
+select {
+    order_id,
+    amount,
+    tier
+}`,
+    'rocky-sort-take':
+`-- Sort, take, and date literals
+-- Try "Lower to SQL" to see ORDER BY + LIMIT
+from catalog.sales.orders
+where order_date >= @2025-01-01
+sort amount desc, order_date
+take 100`,
+    'rocky-null-safe':
+`-- Rocky's != compiles to IS DISTINCT FROM (NULL-safe)
+-- Try "Lower to SQL" to see the difference from SQL's !=
+from catalog.sales.orders
+where status != "cancelled"
+select {
+    order_id,
+    status,
+    amount
+}`,
+    // -- SQL Lineage snippets --
     'sql-lineage':
-`SELECT
+`-- Column lineage from a JOIN query
+-- Try "Compile SQL" to extract lineage
+SELECT
     o.order_id,
     o.customer_id,
     c.customer_name,
@@ -513,7 +664,9 @@ JOIN catalog.sales.customers AS c
     ON o.customer_id = c.customer_id
 WHERE o.order_date >= '2024-01-01'`,
     'sql-join':
-`SELECT
+`-- GROUP BY with aggregation lineage
+-- Try "Compile SQL" to extract lineage
+SELECT
     p.product_id,
     p.product_name,
     SUM(oi.quantity) AS total_sold,
@@ -523,6 +676,7 @@ JOIN catalog.sales.order_items AS oi
     ON p.product_id = oi.product_id
 GROUP BY p.product_id, p.product_name
 ORDER BY revenue DESC`,
+    // -- Identifier snippets --
     'identifier-valid': 'my_table_name',
     'identifier-invalid': 'DROP TABLE users--'
   };
@@ -531,7 +685,35 @@ ORDER BY revenue DESC`,
     const key = e.target.value;
     if (key && snippets[key]) {
       editorEl.value = snippets[key];
+      updateParseStatus();
     }
+  });
+
+  // ---- Debounced parse-error check ----
+  const parseStatusEl = document.getElementById('parse-status');
+  let checkTimer = null;
+
+  function updateParseStatus() {
+    if (!wasm) return;
+    const input = getInput();
+    if (!input.trim()) {
+      parseStatusEl.textContent = '';
+      parseStatusEl.className = '';
+      return;
+    }
+    const errors = JSON.parse(wasm.get_parse_errors(input));
+    if (errors.length === 0) {
+      parseStatusEl.textContent = 'OK';
+      parseStatusEl.className = 'parse-ok';
+    } else {
+      parseStatusEl.textContent = 'line ' + errors[0].line + ':' + errors[0].column;
+      parseStatusEl.className = 'parse-error';
+    }
+  }
+
+  editorEl.addEventListener('input', () => {
+    if (checkTimer) clearTimeout(checkTimer);
+    checkTimer = setTimeout(updateParseStatus, 500);
   });
 
   // ---- Keyboard shortcut ----
