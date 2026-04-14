@@ -70,9 +70,11 @@ pub fn get_parse_errors(source: &str) -> String {
                     found,
                     offset,
                 } => (*offset, expected.clone(), found.clone()),
-                rocky_lang::ParseError::UnexpectedEof { expected } => {
-                    (source.len().saturating_sub(1), expected.clone(), "EOF".to_string())
-                }
+                rocky_lang::ParseError::UnexpectedEof { expected } => (
+                    source.len().saturating_sub(1),
+                    expected.clone(),
+                    "EOF".to_string(),
+                ),
                 rocky_lang::ParseError::InvalidNumber { value } => {
                     (0, "valid number".to_string(), value.clone())
                 }

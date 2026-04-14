@@ -219,7 +219,7 @@ mod tests {
     fn test_classify_bare_name_model() {
         let models: HashSet<String> = ["orders", "customers"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         assert_eq!(
             classify_table_ref("orders", &models),
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_classify_bare_name_unknown() {
-        let models: HashSet<String> = ["orders"].iter().map(|s| s.to_string()).collect();
+        let models: HashSet<String> = ["orders"].iter().map(ToString::to_string).collect();
         assert_eq!(
             classify_table_ref("unknown_table", &models),
             TableRefKind::RawRef("unknown_table".to_string())
