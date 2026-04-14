@@ -396,7 +396,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
     "@types/vscode": "^1.115.0",
-    "@viz-js/viz": "^3.25.0",
+    "@viz-js/viz": "^3.26.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.7.1",
     "eslint": "^10.2.0",
