@@ -1,7 +1,7 @@
 .vscode/**
 .vscode-test/**
 src/**
-node_modules/**
+node_modules/.package-lock.json
 tsconfig.json
 .gitignore
 **/*.ts
