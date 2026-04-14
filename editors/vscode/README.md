@@ -35,7 +35,7 @@ There are three ways to use this extension locally:
 This launches a separate VS Code window with the extension loaded.
 
 ```bash
-cd ~/Developer/rocky-vscode
+cd editors/vscode
 npm install
 npm run compile
 ```
@@ -63,7 +63,7 @@ To set this up, create `.vscode/launch.json`:
 Package the extension as a `.vsix` file and install it directly:
 
 ```bash
-cd ~/Developer/rocky-vscode
+cd editors/vscode
 npm install
 npm run compile
 npx @vscode/vsce package
@@ -88,7 +88,7 @@ npm run compile && npx @vscode/vsce package && code --install-extension rocky-0.
 Create a symlink from the VS Code extensions directory to your local clone:
 
 ```bash
-ln -s ~/Developer/rocky-vscode ~/.vscode/extensions/rocky-dev.rocky-0.1.0
+ln -s "$(pwd)/editors/vscode" ~/.vscode/extensions/rocky-dev.rocky-0.1.0
 ```
 
 Then restart VS Code. This is the least friction for iteration — changes to JSON files (grammar, snippets, language config) take effect on reload. TypeScript changes still require `npm run compile`.
@@ -112,7 +112,7 @@ Then restart VS Code. This is the least friction for iteration — changes to JS
 ## Project Structure
 
 ```
-rocky-vscode/
+editors/vscode/
 ├── package.json                    # Extension manifest
 ├── tsconfig.json                   # TypeScript config
 ├── language-configuration.json     # Brackets, comments, folding

@@ -123,4 +123,4 @@ Credential-gated POCs should fail fast with a clear `: "${VAR:?Set VAR before ru
 
 - Match `../../engine/CLAUDE.md`: conventional commits (`feat:`, `fix:`, etc.), no `Co-Authored-By` trailers.
 - Scope by POC when relevant: `feat(02-performance/01-incremental-watermark): add seed delta`
-- Don't push to remote without explicit user confirmation. This directory is part of the `rocky-data/rocky` monorepo (private) on GitHub.
+- Don't push to remote without explicit user confirmation.
