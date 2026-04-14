@@ -261,7 +261,9 @@ pub async fn run(
         }
     }
 
-    let pipeline = pipeline_config.as_replication().context("expected replication pipeline")?;
+    let pipeline = pipeline_config
+        .as_replication()
+        .context("expected replication pipeline")?;
 
     // All adapters flow through this production-grade execution path.
     // Databricks-specific batch optimizations (batch describe, batch tagging,
@@ -1273,7 +1275,9 @@ pub async fn run(
         }
     }
 
-    let state_store = Arc::try_unwrap(shared_state).ok().map(|m| m.into_inner());
+    let state_store = Arc::try_unwrap(shared_state)
+        .ok()
+        .map(tokio::sync::Mutex::into_inner);
 
     // --- Batched checks ---
     let _checks_span = info_span!("batched_checks").entered();
@@ -1402,7 +1406,7 @@ pub async fn run(
                             .first()
                             .and_then(|r| r.first())
                             .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                            .map(std::string::ToString::to_string);
                         fresh_results.push(batch::FreshnessResult {
                             catalog: br.catalog.clone(),
                             schema: br.schema.clone(),
@@ -1684,7 +1688,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
         if let Some(ref part) = mat.partition {
             metadata.insert("partition_key".into(), json!(part.key));
         }
-        pipes.report_asset_materialization(&asset_key, json!(metadata));
+        pipes.report_asset_materialization(&asset_key, &json!(metadata));
     }
 
     // Asset checks. Each TableCheckOutput has multiple per-check rows;
@@ -1706,14 +1710,14 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 .to_string();
             let passed = check_value
                 .get("passed")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
             pipes.report_asset_check(
                 &asset_key,
                 &check_name,
                 passed,
                 crate::pipes::PipesCheckSeverity::Error,
-                check_value,
+                &check_value,
             );
         }
     }
@@ -1932,7 +1936,7 @@ async fn execute_time_interval_model(
         &local_state
     };
 
-    let plans = plan_partitions(model, selection, partition_opts.lookback, state_ref)
+    let plans = plan_partitions(model, &selection, partition_opts.lookback, state_ref)
         .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
 
     info!(

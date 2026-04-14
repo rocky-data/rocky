@@ -185,9 +185,8 @@ async fn fire_webhook_inner(
             Err(e) => {
                 if attempt < max_attempts {
                     // Exponential backoff capped at 30s to prevent overflow at high attempt counts
-                    let delay = (config.retry_delay_ms
-                        * (1u64 << (attempt - 1).min(10)))
-                    .min(30_000);
+                    let delay =
+                        (config.retry_delay_ms * (1u64 << (attempt - 1).min(10))).min(30_000);
                     warn!(
                         webhook = %config.url,
                         attempt = attempt,

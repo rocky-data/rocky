@@ -216,11 +216,7 @@ impl WarehouseAdapter for BigQueryAdapter {
         let tables = result
             .rows
             .iter()
-            .filter_map(|row| {
-                row.first()
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase())
-            })
+            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_lowercase))
             .collect();
         Ok(tables)
     }

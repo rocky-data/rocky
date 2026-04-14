@@ -175,7 +175,7 @@ fn validate_generated_code(source: &str, format: &str) -> Result<String, String>
                 .diagnostics
                 .iter()
                 .filter(|d| d.is_error())
-                .map(|d| d.to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
 
             if errors.is_empty() {

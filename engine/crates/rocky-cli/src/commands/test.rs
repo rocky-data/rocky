@@ -45,7 +45,12 @@ pub fn run_test(
             }
         }
 
-        if result.failures.is_empty() && !result.diagnostics.iter().any(|d| d.is_error()) {
+        if result.failures.is_empty()
+            && !result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::diagnostic::Diagnostic::is_error)
+        {
             println!("  All {} models passed", result.passed);
         } else {
             for (name, err) in &result.failures {

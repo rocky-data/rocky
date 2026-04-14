@@ -176,7 +176,7 @@ impl PipesEmitter {
     pub fn log(&self, level: &str, message: &str) {
         self.write_message(
             "log",
-            json!({
+            &json!({
                 "message": message,
                 "level": level,
             }),
@@ -191,10 +191,10 @@ impl PipesEmitter {
     /// `metadata` is a JSON object whose values are
     /// [`PipesMetadataRawValue`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesMetadataValue) —
     /// in practice, plain JSON values that Dagster infers types for.
-    pub fn report_asset_materialization(&self, asset_key: &str, metadata: Value) {
+    pub fn report_asset_materialization(&self, asset_key: &str, metadata: &Value) {
         self.write_message(
             "report_asset_materialization",
-            json!({
+            &json!({
                 "asset_key": asset_key,
                 "metadata": metadata,
                 "data_version": Value::Null,
@@ -210,11 +210,11 @@ impl PipesEmitter {
         check_name: &str,
         passed: bool,
         severity: PipesCheckSeverity,
-        metadata: Value,
+        metadata: &Value,
     ) {
         self.write_message(
             "report_asset_check",
-            json!({
+            &json!({
                 "asset_key": asset_key,
                 "check_name": check_name,
                 "passed": passed,
@@ -230,13 +230,13 @@ impl PipesEmitter {
     /// Best-effort: failure to write is silently swallowed (we're
     /// already on the shutdown path).
     pub fn closed(&self) {
-        self.write_message("closed", Value::Null);
+        self.write_message("closed", &Value::Null);
     }
 
     /// Internal: serialize and write a message envelope to the
     /// channel. Wrapped in a mutex so multi-threaded callers
     /// (`--parallel N` partition execution) don't interleave lines.
-    fn write_message(&self, method: &str, params: Value) {
+    fn write_message(&self, method: &str, params: &Value) {
         let envelope = json!({
             "__dagster_pipes_version": PIPES_PROTOCOL_VERSION,
             "method": method,
@@ -341,7 +341,7 @@ mod tests {
 
         emitter.report_asset_materialization(
             "warehouse/marts/fct_orders",
-            json!({
+            &json!({
                 "rows_copied": 1500,
                 "duration_ms": 2300,
             }),
@@ -367,7 +367,7 @@ mod tests {
             "row_count_anomaly",
             false,
             PipesCheckSeverity::Warn,
-            json!({"current_count": 900}),
+            &json!({"current_count": 900}),
         );
 
         let lines = read_lines(&path);

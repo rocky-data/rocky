@@ -112,7 +112,7 @@ pub fn fixture_to_sql(fixture: &TestFixture) -> Option<String> {
 
     // Extract column names from the first row
     let first_row = fixture.rows[0].as_object()?;
-    let columns: Vec<&str> = first_row.keys().map(|k| k.as_str()).collect();
+    let columns: Vec<&str> = first_row.keys().map(std::string::String::as_str).collect();
 
     let mut selects = Vec::with_capacity(fixture.rows.len());
     for row in &fixture.rows {

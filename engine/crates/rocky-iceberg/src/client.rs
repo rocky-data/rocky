@@ -97,12 +97,12 @@ impl IcebergCatalogClient {
     /// `https://my-iceberg-catalog.example.com`. The trailing slash is
     /// stripped if present. `auth_token` is optional -- some catalogs
     /// require Bearer auth, others (e.g., local dev) do not.
-    pub fn new(catalog_url: String, auth_token: Option<String>) -> Self {
+    pub fn new(catalog_url: &str, auth_token: Option<String>) -> Self {
         Self::with_retry(catalog_url, auth_token, RetryConfig::default())
     }
 
     /// Create a new client with custom retry configuration.
-    pub fn with_retry(catalog_url: String, auth_token: Option<String>, retry: RetryConfig) -> Self {
+    pub fn with_retry(catalog_url: &str, auth_token: Option<String>, retry: RetryConfig) -> Self {
         let base_url = catalog_url.trim_end_matches('/').to_string();
         IcebergCatalogClient {
             client: Client::new(),
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_debug_without_token() {
-        let client = IcebergCatalogClient::new("https://localhost:8181".into(), None);
+        let client = IcebergCatalogClient::new("https://localhost:8181", None);
         let debug = format!("{client:?}");
         assert!(debug.contains("localhost"));
         assert!(!debug.contains("secret"));
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_base_url_trailing_slash_stripped() {
-        let client = IcebergCatalogClient::new("https://iceberg.example.com/".into(), None);
+        let client = IcebergCatalogClient::new("https://iceberg.example.com/", None);
         assert_eq!(client.base_url, "https://iceberg.example.com");
     }
 

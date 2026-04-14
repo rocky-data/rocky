@@ -119,7 +119,10 @@ impl PartialCompileResult {
 
     /// Get all model names (successful ones — for ref completions).
     pub fn all_model_names(&self) -> Vec<&str> {
-        self.successful.keys().map(|s| s.as_str()).collect()
+        self.successful
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 }
 

@@ -14,8 +14,8 @@ pub async fn run_serve(
 ) -> Result<()> {
     let state = rocky_server::state::ServerState::new(
         models_dir.to_path_buf(),
-        contracts_dir.map(|p| p.to_path_buf()),
-        config_path.map(|p| p.to_path_buf()),
+        contracts_dir.map(std::path::Path::to_path_buf),
+        config_path.map(std::path::Path::to_path_buf),
     );
 
     // Start filesystem watcher if requested

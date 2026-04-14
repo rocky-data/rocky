@@ -149,12 +149,12 @@ impl AdapterRegistry {
                     let api_key = adapter_cfg
                         .api_key
                         .as_ref()
-                        .map(|s| s.expose())
+                        .map(rocky_core::redacted::RedactedString::expose)
                         .context(format!("adapters.{name}: api_key required for fivetran"))?;
                     let api_secret = adapter_cfg
                         .api_secret
                         .as_ref()
-                        .map(|s| s.expose())
+                        .map(rocky_core::redacted::RedactedString::expose)
                         .context(format!("adapters.{name}: api_secret required for fivetran"))?;
                     let destination_id = adapter_cfg.destination_id.as_deref().context(format!(
                         "adapters.{name}: destination_id required for fivetran"
@@ -173,40 +173,25 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "airbyte" => {
-                    let api_url = adapter_cfg
-                        .host
-                        .as_deref()
-                        .context(format!(
-                            "adapters.{name}: host (API URL) required for airbyte"
-                        ))?;
-                    let auth_token = adapter_cfg
-                        .token
-                        .as_ref()
-                        .map(|s| s.expose().to_string());
+                    let api_url = adapter_cfg.host.as_deref().context(format!(
+                        "adapters.{name}: host (API URL) required for airbyte"
+                    ))?;
+                    let auth_token = adapter_cfg.token.as_ref().map(|s| s.expose().to_string());
 
-                    let client = AirbyteClient::with_retry(
-                        api_url.to_string(),
-                        auth_token,
-                        adapter_cfg.retry.clone(),
-                    );
+                    let client =
+                        AirbyteClient::with_retry(api_url, auth_token, adapter_cfg.retry.clone());
 
                     let adapter = Arc::new(AirbyteDiscoveryAdapter::new(client));
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "iceberg" => {
-                    let catalog_url = adapter_cfg
-                        .host
-                        .as_deref()
-                        .context(format!(
-                            "adapters.{name}: host (REST catalog URL) required for iceberg"
-                        ))?;
-                    let auth_token = adapter_cfg
-                        .token
-                        .as_ref()
-                        .map(|s| s.expose().to_string());
+                    let catalog_url = adapter_cfg.host.as_deref().context(format!(
+                        "adapters.{name}: host (REST catalog URL) required for iceberg"
+                    ))?;
+                    let auth_token = adapter_cfg.token.as_ref().map(|s| s.expose().to_string());
 
                     let client = IcebergCatalogClient::with_retry(
-                        catalog_url.to_string(),
+                        catalog_url,
                         auth_token,
                         adapter_cfg.retry.clone(),
                     );
@@ -370,7 +355,11 @@ pub fn resolve_pipeline<'a>(
             } else if config.pipelines.is_empty() {
                 bail!("no pipelines defined in config")
             } else {
-                let names: Vec<&str> = config.pipelines.keys().map(|s| s.as_str()).collect();
+                let names: Vec<&str> = config
+                    .pipelines
+                    .keys()
+                    .map(std::string::String::as_str)
+                    .collect();
                 bail!(
                     "multiple pipelines defined ({}). Use --pipeline <name> to select one.",
                     names.join(", ")

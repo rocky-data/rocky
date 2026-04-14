@@ -21,7 +21,7 @@ pub fn run_compile(
 ) -> Result<()> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: contracts_dir.map(|p| p.to_path_buf()),
+        contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
     };
@@ -115,7 +115,7 @@ pub fn run_compile(
                     .type_check
                     .typed_models
                     .get(model_name)
-                    .map(|cols| cols.len())
+                    .map(std::vec::Vec::len)
                     .unwrap_or(0);
                 println!("  \u{2713} {model_name} ({col_count} columns)");
             }

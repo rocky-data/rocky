@@ -77,7 +77,7 @@ pub fn topological_sort(nodes: &[DagNode]) -> Result<Vec<String>, DagError> {
 
     if result.len() != nodes.len() {
         // Nodes not in result are part of a cycle
-        let in_result: HashSet<&str> = result.iter().map(|s| s.as_str()).collect();
+        let in_result: HashSet<&str> = result.iter().map(std::string::String::as_str).collect();
         let cyclic: Vec<String> = nodes
             .iter()
             .filter(|n| !in_result.contains(n.name.as_str()))

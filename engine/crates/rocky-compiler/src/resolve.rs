@@ -99,8 +99,12 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
 
         // D011: warn when explicit depends_on is non-empty but misses auto-derived deps
         if !model.config.depends_on.is_empty() {
-            let explicit: HashSet<&str> =
-                model.config.depends_on.iter().map(|s| s.as_str()).collect();
+            let explicit: HashSet<&str> = model
+                .config
+                .depends_on
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
             let missing: Vec<&String> = auto_deps
                 .iter()
                 .filter(|d| !explicit.contains(d.as_str()))

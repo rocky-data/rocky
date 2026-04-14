@@ -439,7 +439,7 @@ pub fn run_bench(
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             cpus: std::thread::available_parallelism()
-                .map(|p| p.get())
+                .map(std::num::NonZero::get)
                 .unwrap_or(1),
         },
         results: results.clone(),

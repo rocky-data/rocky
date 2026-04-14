@@ -220,11 +220,7 @@ pub fn generate_transformation_sql(
     // for strategies that create tables (FullRefresh).
     if let Some(ref format) = plan.format {
         if matches!(plan.strategy, MaterializationStrategy::FullRefresh) {
-            let opts = plan
-                .format_options
-                .as_ref()
-                .cloned()
-                .unwrap_or_default();
+            let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
             return lakehouse::generate_lakehouse_ddl(format, &target, &plan.sql, &opts, dialect)
                 .map_err(|e| SqlGenError::UnsafeFragment {
                     value: String::new(),

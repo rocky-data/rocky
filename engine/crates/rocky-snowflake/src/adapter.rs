@@ -78,10 +78,7 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .collect();
         let name_idx = col_headers.iter().position(|c| c == "name").unwrap_or(0);
         let type_idx = col_headers.iter().position(|c| c == "type").unwrap_or(1);
-        let null_idx = col_headers
-            .iter()
-            .position(|c| c == "null?")
-            .unwrap_or(3);
+        let null_idx = col_headers.iter().position(|c| c == "null?").unwrap_or(3);
 
         let mut columns = Vec::new();
         for row in &result.rows {
@@ -136,11 +133,7 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         let tables = result
             .rows
             .iter()
-            .filter_map(|row| {
-                row.first()
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase())
-            })
+            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_lowercase))
             .collect();
         Ok(tables)
     }
