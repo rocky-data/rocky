@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn test_discover_mapping_logic() {
         // Simulate namespaces returned by the catalog.
-        let all_namespaces = vec![
+        let all_namespaces = [
             "raw_shopify".to_string(),
             "raw_stripe".to_string(),
             "staging_orders".to_string(),
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_discover_empty_prefix_matches_all() {
-        let namespaces = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let namespaces = ["a".to_string(), "b".to_string(), "c".to_string()];
         let matching: Vec<&String> = namespaces
             .iter()
             .filter(|ns| matches_prefix(ns, ""))
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_discover_no_matches() {
-        let namespaces = vec![
+        let namespaces = [
             "staging_orders".to_string(),
             "staging_customers".to_string(),
         ];

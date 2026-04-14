@@ -172,7 +172,7 @@ mod tests {
 
         let committed: HashSet<String> = std::fs::read_dir(&schemas_dir)
             .expect("reading schemas/ directory")
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.ends_with(".schema.json"))
             .collect();

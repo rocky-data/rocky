@@ -389,7 +389,7 @@ where total_revenue > 0
         let file = dir.path().join("test.rocky");
         std::fs::write(&file, "  from orders   \n\n\n\n\nwhere true\n").unwrap();
 
-        let result = run_fmt(&[file.clone()], true);
+        let result = run_fmt(std::slice::from_ref(&file), true);
         assert!(result.is_err());
 
         // File should be unchanged in check mode
@@ -403,7 +403,7 @@ where total_revenue > 0
         let file = dir.path().join("test.rocky");
         std::fs::write(&file, "  from orders   \n\n\n\n\nwhere true\n").unwrap();
 
-        run_fmt(&[file.clone()], false).unwrap();
+        run_fmt(std::slice::from_ref(&file), false).unwrap();
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "from orders\n\n\nwhere true\n");

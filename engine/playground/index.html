@@ -256,6 +256,34 @@
     color: var(--red);
   }
 
+  /* ---- Mode tabs ---- */
+  .mode-tabs {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .mode-tab {
+    font-family: inherit;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    padding: 0.3rem 0.625rem;
+    border: none;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--surface);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .mode-tab:last-child { border-right: none; }
+  .mode-tab:hover { color: var(--text); }
+  .mode-tab.active {
+    background: rgba(88,166,255,0.15);
+    color: var(--accent);
+  }
+
   /* ---- Responsive ---- */
   @media (max-width: 700px) {
     .main { flex-direction: column; }
@@ -276,6 +304,13 @@
 
 <!-- Toolbar -->
 <div class="toolbar">
+  <label>Mode</label>
+  <div class="mode-tabs">
+    <button class="mode-tab active" data-mode="sql">SQL</button>
+    <button class="mode-tab" data-mode="rocky">Rocky DSL</button>
+    <button class="mode-tab" data-mode="identifier">Identifier</button>
+  </div>
+  <div class="toolbar-sep"></div>
   <label>Snippets</label>
   <select id="snippet-picker" title="Load a sample snippet">
     <option value="">-- choose a snippet --</option>
@@ -317,8 +352,7 @@
 <div class="main">
   <div class="pane" id="pane-left" style="flex: 1">
     <div class="pane-header">Editor <span id="parse-status"></span></div>
-    <textarea id="editor" spellcheck="false" placeholder="Enter Rocky DSL or SQL here...">-- Column lineage demo
--- Try clicking "Compile SQL" to extract lineage.
+    <textarea id="editor" spellcheck="false" placeholder="Enter SQL or Rocky DSL here...">-- Column lineage demo (Ctrl+Enter to run)
 SELECT
     o.order_id,
     o.customer_id,
@@ -343,21 +377,85 @@ WHERE o.order_date >= '2024-01-01'</textarea>
 <div class="footer">rocky &mdash; rust sql transformation engine &mdash; WASM playground</div>
 
 <script type="module">
+  // ---- Mode system ----
+  // Modes control which buttons are enabled and which is primary.
+  // "sql" = Compile SQL only, "rocky" = Parse/Lower/Check, "identifier" = Validate
+  let currentMode = 'sql';
+  let wasmReady = false;
+
+  const modeButtons = {
+    sql:        { enabled: ['btn-compile'],                              primary: 'btn-compile' },
+    rocky:      { enabled: ['btn-parse', 'btn-lower', 'btn-check'],     primary: 'btn-lower' },
+    identifier: { enabled: ['btn-validate'],                            primary: 'btn-validate' },
+  };
+
+  const allActionIds = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-check', 'btn-validate'];
+
+  // Map snippet keys to modes
+  function snippetMode(key) {
+    if (key.startsWith('rocky-')) return 'rocky';
+    if (key.startsWith('sql-')) return 'sql';
+    if (key.startsWith('identifier-')) return 'identifier';
+    return null;
+  }
+
+  function setMode(mode) {
+    currentMode = mode;
+
+    // Update tab visuals
+    document.querySelectorAll('.mode-tab').forEach(tab => {
+      tab.classList.toggle('active', tab.dataset.mode === mode);
+    });
+
+    // Update button states
+    const cfg = modeButtons[mode];
+    allActionIds.forEach(id => {
+      const btn = document.getElementById(id);
+      btn.disabled = !wasmReady || !cfg.enabled.includes(id);
+      btn.classList.toggle('primary', id === cfg.primary);
+    });
+
+    // Filter snippet picker to show relevant optgroup
+    filterSnippets(mode);
+
+    // Parse status only applies in rocky mode
+    updateParseStatus();
+  }
+
+  // ---- Snippet picker filtering ----
+  const snippetPicker = document.getElementById('snippet-picker');
+  const optgroups = snippetPicker.querySelectorAll('optgroup');
+
+  function filterSnippets(mode) {
+    const groupMap = { sql: 'SQL Lineage', rocky: 'Rocky DSL', identifier: 'Identifiers' };
+    optgroups.forEach(og => {
+      og.style.display = og.label === groupMap[mode] ? '' : 'none';
+    });
+    // Reset picker if current selection doesn't match mode
+    const selected = snippetPicker.value;
+    if (selected && snippetMode(selected) !== mode) {
+      snippetPicker.value = '';
+    }
+  }
+
+  // ---- Mode tab clicks ----
+  document.querySelectorAll('.mode-tab').forEach(tab => {
+    tab.addEventListener('click', () => setMode(tab.dataset.mode));
+  });
+
   // ---- WASM loading ----
   let wasm = null;
   const statusEl = document.getElementById('wasm-status');
-  const buttons = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-check', 'btn-validate'].map(
-    id => document.getElementById(id)
-  );
 
   async function initWasm() {
     try {
       const mod = await import('./pkg/rocky_wasm.js');
-      await mod.default();  // wasm-pack --target web: default export is init()
+      await mod.default();
       wasm = mod;
+      wasmReady = true;
       statusEl.textContent = 'WASM Ready';
       statusEl.className = 'status-ready';
-      buttons.forEach(b => b.disabled = false);
+      setMode(currentMode);
     } catch (err) {
       console.error('Failed to load WASM:', err);
       statusEl.textContent = 'WASM not built yet';
@@ -383,7 +481,6 @@ WHERE o.order_date >= '2024-01-01'</textarea>
     outputEl.innerHTML = html;
   }
 
-  /** Syntax-highlight a JSON string for display. */
   function highlightJson(jsonStr) {
     try {
       const obj = JSON.parse(jsonStr);
@@ -411,7 +508,6 @@ WHERE o.order_date >= '2024-01-01'</textarea>
     }
   }
 
-  /** Highlight SQL keywords for display. */
   function highlightSql(sql) {
     const keywords = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AND|OR|NOT|AS|IN|IS|NULL|LIKE|BETWEEN|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|UNION|ALL|INSERT|INTO|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|VIEW|INDEX|IF|EXISTS|CASE|WHEN|THEN|ELSE|END|DISTINCT|COUNT|SUM|AVG|MIN|MAX|OVER|PARTITION|WINDOW|WITH|RECURSIVE|CAST|COALESCE|NULLIF|ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD|ROWS|RANGE|UNBOUNDED|PRECEDING|FOLLOWING|CURRENT|ROW|DATE|TRUE|FALSE)\b/gi;
     const escaped = escHtml(sql);
@@ -539,10 +635,8 @@ WHERE o.order_date >= '2024-01-01'</textarea>
 
   // ---- Snippet picker ----
   const snippets = {
-    // -- Rocky DSL snippets --
     'rocky-dsl':
 `-- Basic pipeline: from / select
--- Try "Parse Rocky" or "Lower to SQL"
 from catalog.sales.orders
 select {
     order_id,
@@ -552,7 +646,6 @@ select {
 }`,
     'rocky-filter':
 `-- Where clause + derived columns
--- Try "Lower to SQL" to see the generated SQL
 from catalog.sales.orders
 where order_date >= @2024-01-01
 derive {
@@ -566,7 +659,6 @@ select {
 }`,
     'rocky-group':
 `-- Group by with aggregation functions
--- Try "Lower to SQL" to see GROUP BY output
 from catalog.sales.orders
 group customer_id {
     order_count: count(),
@@ -575,7 +667,6 @@ group customer_id {
 }`,
     'rocky-join':
 `-- Inner join with keep clause
--- Try "Lower to SQL" to see the JOIN output
 from catalog.sales.orders as o
 join catalog.sales.customers as c on customer_id {
     keep c.customer_name
@@ -587,7 +678,6 @@ select {
 }`,
     'rocky-left-join':
 `-- Left join + IS NOT NULL filter
--- Try "Lower to SQL" to see LEFT JOIN output
 from catalog.sales.orders as o
 left_join catalog.sales.customers as c on customer_id {
     keep c.customer_name
@@ -595,7 +685,6 @@ left_join catalog.sales.customers as c on customer_id {
 where c.customer_name is not null`,
     'rocky-window':
 `-- Window functions with partition + frame
--- Try "Lower to SQL" to see OVER clauses
 from catalog.sales.orders
 derive {
     rn: row_number() over (partition customer_id, sort -order_date),
@@ -603,7 +692,6 @@ derive {
 }`,
     'rocky-let':
 `-- Let bindings compile to CTEs (WITH clause)
--- Try "Lower to SQL" to see the CTE output
 let active_customers = from catalog.sales.customers
     where is_active == true
 
@@ -618,7 +706,6 @@ select {
 }`,
     'rocky-match':
 `-- Match expression compiles to CASE WHEN
--- Try "Lower to SQL" to see the CASE output
 from catalog.sales.orders
 derive {
     tier: match amount {
@@ -634,14 +721,12 @@ select {
 }`,
     'rocky-sort-take':
 `-- Sort, take, and date literals
--- Try "Lower to SQL" to see ORDER BY + LIMIT
 from catalog.sales.orders
 where order_date >= @2025-01-01
 sort amount desc, order_date
 take 100`,
     'rocky-null-safe':
 `-- Rocky's != compiles to IS DISTINCT FROM (NULL-safe)
--- Try "Lower to SQL" to see the difference from SQL's !=
 from catalog.sales.orders
 where status != "cancelled"
 select {
@@ -649,10 +734,8 @@ select {
     status,
     amount
 }`,
-    // -- SQL Lineage snippets --
     'sql-lineage':
 `-- Column lineage from a JOIN query
--- Try "Compile SQL" to extract lineage
 SELECT
     o.order_id,
     o.customer_id,
@@ -665,7 +748,6 @@ JOIN catalog.sales.customers AS c
 WHERE o.order_date >= '2024-01-01'`,
     'sql-join':
 `-- GROUP BY with aggregation lineage
--- Try "Compile SQL" to extract lineage
 SELECT
     p.product_id,
     p.product_name,
@@ -676,25 +758,30 @@ JOIN catalog.sales.order_items AS oi
     ON p.product_id = oi.product_id
 GROUP BY p.product_id, p.product_name
 ORDER BY revenue DESC`,
-    // -- Identifier snippets --
     'identifier-valid': 'my_table_name',
     'identifier-invalid': 'DROP TABLE users--'
   };
 
-  document.getElementById('snippet-picker').addEventListener('change', (e) => {
+  snippetPicker.addEventListener('change', (e) => {
     const key = e.target.value;
     if (key && snippets[key]) {
+      const mode = snippetMode(key);
+      if (mode) setMode(mode);
       editorEl.value = snippets[key];
       updateParseStatus();
     }
   });
 
-  // ---- Debounced parse-error check ----
+  // ---- Debounced parse-error check (Rocky mode only) ----
   const parseStatusEl = document.getElementById('parse-status');
   let checkTimer = null;
 
   function updateParseStatus() {
-    if (!wasm) return;
+    if (!wasm || currentMode !== 'rocky') {
+      parseStatusEl.textContent = '';
+      parseStatusEl.className = '';
+      return;
+    }
     const input = getInput();
     if (!input.trim()) {
       parseStatusEl.textContent = '';
@@ -716,14 +803,13 @@ ORDER BY revenue DESC`,
     checkTimer = setTimeout(updateParseStatus, 500);
   });
 
-  // ---- Keyboard shortcut ----
+  // ---- Keyboard shortcut (Ctrl/Cmd+Enter = primary action) ----
   editorEl.addEventListener('keydown', (e) => {
-    // Ctrl/Cmd + Enter = Compile SQL
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();
-      document.getElementById('btn-compile').click();
+      const primaryId = modeButtons[currentMode].primary;
+      document.getElementById(primaryId).click();
     }
-    // Tab inserts two spaces
     if (e.key === 'Tab') {
       e.preventDefault();
       const start = editorEl.selectionStart;
@@ -767,6 +853,9 @@ ORDER BY revenue DESC`,
       document.body.style.userSelect = '';
     }
   });
+
+  // ---- Initialize ----
+  filterSnippets(currentMode);
 </script>
 </body>
 </html>

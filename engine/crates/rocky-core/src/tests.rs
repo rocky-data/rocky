@@ -213,7 +213,7 @@ fn require_column<'a>(test: &'a TestDecl, test_type: &str) -> Result<&'a str, Te
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use super::*;
 
     // ----- TOML deserialization -----
