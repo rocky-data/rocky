@@ -6,7 +6,7 @@ suite("Rocky Extension", () => {
     this.timeout(20000);
     // Activation is otherwise lazy (gated on .rocky files in the workspace),
     // which would leave commands unregistered for the assertions below.
-    const ext = vscode.extensions.getExtension("rocky-dev.rocky");
+    const ext = vscode.extensions.getExtension("rocky-data.rocky");
     if (ext && !ext.isActive) {
       await ext.activate();
     }
