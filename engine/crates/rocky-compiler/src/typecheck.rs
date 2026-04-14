@@ -994,42 +994,7 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
         }
 
         // Binary operations
-        Expr::BinaryOp { left, op, right } => {
-            let (left_type, left_null) = infer_expr_type(left, scope);
-            let (right_type, right_null) = infer_expr_type(right, scope);
-            let nullable = left_null || right_null;
-
-            match op {
-                // Comparison → Boolean
-                ast::BinaryOperator::Eq
-                | ast::BinaryOperator::NotEq
-                | ast::BinaryOperator::Lt
-                | ast::BinaryOperator::LtEq
-                | ast::BinaryOperator::Gt
-                | ast::BinaryOperator::GtEq => (RockyType::Boolean, nullable),
-
-                // Boolean logic
-                ast::BinaryOperator::And | ast::BinaryOperator::Or => {
-                    (RockyType::Boolean, nullable)
-                }
-
-                // Arithmetic → numeric promotion
-                ast::BinaryOperator::Plus
-                | ast::BinaryOperator::Minus
-                | ast::BinaryOperator::Multiply
-                | ast::BinaryOperator::Divide
-                | ast::BinaryOperator::Modulo => {
-                    let result_type = crate::types::common_supertype(&left_type, &right_type)
-                        .unwrap_or(RockyType::Unknown);
-                    (result_type, nullable)
-                }
-
-                // String concatenation
-                ast::BinaryOperator::StringConcat => (RockyType::String, nullable),
-
-                _ => (RockyType::Unknown, nullable),
-            }
-        }
+        Expr::BinaryOp { left, op, right } => infer_binary_op_type(left, op, right, scope),
 
         // Unary operations
         Expr::UnaryOp { op, expr } => {
@@ -1042,151 +1007,14 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
         }
 
         // Function calls (including window functions with OVER clause)
-        Expr::Function(func) => {
-            let name = func.name.to_string().to_uppercase();
-
-            // Validate OVER clause columns if present
-            if let Some(ast::WindowType::WindowSpec(ref spec)) = func.over {
-                validate_window_columns(spec, scope);
-            }
-
-            match name.as_str() {
-                // Aggregate functions (work with or without OVER)
-                "COUNT" => (RockyType::Int64, false),
-                "SUM" => {
-                    let arg_type = first_arg_type(func, scope);
-                    let result = if arg_type.is_integer() {
-                        RockyType::Int64
-                    } else {
-                        arg_type
-                    };
-                    (result, true)
-                }
-                "AVG" => (RockyType::Float64, true),
-                "MIN" | "MAX" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true)
-                }
-                "COALESCE" => {
-                    let arg_types = all_arg_types(func, scope);
-                    let result_type = arg_types
-                        .iter()
-                        .map(|(t, _)| t)
-                        .try_fold(RockyType::Unknown, |acc, t| {
-                            crate::types::common_supertype(&acc, t)
-                        })
-                        .unwrap_or(RockyType::Unknown);
-                    let all_nullable = arg_types.iter().all(|(_, n)| *n);
-                    (result_type, all_nullable)
-                }
-
-                // Ranking window functions → always Int64
-                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => (RockyType::Int64, false),
-
-                // Distribution window functions → always Float64
-                "PERCENT_RANK" | "CUME_DIST" => (RockyType::Float64, false),
-
-                // Value window functions → same type as first arg
-                "FIRST_VALUE" | "LAST_VALUE" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true)
-                }
-                "NTH_VALUE" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true) // nullable — row may not exist
-                }
-
-                // Offset window functions → same type as first arg, nullable
-                "LAG" | "LEAD" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true)
-                }
-
-                // String functions
-                "CONCAT" | "CONCAT_WS" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM"
-                | "REPLACE" | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "LPAD" | "RPAD"
-                | "REVERSE" | "INITCAP" => (RockyType::String, true),
-                "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" => {
-                    (RockyType::Int64, true)
-                }
-                "POSITION" | "STRPOS" | "INSTR" => (RockyType::Int64, true),
-
-                // Numeric functions
-                "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE" | "TRUNC" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true)
-                }
-                "SIGN" => (RockyType::Int32, true),
-                "POWER" | "POW" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "SIN"
-                | "COS" | "TAN" => (RockyType::Float64, true),
-
-                // Date/time functions
-                "NOW" | "CURRENT_TIMESTAMP" => (RockyType::Timestamp, false),
-                "CURRENT_DATE" | "TODAY" => (RockyType::Date, false),
-                "DATE" | "TO_DATE" => (RockyType::Date, true),
-                "TIMESTAMP" | "TO_TIMESTAMP" => (RockyType::Timestamp, true),
-                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK"
-                | "DAYOFYEAR" | "WEEKOFYEAR" | "QUARTER" => (RockyType::Int32, true),
-                "DATE_TRUNC" | "DATE_ADD" | "DATE_SUB" | "DATEADD" | "DATESUB" => {
-                    (RockyType::Timestamp, true)
-                }
-                "DATEDIFF" | "TIMESTAMPDIFF" | "MONTHS_BETWEEN" => (RockyType::Int64, true),
-
-                // Conditional
-                "IF" | "IFF" => {
-                    let arg_types = all_arg_types(func, scope);
-                    if arg_types.len() >= 2 {
-                        (arg_types[1].0.clone(), true)
-                    } else {
-                        (RockyType::Unknown, true)
-                    }
-                }
-                "NULLIF" => {
-                    let arg_type = first_arg_type(func, scope);
-                    (arg_type, true) // always nullable
-                }
-                "GREATEST" | "LEAST" => {
-                    let arg_types = all_arg_types(func, scope);
-                    let result_type = arg_types
-                        .iter()
-                        .map(|(t, _)| t)
-                        .try_fold(RockyType::Unknown, |acc, t| {
-                            crate::types::common_supertype(&acc, t)
-                        })
-                        .unwrap_or(RockyType::Unknown);
-                    (result_type, true)
-                }
-
-                "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
-                _ => (RockyType::Unknown, true),
-            }
-        }
+        Expr::Function(func) => infer_function_type(func, scope),
 
         // CASE WHEN ... THEN ... ELSE ... END
         Expr::Case {
             conditions,
             else_result,
             ..
-        } => {
-            let mut result_type = RockyType::Unknown;
-            let mut nullable = else_result.is_none(); // No ELSE → nullable
-
-            for case_when in conditions {
-                let (t, n) = infer_expr_type(&case_when.result, scope);
-                result_type =
-                    crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
-                nullable = nullable || n;
-            }
-
-            if let Some(else_expr) = else_result {
-                let (t, n) = infer_expr_type(else_expr, scope);
-                result_type =
-                    crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
-                nullable = nullable || n;
-            }
-
-            (result_type, nullable)
-        }
+        } => infer_case_type(conditions, else_result, scope),
 
         // IS NULL / IS NOT NULL → Boolean, non-nullable
         Expr::IsNull(_) | Expr::IsNotNull(_) => (RockyType::Boolean, false),
@@ -1208,6 +1036,205 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
 
         _ => (RockyType::Unknown, true),
     }
+}
+
+/// Infer the result type of a binary operator expression.
+///
+/// Handles comparison, boolean logic, arithmetic (with numeric promotion),
+/// and string concatenation operators.
+fn infer_binary_op_type(
+    left: &Expr,
+    op: &ast::BinaryOperator,
+    right: &Expr,
+    scope: &TypeScope,
+) -> (RockyType, bool) {
+    let (left_type, left_null) = infer_expr_type(left, scope);
+    let (right_type, right_null) = infer_expr_type(right, scope);
+    let nullable = left_null || right_null;
+
+    match op {
+        // Comparison → Boolean
+        ast::BinaryOperator::Eq
+        | ast::BinaryOperator::NotEq
+        | ast::BinaryOperator::Lt
+        | ast::BinaryOperator::LtEq
+        | ast::BinaryOperator::Gt
+        | ast::BinaryOperator::GtEq => (RockyType::Boolean, nullable),
+
+        // Boolean logic
+        ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
+
+        // Arithmetic → numeric promotion
+        ast::BinaryOperator::Plus
+        | ast::BinaryOperator::Minus
+        | ast::BinaryOperator::Multiply
+        | ast::BinaryOperator::Divide
+        | ast::BinaryOperator::Modulo => {
+            let result_type = crate::types::common_supertype(&left_type, &right_type)
+                .unwrap_or(RockyType::Unknown);
+            (result_type, nullable)
+        }
+
+        // String concatenation
+        ast::BinaryOperator::StringConcat => (RockyType::String, nullable),
+
+        _ => (RockyType::Unknown, nullable),
+    }
+}
+
+/// Infer the result type of a SQL function call.
+///
+/// Covers aggregate functions (COUNT, SUM, AVG, MIN, MAX, COALESCE),
+/// ranking and distribution window functions, value and offset window
+/// functions, string functions, numeric functions, date/time functions,
+/// and conditional functions (IF, NULLIF, GREATEST, LEAST).
+fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, bool) {
+    let name = func.name.to_string().to_uppercase();
+
+    // Validate OVER clause columns if present
+    if let Some(ast::WindowType::WindowSpec(ref spec)) = func.over {
+        validate_window_columns(spec, scope);
+    }
+
+    match name.as_str() {
+        // Aggregate functions (work with or without OVER)
+        "COUNT" => (RockyType::Int64, false),
+        "SUM" => {
+            let arg_type = first_arg_type(func, scope);
+            let result = if arg_type.is_integer() {
+                RockyType::Int64
+            } else {
+                arg_type
+            };
+            (result, true)
+        }
+        "AVG" => (RockyType::Float64, true),
+        "MIN" | "MAX" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true)
+        }
+        "COALESCE" => {
+            let arg_types = all_arg_types(func, scope);
+            let result_type = arg_types
+                .iter()
+                .map(|(t, _)| t)
+                .try_fold(RockyType::Unknown, |acc, t| {
+                    crate::types::common_supertype(&acc, t)
+                })
+                .unwrap_or(RockyType::Unknown);
+            let all_nullable = arg_types.iter().all(|(_, n)| *n);
+            (result_type, all_nullable)
+        }
+
+        // Ranking window functions → always Int64
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => (RockyType::Int64, false),
+
+        // Distribution window functions → always Float64
+        "PERCENT_RANK" | "CUME_DIST" => (RockyType::Float64, false),
+
+        // Value window functions → same type as first arg
+        "FIRST_VALUE" | "LAST_VALUE" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true)
+        }
+        "NTH_VALUE" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true) // nullable — row may not exist
+        }
+
+        // Offset window functions → same type as first arg, nullable
+        "LAG" | "LEAD" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true)
+        }
+
+        // String functions
+        "CONCAT" | "CONCAT_WS" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+        | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REVERSE" | "INITCAP" => {
+            (RockyType::String, true)
+        }
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" => (RockyType::Int64, true),
+        "POSITION" | "STRPOS" | "INSTR" => (RockyType::Int64, true),
+
+        // Numeric functions
+        "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE" | "TRUNC" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true)
+        }
+        "SIGN" => (RockyType::Int32, true),
+        "POWER" | "POW" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "SIN" | "COS"
+        | "TAN" => (RockyType::Float64, true),
+
+        // Date/time functions
+        "NOW" | "CURRENT_TIMESTAMP" => (RockyType::Timestamp, false),
+        "CURRENT_DATE" | "TODAY" => (RockyType::Date, false),
+        "DATE" | "TO_DATE" => (RockyType::Date, true),
+        "TIMESTAMP" | "TO_TIMESTAMP" => (RockyType::Timestamp, true),
+        "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
+        | "WEEKOFYEAR" | "QUARTER" => (RockyType::Int32, true),
+        "DATE_TRUNC" | "DATE_ADD" | "DATE_SUB" | "DATEADD" | "DATESUB" => {
+            (RockyType::Timestamp, true)
+        }
+        "DATEDIFF" | "TIMESTAMPDIFF" | "MONTHS_BETWEEN" => (RockyType::Int64, true),
+
+        // Conditional
+        "IF" | "IFF" => {
+            let arg_types = all_arg_types(func, scope);
+            if arg_types.len() >= 2 {
+                (arg_types[1].0.clone(), true)
+            } else {
+                (RockyType::Unknown, true)
+            }
+        }
+        "NULLIF" => {
+            let arg_type = first_arg_type(func, scope);
+            (arg_type, true) // always nullable
+        }
+        "GREATEST" | "LEAST" => {
+            let arg_types = all_arg_types(func, scope);
+            let result_type = arg_types
+                .iter()
+                .map(|(t, _)| t)
+                .try_fold(RockyType::Unknown, |acc, t| {
+                    crate::types::common_supertype(&acc, t)
+                })
+                .unwrap_or(RockyType::Unknown);
+            (result_type, true)
+        }
+
+        "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
+        _ => (RockyType::Unknown, true),
+    }
+}
+
+/// Infer the result type of a CASE WHEN expression.
+///
+/// Folds the common supertype across all THEN branches and the optional
+/// ELSE branch. The result is nullable when any branch is nullable or
+/// when no ELSE clause is present.
+fn infer_case_type(
+    conditions: &[ast::CaseWhen],
+    else_result: &Option<Box<Expr>>,
+    scope: &TypeScope,
+) -> (RockyType, bool) {
+    let mut result_type = RockyType::Unknown;
+    let mut nullable = else_result.is_none(); // No ELSE → nullable
+
+    for case_when in conditions {
+        let (t, n) = infer_expr_type(&case_when.result, scope);
+        result_type =
+            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
+        nullable = nullable || n;
+    }
+
+    if let Some(else_expr) = else_result {
+        let (t, n) = infer_expr_type(else_expr, scope);
+        result_type =
+            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
+        nullable = nullable || n;
+    }
+
+    (result_type, nullable)
 }
 
 /// Convert an sqlparser DataType to RockyType.
