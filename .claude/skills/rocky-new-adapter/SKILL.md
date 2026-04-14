@@ -109,7 +109,7 @@ The `SqlDialect` trait is where adapters actually diverge. Things to get right:
 - [ ] Auth module with env-var auto-detection
 - [ ] Conformance test wired up (`rocky test-adapter <name>` passes)
 - [ ] Factory registration so `rocky.toml` `type = "<name>"` resolves
-- [ ] Env vars documented in `engine/README.md` and/or `engine/docs/src/content/docs/adapters/<name>.md`
+- [ ] Env vars documented in `engine/README.md` and/or `docs/src/content/docs/adapters/<name>.md`
 - [ ] `cargo test -p rocky-<name>` green
 - [ ] `cargo clippy -p rocky-<name> -- -D warnings` clean
 

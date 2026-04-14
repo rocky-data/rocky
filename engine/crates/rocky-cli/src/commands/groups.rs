@@ -5,7 +5,7 @@
 //! A follow-up phase will use these groups to build nested subcommand trees
 //! with backward-compatible top-level aliases.
 //!
-//! See `engine/docs/cli-command-groups.md` for the full design document.
+//! See `docs/cli-command-groups.md` for the full design document.
 
 use std::fmt;
 

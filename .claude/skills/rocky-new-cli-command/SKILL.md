@@ -98,7 +98,7 @@ Conventions:
 
 ## Step 7 — Docs + engine README
 
-- `engine/docs/src/content/docs/commands/<name>.md` (Astro/Starlight) — user-facing reference.
+- `docs/src/content/docs/commands/<name>.md` (Astro/Starlight) — user-facing reference.
 - `engine/README.md` and monorepo `README.md` if the command is user-prominent enough to warrant a top-level mention.
 
 ## Final check — run everything

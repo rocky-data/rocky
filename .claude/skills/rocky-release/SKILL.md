@@ -130,7 +130,7 @@ Path-filtered workflows in `.github/workflows/`:
 - `engine-weekly.yml` — coverage (tarpaulin) + cargo-audit, Monday schedule + manual dispatch
 - `engine-bench.yml` — only PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`
 - `engine-release.yml` — Windows-only build on tag `engine-v*` (triggered by the release creation event, not tag push)
-- `engine-docs.yml` — build + deploy Astro docs from `engine/docs/` to GitHub Pages
+- `engine-docs.yml` — build + deploy Astro docs from `docs/` to GitHub Pages
 - `codegen-drift.yml` — fails any PR where committed bindings drift from `just codegen` output
 
 ## Post-release checklist

@@ -114,7 +114,6 @@ engine/                         # this directory, inside the rocky monorepo
 ├── rocky/                      # Binary crate (the `rocky` CLI)
 │   └── src/
 │       └── main.rs
-├── docs/                       # Documentation site (Astro + Starlight)
 └── examples/                   # 5 self-contained example projects (DuckDB, no credentials)
 ```
 
@@ -192,7 +191,7 @@ GitHub Actions workflows live at the monorepo root in `../.github/workflows/`, p
 - `engine-weekly.yml` — Coverage (tarpaulin) + security audit, runs Monday 08:00 UTC + manual dispatch.
 - `engine-release.yml` — Full 5-target matrix build on tag `engine-v*` (macOS ARM64/Intel, Linux x86_64/ARM64, Windows). `scripts/release.sh` is a local-build fallback.
 - `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*` (120% alert threshold).
-- `engine-docs.yml` — Build + deploy Astro docs from `engine/docs/` to GitHub Pages.
+- `engine-docs.yml` — Build + deploy Astro docs from `docs/` to GitHub Pages.
 
 ## Schema Pattern
 
