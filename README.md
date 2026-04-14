@@ -1,4 +1,8 @@
-# Rocky
+<p align="center">
+  <img src="editors/vscode/icons/rocky-icon-512.png" alt="Rocky" width="128" />
+</p>
+
+<h1 align="center">Rocky</h1>
 
 [![Engine CI](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml)
 [![Dagster CI](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml)
