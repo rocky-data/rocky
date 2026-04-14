@@ -590,10 +590,7 @@ mod tests {
                 "tenant mismatch for {schema_name}"
             );
 
-            let regions: Vec<String> = expected_regions
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
+            let regions: Vec<String> = expected_regions.iter().map(ToString::to_string).collect();
             assert_eq!(
                 parsed.get_multiple("regions"),
                 Some(regions.as_slice()),
