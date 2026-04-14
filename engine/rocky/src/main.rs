@@ -64,7 +64,7 @@ struct Cli {
     config: PathBuf,
 
     /// Output format
-    #[arg(short, long, default_value = "json")]
+    #[arg(short, long, default_value = "json", global = true)]
     output: OutputFormat,
 
     /// State store path
@@ -271,8 +271,8 @@ enum Command {
         #[arg(long, default_value = "models")]
         models: PathBuf,
         /// Output file path (default: docs/catalog.html)
-        #[arg(long, default_value = "docs/catalog.html")]
-        output: PathBuf,
+        #[arg(long = "output-path", default_value = "docs/catalog.html")]
+        output_path: PathBuf,
     },
 
     /// Show stored watermarks
@@ -427,7 +427,11 @@ enum Command {
     },
 
     /// Start Language Server Protocol server for IDE integration
-    Lsp,
+    Lsp {
+        /// Accept --stdio for compatibility (stdio is always the transport)
+        #[arg(long, hide = true)]
+        stdio: bool,
+    },
 
     /// Run local model tests via DuckDB (no warehouse needed)
     ///
@@ -862,9 +866,10 @@ async fn main() -> Result<()> {
         Command::Snapshot { pipeline, dry_run } => {
             rocky_cli::commands::run_snapshot(&cli.config, pipeline.as_deref(), dry_run, json).await
         }
-        Command::Docs { models, output } => {
-            rocky_cli::commands::run_docs(&cli.config, &models, &output, json)
-        }
+        Command::Docs {
+            models,
+            output_path,
+        } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
         Command::State => rocky_cli::commands::state_show(&cli.state_path, json),
         Command::Compile {
             models,
@@ -955,7 +960,7 @@ async fn main() -> Result<()> {
             };
             rocky_cli::commands::run_serve(&models, contracts.as_deref(), config, port, watch).await
         }
-        Command::Lsp => rocky_cli::commands::run_lsp().await,
+        Command::Lsp { stdio: _ } => rocky_cli::commands::run_lsp().await,
         #[cfg(feature = "duckdb")]
         Command::Test {
             models,
