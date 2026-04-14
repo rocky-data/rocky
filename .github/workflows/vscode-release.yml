@@ -70,5 +70,7 @@ jobs:
           files: editors/vscode/*.vsix
 
       - name: Publish to VS Code Marketplace
-        if: ${{ secrets.VSCE_PAT != '' }}
-        run: npx @vscode/vsce publish --pat ${{ secrets.VSCE_PAT }}
+        if: env.VSCE_PAT != ''
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce publish --pat "$VSCE_PAT"

@@ -107,7 +107,7 @@ jobs:
         working-directory: engine
 
       - name: Publish to npm
-        if: ${{ secrets.NPM_TOKEN != '' }}
+        if: env.NODE_AUTH_TOKEN != ''
         working-directory: engine/crates/rocky-wasm/pkg
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
