@@ -244,11 +244,11 @@ pub fn load_macros_from_dir(dir: &Path) -> Result<Vec<MacroDef>, MacroError> {
             path: dir.display().to_string(),
             source: e,
         })?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     // Sort for deterministic ordering.
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut macros = Vec::new();
 

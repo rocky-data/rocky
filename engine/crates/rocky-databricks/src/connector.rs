@@ -49,7 +49,10 @@ pub struct ConnectorConfig {
 impl ConnectorConfig {
     /// Extracts warehouse_id from an HTTP path like `/sql/1.0/warehouses/{id}`.
     pub fn warehouse_id_from_http_path(http_path: &str) -> Option<String> {
-        http_path.rsplit('/').next().map(|s| s.to_string())
+        http_path
+            .rsplit('/')
+            .next()
+            .map(std::string::ToString::to_string)
     }
 }
 

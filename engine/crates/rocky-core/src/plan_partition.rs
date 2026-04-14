@@ -120,7 +120,7 @@ pub enum PlanError {
 ///    on partial failure.
 pub fn plan_partitions(
     model: &Model,
-    selection: PartitionSelection,
+    selection: &PartitionSelection,
     lookback_override: Option<u32>,
     state: &StateStore,
 ) -> Result<Vec<PartitionPlan>, PlanError> {
@@ -149,7 +149,7 @@ pub fn plan_partitions(
     let mut keys = resolve_selection(
         &model.config.name,
         time_grain,
-        &selection,
+        selection,
         first_partition.as_deref(),
         state,
     )?;
@@ -442,7 +442,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Single("2026-04-07".into()),
+            &PartitionSelection::Single("2026-04-07".into()),
             None,
             &state,
         )
@@ -458,7 +458,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let err = plan_partitions(
             &model,
-            PartitionSelection::Single("not-a-date".into()),
+            &PartitionSelection::Single("not-a-date".into()),
             None,
             &state,
         )
@@ -472,7 +472,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Range {
+            &PartitionSelection::Range {
                 from: "2026-04-01".into(),
                 to: "2026-04-03".into(),
             },
@@ -489,7 +489,7 @@ mod tests {
     fn test_latest_returns_one_partition() {
         let model = make_model("m", TimeGrain::Day, 0, 1, None);
         let (state, _dir) = temp_state();
-        let plans = plan_partitions(&model, PartitionSelection::Latest, None, &state).unwrap();
+        let plans = plan_partitions(&model, &PartitionSelection::Latest, None, &state).unwrap();
         assert_eq!(plans.len(), 1);
         // Key format must match the grain.
         assert_eq!(plans[0].partition_key.len(), "YYYY-MM-DD".len());
@@ -499,7 +499,7 @@ mod tests {
     fn test_missing_requires_first_partition() {
         let model = make_model("m", TimeGrain::Day, 0, 1, None);
         let (state, _dir) = temp_state();
-        let err = plan_partitions(&model, PartitionSelection::Missing, None, &state).unwrap_err();
+        let err = plan_partitions(&model, &PartitionSelection::Missing, None, &state).unwrap_err();
         assert!(matches!(err, PlanError::MissingNeedsFirstPartition));
     }
 
@@ -524,7 +524,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let plans = plan_partitions(&model, PartitionSelection::Missing, None, &state).unwrap();
+        let plans = plan_partitions(&model, &PartitionSelection::Missing, None, &state).unwrap();
         let keys: Vec<&str> = plans.iter().map(|p| p.partition_key.as_str()).collect();
         // 04-01, 04-03, 04-05 should be missing from the result.
         assert!(!keys.contains(&"2026-04-01"));
@@ -543,7 +543,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Single("2026-04-07".into()),
+            &PartitionSelection::Single("2026-04-07".into()),
             Some(3),
             &state,
         )
@@ -563,7 +563,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Single("2026-04-07".into()),
+            &PartitionSelection::Single("2026-04-07".into()),
             Some(3),
             &state,
         )
@@ -577,7 +577,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Single("2026-04-07".into()),
+            &PartitionSelection::Single("2026-04-07".into()),
             None,
             &state,
         )
@@ -593,7 +593,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Range {
+            &PartitionSelection::Range {
                 from: "2026-04-01".into(),
                 to: "2026-04-03".into(),
             },
@@ -611,7 +611,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Range {
+            &PartitionSelection::Range {
                 from: "2026-04-01".into(),
                 to: "2026-04-06".into(),
             },
@@ -652,7 +652,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let plans = plan_partitions(&model, PartitionSelection::Missing, None, &state).unwrap();
+        let plans = plan_partitions(&model, &PartitionSelection::Missing, None, &state).unwrap();
         // The first plan should be 04-01 alone (because 04-02 is recorded so
         // it's not in the missing set; the next missing key is 04-03 which is
         // not consecutive with 04-01).
@@ -691,7 +691,7 @@ mod tests {
             contract_path: None,
         };
         let (state, _dir) = temp_state();
-        let err = plan_partitions(&model, PartitionSelection::Latest, None, &state).unwrap_err();
+        let err = plan_partitions(&model, &PartitionSelection::Latest, None, &state).unwrap_err();
         assert!(matches!(err, PlanError::WrongStrategy { .. }));
     }
 
@@ -701,7 +701,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Single("2026".into()),
+            &PartitionSelection::Single("2026".into()),
             None,
             &state,
         )
@@ -715,7 +715,7 @@ mod tests {
         let (state, _dir) = temp_state();
         let plans = plan_partitions(
             &model,
-            PartitionSelection::Range {
+            &PartitionSelection::Range {
                 from: "2024-11".into(),
                 to: "2025-02".into(),
             },

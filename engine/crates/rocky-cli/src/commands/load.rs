@@ -253,7 +253,7 @@ fn discover_files(
         .context(format!("failed to read source directory {}", dir.display()))?;
 
     let mut files: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .filter(|p| {

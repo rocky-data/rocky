@@ -58,7 +58,10 @@ pub fn run_ci(models_dir: &Path, contracts_dir: Option<&Path>) -> anyhow::Result
     info!("step 1: compile");
     let test_result = crate::test_runner::run_tests(models_dir, contracts_dir)?;
 
-    let compile_ok = !test_result.diagnostics.iter().any(|d| d.is_error());
+    let compile_ok = !test_result
+        .diagnostics
+        .iter()
+        .any(rocky_compiler::diagnostic::Diagnostic::is_error);
 
     let tests_ok = test_result.failures.is_empty();
 

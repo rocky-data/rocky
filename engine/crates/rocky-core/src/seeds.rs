@@ -290,11 +290,11 @@ fn is_timestamp_like(value: &str) -> bool {
     }
     let bytes = value.as_bytes();
     // YYYY-MM-DD
-    bytes[0..4].iter().all(|b| b.is_ascii_digit())
+    bytes[0..4].iter().all(u8::is_ascii_digit)
         && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
         && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Widen two types to their common supertype.
@@ -334,11 +334,11 @@ pub fn discover_seeds(dir: &Path) -> Result<Vec<SeedFile>, SeedError> {
             path: dir.display().to_string(),
             source: e,
         })?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     // Sort for deterministic ordering.
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let path = entry.path();

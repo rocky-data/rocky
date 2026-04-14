@@ -130,7 +130,7 @@ impl SemanticGraph {
     pub fn edges_targeting<'a>(&'a self, model: &str) -> impl Iterator<Item = &'a LineageEdge> {
         self.edges_by_target_model
             .get(model)
-            .map(|idxs| idxs.as_slice())
+            .map(std::vec::Vec::as_slice)
             .unwrap_or(&[])
             .iter()
             .map(move |&idx| &self.edges[idx])
@@ -317,11 +317,11 @@ pub fn build_semantic_graph(
                 has_star: lineage_result.has_star,
                 upstream: upstream_map
                     .get(model_name.as_str())
-                    .map(|deps| deps.iter().map(|s| s.to_string()).collect())
+                    .map(|deps| deps.iter().map(std::string::ToString::to_string).collect())
                     .unwrap_or_default(),
                 downstream: downstream_map
                     .get(model_name.as_str())
-                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .map(|v| v.iter().map(std::string::ToString::to_string).collect())
                     .unwrap_or_default(),
                 intent: model.config.intent.clone(),
             },

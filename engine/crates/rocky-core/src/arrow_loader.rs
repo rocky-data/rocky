@@ -184,7 +184,10 @@ impl Iterator for CsvBatchReader {
         for _ in 0..self.batch_size {
             match self.reader.records().next() {
                 Some(Ok(record)) => {
-                    let row: Vec<String> = record.iter().map(|f| f.to_string()).collect();
+                    let row: Vec<String> = record
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect();
                     rows.push(row);
                 }
                 Some(Err(e)) => {
@@ -420,11 +423,11 @@ fn is_timestamp_like(value: &str) -> bool {
         return false;
     }
     let bytes = value.as_bytes();
-    bytes[0..4].iter().all(|b| b.is_ascii_digit())
+    bytes[0..4].iter().all(u8::is_ascii_digit)
         && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
         && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Widen two types to their common supertype.

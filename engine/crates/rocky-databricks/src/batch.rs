@@ -296,7 +296,10 @@ pub async fn execute_batch_freshness(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_timestamp = row.get(3).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let max_timestamp = row
+                .get(3)
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
 
             results.push(FreshnessResult {
                 catalog,

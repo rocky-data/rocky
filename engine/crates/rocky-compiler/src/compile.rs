@@ -151,7 +151,7 @@ pub fn compile_project(
         &config.source_schemas,
         None,
         &project.models,
-        Some(join_keys_acc.clone()),
+        Some(&join_keys_acc),
     );
     timings.typecheck_ms = tc_start.elapsed().as_millis() as u64;
     timings.typecheck_join_keys_ms = join_keys_acc.load(Ordering::Relaxed);
@@ -198,7 +198,9 @@ pub fn compile_project(
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
 
-    let has_errors = diagnostics.iter().any(|d| d.is_error());
+    let has_errors = diagnostics
+        .iter()
+        .any(super::diagnostic::Diagnostic::is_error);
 
     Ok(CompileResult {
         project,

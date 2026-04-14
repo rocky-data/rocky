@@ -51,6 +51,60 @@ pub fn lower_rocky_to_sql(source: &str) -> String {
     }
 }
 
+/// Return parse errors with positions for a Rocky DSL source string.
+///
+/// Returns a JSON array of error objects. The parser currently has no error
+/// recovery, so the array contains at most one element. Format:
+/// ```json
+/// [{"offset": 42, "line": 3, "column": 5, "message": "...", "expected": "...", "found": "..."}]
+/// ```
+/// An empty array `[]` means no errors.
+#[wasm_bindgen]
+pub fn get_parse_errors(source: &str) -> String {
+    match rocky_lang::parse(source) {
+        Ok(_) => "[]".to_string(),
+        Err(e) => {
+            let (offset, expected, found) = match &e {
+                rocky_lang::ParseError::UnexpectedToken {
+                    expected,
+                    found,
+                    offset,
+                } => (*offset, expected.clone(), found.clone()),
+                rocky_lang::ParseError::UnexpectedEof { expected } => {
+                    (source.len().saturating_sub(1), expected.clone(), "EOF".to_string())
+                }
+                rocky_lang::ParseError::InvalidNumber { value } => {
+                    (0, "valid number".to_string(), value.clone())
+                }
+                rocky_lang::ParseError::EmptyFile => {
+                    (0, "pipeline step".to_string(), "empty file".to_string())
+                }
+            };
+
+            // Convert byte offset to line/column.
+            let (line, col) = byte_offset_to_line_col(source, offset);
+
+            serde_json::json!([{
+                "offset": offset,
+                "line": line,
+                "column": col,
+                "message": e.to_string(),
+                "expected": expected,
+                "found": found,
+            }])
+            .to_string()
+        }
+    }
+}
+
+/// Convert a byte offset to 1-based line and column numbers.
+fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let before = &source[..offset.min(source.len())];
+    let line = before.chars().filter(|c| *c == '\n').count() + 1;
+    let col = before.rfind('\n').map_or(offset, |pos| offset - pos - 1) + 1;
+    (line, col)
+}
+
 /// Validate whether a string is a legal SQL identifier.
 ///
 /// Returns `true` if the identifier matches `^[a-zA-Z0-9_]+$`.
@@ -105,6 +159,33 @@ mod tests {
         let result = lower_rocky_to_sql("invalid @@@ garbage");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("error").is_some());
+    }
+
+    #[test]
+    fn test_get_parse_errors_success() {
+        let result = get_parse_errors("from orders\nselect { id }");
+        assert_eq!(result, "[]");
+    }
+
+    #[test]
+    fn test_get_parse_errors_failure() {
+        let result = get_parse_errors("filter x > 1");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0].get("offset").is_some());
+        assert!(arr[0].get("line").is_some());
+        assert!(arr[0].get("column").is_some());
+        assert!(arr[0].get("message").is_some());
+    }
+
+    #[test]
+    fn test_get_parse_errors_empty_file() {
+        let result = get_parse_errors("");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["found"], "empty file");
     }
 
     #[test]

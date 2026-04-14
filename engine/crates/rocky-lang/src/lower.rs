@@ -1511,10 +1511,7 @@ full_join customers as c on customer_id"#,
     fn test_lower_cross_join() {
         let file = parse("from orders\ncross_join dates").unwrap();
         let sql = lower_to_sql(&file).unwrap();
-        assert!(
-            sql.contains("CROSS JOIN dates AS dates"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("CROSS JOIN dates AS dates"), "got: {sql}");
         assert!(
             !sql.contains(" ON "),
             "cross join should have no ON clause, got: {sql}"
@@ -1539,10 +1536,7 @@ left join customers as c on customer_id"#,
     fn test_lower_cross_join_two_word() {
         let file = parse("from orders\ncross join dates").unwrap();
         let sql = lower_to_sql(&file).unwrap();
-        assert!(
-            sql.contains("CROSS JOIN dates AS dates"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("CROSS JOIN dates AS dates"), "got: {sql}");
     }
 
     #[test]

@@ -54,7 +54,11 @@ pub enum StateError {
          Delete or migrate the state file at {path} to continue. \
          See https://rocky.dev/docs/state-migration for instructions."
     )]
-    SchemaMismatch { found: u32, expected: u32, path: String },
+    SchemaMismatch {
+        found: u32,
+        expected: u32,
+        path: String,
+    },
 
     #[error("state schema version is corrupt: expected an integer, found {0:?}")]
     VersionParse(String),

@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use rocky_core::ir::{ColumnInfo, TableRef};
-use rocky_sql::validation;
 use rocky_core::traits::{
     AdapterError, AdapterResult, ExplainResult, QueryResult, SqlDialect, WarehouseAdapter,
 };
+use rocky_sql::validation;
 
 use crate::DuckDbConnector;
 use crate::dialect::DuckDbSqlDialect;
@@ -181,11 +181,7 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         let tables = result
             .rows
             .iter()
-            .filter_map(|row| {
-                row.first()
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase())
-            })
+            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_lowercase))
             .collect();
         Ok(tables)
     }

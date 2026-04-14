@@ -41,7 +41,7 @@ pub fn read_file_smart(path: &Path) -> io::Result<String> {
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
     std::str::from_utf8(&mmap)
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 

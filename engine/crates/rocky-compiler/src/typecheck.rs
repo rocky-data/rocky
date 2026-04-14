@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, I001, I002, SourceSpan, W001,
-    W002, W003,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, I001, I002, SourceSpan, W001, W002,
+    W003,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -110,7 +110,7 @@ pub fn typecheck_project_with_models(
     source_schemas: &HashMap<String, Vec<TypedColumn>>,
     _type_map: Option<&dyn Fn(&str) -> RockyType>,
     models: &[rocky_core::models::Model],
-    join_keys_acc: Option<Arc<AtomicU64>>,
+    join_keys_acc: Option<&Arc<AtomicU64>>,
 ) -> TypeCheckResult {
     let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -184,7 +184,7 @@ pub fn typecheck_project_with_models(
                     col_index_snapshot,
                     &model_by_name,
                     &model_names,
-                    join_keys_acc.as_ref(),
+                    join_keys_acc,
                 ))
             })
             .collect();
@@ -328,7 +328,7 @@ fn compute_model_typecheck(
         let has_unknown_upstream = model_schema
             .upstream
             .iter()
-            .any(|up| typed_models.get(up).is_none_or(|cols| cols.is_empty()));
+            .any(|up| typed_models.get(up).is_none_or(std::vec::Vec::is_empty));
 
         if has_unknown_upstream {
             diagnostics.push(Diagnostic::warning(
@@ -633,7 +633,11 @@ fn check_first_partition(
 /// sources that aren't models in the graph). The fallback yields the same
 /// behavior as the prior serial loop — correct, just not parallelized.
 fn derive_execution_layers(graph: &SemanticGraph) -> Vec<Vec<String>> {
-    let model_set: HashSet<&str> = graph.models.keys().map(|s| s.as_str()).collect();
+    let model_set: HashSet<&str> = graph
+        .models
+        .keys()
+        .map(std::string::String::as_str)
+        .collect();
     let nodes: Vec<DagNode> = graph
         .models
         .iter()

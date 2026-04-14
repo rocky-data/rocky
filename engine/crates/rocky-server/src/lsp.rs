@@ -1927,8 +1927,10 @@ pub fn compile_incremental(
     }
 
     // Find transitive dependents
-    let mut affected: std::collections::HashSet<String> =
-        changed_models.iter().map(|s| s.to_string()).collect();
+    let mut affected: std::collections::HashSet<String> = changed_models
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let mut changed = true;
     while changed {

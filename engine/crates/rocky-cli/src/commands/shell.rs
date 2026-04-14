@@ -264,7 +264,11 @@ fn print_query_result(result: &rocky_core::traits::QueryResult) {
 
     // Compute column widths: max of header length and cell contents.
     let num_cols = result.columns.len();
-    let mut widths: Vec<usize> = result.columns.iter().map(|c| c.len()).collect();
+    let mut widths: Vec<usize> = result
+        .columns
+        .iter()
+        .map(std::string::String::len)
+        .collect();
 
     let formatted_rows: Vec<Vec<String>> = result
         .rows

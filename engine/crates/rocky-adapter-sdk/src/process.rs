@@ -344,7 +344,7 @@ impl WarehouseAdapter for ProcessAdapter {
             .await?;
 
         resp.get("exists")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .ok_or_else(|| AdapterError::msg("table_exists response missing 'exists' field"))
     }
 

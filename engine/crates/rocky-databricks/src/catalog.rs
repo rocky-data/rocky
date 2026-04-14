@@ -83,7 +83,11 @@ impl<'a> CatalogManager<'a> {
         let schemas = result
             .rows
             .iter()
-            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|row| {
+                row.first()
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string)
+            })
             .collect();
         Ok(schemas)
     }
@@ -100,7 +104,11 @@ impl<'a> CatalogManager<'a> {
         let tables = result
             .rows
             .iter()
-            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|row| {
+                row.first()
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string)
+            })
             .collect();
         Ok(tables)
     }
@@ -117,7 +125,11 @@ impl<'a> CatalogManager<'a> {
         let catalogs = result
             .rows
             .iter()
-            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|row| {
+                row.first()
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string)
+            })
             .collect();
         Ok(catalogs)
     }

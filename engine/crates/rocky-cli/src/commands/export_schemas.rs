@@ -19,9 +19,9 @@ use crate::output::{
     AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, CiOutput,
     ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
     DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput,
-    ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
-    ProfileStorageOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
-    ValidateMigrationOutput, ValidateOutput,
+    ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput,
+    PlanOutput, ProfileStorageOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.

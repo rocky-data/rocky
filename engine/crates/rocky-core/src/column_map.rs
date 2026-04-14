@@ -9,10 +9,7 @@ use crate::ir::ColumnInfo;
 
 /// Build a case-insensitive `name → &ColumnInfo` map.
 pub fn build_column_map(columns: &[ColumnInfo]) -> HashMap<String, &ColumnInfo> {
-    columns
-        .iter()
-        .map(|c| (c.name.to_lowercase(), c))
-        .collect()
+    columns.iter().map(|c| (c.name.to_lowercase(), c)).collect()
 }
 
 /// Build a case-insensitive set of column names, excluding any in `exclude`.

@@ -114,12 +114,12 @@ impl AirbyteClient {
     /// `api_url` should be the Airbyte API root, e.g. `https://api.airbyte.com`.
     /// `auth_token` is optional -- Cloud deployments require it (Bearer token),
     /// self-hosted OSS instances may not require auth.
-    pub fn new(api_url: String, auth_token: Option<String>) -> Self {
+    pub fn new(api_url: &str, auth_token: Option<String>) -> Self {
         Self::with_retry(api_url, auth_token, RetryConfig::default())
     }
 
     /// Create a new client with custom retry configuration.
-    pub fn with_retry(api_url: String, auth_token: Option<String>, retry: RetryConfig) -> Self {
+    pub fn with_retry(api_url: &str, auth_token: Option<String>, retry: RetryConfig) -> Self {
         let base_url = api_url.trim_end_matches('/').to_string();
         AirbyteClient {
             client: Client::new(),
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_debug_without_token() {
-        let client = AirbyteClient::new("https://localhost:8000".into(), None);
+        let client = AirbyteClient::new("https://localhost:8000", None);
         let debug = format!("{client:?}");
         assert!(debug.contains("localhost"));
         assert!(!debug.contains("secret"));
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_base_url_trailing_slash_stripped() {
-        let client = AirbyteClient::new("https://api.airbyte.com/".into(), None);
+        let client = AirbyteClient::new("https://api.airbyte.com/", None);
         assert_eq!(client.base_url, "https://api.airbyte.com");
     }
 

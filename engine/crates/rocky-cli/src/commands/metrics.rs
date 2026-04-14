@@ -125,7 +125,7 @@ pub fn run_metrics(
             count: typed_snapshots.len(),
             snapshots: typed_snapshots,
             alerts: alert_entries.clone(),
-            column: column.map(|c| c.to_string()),
+            column: column.map(std::string::ToString::to_string),
             column_trend,
             message: None,
         };

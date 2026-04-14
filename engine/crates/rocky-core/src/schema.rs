@@ -251,7 +251,7 @@ impl SchemaPattern {
 
                     let vals: Vec<String> = segments[idx..idx + available]
                         .iter()
-                        .map(|s| s.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect();
                     values.insert(name.clone(), SchemaValue::Multiple(vals));
                     idx += available;

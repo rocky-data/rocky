@@ -25,8 +25,10 @@ pub async fn run_estimate(
     output_json: bool,
 ) -> Result<()> {
     // 1. Load config + adapter registry.
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
-        .context(format!("failed to load config from {}", config_path.display()))?;
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
@@ -61,8 +63,7 @@ pub async fn run_estimate(
         let plan = model.to_plan();
         let dialect = warehouse_adapter.dialect();
 
-        let sql_result =
-            rocky_core::sql_gen::generate_transformation_sql(&plan, dialect);
+        let sql_result = rocky_core::sql_gen::generate_transformation_sql(&plan, dialect);
 
         let sql = match sql_result {
             Ok(stmts) => stmts.join(";\n"),
@@ -105,7 +106,10 @@ pub async fn run_estimate(
                 }
                 let total_lines = est.raw_explain.lines().count();
                 if total_lines > 3 {
-                    println!("    ... ({} more lines, use --output json for full plan)", total_lines - 3);
+                    println!(
+                        "    ... ({} more lines, use --output json for full plan)",
+                        total_lines - 3
+                    );
                 }
             }
             println!();
@@ -121,9 +125,10 @@ async fn run_explain(
     model_name: &str,
     sql: &str,
 ) -> Result<ModelEstimate> {
-    let explain_result = adapter.explain(sql).await.context(format!(
-        "EXPLAIN failed for model '{model_name}'"
-    ))?;
+    let explain_result = adapter
+        .explain(sql)
+        .await
+        .context(format!("EXPLAIN failed for model '{model_name}'"))?;
 
     Ok(ModelEstimate {
         model_name: model_name.to_string(),

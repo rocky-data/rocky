@@ -411,7 +411,7 @@ impl HookContext {
 
     /// Creates a synthetic test context for `rocky hooks test`.
     pub fn synthetic(event: HookEvent, pipeline: &str) -> Self {
-        let mut ctx = Self::new(event.clone(), "test-run-id", pipeline);
+        let mut ctx = Self::new(event, "test-run-id", pipeline);
         ctx.table = Some("catalog.schema.table".to_string());
         ctx.model = Some("example_model".to_string());
         ctx.duration_ms = Some(1234);
@@ -586,19 +586,19 @@ impl HookRegistry {
 
     /// Returns the total number of hooks (shell + webhooks) registered across all events.
     pub fn total_hook_count(&self) -> usize {
-        let shell_count: usize = self.hooks.values().map(|v| v.len()).sum();
-        let webhook_count: usize = self.webhooks.values().map(|v| v.len()).sum();
+        let shell_count: usize = self.hooks.values().map(std::vec::Vec::len).sum();
+        let webhook_count: usize = self.webhooks.values().map(std::vec::Vec::len).sum();
         shell_count + webhook_count
     }
 
     /// Returns the total number of shell hooks registered.
     pub fn shell_hook_count(&self) -> usize {
-        self.hooks.values().map(|v| v.len()).sum()
+        self.hooks.values().map(std::vec::Vec::len).sum()
     }
 
     /// Returns the total number of webhooks registered.
     pub fn webhook_count(&self) -> usize {
-        self.webhooks.values().map(|v| v.len()).sum()
+        self.webhooks.values().map(std::vec::Vec::len).sum()
     }
 
     /// Fires all hooks registered for the given context's event.

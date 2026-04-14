@@ -295,7 +295,7 @@ pub fn render_diagnostics(
         let src = d
             .span
             .as_ref()
-            .and_then(|s| source_map.get(&s.file).map(|t| t.as_str()));
+            .and_then(|s| source_map.get(&s.file).map(std::string::String::as_str));
 
         let report = d.to_miette(src);
         // Use miette's GraphicalReportHandler for pretty output.

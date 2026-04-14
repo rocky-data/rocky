@@ -155,7 +155,10 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
                     });
 
                     // Validate DAG
-                    let dag_nodes: Vec<_> = models.iter().map(|m| m.to_dag_node()).collect();
+                    let dag_nodes: Vec<_> = models
+                        .iter()
+                        .map(rocky_core::models::Model::to_dag_node)
+                        .collect();
                     match rocky_core::dag::topological_sort(&dag_nodes) {
                         Ok(order) => {
                             out.models = ValidateModelsStatus {
@@ -631,8 +634,11 @@ fn validate_snapshot_pipeline(
 ///
 /// Checks that all referenced pipeline names exist and that the graph is acyclic.
 fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut ValidateOutput) {
-    let pipeline_names: std::collections::HashSet<&str> =
-        cfg.pipelines.keys().map(|s| s.as_str()).collect();
+    let pipeline_names: std::collections::HashSet<&str> = cfg
+        .pipelines
+        .keys()
+        .map(std::string::String::as_str)
+        .collect();
 
     let mut has_deps = false;
 
