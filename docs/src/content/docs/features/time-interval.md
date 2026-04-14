@@ -298,8 +298,8 @@ The following are deferred:
 
 ## See also
 
-- [Partition-checksum POC](https://github.com/...) — runnable end-to-end
-  demo of `time_interval` with late-arriving data correction
+- Partition-checksum POC — runnable end-to-end demo of `time_interval`
+  with late-arriving data correction
   (`examples/playground/pocs/02-performance/03-partition-checksum/`)
 - [Dagster partitions guide](/dagster/partitions/) — how the dagster-rocky
   integration translates `time_interval` into Dagster `PartitionsDefinition`

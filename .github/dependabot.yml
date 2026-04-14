@@ -6,7 +6,7 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: npm
-    directory: /engine/docs
+    directory: /docs
     schedule:
       interval: weekly
 

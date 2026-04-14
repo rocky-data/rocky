@@ -39,7 +39,7 @@ Each subproject's native tool (`cargo`, `uv`, `npm`) also works directly from in
 → **`rocky-new-cli-command`** skill. This is the superset that walks through engine impl + codegen + dagster resource method + vscode command registration.
 
 ### "Change Rocky DSL syntax (`.rocky` files)"
-→ **`rocky-dsl-change`** skill. Lockstep change across `engine/rocky-lang`, `engine/rocky-compiler`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, and `engine/docs/src/content/docs/rocky-lang-spec.md`.
+→ **`rocky-dsl-change`** skill. Lockstep change across `engine/rocky-lang`, `engine/rocky-compiler`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, and `docs/src/content/docs/rocky-lang-spec.md`.
 
 ### "Add a new warehouse or source adapter"
 → **`rocky-new-adapter`** skill. New crate under `engine/crates/rocky-<name>/`, implementing traits from `rocky-adapter-sdk`, with conformance tests. Template crates: `rocky-databricks`, `rocky-snowflake`, `rocky-duckdb`, `rocky-fivetran`.
@@ -66,7 +66,7 @@ When a change touches X, what else moves?
 | You change | Also touch |
 |---|---|
 | `engine/crates/rocky-cli/src/output.rs` (any `*Output` struct) | Run `just codegen` — auto-regenerates `schemas/`, `integrations/dagster/.../types_generated/`, `editors/vscode/src/types/generated/`. Then re-export in `integrations/dagster/src/dagster_rocky/types.py` and add a dispatch row in `parse_rocky_output()`. |
-| A `.rocky` keyword or operator | `engine/rocky-lang/src/{token,parser,lower}.rs`, `engine/rocky-compiler/src/`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, `engine/docs/src/content/docs/rocky-lang-spec.md` |
+| A `.rocky` keyword or operator | `engine/rocky-lang/src/{token,parser,lower}.rs`, `engine/rocky-compiler/src/`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, `docs/src/content/docs/rocky-lang-spec.md` |
 | A new CLI command | Engine impl + `rocky-cli/src/output.rs` struct + `rocky-cli/src/commands/export_schemas.rs` registration + `just codegen` + dagster `resource.py` method + vscode `src/commands/<group>.ts` + `package.json` contribution |
 | A new adapter | New crate in `engine/crates/` + `engine/Cargo.toml` members + conformance test hookup + factory registration in `rocky-core/src/config.rs` |
 | `rocky.toml` config schema | `engine/crates/rocky-core/src/config.rs` + `editors/vscode/schemas/rocky-config.schema.json` (for IDE autocompletion) |

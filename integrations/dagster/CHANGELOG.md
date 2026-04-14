@@ -168,7 +168,7 @@ These shipped in the engine to support dagster-rocky's v0.4 features:
 
 #### Documentation
 
-Seven new doc pages under `engine/docs/src/content/docs/dagster/`:
+Seven new doc pages under `docs/src/content/docs/dagster/`:
 
 - `freshness.md` (order 9)
 - `sensors.md` (order 10)

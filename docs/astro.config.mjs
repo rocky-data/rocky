@@ -2,8 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
 export default defineConfig({
-  site: "https://rocky-data.github.io",
-  base: "/rocky",
+  site: "https://rocky-data.dev",
   integrations: [
     starlight({
       title: "Rocky",

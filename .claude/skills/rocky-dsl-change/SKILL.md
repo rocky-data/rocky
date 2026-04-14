@@ -37,7 +37,7 @@ All four live under `engine/` and `editors/vscode/` in the same monorepo, so the
 3. **Highlight it** in `editors/vscode/syntaxes/rocky.tmLanguage.json`.
    - Add the keyword to the appropriate `match` pattern. TextMate grammars are pure regex with scope names — the scope name should match an existing family (`keyword.control.rocky`, `keyword.operator.rocky`, etc.) so existing themes color it.
 4. **Offer a snippet** in `editors/vscode/snippets/rocky.json` when the keyword is something users would want to autocomplete with a body.
-5. **Update the spec doc**: `engine/docs/src/content/docs/rocky-lang-spec.md` is the canonical Rocky DSL spec. Keep it in sync — it's published via the Astro docs site.
+5. **Update the spec doc**: `docs/src/content/docs/rocky-lang-spec.md` is the canonical Rocky DSL spec. Keep it in sync — it's published via the Astro docs site.
 6. **Add a test**:
    - Engine side: a unit test in `rocky-lang` or an integration test in `rocky-compiler` that parses and type-checks a snippet using the new syntax.
    - VS Code side: for non-trivial grammar changes, add a case to `editors/vscode/src/` vitest tests if one exists, or smoke-test in the Extension Development Host (F5).
@@ -75,7 +75,7 @@ If you changed that rule, you'd touch:
 - `engine/crates/rocky-compiler/` to fold into the IR.
 - `engine/crates/rocky-sql/src/transpile.rs` to emit dialect-specific SQL.
 - `editors/vscode/syntaxes/rocky.tmLanguage.json` so the operator highlights as an operator, not an error.
-- `engine/docs/src/content/docs/rocky-lang-spec.md` to document the semantics.
+- `docs/src/content/docs/rocky-lang-spec.md` to document the semantics.
 
 ## Common pitfalls
 
@@ -88,4 +88,4 @@ If you changed that rule, you'd touch:
 
 - `CLAUDE.md` (monorepo root) — "When modifying Rocky DSL syntax" cascade rules.
 - `engine/CLAUDE.md` — "Rocky DSL (.rocky files)" section for the current pipeline step list.
-- `engine/docs/src/content/docs/rocky-lang-spec.md` — the published language spec.
+- `docs/src/content/docs/rocky-lang-spec.md` — the published language spec.
