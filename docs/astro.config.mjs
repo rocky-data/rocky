@@ -8,6 +8,12 @@ export default defineConfig({
     starlight({
       title: "Rocky",
       description: "Rust SQL transformation engine that replaces dbt",
+      logo: {
+        dark: "./src/assets/rocky-logo-dark.svg",
+        light: "./src/assets/rocky-logo-light.svg",
+        alt: "Rocky",
+      },
+      favicon: "/favicon.png",
       social: [
         {
           icon: "github",

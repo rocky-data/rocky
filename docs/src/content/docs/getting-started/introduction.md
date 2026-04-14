@@ -107,6 +107,13 @@ Rocky's engine is a Cargo workspace with 20 crates:
 - **rocky-wasm** — WebAssembly exports for browser/edge execution
 - **rocky** — The binary crate
 
+## Community & Support
+
+- **GitHub Discussions** — Questions, ideas, and show-and-tell: [rocky-data/rocky/discussions](https://github.com/rocky-data/rocky/discussions)
+- **Issues** — Bug reports and feature requests: [rocky-data/rocky/issues](https://github.com/rocky-data/rocky/issues)
+- **Email** — General inquiries: [hello@rocky-data.dev](mailto:hello@rocky-data.dev)
+- **Security** — Vulnerability reports: [security@rocky-data.dev](mailto:security@rocky-data.dev) (see [SECURITY.md](https://github.com/rocky-data/rocky/blob/main/SECURITY.md))
+
 ## License
 
 Rocky is licensed under [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
