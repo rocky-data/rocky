@@ -5,7 +5,7 @@ description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
-authors = [{ name = "Hugo Correia" }]
+authors = [{ name = "Hugo Correia", email = "hello@rocky-data.dev" }]
 keywords = ["dagster", "data-engineering", "sql", "transformation", "rocky", "dbt"]
 classifiers = [
     "Development Status :: 4 - Beta",
