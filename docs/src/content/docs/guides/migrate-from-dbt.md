@@ -11,7 +11,7 @@ Rocky includes a built-in importer that converts dbt SQL models to Rocky's sidec
 
 Before starting, make sure you have:
 
-1. **Rocky installed** -- see [Installation](/rocky/getting-started/installation/)
+1. **Rocky installed** -- see [Installation](/getting-started/installation/)
 2. **An existing dbt project** with models in a `models/` directory
 3. **Access to your warehouse credentials** (Databricks host, HTTP path, token)
 
@@ -455,7 +455,7 @@ You do not need to migrate everything at once. Here is a recommended phased appr
 
 1. Migrate all models to Rocky
 2. Remove dbt from CI/CD
-3. Set up [Dagster integration](/rocky/dagster/introduction/) for orchestration
+3. Set up [Dagster integration](/dagster/introduction/) for orchestration
 
 ### Running dbt and Rocky side by side
 
@@ -480,7 +480,7 @@ Once Rocky covers all models, remove the dbt steps.
 
 You don't need to convert everything. dbt packages like `fivetran/facebook_ads` or `fivetran/stripe` produce tables in your warehouse that Rocky can reference directly as external sources. Rocky's resolver automatically classifies schema-qualified table references (`dbt_fivetran.stg_facebook_ads__ad_history`) as external -- they appear in lineage but do not create DAG dependencies.
 
-This lets you keep vendor-maintained staging packages in dbt and write your custom analytics in Rocky. See [Using Rocky with dbt Packages](/rocky/guides/using-dbt-packages/) for the full walkthrough.
+This lets you keep vendor-maintained staging packages in dbt and write your custom analytics in Rocky. See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for the full walkthrough.
 
 ## Troubleshooting
 

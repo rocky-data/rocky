@@ -343,7 +343,7 @@ Testing 12 models...
 
 ## 7. Intent in the IDE
 
-When using the [VS Code extension](/rocky/guides/ide-setup/), models with intent get enhanced IDE features:
+When using the [VS Code extension](/guides/ide-setup/), models with intent get enhanced IDE features:
 
 - **Hover**: Shows the intent description above the column list when hovering over a model name
 - **Document Symbols**: Intent appears as the first child of the model in the Outline panel

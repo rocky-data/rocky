@@ -186,4 +186,4 @@ rocky run --filter tenant=acme
 rocky compare --filter regions=us_west
 ```
 
-See the [CLI Filters reference](/rocky/reference/filters/) for the full syntax, grammar, and common patterns.
+See the [CLI Filters reference](/reference/filters/) for the full syntax, grammar, and common patterns.

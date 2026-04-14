@@ -358,7 +358,7 @@ rocky ai-test --all --save
 
 Generates test assertions based on each model's SQL logic and intent description, and saves them to the `tests/` directory.
 
-See the [AI Features guide](/rocky/guides/ai-features/) for a complete walkthrough.
+See the [AI Features guide](/guides/ai-features/) for a complete walkthrough.
 
 ## 7. Run CI Locally
 
@@ -481,8 +481,8 @@ Headline (50k models): Rocky compiles in **10.5s**, **15x faster** than dbt-core
 
 ## Next Steps
 
-- [Migrating from dbt](/rocky/guides/migrate-from-dbt/) -- import an existing dbt project
-- [IDE Setup](/rocky/guides/ide-setup/) -- install the VS Code extension for hover types, go-to-definition, and inline lineage
-- [CI/CD Integration](/rocky/guides/ci-cd/) -- add Rocky to your GitHub Actions or GitLab CI pipeline
-- [AI Features](/rocky/guides/ai-features/) -- generate models, sync schema changes, and create tests with AI
-- [Data Governance](/rocky/guides/governance/) -- configure contracts, permissions, and quality checks
+- [Migrating from dbt](/guides/migrate-from-dbt/) -- import an existing dbt project
+- [IDE Setup](/guides/ide-setup/) -- install the VS Code extension for hover types, go-to-definition, and inline lineage
+- [CI/CD Integration](/guides/ci-cd/) -- add Rocky to your GitHub Actions or GitLab CI pipeline
+- [AI Features](/guides/ai-features/) -- generate models, sync schema changes, and create tests with AI
+- [Data Governance](/guides/governance/) -- configure contracts, permissions, and quality checks

@@ -44,7 +44,7 @@ rocky plan --filter id=conn_abc123
 
 ### Any other key — parsed schema component
 
-Every other key name is matched against a named component parsed out of the source schema by the pipeline's [schema_pattern](/rocky/concepts/schema-patterns/). The key must match one of the component names declared in `rocky.toml`:
+Every other key name is matched against a named component parsed out of the source schema by the pipeline's [schema_pattern](/concepts/schema-patterns/). The key must match one of the component names declared in `rocky.toml`:
 
 ```toml
 [pipeline.bronze.source.schema_pattern]
@@ -155,6 +155,6 @@ A filter that parses correctly but matches zero sources is **not** an error — 
 
 ## Related
 
-- [Schema Patterns](/rocky/concepts/schema-patterns/) — how source schema names are parsed into the components you filter on
-- [CLI Reference](/rocky/reference/cli/) — full CLI surface, all commands
-- [Core pipeline commands](/rocky/reference/commands/core-pipeline/) — `plan`, `run`, `compare` detail
+- [Schema Patterns](/concepts/schema-patterns/) — how source schema names are parsed into the components you filter on
+- [CLI Reference](/reference/cli/) — full CLI surface, all commands
+- [Core pipeline commands](/reference/commands/core-pipeline/) — `plan`, `run`, `compare` detail

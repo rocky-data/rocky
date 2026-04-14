@@ -214,7 +214,7 @@ For full type checking of columns from external sources, Rocky can introspect th
 | Vendor-maintained staging packages (Fivetran, Airbyte) | Keep in dbt -- they're actively maintained and tested |
 | Custom macros shared across models | Consider converting to Rocky CTEs or separate models |
 | Simple `ref()`-based models with no Jinja | Good candidates for conversion via `rocky import-dbt` |
-| Models using `{{ var() }}`, `{% for %}`, or custom macros | Keep in dbt or use the [manifest fast path](/rocky/guides/migrate-from-dbt/#manifest-fast-path) |
+| Models using `{{ var() }}`, `{% for %}`, or custom macros | Keep in dbt or use the [manifest fast path](/guides/migrate-from-dbt/#manifest-fast-path) |
 | New analytics models built on existing tables | Write directly in Rocky |
 
 The pragmatic path: let dbt packages handle what they're good at (vendor-maintained staging models), and use Rocky for the transformation layer you own and maintain.
@@ -232,6 +232,6 @@ The POC seeds tables simulating Fivetran facebook_ads and stripe dbt package out
 
 ## Related
 
-- [Migrating from dbt](/rocky/guides/migrate-from-dbt/) -- full conversion workflow when you want to replace dbt entirely
-- [DAG & Dependencies](/rocky/concepts/dag-dependencies/) -- how Rocky resolves model dependencies and external references
-- [Silver Layer (Models)](/rocky/concepts/silver-layer/) -- model configuration and materialization strategies
+- [Migrating from dbt](/guides/migrate-from-dbt/) -- full conversion workflow when you want to replace dbt entirely
+- [DAG & Dependencies](/concepts/dag-dependencies/) -- how Rocky resolves model dependencies and external references
+- [Silver Layer (Models)](/concepts/silver-layer/) -- model configuration and materialization strategies

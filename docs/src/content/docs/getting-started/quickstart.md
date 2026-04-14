@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-This guide walks you through setting up a Rocky pipeline that replicates Fivetran-landed sources into Databricks. If you do not have warehouse credentials handy, the [Playground guide](/rocky/guides/playground/) does the same thing end-to-end against a local DuckDB file with no setup.
+This guide walks you through setting up a Rocky pipeline that replicates Fivetran-landed sources into Databricks. If you do not have warehouse credentials handy, the [Playground guide](/guides/playground/) does the same thing end-to-end against a local DuckDB file with no setup.
 
 ## 1. Initialize a Project
 
@@ -197,9 +197,9 @@ acme_warehouse.staging__us_west__shopify.customers | 2026-03-30T10:00:00Z | 2026
 
 ## Next Steps
 
-- Try the [playground](/rocky/guides/playground/) for a credential-free DuckDB version of this flow
-- Learn about [schema patterns](/rocky/concepts/schema-patterns/) to customize source-to-target mapping
-- Add [transformation models](/rocky/concepts/silver-layer/) for custom SQL
-- Configure [data quality checks](/rocky/features/data-quality-checks/)
-- Set up [permissions](/rocky/features/permissions/) for RBAC
-- Integrate with [Dagster](/rocky/dagster/introduction/) for orchestration
+- Try the [playground](/guides/playground/) for a credential-free DuckDB version of this flow
+- Learn about [schema patterns](/concepts/schema-patterns/) to customize source-to-target mapping
+- Add [transformation models](/concepts/silver-layer/) for custom SQL
+- Configure [data quality checks](/features/data-quality-checks/)
+- Set up [permissions](/features/permissions/) for RBAC
+- Integrate with [Dagster](/dagster/introduction/) for orchestration

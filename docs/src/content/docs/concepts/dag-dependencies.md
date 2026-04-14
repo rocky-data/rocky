@@ -107,7 +107,7 @@ JOIN dbt_fivetran.stg_facebook_ads__ad_history f
     ON o.campaign_id = f.campaign_id
 ```
 
-See [Using Rocky with dbt Packages](/rocky/guides/using-dbt-packages/) for a full guide on this pattern.
+See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for a full guide on this pattern.
 
 ## How it differs from dbt
 

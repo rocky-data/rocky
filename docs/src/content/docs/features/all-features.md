@@ -209,4 +209,4 @@ All AI commands are CLI-native, not cloud-dependent. Intent is stored as metadat
 | Config validation | **15 ms** |
 | SQL generation | **200 ms** (50k tables/sec) |
 
-Linear scaling verified from 1k to 50k models. See [benchmarks](/rocky/features/benchmarks/) for full comparison with dbt-core and dbt-fusion.
+Linear scaling verified from 1k to 50k models. See [benchmarks](/features/benchmarks/) for full comparison with dbt-core and dbt-fusion.

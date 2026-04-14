@@ -407,7 +407,7 @@ rocky doctor --check auth      # Verify credentials + connectivity for all adapt
 
 The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an adapter-specific cheaper query) and each discovery adapter. Reports per-adapter pass/fail with latency.
 
-See the [CLI Reference](/rocky/reference/cli/#rocky-doctor) for the full check list and JSON output format.
+See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
 
 ---
 
@@ -426,5 +426,5 @@ rocky list consumers <model> # What depends on this model
 
 All subcommands support `--output json` via `-o json`. Models are discovered from the `models/` directory (and immediate subdirectories for the common `models/{layer}/` layout).
 
-See the [CLI Reference](/rocky/reference/cli/#rocky-list) for full examples and JSON output schemas.
+See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
 - [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- validate config after registering the adapter

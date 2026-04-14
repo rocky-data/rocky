@@ -69,7 +69,7 @@ Source adapters are metadata-only — they identify what schemas and tables exis
 
 A single DuckDB adapter instance can act as both source and warehouse, which is how the playground and credential-free examples run end-to-end.
 
-Rocky is designed for extensibility — new source and warehouse adapters can be added through the [Adapter SDK](/rocky/concepts/adapters/) without modifying the core engine.
+Rocky is designed for extensibility — new source and warehouse adapters can be added through the [Adapter SDK](/concepts/adapters/) without modifying the core engine.
 
 ## Monorepo
 

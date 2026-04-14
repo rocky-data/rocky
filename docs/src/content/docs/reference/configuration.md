@@ -334,7 +334,7 @@ Given `source=shopify`:
 | `warehouse` | `warehouse` (static — no substitution) |
 | `stage__{source}` | `stage__shopify` |
 
-For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders in `catalog_template` — see [Schema Patterns](/rocky/concepts/schema-patterns/) for the full pattern reference (e.g. `catalog_template = "{tenant}_warehouse"` with `components = ["tenant", "regions...", "source"]`).
+For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders in `catalog_template` — see [Schema Patterns](/concepts/schema-patterns/) for the full pattern reference (e.g. `catalog_template = "{tenant}_warehouse"` with `components = ["tenant", "regions...", "source"]`).
 
 ### `[pipeline.NAME.target.governance]`
 

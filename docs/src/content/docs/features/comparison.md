@@ -165,7 +165,7 @@ A factual feature-by-feature comparison of the major SQL transformation tools in
 | **Warm compile** | **0.72 s** | 33.12 s (46x) | 37.16 s (52x) |
 | **Config validation** | **15 ms** | 2,187 ms (146x) | 1,473 ms (98x) |
 
-See [benchmarks](/rocky/features/benchmarks/) for full cost analysis and methodology.
+See [benchmarks](/features/benchmarks/) for full cost analysis and methodology.
 
 ## Where Each Tool Excels
 

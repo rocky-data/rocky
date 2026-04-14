@@ -65,7 +65,7 @@ Using the parsed components:
 
 So `fivetran_catalog.src__shopify.orders` is copied to `warehouse.stage__shopify.orders`.
 
-For multi-tenant setups where each tenant gets its own catalog, see [Schema Patterns](/rocky/concepts/schema-patterns/) for the `{tenant}_warehouse` + `components = ["tenant", "regions...", "source"]` pattern.
+For multi-tenant setups where each tenant gets its own catalog, see [Schema Patterns](/concepts/schema-patterns/) for the `{tenant}_warehouse` + `components = ["tenant", "regions...", "source"]` pattern.
 
 ## Auto-creation
 
