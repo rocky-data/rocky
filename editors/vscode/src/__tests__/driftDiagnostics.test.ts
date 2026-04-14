@@ -7,7 +7,7 @@ const mockDiagnosticCollection = {
   dispose: vi.fn(),
 };
 
-const mockSubscriptions: { push: ReturnType<typeof vi.fn> } = {
+const _mockSubscriptions: { push: ReturnType<typeof vi.fn> } = {
   push: vi.fn(),
 };
 
