@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-04-14
+
+### Fixed
+
+- Fix extension failing to activate — `.vscodeignore` was stripping the `vscode-languageclient` runtime dependency from the VSIX package, causing a crash on `require("vscode-languageclient/node")` before `activate()` could run. No commands, output channel, or LSP client would register.
+- Add dedicated monochrome activity bar icon (`rocky-activity-bar.svg`) so the sidebar icon renders correctly with VS Code theme colors instead of showing a solid dark square.
+
 ## [1.0.0] — 2026-04-13
 
 ### Changed — Phase 2 schema codegen integration
