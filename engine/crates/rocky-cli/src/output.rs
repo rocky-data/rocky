@@ -544,6 +544,12 @@ pub struct OptimizeOutput {
     pub total_models_analyzed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Hint pointing users to `rocky compile --output json` for
+    /// inferred incrementality recommendations on `full_refresh` models.
+    /// Only populated when the optimize command detects that compile-time
+    /// analysis could provide additional optimization opportunities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incrementality_note: Option<String>,
 }
 
 /// One materialization-strategy recommendation. Mirrors
@@ -567,6 +573,11 @@ impl OptimizeOutput {
             recommendations,
             total_models_analyzed: count,
             message: None,
+            incrementality_note: Some(
+                "Run `rocky compile --output json` for inferred incrementality \
+                 hints on full_refresh models"
+                    .to_string(),
+            ),
         }
     }
 
@@ -577,6 +588,7 @@ impl OptimizeOutput {
             recommendations: vec![],
             total_models_analyzed: 0,
             message: Some(message.into()),
+            incrementality_note: None,
         }
     }
 }
