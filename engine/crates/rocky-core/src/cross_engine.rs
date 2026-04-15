@@ -485,6 +485,7 @@ mod tests {
             pipelines: pipeline_map,
             hooks: Default::default(),
             cost: Default::default(),
+            schema_evolution: Default::default(),
         }
     }
 

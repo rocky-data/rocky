@@ -255,6 +255,12 @@ pub struct DriftResult {
     pub table: TableRef,
     pub drifted_columns: Vec<DriftedColumn>,
     pub action: DriftAction,
+    /// Columns in grace period (present in target, absent from source, not yet expired).
+    #[serde(default)]
+    pub grace_period_columns: Vec<GracePeriodColumn>,
+    /// Columns whose grace period has expired and should be dropped from the target.
+    #[serde(default)]
+    pub columns_to_drop: Vec<String>,
 }
 
 /// A single column that has drifted between source and target.
@@ -263,6 +269,23 @@ pub struct DriftedColumn {
     pub name: String,
     pub source_type: String,
     pub target_type: String,
+}
+
+/// A column that exists in the target but has been dropped from the source
+/// and is being kept during a grace period. After the grace period expires
+/// the column is removed from the target table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GracePeriodColumn {
+    /// Column name.
+    pub name: String,
+    /// Column data type in the target.
+    pub data_type: String,
+    /// When the column was first detected as missing from the source.
+    pub first_seen_at: DateTime<Utc>,
+    /// When the grace period expires.
+    pub expires_at: DateTime<Utc>,
+    /// Days remaining until the column is dropped.
+    pub days_remaining: u32,
 }
 
 /// What to do when drift is detected.

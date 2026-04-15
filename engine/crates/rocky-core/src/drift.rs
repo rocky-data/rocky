@@ -1,6 +1,10 @@
+use chrono::{DateTime, Duration, Utc};
+use tracing::warn;
+
 use crate::column_map;
-use crate::ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, TableRef};
+use crate::ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, GracePeriodColumn, TableRef};
 use crate::sql_gen::SqlGenError;
+use crate::state::GracePeriodRecord;
 use crate::traits::SqlDialect;
 
 /// Compares source and target column types to detect schema drift.
@@ -44,6 +48,8 @@ pub fn detect_drift(
         table: table.clone(),
         drifted_columns,
         action,
+        grace_period_columns: Vec::new(),
+        columns_to_drop: Vec::new(),
     }
 }
 
@@ -176,6 +182,151 @@ pub fn generate_alter_column_sql(
         statements.push(format!(
             "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
             table_ref, col.name, col.source_type
+        ));
+    }
+    Ok(statements)
+}
+
+/// Detects columns that exist in the target but have been dropped from the
+/// source, and evaluates them against the grace-period policy.
+///
+/// This function is pure — it takes existing grace-period records as input
+/// and returns three categories of columns:
+///
+/// - **New drops** (`new_records`): columns not yet tracked that need a
+///   `GracePeriodRecord` created in the state store.
+/// - **In grace period** (`in_grace_period`): columns whose grace period has
+///   not yet expired.
+/// - **Expired** (`expired`): columns whose grace period has elapsed and
+///   should be dropped from the target table.
+///
+/// Columns that existed in the grace-period records but now reappear in the
+/// source are returned in `reappeared` so the caller can clean up the state.
+pub fn detect_column_drops(
+    source_columns: &[ColumnInfo],
+    target_columns: &[ColumnInfo],
+    grace_period_days: u32,
+    existing_records: &[GracePeriodRecord],
+    now: DateTime<Utc>,
+) -> ColumnDropResult {
+    let source_set: std::collections::HashSet<String> = source_columns
+        .iter()
+        .map(|c| c.name.to_lowercase())
+        .collect();
+
+    let record_map: std::collections::HashMap<String, &GracePeriodRecord> = existing_records
+        .iter()
+        .map(|r| (r.column_name.to_lowercase(), r))
+        .collect();
+
+    let mut new_records = Vec::new();
+    let mut in_grace_period = Vec::new();
+    let mut expired = Vec::new();
+
+    for target_col in target_columns {
+        let col_lower = target_col.name.to_lowercase();
+        if source_set.contains(&col_lower) {
+            continue;
+        }
+
+        // Column is in the target but not in the source — it's been dropped.
+        if let Some(record) = record_map.get(&col_lower) {
+            if now >= record.expires_at {
+                expired.push(record.column_name.clone());
+            } else {
+                let days_remaining = (record.expires_at - now).num_days().max(0) as u32;
+                warn!(
+                    column = %record.column_name,
+                    expires_at = %record.expires_at,
+                    days_remaining,
+                    "column in grace period (NULL-filled), will be dropped in {days_remaining} day(s)"
+                );
+                in_grace_period.push(GracePeriodColumn {
+                    name: record.column_name.clone(),
+                    data_type: record.data_type.clone(),
+                    first_seen_at: record.first_seen_at,
+                    expires_at: record.expires_at,
+                    days_remaining,
+                });
+            }
+        } else {
+            // New drop — no existing record.
+            let first_seen_at = now;
+            let expires_at = now + Duration::days(i64::from(grace_period_days));
+            let days_remaining = grace_period_days;
+            warn!(
+                column = %target_col.name,
+                grace_period_days,
+                expires_at = %expires_at,
+                "column dropped from source, entering {grace_period_days}-day grace period (NULL-filled)"
+            );
+            new_records.push(GracePeriodRecord {
+                table_key: String::new(), // caller fills this in
+                column_name: target_col.name.clone(),
+                data_type: target_col.data_type.clone(),
+                first_seen_at,
+                expires_at,
+            });
+            in_grace_period.push(GracePeriodColumn {
+                name: target_col.name.clone(),
+                data_type: target_col.data_type.clone(),
+                first_seen_at,
+                expires_at,
+                days_remaining,
+            });
+        }
+    }
+
+    // Find columns that were in the grace-period records but have reappeared
+    // in the source (the source added the column back).
+    let reappeared: Vec<String> = existing_records
+        .iter()
+        .filter(|r| source_set.contains(&r.column_name.to_lowercase()))
+        .map(|r| r.column_name.clone())
+        .collect();
+
+    ColumnDropResult {
+        new_records,
+        in_grace_period,
+        expired,
+        reappeared,
+    }
+}
+
+/// Result of [`detect_column_drops`].
+#[derive(Debug, Clone)]
+pub struct ColumnDropResult {
+    /// Columns newly detected as dropped — need a `GracePeriodRecord` in state.
+    pub new_records: Vec<GracePeriodRecord>,
+    /// Columns currently in their grace period (NULL-filled).
+    pub in_grace_period: Vec<GracePeriodColumn>,
+    /// Column names whose grace period has expired — ready to be dropped.
+    pub expired: Vec<String>,
+    /// Column names that reappeared in the source — their grace-period
+    /// records should be removed from the state store.
+    pub reappeared: Vec<String>,
+}
+
+/// Generates `ALTER TABLE ... DROP COLUMN` SQL for columns whose grace
+/// period has expired.
+pub fn generate_drop_column_sql(
+    table: &TableRef,
+    columns: &[String],
+    dialect: &dyn SqlDialect,
+) -> Result<Vec<String>, SqlGenError> {
+    let table_ref = dialect
+        .format_table_ref(&table.catalog, &table.schema, &table.table)
+        .map_err(|e| SqlGenError::UnsafeFragment {
+            value: String::new(),
+            reason: e.to_string(),
+        })?;
+
+    let mut statements = Vec::new();
+    for col_name in columns {
+        rocky_sql::validation::validate_identifier(col_name)?;
+        statements.push(format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            table_ref, col_name
         ));
     }
     Ok(statements)
@@ -506,5 +657,200 @@ mod tests {
             target_type: "INT".into(),
         }];
         assert!(generate_alter_column_sql(&table, &drifted, &dialect()).is_err());
+    }
+
+    // --- Grace-period column drop tests ---
+
+    #[test]
+    fn test_detect_new_column_drop() {
+        let source = vec![col("id", "INT")];
+        let target = vec![col("id", "INT"), col("old_col", "STRING")];
+        let now = Utc::now();
+
+        let result = detect_column_drops(&source, &target, 7, &[], now);
+
+        assert_eq!(result.new_records.len(), 1);
+        assert_eq!(result.new_records[0].column_name, "old_col");
+        assert_eq!(result.new_records[0].data_type, "STRING");
+        assert_eq!(result.in_grace_period.len(), 1);
+        assert_eq!(result.in_grace_period[0].name, "old_col");
+        assert_eq!(result.in_grace_period[0].days_remaining, 7);
+        assert!(result.expired.is_empty());
+        assert!(result.reappeared.is_empty());
+    }
+
+    #[test]
+    fn test_column_within_grace_period() {
+        let source = vec![col("id", "INT")];
+        let target = vec![col("id", "INT"), col("old_col", "STRING")];
+        let now = Utc::now();
+        let first_seen = now - Duration::days(3);
+        let expires = first_seen + Duration::days(7);
+
+        let existing = vec![GracePeriodRecord {
+            table_key: "cat.sch.tbl".into(),
+            column_name: "old_col".into(),
+            data_type: "STRING".into(),
+            first_seen_at: first_seen,
+            expires_at: expires,
+        }];
+
+        let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+        assert!(result.new_records.is_empty());
+        assert_eq!(result.in_grace_period.len(), 1);
+        assert_eq!(result.in_grace_period[0].name, "old_col");
+        assert_eq!(result.in_grace_period[0].days_remaining, 4);
+        assert!(result.expired.is_empty());
+        assert!(result.reappeared.is_empty());
+    }
+
+    #[test]
+    fn test_column_past_grace_period() {
+        let source = vec![col("id", "INT")];
+        let target = vec![col("id", "INT"), col("old_col", "STRING")];
+        let now = Utc::now();
+        let first_seen = now - Duration::days(10);
+        let expires = first_seen + Duration::days(7); // expired 3 days ago
+
+        let existing = vec![GracePeriodRecord {
+            table_key: "cat.sch.tbl".into(),
+            column_name: "old_col".into(),
+            data_type: "STRING".into(),
+            first_seen_at: first_seen,
+            expires_at: expires,
+        }];
+
+        let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+        assert!(result.new_records.is_empty());
+        assert!(result.in_grace_period.is_empty());
+        assert_eq!(result.expired.len(), 1);
+        assert_eq!(result.expired[0], "old_col");
+        assert!(result.reappeared.is_empty());
+    }
+
+    #[test]
+    fn test_column_reappears_in_source() {
+        let source = vec![col("id", "INT"), col("old_col", "STRING")];
+        let target = vec![col("id", "INT"), col("old_col", "STRING")];
+        let now = Utc::now();
+        let first_seen = now - Duration::days(2);
+        let expires = first_seen + Duration::days(7);
+
+        let existing = vec![GracePeriodRecord {
+            table_key: "cat.sch.tbl".into(),
+            column_name: "old_col".into(),
+            data_type: "STRING".into(),
+            first_seen_at: first_seen,
+            expires_at: expires,
+        }];
+
+        let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+        // Column is back in source — not a drop at all.
+        assert!(result.new_records.is_empty());
+        assert!(result.in_grace_period.is_empty());
+        assert!(result.expired.is_empty());
+        assert_eq!(result.reappeared.len(), 1);
+        assert_eq!(result.reappeared[0], "old_col");
+    }
+
+    #[test]
+    fn test_zero_grace_period_drops_immediately() {
+        let source = vec![col("id", "INT")];
+        let target = vec![col("id", "INT"), col("old_col", "STRING")];
+        let now = Utc::now();
+
+        let result = detect_column_drops(&source, &target, 0, &[], now);
+
+        // With 0-day grace period, column enters grace period but expires
+        // immediately on the next run. On the first detection it is still
+        // "new" so it gets a record, but the caller should detect expiry
+        // immediately because `expires_at == first_seen_at`.
+        assert_eq!(result.new_records.len(), 1);
+        assert_eq!(result.in_grace_period.len(), 1);
+        assert_eq!(result.in_grace_period[0].days_remaining, 0);
+    }
+
+    #[test]
+    fn test_no_drops_detected() {
+        let source = vec![col("id", "INT"), col("name", "STRING")];
+        let target = vec![col("id", "INT"), col("name", "STRING")];
+        let now = Utc::now();
+
+        let result = detect_column_drops(&source, &target, 7, &[], now);
+
+        assert!(result.new_records.is_empty());
+        assert!(result.in_grace_period.is_empty());
+        assert!(result.expired.is_empty());
+        assert!(result.reappeared.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_drops_mixed_state() {
+        let source = vec![col("id", "INT")];
+        let target = vec![
+            col("id", "INT"),
+            col("new_drop", "STRING"),
+            col("in_grace", "INT"),
+            col("expired_col", "BOOLEAN"),
+        ];
+        let now = Utc::now();
+
+        let existing = vec![
+            GracePeriodRecord {
+                table_key: "cat.sch.tbl".into(),
+                column_name: "in_grace".into(),
+                data_type: "INT".into(),
+                first_seen_at: now - Duration::days(3),
+                expires_at: now + Duration::days(4),
+            },
+            GracePeriodRecord {
+                table_key: "cat.sch.tbl".into(),
+                column_name: "expired_col".into(),
+                data_type: "BOOLEAN".into(),
+                first_seen_at: now - Duration::days(10),
+                expires_at: now - Duration::days(3),
+            },
+        ];
+
+        let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+        assert_eq!(result.new_records.len(), 1);
+        assert_eq!(result.new_records[0].column_name, "new_drop");
+
+        assert_eq!(result.in_grace_period.len(), 2); // new_drop + in_grace
+        let names: Vec<&str> = result
+            .in_grace_period
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        assert!(names.contains(&"new_drop"));
+        assert!(names.contains(&"in_grace"));
+
+        assert_eq!(result.expired.len(), 1);
+        assert_eq!(result.expired[0], "expired_col");
+
+        assert!(result.reappeared.is_empty());
+    }
+
+    #[test]
+    fn test_generate_drop_column_sql() {
+        let table = table_ref();
+        let columns = vec!["old_col".to_string()];
+        let stmts = generate_drop_column_sql(&table, &columns, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "ALTER TABLE acme_warehouse.staging__us_west__shopify.orders DROP COLUMN old_col"
+        );
+    }
+
+    #[test]
+    fn test_generate_drop_column_rejects_bad_name() {
+        let table = table_ref();
+        let columns = vec!["bad; DROP".to_string()];
+        assert!(generate_drop_column_sql(&table, &columns, &dialect()).is_err());
     }
 }

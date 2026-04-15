@@ -696,6 +696,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            schema_evolution: Default::default(),
         };
 
         let models = vec![
@@ -761,6 +762,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            schema_evolution: Default::default(),
         };
 
         let models = vec![Model {
@@ -823,6 +825,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            schema_evolution: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);
