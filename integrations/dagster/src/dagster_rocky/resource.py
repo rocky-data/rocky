@@ -41,6 +41,7 @@ from .types import (
     ColumnLineageResult,
     CompileResult,
     ConformanceResult,
+    DagResult,
     DiscoverResult,
     DoctorResult,
     HistoryResult,
@@ -735,6 +736,79 @@ class RockyResource(dg.ConfigurableResource):
         if column is not None:
             return ColumnLineageResult.model_validate_json(output)
         return ModelLineageResult.model_validate_json(output)
+
+    # ------------------------------------------------------------------ #
+    # DAG + per-model execution                                          #
+    # ------------------------------------------------------------------ #
+
+    def dag(self, *, column_lineage: bool = False) -> DagResult:
+        """Run ``rocky dag`` and return the full unified DAG.
+
+        Returns a :class:`DagResult` containing all pipeline stages as nodes
+        with enriched metadata (target, strategy, freshness, partition shape,
+        upstream dependencies). Consumers can build a complete Dagster asset
+        graph from a single call.
+
+        Args:
+            column_lineage: When ``True``, include column-level lineage
+                edges (requires model compilation; slower).
+        """
+        args = ["dag", "--models", self.models_dir]
+        if self.contracts_dir is not None:
+            args.extend(["--contracts", self.contracts_dir])
+        if column_lineage:
+            args.append("--column-lineage")
+        return DagResult.model_validate_json(self._run_rocky(args))
+
+    def run_model(
+        self,
+        model_name: str,
+        *,
+        filter: str | None = None,
+        partition: str | None = None,
+        partition_from: str | None = None,
+        partition_to: str | None = None,
+        latest: bool = False,
+        missing: bool = False,
+        lookback: int | None = None,
+        parallel: int | None = None,
+    ) -> RunResult:
+        """Run ``rocky run --model <name>`` for a single compiled model.
+
+        ``--model`` is an alternative execution path to ``--filter`` — it
+        skips the replication phase and executes only the named model.
+        Dagster uses this for per-asset materialization when it controls
+        the DAG scheduling.
+
+        Args:
+            model_name: Name of the compiled model to execute.
+            filter: Optional source filter (passed alongside ``--model``).
+            partition: Single partition key for time-interval models.
+            partition_from: Start of a closed partition range (inclusive).
+            partition_to: End of a closed partition range (inclusive).
+            latest: Run the partition containing now() (UTC).
+            missing: Run partitions missing from the state store.
+            lookback: Recompute previous N partitions.
+            parallel: Run N partitions concurrently.
+        """
+        args = ["run", "--model", model_name, "--models", self.models_dir]
+        if filter is not None:
+            args.extend(["--filter", filter])
+        if partition is not None:
+            args.extend(["--partition", partition])
+        if partition_from is not None and partition_to is not None:
+            args.extend(["--from", partition_from, "--to", partition_to])
+        if latest:
+            args.append("--latest")
+        if missing:
+            args.append("--missing")
+        if lookback is not None:
+            args.extend(["--lookback", str(lookback)])
+        if parallel is not None:
+            args.extend(["--parallel", str(parallel)])
+        return RunResult.model_validate_json(
+            self._run_rocky(args, allow_partial=True)
+        )
 
     # ------------------------------------------------------------------ #
     # Local testing (always CLI)                                         #

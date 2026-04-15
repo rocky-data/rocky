@@ -26,6 +26,11 @@ from .contracts import (
     contract_check_specs_for_model,
     discover_contract_rules,
 )
+from .dag_assets import (
+    DagAssetGroup,
+    build_dag_specs,
+    split_dag_specs_by_group,
+)
 from .derived_models import (
     ModelGroup,
     build_model_specs,
@@ -76,6 +81,9 @@ from .types import (
     ConformanceResult,
     ContractResult,
     ContractViolation,
+    DagEdge,
+    DagNode,
+    DagResult,
     Diagnostic,
     DiscoverResult,
     DoctorResult,

@@ -62,6 +62,7 @@ from .sensor import rocky_source_sensor
 from .translator import RockyDagsterTranslator
 from .types import (
     CompileResult,
+    DagResult,
     Diagnostic,
     DiscoverResult,
     OptimizeResult,
@@ -249,6 +250,14 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: optimize metadata, contract checks, and partition definitions all
     #: still apply per-asset.
     surface_derived_models: bool = False
+    #: When ``True``, use the DAG-driven asset builder that creates a
+    #: single connected asset graph from ``rocky dag``. Every pipeline
+    #: stage (source, load, transformation, seed, quality, snapshot)
+    #: becomes a Dagster asset with fully resolved upstream dependencies.
+    #: Supersedes the separate ``discover`` + ``surface_derived_models``
+    #: paths. Defaults to ``False`` for backward compatibility; will
+    #: become the default in a future release.
+    dag_mode: bool = False
     #: When ``True``, ``build_defs_from_state`` includes a
     #: :func:`rocky_source_sensor` definition that polls ``rocky discover``
     #: and emits ``RunRequest`` events when upstream connectors produce
@@ -324,6 +333,12 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             if optimize_payload is not None:
                 state["optimize"] = optimize_payload
 
+        # DAG mode: cache the full unified DAG alongside discover/compile.
+        if self.dag_mode:
+            dag_payload = self._dag_payload(rocky)
+            if dag_payload is not None:
+                state["dag"] = dag_payload
+
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     def _compile_payload(self, rocky: RockyResource) -> dict | None:
@@ -351,6 +366,47 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         except dg.Failure:
             return None
 
+    def _dag_payload(self, rocky: RockyResource) -> dict | None:
+        """Return DAG JSON, or ``None`` if the DAG command fails.
+
+        Same best-effort semantics: a missing binary or config issue does
+        not block state persistence.
+        """
+        try:
+            return json.loads(
+                rocky.dag(column_lineage=True).model_dump_json()
+            )
+        except dg.Failure:
+            return None
+
+    def _build_defs_from_dag(self, state_path: Path) -> dg.Definitions:
+        """Build asset definitions from the cached ``rocky dag`` output.
+
+        Falls back to the discover-based flow if the DAG slot is missing
+        from the cached state (e.g., first run before ``dag_mode`` was set).
+        """
+        from .dag_assets import build_dag_specs, split_dag_specs_by_group
+
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        if "dag" not in raw:
+            # Graceful fallback: re-enter the non-DAG path.
+            self.dag_mode = False
+            return self.build_defs_from_state(None, state_path)
+
+        dag_result = DagResult.model_validate(raw["dag"])
+        translator = self._get_translator()
+        rocky = self._get_rocky_resource()
+
+        specs, node_id_to_key = build_dag_specs(
+            dag_result,
+            translator=translator,
+        )
+
+        return dg.Definitions(
+            assets=specs,
+            resources={"rocky": rocky},
+        )
+
     # ------------------------------------------------------------------ #
     # Definition building                                                #
     # ------------------------------------------------------------------ #
@@ -363,6 +419,10 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         """Build materializable assets from the cached discover/compile state."""
         if state_path is None:
             return dg.Definitions()
+
+        # DAG-mode: build the full connected asset graph from ``rocky dag``.
+        if self.dag_mode:
+            return self._build_defs_from_dag(state_path)
 
         discover, compile_result, optimize_result = _load_state(state_path)
         compile_state = _CompileState.from_result(compile_result)
