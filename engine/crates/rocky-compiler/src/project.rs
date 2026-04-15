@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use rocky_core::dag::{self, DagNode};
 use rocky_core::models::{self, Model, ModelConfig, TargetConfig};
+use rocky_core::unified_dag::UnifiedDag;
 use rocky_sql::lineage;
 use thiserror::Error;
 use tracing::info;
@@ -32,6 +33,12 @@ pub struct Project {
     pub lineage_cache: HashMap<String, lineage::LineageResult>,
     /// Diagnostics from dependency resolution (e.g., D011 mismatch warnings).
     pub resolve_diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    /// Optional unified DAG spanning all pipeline types, seeds, and tests.
+    ///
+    /// This is populated by the CLI when full project context is available
+    /// (config + models + seeds). `None` when only model-level compilation
+    /// is performed.
+    pub unified_dag: Option<UnifiedDag>,
 }
 
 /// Errors during project loading.
@@ -97,6 +104,7 @@ impl Project {
             layers,
             lineage_cache,
             resolve_diagnostics,
+            unified_dag: None,
         })
     }
 
@@ -108,6 +116,15 @@ impl Project {
     /// Number of models in the project.
     pub fn model_count(&self) -> usize {
         self.models.len()
+    }
+
+    /// Attach a unified DAG built from the full project context.
+    ///
+    /// Called by the CLI after loading config, models, and seeds. The
+    /// unified DAG is a read-only view used for display (`rocky plan`)
+    /// and lineage queries.
+    pub fn set_unified_dag(&mut self, dag: UnifiedDag) {
+        self.unified_dag = Some(dag);
     }
 }
 

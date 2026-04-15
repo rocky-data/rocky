@@ -1,14 +1,22 @@
-//! Unified ELT DAG — read-only view of all pipeline stages as a single graph.
+//! Unified ELT DAG — single graph representing all pipeline stages.
 //!
 //! Rocky currently models pipelines as separate [`PipelineConfig`] variants
 //! (replication, transformation, quality, snapshot, load). This module
-//! introduces foundation types that represent every stage as a node in one
-//! directed acyclic graph, with typed edges expressing data-flow and
-//! governance dependencies.
+//! provides a unified DAG abstraction where every stage is a node with
+//! typed edges expressing data-flow, governance, and check dependencies.
 //!
-//! **This is a read-only projection** of the existing config — it does not
-//! replace [`PipelineConfig`] or change how pipelines execute. Future work
-//! (Plan 50 phases 2+) will wire the unified DAG into the execution engine.
+//! ## Key features
+//!
+//! - **Parse-layer sugar:** a `type = "replication"` pipeline automatically
+//!   expands into a `Source` + `Load` node pair, making the EL steps
+//!   explicit in the DAG without requiring config changes.
+//! - **Cross-step dependencies:** a model can depend on a seed, a test
+//!   depends on its model, and a quality pipeline depends on upstream
+//!   transformation outputs — all resolved into typed edges.
+//! - **Validation:** cycle detection, duplicate node IDs, dangling edges,
+//!   and invalid edge semantics (e.g., a test producing data downstream).
+//! - **Execution phases:** Kahn's algorithm groups nodes into parallel
+//!   layers respecting all dependency edges.
 //!
 //! [`PipelineConfig`]: crate::config::PipelineConfig
 
@@ -20,6 +28,7 @@ use thiserror::Error;
 
 use crate::config::{PipelineConfig, RockyConfig};
 use crate::models::Model;
+use crate::seeds::SeedFile;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -36,6 +45,22 @@ pub enum UnifiedDagError {
 
     #[error("pipeline '{pipeline}' referenced by model '{model}' not found in config")]
     PipelineNotFound { pipeline: String, model: String },
+
+    #[error("duplicate node ID: '{id}'")]
+    DuplicateNodeId { id: String },
+
+    #[error("edge references non-existent node: from='{from}', to='{to}'")]
+    DanglingEdge { from: String, to: String },
+
+    #[error("invalid edge from '{from}' to '{to}': {reason}")]
+    InvalidEdge {
+        from: String,
+        to: String,
+        reason: String,
+    },
+
+    #[error("self-loop detected on node '{node}'")]
+    SelfLoop { node: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +110,10 @@ pub enum NodeKind {
     /// External data source (Fivetran connector, manual source definition).
     Source,
     /// Table replication (incremental copy, full refresh).
+    ///
+    /// Retained for deserialization compatibility with stored DAGs. New DAGs
+    /// expand replication pipelines into [`Source`](Self::Source) +
+    /// [`Load`](Self::Load) node pairs via parse-layer sugar.
     Replication,
     /// SQL/Rocky model execution.
     Transformation,
@@ -208,29 +237,71 @@ impl UnifiedDag {
             .filter(|id| !has_outgoing.contains(id))
             .collect()
     }
+
+    /// Returns the total number of nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns the total number of edges.
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Returns a summary with counts per node kind.
+    pub fn summary(&self) -> DagSummary {
+        let mut counts: HashMap<NodeKind, usize> = HashMap::new();
+        for node in &self.nodes {
+            *counts.entry(node.kind).or_insert(0) += 1;
+        }
+        DagSummary {
+            total_nodes: self.nodes.len(),
+            total_edges: self.edges.len(),
+            counts_by_kind: counts,
+        }
+    }
+}
+
+/// High-level summary of a unified DAG, useful for display in `rocky plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagSummary {
+    /// Total number of nodes in the DAG.
+    pub total_nodes: usize,
+    /// Total number of edges in the DAG.
+    pub total_edges: usize,
+    /// Node counts grouped by kind.
+    pub counts_by_kind: HashMap<NodeKind, usize>,
 }
 
 // ---------------------------------------------------------------------------
 // DAG construction
 // ---------------------------------------------------------------------------
 
-/// Builds a unified DAG from the current configuration and loaded models.
+/// Builds a unified DAG from the current configuration, loaded models, and seeds.
 ///
 /// Each pipeline in `config.pipelines` becomes one or more nodes:
-/// - **Replication** pipelines become a single `Replication` node.
+/// - **Replication** pipelines expand into a `Source` + `Load` node pair
+///   (parse-layer sugar — makes the EL steps explicit in the graph).
 /// - **Transformation** pipelines expand into per-model `Transformation`
 ///   nodes (and `Seed` / `Test` nodes when applicable).
 /// - **Quality** pipelines become a single `Quality` node.
 /// - **Snapshot** pipelines become a single `Snapshot` node.
 /// - **Load** pipelines become a single `Load` node.
 ///
+/// Seeds provided in `seeds` become standalone `Seed` nodes. Cross-step
+/// dependencies (e.g., a model depending on a seed by name) are resolved
+/// after all nodes are created.
+///
 /// Edges are derived from:
 /// - `depends_on` at the pipeline level (inter-pipeline chaining).
-/// - `depends_on` at the model level (intra-pipeline model ordering).
+/// - `depends_on` at the model level (intra-pipeline model ordering
+///   plus cross-step references to seeds and loads).
 /// - Implicit test-after-model relationships.
+/// - Replication sugar (Source → Load within each replication pipeline).
 pub fn build_unified_dag(
     config: &RockyConfig,
     models: &[Model],
+    seeds: &[SeedFile],
 ) -> Result<UnifiedDag, UnifiedDagError> {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -239,31 +310,64 @@ pub fn build_unified_dag(
     // can wire edges from the *last* node of the upstream pipeline.
     let mut pipeline_node_ids: HashMap<String, Vec<NodeId>> = HashMap::new();
 
+    // Logical-name -> NodeId map for cross-step dependency resolution.
+    // Populated as nodes are created.
+    let mut name_to_node: HashMap<String, NodeId> = HashMap::new();
+
+    // --- Add seed nodes (pipeline-independent) ---
+    for seed in seeds {
+        let node_id = NodeId::new("seed", &seed.name);
+        nodes.push(UnifiedNode {
+            id: node_id.clone(),
+            kind: NodeKind::Seed,
+            label: seed.name.clone(),
+            pipeline: None,
+        });
+        name_to_node.insert(seed.name.clone(), node_id);
+    }
+
     for (pipeline_name, pipeline_cfg) in &config.pipelines {
         match pipeline_cfg {
             PipelineConfig::Replication(_) => {
-                let node_id = NodeId::new("replication", pipeline_name);
+                // Parse-layer sugar: expand replication into Source + Load.
+                let source_id = NodeId::new("source", pipeline_name);
+                let load_id = NodeId::new("load", pipeline_name);
+
                 nodes.push(UnifiedNode {
-                    id: node_id.clone(),
-                    kind: NodeKind::Replication,
-                    label: pipeline_name.clone(),
+                    id: source_id.clone(),
+                    kind: NodeKind::Source,
+                    label: format!("{pipeline_name} (source)"),
                     pipeline: Some(pipeline_name.clone()),
                 });
+                nodes.push(UnifiedNode {
+                    id: load_id.clone(),
+                    kind: NodeKind::Load,
+                    label: format!("{pipeline_name} (load)"),
+                    pipeline: Some(pipeline_name.clone()),
+                });
+
+                edges.push(UnifiedEdge {
+                    from: source_id.clone(),
+                    to: load_id.clone(),
+                    edge_type: EdgeType::DataDependency,
+                });
+
+                // The Load node is the "output" of a replication pipeline.
+                name_to_node.insert(pipeline_name.clone(), load_id.clone());
+
                 pipeline_node_ids
                     .entry(pipeline_name.clone())
                     .or_default()
-                    .push(node_id);
+                    .extend([source_id, load_id]);
             }
             PipelineConfig::Transformation(_) => {
-                // Filter models belonging to this pipeline. In practice the
-                // caller passes models loaded from the glob of the relevant
-                // transformation pipeline. We add all provided models.
                 add_transformation_nodes(
                     pipeline_name,
                     models,
                     &mut nodes,
                     &mut edges,
                     &mut pipeline_node_ids,
+                    &mut name_to_node,
                 );
             }
             PipelineConfig::Quality(_) => {
@@ -300,6 +404,7 @@ pub fn build_unified_dag(
                     label: pipeline_name.clone(),
                     pipeline: Some(pipeline_name.clone()),
                 });
+                name_to_node.insert(pipeline_name.clone(), node_id.clone());
                 pipeline_node_ids
                     .entry(pipeline_name.clone())
                     .or_default()
@@ -307,6 +412,12 @@ pub fn build_unified_dag(
             }
         }
     }
+
+    // --- Resolve cross-step dependencies for models ---
+    // A model's depends_on may reference seeds or other step types by name.
+    // Intra-pipeline model deps were already wired in add_transformation_nodes;
+    // here we wire cross-step references (seed, replication load, etc.).
+    resolve_cross_step_deps(models, &name_to_node, &mut edges);
 
     // Wire inter-pipeline depends_on edges.
     for (pipeline_name, pipeline_cfg) in &config.pipelines {
@@ -344,7 +455,7 @@ pub fn build_unified_dag(
                 nodes
                     .iter()
                     .find(|n| n.id == **id)
-                    .map(|n| n.kind != NodeKind::Test)
+                    .map(|n| n.kind != NodeKind::Test && n.kind != NodeKind::Source)
                     .unwrap_or(true)
             })
             .collect();
@@ -371,13 +482,14 @@ pub fn build_unified_dag(
                             && e.edge_type != EdgeType::CheckDependency
                     })
                 })
-                // Exclude test nodes from exit — tests don't gate downstream
-                // pipelines.
+                // Exclude test and source nodes from exit — tests don't gate
+                // downstream pipelines, and source nodes are internal to the
+                // replication sugar.
                 .filter(|id| {
                     nodes
                         .iter()
                         .find(|n| n.id == **id)
-                        .map(|n| n.kind != NodeKind::Test)
+                        .map(|n| n.kind != NodeKind::Test && n.kind != NodeKind::Source)
                         .unwrap_or(true)
                 })
                 .collect();
@@ -397,6 +509,37 @@ pub fn build_unified_dag(
     Ok(UnifiedDag { nodes, edges })
 }
 
+/// Resolves cross-step dependencies for models.
+///
+/// For each model, checks if any `depends_on` entry refers to a seed, load,
+/// or other non-model node via the `name_to_node` map. If the dependency is
+/// already wired as an intra-pipeline model edge, it is skipped.
+fn resolve_cross_step_deps(
+    models: &[Model],
+    name_to_node: &HashMap<String, NodeId>,
+    edges: &mut Vec<UnifiedEdge>,
+) {
+    let model_names: HashSet<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
+
+    for model in models {
+        let model_id = NodeId::new("transformation", &model.config.name);
+        for dep in &model.config.depends_on {
+            // Skip intra-pipeline model deps — already wired.
+            if model_names.contains(dep.as_str()) {
+                continue;
+            }
+            // Check if this dep is a known cross-step node.
+            if let Some(dep_node_id) = name_to_node.get(dep.as_str()) {
+                edges.push(UnifiedEdge {
+                    from: dep_node_id.clone(),
+                    to: model_id.clone(),
+                    edge_type: EdgeType::DataDependency,
+                });
+            }
+        }
+    }
+}
+
 /// Expands a transformation pipeline into per-model nodes, seed nodes,
 /// and test nodes, wiring intra-pipeline edges.
 fn add_transformation_nodes(
@@ -405,6 +548,7 @@ fn add_transformation_nodes(
     nodes: &mut Vec<UnifiedNode>,
     edges: &mut Vec<UnifiedEdge>,
     pipeline_node_ids: &mut HashMap<String, Vec<NodeId>>,
+    name_to_node: &mut HashMap<String, NodeId>,
 ) {
     // Build a set of model names for resolving depends_on within the pipeline.
     let model_names: HashSet<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
@@ -423,6 +567,7 @@ fn add_transformation_nodes(
             .entry(pipeline_name.to_string())
             .or_default()
             .push(node_id.clone());
+        name_to_node.insert(model_name.clone(), node_id.clone());
 
         // Intra-pipeline model dependencies.
         for dep in &model.config.depends_on {
@@ -584,6 +729,77 @@ pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, Unif
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Validates the structural integrity of a unified DAG.
+///
+/// Returns a list of validation errors. An empty list means the DAG is valid.
+/// Checks performed:
+/// - No duplicate `NodeId`s.
+/// - All edge endpoints reference existing nodes (no dangling edges).
+/// - No self-loops (an edge from a node to itself).
+/// - No `DataDependency` edges originating from `Test` nodes (tests don't
+///   produce data for downstream steps).
+/// - No cycles (detected via `execution_phases`).
+pub fn validate(dag: &UnifiedDag) -> Vec<UnifiedDagError> {
+    let mut errors = Vec::new();
+
+    // 1. Duplicate node IDs.
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    for node in &dag.nodes {
+        if !seen_ids.insert(&node.id.0) {
+            errors.push(UnifiedDagError::DuplicateNodeId {
+                id: node.id.0.clone(),
+            });
+        }
+    }
+
+    let node_ids: HashSet<&str> = dag.nodes.iter().map(|n| n.id.0.as_str()).collect();
+    let node_map: HashMap<&str, &UnifiedNode> =
+        dag.nodes.iter().map(|n| (n.id.0.as_str(), n)).collect();
+
+    for edge in &dag.edges {
+        // 2. Dangling edges.
+        if !node_ids.contains(edge.from.0.as_str()) || !node_ids.contains(edge.to.0.as_str()) {
+            errors.push(UnifiedDagError::DanglingEdge {
+                from: edge.from.0.clone(),
+                to: edge.to.0.clone(),
+            });
+            continue;
+        }
+
+        // 3. Self-loops.
+        if edge.from == edge.to {
+            errors.push(UnifiedDagError::SelfLoop {
+                node: edge.from.0.clone(),
+            });
+            continue;
+        }
+
+        // 4. Test nodes must not have outgoing DataDependency edges.
+        if edge.edge_type == EdgeType::DataDependency {
+            if let Some(from_node) = node_map.get(edge.from.0.as_str()) {
+                if from_node.kind == NodeKind::Test {
+                    errors.push(UnifiedDagError::InvalidEdge {
+                        from: edge.from.0.clone(),
+                        to: edge.to.0.clone(),
+                        reason: "test nodes cannot have outgoing data dependencies".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    // 5. Cycle detection via execution_phases (which uses Kahn's algorithm).
+    if let Err(e) = execution_phases(dag) {
+        errors.push(e);
+    }
+
+    errors
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -592,8 +808,10 @@ mod tests {
     use super::*;
     use crate::config::*;
     use crate::models::{ModelConfig, StrategyConfig, TargetConfig};
+    use crate::seeds::SeedConfig;
     use crate::tests::{TestDecl, TestSeverity, TestType};
     use indexmap::IndexMap;
+    use std::path::PathBuf;
 
     /// Helper: build a minimal RockyConfig with the given pipelines.
     fn config_with_pipelines(pipelines: Vec<(&str, PipelineConfig)>) -> RockyConfig {
@@ -701,40 +919,82 @@ mod tests {
         }
     }
 
+    /// Helper: build a minimal SeedFile.
+    fn seed(name: &str) -> SeedFile {
+        SeedFile {
+            name: name.into(),
+            file_path: PathBuf::from(format!("seeds/{name}.csv")),
+            format: crate::seeds::SeedFormat::Csv,
+            config: SeedConfig {
+                name: Some(name.into()),
+                target: None,
+                strategy: Default::default(),
+                column_types: Default::default(),
+            },
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // DAG construction tests
+    // DAG construction tests — replication sugar
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_single_replication_pipeline() {
+    fn test_single_replication_pipeline_expands_to_source_and_load() {
         let config = config_with_pipelines(vec![("raw_ingest", repl_pipeline(vec![]))]);
-        let dag = build_unified_dag(&config, &[]).unwrap();
+        let dag = build_unified_dag(&config, &[], &[]).unwrap();
 
-        assert_eq!(dag.nodes.len(), 1);
-        assert_eq!(dag.nodes[0].kind, NodeKind::Replication);
-        assert_eq!(dag.nodes[0].label, "raw_ingest");
-        assert!(dag.edges.is_empty());
+        // Replication sugar: Source + Load = 2 nodes
+        assert_eq!(dag.node_count(), 2);
+
+        let source = dag.node(&NodeId::new("source", "raw_ingest"));
+        assert!(source.is_some());
+        assert_eq!(source.unwrap().kind, NodeKind::Source);
+
+        let load = dag.node(&NodeId::new("load", "raw_ingest"));
+        assert!(load.is_some());
+        assert_eq!(load.unwrap().kind, NodeKind::Load);
+
+        // One internal edge: Source -> Load
+        assert_eq!(dag.edge_count(), 1);
+        assert_eq!(dag.edges[0].from, NodeId::new("source", "raw_ingest"));
+        assert_eq!(dag.edges[0].to, NodeId::new("load", "raw_ingest"));
+        assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
     }
 
     #[test]
-    fn test_pipeline_chaining() {
+    fn test_pipeline_chaining_with_replication_sugar() {
         let config = config_with_pipelines(vec![
             ("raw_ingest", repl_pipeline(vec![])),
             ("silver", transform_pipeline(vec!["raw_ingest"])),
         ]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
-        // 1 replication + 1 transformation model = 2 nodes
-        assert_eq!(dag.nodes.len(), 2);
+        // 2 replication nodes (source + load) + 1 transformation = 3 nodes
+        assert_eq!(dag.node_count(), 3);
 
-        // Should have one inter-pipeline edge: raw_ingest -> stg_orders
-        assert_eq!(dag.edges.len(), 1);
-        assert_eq!(dag.edges[0].from, NodeId::new("replication", "raw_ingest"));
-        assert_eq!(dag.edges[0].to, NodeId::new("transformation", "stg_orders"));
-        assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
+        // Edges: source -> load (internal), load -> stg_orders (inter-pipeline)
+        let data_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataDependency)
+            .collect();
+        assert_eq!(data_edges.len(), 2);
+
+        // The load node of raw_ingest connects to stg_orders
+        let inter_pipeline: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.to == NodeId::new("transformation", "stg_orders"))
+            .collect();
+        assert_eq!(inter_pipeline.len(), 1);
+        assert_eq!(inter_pipeline[0].from, NodeId::new("load", "raw_ingest"));
     }
+
+    // -----------------------------------------------------------------------
+    // DAG construction tests — models
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_model_dependencies() {
@@ -746,9 +1006,9 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "stg_customers"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
-        assert_eq!(dag.nodes.len(), 3);
+        assert_eq!(dag.node_count(), 3);
 
         // Two intra-pipeline data edges
         let data_edges: Vec<_> = dag
@@ -785,10 +1045,10 @@ mod tests {
         ];
 
         let models = vec![model("stg_orders", vec![], test_decls)];
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
         // 1 model + 2 test nodes
-        assert_eq!(dag.nodes.len(), 3);
+        assert_eq!(dag.node_count(), 3);
 
         let test_nodes: Vec<_> = dag
             .nodes
@@ -815,7 +1075,7 @@ mod tests {
             config_with_pipelines(vec![("silver", transform_pipeline(vec!["nonexistent"]))]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let result = build_unified_dag(&config, &models);
+        let result = build_unified_dag(&config, &models, &[]);
         assert!(matches!(
             result,
             Err(UnifiedDagError::UnknownDependency { .. })
@@ -825,7 +1085,7 @@ mod tests {
     #[test]
     fn test_empty_config() {
         let config = config_with_pipelines(vec![]);
-        let dag = build_unified_dag(&config, &[]).unwrap();
+        let dag = build_unified_dag(&config, &[], &[]).unwrap();
         assert!(dag.nodes.is_empty());
         assert!(dag.edges.is_empty());
     }
@@ -843,19 +1103,144 @@ mod tests {
             model("dim_customers", vec![], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
-        // 1 replication + 2 transformation + 1 quality = 4 nodes
-        assert_eq!(dag.nodes.len(), 4);
+        // 2 replication (source + load) + 2 transformation + 1 quality = 5 nodes
+        assert_eq!(dag.node_count(), 5);
 
-        // Inter-pipeline edges: raw_ingest -> stg_orders, raw_ingest -> dim_customers,
-        // stg_orders -> nightly_dq, dim_customers -> nightly_dq
-        let inter_edges: Vec<_> = dag
+        // Inter-pipeline edges:
+        //   source -> load (replication internal)
+        //   load -> stg_orders, load -> dim_customers (repl -> transform)
+        //   stg_orders -> nightly_dq, dim_customers -> nightly_dq (transform -> quality)
+        let data_edges: Vec<_> = dag
             .edges
             .iter()
             .filter(|e| e.edge_type == EdgeType::DataDependency)
             .collect();
-        assert_eq!(inter_edges.len(), 4);
+        assert_eq!(data_edges.len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Seed node tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_seed_nodes_created() {
+        let config = config_with_pipelines(vec![("silver", transform_pipeline(vec![]))]);
+        let seeds = vec![seed("dim_date"), seed("country_codes")];
+        let dag = build_unified_dag(&config, &[], &seeds).unwrap();
+
+        // 2 seed nodes, no models
+        assert_eq!(dag.node_count(), 2);
+
+        let seed_nodes: Vec<_> = dag
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Seed)
+            .collect();
+        assert_eq!(seed_nodes.len(), 2);
+
+        // Seeds have no pipeline association
+        assert!(seed_nodes.iter().all(|n| n.pipeline.is_none()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-step dependency tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_model_depends_on_seed() {
+        let config = config_with_pipelines(vec![("silver", transform_pipeline(vec![]))]);
+        let seeds = vec![seed("dim_date")];
+        let models = vec![model("fct_orders", vec!["dim_date"], vec![])];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+
+        // 1 seed + 1 model = 2 nodes
+        assert_eq!(dag.node_count(), 2);
+
+        // Cross-step edge: seed:dim_date -> transformation:fct_orders
+        assert_eq!(dag.edge_count(), 1);
+        assert_eq!(dag.edges[0].from, NodeId::new("seed", "dim_date"));
+        assert_eq!(dag.edges[0].to, NodeId::new("transformation", "fct_orders"));
+        assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
+    }
+
+    #[test]
+    fn test_model_depends_on_replication_load() {
+        let config = config_with_pipelines(vec![
+            ("raw_ingest", repl_pipeline(vec![])),
+            ("silver", transform_pipeline(vec![])),
+        ]);
+
+        // Model explicitly depends on raw_ingest (the replication pipeline name).
+        let models = vec![model("stg_orders", vec!["raw_ingest"], vec![])];
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+
+        // Cross-step edge: load:raw_ingest -> transformation:stg_orders
+        let cross_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.to == NodeId::new("transformation", "stg_orders"))
+            .collect();
+        assert_eq!(cross_edges.len(), 1);
+        assert_eq!(cross_edges[0].from, NodeId::new("load", "raw_ingest"));
+    }
+
+    #[test]
+    fn test_model_depends_on_seed_and_model() {
+        let config = config_with_pipelines(vec![("silver", transform_pipeline(vec![]))]);
+        let seeds = vec![seed("dim_date")];
+        let models = vec![
+            model("stg_orders", vec![], vec![]),
+            model("fct_orders", vec!["stg_orders", "dim_date"], vec![]),
+        ];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+
+        // fct_orders has two incoming edges: one from stg_orders, one from dim_date
+        let fct_incoming: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.to == NodeId::new("transformation", "fct_orders"))
+            .collect();
+        assert_eq!(fct_incoming.len(), 2);
+
+        let from_ids: HashSet<&NodeId> = fct_incoming.iter().map(|e| &e.from).collect();
+        assert!(from_ids.contains(&NodeId::new("transformation", "stg_orders")));
+        assert!(from_ids.contains(&NodeId::new("seed", "dim_date")));
+    }
+
+    #[test]
+    fn test_full_elt_chain() {
+        // Full chain: replication -> seed + transformation -> quality
+        let config = config_with_pipelines(vec![
+            ("raw_ingest", repl_pipeline(vec![])),
+            ("silver", transform_pipeline(vec!["raw_ingest"])),
+            ("nightly_dq", quality_pipeline(vec!["silver"])),
+        ]);
+
+        let seeds = vec![seed("dim_date")];
+        let models = vec![
+            model("stg_orders", vec![], vec![]),
+            model("fct_orders", vec!["stg_orders", "dim_date"], vec![]),
+        ];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+
+        // source + load + 2 models + 1 seed + 1 quality = 6 nodes
+        assert_eq!(dag.node_count(), 6);
+
+        // Verify the DAG is valid
+        let errors = validate(&dag);
+        assert!(
+            errors.is_empty(),
+            "unexpected validation errors: {errors:?}"
+        );
+
+        // Verify execution phases work
+        let phases = execution_phases(&dag).unwrap();
+        assert!(phases.len() >= 3); // at least: source, load+seed, models, quality
     }
 
     // -----------------------------------------------------------------------
@@ -863,21 +1248,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_phases_linear_chain() {
+    fn test_phases_linear_chain_with_replication_sugar() {
         let config = config_with_pipelines(vec![
             ("raw_ingest", repl_pipeline(vec![])),
             ("silver", transform_pipeline(vec!["raw_ingest"])),
         ]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
         let phases = execution_phases(&dag).unwrap();
 
-        assert_eq!(phases.len(), 2);
-        assert_eq!(phases[0].len(), 1);
-        assert_eq!(phases[0][0].kind, NodeKind::Replication);
-        assert_eq!(phases[1].len(), 1);
-        assert_eq!(phases[1][0].kind, NodeKind::Transformation);
+        // Phase 0: source, Phase 1: load, Phase 2: stg_orders
+        assert_eq!(phases.len(), 3);
+        assert_eq!(phases[0][0].kind, NodeKind::Source);
+        assert_eq!(phases[1][0].kind, NodeKind::Load);
+        assert_eq!(phases[2][0].kind, NodeKind::Transformation);
     }
 
     #[test]
@@ -890,7 +1275,7 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "stg_customers"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         assert_eq!(phases.len(), 2);
@@ -912,7 +1297,7 @@ mod tests {
         }];
 
         let models = vec![model("stg_orders", vec![], test_decls)];
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // Phase 0: stg_orders, Phase 1: test node
@@ -931,7 +1316,7 @@ mod tests {
             model("c", vec![], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // All in one phase
@@ -950,7 +1335,7 @@ mod tests {
             model("d", vec!["b", "c"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         assert_eq!(phases.len(), 3);
@@ -962,7 +1347,26 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_roots_and_leaves() {
+    fn test_phases_with_seeds() {
+        let config = config_with_pipelines(vec![("silver", transform_pipeline(vec![]))]);
+        let seeds = vec![seed("dim_date")];
+        let models = vec![model("fct_orders", vec!["dim_date"], vec![])];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let phases = execution_phases(&dag).unwrap();
+
+        // Phase 0: seed, Phase 1: model
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0][0].kind, NodeKind::Seed);
+        assert_eq!(phases[1][0].kind, NodeKind::Transformation);
+    }
+
+    // -----------------------------------------------------------------------
+    // DAG query tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dag_roots_and_leaves_with_sugar() {
         let config = config_with_pipelines(vec![
             ("raw_ingest", repl_pipeline(vec![])),
             ("silver", transform_pipeline(vec!["raw_ingest"])),
@@ -973,11 +1377,11 @@ mod tests {
             model("fct_orders", vec!["stg_orders"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
         let roots = dag.roots();
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], &NodeId::new("replication", "raw_ingest"));
+        assert_eq!(roots[0], &NodeId::new("source", "raw_ingest"));
 
         let leaves = dag.leaves();
         assert_eq!(leaves.len(), 1);
@@ -1022,7 +1426,7 @@ mod tests {
 
         let models = vec![model("a", vec![], vec![]), model("b", vec!["a"], vec![])];
 
-        let dag = build_unified_dag(&config, &models).unwrap();
+        let dag = build_unified_dag(&config, &models, &[]).unwrap();
 
         let a_id = NodeId::new("transformation", "a");
         let b_id = NodeId::new("transformation", "b");
@@ -1038,5 +1442,190 @@ mod tests {
         // a has no incoming, b has no outgoing
         assert!(dag.incoming_edges(&a_id).is_empty());
         assert!(dag.outgoing_edges(&b_id).is_empty());
+    }
+
+    #[test]
+    fn test_dag_summary() {
+        let config = config_with_pipelines(vec![
+            ("raw_ingest", repl_pipeline(vec![])),
+            ("silver", transform_pipeline(vec!["raw_ingest"])),
+        ]);
+        let seeds = vec![seed("dim_date")];
+        let models = vec![model("stg_orders", vec![], vec![])];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let summary = dag.summary();
+
+        assert_eq!(summary.total_nodes, 4); // source + load + seed + model
+        assert_eq!(summary.counts_by_kind[&NodeKind::Source], 1);
+        assert_eq!(summary.counts_by_kind[&NodeKind::Load], 1);
+        assert_eq!(summary.counts_by_kind[&NodeKind::Seed], 1);
+        assert_eq!(summary.counts_by_kind[&NodeKind::Transformation], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_valid_dag() {
+        let config = config_with_pipelines(vec![
+            ("raw_ingest", repl_pipeline(vec![])),
+            ("silver", transform_pipeline(vec!["raw_ingest"])),
+        ]);
+        let seeds = vec![seed("dim_date")];
+        let models = vec![model("stg_orders", vec!["dim_date"], vec![])];
+
+        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let errors = validate(&dag);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn test_validate_duplicate_node_ids() {
+        let dag = UnifiedDag {
+            nodes: vec![
+                UnifiedNode {
+                    id: NodeId::new("transformation", "a"),
+                    kind: NodeKind::Transformation,
+                    label: "a".into(),
+                    pipeline: None,
+                },
+                UnifiedNode {
+                    id: NodeId::new("transformation", "a"),
+                    kind: NodeKind::Transformation,
+                    label: "a_dup".into(),
+                    pipeline: None,
+                },
+            ],
+            edges: vec![],
+        };
+
+        let errors = validate(&dag);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            UnifiedDagError::DuplicateNodeId { id } if id == "transformation:a"
+        )));
+    }
+
+    #[test]
+    fn test_validate_dangling_edge() {
+        let dag = UnifiedDag {
+            nodes: vec![UnifiedNode {
+                id: NodeId::new("transformation", "a"),
+                kind: NodeKind::Transformation,
+                label: "a".into(),
+                pipeline: None,
+            }],
+            edges: vec![UnifiedEdge {
+                from: NodeId::new("transformation", "a"),
+                to: NodeId::new("transformation", "nonexistent"),
+                edge_type: EdgeType::DataDependency,
+            }],
+        };
+
+        let errors = validate(&dag);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, UnifiedDagError::DanglingEdge { .. }))
+        );
+    }
+
+    #[test]
+    fn test_validate_self_loop() {
+        let dag = UnifiedDag {
+            nodes: vec![UnifiedNode {
+                id: NodeId::new("transformation", "a"),
+                kind: NodeKind::Transformation,
+                label: "a".into(),
+                pipeline: None,
+            }],
+            edges: vec![UnifiedEdge {
+                from: NodeId::new("transformation", "a"),
+                to: NodeId::new("transformation", "a"),
+                edge_type: EdgeType::DataDependency,
+            }],
+        };
+
+        let errors = validate(&dag);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, UnifiedDagError::SelfLoop { .. }))
+        );
+    }
+
+    #[test]
+    fn test_validate_test_data_dependency() {
+        // A test node should not have an outgoing data dependency.
+        let dag = UnifiedDag {
+            nodes: vec![
+                UnifiedNode {
+                    id: NodeId::new("test", "t1"),
+                    kind: NodeKind::Test,
+                    label: "t1".into(),
+                    pipeline: None,
+                },
+                UnifiedNode {
+                    id: NodeId::new("transformation", "a"),
+                    kind: NodeKind::Transformation,
+                    label: "a".into(),
+                    pipeline: None,
+                },
+            ],
+            edges: vec![UnifiedEdge {
+                from: NodeId::new("test", "t1"),
+                to: NodeId::new("transformation", "a"),
+                edge_type: EdgeType::DataDependency,
+            }],
+        };
+
+        let errors = validate(&dag);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, UnifiedDagError::InvalidEdge { .. }))
+        );
+    }
+
+    #[test]
+    fn test_validate_cycle_detected() {
+        let dag = UnifiedDag {
+            nodes: vec![
+                UnifiedNode {
+                    id: NodeId::new("transformation", "a"),
+                    kind: NodeKind::Transformation,
+                    label: "a".into(),
+                    pipeline: None,
+                },
+                UnifiedNode {
+                    id: NodeId::new("transformation", "b"),
+                    kind: NodeKind::Transformation,
+                    label: "b".into(),
+                    pipeline: None,
+                },
+            ],
+            edges: vec![
+                UnifiedEdge {
+                    from: NodeId::new("transformation", "a"),
+                    to: NodeId::new("transformation", "b"),
+                    edge_type: EdgeType::DataDependency,
+                },
+                UnifiedEdge {
+                    from: NodeId::new("transformation", "b"),
+                    to: NodeId::new("transformation", "a"),
+                    edge_type: EdgeType::DataDependency,
+                },
+            ],
+        };
+
+        let errors = validate(&dag);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, UnifiedDagError::CyclicDependency { .. }))
+        );
     }
 }
