@@ -2899,6 +2899,7 @@ mod tests {
         let input = "  from orders   \n  where true  \n";
         let formatted = rocky_lang::fmt::format_rocky(input, "    ");
         assert_eq!(formatted, "from orders\nwhere true\n");
+    }
 
     // -- format helpers -------------------------------------------------------
 

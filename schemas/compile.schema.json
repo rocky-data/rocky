@@ -27,6 +27,39 @@
         }
       ]
     },
+    "CostHint": {
+      "description": "Heuristic cost estimate derived from DAG-aware cardinality propagation.\n\nThese numbers are directional — useful for comparing models within a project and surfacing expensive operations in the LSP, but not precise enough to substitute for a warehouse EXPLAIN. Use `rocky estimate` for warehouse-backed estimates.",
+      "properties": {
+        "confidence": {
+          "description": "Confidence level: `\"low\"`, `\"medium\"`, or `\"high\"`.",
+          "type": "string"
+        },
+        "estimated_bytes": {
+          "description": "Estimated total output bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "estimated_cost_usd": {
+          "description": "Estimated compute cost in USD.",
+          "format": "double",
+          "type": "number"
+        },
+        "estimated_rows": {
+          "description": "Estimated number of output rows.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "confidence",
+        "estimated_bytes",
+        "estimated_cost_usd",
+        "estimated_rows"
+      ],
+      "type": "object"
+    },
     "Diagnostic": {
       "description": "A compiler diagnostic (error, warning, or informational message).",
       "properties": {
@@ -121,6 +154,17 @@
             "string",
             "null"
           ]
+        },
+        "cost_hint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CostHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "DAG-propagated cost estimate for this model. Populated at compile time using heuristic cardinality propagation (no warehouse round-trip). `None` when no upstream table statistics are available."
         },
         "freshness": {
           "anyOf": [

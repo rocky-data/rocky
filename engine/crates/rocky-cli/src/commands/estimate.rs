@@ -35,8 +35,8 @@ pub async fn run_estimate(
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
 
-    // Determine warehouse pricing model from the adapter type name.
-    let pricing = resolve_pricing(&rocky_cfg);
+    // Determine warehouse pricing model from the pipeline's target adapter.
+    let pricing = resolve_pricing(&rocky_cfg, pipeline.target_adapter());
 
     // 2. Load all models.
     let all_models = load_all_models(models_dir)?;
@@ -181,17 +181,18 @@ fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
     Ok(all)
 }
 
-/// Resolve a warehouse pricing model from the Rocky config.
+/// Resolve a warehouse pricing model from the pipeline's target adapter.
 ///
-/// Inspects the adapter type in the config and returns the appropriate
-/// pricing model. Falls back to Databricks pricing when the adapter type
-/// is not recognized.
-fn resolve_pricing(config: &rocky_core::config::RockyConfig) -> WarehouseCostModel {
-    // Check the default adapter (or first adapter) type string.
+/// Looks up the specific adapter used by the pipeline (not just the first
+/// adapter in the config) and returns the appropriate pricing model. Falls
+/// back to Databricks pricing when the adapter type is not recognized.
+fn resolve_pricing(
+    config: &rocky_core::config::RockyConfig,
+    target_adapter: &str,
+) -> WarehouseCostModel {
     let adapter_type = config
         .adapters
-        .values()
-        .next()
+        .get(target_adapter)
         .map(|a| a.adapter_type.as_str())
         .unwrap_or("");
 
