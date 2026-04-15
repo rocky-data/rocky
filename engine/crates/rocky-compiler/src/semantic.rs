@@ -169,6 +169,18 @@ impl SemanticGraph {
 
         result
     }
+
+    /// Find downstream consumers of a column: edges where `source` matches `(model, column)`.
+    ///
+    /// Returns edges whose `source.model == model` and `source.column == column`,
+    /// i.e. models that read this column as input. O(E) scan — acceptable for
+    /// hover latency; add an `edges_by_source_column` index if profiling shows need.
+    pub fn column_consumers(&self, model: &str, column: &str) -> Vec<&LineageEdge> {
+        self.edges
+            .iter()
+            .filter(|e| &*e.source.model == model && &*e.source.column == column)
+            .collect()
+    }
 }
 
 /// Build a semantic graph from a resolved project.
@@ -520,5 +532,59 @@ mod tests {
             .find(|e| &*e.target.model == "b" && &*e.target.column == "amount_int");
         assert!(cast_edge.is_some());
         assert_eq!(cast_edge.unwrap().transform, TransformKind::Cast);
+    }
+
+    #[test]
+    fn test_column_consumers() {
+        let models = vec![
+            make_model("a", "SELECT id, name FROM source.raw.users"),
+            make_model("b", "SELECT id, name FROM a"),
+            make_model("c", "SELECT id FROM a"),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        // a.id is consumed by both b and c
+        let consumers = graph.column_consumers("a", "id");
+        let consumer_models: Vec<&str> = consumers.iter().map(|e| &*e.target.model).collect();
+        assert!(consumer_models.contains(&"b"));
+        assert!(consumer_models.contains(&"c"));
+        assert_eq!(consumers.len(), 2);
+
+        // a.name is consumed by b only
+        let name_consumers = graph.column_consumers("a", "name");
+        assert_eq!(name_consumers.len(), 1);
+        assert_eq!(&*name_consumers[0].target.model, "b");
+
+        // c.id has no consumers (leaf model)
+        let leaf_consumers = graph.column_consumers("c", "id");
+        assert!(leaf_consumers.is_empty());
+    }
+
+    #[test]
+    fn test_column_consumers_diamond() {
+        let models = vec![
+            make_model("a", "SELECT id, value FROM source.raw.data"),
+            make_model("b", "SELECT id, value AS b_value FROM a"),
+            make_model("c", "SELECT id, value AS c_value FROM a"),
+            make_model(
+                "d",
+                "SELECT b.id, b.b_value, c.c_value FROM b JOIN c ON b.id = c.id",
+            ),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        // b.id is consumed by d
+        let consumers = graph.column_consumers("b", "id");
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(&*consumers[0].target.model, "d");
+
+        // b.b_value is consumed by d
+        let bv_consumers = graph.column_consumers("b", "b_value");
+        assert_eq!(bv_consumers.len(), 1);
+        assert_eq!(&*bv_consumers[0].target.model, "d");
     }
 }

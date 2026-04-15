@@ -815,33 +815,13 @@ impl LanguageServer for RockyLsp {
                 // Look for the column in the current model's typed columns
                 if let Some(typed_cols) = result.type_check.typed_models.get(model_name) {
                     if let Some(col) = typed_cols.iter().find(|c| c.name == *w) {
-                        let nullable = if col.nullable { "?" } else { "" };
-                        let mut info_lines = vec![format!(
-                            "**Column:** `{}`: `{:?}{}`",
-                            col.name, col.data_type, nullable
-                        )];
-
-                        // Trace lineage for this column
-                        let edges = result.semantic_graph.trace_column(model_name, w);
-                        if !edges.is_empty() {
-                            info_lines.push(String::new());
-                            info_lines.push("**Lineage:**".to_string());
-                            for edge in &edges {
-                                info_lines.push(format!(
-                                    "- `{}.{}` \u{2190} `{}.{}` ({})",
-                                    edge.target.model,
-                                    edge.target.column,
-                                    edge.source.model,
-                                    edge.source.column,
-                                    edge.transform,
-                                ));
-                            }
-                        }
+                        let value =
+                            build_column_hover_markdown(col, model_name, &result.semantic_graph);
 
                         return Ok(Some(Hover {
                             contents: HoverContents::Markup(MarkupContent {
                                 kind: MarkupKind::Markdown,
-                                value: info_lines.join("\n"),
+                                value,
                             }),
                             range: None,
                         }));
@@ -853,14 +833,16 @@ impl LanguageServer for RockyLsp {
                     for upstream_name in &schema.upstream {
                         if let Some(up_cols) = result.type_check.typed_models.get(upstream_name) {
                             if let Some(col) = up_cols.iter().find(|c| c.name == *w) {
-                                let nullable = if col.nullable { "?" } else { "" };
+                                let value = build_column_hover_markdown(
+                                    col,
+                                    upstream_name,
+                                    &result.semantic_graph,
+                                );
+
                                 return Ok(Some(Hover {
                                     contents: HoverContents::Markup(MarkupContent {
                                         kind: MarkupKind::Markdown,
-                                        value: format!(
-                                            "**Column:** `{}` from `{}`\n\n**Type:** `{:?}{}`",
-                                            col.name, upstream_name, col.data_type, nullable
-                                        ),
+                                        value,
                                     }),
                                     range: None,
                                 }));
@@ -1641,6 +1623,55 @@ fn find_column_line_in_sql(sql: &str, column_name: &str) -> u32 {
     0
 }
 
+/// Build rich Markdown hover content for a column, including type, upstream
+/// lineage chain, and downstream consumers.
+///
+/// Extracted as a pure function so it can be unit-tested without spinning up
+/// the async LSP server.
+fn build_column_hover_markdown(
+    col: &rocky_compiler::types::TypedColumn,
+    model_name: &str,
+    graph: &rocky_compiler::semantic::SemanticGraph,
+) -> String {
+    let nullable = if col.nullable { "?" } else { "" };
+    let mut lines = vec![format!(
+        "**Column:** `{}.{}` : `{:?}{}`",
+        model_name, col.name, col.data_type, nullable
+    )];
+
+    // ── Upstream sources ──────────────────────────────────────────────
+    let trace = graph.trace_column(model_name, &col.name);
+    if !trace.is_empty() {
+        lines.push(String::new());
+        lines.push("**Upstream sources:**".to_string());
+        for edge in &trace {
+            lines.push(format!(
+                "- `{}.{}` \u{2190} `{}.{}` ({})",
+                edge.target.model,
+                edge.target.column,
+                edge.source.model,
+                edge.source.column,
+                edge.transform,
+            ));
+        }
+    }
+
+    // ── Downstream consumers ──────────────────────────────────────────
+    let consumers = graph.column_consumers(model_name, &col.name);
+    if !consumers.is_empty() {
+        lines.push(String::new());
+        lines.push("**Downstream consumers:**".to_string());
+        for edge in &consumers {
+            lines.push(format!(
+                "- `{}.{}` ({})",
+                edge.target.model, edge.target.column, edge.transform,
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
 /// Collect inlay hints from a query's SELECT clause using AST expression spans.
 fn collect_inlay_hints_from_select(
     query: &ast::Query,
@@ -2005,4 +2036,190 @@ pub async fn run_lsp() {
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+    use rocky_compiler::semantic::{
+        ColumnDef, LineageEdge, ModelSchema, QualifiedColumn, SemanticGraph,
+    };
+    use rocky_compiler::types::{RockyType, TypedColumn};
+    use rocky_sql::lineage::TransformKind;
+    use std::sync::Arc;
+
+    fn make_graph() -> SemanticGraph {
+        let mut models = IndexMap::new();
+        models.insert(
+            "source_table".to_string(),
+            ModelSchema {
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                    },
+                ],
+                has_star: false,
+                upstream: vec![],
+                downstream: vec!["staging".to_string()],
+                intent: None,
+            },
+        );
+        models.insert(
+            "staging".to_string(),
+            ModelSchema {
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                    },
+                ],
+                has_star: false,
+                upstream: vec!["source_table".to_string()],
+                downstream: vec!["mart".to_string()],
+                intent: None,
+            },
+        );
+        models.insert(
+            "mart".to_string(),
+            ModelSchema {
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                }],
+                has_star: false,
+                upstream: vec!["staging".to_string()],
+                downstream: vec![],
+                intent: None,
+            },
+        );
+
+        let edges = vec![
+            LineageEdge {
+                source: QualifiedColumn {
+                    model: Arc::from("source_table"),
+                    column: Arc::from("id"),
+                },
+                target: QualifiedColumn {
+                    model: Arc::from("staging"),
+                    column: Arc::from("id"),
+                },
+                transform: TransformKind::Direct,
+            },
+            LineageEdge {
+                source: QualifiedColumn {
+                    model: Arc::from("source_table"),
+                    column: Arc::from("name"),
+                },
+                target: QualifiedColumn {
+                    model: Arc::from("staging"),
+                    column: Arc::from("name"),
+                },
+                transform: TransformKind::Direct,
+            },
+            LineageEdge {
+                source: QualifiedColumn {
+                    model: Arc::from("staging"),
+                    column: Arc::from("id"),
+                },
+                target: QualifiedColumn {
+                    model: Arc::from("mart"),
+                    column: Arc::from("id"),
+                },
+                transform: TransformKind::Cast,
+            },
+        ];
+
+        SemanticGraph::new(models, edges)
+    }
+
+    #[test]
+    fn test_column_hover_with_upstream_and_downstream() {
+        let graph = make_graph();
+        let col = TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        };
+
+        let md = build_column_hover_markdown(&col, "staging", &graph);
+
+        // Type header
+        assert!(md.contains("**Column:** `staging.id` : `Int64`"));
+        // Upstream section
+        assert!(md.contains("**Upstream sources:**"));
+        assert!(md.contains("`source_table.id`"));
+        // Downstream section
+        assert!(md.contains("**Downstream consumers:**"));
+        assert!(md.contains("`mart.id`"));
+    }
+
+    #[test]
+    fn test_column_hover_leaf_model_no_downstream() {
+        let graph = make_graph();
+        let col = TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        };
+
+        let md = build_column_hover_markdown(&col, "mart", &graph);
+
+        assert!(md.contains("**Column:** `mart.id` : `Int64`"));
+        // Has upstream
+        assert!(md.contains("**Upstream sources:**"));
+        assert!(md.contains("`staging.id`"));
+        // No downstream
+        assert!(!md.contains("**Downstream consumers:**"));
+    }
+
+    #[test]
+    fn test_column_hover_source_no_upstream() {
+        let graph = make_graph();
+        let col = TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Int64,
+            nullable: true,
+        };
+
+        let md = build_column_hover_markdown(&col, "source_table", &graph);
+
+        assert!(md.contains("**Column:** `source_table.id` : `Int64?`"));
+        // No upstream
+        assert!(!md.contains("**Upstream sources:**"));
+        // Has downstream
+        assert!(md.contains("**Downstream consumers:**"));
+        assert!(md.contains("`staging.id`"));
+    }
+
+    #[test]
+    fn test_column_hover_nullable_marker() {
+        let graph = make_graph();
+        let col = TypedColumn {
+            name: "name".to_string(),
+            data_type: RockyType::String,
+            nullable: true,
+        };
+
+        let md = build_column_hover_markdown(&col, "staging", &graph);
+        assert!(md.contains("`String?`"));
+    }
+
+    #[test]
+    fn test_column_hover_transform_kind_shown() {
+        let graph = make_graph();
+        let col = TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        };
+
+        let md = build_column_hover_markdown(&col, "mart", &graph);
+        // The edge from staging -> mart is a Cast transform
+        assert!(md.contains("(cast)"));
+    }
 }
