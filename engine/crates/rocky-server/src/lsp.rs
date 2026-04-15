@@ -521,6 +521,8 @@ impl LanguageServer for RockyLsp {
                         },
                     ),
                 ),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -1178,27 +1180,57 @@ impl LanguageServer for RockyLsp {
             }
         }
 
-        // Extract CTEs as symbols with actual positions
-        let ctes = extract_cte_info(&model.sql);
-        for cte in &ctes {
-            let cte_range = Range::new(
-                Position::new(cte.line.saturating_sub(1) as u32, cte.col as u32),
-                Position::new(
-                    cte.line.saturating_sub(1) as u32,
-                    cte.col as u32 + cte.name.len() as u32,
-                ),
-            );
-            #[allow(deprecated)]
-            children.push(DocumentSymbol {
-                name: cte.name.clone(),
-                detail: Some("CTE".to_string()),
-                kind: SymbolKind::FUNCTION,
-                tags: None,
-                deprecated: None,
-                range: cte_range,
-                selection_range: cte_range,
-                children: None,
-            });
+        let uri_str = uri.to_string();
+        let ext = uri_extension(&uri_str);
+
+        if ext == "rocky" {
+            // For .rocky files, show pipeline step keywords as symbols
+            let docs = self.documents.read().await;
+            let doc_text = docs.get(&uri.to_string()).cloned();
+            drop(docs);
+            if let Some(text) = doc_text {
+                let steps = extract_rocky_pipeline_steps(&text);
+                for step in &steps {
+                    let step_range = Range::new(
+                        Position::new(step.line as u32, 0),
+                        Position::new(step.line as u32, step.keyword.len() as u32),
+                    );
+                    #[allow(deprecated)]
+                    children.push(DocumentSymbol {
+                        name: step.keyword.clone(),
+                        detail: step.detail.clone(),
+                        kind: SymbolKind::KEY,
+                        tags: None,
+                        deprecated: None,
+                        range: step_range,
+                        selection_range: step_range,
+                        children: None,
+                    });
+                }
+            }
+        } else {
+            // For .sql files, extract CTEs as symbols with actual positions
+            let ctes = extract_cte_info(&model.sql);
+            for cte in &ctes {
+                let cte_range = Range::new(
+                    Position::new(cte.line.saturating_sub(1) as u32, cte.col as u32),
+                    Position::new(
+                        cte.line.saturating_sub(1) as u32,
+                        cte.col as u32 + cte.name.len() as u32,
+                    ),
+                );
+                #[allow(deprecated)]
+                children.push(DocumentSymbol {
+                    name: cte.name.clone(),
+                    detail: Some("CTE".to_string()),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range: cte_range,
+                    selection_range: cte_range,
+                    children: None,
+                });
+            }
         }
 
         #[allow(deprecated)]
@@ -1496,6 +1528,65 @@ impl LanguageServer for RockyLsp {
             result_id: None,
             data,
         })))
+    }
+
+    // ── Folding Ranges (Phase 3I) ──────────────────────────────────────────
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri.to_string();
+
+        let docs = self.documents.read().await;
+        let doc_text = match docs.get(&uri) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        drop(docs);
+
+        let ext = uri_extension(&uri);
+        let ranges = compute_folding_ranges(&doc_text, ext);
+
+        if ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ranges))
+        }
+    }
+
+    // ── Formatting (Phase 3J) ──────────────────────────────────────────────
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri.to_string();
+        let ext = uri_extension(&uri);
+
+        // Only format .rocky files
+        if ext != "rocky" {
+            return Ok(None);
+        }
+
+        let docs = self.documents.read().await;
+        let doc_text = match docs.get(&uri) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        drop(docs);
+
+        let formatted = rocky_lang::fmt::format_rocky(&doc_text, "    ");
+
+        if formatted == doc_text {
+            return Ok(None);
+        }
+
+        // Replace the entire document
+        let line_count = doc_text.lines().count().max(1) as u32;
+        let last_line_len = doc_text.lines().last().map_or(0, str::len) as u32;
+
+        Ok(Some(vec![TextEdit {
+            range: Range::new(
+                Position::new(0, 0),
+                Position::new(line_count, last_line_len),
+            ),
+            new_text: formatted,
+        }]))
     }
 }
 
@@ -1949,6 +2040,346 @@ fn collect_tokens_from_expr(
     }
 }
 
+// ── URI extension helper ───────────────────────────────────────────────────
+
+/// Extract file extension from a URI string (e.g., "file:///foo.rocky" -> "rocky").
+fn uri_extension(uri: &str) -> &str {
+    uri.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("")
+}
+
+// ── Rocky pipeline step extraction ─────────────────────────────────────────
+
+/// Pipeline step keywords recognized in `.rocky` files.
+const ROCKY_STEP_KEYWORDS: &[&str] = &[
+    "from",
+    "where",
+    "group",
+    "derive",
+    "select",
+    "join",
+    "sort",
+    "take",
+    "distinct",
+    "replicate",
+];
+
+/// A pipeline step found in a `.rocky` file.
+struct RockyPipelineStep {
+    keyword: String,
+    detail: Option<String>,
+    line: usize,
+}
+
+/// Extract pipeline step keywords from `.rocky` source text.
+fn extract_rocky_pipeline_steps(text: &str) -> Vec<RockyPipelineStep> {
+    let mut steps = Vec::new();
+
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        for &kw in ROCKY_STEP_KEYWORDS {
+            if let Some(rest) = trimmed.strip_prefix(kw) {
+                if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+                    // Capture the rest of the line (after keyword) as detail
+                    let detail = rest.trim();
+                    let detail = if detail.is_empty() {
+                        None
+                    } else {
+                        // Truncate long details
+                        let d = detail.trim_end_matches('{').trim();
+                        if d.len() > 60 {
+                            Some(format!("{}...", &d[..57]))
+                        } else {
+                            Some(d.to_string())
+                        }
+                    };
+                    steps.push(RockyPipelineStep {
+                        keyword: kw.to_string(),
+                        detail,
+                        line: i,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    steps
+}
+
+// ── Folding range computation ──────────────────────────────────────────────
+
+/// Compute folding ranges for a document based on file extension.
+fn compute_folding_ranges(text: &str, ext: &str) -> Vec<FoldingRange> {
+    match ext {
+        "rocky" => compute_rocky_folding_ranges(text),
+        "sql" => compute_sql_folding_ranges(text),
+        "toml" => compute_toml_folding_ranges(text),
+        _ => Vec::new(),
+    }
+}
+
+/// Folding ranges for `.rocky` files: brace blocks and consecutive comment lines.
+fn compute_rocky_folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Brace-block folding: track open brace positions via a stack.
+    let mut brace_stack: Vec<u32> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => brace_stack.push(i as u32),
+                '}' => {
+                    if let Some(start) = brace_stack.pop() {
+                        if (i as u32) > start {
+                            ranges.push(FoldingRange {
+                                start_line: start,
+                                start_character: None,
+                                end_line: i as u32,
+                                end_character: None,
+                                kind: Some(FoldingRangeKind::Region),
+                                collapsed_text: None,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Consecutive comment line groups (3+ lines).
+    fold_consecutive_comment_lines(&lines, "--", &mut ranges);
+
+    ranges
+}
+
+/// Folding ranges for `.sql` files: CASE..END, WITH CTE spans, comment blocks.
+fn compute_sql_folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // CASE..END folding (case-insensitive).
+    let mut case_stack: Vec<u32> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let upper = line.trim().to_uppercase();
+        // Count CASE and END keywords on this line.
+        // Simple heuristic: standalone CASE / END token boundaries.
+        for token in upper.split_whitespace() {
+            if token == "CASE" || token.starts_with("CASE,") || token.ends_with(",CASE") {
+                case_stack.push(i as u32);
+            } else if token == "END" || token == "END," || token == "END)" {
+                if let Some(start) = case_stack.pop() {
+                    if (i as u32) > start {
+                        ranges.push(FoldingRange {
+                            start_line: start,
+                            start_character: None,
+                            end_line: i as u32,
+                            end_character: None,
+                            kind: Some(FoldingRangeKind::Region),
+                            collapsed_text: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // WITH CTE spans: from CTE name AS ( to closing ).
+    // Track parenthesis nesting within the WITH block.
+    let mut in_with = false;
+    let mut cte_start: Option<u32> = None;
+    let mut paren_depth: i32 = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let upper = line.trim().to_uppercase();
+        let tokens: Vec<&str> = upper.split_whitespace().collect();
+
+        if !in_with && (tokens.first() == Some(&"WITH") || upper.starts_with("WITH ")) {
+            in_with = true;
+            // The CTE name follows WITH
+            cte_start = Some(i as u32);
+            paren_depth = 0;
+        }
+
+        if in_with {
+            for ch in line.chars() {
+                match ch {
+                    '(' => paren_depth += 1,
+                    ')' => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            if let Some(start) = cte_start.take() {
+                                if (i as u32) > start {
+                                    ranges.push(FoldingRange {
+                                        start_line: start,
+                                        start_character: None,
+                                        end_line: i as u32,
+                                        end_character: None,
+                                        kind: Some(FoldingRangeKind::Region),
+                                        collapsed_text: None,
+                                    });
+                                }
+                            }
+                            // Check if the next non-blank line starts a new CTE
+                            // (has comma + name + AS pattern).
+                            // For now, set cte_start to next line if still in WITH block.
+                            let rest = upper.trim_end();
+                            if rest.ends_with(',') {
+                                cte_start = Some(i as u32 + 1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // If the line has a comma after closing paren, next CTE starts
+            if paren_depth == 0 && cte_start.is_none() {
+                let trimmed = line.trim();
+                if trimmed.ends_with(',') {
+                    cte_start = Some(i as u32 + 1);
+                } else {
+                    // Final SELECT or end of WITH block
+                    in_with = false;
+                }
+            }
+        }
+    }
+
+    // Block comments /* ... */
+    let mut block_start: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if block_start.is_none() && line.contains("/*") {
+            block_start = Some(i as u32);
+        }
+        if block_start.is_some() && line.contains("*/") {
+            if let Some(start) = block_start.take() {
+                if (i as u32) > start {
+                    ranges.push(FoldingRange {
+                        start_line: start,
+                        start_character: None,
+                        end_line: i as u32,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Comment),
+                        collapsed_text: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Consecutive single-line comment groups.
+    fold_consecutive_comment_lines(&lines, "--", &mut ranges);
+
+    ranges
+}
+
+/// Folding ranges for `.toml` files: section headers and comment blocks.
+fn compute_toml_folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Section headers: [section] to next [section] or EOF.
+    let mut section_start: Option<u32> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") || trimmed.starts_with("[[") {
+            // Close previous section.
+            if let Some(start) = section_start.take() {
+                // End at the last non-blank line before this section header.
+                let end = find_last_nonblank_before(&lines, i);
+                if end > start as usize {
+                    ranges.push(FoldingRange {
+                        start_line: start,
+                        start_character: None,
+                        end_line: end as u32,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: None,
+                    });
+                }
+            }
+            section_start = Some(i as u32);
+        }
+    }
+    // Close final section.
+    if let Some(start) = section_start {
+        let end = find_last_nonblank_before(&lines, lines.len());
+        if end > start as usize {
+            ranges.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: end as u32,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    }
+
+    // Consecutive comment line groups.
+    fold_consecutive_comment_lines(&lines, "#", &mut ranges);
+
+    ranges
+}
+
+/// Group consecutive lines that start with `prefix` into folding ranges.
+/// Only creates a range if 2+ consecutive comment lines are found.
+fn fold_consecutive_comment_lines(lines: &[&str], prefix: &str, ranges: &mut Vec<FoldingRange>) {
+    let mut run_start: Option<u32> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().starts_with(prefix) {
+            if run_start.is_none() {
+                run_start = Some(i as u32);
+            }
+        } else if let Some(start) = run_start.take() {
+            let end = i as u32 - 1;
+            if end > start {
+                ranges.push(FoldingRange {
+                    start_line: start,
+                    start_character: None,
+                    end_line: end,
+                    end_character: None,
+                    kind: Some(FoldingRangeKind::Comment),
+                    collapsed_text: None,
+                });
+            }
+        }
+    }
+    // Handle run at EOF.
+    if let Some(start) = run_start {
+        let end = lines.len() as u32 - 1;
+        if end > start {
+            ranges.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Comment),
+                collapsed_text: None,
+            });
+        }
+    }
+}
+
+/// Find the last non-blank line index before `before_idx`.
+fn find_last_nonblank_before(lines: &[&str], before_idx: usize) -> usize {
+    let mut last = 0;
+    for (i, line) in lines.iter().enumerate().take(before_idx) {
+        if !line.trim().is_empty() {
+            last = i;
+        }
+    }
+    last
+}
+
 // ── Incremental compilation (Phase 3H) ──────────────────────────────────────
 
 /// Incremental compilation: recompile only changed models + dependents.
@@ -2221,5 +2652,159 @@ mod tests {
         let md = build_column_hover_markdown(&col, "mart", &graph);
         // The edge from staging -> mart is a Cast transform
         assert!(md.contains("(cast)"));
+    }
+
+    // ── Folding range tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_rocky_folding_brace_blocks() {
+        let input = "from orders\ngroup customer_id {\n    total: sum(amount)\n}\n";
+        let ranges = compute_folding_ranges(input, "rocky");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_line, 1);
+        assert_eq!(ranges[0].end_line, 3);
+    }
+
+    #[test]
+    fn test_rocky_folding_nested_braces() {
+        let input = "derive {\n    a: 1,\n    b: match {\n        true => 2\n    }\n}\n";
+        let ranges = compute_folding_ranges(input, "rocky");
+        // Two folding ranges: outer derive{} and inner match{}
+        assert_eq!(ranges.len(), 2);
+        // Inner match block
+        let inner = ranges.iter().find(|r| r.start_line == 2).unwrap();
+        assert_eq!(inner.end_line, 4);
+        // Outer derive block
+        let outer = ranges.iter().find(|r| r.start_line == 0).unwrap();
+        assert_eq!(outer.end_line, 5);
+    }
+
+    #[test]
+    fn test_rocky_folding_comment_groups() {
+        let input = "-- comment 1\n-- comment 2\n-- comment 3\nfrom orders\n";
+        let ranges = compute_folding_ranges(input, "rocky");
+        let comment_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.kind == Some(FoldingRangeKind::Comment))
+            .collect();
+        assert_eq!(comment_ranges.len(), 1);
+        assert_eq!(comment_ranges[0].start_line, 0);
+        assert_eq!(comment_ranges[0].end_line, 2);
+    }
+
+    #[test]
+    fn test_sql_folding_case_end() {
+        let input = "SELECT\n    CASE\n        WHEN x > 0 THEN 'pos'\n        ELSE 'neg'\n    END AS label\nFROM t\n";
+        let ranges = compute_folding_ranges(input, "sql");
+        let case_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.kind == Some(FoldingRangeKind::Region))
+            .collect();
+        assert!(!case_ranges.is_empty());
+        let case_range = case_ranges.iter().find(|r| r.start_line == 1).unwrap();
+        assert_eq!(case_range.end_line, 4);
+    }
+
+    #[test]
+    fn test_sql_folding_block_comment() {
+        let input = "/* This is\n   a block\n   comment */\nSELECT 1\n";
+        let ranges = compute_folding_ranges(input, "sql");
+        let comment_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.kind == Some(FoldingRangeKind::Comment))
+            .collect();
+        assert_eq!(comment_ranges.len(), 1);
+        assert_eq!(comment_ranges[0].start_line, 0);
+        assert_eq!(comment_ranges[0].end_line, 2);
+    }
+
+    #[test]
+    fn test_toml_folding_sections() {
+        let input = "[adapter]\ntype = \"duckdb\"\npath = \"test.db\"\n\n[pipeline.main]\ntype = \"replication\"\n";
+        let ranges = compute_folding_ranges(input, "toml");
+        let section_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.kind == Some(FoldingRangeKind::Region))
+            .collect();
+        assert_eq!(section_ranges.len(), 2);
+        // First section: [adapter] from line 0
+        assert_eq!(section_ranges[0].start_line, 0);
+        // Second section: [pipeline.main] from line 4
+        assert_eq!(section_ranges[1].start_line, 4);
+    }
+
+    #[test]
+    fn test_toml_folding_comment_groups() {
+        let input = "# Comment 1\n# Comment 2\n# Comment 3\n[adapter]\ntype = \"duckdb\"\n";
+        let ranges = compute_folding_ranges(input, "toml");
+        let comment_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.kind == Some(FoldingRangeKind::Comment))
+            .collect();
+        assert_eq!(comment_ranges.len(), 1);
+        assert_eq!(comment_ranges[0].start_line, 0);
+        assert_eq!(comment_ranges[0].end_line, 2);
+    }
+
+    #[test]
+    fn test_unknown_extension_no_folding() {
+        let ranges = compute_folding_ranges("some text", "txt");
+        assert!(ranges.is_empty());
+    }
+
+    // ── Document symbol tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_rocky_pipeline_step_extraction() {
+        let input = "from raw_orders\nwhere status != \"cancelled\"\ngroup customer_id {\n    total: sum(amount)\n}\nsort total desc\ntake 10\n";
+        let steps = extract_rocky_pipeline_steps(input);
+        let keywords: Vec<&str> = steps.iter().map(|s| s.keyword.as_str()).collect();
+        assert_eq!(keywords, vec!["from", "where", "group", "sort", "take"]);
+    }
+
+    #[test]
+    fn test_rocky_pipeline_step_detail() {
+        let input = "from raw_orders\njoin customers as c on customer_id\n";
+        let steps = extract_rocky_pipeline_steps(input);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].keyword, "from");
+        assert_eq!(steps[0].detail, Some("raw_orders".to_string()));
+        assert_eq!(steps[1].keyword, "join");
+        assert!(steps[1].detail.as_ref().unwrap().contains("customers"));
+    }
+
+    #[test]
+    fn test_rocky_pipeline_ignores_comments() {
+        let input = "-- from is not a step here\nfrom orders\n";
+        let steps = extract_rocky_pipeline_steps(input);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].keyword, "from");
+    }
+
+    #[test]
+    fn test_rocky_pipeline_no_false_keyword_match() {
+        // "fromage" should not match "from"
+        let input = "fromage something\n";
+        let steps = extract_rocky_pipeline_steps(input);
+        assert!(steps.is_empty());
+    }
+
+    // ── URI extension helper tests ─────────────────────────────────────
+
+    #[test]
+    fn test_uri_extension() {
+        assert_eq!(uri_extension("file:///path/to/file.rocky"), "rocky");
+        assert_eq!(uri_extension("file:///path/to/file.sql"), "sql");
+        assert_eq!(uri_extension("file:///path/to/file.toml"), "toml");
+        assert_eq!(uri_extension("file:///no-extension"), "");
+    }
+
+    // ── Formatting tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_format_rocky_via_lang() {
+        let input = "  from orders   \n  where true  \n";
+        let formatted = rocky_lang::fmt::format_rocky(input, "    ");
+        assert_eq!(formatted, "from orders\nwhere true\n");
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod ast;
 pub mod error;
+pub mod fmt;
 pub mod lower;
 pub mod parser;
 pub mod token;
