@@ -847,11 +847,11 @@ from .types_generated import (  # noqa: E402, F401
     ChecksConfigOutput,
     CiDiffOutput,
     CiOutput,
-    DiffResult,
-    DiffSummary,
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,
+    DiffResult,
+    DiffSummary,
     DiscoverOutput,
     DoctorOutput,
     DriftActionOutput,
@@ -884,7 +884,6 @@ from .types_generated import (  # noqa: E402, F401
     TestFailure,
     TestOutput,
 )
-
 
 # ---------------------------------------------------------------------------
 # Union type and parser

@@ -1,6 +1,7 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "run",
+  "pipeline_type": "replication",
   "filter": "source=events",
   "duration_ms": 0,
   "tables_copied": 1,
@@ -8,23 +9,59 @@
   "materializations": [
     {
       "asset_key": [
-        "staging__events",
+        "duckdb",
+        "events",
         "events"
       ],
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "full_refresh"
+        "strategy": "full_refresh",
+        "watermark": "2026-04-15T21:54:15.056301Z",
+        "target_table_full_name": "poc.staging__events.events"
       }
     }
   ],
-  "check_results": [],
+  "check_results": [
+    {
+      "asset_key": [
+        "duckdb",
+        "events",
+        "events"
+      ],
+      "checks": [
+        {
+          "name": "row_count",
+          "passed": true,
+          "source_count": 500,
+          "target_count": 500
+        }
+      ]
+    }
+  ],
   "execution": {
-    "concurrency": 8,
+    "concurrency": 32,
     "tables_processed": 1,
-    "tables_failed": 0
+    "tables_failed": 0,
+    "adaptive_concurrency": true,
+    "final_concurrency": 32,
+    "rate_limits_detected": 0
   },
-  "metrics": null,
+  "metrics": {
+    "tables_processed": 1,
+    "tables_failed": 0,
+    "error_rate_pct": 0.0,
+    "statements_executed": 0,
+    "retries_attempted": 0,
+    "retries_succeeded": 0,
+    "anomalies_detected": 0,
+    "table_duration_p50_ms": 0,
+    "table_duration_p95_ms": 0,
+    "table_duration_max_ms": 0,
+    "query_duration_p50_ms": 0,
+    "query_duration_p95_ms": 0,
+    "query_duration_max_ms": 0
+  },
   "permissions": {
     "grants_added": 0,
     "grants_revoked": 0,
@@ -32,7 +69,7 @@
     "schemas_created": 1
   },
   "drift": {
-    "tables_checked": 0,
+    "tables_checked": 1,
     "tables_drifted": 0,
     "actions_taken": []
   }

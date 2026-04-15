@@ -14,6 +14,9 @@ path = "playground.duckdb"
 strategy = "full_refresh"
 timestamp_column = "_updated_at"
 
+[pipeline.playground.source.discovery]
+adapter = "default"
+
 [pipeline.playground.source.schema_pattern]
 prefix = "raw__"
 separator = "__"
@@ -22,6 +25,9 @@ components = ["source"]
 [pipeline.playground.target]
 catalog_template = "playground"
 schema_template = "staging__{source}"
+
+[pipeline.playground.target.governance]
+auto_create_schemas = true
 
 [pipeline.playground.checks]
 row_count = false

@@ -324,7 +324,7 @@ pub async fn doctor(
     let overall = if has_critical {
         "critical"
     } else if has_warning {
-        "degraded"
+        "warning"
     } else {
         "healthy"
     };
@@ -364,8 +364,6 @@ pub async fn doctor(
 
     if has_critical {
         std::process::exit(2);
-    } else if has_warning {
-        std::process::exit(1);
     }
 
     Ok(())

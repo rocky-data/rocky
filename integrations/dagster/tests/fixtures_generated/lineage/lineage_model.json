@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "lineage",
   "model": "fct_revenue",
   "columns": [
@@ -35,7 +35,7 @@
         "model": "fct_revenue",
         "column": "total"
       },
-      "transform": "aggregation(\"sum\")"
+      "transform": "aggregation: sum"
     }
   ]
 }

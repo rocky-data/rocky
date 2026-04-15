@@ -75,31 +75,35 @@ pub async fn plan(
             String::new()
         };
 
-        // Catalog creation — only when the dialect supports catalogs.
-        if let Some(create_cat) = dialect.create_catalog_sql(&target_catalog) {
-            let sql = create_cat.map_err(|e| anyhow::anyhow!("create_catalog: {e}"))?;
-            output.statements.push(PlannedStatement {
-                purpose: "create_catalog".into(),
-                target: target_catalog.clone(),
-                sql,
-            });
+        // Catalog creation — only when governance enables it and the dialect supports catalogs.
+        if pipeline.target.governance.auto_create_catalogs {
+            if let Some(create_cat) = dialect.create_catalog_sql(&target_catalog) {
+                let sql = create_cat.map_err(|e| anyhow::anyhow!("create_catalog: {e}"))?;
+                output.statements.push(PlannedStatement {
+                    purpose: "create_catalog".into(),
+                    target: target_catalog.clone(),
+                    sql,
+                });
+            }
         }
 
-        // Schema creation — pass empty catalog when the dialect is catalog-less.
-        if let Some(create_sch) =
-            dialect.create_schema_sql(&effective_target_catalog, &target_schema)
-        {
-            let sql = create_sch.map_err(|e| anyhow::anyhow!("create_schema: {e}"))?;
-            let target_label = if effective_target_catalog.is_empty() {
-                target_schema.clone()
-            } else {
-                format!("{effective_target_catalog}.{target_schema}")
-            };
-            output.statements.push(PlannedStatement {
-                purpose: "create_schema".into(),
-                target: target_label,
-                sql,
-            });
+        // Schema creation — only when governance enables it.
+        if pipeline.target.governance.auto_create_schemas {
+            if let Some(create_sch) =
+                dialect.create_schema_sql(&effective_target_catalog, &target_schema)
+            {
+                let sql = create_sch.map_err(|e| anyhow::anyhow!("create_schema: {e}"))?;
+                let target_label = if effective_target_catalog.is_empty() {
+                    target_schema.clone()
+                } else {
+                    format!("{effective_target_catalog}.{target_schema}")
+                };
+                output.statements.push(PlannedStatement {
+                    purpose: "create_schema".into(),
+                    target: target_label,
+                    sql,
+                });
+            }
         }
 
         // Per-table copy SQL

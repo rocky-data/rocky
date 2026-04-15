@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "compile",
   "models": 1,
   "execution_layers": 1,
@@ -28,6 +28,12 @@
         "catalog": "",
         "schema": "marts",
         "table": "fct_daily_orders"
+      },
+      "cost_hint": {
+        "estimated_rows": 10000,
+        "estimated_bytes": 2560000,
+        "estimated_cost_usd": 2.28e-05,
+        "confidence": "high"
       }
     }
   ]

@@ -1,6 +1,6 @@
 {
   "command": "doctor",
-  "overall": "degraded",
+  "overall": "warning",
   "checks": [
     {
       "name": "config",
@@ -11,7 +11,7 @@
     {
       "name": "state",
       "status": "healthy",
-      "message": "State store healthy (0 watermarks)",
+      "message": "State store healthy (1 watermarks)",
       "duration_ms": 0
     },
     {
@@ -30,6 +30,24 @@
       "name": "state_sync",
       "status": "warning",
       "message": "State backend: local",
+      "duration_ms": 0
+    },
+    {
+      "name": "auth/default",
+      "status": "healthy",
+      "message": "Authenticated to default",
+      "duration_ms": 0
+    },
+    {
+      "name": "auth",
+      "status": "healthy",
+      "message": "All 1 warehouse adapter(s) authenticated",
+      "duration_ms": 0
+    },
+    {
+      "name": "auth/default",
+      "status": "healthy",
+      "message": "Discovery adapter default reachable",
       "duration_ms": 0
     }
   ],
