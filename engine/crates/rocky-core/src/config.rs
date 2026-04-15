@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
@@ -147,6 +147,9 @@ fn navigate_to_table_mut<'a>(
 /// Errors from loading and parsing pipeline configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("No rocky.toml found at '{}'", .path.display())]
+    FileNotFound { path: PathBuf },
+
     #[error("failed to read config file: {0}")]
     ReadFile(#[from] std::io::Error),
 
@@ -1436,7 +1439,15 @@ pub struct PipelineTargetConfig {
 /// deprecation warnings programmatically (e.g., `rocky doctor`, `rocky
 /// validate`) can use [`check_config_deprecations`] on the raw TOML string.
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
-    let raw = std::fs::read_to_string(path)?;
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ConfigError::FileNotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            ConfigError::ReadFile(e)
+        }
+    })?;
     let substituted = substitute_env_vars(&raw)?;
     let mut value: toml::Value = toml::from_str(&substituted)?;
     apply_deprecations(&mut value);
