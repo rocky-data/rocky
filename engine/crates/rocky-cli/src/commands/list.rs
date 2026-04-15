@@ -24,7 +24,7 @@ pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
                 target_adapter: pc.target_adapter().to_string(),
                 source_adapter,
                 depends_on: pc.depends_on().to_vec(),
-                concurrency: pc.execution().concurrency,
+                concurrency: pc.execution().concurrency.to_string(),
             }
         })
         .collect();

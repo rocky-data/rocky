@@ -890,7 +890,7 @@ pub struct ListPipelineEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_adapter: Option<String>,
     pub depends_on: Vec<String>,
-    pub concurrency: usize,
+    pub concurrency: String,
 }
 
 impl ListPipelinesOutput {

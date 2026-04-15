@@ -40,7 +40,7 @@ pub async fn run_transformation(
 
     let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
-    let concurrency = pipeline.execution.concurrency;
+    let concurrency = pipeline.execution.concurrency.max_concurrency();
 
     let mut output = RunOutput::new(String::new(), 0, concurrency);
     output.pipeline_type = Some("transformation".to_string());
@@ -127,7 +127,11 @@ pub async fn run_quality(
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
     let dialect = warehouse_adapter.dialect();
 
-    let mut output = RunOutput::new(String::new(), 0, pipeline.execution.concurrency);
+    let mut output = RunOutput::new(
+        String::new(),
+        0,
+        pipeline.execution.concurrency.max_concurrency(),
+    );
     output.pipeline_type = Some("quality".to_string());
 
     if !pipeline.checks.enabled {
