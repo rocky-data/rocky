@@ -65,7 +65,7 @@ jobs:
         run: npx @vscode/vsce package
 
       - name: Attach VSIX to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: editors/vscode/*.vsix
 
