@@ -4,6 +4,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use rocky_core::cost::downstream_counts;
+use rocky_core::dag::DagNode;
+use rocky_core::models;
 use rocky_core::optimize::{CostConfig, MaterializationCost, ModelStats, recommend_strategy};
 use rocky_core::state::StateStore;
 
@@ -12,6 +15,7 @@ use crate::output::{OptimizeOutput, OptimizeRecommendation, print_json};
 /// Execute `rocky optimize`.
 pub fn run_optimize(
     state_path: &Path,
+    models_dir: Option<&Path>,
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -29,6 +33,12 @@ pub fn run_optimize(
         }
         return Ok(());
     }
+
+    // Build DAG from model definitions on disk (if models_dir is available).
+    // This lets us compute downstream_references accurately instead of
+    // defaulting to 0.
+    let dag_nodes = load_dag_from_models(models_dir);
+    let downstream = downstream_counts(&dag_nodes);
 
     // Collect unique model names across all runs
     let mut model_names: Vec<String> = runs
@@ -81,7 +91,7 @@ pub fn run_optimize(
             current_strategy: "table".to_string(), // default assumption
             avg_duration_seconds,
             estimated_size_gb,
-            downstream_references: 0, // would need DAG info
+            downstream_references: downstream.get(model_name.as_str()).copied().unwrap_or(0),
             history_runs: history.len(),
             runs_per_month,
         };
@@ -134,6 +144,41 @@ pub fn run_optimize(
     }
 
     Ok(())
+}
+
+/// Load model definitions from disk and build DAG nodes.
+///
+/// Returns an empty Vec if `models_dir` is `None` or if loading fails.
+/// Failure to read models is non-fatal — the optimize command degrades
+/// gracefully to `downstream_references: 0` for all models.
+fn load_dag_from_models(models_dir: Option<&Path>) -> Vec<DagNode> {
+    let Some(dir) = models_dir else {
+        return vec![];
+    };
+
+    let mut all_models = match models::load_models_from_dir(dir) {
+        Ok(m) => m,
+        Err(_) => return vec![],
+    };
+
+    // Also check one level of subdirectories (same pattern as estimate.rs).
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(sub) = models::load_models_from_dir(&entry.path()) {
+                    all_models.extend(sub);
+                }
+            }
+        }
+    }
+
+    all_models
+        .iter()
+        .map(|m| DagNode {
+            name: m.config.name.clone(),
+            depends_on: m.config.depends_on.clone(),
+        })
+        .collect()
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

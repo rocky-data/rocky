@@ -528,6 +528,9 @@ enum Command {
 
     /// Analyze materialization costs and recommend strategy changes
     Optimize {
+        /// Path to models directory (used to compute downstream references)
+        #[arg(long, default_value = "models")]
+        models: String,
         /// Filter to a specific model
         #[arg(long)]
         model: Option<String>,
@@ -1047,8 +1050,14 @@ async fn main() -> Result<()> {
             alerts,
             json,
         ),
-        Command::Optimize { model } => {
-            rocky_cli::commands::run_optimize(&cli.state_path, model.as_deref(), json)
+        Command::Optimize { models, model } => {
+            let models_path = std::path::Path::new(&models);
+            let models_dir = if models_path.is_dir() {
+                Some(models_path)
+            } else {
+                None
+            };
+            rocky_cli::commands::run_optimize(&cli.state_path, models_dir, model.as_deref(), json)
         }
         Command::Estimate {
             models,

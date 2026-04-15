@@ -2,7 +2,8 @@
 //!
 //! Compiles models, generates their SQL, and runs EXPLAIN against the
 //! configured warehouse adapter to produce cost estimates (bytes scanned,
-//! row counts, raw plan output).
+//! row counts, raw plan output). When the adapter returns byte counts, a
+//! USD cost estimate is computed using the per-warehouse pricing model.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, info};
 
+use rocky_core::cost::WarehouseCostModel;
 use rocky_core::models;
 use rocky_core::traits::WarehouseAdapter;
 
@@ -32,6 +34,9 @@ pub async fn run_estimate(
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+
+    // Determine warehouse pricing model from the adapter type name.
+    let pricing = resolve_pricing(&rocky_cfg);
 
     // 2. Load all models.
     let all_models = load_all_models(models_dir)?;
@@ -73,7 +78,7 @@ pub async fn run_estimate(
             }
         };
 
-        match run_explain(&warehouse_adapter, &model.config.name, &sql).await {
+        match run_explain(&warehouse_adapter, &model.config.name, &sql, &pricing).await {
             Ok(estimate) => estimates.push(estimate),
             Err(e) => {
                 debug!(model = %model.config.name, "explain failed: {e}");
@@ -98,6 +103,9 @@ pub async fn run_estimate(
             if let Some(rows) = est.estimated_rows {
                 println!("    Rows: {rows}");
             }
+            if let Some(cost) = est.estimated_cost_usd {
+                println!("    Est. cost: ${cost:.6}");
+            }
             if !est.raw_explain.is_empty() {
                 // Show first 3 lines of EXPLAIN for human-readable summary.
                 let preview: Vec<&str> = est.raw_explain.lines().take(3).collect();
@@ -114,6 +122,12 @@ pub async fn run_estimate(
             }
             println!();
         }
+
+        // Print total cost if any model had a cost estimate.
+        let total: f64 = estimates.iter().filter_map(|e| e.estimated_cost_usd).sum();
+        if total > 0.0 {
+            println!("  Total estimated cost: ${total:.6}");
+        }
     }
 
     Ok(())
@@ -124,16 +138,25 @@ async fn run_explain(
     adapter: &Arc<dyn WarehouseAdapter>,
     model_name: &str,
     sql: &str,
+    pricing: &WarehouseCostModel,
 ) -> Result<ModelEstimate> {
     let explain_result = adapter
         .explain(sql)
         .await
         .context(format!("EXPLAIN failed for model '{model_name}'"))?;
 
+    // Compute USD cost from bytes scanned using the warehouse pricing model.
+    let cost_usd = explain_result.estimated_bytes_scanned.map(|bytes| {
+        let row_estimate = explain_result.estimated_rows.unwrap_or(0);
+        (row_estimate as f64 * pricing.per_row_scan_cost)
+            + (bytes as f64 * pricing.per_byte_io_cost)
+    });
+
     Ok(ModelEstimate {
         model_name: model_name.to_string(),
         estimated_bytes_scanned: explain_result.estimated_bytes_scanned,
         estimated_rows: explain_result.estimated_rows,
+        estimated_cost_usd: cost_usd,
         raw_explain: explain_result.raw_explain,
     })
 }
@@ -156,4 +179,26 @@ fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
     }
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
+}
+
+/// Resolve a warehouse pricing model from the Rocky config.
+///
+/// Inspects the adapter type in the config and returns the appropriate
+/// pricing model. Falls back to Databricks pricing when the adapter type
+/// is not recognized.
+fn resolve_pricing(config: &rocky_core::config::RockyConfig) -> WarehouseCostModel {
+    // Check the default adapter (or first adapter) type string.
+    let adapter_type = config
+        .adapters
+        .values()
+        .next()
+        .map(|a| a.adapter_type.as_str())
+        .unwrap_or("");
+
+    match adapter_type {
+        t if t.contains("snowflake") => WarehouseCostModel::snowflake(),
+        t if t.contains("bigquery") => WarehouseCostModel::bigquery(),
+        t if t.contains("duckdb") => WarehouseCostModel::duckdb(),
+        _ => WarehouseCostModel::databricks(),
+    }
 }

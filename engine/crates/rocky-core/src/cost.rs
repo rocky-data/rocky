@@ -363,6 +363,159 @@ pub fn estimate_aggregate_cost(
 }
 
 // ---------------------------------------------------------------------------
+// DAG-aware cost propagation
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+use crate::dag::DagNode;
+
+/// Per-model table statistics used as seed data for cost propagation.
+///
+/// For source/leaf models with known catalog statistics (row count, average
+/// row size), create a `TableStats` and pass it into [`propagate_costs`].
+/// Transformation models that don't have catalog stats are inferred from
+/// their upstream dependencies.
+#[derive(Debug, Clone)]
+pub struct TableStats {
+    /// Number of rows in the table.
+    pub row_count: u64,
+    /// Average size of a single row in bytes.
+    pub avg_row_bytes: u64,
+}
+
+/// Default filter selectivity applied when propagating cost through a
+/// transformation model that has no explicit statistics.
+///
+/// 0.8 means we assume the transformation retains 80% of upstream rows
+/// (a conservative heuristic — most staging transforms are light filters).
+const DEFAULT_TRANSFORM_SELECTIVITY: f64 = 0.8;
+
+/// Propagates cost estimates through a DAG using topological ordering.
+///
+/// For each node in the DAG:
+/// - If `base_stats` contains an entry, the estimate starts from a table scan
+///   using those statistics.
+/// - Otherwise, the estimate is derived from the node's upstream dependencies
+///   by summing their estimates (to model a union/join) and applying a default
+///   filter selectivity to approximate transformation overhead.
+///
+/// Returns a map from model name to [`CostEstimate`]. Models involved in
+/// cycles (which `topological_sort` would reject) are excluded.
+///
+/// # Errors
+///
+/// Returns `Err` if the DAG contains cycles or references unknown nodes.
+pub fn propagate_costs(
+    nodes: &[DagNode],
+    base_stats: &HashMap<String, TableStats>,
+    warehouse_type: WarehouseType,
+) -> Result<HashMap<String, CostEstimate>, crate::dag::DagError> {
+    let sorted = crate::dag::topological_sort(nodes)?;
+    let mut estimates: HashMap<String, CostEstimate> = HashMap::with_capacity(nodes.len());
+
+    let deps_map: HashMap<&str, &[String]> = nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+        .collect();
+
+    for name in &sorted {
+        if let Some(stats) = base_stats.get(name.as_str()) {
+            // Leaf/source node with known statistics.
+            let est =
+                estimate_table_scan_cost(stats.row_count, stats.avg_row_bytes, warehouse_type);
+            estimates.insert(name.clone(), est);
+        } else {
+            // Transformation node: derive from upstream.
+            let deps = deps_map.get(name.as_str()).copied().unwrap_or(&[]);
+            let upstream: Vec<&CostEstimate> = deps
+                .iter()
+                .filter_map(|d| estimates.get(d.as_str()))
+                .collect();
+
+            let combined = if upstream.is_empty() {
+                // No upstream estimates available — use a minimal placeholder.
+                CostEstimate {
+                    estimated_rows: 0,
+                    estimated_bytes: 0,
+                    estimated_compute_cost_usd: 0.0,
+                    confidence: Confidence::Low,
+                }
+            } else if upstream.len() == 1 {
+                // Single upstream: apply filter selectivity.
+                estimate_filter_cost(upstream[0], DEFAULT_TRANSFORM_SELECTIVITY)
+            } else {
+                // Multiple upstreams: sum rows/bytes/cost, then apply selectivity.
+                let total_rows: u64 = upstream.iter().map(|e| e.estimated_rows).sum();
+                let total_bytes: u64 = upstream.iter().map(|e| e.estimated_bytes).sum();
+                let total_cost: f64 = upstream.iter().map(|e| e.estimated_compute_cost_usd).sum();
+                let min_confidence = upstream
+                    .iter()
+                    .map(|e| e.confidence)
+                    .fold(Confidence::High, Confidence::min);
+
+                let merged = CostEstimate {
+                    estimated_rows: total_rows,
+                    estimated_bytes: total_bytes,
+                    estimated_compute_cost_usd: total_cost,
+                    confidence: min_confidence,
+                };
+                estimate_filter_cost(&merged, DEFAULT_TRANSFORM_SELECTIVITY)
+            };
+
+            estimates.insert(name.clone(), combined);
+        }
+    }
+
+    Ok(estimates)
+}
+
+/// Counts how many downstream (dependent) models each node has.
+///
+/// Returns a map from model name to the number of models that directly
+/// depend on it. Nodes with no downstream dependents are included with
+/// a count of 0.
+#[must_use]
+pub fn downstream_counts(nodes: &[DagNode]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = nodes.iter().map(|n| (n.name.clone(), 0)).collect();
+
+    for node in nodes {
+        for dep in &node.depends_on {
+            if let Some(count) = counts.get_mut(dep.as_str()) {
+                *count += 1;
+            }
+        }
+    }
+
+    counts
+}
+
+/// Aggregates per-model cost estimates into a project total.
+///
+/// Sums the estimated compute cost across all models. Confidence is the
+/// minimum across all inputs.
+#[must_use]
+pub fn aggregate_project_cost(estimates: &HashMap<String, CostEstimate>) -> CostEstimate {
+    let total_rows: u64 = estimates.values().map(|e| e.estimated_rows).sum();
+    let total_bytes: u64 = estimates.values().map(|e| e.estimated_bytes).sum();
+    let total_cost: f64 = estimates
+        .values()
+        .map(|e| e.estimated_compute_cost_usd)
+        .sum();
+    let confidence = estimates
+        .values()
+        .map(|e| e.confidence)
+        .fold(Confidence::High, Confidence::min);
+
+    CostEstimate {
+        estimated_rows: total_rows,
+        estimated_bytes: total_bytes,
+        estimated_compute_cost_usd: total_cost,
+        confidence,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -647,5 +800,219 @@ mod tests {
         assert_eq!(json, "\"medium\"");
         let json = serde_json::to_string(&Confidence::Low).unwrap();
         assert_eq!(json, "\"low\"");
+    }
+
+    // -- DAG propagation -------------------------------------------------------
+
+    fn dag_node(name: &str, deps: &[&str]) -> DagNode {
+        DagNode {
+            name: name.to_string(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn propagate_linear_chain() {
+        // source -> staging -> mart
+        let nodes = vec![
+            dag_node("source", &[]),
+            dag_node("staging", &["source"]),
+            dag_node("mart", &["staging"]),
+        ];
+
+        let mut base = HashMap::new();
+        base.insert(
+            "source".to_string(),
+            TableStats {
+                row_count: 100_000,
+                avg_row_bytes: 200,
+            },
+        );
+
+        let estimates = propagate_costs(&nodes, &base, WarehouseType::Databricks).unwrap();
+
+        assert_eq!(estimates.len(), 3);
+        assert_eq!(estimates["source"].estimated_rows, 100_000);
+        // staging = source * 0.8 selectivity
+        assert_eq!(estimates["staging"].estimated_rows, 80_000);
+        // mart = staging * 0.8 = 64_000
+        assert_eq!(estimates["mart"].estimated_rows, 64_000);
+        // Cost should increase through the pipeline (each stage adds compute).
+        assert!(
+            estimates["staging"].estimated_compute_cost_usd
+                > estimates["source"].estimated_compute_cost_usd
+        );
+    }
+
+    #[test]
+    fn propagate_diamond_dag() {
+        // source -> left, source -> right, left + right -> output
+        let nodes = vec![
+            dag_node("source", &[]),
+            dag_node("left", &["source"]),
+            dag_node("right", &["source"]),
+            dag_node("output", &["left", "right"]),
+        ];
+
+        let mut base = HashMap::new();
+        base.insert(
+            "source".to_string(),
+            TableStats {
+                row_count: 10_000,
+                avg_row_bytes: 128,
+            },
+        );
+
+        let estimates = propagate_costs(&nodes, &base, WarehouseType::Databricks).unwrap();
+
+        assert_eq!(estimates.len(), 4);
+        // left and right both derive from source with 0.8 selectivity.
+        assert_eq!(estimates["left"].estimated_rows, 8_000);
+        assert_eq!(estimates["right"].estimated_rows, 8_000);
+        // output merges left+right (16_000 total) then applies 0.8 selectivity.
+        assert_eq!(estimates["output"].estimated_rows, 12_800);
+    }
+
+    #[test]
+    fn propagate_with_multiple_sources() {
+        let nodes = vec![
+            dag_node("orders", &[]),
+            dag_node("customers", &[]),
+            dag_node("joined", &["orders", "customers"]),
+        ];
+
+        let mut base = HashMap::new();
+        base.insert(
+            "orders".to_string(),
+            TableStats {
+                row_count: 500_000,
+                avg_row_bytes: 256,
+            },
+        );
+        base.insert(
+            "customers".to_string(),
+            TableStats {
+                row_count: 10_000,
+                avg_row_bytes: 128,
+            },
+        );
+
+        let estimates = propagate_costs(&nodes, &base, WarehouseType::BigQuery).unwrap();
+
+        assert_eq!(estimates.len(), 3);
+        assert_eq!(estimates["orders"].estimated_rows, 500_000);
+        assert_eq!(estimates["customers"].estimated_rows, 10_000);
+        // joined = (500_000 + 10_000) * 0.8 = 408_000
+        assert_eq!(estimates["joined"].estimated_rows, 408_000);
+    }
+
+    #[test]
+    fn propagate_duckdb_is_free() {
+        let nodes = vec![dag_node("source", &[]), dag_node("transform", &["source"])];
+
+        let mut base = HashMap::new();
+        base.insert(
+            "source".to_string(),
+            TableStats {
+                row_count: 1_000_000,
+                avg_row_bytes: 100,
+            },
+        );
+
+        let estimates = propagate_costs(&nodes, &base, WarehouseType::DuckDb).unwrap();
+
+        assert_eq!(estimates["source"].estimated_compute_cost_usd, 0.0);
+        // DuckDB per-row costs are zero, but filter still uses Databricks
+        // model for compute overhead — this is acceptable because DuckDB
+        // is local and the cost is symbolic.
+    }
+
+    #[test]
+    fn propagate_empty_dag() {
+        let estimates = propagate_costs(&[], &HashMap::new(), WarehouseType::Databricks).unwrap();
+        assert!(estimates.is_empty());
+    }
+
+    #[test]
+    fn propagate_no_base_stats() {
+        // All nodes are transformations with no catalog stats.
+        let nodes = vec![dag_node("a", &[]), dag_node("b", &["a"])];
+
+        let estimates =
+            propagate_costs(&nodes, &HashMap::new(), WarehouseType::Databricks).unwrap();
+
+        assert_eq!(estimates.len(), 2);
+        // "a" has no upstream and no base stats → zero-row placeholder.
+        assert_eq!(estimates["a"].estimated_rows, 0);
+        assert_eq!(estimates["a"].confidence, Confidence::Low);
+    }
+
+    // -- Downstream counts ----------------------------------------------------
+
+    #[test]
+    fn downstream_counts_diamond() {
+        let nodes = vec![
+            dag_node("source", &[]),
+            dag_node("left", &["source"]),
+            dag_node("right", &["source"]),
+            dag_node("output", &["left", "right"]),
+        ];
+
+        let counts = downstream_counts(&nodes);
+
+        assert_eq!(counts["source"], 2); // left + right depend on source
+        assert_eq!(counts["left"], 1); // only output depends on left
+        assert_eq!(counts["right"], 1); // only output depends on right
+        assert_eq!(counts["output"], 0); // leaf node
+    }
+
+    #[test]
+    fn downstream_counts_independent_nodes() {
+        let nodes = vec![dag_node("a", &[]), dag_node("b", &[]), dag_node("c", &[])];
+
+        let counts = downstream_counts(&nodes);
+
+        assert_eq!(counts["a"], 0);
+        assert_eq!(counts["b"], 0);
+        assert_eq!(counts["c"], 0);
+    }
+
+    #[test]
+    fn downstream_counts_fan_out() {
+        let nodes = vec![
+            dag_node("hub", &[]),
+            dag_node("a", &["hub"]),
+            dag_node("b", &["hub"]),
+            dag_node("c", &["hub"]),
+            dag_node("d", &["hub"]),
+        ];
+
+        let counts = downstream_counts(&nodes);
+
+        assert_eq!(counts["hub"], 4);
+    }
+
+    // -- Aggregate project cost -----------------------------------------------
+
+    #[test]
+    fn aggregate_project_cost_basic() {
+        let nodes = vec![dag_node("source", &[]), dag_node("staging", &["source"])];
+
+        let mut base = HashMap::new();
+        base.insert(
+            "source".to_string(),
+            TableStats {
+                row_count: 100_000,
+                avg_row_bytes: 200,
+            },
+        );
+
+        let estimates = propagate_costs(&nodes, &base, WarehouseType::Databricks).unwrap();
+        let total = aggregate_project_cost(&estimates);
+
+        assert!(total.estimated_rows > 0);
+        assert!(total.estimated_compute_cost_usd > 0.0);
+        // Total rows = source (100k) + staging (80k) = 180k
+        assert_eq!(total.estimated_rows, 180_000);
     }
 }

@@ -786,6 +786,35 @@ impl LanguageServer for RockyLsp {
                     }
                 }
 
+                // Show DAG-propagated cost hint if available.
+                if let Some(cost_est) = compute_model_cost_hint(result, hover_name) {
+                    info_lines.push(String::new());
+                    if cost_est.estimated_compute_cost_usd > 0.0 {
+                        info_lines.push(format!(
+                            "**Est. cost:** ${:.6} ({} rows, {} bytes) — confidence: {}",
+                            cost_est.estimated_compute_cost_usd,
+                            format_number(cost_est.estimated_rows),
+                            format_bytes(cost_est.estimated_bytes),
+                            match cost_est.confidence {
+                                rocky_core::cost::Confidence::High => "high",
+                                rocky_core::cost::Confidence::Medium => "medium",
+                                rocky_core::cost::Confidence::Low => "low",
+                            },
+                        ));
+                    } else {
+                        info_lines.push(format!(
+                            "**Est. rows:** {} ({} bytes) — confidence: {}",
+                            format_number(cost_est.estimated_rows),
+                            format_bytes(cost_est.estimated_bytes),
+                            match cost_est.confidence {
+                                rocky_core::cost::Confidence::High => "high",
+                                rocky_core::cost::Confidence::Medium => "medium",
+                                rocky_core::cost::Confidence::Low => "low",
+                            },
+                        ));
+                    }
+                }
+
                 if let Some(cols) = typed_cols {
                     info_lines.push(String::new());
                     info_lines.push("**Columns:**".to_string());
@@ -1712,6 +1741,70 @@ fn find_column_line_in_sql(sql: &str, column_name: &str) -> u32 {
         }
     }
     0
+}
+
+/// Compute a cost estimate for a model using DAG-aware cardinality propagation.
+///
+/// Returns `None` if the project has no models or the model is not found.
+/// Uses a default row count heuristic (10 000 rows, 256 bytes/row) for leaf
+/// models since we don't have warehouse catalog stats in the LSP context.
+fn compute_model_cost_hint(
+    result: &CompileResult,
+    model_name: &str,
+) -> Option<rocky_core::cost::CostEstimate> {
+    use rocky_core::cost::{TableStats, WarehouseType, propagate_costs};
+
+    let dag_nodes = &result.project.dag_nodes;
+    if dag_nodes.is_empty() {
+        return None;
+    }
+
+    // Build base stats for leaf nodes (models with no depends_on).
+    // We use a default heuristic since we don't have catalog stats in LSP.
+    let mut base_stats = std::collections::HashMap::new();
+    for node in dag_nodes {
+        if node.depends_on.is_empty() {
+            base_stats.insert(
+                node.name.clone(),
+                TableStats {
+                    row_count: 10_000,
+                    avg_row_bytes: 256,
+                },
+            );
+        }
+    }
+
+    let estimates = propagate_costs(dag_nodes, &base_stats, WarehouseType::Databricks).ok()?;
+    estimates.get(model_name).cloned()
+}
+
+/// Format a number with thousands separators for hover display.
+fn format_number(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Format bytes into a human-readable string (KB, MB, GB).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1_024 {
+        format!("{bytes} B")
+    } else if bytes < 1_048_576 {
+        format!("{:.1} KB", bytes as f64 / 1_024.0)
+    } else if bytes < 1_073_741_824 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    }
 }
 
 /// Build rich Markdown hover content for a column, including type, upstream
@@ -2806,5 +2899,29 @@ mod tests {
         let input = "  from orders   \n  where true  \n";
         let formatted = rocky_lang::fmt::format_rocky(input, "    ");
         assert_eq!(formatted, "from orders\nwhere true\n");
+
+    // -- format helpers -------------------------------------------------------
+
+    #[test]
+    fn test_format_number_small() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(42), "42");
+        assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn test_format_number_thousands() {
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(10_000), "10,000");
+        assert_eq!(format_number(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn test_format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1_024), "1.0 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
     }
 }
