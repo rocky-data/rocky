@@ -11,6 +11,7 @@ rocky-core = { path = "../rocky-core" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 rocky-ai = { path = "../rocky-ai" }
 rocky-compiler = { path = "../rocky-compiler" }
+rocky-lang = { path = "../rocky-lang" }
 rocky-server = { path = "../rocky-server" }
 rocky-engine = { path = "../rocky-engine", default-features = false }
 rocky-observe = { path = "../rocky-observe" }

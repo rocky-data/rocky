@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rocky-compiler = { path = "../rocky-compiler" }
 rocky-core = { path = "../rocky-core" }
+rocky-lang = { path = "../rocky-lang" }
 rocky-sql = { path = "../rocky-sql" }
 axum = { workspace = true }
 tower = { workspace = true }
