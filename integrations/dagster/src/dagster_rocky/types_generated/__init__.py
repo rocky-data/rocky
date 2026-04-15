@@ -54,6 +54,9 @@ from .ai_test_schema import AiTestAssertion, AiTestModelResult, AiTestOutput
 # defined canonically below)
 from .ci_schema import CiOutput
 
+# CI diff command — structural diff between git refs
+from .ci_diff_schema import CiDiffOutput, DiffResult, DiffSummary
+
 # Column lineage (per-column shape of `rocky lineage --column <col>`)
 from .column_lineage_schema import ColumnLineageOutput
 
@@ -165,6 +168,10 @@ __all__ = [
     "AiTestAssertion",
     # ci
     "CiOutput",
+    # ci-diff
+    "CiDiffOutput",
+    "DiffResult",
+    "DiffSummary",
     # column lineage
     "ColumnLineageOutput",
     # compile (shared types)

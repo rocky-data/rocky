@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Status of a single model in the diff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDiffStatus {
     /// Model output is identical across both sides.
@@ -46,7 +47,7 @@ impl fmt::Display for ModelDiffStatus {
 // ---------------------------------------------------------------------------
 
 /// The kind of change observed for a single column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnChangeType {
     /// Column was added in the incoming side.
@@ -68,7 +69,7 @@ impl fmt::Display for ColumnChangeType {
 }
 
 /// A single column-level difference within a model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ColumnDiff {
     /// Column name.
     pub column_name: String,
@@ -87,7 +88,7 @@ pub struct ColumnDiff {
 // ---------------------------------------------------------------------------
 
 /// Diff result for a single model between two pipeline states.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiffResult {
     /// Fully-qualified model name (e.g. `catalog.schema.table`).
     pub model_name: String,
@@ -112,7 +113,7 @@ pub struct DiffResult {
 // ---------------------------------------------------------------------------
 
 /// High-level summary across all models in a diff run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiffSummary {
     pub total_models: usize,
     pub unchanged: usize,

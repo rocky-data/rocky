@@ -467,6 +467,21 @@ enum Command {
         contracts: Option<PathBuf>,
     },
 
+    /// Detect changed models between git refs and generate a structural diff report
+    ///
+    /// Compares model files between a base ref (default: main) and HEAD,
+    /// compiles both versions to extract schemas, and produces a report
+    /// showing which models changed and how (added/modified/removed columns).
+    /// Outputs JSON (for CI pipelines) and Markdown (for PR comments).
+    CiDiff {
+        /// Git ref to compare against (default: main)
+        #[arg(default_value = "main")]
+        base_ref: String,
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+
     /// Scaffold a new warehouse adapter crate
     InitAdapter {
         /// Adapter name (e.g., "bigquery", "redshift")
@@ -993,6 +1008,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "duckdb")]
         Command::Ci { models, contracts } => {
             rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
+        }
+        Command::CiDiff { base_ref, models } => {
+            rocky_cli::commands::run_ci_diff(&base_ref, &models, json)
         }
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
         Command::TestAdapter {
