@@ -196,7 +196,7 @@ impl<'a> ExecutionContext<'a> {
 #[tracing::instrument(skip_all, name = "run")]
 pub async fn run(
     config_path: &Path,
-    filter: &str,
+    filter: Option<&str>,
     pipeline_name_arg: Option<&str>,
     state_path: &Path,
     governance_override: Option<&GovernanceOverride>,
@@ -274,7 +274,7 @@ pub async fn run(
     // instead of batched queries.
 
     let pattern = pipeline.schema_pattern()?;
-    let (filter_key, filter_value) = parse_filter(filter)?;
+    let parsed_filter = filter.map(parse_filter).transpose()?;
 
     // Download state from remote storage (S3/Valkey) if configured
     if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path) {
@@ -341,7 +341,7 @@ pub async fn run(
     .await?;
 
     let concurrency = pipeline.execution.concurrency.max(1);
-    let mut output = RunOutput::new(filter.to_string(), 0, concurrency);
+    let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
     let mut catalogs_created: usize = 0;
     let mut schemas_created: usize = 0;
@@ -377,8 +377,10 @@ pub async fn run(
                 Err(_) => continue,
             };
 
-            if !matches_filter(conn, &parsed, &filter_key, &filter_value) {
-                continue;
+            if let Some((ref filter_key, ref filter_value)) = parsed_filter {
+                if !matches_filter(conn, &parsed, filter_key, filter_value) {
+                    continue;
+                }
             }
 
             let components = parsed_to_json_map(&parsed);
