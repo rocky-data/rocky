@@ -16,8 +16,8 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, CiOutput,
-    ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, CiDiffOutput,
+    CiOutput, ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
     DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput,
     ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput,
     PlanOutput, ProfileStorageOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
@@ -51,6 +51,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<CompileOutput>("compile"),
         entry::<TestOutput>("test"),
         entry::<CiOutput>("ci"),
+        entry::<CiDiffOutput>("ci_diff"),
         entry::<OptimizeOutput>("optimize"),
         entry::<EstimateOutput>("estimate"),
         entry::<HistoryOutput>("history"),

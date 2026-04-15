@@ -4,6 +4,7 @@ mod archive;
 pub mod bench;
 #[cfg(feature = "duckdb")]
 mod ci;
+mod ci_diff;
 mod compact;
 mod compare;
 mod compile;
@@ -48,6 +49,7 @@ pub use archive::run_archive;
 pub use bench::run_bench;
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
+pub use ci_diff::run_ci_diff;
 pub use compact::{run_compact, run_measure_dedup};
 pub use compare::compare;
 pub use compile::run_compile;

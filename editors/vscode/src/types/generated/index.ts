@@ -32,6 +32,9 @@ export type { AiTestAssertion, AiTestModelResult, AiTestOutput } from "./ai_test
 // CI
 export type { CiOutput } from "./ci";
 
+// CI Diff
+export type { CiDiffOutput, DiffResult, DiffSummary } from "./ci_diff";
+
 // Column lineage (per-column shape of `rocky lineage --column <col>`)
 export type { ColumnLineageOutput } from "./column_lineage";
 

@@ -836,6 +836,7 @@ RockyOutput = (
     | ColumnLineageResult
     | TestResult
     | CiResult
+    | CiDiffOutput
     | HistoryResult
     | ModelHistoryResult
     | MetricsResult
@@ -862,6 +863,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "compile": CompileResult,
     "test": TestResult,
     "ci": CiResult,
+    "ci-diff": CiDiffOutput,
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
     "ai": AiResult,
@@ -923,7 +925,10 @@ from .types_generated import (  # noqa: E402, F401
     AiTestOutput,
     AnomalyOutput,
     ChecksConfigOutput,
+    CiDiffOutput,
     CiOutput,
+    DiffResult,
+    DiffSummary,
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,

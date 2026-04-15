@@ -1,0 +1,245 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ColumnChangeType": {
+      "description": "The kind of change observed for a single column.",
+      "oneOf": [
+        {
+          "description": "Column was added in the incoming side.",
+          "enum": [
+            "added"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Column was removed (present on base, absent on incoming).",
+          "enum": [
+            "removed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Column data type changed between base and incoming.",
+          "enum": [
+            "type_changed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ColumnDiff": {
+      "description": "A single column-level difference within a model.",
+      "properties": {
+        "change_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ColumnChangeType"
+            }
+          ],
+          "description": "Kind of change."
+        },
+        "column_name": {
+          "description": "Column name.",
+          "type": "string"
+        },
+        "new_type": {
+          "description": "New data type (empty for removed columns).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "old_type": {
+          "description": "Previous data type (empty for added columns).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "change_type",
+        "column_name"
+      ],
+      "type": "object"
+    },
+    "DiffResult": {
+      "description": "Diff result for a single model between two pipeline states.",
+      "properties": {
+        "column_changes": {
+          "description": "Column-level changes (empty for unchanged models).",
+          "items": {
+            "$ref": "#/definitions/ColumnDiff"
+          },
+          "type": "array"
+        },
+        "model_name": {
+          "description": "Fully-qualified model name (e.g. `catalog.schema.table`).",
+          "type": "string"
+        },
+        "row_count_after": {
+          "description": "Row count on the incoming (PR) side. `None` for removed models.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "row_count_before": {
+          "description": "Row count on the base (target branch) side. `None` for added models.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sample_changed_rows": {
+          "description": "Optional sample of changed rows for human review.",
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelDiffStatus"
+            }
+          ],
+          "description": "High-level status."
+        }
+      },
+      "required": [
+        "model_name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "DiffSummary": {
+      "description": "High-level summary across all models in a diff run.",
+      "properties": {
+        "added": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "modified": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "removed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_models": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unchanged": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "added",
+        "modified",
+        "removed",
+        "total_models",
+        "unchanged"
+      ],
+      "type": "object"
+    },
+    "ModelDiffStatus": {
+      "description": "Status of a single model in the diff.",
+      "oneOf": [
+        {
+          "description": "Model output is identical across both sides.",
+          "enum": [
+            "unchanged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists on both sides but output differs.",
+          "enum": [
+            "modified"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists only on the incoming (PR) side.",
+          "enum": [
+            "added"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists only on the base (target branch) side.",
+          "enum": [
+            "removed"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky ci-diff`.\n\nReports which models changed between two git refs, with optional column-level structural diffs when compilation succeeds on both sides.",
+  "properties": {
+    "base_ref": {
+      "description": "Git ref used as the comparison base (e.g. `main`).",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "head_ref": {
+      "description": "Git ref for the incoming changes (typically `HEAD`).",
+      "type": "string"
+    },
+    "markdown": {
+      "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
+      "type": "string"
+    },
+    "models": {
+      "description": "Per-model diff results.",
+      "items": {
+        "$ref": "#/definitions/DiffResult"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DiffSummary"
+        }
+      ],
+      "description": "Aggregate counts of changed models."
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "base_ref",
+    "command",
+    "head_ref",
+    "markdown",
+    "models",
+    "summary",
+    "version"
+  ],
+  "title": "CiDiffOutput",
+  "type": "object"
+}

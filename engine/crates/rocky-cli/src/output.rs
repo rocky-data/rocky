@@ -532,6 +532,46 @@ impl CiOutput {
     }
 }
 
+/// JSON output for `rocky ci-diff`.
+///
+/// Reports which models changed between two git refs, with optional
+/// column-level structural diffs when compilation succeeds on both sides.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CiDiffOutput {
+    pub version: String,
+    pub command: String,
+    /// Git ref used as the comparison base (e.g. `main`).
+    pub base_ref: String,
+    /// Git ref for the incoming changes (typically `HEAD`).
+    pub head_ref: String,
+    /// Aggregate counts of changed models.
+    pub summary: rocky_core::ci_diff::DiffSummary,
+    /// Per-model diff results.
+    pub models: Vec<rocky_core::ci_diff::DiffResult>,
+    /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
+    pub markdown: String,
+}
+
+impl CiDiffOutput {
+    pub fn new(
+        base_ref: String,
+        head_ref: String,
+        summary: rocky_core::ci_diff::DiffSummary,
+        models: Vec<rocky_core::ci_diff::DiffResult>,
+    ) -> Self {
+        let markdown = rocky_core::ci_diff::format_diff_markdown(&models);
+        CiDiffOutput {
+            version: VERSION.to_string(),
+            command: "ci-diff".to_string(),
+            base_ref,
+            head_ref,
+            summary,
+            models,
+            markdown,
+        }
+    }
+}
+
 /// JSON output for `rocky optimize`.
 ///
 /// `recommendations` is empty when no run history exists; `message` is
