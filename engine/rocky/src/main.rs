@@ -715,7 +715,9 @@ async fn main() -> Result<()> {
     // Init structured logging (JSON when output is JSON, human-readable otherwise)
     rocky_observe::tracing_setup::init_tracing(json);
 
-    match cli.command {
+    let config_path = cli.config.clone();
+
+    let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover { pipeline } => {
@@ -1108,7 +1110,23 @@ async fn main() -> Result<()> {
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output } => rocky_cli::commands::export_schemas(&output),
+    };
+
+    // In text mode, try to upgrade config errors to rich miette diagnostics
+    // with source spans and suggestions. JSON mode returns structured errors
+    // unchanged for orchestrators (e.g., Dagster).
+    if let Err(ref err) = result {
+        if !json {
+            if let Some(diagnostic) =
+                rocky_cli::error_reporter::try_upgrade_config_error(err, &config_path)
+            {
+                eprintln!("{:?}", miette::Report::new(diagnostic));
+                std::process::exit(1);
+            }
+        }
     }
+
+    result
 }
 
 /// Waits for SIGTERM (K8s pod termination) or SIGINT (Ctrl+C).

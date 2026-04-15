@@ -154,7 +154,12 @@ pub enum ConfigError {
     ParseToml(#[from] toml::de::Error),
 
     #[error("environment variable '{name}' not set (referenced in config)")]
-    MissingEnvVar { name: String },
+    MissingEnvVar {
+        name: String,
+        /// Byte range of the `${VAR}` placeholder in the raw config file.
+        /// Used by the CLI error reporter to render source spans.
+        span: Option<std::ops::Range<usize>>,
+    },
 
     #[error("invalid schema pattern: {0}")]
     InvalidPattern(#[from] crate::schema::SchemaError),
@@ -593,49 +598,66 @@ static ENV_VAR_RE: LazyLock<Regex> =
 /// - `${VAR:-fallback}` — uses `fallback` if VAR is not set or empty
 pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     let re = &*ENV_VAR_RE;
-    let mut output_lines = Vec::new();
-    let mut errors = Vec::new();
+    let mut result = String::with_capacity(input.len());
+    let mut last_end = 0;
+    // Track the first missing env var and its byte span for diagnostics.
+    let mut first_missing: Option<(String, std::ops::Range<usize>)> = None;
 
-    for line in input.lines() {
-        // Skip TOML comment lines — don't substitute env vars in comments
-        if line.trim_start().starts_with('#') {
-            output_lines.push(line.to_string());
+    for cap in re.captures_iter(input) {
+        let full_match = cap.get(0).expect("capture group 0 always exists");
+        let match_start = full_match.start();
+        let match_end = full_match.end();
+
+        // Check if this match is inside a TOML comment line — find the line
+        // containing this match and skip if it starts with '#'.
+        let line_start = input[..match_start].rfind('\n').map_or(0, |p| p + 1);
+        if input[line_start..].trim_start().starts_with('#') {
+            // Inside a comment — copy verbatim and skip substitution.
+            result.push_str(&input[last_end..match_end]);
+            last_end = match_end;
             continue;
         }
 
-        let mut result_line = line.to_string();
-        for cap in re.captures_iter(line) {
-            let expr = &cap[1];
+        // Copy everything between the last match and this one.
+        result.push_str(&input[last_end..match_start]);
 
-            if let Some(sep_pos) = expr.find(":-") {
-                let var_name = &expr[..sep_pos];
-                let default_value = &expr[sep_pos + 2..];
-                let value = std::env::var(var_name)
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| default_value.to_string());
-                result_line = result_line.replace(&cap[0], &value);
-            } else {
-                match std::env::var(expr) {
-                    Ok(value) => {
-                        result_line = result_line.replace(&cap[0], &value);
+        let expr = &cap[1];
+        if let Some(sep_pos) = expr.find(":-") {
+            let var_name = &expr[..sep_pos];
+            let default_value = &expr[sep_pos + 2..];
+            let value = std::env::var(var_name)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| default_value.to_string());
+            result.push_str(&value);
+        } else {
+            match std::env::var(expr) {
+                Ok(value) => {
+                    result.push_str(&value);
+                }
+                Err(_) => {
+                    if first_missing.is_none() {
+                        first_missing = Some((expr.to_string(), match_start..match_end));
                     }
-                    Err(_) => {
-                        errors.push(expr.to_string());
-                    }
+                    // Keep the placeholder verbatim so the rest of the string
+                    // stays intact for context.
+                    result.push_str(&input[match_start..match_end]);
                 }
             }
         }
-        output_lines.push(result_line);
+        last_end = match_end;
     }
 
-    if let Some(first_missing) = errors.into_iter().next() {
+    if let Some((name, span)) = first_missing {
         return Err(ConfigError::MissingEnvVar {
-            name: first_missing,
+            name,
+            span: Some(span),
         });
     }
 
-    Ok(output_lines.join("\n"))
+    // Copy the tail of the input after the last match.
+    result.push_str(&input[last_end..]);
+    Ok(result)
 }
 
 // ===========================================================================
