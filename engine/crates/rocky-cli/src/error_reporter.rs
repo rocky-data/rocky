@@ -18,13 +18,17 @@ use rocky_core::config::ConfigError;
 
 /// A miette-compatible diagnostic wrapping a Rocky config error with
 /// source context.
+///
+/// The `src` field is optional so that errors which happen before the
+/// config file can be read (e.g., [`ConfigError::FileNotFound`]) can still
+/// render a friendly message and help section without a source snippet.
 #[derive(Debug, miette::Diagnostic, thiserror::Error)]
 #[error("{message}")]
 pub struct ConfigDiagnostic {
     message: String,
 
     #[source_code]
-    src: miette::NamedSource<String>,
+    src: Option<miette::NamedSource<String>>,
 
     #[label("{label}")]
     span: Option<SourceSpan>,
@@ -61,6 +65,21 @@ pub fn try_upgrade_config_error(
     // `.context()` layers.
     let config_err = err.downcast_ref::<ConfigError>()?;
 
+    if let ConfigError::FileNotFound { path } = config_err {
+        return Some(ConfigDiagnostic {
+            message: format!("No rocky.toml found at '{}'", path.display()),
+            src: None,
+            span: None,
+            label: String::new(),
+            help: Some(
+                "Run `rocky init` to create a new project, or use `--config <path>` \
+                 to specify a config file.\n\
+                 Run `rocky playground` to try Rocky with a sample DuckDB project."
+                    .to_string(),
+            ),
+        });
+    }
+
     let source_text = std::fs::read_to_string(config_path).ok()?;
     let named_source = miette::NamedSource::new(config_path.display().to_string(), source_text);
 
@@ -70,7 +89,7 @@ pub fn try_upgrade_config_error(
 
             Some(ConfigDiagnostic {
                 message: format!("environment variable '{name}' is not set"),
-                src: named_source,
+                src: Some(named_source),
                 span: miette_span,
                 label: format!("${{{name}}} referenced here"),
                 help: Some(format!(
@@ -84,7 +103,7 @@ pub fn try_upgrade_config_error(
 
             Some(ConfigDiagnostic {
                 message: format!("invalid TOML syntax: {toml_err}"),
-                src: named_source,
+                src: Some(named_source),
                 span: miette_span,
                 label: "parse error here".to_string(),
                 help: Some(
@@ -97,6 +116,7 @@ pub fn try_upgrade_config_error(
         }
         // ReadFile and InvalidPattern don't have span info — let the
         // caller fall through to standard anyhow rendering.
+        // FileNotFound is handled above.
         _ => None,
     }
 }
@@ -176,6 +196,41 @@ type = "databricks"
 
         let diag = try_upgrade_config_error(&err, &config_path);
         assert!(diag.is_none(), "ReadFile should fall through to anyhow");
+    }
+
+    #[test]
+    fn file_not_found_produces_diagnostic_without_source() {
+        let missing_path = std::path::PathBuf::from("/definitely/not/real/rocky.toml");
+        let err: anyhow::Error = ConfigError::FileNotFound {
+            path: missing_path.clone(),
+        }
+        .into();
+
+        let diag = try_upgrade_config_error(&err, &missing_path);
+        assert!(
+            diag.is_some(),
+            "should produce a diagnostic for FileNotFound even when the file cannot be read"
+        );
+        let diag = diag.unwrap();
+        assert!(diag.message.contains("No rocky.toml found"));
+        assert!(diag.message.contains("/definitely/not/real/rocky.toml"));
+        let help = diag.help.as_ref().unwrap();
+        assert!(help.contains("rocky init"));
+        assert!(help.contains("rocky playground"));
+        assert!(help.contains("--config"));
+        assert!(diag.src.is_none());
+        assert!(diag.span.is_none());
+    }
+
+    #[test]
+    fn load_rocky_config_returns_file_not_found_for_missing_path() {
+        use rocky_core::config::load_rocky_config;
+        let missing = std::path::PathBuf::from("/definitely/not/real/rocky.toml");
+        let err = load_rocky_config(&missing).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::FileNotFound { .. }),
+            "expected FileNotFound, got: {err:?}"
+        );
     }
 
     #[test]

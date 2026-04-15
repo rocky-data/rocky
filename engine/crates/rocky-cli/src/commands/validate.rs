@@ -26,9 +26,14 @@ pub fn validate(config_path: &Path, json: bool) -> Result<()> {
 fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     let mut out = ValidateOutput::new();
 
-    // Check file exists
+    // Check file exists. Return the typed ConfigError so the CLI
+    // error reporter can upgrade it to a rich miette diagnostic with
+    // `rocky init` / `rocky playground` hints.
     if !config_path.exists() {
-        anyhow::bail!("Config file not found: {}", config_path.display());
+        return Err(rocky_core::config::ConfigError::FileNotFound {
+            path: config_path.to_path_buf(),
+        }
+        .into());
     }
 
     // Parse config (with env var substitution)
