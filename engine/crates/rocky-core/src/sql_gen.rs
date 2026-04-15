@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::ir::{
     MaterializationStrategy, PartitionWindow, ReplicationPlan, SnapshotPlan, TransformationPlan,
 };
-use crate::lakehouse;
+use crate::lakehouse::{self, LakehouseError};
 use crate::traits::SqlDialect;
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
@@ -23,6 +23,9 @@ pub enum SqlGenError {
         "time_interval plan is missing its PartitionWindow — the runtime must populate `window` per partition before calling generate_transformation_sql"
     )]
     MissingPartitionWindow,
+
+    #[error("lakehouse DDL error: {0}")]
+    Lakehouse(#[from] LakehouseError),
 }
 
 /// Generates the SELECT SQL for a replication plan using the given dialect.
@@ -217,15 +220,16 @@ pub fn generate_transformation_sql(
     }
 
     // If a lakehouse format is specified, use format-specific DDL generation
-    // for strategies that create tables (FullRefresh).
+    // for strategies that create tables (FullRefresh, Incremental first-run,
+    // Merge first-run). The runtime calls `generate_transformation_initial_ddl`
+    // for the initial table creation of non-FullRefresh strategies; here we
+    // handle FullRefresh which always does CTAS.
     if let Some(ref format) = plan.format {
         if matches!(plan.strategy, MaterializationStrategy::FullRefresh) {
             let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
-            return lakehouse::generate_lakehouse_ddl(format, &target, &plan.sql, &opts, dialect)
-                .map_err(|e| SqlGenError::UnsafeFragment {
-                    value: String::new(),
-                    reason: e.to_string(),
-                });
+            return Ok(lakehouse::generate_lakehouse_ddl(
+                format, &target, &plan.sql, &opts, dialect,
+            )?);
         }
     }
 
@@ -385,7 +389,60 @@ pub fn generate_time_interval_bootstrap_sql(
     };
 
     let body = substitute_partition_placeholders(&plan.sql, &bootstrap_window);
+
+    // When a lakehouse format is specified, the bootstrap table must be
+    // created using format-specific DDL (e.g., USING DELTA / USING ICEBERG)
+    // so the partitioning, clustering, and table properties are applied from
+    // the very first creation.
+    if let Some(ref format) = plan.format {
+        let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
+        let stmts = lakehouse::generate_lakehouse_ddl(format, &target, &body, &opts, dialect)?;
+        // generate_lakehouse_ddl returns Vec<String>; join into a single
+        // statement since the bootstrap function returns String.
+        return Ok(stmts.join(";\n"));
+    }
+
     Ok(dialect.create_table_as(&target, &body))
+}
+
+/// Generates the initial DDL to create a target table with lakehouse format
+/// for non-FullRefresh strategies.
+///
+/// Strategies like Incremental, Merge, DeleteInsert, and Microbatch need
+/// the target table to exist before their first INSERT/MERGE run. When
+/// `plan.format` is set, the runtime should call this function to create
+/// the table using format-specific DDL (e.g., `CREATE TABLE ... USING DELTA`).
+///
+/// When `plan.format` is `None`, falls back to a plain
+/// `dialect.create_table_as`. The body SQL is the plan's `sql` field, so
+/// the table schema matches what the model would produce.
+///
+/// This is complementary to `generate_transformation_sql` — the runtime
+/// calls this once on first run, then switches to the regular strategy
+/// for subsequent runs.
+pub fn generate_transformation_initial_ddl(
+    plan: &TransformationPlan,
+    dialect: &dyn SqlDialect,
+) -> Result<Vec<String>, SqlGenError> {
+    let target = dialect
+        .format_table_ref(
+            &plan.target.catalog,
+            &plan.target.schema,
+            &plan.target.table,
+        )
+        .map_err(|e| SqlGenError::UnsafeFragment {
+            value: String::new(),
+            reason: e.to_string(),
+        })?;
+
+    if let Some(ref format) = plan.format {
+        let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
+        return Ok(lakehouse::generate_lakehouse_ddl(
+            format, &target, &plan.sql, &opts, dialect,
+        )?);
+    }
+
+    Ok(vec![dialect.create_table_as(&target, &plan.sql)])
 }
 
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
@@ -1450,5 +1507,392 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             result.is_ok(),
             "bootstrap should not error on missing window: {result:?}"
         );
+    }
+
+    // ----- lakehouse format integration tests -----
+
+    use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
+
+    fn lakehouse_plan(
+        format: LakehouseFormat,
+        options: LakehouseOptions,
+        strategy: MaterializationStrategy,
+    ) -> TransformationPlan {
+        TransformationPlan {
+            sources: vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "raw".into(),
+                table: "stg_orders".into(),
+            }],
+            target: TargetRef {
+                catalog: "cat".into(),
+                schema: "silver".into(),
+                table: "fct_orders".into(),
+            },
+            strategy,
+            sql: "SELECT id, amount, region FROM cat.raw.stg_orders".into(),
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            format: Some(format),
+            format_options: Some(options),
+        }
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_delta() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions {
+                partition_by: vec!["region".into()],
+                cluster_by: vec!["id".into()],
+                table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
+                comment: Some("Orders fact table".into()),
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(sql.contains("USING DELTA"), "expected USING DELTA: {sql}");
+        assert!(
+            sql.contains("PARTITIONED BY (region)"),
+            "expected partition clause: {sql}"
+        );
+        assert!(
+            sql.contains("CLUSTER BY (id)"),
+            "expected cluster clause: {sql}"
+        );
+        assert!(
+            sql.contains("COMMENT 'Orders fact table'"),
+            "expected comment: {sql}"
+        );
+        assert!(
+            sql.contains("TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"),
+            "expected tblproperties: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT id, amount, region FROM cat.raw.stg_orders"),
+            "expected body SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_iceberg() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::IcebergTable,
+            LakehouseOptions {
+                partition_by: vec!["region".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING ICEBERG"),
+            "expected USING ICEBERG: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (region)"),
+            "expected partition clause: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_streaming_table() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::StreamingTable,
+            LakehouseOptions::default(),
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].contains("CREATE OR REPLACE STREAMING TABLE"),
+            "expected STREAMING TABLE: {}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_view() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::View,
+            LakehouseOptions::default(),
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].contains("CREATE OR REPLACE VIEW"),
+            "expected VIEW: {}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_materialized_view() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::MaterializedView,
+            LakehouseOptions {
+                comment: Some("MV test".into()),
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("CREATE OR REPLACE MATERIALIZED VIEW"),
+            "expected MATERIALIZED VIEW: {sql}"
+        );
+        assert!(sql.contains("COMMENT 'MV test'"), "expected comment: {sql}");
+    }
+
+    #[test]
+    fn test_lakehouse_full_refresh_plain_table() {
+        // LakehouseFormat::Table with options should still apply partitioning
+        // and properties even though it's a "plain" table.
+        let plan = lakehouse_plan(
+            LakehouseFormat::Table,
+            LakehouseOptions {
+                cluster_by: vec!["id".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("CREATE OR REPLACE TABLE"),
+            "expected CTAS: {sql}"
+        );
+        assert!(
+            sql.contains("CLUSTER BY (id)"),
+            "expected cluster clause: {sql}"
+        );
+        // Plain table should NOT have USING DELTA/ICEBERG.
+        assert!(
+            !sql.contains("USING"),
+            "plain table should not have USING: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_incremental_ignores_format_on_insert() {
+        // Incremental INSERT should not emit lakehouse DDL — that's for
+        // initial table creation. The format field is silently ignored for
+        // the INSERT path, since the table already exists.
+        let plan = lakehouse_plan(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions::default(),
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+                watermark: None,
+            },
+        );
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].starts_with("INSERT INTO"),
+            "incremental should be INSERT INTO: {}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_delta() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions {
+                partition_by: vec!["region".into()],
+                table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+                watermark: None,
+            },
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING DELTA"),
+            "initial DDL should use DELTA: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (region)"),
+            "initial DDL should include partitioning: {sql}"
+        );
+        assert!(
+            sql.contains("TBLPROPERTIES"),
+            "initial DDL should include tblproperties: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_iceberg() {
+        let plan = lakehouse_plan(
+            LakehouseFormat::IcebergTable,
+            LakehouseOptions {
+                cluster_by: vec!["user_id".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: ColumnSelection::All,
+            },
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING ICEBERG"),
+            "initial DDL should use ICEBERG: {sql}"
+        );
+        assert!(
+            sql.contains("CLUSTER BY (user_id)"),
+            "initial DDL should include clustering: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_fallback_no_format() {
+        // When format is None, generate_transformation_initial_ddl should
+        // fall back to the plain dialect.create_table_as.
+        let plan = TransformationPlan {
+            format: None,
+            format_options: None,
+            ..lakehouse_plan(
+                LakehouseFormat::DeltaTable,
+                LakehouseOptions::default(),
+                MaterializationStrategy::FullRefresh,
+            )
+        };
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].starts_with("CREATE OR REPLACE TABLE"),
+            "should fall back to plain CTAS: {}",
+            stmts[0]
+        );
+        assert!(
+            !stmts[0].contains("USING"),
+            "plain fallback should not contain USING: {}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_time_interval_bootstrap_with_delta_format() {
+        // Time-interval bootstrap should use lakehouse DDL when format is set.
+        let mut plan = time_interval_plan(
+            "order_date",
+            "SELECT order_date, amount FROM cat.raw.stg_orders \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            None,
+        );
+        plan.format = Some(LakehouseFormat::DeltaTable);
+        plan.format_options = Some(LakehouseOptions {
+            partition_by: vec!["order_date".into()],
+            table_properties: vec![("delta.autoOptimize.optimizeWrite".into(), "true".into())],
+            ..LakehouseOptions::default()
+        });
+
+        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
+        assert!(
+            sql.contains("USING DELTA"),
+            "bootstrap should use DELTA: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (order_date)"),
+            "bootstrap should include partitioning: {sql}"
+        );
+        assert!(
+            sql.contains("TBLPROPERTIES"),
+            "bootstrap should include tblproperties: {sql}"
+        );
+        // Sentinel timestamps should be substituted.
+        assert!(
+            sql.contains("'1900-01-01 00:00:00'"),
+            "bootstrap should have sentinel timestamps: {sql}"
+        );
+        // Bare placeholders should be gone.
+        assert!(
+            !sql.contains("@start_date"),
+            "placeholder not substituted: {sql}"
+        );
+        assert!(
+            !sql.contains("@end_date"),
+            "placeholder not substituted: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_time_interval_bootstrap_without_format() {
+        // Without format, bootstrap should use plain CTAS as before.
+        let plan = time_interval_plan(
+            "order_date",
+            "SELECT order_date FROM cat.raw.stg_orders \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            None,
+        );
+        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
+        assert!(
+            sql.starts_with("CREATE OR REPLACE TABLE"),
+            "should use plain CTAS: {sql}"
+        );
+        assert!(
+            !sql.contains("USING"),
+            "plain bootstrap should not contain USING: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_with_delete_insert_strategy() {
+        // DeleteInsert strategy should also get lakehouse DDL on initial creation.
+        let plan = lakehouse_plan(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions {
+                partition_by: vec!["date_key".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::DeleteInsert {
+                partition_by: vec!["date_key".into()],
+            },
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING DELTA"),
+            "initial DDL should use DELTA: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (date_key)"),
+            "should include partitioning: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_invalid_option_rejected() {
+        // Ensure invalid lakehouse options propagate as LakehouseError.
+        let plan = lakehouse_plan(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions {
+                partition_by: vec!["DROP TABLE --".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let result = generate_transformation_initial_ddl(&plan, &dialect());
+        assert!(result.is_err(), "should reject invalid partition column");
     }
 }
