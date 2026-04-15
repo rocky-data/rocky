@@ -10,7 +10,7 @@ use rocky_compiler::diagnostic::{self, Severity};
 use rocky_compiler::incrementality;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
 
-use crate::output::{CompileOutput, ModelDetail, print_json};
+use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
 /// Execute `rocky compile`.
 pub fn run_compile(
@@ -69,6 +69,25 @@ pub fn run_compile(
     };
 
     if output_json {
+        // Compute DAG-propagated cost estimates for all models.
+        let cost_estimates = {
+            use rocky_core::cost::{TableStats, WarehouseType, propagate_costs};
+            let dag_nodes = &result.project.dag_nodes;
+            let mut base_stats = std::collections::HashMap::new();
+            for node in dag_nodes {
+                if node.depends_on.is_empty() {
+                    base_stats.insert(
+                        node.name.clone(),
+                        TableStats {
+                            row_count: 10_000,
+                            avg_row_bytes: 256,
+                        },
+                    );
+                }
+            }
+            propagate_costs(dag_nodes, &base_stats, WarehouseType::Databricks).unwrap_or_default()
+        };
+
         let models_detail: Vec<ModelDetail> = result
             .project
             .models
@@ -86,6 +105,16 @@ pub fn run_compile(
                     &model.sql,
                     &model.config.strategy,
                 );
+                let cost_hint = cost_estimates.get(&model.config.name).map(|est| CostHint {
+                    estimated_rows: est.estimated_rows,
+                    estimated_bytes: est.estimated_bytes,
+                    estimated_cost_usd: est.estimated_compute_cost_usd,
+                    confidence: match est.confidence {
+                        rocky_core::cost::Confidence::High => "high".to_string(),
+                        rocky_core::cost::Confidence::Medium => "medium".to_string(),
+                        rocky_core::cost::Confidence::Low => "low".to_string(),
+                    },
+                });
                 ModelDetail {
                     name: model.config.name.clone(),
                     strategy: model.config.strategy.clone(),
@@ -93,6 +122,7 @@ pub fn run_compile(
                     freshness: model.config.freshness.clone(),
                     contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                     incrementality_hint,
+                    cost_hint,
                 }
             })
             .collect();

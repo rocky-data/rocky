@@ -380,6 +380,29 @@ pub struct ModelDetail {
     /// were found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incrementality_hint: Option<rocky_compiler::incrementality::IncrementalityHint>,
+    /// DAG-propagated cost estimate for this model. Populated at compile
+    /// time using heuristic cardinality propagation (no warehouse round-trip).
+    /// `None` when no upstream table statistics are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<CostHint>,
+}
+
+/// Heuristic cost estimate derived from DAG-aware cardinality propagation.
+///
+/// These numbers are directional — useful for comparing models within a
+/// project and surfacing expensive operations in the LSP, but not precise
+/// enough to substitute for a warehouse EXPLAIN. Use `rocky estimate` for
+/// warehouse-backed estimates.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CostHint {
+    /// Estimated number of output rows.
+    pub estimated_rows: u64,
+    /// Estimated total output bytes.
+    pub estimated_bytes: u64,
+    /// Estimated compute cost in USD.
+    pub estimated_cost_usd: f64,
+    /// Confidence level: `"low"`, `"medium"`, or `"high"`.
+    pub confidence: String,
 }
 
 impl CompileOutput {
@@ -644,6 +667,10 @@ pub struct EstimateOutput {
     pub command: String,
     pub estimates: Vec<ModelEstimate>,
     pub total_models: usize,
+    /// Total estimated cost in USD across all models. `None` when no
+    /// individual model produced a cost estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_estimated_cost_usd: Option<f64>,
 }
 
 /// Cost estimate for a single model.
@@ -656,6 +683,9 @@ pub struct ModelEstimate {
     /// Estimated number of rows (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_rows: Option<u64>,
+    /// Estimated compute cost in USD (derived from warehouse pricing model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
     /// Raw EXPLAIN output from the warehouse.
     pub raw_explain: String,
 }
@@ -663,11 +693,18 @@ pub struct ModelEstimate {
 impl EstimateOutput {
     pub fn new(estimates: Vec<ModelEstimate>) -> Self {
         let count = estimates.len();
+        let total_cost: f64 = estimates.iter().filter_map(|e| e.estimated_cost_usd).sum();
+        let total_cost = if total_cost > 0.0 {
+            Some(total_cost)
+        } else {
+            None
+        };
         EstimateOutput {
             version: VERSION.to_string(),
             command: "estimate".to_string(),
             estimates,
             total_models: count,
+            total_estimated_cost_usd: total_cost,
         }
     }
 }

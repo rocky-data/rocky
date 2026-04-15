@@ -179,6 +179,10 @@ export interface ModelDetail {
    */
   contract_source?: string | null;
   /**
+   * DAG-propagated cost estimate for this model. Populated at compile time using heuristic cardinality propagation (no warehouse round-trip). `None` when no upstream table statistics are available.
+   */
+  cost_hint?: CostHint | null;
+  /**
    * Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured.
    */
   freshness?: ModelFreshnessConfig | null;
@@ -195,6 +199,30 @@ export interface ModelDetail {
    * Target table coordinates.
    */
   target: TargetConfig;
+  [k: string]: unknown;
+}
+/**
+ * Heuristic cost estimate derived from DAG-aware cardinality propagation.
+ *
+ * These numbers are directional — useful for comparing models within a project and surfacing expensive operations in the LSP, but not precise enough to substitute for a warehouse EXPLAIN. Use `rocky estimate` for warehouse-backed estimates.
+ */
+export interface CostHint {
+  /**
+   * Confidence level: `"low"`, `"medium"`, or `"high"`.
+   */
+  confidence: string;
+  /**
+   * Estimated total output bytes.
+   */
+  estimated_bytes: number;
+  /**
+   * Estimated compute cost in USD.
+   */
+  estimated_cost_usd: number;
+  /**
+   * Estimated number of output rows.
+   */
+  estimated_rows: number;
   [k: string]: unknown;
 }
 /**

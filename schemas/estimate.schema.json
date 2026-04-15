@@ -13,6 +13,14 @@
             "null"
           ]
         },
+        "estimated_cost_usd": {
+          "description": "Estimated compute cost in USD (derived from warehouse pricing model).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "estimated_rows": {
           "description": "Estimated number of rows (if available).",
           "format": "uint64",
@@ -47,6 +55,14 @@
         "$ref": "#/definitions/ModelEstimate"
       },
       "type": "array"
+    },
+    "total_estimated_cost_usd": {
+      "description": "Total estimated cost in USD across all models. `None` when no individual model produced a cost estimate.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
     },
     "total_models": {
       "format": "uint",
