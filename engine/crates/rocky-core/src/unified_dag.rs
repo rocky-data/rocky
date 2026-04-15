@@ -110,6 +110,10 @@ pub enum NodeKind {
     /// External data source (Fivetran connector, manual source definition).
     Source,
     /// Table replication (incremental copy, full refresh).
+    ///
+    /// Retained for deserialization compatibility with stored DAGs. New DAGs
+    /// expand replication pipelines into [`Source`](Self::Source) +
+    /// [`Load`](Self::Load) node pairs via parse-layer sugar.
     Replication,
     /// SQL/Rocky model execution.
     Transformation,
