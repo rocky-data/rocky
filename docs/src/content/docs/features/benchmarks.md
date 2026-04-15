@@ -22,6 +22,33 @@ Rocky 0.3.0 (post-optimization) compiles 10,000 models in **1.00 second** — **
 
 Benchmarked on Apple Silicon (12-core, 36 GB RAM) with a synthetic 4-layer medallion DAG. 3 iterations per benchmark, mean reported. Full methodology in `examples/playground/benchmarks/REPORT_CURRENT.md`.
 
+## Why Rocky Is This Fast
+
+The numbers above aren't just "Rust is faster than Python." They come from specific architectural decisions:
+
+**No Jinja, no manifest, no parse step.** dbt loads a Python interpreter, parses Jinja templates, and serializes a manifest file (often 100+ MB at scale) before it can resolve the DAG. Rocky goes straight from TOML + SQL to an in-memory execution plan — no templating engine, no intermediate serialization. This is why startup is 64x faster and config validation is 146x faster.
+
+**Parallel type checking by DAG layer.** Rocky groups models into execution layers (models within a layer have no interdependencies) and type-checks each layer in parallel across all CPU cores via [rayon](https://github.com/rayon-rs/rayon). dbt's graph traversal is single-threaded Python. This drives the 34x compile speedup.
+
+**String interning.** In a 10k-model project, identifiers like `catalog.schema.table` repeat thousands of times across model metadata. Rocky interns them via [lasso](https://github.com/Kixiron/lasso) — each unique string is stored once, every reference is a cheap integer handle. dbt duplicates these strings across Python dicts and dataclass instances. This is why Rocky uses 4.3x less memory.
+
+**Memory-mapped file I/O.** For files larger than 4 KB, Rocky uses OS-level `mmap` instead of buffered reads. The OS handles page-level scheduling and avoids copying file contents into the GC heap. At 10k+ SQL files, this reduces both memory pressure and syscall overhead.
+
+**Embedded state store.** Rocky tracks incremental state in an embedded [redb](https://github.com/cberner/redb) transactional database. dbt uses YAML/JSON files that must be fully loaded and parsed. Atomic reads from redb are why warm compiles (0.72s) are 28% faster than cold compiles.
+
+**Optimized release binary.** The Rocky binary is compiled with `opt-level = 3`, thin LTO, single codegen unit, and `panic = "abort"` — producing a ~15 MB static binary with no runtime dependencies. Startup is 14ms vs dbt's 896ms Python interpreter bootstrap.
+
+### How does SQLMesh compare?
+
+SQLMesh is architecturally closer to Rocky than dbt — it uses [SQLGlot](https://github.com/tobymao/sqlglot) for static SQL analysis instead of Jinja templates. But it's still Python-bound:
+
+- **Single-threaded analysis.** SQLGlot parses and type-checks models sequentially in Python. Rocky parallelizes type checking across DAG layers via rayon, using all available CPU cores.
+- **Python AST overhead.** SQLGlot represents every SQL AST node as a Python object with full string attributes. Rocky interns identifiers and uses Rust's zero-cost abstractions — same analysis, a fraction of the memory.
+- **Snapshot state.** SQLMesh maintains "snapshots" (similar to dbt's manifest) that track environment state and grow with project size. Rocky keeps the project graph in-memory with no serialization step, and persists only incremental watermarks in an embedded redb database.
+- **Runtime overhead.** SQLMesh loads the Python interpreter, SQLGlot, and its dependency tree on every invocation. Rocky's static binary starts in 14ms.
+
+The result: at 10k models, Rocky compiles in ~1 second using ~147 MB. Python-based tools — whether they use Jinja (dbt) or SQLGlot (SQLMesh) — operate in the 30-40 second range with 4-7x the memory footprint.
+
 ## What These Numbers Mean
 
 ### For CI/CD
