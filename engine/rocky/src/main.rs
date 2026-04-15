@@ -225,9 +225,9 @@ enum Command {
 
     /// Load files (CSV, Parquet, JSONL) from a directory into the warehouse
     Load {
-        /// Source directory containing data files
+        /// Source directory containing data files (overrides pipeline config)
         #[arg(long)]
-        source_dir: PathBuf,
+        source_dir: Option<PathBuf>,
         /// File format: csv, parquet, jsonl (default: auto-detect from extension)
         #[arg(long)]
         format: Option<String>,
@@ -866,7 +866,7 @@ async fn main() -> Result<()> {
         } => {
             rocky_cli::commands::run_load(
                 &cli.config,
-                &source_dir,
+                source_dir.as_deref(),
                 format.as_deref(),
                 target.as_deref(),
                 pipeline.as_deref(),

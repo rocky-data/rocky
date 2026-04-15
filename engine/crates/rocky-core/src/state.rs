@@ -26,6 +26,13 @@ const PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("partition
 /// is deleted; when the grace period expires the column is dropped from
 /// the target and the record is removed.
 const GRACE_PERIODS: TableDefinition<&str, &[u8]> = TableDefinition::new("grace_periods");
+/// Per-file load tracking for the `load` pipeline type.
+///
+/// Key format: `"{pipeline_name}|{file_path}"` (e.g.
+/// `"ingest|data/orders.csv"`). Value: serialized [`LoadedFileRecord`].
+/// Used for incremental loads: files already recorded with a matching hash
+/// can be skipped.
+const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_files");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -34,7 +41,7 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 /// Increment this constant whenever a table is added, removed, or structurally
 /// changed in a way that is incompatible with an older binary. Rocky will
 /// refuse to open a database whose stored version exceeds this value.
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -128,7 +135,7 @@ impl StateStore {
                 }
                 None => {
                     // Fresh database or pre-versioning database — stamp the version.
-                    metadata.insert("schema_version", "2")?;
+                    metadata.insert("schema_version", "3")?;
                 }
             }
 
@@ -140,6 +147,7 @@ impl StateStore {
             let _table = txn.open_table(RUN_PROGRESS)?;
             let _table = txn.open_table(PARTITIONS)?;
             let _table = txn.open_table(GRACE_PERIODS)?;
+            let _table = txn.open_table(LOADED_FILES)?;
         }
         txn.commit()?;
 
@@ -822,6 +830,104 @@ impl StateStore {
         txn.commit()?;
         Ok(removed)
     }
+
+    // ------------------------------------------------------------------
+    // Loaded-files tracking (load pipeline)
+    // ------------------------------------------------------------------
+
+    /// Records a successfully loaded file for a pipeline.
+    ///
+    /// Key: `"{pipeline}|{file_path}"`.
+    pub fn record_loaded_file(
+        &self,
+        pipeline: &str,
+        file_path: &str,
+        record: &LoadedFileRecord,
+    ) -> Result<(), StateError> {
+        let key = loaded_file_key(pipeline, file_path);
+        let bytes = serde_json::to_vec(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(LOADED_FILES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Gets the record for a previously loaded file.
+    pub fn get_loaded_file(
+        &self,
+        pipeline: &str,
+        file_path: &str,
+    ) -> Result<Option<LoadedFileRecord>, StateError> {
+        let key = loaded_file_key(pipeline, file_path);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(LOADED_FILES)?;
+        match table.get(key.as_str())? {
+            Some(value) => {
+                let record: LoadedFileRecord = serde_json::from_slice(value.value())?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists all loaded files for a pipeline.
+    pub fn list_loaded_files(
+        &self,
+        pipeline: &str,
+    ) -> Result<Vec<(String, LoadedFileRecord)>, StateError> {
+        let prefix = format!("{pipeline}|");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(LOADED_FILES)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key_str = key.value();
+            if key_str.starts_with(&prefix) {
+                let file_path = key_str[prefix.len()..].to_string();
+                let record: LoadedFileRecord = serde_json::from_slice(value.value())?;
+                results.push((file_path, record));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Deletes the record for a loaded file.
+    /// Returns true if a record was removed.
+    pub fn delete_loaded_file(&self, pipeline: &str, file_path: &str) -> Result<bool, StateError> {
+        let key = loaded_file_key(pipeline, file_path);
+        let txn = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = txn.open_table(LOADED_FILES)?;
+            removed = table.remove(key.as_str())?.is_some();
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+}
+
+/// Builds the key for the LOADED_FILES table.
+fn loaded_file_key(pipeline: &str, file_path: &str) -> String {
+    format!("{pipeline}|{file_path}")
+}
+
+/// Record of a successfully loaded file, stored in the state database.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoadedFileRecord {
+    /// Timestamp of the load operation.
+    pub loaded_at: chrono::DateTime<chrono::Utc>,
+    /// Number of rows loaded from this file.
+    pub rows_loaded: u64,
+    /// Size of the source file in bytes.
+    pub bytes_read: u64,
+    /// Duration of the load in milliseconds.
+    pub duration_ms: u64,
+    /// SHA-256 hash of the file content (hex-encoded).
+    /// Used for change detection on incremental loads.
+    pub file_hash: Option<String>,
 }
 
 /// A historical row count snapshot for anomaly detection.
@@ -1623,6 +1729,127 @@ mod tests {
         assert!(
             store
                 .get_partition("fct", "orders|2026-04")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // --- Loaded-files tracking tests ---
+
+    fn make_loaded_file_record(rows: u64, bytes: u64) -> LoadedFileRecord {
+        LoadedFileRecord {
+            loaded_at: Utc::now(),
+            rows_loaded: rows,
+            bytes_read: bytes,
+            duration_ms: 100,
+            file_hash: Some("abc123".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_record_and_get_loaded_file() {
+        let (store, _dir) = temp_store();
+        let rec = make_loaded_file_record(1000, 50_000);
+
+        store
+            .record_loaded_file("ingest", "data/orders.csv", &rec)
+            .unwrap();
+
+        let retrieved = store
+            .get_loaded_file("ingest", "data/orders.csv")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.rows_loaded, 1000);
+        assert_eq!(retrieved.bytes_read, 50_000);
+        assert_eq!(retrieved.file_hash.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_get_nonexistent_loaded_file() {
+        let (store, _dir) = temp_store();
+        assert!(
+            store
+                .get_loaded_file("ingest", "data/nope.csv")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_record_loaded_file_overwrites() {
+        let (store, _dir) = temp_store();
+        let rec1 = make_loaded_file_record(100, 5000);
+        store
+            .record_loaded_file("ingest", "data/orders.csv", &rec1)
+            .unwrap();
+
+        let rec2 = make_loaded_file_record(200, 10_000);
+        store
+            .record_loaded_file("ingest", "data/orders.csv", &rec2)
+            .unwrap();
+
+        let retrieved = store
+            .get_loaded_file("ingest", "data/orders.csv")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.rows_loaded, 200);
+    }
+
+    #[test]
+    fn test_list_loaded_files_filters_by_pipeline() {
+        let (store, _dir) = temp_store();
+        store
+            .record_loaded_file("pipe_a", "a.csv", &make_loaded_file_record(10, 100))
+            .unwrap();
+        store
+            .record_loaded_file("pipe_a", "b.csv", &make_loaded_file_record(20, 200))
+            .unwrap();
+        store
+            .record_loaded_file("pipe_b", "c.csv", &make_loaded_file_record(30, 300))
+            .unwrap();
+
+        let a_files = store.list_loaded_files("pipe_a").unwrap();
+        assert_eq!(a_files.len(), 2);
+
+        let b_files = store.list_loaded_files("pipe_b").unwrap();
+        assert_eq!(b_files.len(), 1);
+        assert_eq!(b_files[0].0, "c.csv");
+    }
+
+    #[test]
+    fn test_list_loaded_files_empty() {
+        let (store, _dir) = temp_store();
+        let files = store.list_loaded_files("nonexistent").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_delete_loaded_file() {
+        let (store, _dir) = temp_store();
+        store
+            .record_loaded_file("ingest", "data/x.csv", &make_loaded_file_record(10, 100))
+            .unwrap();
+        assert!(store.delete_loaded_file("ingest", "data/x.csv").unwrap());
+        assert!(
+            store
+                .get_loaded_file("ingest", "data/x.csv")
+                .unwrap()
+                .is_none()
+        );
+        // Second delete is a no-op.
+        assert!(!store.delete_loaded_file("ingest", "data/x.csv").unwrap());
+    }
+
+    #[test]
+    fn test_loaded_file_key_namespacing() {
+        // Files from different pipelines must not collide.
+        let (store, _dir) = temp_store();
+        store
+            .record_loaded_file("pipe_a", "data.csv", &make_loaded_file_record(10, 100))
+            .unwrap();
+        assert!(
+            store
+                .get_loaded_file("pipe_b", "data.csv")
                 .unwrap()
                 .is_none()
         );
