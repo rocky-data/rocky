@@ -20,6 +20,10 @@ pub fn validate(config_path: &Path, json: bool) -> Result<()> {
         render_text(&output);
     }
 
+    if !output.valid {
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 

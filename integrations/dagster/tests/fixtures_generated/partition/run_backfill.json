@@ -1,6 +1,7 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "run",
+  "pipeline_type": "replication",
   "filter": "source=orders",
   "duration_ms": 0,
   "tables_copied": 1,
@@ -8,13 +9,16 @@
   "materializations": [
     {
       "asset_key": [
-        "staging__orders",
+        "duckdb",
+        "orders",
         "orders"
       ],
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "full_refresh"
+        "strategy": "full_refresh",
+        "watermark": "2026-04-15T21:54:13.768364Z",
+        "target_table_full_name": "poc.staging__orders.orders"
       }
     },
     {
@@ -26,7 +30,11 @@
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "time_interval"
+        "strategy": "time_interval",
+        "target_table_full_name": ".marts.fct_daily_orders",
+        "sql_hash": "a8975e5a44e05fc9",
+        "column_count": 3,
+        "compile_time_ms": 0
       },
       "partition": {
         "key": "2026-04-04",
@@ -43,7 +51,11 @@
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "time_interval"
+        "strategy": "time_interval",
+        "target_table_full_name": ".marts.fct_daily_orders",
+        "sql_hash": "6841226935681d42",
+        "column_count": 3,
+        "compile_time_ms": 0
       },
       "partition": {
         "key": "2026-04-05",
@@ -60,7 +72,11 @@
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "time_interval"
+        "strategy": "time_interval",
+        "target_table_full_name": ".marts.fct_daily_orders",
+        "sql_hash": "43c5cc76b5aad342",
+        "column_count": 3,
+        "compile_time_ms": 0
       },
       "partition": {
         "key": "2026-04-06",
@@ -77,7 +93,11 @@
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "time_interval"
+        "strategy": "time_interval",
+        "target_table_full_name": ".marts.fct_daily_orders",
+        "sql_hash": "ce0fd1a2df2e4b0d",
+        "column_count": 3,
+        "compile_time_ms": 0
       },
       "partition": {
         "key": "2026-04-07",
@@ -94,7 +114,11 @@
       "rows_copied": null,
       "duration_ms": 0,
       "metadata": {
-        "strategy": "time_interval"
+        "strategy": "time_interval",
+        "target_table_full_name": ".marts.fct_daily_orders",
+        "sql_hash": "d0e9a49c9722f466",
+        "column_count": 3,
+        "compile_time_ms": 0
       },
       "partition": {
         "key": "2026-04-08",
@@ -105,11 +129,28 @@
   ],
   "check_results": [],
   "execution": {
-    "concurrency": 8,
+    "concurrency": 32,
     "tables_processed": 1,
-    "tables_failed": 0
+    "tables_failed": 0,
+    "adaptive_concurrency": true,
+    "final_concurrency": 32,
+    "rate_limits_detected": 0
   },
-  "metrics": null,
+  "metrics": {
+    "tables_processed": 1,
+    "tables_failed": 0,
+    "error_rate_pct": 0.0,
+    "statements_executed": 0,
+    "retries_attempted": 0,
+    "retries_succeeded": 0,
+    "anomalies_detected": 0,
+    "table_duration_p50_ms": 0,
+    "table_duration_p95_ms": 0,
+    "table_duration_max_ms": 0,
+    "query_duration_p50_ms": 0,
+    "query_duration_p95_ms": 0,
+    "query_duration_max_ms": 0
+  },
   "permissions": {
     "grants_added": 0,
     "grants_revoked": 0,
@@ -117,7 +158,7 @@
     "schemas_created": 1
   },
   "drift": {
-    "tables_checked": 0,
+    "tables_checked": 1,
     "tables_drifted": 0,
     "actions_taken": []
   },

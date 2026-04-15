@@ -1,5 +1,11 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "state",
-  "watermarks": []
+  "watermarks": [
+    {
+      "table": "playground.staging__orders.orders",
+      "last_value": "2026-04-15T21:54:13.040748Z",
+      "updated_at": "2000-01-01T00:00:00Z"
+    }
+  ]
 }

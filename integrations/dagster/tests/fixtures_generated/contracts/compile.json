@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "compile",
   "models": 3,
   "execution_layers": 2,
@@ -40,6 +40,20 @@
         "catalog": "poc",
         "schema": "demo",
         "table": "broken_metrics"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'order_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 8000,
+        "estimated_bytes": 2048000,
+        "estimated_cost_usd": 7.280000000000001e-05,
+        "confidence": "medium"
       }
     },
     {
@@ -51,6 +65,20 @@
         "catalog": "poc",
         "schema": "demo",
         "table": "good_metrics"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'order_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 8000,
+        "estimated_bytes": 2048000,
+        "estimated_cost_usd": 7.280000000000001e-05,
+        "confidence": "medium"
       }
     },
     {
@@ -62,6 +90,20 @@
         "catalog": "poc",
         "schema": "staging",
         "table": "raw_orders"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'order_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 10000,
+        "estimated_bytes": 2560000,
+        "estimated_cost_usd": 2.28e-05,
+        "confidence": "high"
       }
     }
   ]

@@ -5,6 +5,9 @@ path = "poc.duckdb"
 [pipeline.poc]
 strategy = "full_refresh"
 
+[pipeline.poc.source.discovery]
+adapter = "default"
+
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"
 separator = "__"
@@ -13,6 +16,9 @@ components = ["source"]
 [pipeline.poc.target]
 catalog_template = "poc"
 schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
 
 [pipeline.poc.checks]
 enabled = true

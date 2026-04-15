@@ -39,7 +39,7 @@ section.
 
 ```bash
 cd examples/playground/pocs/00-foundations/00-playground-default
-rocky validate -c rocky.toml
+rocky -c rocky.toml validate
 ```
 
 | | |
@@ -147,7 +147,7 @@ rocky -c rocky.toml state
 ### 1.10 Doctor
 
 ```bash
-rocky doctor -c rocky.toml
+rocky -c rocky.toml doctor
 ```
 
 | | |
@@ -177,8 +177,8 @@ Use the dedicated snapshot POC:
 
 ```bash
 cd examples/playground/pocs/01-quality/05-snapshot-scd2
-duckdb poc.duckdb < data/seed.sql
-rocky snapshot -c rocky.toml --dry-run
+duckdb poc.duckdb < data/seed_v1.sql
+rocky -c rocky.toml snapshot --dry-run
 ```
 
 | | |
@@ -192,7 +192,7 @@ rocky snapshot -c rocky.toml --dry-run
 If the playground POC has a `seeds/` directory with CSV files:
 
 ```bash
-rocky seed -c rocky.toml
+rocky -c rocky.toml seed
 ```
 
 | | |
@@ -247,7 +247,7 @@ rocky -c rocky-databricks.toml run --filter <key>=<value>
 ### 2.4 Seed
 
 ```bash
-rocky seed -c rocky-databricks.toml --seeds seeds/
+rocky -c rocky-databricks.toml seed --seeds seeds/
 ```
 
 | | |
@@ -261,7 +261,7 @@ rocky seed -c rocky-databricks.toml --seeds seeds/
 Requires a `type = "snapshot"` pipeline in the config with Databricks adapter.
 
 ```bash
-rocky snapshot -c rocky-databricks.toml --dry-run
+rocky -c rocky-databricks.toml snapshot --dry-run
 ```
 
 | | |
@@ -273,7 +273,7 @@ rocky snapshot -c rocky-databricks.toml --dry-run
 ### 2.6 Doctor
 
 ```bash
-rocky doctor -c rocky-databricks.toml
+rocky -c rocky-databricks.toml doctor
 ```
 
 | | |
@@ -340,7 +340,7 @@ rocky -c rocky-snowflake.toml run --filter <key>=<value>
 ### 3.4 Seed
 
 ```bash
-rocky seed -c rocky-snowflake.toml --seeds seeds/
+rocky -c rocky-snowflake.toml seed --seeds seeds/
 ```
 
 | | |
@@ -352,7 +352,7 @@ rocky seed -c rocky-snowflake.toml --seeds seeds/
 ### 3.5 Snapshot
 
 ```bash
-rocky snapshot -c rocky-snowflake.toml --dry-run
+rocky -c rocky-snowflake.toml snapshot --dry-run
 ```
 
 | | |
@@ -364,7 +364,7 @@ rocky snapshot -c rocky-snowflake.toml --dry-run
 ### 3.6 Doctor
 
 ```bash
-rocky doctor -c rocky-snowflake.toml
+rocky -c rocky-snowflake.toml doctor
 ```
 
 | | |
@@ -468,7 +468,7 @@ rocky -c rocky-bigquery.toml run --filter <key>=<value>
 ### 5.4 Doctor
 
 ```bash
-rocky doctor -c rocky-bigquery.toml
+rocky -c rocky-bigquery.toml doctor
 ```
 
 | | |
@@ -504,7 +504,7 @@ Spot-check that `--output table` renders without panics:
 ```bash
 rocky -c rocky.toml discover --output table
 rocky -c rocky.toml state --output table
-rocky doctor -c rocky.toml --output table
+rocky -c rocky.toml doctor --output table
 ```
 
 | | |
@@ -532,8 +532,8 @@ rocky run --help
 Verify non-zero exits for expected failures:
 
 ```bash
-rocky validate -c /nonexistent/rocky.toml; echo "exit: $?"
-rocky run -c rocky.toml --filter source=NONEXISTENT; echo "exit: $?"
+rocky -c /nonexistent/rocky.toml validate; echo "exit: $?"
+rocky -c rocky.toml run --filter source=NONEXISTENT; echo "exit: $?"
 ```
 
 | | |

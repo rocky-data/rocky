@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "1.0.2",
   "command": "compile",
   "models": 3,
   "execution_layers": 3,
@@ -8,7 +8,11 @@
       "severity": "Info",
       "code": "I001",
       "message": "SELECT * used \u2014 consider explicit column list for stability",
-      "span": null,
+      "span": {
+        "file": "models/stg_orders.rocky",
+        "line": 1,
+        "col": 1
+      },
       "model": "stg_orders",
       "suggestion": null
     }
@@ -32,6 +36,20 @@
         "catalog": "poc",
         "schema": "staging",
         "table": "raw_orders"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'order_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 10000,
+        "estimated_bytes": 2560000,
+        "estimated_cost_usd": 2.28e-05,
+        "confidence": "high"
       }
     },
     {
@@ -43,6 +61,20 @@
         "catalog": "poc",
         "schema": "demo",
         "table": "fct_revenue"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "customer_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'customer_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 6400,
+        "estimated_bytes": 1638400,
+        "estimated_cost_usd": 0.0001128,
+        "confidence": "medium"
       }
     },
     {
@@ -54,6 +86,20 @@
         "catalog": "poc",
         "schema": "demo",
         "table": "stg_orders"
+      },
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_id",
+        "confidence": "medium",
+        "signals": [
+          "column name 'order_id' matches auto-increment ID pattern"
+        ]
+      },
+      "cost_hint": {
+        "estimated_rows": 8000,
+        "estimated_bytes": 2048000,
+        "estimated_cost_usd": 7.280000000000001e-05,
+        "confidence": "medium"
       }
     }
   ]
