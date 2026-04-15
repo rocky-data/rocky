@@ -1683,6 +1683,106 @@ impl StateOutput {
     }
 }
 
+// ---------------------------------------------------------------------------
+// rocky dag
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky dag`.
+///
+/// Projects the engine's internal [`UnifiedDag`] into an enriched,
+/// orchestrator-friendly shape: every pipeline stage becomes a node with
+/// its target table coordinates, materialization strategy, freshness SLA,
+/// partition shape, and direct upstream dependencies.
+///
+/// Consumers (dagster-rocky) can build a complete, connected asset graph
+/// from a single `rocky dag --output json` call.
+///
+/// [`UnifiedDag`]: rocky_core::unified_dag::UnifiedDag
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagOutput {
+    pub version: String,
+    pub command: String,
+    /// Every stage in the pipeline as an enriched DAG node.
+    pub nodes: Vec<DagNodeOutput>,
+    /// Directed edges between nodes (from → to).
+    pub edges: Vec<DagEdgeOutput>,
+    /// Topologically-sorted execution layers. Nodes within the same
+    /// layer have no mutual dependencies and can execute in parallel.
+    pub execution_layers: Vec<Vec<String>>,
+    /// Summary counts for the DAG.
+    pub summary: DagSummaryOutput,
+    /// Column-level lineage edges across all models. Only populated
+    /// when `--column-lineage` is passed; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_lineage: Vec<LineageEdgeRecord>,
+}
+
+/// One node in the enriched DAG, projected for orchestrators.
+///
+/// Cross-references the engine's internal `UnifiedNode` with model
+/// configs, seeds, and pipeline configs to attach the metadata that
+/// orchestrators need (target, strategy, freshness, partition shape).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagNodeOutput {
+    /// Unique identifier: `{kind}:{name}` (e.g. `transformation:stg_orders`).
+    pub id: String,
+    /// Node kind: `source`, `load`, `transformation`, `quality`,
+    /// `snapshot`, `seed`, `test`, `replication`.
+    pub kind: String,
+    /// Human-readable label (usually the pipeline or model name).
+    pub label: String,
+    /// Pipeline name from `rocky.toml`, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// Target table coordinates. Present for transformation, seed,
+    /// load, and snapshot nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<rocky_core::models::TargetConfig>,
+    /// Materialization strategy. Present for transformation nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<rocky_core::models::StrategyConfig>,
+    /// Per-model freshness expectation from the model sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<rocky_core::models::ModelFreshnessConfig>,
+    /// Partition shape for time-interval models. `None` for
+    /// unpartitioned strategies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_shape: Option<PartitionShapeOutput>,
+    /// Upstream node IDs (derived from DAG edges).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+/// Partition shape metadata for time-interval nodes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PartitionShapeOutput {
+    /// Time granularity: `"daily"`, `"hourly"`, `"monthly"`, `"yearly"`.
+    pub granularity: String,
+    /// First partition key, if declared in the model sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_partition: Option<String>,
+}
+
+/// One directed edge in the DAG output.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagEdgeOutput {
+    /// Upstream node ID.
+    pub from: String,
+    /// Downstream node ID.
+    pub to: String,
+    /// Semantic classification: `"data"`, `"check"`, `"governance"`.
+    pub edge_type: String,
+}
+
+/// Summary counts for the DAG.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagSummaryOutput {
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub execution_layers: usize,
+    pub counts_by_kind: HashMap<String, usize>,
+}
+
 /// Prints output as JSON or formatted table.
 pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(output)?;

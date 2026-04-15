@@ -1,0 +1,488 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DagEdgeOutput": {
+      "description": "One directed edge in the DAG output.",
+      "properties": {
+        "edge_type": {
+          "description": "Semantic classification: `\"data\"`, `\"check\"`, `\"governance\"`.",
+          "type": "string"
+        },
+        "from": {
+          "description": "Upstream node ID.",
+          "type": "string"
+        },
+        "to": {
+          "description": "Downstream node ID.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edge_type",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "DagNodeOutput": {
+      "description": "One node in the enriched DAG, projected for orchestrators.\n\nCross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).",
+      "properties": {
+        "depends_on": {
+          "description": "Upstream node IDs (derived from DAG edges).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelFreshnessConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-model freshness expectation from the model sidecar."
+        },
+        "id": {
+          "description": "Unique identifier: `{kind}:{name}` (e.g. `transformation:stg_orders`).",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Node kind: `source`, `load`, `transformation`, `quality`, `snapshot`, `seed`, `test`, `replication`.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human-readable label (usually the pipeline or model name).",
+          "type": "string"
+        },
+        "partition_shape": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PartitionShapeOutput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Partition shape for time-interval models. `None` for unpartitioned strategies."
+        },
+        "pipeline": {
+          "description": "Pipeline name from `rocky.toml`, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strategy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StrategyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Materialization strategy. Present for transformation nodes."
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TargetConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target table coordinates. Present for transformation, seed, load, and snapshot nodes."
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label"
+      ],
+      "type": "object"
+    },
+    "DagSummaryOutput": {
+      "description": "Summary counts for the DAG.",
+      "properties": {
+        "counts_by_kind": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "execution_layers": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_edges": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_nodes": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "counts_by_kind",
+        "execution_layers",
+        "total_edges",
+        "total_nodes"
+      ],
+      "type": "object"
+    },
+    "LineageEdgeRecord": {
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "target": {
+          "$ref": "#/definitions/LineageQualifiedColumn"
+        },
+        "transform": {
+          "description": "Transform kind: \"direct\", \"cast\", \"expression\", etc. Stringified from `rocky_sql::lineage::TransformKind` to avoid pulling schemars into rocky-sql.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "transform"
+      ],
+      "type": "object"
+    },
+    "LineageQualifiedColumn": {
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "model"
+      ],
+      "type": "object"
+    },
+    "ModelFreshnessConfig": {
+      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model. The compiler does not validate this — it's a metadata field consumed by downstream observability tools.",
+      "properties": {
+        "max_lag_seconds": {
+          "description": "Maximum lag in seconds before the model is considered stale.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_lag_seconds"
+      ],
+      "type": "object"
+    },
+    "PartitionShapeOutput": {
+      "description": "Partition shape metadata for time-interval nodes.",
+      "properties": {
+        "first_partition": {
+          "description": "First partition key, if declared in the model sidecar.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "granularity": {
+          "description": "Time granularity: `\"daily\"`, `\"hourly\"`, `\"monthly\"`, `\"yearly\"`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "granularity"
+      ],
+      "type": "object"
+    },
+    "StrategyConfig": {
+      "description": "Materialization strategy for a model, defaulting to full refresh.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "full_refresh"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "timestamp_column": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "incremental"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "timestamp_column",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "merge"
+              ],
+              "type": "string"
+            },
+            "unique_key": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "update_columns": {
+              "default": null,
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "unique_key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Partition-keyed materialization. Each run targets specific partitions rather than appending past a watermark. Idempotent and backfill-friendly.\n\nThe model SQL must reference `@start_date` and `@end_date` placeholders, which the runtime substitutes per partition with quoted timestamp literals.",
+          "properties": {
+            "batch_size": {
+              "default": 1,
+              "description": "Combine N consecutive partitions into one SQL statement when backfilling. Defaults to 1 (atomic per-partition replacement).",
+              "format": "uint32",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "first_partition": {
+              "default": null,
+              "description": "Lower bound for `--missing` discovery, in canonical key format (e.g., `\"2024-01-01\"` for daily). Required when `--missing` is used.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "granularity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimeGrain"
+                }
+              ],
+              "description": "Partition granularity (`hour`, `day`, `month`, `year`)."
+            },
+            "lookback": {
+              "default": 0,
+              "description": "Recompute the previous N partitions on each run, in addition to whatever the CLI selected. Standard handling for late-arriving data.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "time_column": {
+              "description": "Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "time_interval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "granularity",
+            "time_column",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral model — inlined as CTE in downstream queries, no table created.",
+          "properties": {
+            "type": {
+              "enum": [
+                "ephemeral"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Delete+Insert: delete matching rows by partition key, then insert.",
+          "properties": {
+            "partition_by": {
+              "description": "Column(s) used to identify the partition to delete.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "delete_insert"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "partition_by",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Microbatch: alias for time_interval with hourly defaults. dbt-compatible naming for partition-based incremental processing.",
+          "properties": {
+            "granularity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimeGrain"
+                }
+              ],
+              "default": "hour",
+              "description": "Batch granularity (default: Hour)."
+            },
+            "timestamp_column": {
+              "description": "Timestamp column for micro-batch boundaries.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "microbatch"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "timestamp_column",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TargetConfig": {
+      "description": "Target table coordinates for a model.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    },
+    "TimeGrain": {
+      "description": "Partition granularity for `time_interval` materialization.\n\nThe granularity determines: - The canonical partition key format (see [`TimeGrain::format_str`]). - How `@start_date` / `@end_date` placeholders are computed per partition. - What column types are valid (`hour` requires TIMESTAMP; others accept DATE).",
+      "enum": [
+        "hour",
+        "day",
+        "month",
+        "year"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "JSON output for `rocky dag`.\n\nProjects the engine's internal [`UnifiedDag`] into an enriched, orchestrator-friendly shape: every pipeline stage becomes a node with its target table coordinates, materialization strategy, freshness SLA, partition shape, and direct upstream dependencies.\n\nConsumers (dagster-rocky) can build a complete, connected asset graph from a single `rocky dag --output json` call.\n\n[`UnifiedDag`]: rocky_core::unified_dag::UnifiedDag",
+  "properties": {
+    "column_lineage": {
+      "description": "Column-level lineage edges across all models. Only populated when `--column-lineage` is passed; empty otherwise.",
+      "items": {
+        "$ref": "#/definitions/LineageEdgeRecord"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "edges": {
+      "description": "Directed edges between nodes (from → to).",
+      "items": {
+        "$ref": "#/definitions/DagEdgeOutput"
+      },
+      "type": "array"
+    },
+    "execution_layers": {
+      "description": "Topologically-sorted execution layers. Nodes within the same layer have no mutual dependencies and can execute in parallel.",
+      "items": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "nodes": {
+      "description": "Every stage in the pipeline as an enriched DAG node.",
+      "items": {
+        "$ref": "#/definitions/DagNodeOutput"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DagSummaryOutput"
+        }
+      ],
+      "description": "Summary counts for the DAG."
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "edges",
+    "execution_layers",
+    "nodes",
+    "summary",
+    "version"
+  ],
+  "title": "DagOutput",
+  "type": "object"
+}
