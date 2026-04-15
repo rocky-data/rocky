@@ -301,6 +301,177 @@ fn bench_sql_generation(c: &mut Criterion) {
     group.finish();
 }
 
+/// Generate a synthetic project with a fixed 4-layer DAG for the sub-second
+/// compile benchmark.
+///
+/// Layer 0: 50 source models (no dependencies)
+/// Layer 1: 150 staging models (each depends on 1 source)
+/// Layer 2: 200 intermediate models (each depends on 2 staging models)
+/// Layer 3: 100 mart models (each depends on 1-2 intermediate models)
+/// Total: 500 models
+fn generate_layered_project(dir: &Path) {
+    let models_dir = dir.join("models");
+    fs::create_dir_all(&models_dir).unwrap();
+
+    let mut model_idx = 0;
+
+    // Layer 0: 50 source models
+    let mut source_names = Vec::with_capacity(50);
+    for _ in 0..50 {
+        let name = format!("src_{model_idx:04}");
+        let ncols = 8 + (model_idx % 12);
+        let cols: Vec<String> = (0..ncols).map(|c| format!("col_{c}")).collect();
+        let select = cols.join(", ");
+        let sql = format!("SELECT {select} FROM raw_data.source_{model_idx}");
+        let toml = format!(
+            r#"name = "{name}"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "sources"
+table = "{name}"
+"#
+        );
+        fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
+        fs::write(models_dir.join(format!("{name}.toml")), &toml).unwrap();
+        source_names.push(name);
+        model_idx += 1;
+    }
+
+    // Layer 1: 150 staging models (each depends on 1 source)
+    let mut staging_names = Vec::with_capacity(150);
+    for i in 0..150 {
+        let name = format!("stg_{model_idx:04}");
+        let dep = &source_names[i % source_names.len()];
+        let sql = format!(
+            "SELECT\n    col_0,\n    col_1,\n    UPPER(col_2) AS col_2_upper,\n    \
+             COALESCE(col_3, 'unknown') AS col_3_clean\nFROM {dep}"
+        );
+        let toml = format!(
+            r#"name = "{name}"
+depends_on = ["{dep}"]
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "staging"
+table = "{name}"
+"#
+        );
+        fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
+        fs::write(models_dir.join(format!("{name}.toml")), &toml).unwrap();
+        staging_names.push(name);
+        model_idx += 1;
+    }
+
+    // Layer 2: 200 intermediate models (each depends on 2 staging models)
+    let mut intermediate_names = Vec::with_capacity(200);
+    for i in 0..200 {
+        let name = format!("int_{model_idx:04}");
+        let dep1 = &staging_names[i % staging_names.len()];
+        let dep2 = &staging_names[(i + 7) % staging_names.len()];
+        let sql = format!(
+            "SELECT\n    a.col_0,\n    a.col_1,\n    b.col_2_upper,\n    \
+             COUNT(*) AS row_count,\n    SUM(a.col_1) AS total\n\
+             FROM {dep1} a\nJOIN {dep2} b ON a.col_0 = b.col_0\n\
+             GROUP BY a.col_0, a.col_1, b.col_2_upper"
+        );
+        let toml = format!(
+            r#"name = "{name}"
+depends_on = ["{dep1}", "{dep2}"]
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "intermediate"
+table = "{name}"
+"#
+        );
+        fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
+        fs::write(models_dir.join(format!("{name}.toml")), &toml).unwrap();
+        intermediate_names.push(name);
+        model_idx += 1;
+    }
+
+    // Layer 3: 100 mart models (each depends on 1-2 intermediate models)
+    for i in 0..100 {
+        let name = format!("fct_{model_idx:04}");
+        let dep1 = &intermediate_names[i % intermediate_names.len()];
+        let has_second_dep = i % 3 == 0;
+        let deps_toml;
+        let sql;
+        if has_second_dep {
+            let dep2 = &intermediate_names[(i + 13) % intermediate_names.len()];
+            deps_toml = format!(r#"depends_on = ["{dep1}", "{dep2}"]"#);
+            sql = format!(
+                "SELECT\n    a.col_0,\n    a.total,\n    a.row_count,\n    \
+                 b.col_2_upper AS secondary_dim,\n    \
+                 CASE WHEN a.total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
+                 ROW_NUMBER() OVER (ORDER BY a.total DESC) AS rank\n\
+                 FROM {dep1} a\nJOIN {dep2} b ON a.col_0 = b.col_0"
+            );
+        } else {
+            deps_toml = format!(r#"depends_on = ["{dep1}"]"#);
+            sql = format!(
+                "SELECT\n    col_0,\n    total,\n    row_count,\n    \
+                 CASE WHEN total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
+                 ROW_NUMBER() OVER (ORDER BY total DESC) AS rank\n\
+                 FROM {dep1}"
+            );
+        }
+        let toml = format!(
+            r#"name = "{name}"
+{deps_toml}
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "marts"
+table = "{name}"
+"#
+        );
+        fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
+        fs::write(models_dir.join(format!("{name}.toml")), &toml).unwrap();
+        model_idx += 1;
+    }
+}
+
+/// Benchmark 500-model compile targeting sub-1s.
+///
+/// Uses `generate_layered_project` to produce a realistic 4-layer DAG
+/// (50 sources → 150 staging → 200 intermediate → 100 marts).
+fn bench_sub_second_compile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sub_second_compile");
+    group.sample_size(10);
+
+    let dir = TempDir::new().unwrap();
+    generate_layered_project(dir.path());
+
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        source_column_info: HashMap::new(),
+    };
+
+    group.bench_function("500_models_4_layers", |b| {
+        b.iter(|| {
+            compile(&config).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_startup(c: &mut Criterion) {
     // Measure subprocess startup time (binary must be built first)
     c.bench_function("binary_startup", |b| {
@@ -319,6 +490,7 @@ criterion_group!(
     bench_cold_compile,
     bench_dag_resolution,
     bench_sql_generation,
+    bench_sub_second_compile,
     bench_startup,
 );
 criterion_main!(benches);
