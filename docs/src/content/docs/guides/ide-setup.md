@@ -11,9 +11,26 @@ The extension source is in the monorepo at [`editors/vscode/`](https://github.co
 
 ## 1. Install the Extension
 
-There are three ways to install the extension, depending on your workflow.
+There are four ways to install the extension, depending on your workflow.
 
-### Method A: F5 Development Host (for contributors)
+### Method A: Install from the VS Code Marketplace
+
+The extension is published on the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky). Install it directly from VS Code:
+
+1. Open VS Code
+2. Go to **Extensions** (**Cmd+Shift+X** / **Ctrl+Shift+X**)
+3. Search for **Rocky**
+4. Click **Install**
+
+Or install from the command line:
+
+```bash
+code --install-extension rocky-data.rocky
+```
+
+This is the recommended method for most users. The extension updates automatically when new versions are published.
+
+### Method B: F5 Development Host (for contributors)
 
 Clone the monorepo and launch the extension in VS Code's Extension Development Host:
 
@@ -26,7 +43,7 @@ npm run compile
 
 Open the `editors/vscode` folder in VS Code, then press **F5**. This launches a new VS Code window with the extension loaded. Changes to the TypeScript source are picked up on the next F5 launch.
 
-### Method B: Install from VSIX
+### Method C: Install from VSIX
 
 Build a `.vsix` package and install it directly:
 
@@ -37,15 +54,15 @@ npm run compile
 npx vsce package
 ```
 
-This produces a file like `rocky-0.1.0.vsix`. Install it in VS Code:
+This produces a file like `rocky-<version>.vsix`. Install it in VS Code:
 
 ```bash
-code --install-extension rocky-0.1.0.vsix
+code --install-extension rocky-<version>.vsix
 ```
 
 Or open VS Code, go to **Extensions** > **...** (three dots menu) > **Install from VSIX** and select the file.
 
-### Method C: Symlink for Local Development
+### Method D: Symlink for Local Development
 
 If you are iterating on the extension frequently, symlink the compiled output into VS Code's extensions directory:
 
@@ -55,7 +72,7 @@ npm install
 npm run compile
 
 # macOS / Linux
-ln -s "$(pwd)" ~/.vscode/extensions/rocky-dev.rocky-0.1.0
+ln -s "$(pwd)" ~/.vscode/extensions/rocky-data.rocky-<version>
 
 # Restart VS Code
 ```
