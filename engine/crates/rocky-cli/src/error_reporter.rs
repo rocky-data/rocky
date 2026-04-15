@@ -234,6 +234,22 @@ type = "databricks"
     }
 
     #[test]
+    fn file_not_found_found_through_context_wrapping() {
+        let missing_path = std::path::PathBuf::from("/not/real/rocky.toml");
+        let err: anyhow::Error = ConfigError::FileNotFound {
+            path: missing_path.clone(),
+        }
+        .into();
+        let wrapped = err.context("failed to load config from /not/real/rocky.toml");
+
+        let diag = try_upgrade_config_error(&wrapped, &missing_path);
+        assert!(
+            diag.is_some(),
+            "should find FileNotFound through .context() wrapping"
+        );
+    }
+
+    #[test]
     fn did_you_mean_finds_close_match() {
         assert_eq!(
             did_you_mean("databrik", KNOWN_ADAPTER_TYPES),
