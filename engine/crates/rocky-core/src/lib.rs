@@ -1,5 +1,6 @@
 pub mod access;
 pub mod arrow_loader;
+pub mod bridge;
 pub mod catalog;
 pub mod checks;
 pub mod ci_diff;

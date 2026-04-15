@@ -47,6 +47,14 @@ pub struct ModelConfig {
     pub target: TargetConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// Per-model adapter override. When set, this model materializes using
+    /// a different adapter than the pipeline default. References a key in
+    /// `[adapter.*]` from `rocky.toml`.
+    ///
+    /// Enables cross-warehouse models within a single transformation pipeline
+    /// — e.g., most models target Databricks but one targets Snowflake.
+    #[serde(default)]
+    pub adapter: Option<String>,
     /// Natural language description of what this model does.
     /// Used by `rocky ai sync` to propose updates when upstream schemas change.
     #[serde(default)]
@@ -267,6 +275,9 @@ pub struct RawModelConfig {
     pub target: Option<RawTargetConfig>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// Per-model adapter override (references an `[adapter.*]` key).
+    #[serde(default)]
+    pub adapter: Option<String>,
     #[serde(default)]
     pub intent: Option<String>,
     #[serde(default)]
@@ -402,6 +413,7 @@ fn resolve_model_config(
             table,
         },
         sources: raw.sources,
+        adapter: raw.adapter,
         intent,
         freshness,
         tests: raw.tests,
