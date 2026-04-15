@@ -67,6 +67,29 @@ export function ensureWorkspace(): boolean {
 }
 
 /**
+ * Extract a model name from the argument passed to a command handler.
+ *
+ * When a command fires from a tree-view context menu, VS Code passes the
+ * TreeItem object — not a string. This normaliser handles:
+ *  - string argument (returned as-is)
+ *  - object with a `label` string property (e.g. ModelTreeItem)
+ *  - undefined / null / anything else → undefined (so the caller can fall
+ *    back to an input box or the active editor)
+ */
+export function resolveModelName(arg: unknown): string | undefined {
+  if (typeof arg === "string" && arg.length > 0) return arg;
+  if (
+    arg != null &&
+    typeof arg === "object" &&
+    "label" in arg &&
+    typeof (arg as Record<string, unknown>).label === "string"
+  ) {
+    return (arg as Record<string, unknown>).label as string;
+  }
+  return undefined;
+}
+
+/**
  * Prompt the user with an input box and validate emptiness.
  * Returns undefined when the user cancels or the input is blank.
  */

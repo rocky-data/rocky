@@ -1,13 +1,18 @@
 import * as vscode from "vscode";
 import { runRockyJsonWithProgress, showRockyError } from "../rockyCli";
 import type { HistoryResult, MetricsResult } from "../types/rockyJson";
-import { ensureWorkspace, promptForInput, showJsonInEditor } from "./ui";
+import {
+  ensureWorkspace,
+  promptForInput,
+  resolveModelName,
+  showJsonInEditor,
+} from "./ui";
 
-export async function history(modelArg?: string): Promise<void> {
+export async function history(modelArg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
   const model =
-    modelArg ??
+    resolveModelName(modelArg) ??
     (await promptForInput(
       "Filter to a specific model (leave empty for all runs)",
       { placeHolder: "e.g., customer_orders" },
@@ -33,11 +38,11 @@ export async function history(modelArg?: string): Promise<void> {
   }
 }
 
-export async function metrics(modelArg?: string): Promise<void> {
+export async function metrics(modelArg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
   const model =
-    modelArg ??
+    resolveModelName(modelArg) ??
     (await promptForInput("Model to inspect", {
       placeHolder: "e.g., fct_daily_revenue",
       required: true,

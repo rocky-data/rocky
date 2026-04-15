@@ -3,17 +3,23 @@ import * as vscode from "vscode";
 import { getWorkspaceFolder } from "../config";
 import { getExtensionUri } from "../extensionState";
 import { runRocky } from "../rockyCli";
+import { resolveModelName } from "./ui";
 
-export async function showLineage(): Promise<void> {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    vscode.window.showWarningMessage("Open a Rocky model file first.");
-    return;
+export async function showLineage(arg?: unknown): Promise<void> {
+  // When invoked from the tree-view context menu, `arg` is a ModelTreeItem.
+  // When invoked from the command palette, fall back to the active editor.
+  let modelName = resolveModelName(arg);
+
+  if (!modelName) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showWarningMessage("Open a Rocky model file first.");
+      return;
+    }
+    modelName = path
+      .basename(editor.document.fileName)
+      .replace(/\.(rocky|sql)$/, "");
   }
-
-  const modelName = path
-    .basename(editor.document.fileName)
-    .replace(/\.(rocky|sql)$/, "");
   if (!modelName) return;
 
   const workspaceFolder = getWorkspaceFolder();

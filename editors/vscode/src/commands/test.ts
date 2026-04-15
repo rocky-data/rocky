@@ -2,18 +2,18 @@ import * as vscode from "vscode";
 import { runRockyJsonWithProgress, showRockyError } from "../rockyCli";
 import { getOutputChannel } from "../output";
 import type { TestResult } from "../types/rockyJson";
-import { ensureWorkspace, promptForInput } from "./ui";
+import { ensureWorkspace, promptForInput, resolveModelName } from "./ui";
 
 /**
  * Phase 2: simple shell-out that surfaces a pass/fail toast and writes failure
  * detail to the output channel. Phase 3 will replace this with a real Test
  * Explorer integration backed by `vscode.tests.createTestController`.
  */
-export async function test(modelArg?: string): Promise<void> {
+export async function test(modelArg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
   const model =
-    modelArg ??
+    resolveModelName(modelArg) ??
     (await promptForInput(
       "Filter to a specific model (leave empty for all)",
       { placeHolder: "e.g., customer_orders" },

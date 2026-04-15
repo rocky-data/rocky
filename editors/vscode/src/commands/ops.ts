@@ -6,7 +6,7 @@ import {
 } from "../rockyCli";
 import type { DoctorResult } from "../types/rockyJson";
 import { showDoctorResult } from "../webviews/doctor";
-import { ensureWorkspace, showJsonInEditor } from "./ui";
+import { ensureWorkspace, resolveModelName, showJsonInEditor } from "./ui";
 
 export async function doctor(): Promise<void> {
   if (!ensureWorkspace()) return;
@@ -23,11 +23,11 @@ export async function doctor(): Promise<void> {
   }
 }
 
-export async function optimize(modelArg?: string): Promise<void> {
+export async function optimize(modelArg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
   const model =
-    modelArg ??
+    resolveModelName(modelArg) ??
     (await vscode.window.showInputBox({
       prompt: "Model to analyze (leave empty for all)",
       placeHolder: "e.g., customer_orders",
