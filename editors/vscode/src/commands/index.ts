@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { restartLspClient } from "../lspClient";
 import { aiExplain, aiGenerate, aiSync, aiTest } from "./ai";
+import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { hooksList, hooksTest } from "./hooks";
 import { history, metrics } from "./inspect";
@@ -17,6 +18,9 @@ import { test } from "./test";
  */
 export function registerCommands(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
+    // Command palette (Cmd+Shift+R / Ctrl+Shift+R)
+    vscode.commands.registerCommand("rocky.commandPalette", commandPalette),
+
     // LSP lifecycle
     vscode.commands.registerCommand("rocky.restartServer", restartLspClient),
 

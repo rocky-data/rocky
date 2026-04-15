@@ -85,6 +85,11 @@
     },
     "commands": [
       {
+        "command": "rocky.commandPalette",
+        "title": "Rocky Command Palette",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.codeLens.runModel",
         "title": "Run Model (Terminal)",
         "category": "Rocky"
@@ -372,7 +377,14 @@
           "group": "2_inspect@4"
         }
       ]
-    }
+    },
+    "keybindings": [
+      {
+        "command": "rocky.commandPalette",
+        "key": "ctrl+shift+r",
+        "mac": "cmd+shift+r"
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",
