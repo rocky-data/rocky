@@ -42,17 +42,19 @@ pub fn transpile_sql(sql: &str, from_dialect: &str, to_dialect: &str) -> String 
     let from = match parse_dialect(from_dialect) {
         Some(d) => d,
         None => {
-            return format!(
-                r#"{{"error":"unknown source dialect: {from_dialect}. Expected one of: snowflake, databricks, bigquery, duckdb"}}"#
-            );
+            return serde_json::json!({
+                "error": format!("unknown source dialect: {from_dialect}. Expected one of: snowflake, databricks, bigquery, duckdb")
+            })
+            .to_string();
         }
     };
     let to = match parse_dialect(to_dialect) {
         Some(d) => d,
         None => {
-            return format!(
-                r#"{{"error":"unknown target dialect: {to_dialect}. Expected one of: snowflake, databricks, bigquery, duckdb"}}"#
-            );
+            return serde_json::json!({
+                "error": format!("unknown target dialect: {to_dialect}. Expected one of: snowflake, databricks, bigquery, duckdb")
+            })
+            .to_string();
         }
     };
 
