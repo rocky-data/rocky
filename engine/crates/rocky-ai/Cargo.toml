@@ -1,6 +1,6 @@
 [package]
 name = "rocky-ai"
-version = "1.0.0"
+version = "1.0.1"
 description = "AI intent layer for Rocky: natural language to model generation"
 edition.workspace = true
 license.workspace = true
