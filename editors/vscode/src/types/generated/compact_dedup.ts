@@ -42,6 +42,10 @@ export interface CompactDedupOutput {
    */
   raw: DedupSummary;
   /**
+   * Table scope used for the measurement: - `"managed"` — only tables that correspond to Rocky-managed models. - `"all"` — all non-system tables in the warehouse (legacy behavior, activated by `--all-tables`).
+   */
+  scope: string;
+  /**
    * Dedup computed after excluding Rocky-owned metadata columns. The gap between `raw` and `semantic` is "dedup we'd unlock if we ignored Rocky's own per-row metadata."
    */
   semantic: DedupSummary;

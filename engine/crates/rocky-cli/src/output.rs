@@ -1050,6 +1050,11 @@ pub struct CompactDedupOutput {
     pub engine: String,
     /// Project name from `rocky.toml`.
     pub project: String,
+    /// Table scope used for the measurement:
+    /// - `"managed"` — only tables that correspond to Rocky-managed models.
+    /// - `"all"` — all non-system tables in the warehouse (legacy behavior,
+    ///   activated by `--all-tables`).
+    pub scope: String,
     pub tables_scanned: usize,
     pub partitions_scanned: usize,
     /// Dedup computed over all columns (what a byte-level chunk store

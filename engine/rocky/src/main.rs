@@ -538,11 +538,17 @@ enum Command {
         /// Show SQL without executing
         #[arg(long)]
         dry_run: bool,
-        /// Measure cross-table dedup ratio across all Rocky-managed tables
-        /// in the project (Layer 0 storage experiment). Project-wide; does
-        /// not take a model argument.
+        /// Measure cross-table dedup ratio across Rocky-managed tables
+        /// in the project (Layer 0 storage experiment). By default, only
+        /// tables that correspond to models in the project DAG are scanned.
+        /// Use --all-tables to scan every non-system table instead.
         #[arg(long, conflicts_with = "model")]
         measure_dedup: bool,
+        /// Scan all non-system tables in the warehouse instead of only
+        /// Rocky-managed tables. Without this flag, --measure-dedup resolves
+        /// the project's model list and filters the scan accordingly.
+        #[arg(long, requires = "measure_dedup")]
+        all_tables: bool,
         /// Comma-separated columns to exclude from the "semantic" dedup
         /// hash. Defaults to the Rocky-owned metadata columns:
         /// `_loaded_by,_loaded_at,_fivetran_synced,_synced_at`.
@@ -1038,6 +1044,7 @@ async fn main() -> Result<()> {
             target_size,
             dry_run,
             measure_dedup,
+            all_tables,
             exclude_columns,
             calibrate_bytes,
         } => {
@@ -1048,8 +1055,14 @@ async fn main() -> Result<()> {
                         .map(String::from)
                         .collect::<Vec<_>>()
                 });
-                rocky_cli::commands::run_measure_dedup(&cli.config, cols, calibrate_bytes, json)
-                    .await
+                rocky_cli::commands::run_measure_dedup(
+                    &cli.config,
+                    cols,
+                    calibrate_bytes,
+                    all_tables,
+                    json,
+                )
+                .await
             } else {
                 // `required_unless_present = "measure_dedup"` on `model`
                 // guarantees this branch always has a model.

@@ -4,12 +4,14 @@
 //! dedup-measurement experiment (`run_measure_dedup`). See
 //! `plans/rocky-storage-layer-0.md` for the scope + decision gate.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
+use rocky_core::config::{PipelineConfig, RockyConfig};
 use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
 use rocky_core::ir::TableRef;
@@ -103,10 +105,11 @@ fn default_metadata_columns() -> Vec<String> {
 /// Execute `rocky compact --measure-dedup` — the Layer 0 cross-table
 /// dedup-measurement experiment.
 ///
-/// Hashes every user table in the warehouse twice (raw = `HASH(*)`,
-/// semantic = `HASH(...non-metadata columns...)`) and reports a
-/// partition-level **lower bound** on cross-table byte dedup, plus a
-/// decision-gate verdict per `plans/rocky-storage-layer-0.md` §6.
+/// By default, scopes the measurement to **Rocky-managed tables only** —
+/// tables whose `catalog.schema.table` coordinates match a model target
+/// in the project DAG. Pass `all_tables = true` (CLI: `--all-tables`) to
+/// fall back to the original behavior of scanning every non-system table
+/// in the warehouse via `information_schema`.
 ///
 /// ## Scope (Layer 0 Step 4)
 ///
@@ -138,9 +141,11 @@ pub async fn run_measure_dedup(
     config_path: &Path,
     exclude_columns: Option<Vec<String>>,
     calibrate_bytes: bool,
+    all_tables: bool,
     output_json: bool,
 ) -> Result<()> {
-    let output = compute_measure_dedup(config_path, exclude_columns, calibrate_bytes).await?;
+    let output =
+        compute_measure_dedup(config_path, exclude_columns, calibrate_bytes, all_tables).await?;
     if output_json {
         print_json(&output)?;
     } else {
@@ -161,6 +166,7 @@ pub(crate) async fn compute_measure_dedup(
     config_path: &Path,
     exclude_columns: Option<Vec<String>>,
     calibrate_bytes: bool,
+    all_tables: bool,
 ) -> Result<CompactDedupOutput> {
     let started_at = Utc::now();
     let start = Instant::now();
@@ -199,22 +205,60 @@ pub(crate) async fn compute_measure_dedup(
 
     let excluded_columns: Vec<String> = exclude_columns.unwrap_or_else(default_metadata_columns);
 
+    let scope = if all_tables { "all" } else { "managed" };
+
     tracing::info!(
         pipeline = %project,
         engine = %engine,
+        scope = %scope,
         excluded_columns = ?excluded_columns,
         "rocky compact --measure-dedup: starting Layer 0 dedup measurement"
     );
 
     // 5. Enumerate tables to measure.
-    let tables = enumerate_tables(adapter.as_ref()).await?;
+    let all_warehouse_tables = enumerate_tables(adapter.as_ref()).await?;
+
+    let tables = if all_tables {
+        all_warehouse_tables
+    } else {
+        // Resolve the set of managed target tables from the pipeline config,
+        // then intersect with what actually exists in the warehouse.
+        let managed = resolve_managed_tables(config_path, &rocky_cfg, pipeline, &registry).await?;
+        let managed_set: HashSet<String> = managed
+            .iter()
+            .map(|t| format!("{}.{}.{}", t.catalog, t.schema, t.table).to_lowercase())
+            .collect();
+
+        let total_warehouse = all_warehouse_tables.len();
+        let filtered: Vec<TableRef> = all_warehouse_tables
+            .into_iter()
+            .filter(|t| {
+                let key = format!("{}.{}.{}", t.catalog, t.schema, t.table).to_lowercase();
+                managed_set.contains(&key)
+            })
+            .collect();
+
+        tracing::info!(
+            warehouse_tables = total_warehouse,
+            managed_tables = managed.len(),
+            matched_tables = filtered.len(),
+            "filtered to Rocky-managed tables (use --all-tables to scan everything)"
+        );
+
+        filtered
+    };
+
     let tables_scanned = tables.len();
 
     if tables_scanned == 0 {
+        let hint = if all_tables {
+            "no user tables found in the warehouse"
+        } else {
+            "no Rocky-managed tables found in the warehouse (try --all-tables to scan everything)"
+        };
         bail!(
-            "no user tables found in the warehouse — the dedup measurement \
-             needs at least one table. Materialize the pipeline first \
-             (`rocky run`) and retry."
+            "{hint} — the dedup measurement needs at least one table. \
+             Materialize the pipeline first (`rocky run`) and retry."
         );
     }
 
@@ -286,6 +330,7 @@ pub(crate) async fn compute_measure_dedup(
     let output = build_compact_dedup_output(
         engine,
         project,
+        scope.to_string(),
         tables_scanned,
         partitions_scanned,
         &raw_stats,
@@ -352,6 +397,129 @@ async fn enumerate_tables(adapter: &dyn WarehouseAdapter) -> Result<Vec<TableRef
         });
     }
     Ok(tables)
+}
+
+/// Resolve the set of target tables that Rocky manages for the given pipeline.
+///
+/// For **replication** pipelines: runs source discovery via the configured
+/// discovery adapter and maps each discovered source table through the
+/// schema-pattern + template resolution to produce the full set of target
+/// `TableRef`s.
+///
+/// For **transformation** pipelines: loads the model files from the models
+/// directory and reads each model's `target` config (catalog, schema, table).
+///
+/// Other pipeline types (quality, snapshot, load) fall back to an empty set
+/// with a warning — the caller can use `--all-tables` for those.
+async fn resolve_managed_tables(
+    config_path: &Path,
+    _rocky_cfg: &RockyConfig,
+    pipeline: &PipelineConfig,
+    registry: &AdapterRegistry,
+) -> Result<Vec<TableRef>> {
+    match pipeline {
+        PipelineConfig::Replication(repl) => {
+            let pattern = repl.schema_pattern()?;
+            let target_catalog_template = &repl.target.catalog_template;
+            let target_schema_template = &repl.target.schema_template;
+            let target_sep = repl
+                .target
+                .separator
+                .as_deref()
+                .unwrap_or(&pattern.separator);
+
+            let connectors = if let Some(ref disc) = repl.source.discovery {
+                let discovery_adapter = registry.discovery_adapter(&disc.adapter)?;
+                discovery_adapter
+                    .discover(&pattern.prefix)
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?
+            } else {
+                // Manual sources don't have discovery — can't resolve the
+                // full set of managed tables. Fall back to empty.
+                tracing::warn!(
+                    "replication pipeline has no discovery adapter; \
+                     cannot resolve managed tables. Use --all-tables."
+                );
+                return Ok(Vec::new());
+            };
+
+            let mut tables = Vec::new();
+            for conn in &connectors {
+                let parsed = match pattern.parse(&conn.schema) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+                let target_schema = parsed.resolve_template(target_schema_template, target_sep);
+
+                for table in &conn.tables {
+                    tables.push(TableRef {
+                        catalog: target_catalog.clone(),
+                        schema: target_schema.clone(),
+                        table: table.name.clone(),
+                    });
+                }
+            }
+            Ok(tables)
+        }
+        PipelineConfig::Transformation(t) => {
+            let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+
+            // Resolve the models directory from the pipeline's `models` glob.
+            // The glob is typically "models/**", so strip the glob suffix.
+            let models_base = t.models.trim_end_matches("/**").trim_end_matches("/*");
+            let models_dir = config_dir.join(models_base);
+
+            if !models_dir.exists() {
+                tracing::warn!(
+                    models_dir = %models_dir.display(),
+                    "models directory does not exist; cannot resolve managed tables"
+                );
+                return Ok(Vec::new());
+            }
+
+            let models = load_all_models(&models_dir)?;
+            let tables = models
+                .iter()
+                .map(|m| TableRef {
+                    catalog: m.config.target.catalog.clone(),
+                    schema: m.config.target.schema.clone(),
+                    table: m.config.target.table.clone(),
+                })
+                .collect();
+            Ok(tables)
+        }
+        _ => {
+            tracing::warn!(
+                pipeline_type = pipeline.pipeline_type_str(),
+                "managed-table resolution not supported for this pipeline type; \
+                 use --all-tables to scan the full warehouse"
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Load all models from a directory, including subdirectories.
+///
+/// Mirrors the pattern used by `list.rs`, `test.rs`, and `estimate.rs`.
+fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
+    let mut all = rocky_core::models::load_models_from_dir(models_dir).context(format!(
+        "failed to load models from {}",
+        models_dir.display()
+    ))?;
+    if let Ok(entries) = std::fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path()) {
+                    all.extend(sub);
+                }
+            }
+        }
+    }
+    Ok(all)
 }
 
 /// Execute one whole-table checksum SQL against the warehouse and parse
@@ -439,6 +607,7 @@ fn json_number_to_u64(v: Option<&serde_json::Value>) -> Option<u64> {
 fn build_compact_dedup_output(
     engine: String,
     project: String,
+    scope: String,
     tables_scanned: usize,
     partitions_scanned: usize,
     raw_stats: &DedupStats,
@@ -478,6 +647,7 @@ fn build_compact_dedup_output(
         command: "compact_dedup".to_string(),
         engine,
         project,
+        scope,
         tables_scanned,
         partitions_scanned,
         raw: stats_to_summary(raw_stats),
@@ -502,14 +672,23 @@ fn stats_to_summary(stats: &DedupStats) -> DedupSummary {
 }
 
 fn render_measure_dedup_human(output: &CompactDedupOutput) {
+    let scope_label = if output.scope == "managed" {
+        "managed tables only"
+    } else {
+        "all warehouse tables"
+    };
     println!(
-        "Scanning Rocky project '{}' (engine: {})... {} tables, {} partitions",
-        output.project, output.engine, output.tables_scanned, output.partitions_scanned
+        "Scanning Rocky project '{}' (engine: {}, scope: {})... {} tables, {} partitions",
+        output.project,
+        output.engine,
+        scope_label,
+        output.tables_scanned,
+        output.partitions_scanned
     );
     println!();
     println!(
-        "Cross-table dedup analysis (engine-scoped: {}, granularity: partition)",
-        output.engine
+        "Cross-table dedup analysis (engine-scoped: {}, scope: {}, granularity: partition)",
+        output.engine, scope_label
     );
     println!();
     println!("  Raw dedup (all columns):");
@@ -722,12 +901,14 @@ schema_template = "staging__{{source}}"
             ),
         )?;
 
-        // Exercise the pure-compute path.
-        let output = compute_measure_dedup(&config_path, None, false).await?;
+        // Exercise the pure-compute path with --all-tables since the test
+        // creates tables manually without Rocky models.
+        let output = compute_measure_dedup(&config_path, None, false, true).await?;
 
         // Top-level shape.
         assert_eq!(output.engine, "duckdb");
         assert_eq!(output.project, "test");
+        assert_eq!(output.scope, "all");
         assert_eq!(output.tables_scanned, 3);
         assert_eq!(output.partitions_scanned, 3);
 
@@ -806,6 +987,119 @@ schema_template = "staging__{{source}}"
         // Calibration is None — Layer 0 Step 4 deferred byte-level
         // calibration to a follow-up.
         assert!(output.calibration.is_none());
+
+        Ok(())
+    }
+
+    /// Verify that managed-table scoping filters the table set correctly
+    /// for a transformation pipeline.
+    ///
+    /// Sets up a DuckDB with three tables but a transformation pipeline
+    /// that declares only two of them as models. The managed-scope measurement
+    /// should only scan the two model targets; --all-tables should scan all three.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compute_measure_dedup_scoped_to_managed_tables() -> Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test.duckdb");
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path)
+                .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
+            for sql in &[
+                "CREATE SCHEMA staging",
+                "CREATE TABLE staging.orders AS \
+                 SELECT i AS id, ('row_' || i) AS name \
+                 FROM generate_series(1, 100) t(i)",
+                "CREATE TABLE staging.customers AS \
+                 SELECT i AS id, ('row_' || i) AS name \
+                 FROM generate_series(1, 100) t(i)",
+                "CREATE TABLE staging.unmanaged AS \
+                 SELECT i AS id FROM generate_series(1, 50) t(i)",
+            ] {
+                adapter
+                    .execute_statement(sql)
+                    .await
+                    .map_err(|e| anyhow!("setup: {sql}: {e}"))?;
+            }
+        }
+
+        // Write a transformation pipeline config + model files.
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "default"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // Create models directory with two models (orders and customers).
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir)?;
+
+        // _defaults.toml
+        std::fs::write(
+            models_dir.join("_defaults.toml"),
+            r#"
+[target]
+catalog = "test"
+schema = "staging"
+"#,
+        )?;
+
+        // orders model
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            r#"
+name = "orders"
+[target]
+catalog = "test"
+schema = "staging"
+table = "orders"
+"#,
+        )?;
+        std::fs::write(models_dir.join("orders.sql"), "SELECT * FROM raw.orders")?;
+
+        // customers model
+        std::fs::write(
+            models_dir.join("customers.toml"),
+            r#"
+name = "customers"
+[target]
+catalog = "test"
+schema = "staging"
+table = "customers"
+"#,
+        )?;
+        std::fs::write(
+            models_dir.join("customers.sql"),
+            "SELECT * FROM raw.customers",
+        )?;
+
+        // Managed scope: should only scan 2 tables (orders + customers).
+        let managed_output = compute_measure_dedup(&config_path, None, false, false).await?;
+        assert_eq!(managed_output.scope, "managed");
+        assert_eq!(managed_output.tables_scanned, 2);
+
+        // All-tables scope: should scan all 3 tables.
+        let all_output = compute_measure_dedup(&config_path, None, false, true).await?;
+        assert_eq!(all_output.scope, "all");
+        assert_eq!(all_output.tables_scanned, 3);
 
         Ok(())
     }

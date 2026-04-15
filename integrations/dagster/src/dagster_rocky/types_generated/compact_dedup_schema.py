@@ -110,6 +110,10 @@ class CompactDedupOutput(BaseModel):
     """
     Project name from `rocky.toml`.
     """
+    scope: str
+    """
+    Table scope used for the measurement: - `"managed"` — only tables that correspond to Rocky-managed models. - `"all"` — all non-system tables in the warehouse (legacy behavior, activated by `--all-tables`).
+    """
     raw: DedupSummary
     """
     Dedup computed over all columns (what a byte-level chunk store would actually deduplicate).
