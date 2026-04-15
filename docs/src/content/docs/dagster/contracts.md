@@ -147,7 +147,7 @@ ends with `orders`. Today this means:
   release), every model with a contract file gets the wiring
   automatically.
 
-This is a known limitation: dagster-rocky 0.4's RockyComponent surfaces
+This is a known limitation: dagster-rocky's RockyComponent surfaces
 source replication tables but not derived models. The contract wiring
 is correct for both cases — it just doesn't have many derived-model
 assets to attach to today.
