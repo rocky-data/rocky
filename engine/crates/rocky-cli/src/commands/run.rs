@@ -340,7 +340,7 @@ pub async fn run(
     .instrument(info_span!("discover_sources"))
     .await?;
 
-    let concurrency = pipeline.execution.concurrency.max(1);
+    let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
     let mut catalogs_created: usize = 0;
@@ -882,8 +882,8 @@ pub async fn run(
 
     // Adaptive concurrency throttle — when enabled, dynamically adjusts the
     // number of in-flight tasks based on rate-limit signals from the warehouse.
-    // When disabled (default), concurrency stays fixed at the configured level.
-    let adaptive = pipeline.execution.adaptive_concurrency;
+    // When fixed, concurrency stays constant at the configured level.
+    let adaptive = pipeline.execution.concurrency.is_adaptive();
     let throttle = if adaptive {
         // increase_interval = 10 means: after 10 consecutive successes,
         // concurrency increases by 1 (or 2 during slow-start). This prevents

@@ -165,16 +165,109 @@ pub enum ConfigError {
     InvalidPattern(#[from] crate::schema::SchemaError),
 }
 
+/// Concurrency strategy for table processing.
+///
+/// Controls how many tables Rocky processes in parallel. Accepts either
+/// `"adaptive"` (AIMD throttle that adjusts based on rate-limit signals)
+/// or a fixed integer (e.g. `8`).
+///
+/// # TOML examples
+///
+/// ```toml
+/// # Use adaptive concurrency (default) — starts at max, adjusts on 429s
+/// concurrency = "adaptive"
+///
+/// # Fixed concurrency — always 8 in-flight tables
+/// concurrency = 8
+///
+/// # Serial execution
+/// concurrency = 1
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConcurrencyMode {
+    /// AIMD-based adaptive concurrency. Starts at `max` (default 32) and
+    /// dynamically adjusts based on warehouse rate-limit signals (HTTP 429,
+    /// `UC_REQUEST_LIMIT_EXCEEDED`). On sustained success, concurrency
+    /// slowly increases; on rate limits, it halves.
+    #[default]
+    Adaptive,
+    /// Fixed concurrency — always exactly this many in-flight tables.
+    /// Clamped to at least 1.
+    Fixed(usize),
+}
+
+/// Default adaptive max when no explicit cap is given.
+const ADAPTIVE_MAX_CONCURRENCY: usize = 32;
+
+impl ConcurrencyMode {
+    /// Whether this mode uses the AIMD adaptive throttle.
+    pub fn is_adaptive(&self) -> bool {
+        matches!(self, Self::Adaptive)
+    }
+
+    /// The maximum number of in-flight tables this mode allows.
+    ///
+    /// - `Adaptive` → [`ADAPTIVE_MAX_CONCURRENCY`] (32)
+    /// - `Fixed(n)` → `n` (clamped to at least 1)
+    pub fn max_concurrency(&self) -> usize {
+        match self {
+            Self::Adaptive => ADAPTIVE_MAX_CONCURRENCY,
+            Self::Fixed(n) => (*n).max(1),
+        }
+    }
+}
+
+impl std::fmt::Display for ConcurrencyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Adaptive => write!(f, "adaptive"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl Serialize for ConcurrencyMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Adaptive => serializer.serialize_str("adaptive"),
+            Self::Fixed(n) => serializer.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConcurrencyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Num(usize),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Str(s) if s.eq_ignore_ascii_case("adaptive") => Ok(ConcurrencyMode::Adaptive),
+            Raw::Str(s) => Err(serde::de::Error::custom(format!(
+                "invalid concurrency mode '{s}': expected \"adaptive\" or an integer"
+            ))),
+            Raw::Num(n) => Ok(ConcurrencyMode::Fixed(n.max(1))),
+        }
+    }
+}
+
 /// Controls parallelism and error handling for table processing.
 ///
 /// Rocky processes tables within a run concurrently using async tasks.
 /// Tune `concurrency` based on your warehouse capacity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConfig {
-    /// Maximum number of tables processed in parallel (default: 16).
-    /// Higher values increase throughput on large warehouses but add load.
-    #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
+    /// Concurrency strategy (default: `"adaptive"`).
+    ///
+    /// - `"adaptive"` — AIMD throttle that starts at 32 and adjusts based on
+    ///   rate-limit signals. Best for remote warehouses (Databricks, Snowflake).
+    /// - An integer (e.g. `8`) — fixed concurrency, always this many in-flight
+    ///   tables. Use for local adapters (DuckDB) or when you know the limit.
+    /// - `1` — serial execution.
+    #[serde(default)]
+    pub concurrency: ConcurrencyMode,
     /// If true, abort all remaining tables on first error.
     /// If false, process all tables and report errors at the end (partial success).
     #[serde(default)]
@@ -188,23 +281,15 @@ pub struct ExecutionConfig {
     /// Default: 1. Set to 0 to disable auto-retry.
     #[serde(default = "default_table_retries")]
     pub table_retries: u32,
-    /// Enable adaptive concurrency (AIMD throttle). When enabled, Rocky
-    /// dynamically adjusts the number of in-flight table operations based on
-    /// warehouse rate-limit signals (HTTP 429, `UC_REQUEST_LIMIT_EXCEEDED`).
-    /// On success, concurrency slowly increases; on rate limits, it halves.
-    /// Default: false (fixed concurrency for backward compatibility).
-    #[serde(default)]
-    pub adaptive_concurrency: bool,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            concurrency: default_concurrency(),
+            concurrency: ConcurrencyMode::default(),
             fail_fast: false,
             error_rate_abort_pct: default_error_rate_abort_pct(),
             table_retries: default_table_retries(),
-            adaptive_concurrency: false,
         }
     }
 }
@@ -215,10 +300,6 @@ fn default_error_rate_abort_pct() -> u32 {
 
 fn default_table_retries() -> u32 {
     1
-}
-
-fn default_concurrency() -> usize {
-    16
 }
 
 /// State storage backend variants.
@@ -1740,7 +1821,7 @@ fail_fast = false
         assert!(pipeline.target.governance.auto_create_catalogs);
         assert_eq!(pipeline.target.governance.grants.len(), 1);
         assert!(pipeline.checks.enabled);
-        assert_eq!(pipeline.execution.concurrency, 16);
+        assert_eq!(pipeline.execution.concurrency, ConcurrencyMode::Fixed(16));
     }
 
     #[test]
@@ -2297,7 +2378,7 @@ fail_fast = true
         assert!(t.target.governance.auto_create_schemas);
         assert!(t.checks.enabled);
         assert_eq!(t.checks.freshness.as_ref().unwrap().threshold_seconds, 3600);
-        assert_eq!(t.execution.concurrency, 4);
+        assert_eq!(t.execution.concurrency, ConcurrencyMode::Fixed(4));
         assert!(t.execution.fail_fast);
     }
 
@@ -2316,7 +2397,7 @@ adapter = "db"
         let config: RockyConfig = toml::from_str(toml_str).unwrap();
         let t = config.pipelines["transforms"].as_transformation().unwrap();
         assert_eq!(t.models, "models/**");
-        assert_eq!(t.execution.concurrency, 16);
+        assert_eq!(t.execution.concurrency, ConcurrencyMode::Adaptive);
         assert!(!t.execution.fail_fast);
         assert!(!t.checks.enabled);
     }
@@ -2436,7 +2517,7 @@ fail_fast = true
         assert!(q.checks.enabled);
         assert!(q.checks.row_count);
         assert_eq!(q.checks.custom.len(), 1);
-        assert_eq!(q.execution.concurrency, 2);
+        assert_eq!(q.execution.concurrency, ConcurrencyMode::Fixed(2));
     }
 
     // --- Snapshot pipeline tests ---
@@ -2484,7 +2565,7 @@ concurrency = 1
         assert_eq!(s.target.catalog, "warehouse");
         assert_eq!(s.target.table, "customers_history");
         assert!(s.target.governance.auto_create_schemas);
-        assert_eq!(s.execution.concurrency, 1);
+        assert_eq!(s.execution.concurrency, ConcurrencyMode::Fixed(1));
     }
 
     // --- Pipeline chaining (depends_on) tests ---
@@ -2670,7 +2751,7 @@ concurrency = 2
         assert!(!l.options.csv_has_header);
         assert!(l.checks.enabled);
         assert!(l.checks.row_count);
-        assert_eq!(l.execution.concurrency, 2);
+        assert_eq!(l.execution.concurrency, ConcurrencyMode::Fixed(2));
     }
 
     #[test]
@@ -2702,7 +2783,7 @@ schema = "staging"
         assert!(l.options.csv_has_header);
         // Checks default to disabled
         assert!(!l.checks.enabled);
-        assert_eq!(l.execution.concurrency, 16);
+        assert_eq!(l.execution.concurrency, ConcurrencyMode::Adaptive);
     }
 
     #[test]
@@ -3336,30 +3417,89 @@ schema_template = "staging"
     }
 
     #[test]
-    fn test_execution_config_defaults_adaptive_concurrency_off() {
+    fn test_execution_config_defaults_adaptive() {
         let cfg = ExecutionConfig::default();
-        assert!(!cfg.adaptive_concurrency);
-        assert_eq!(cfg.concurrency, 16);
+        assert_eq!(cfg.concurrency, ConcurrencyMode::Adaptive);
+        assert!(cfg.concurrency.is_adaptive());
+        assert_eq!(cfg.concurrency.max_concurrency(), 32);
     }
 
     #[test]
-    fn test_execution_config_adaptive_concurrency_from_toml() {
+    fn test_execution_config_adaptive_from_toml() {
+        let toml_str = r#"
+concurrency = "adaptive"
+"#;
+        let cfg: ExecutionConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.concurrency.is_adaptive());
+        assert_eq!(cfg.concurrency.max_concurrency(), 32);
+    }
+
+    #[test]
+    fn test_execution_config_fixed_from_toml() {
         let toml_str = r#"
 concurrency = 8
-adaptive_concurrency = true
 "#;
         let cfg: ExecutionConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.adaptive_concurrency);
-        assert_eq!(cfg.concurrency, 8);
+        assert!(!cfg.concurrency.is_adaptive());
+        assert_eq!(cfg.concurrency, ConcurrencyMode::Fixed(8));
+        assert_eq!(cfg.concurrency.max_concurrency(), 8);
     }
 
     #[test]
-    fn test_execution_config_adaptive_concurrency_omitted() {
-        // Omitting adaptive_concurrency defaults to false (backward compat)
+    fn test_execution_config_serial_from_toml() {
         let toml_str = r#"
-concurrency = 4
+concurrency = 1
 "#;
         let cfg: ExecutionConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.adaptive_concurrency);
+        assert_eq!(cfg.concurrency, ConcurrencyMode::Fixed(1));
+        assert_eq!(cfg.concurrency.max_concurrency(), 1);
+    }
+
+    #[test]
+    fn test_execution_config_zero_clamped_to_one() {
+        let toml_str = r#"
+concurrency = 0
+"#;
+        let cfg: ExecutionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.concurrency, ConcurrencyMode::Fixed(1));
+        assert_eq!(cfg.concurrency.max_concurrency(), 1);
+    }
+
+    #[test]
+    fn test_execution_config_omitted_defaults_to_adaptive() {
+        // Omitting concurrency entirely defaults to adaptive
+        let toml_str = r#"
+fail_fast = true
+"#;
+        let cfg: ExecutionConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.concurrency.is_adaptive());
+    }
+
+    #[test]
+    fn test_execution_config_invalid_string_errors() {
+        let toml_str = r#"
+concurrency = "turbo"
+"#;
+        let result: Result<ExecutionConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_concurrency_mode_display() {
+        assert_eq!(ConcurrencyMode::Adaptive.to_string(), "adaptive");
+        assert_eq!(ConcurrencyMode::Fixed(8).to_string(), "8");
+    }
+
+    #[test]
+    fn test_concurrency_mode_roundtrip() {
+        // Adaptive roundtrip
+        let adaptive = ConcurrencyMode::Adaptive;
+        let json = serde_json::to_string(&adaptive).unwrap();
+        assert_eq!(json, r#""adaptive""#);
+
+        // Fixed roundtrip
+        let fixed = ConcurrencyMode::Fixed(16);
+        let json = serde_json::to_string(&fixed).unwrap();
+        assert_eq!(json, "16");
     }
 }
