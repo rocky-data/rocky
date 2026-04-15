@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tracing::warn;
 
+use crate::error_reporter;
+
 use rocky_core::config::{AdapterConfig, RockyConfig};
 use rocky_core::traits::{DiscoveryAdapter, WarehouseAdapter};
 
@@ -261,9 +263,17 @@ impl AdapterRegistry {
                     warehouse.insert(name.clone(), Arc::new(adapter));
                 }
                 other => {
-                    bail!(
-                        "adapters.{name}: unsupported adapter type '{other}'. Supported: databricks, duckdb, snowflake, bigquery, fivetran, airbyte, iceberg, manual"
+                    let mut msg = format!(
+                        "adapters.{name}: unsupported adapter type '{other}'. \
+                         Supported: databricks, duckdb, snowflake, bigquery, \
+                         fivetran, airbyte, iceberg, manual"
                     );
+                    if let Some(suggestion) =
+                        error_reporter::did_you_mean(other, error_reporter::KNOWN_ADAPTER_TYPES)
+                    {
+                        msg.push_str(&format!(". Did you mean '{suggestion}'?"));
+                    }
+                    bail!(msg);
                 }
             }
         }
@@ -342,11 +352,18 @@ pub fn resolve_pipeline<'a>(
 ) -> Result<(&'a str, &'a rocky_core::config::PipelineConfig)> {
     match pipeline_name {
         Some(name) => {
-            let pipeline = config
-                .pipelines
-                .get(name)
-                .context(format!("pipeline '{name}' not found in config"))?;
-            Ok((name, pipeline))
+            let pipeline = config.pipelines.get(name);
+            match pipeline {
+                Some(p) => Ok((name, p)),
+                None => {
+                    let known: Vec<&str> = config.pipelines.keys().map(String::as_str).collect();
+                    let mut msg = format!("pipeline '{name}' not found in config");
+                    if let Some(suggestion) = error_reporter::did_you_mean(name, &known) {
+                        msg.push_str(&format!(". Did you mean '{suggestion}'?"));
+                    }
+                    bail!(msg)
+                }
+            }
         }
         None => {
             if config.pipelines.len() == 1 {

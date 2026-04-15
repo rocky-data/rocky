@@ -3152,8 +3152,11 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strsim",
  "tempfile",
+ "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 
