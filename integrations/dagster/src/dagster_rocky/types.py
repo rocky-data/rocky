@@ -823,6 +823,70 @@ class DriftDetectResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 round 9 — generated types bridge
+# ---------------------------------------------------------------------------
+#
+# As of Phase 2, every Rocky CLI command's JSON output has a typed Rust
+# struct deriving JsonSchema. The schemars-generated Pydantic v2 models live
+# in `dagster_rocky.types_generated`. This section re-exports them from
+# `dagster_rocky.types` so consumers have ONE place to import from.
+#
+# Naming convention: the generated classes use the Rust field-struct names
+# Generated Pydantic models from JSON schemas (via datamodel-codegen).
+# The generated names use the Rust struct names (`DiscoverOutput`,
+# `RunOutput`, etc.) while the hand-written classes above use
+# Python-flavored names (`DiscoverResult`, `RunResult`, etc.).
+# Both remain importable. The hand-written classes are the public API.
+
+from .types_generated import (  # noqa: E402, F401
+    AiExplainOutput,
+    AiGenerateOutput,
+    AiSyncOutput,
+    AiTestOutput,
+    AnomalyOutput,
+    ChecksConfigOutput,
+    CiDiffOutput,
+    CiOutput,
+    DiffResult,
+    DiffSummary,
+    ColumnLineageOutput,
+    ColumnTrendPoint,
+    CompileOutput,
+    DiscoverOutput,
+    DoctorOutput,
+    DriftActionOutput,
+    DriftOutput,
+    DriftSummary,
+    FreshnessConfigOutput,
+    HistoryOutput,
+    LineageColumnDef,
+    LineageEdgeRecord,
+    LineageOutput,
+    LineageQualifiedColumn,
+    MaterializationOutput,
+    MetricsAlert,
+    MetricsOutput,
+    MetricsSnapshotEntry,
+    ModelExecutionRecord,
+    ModelHistoryOutput,
+    OptimizeOutput,
+    OptimizeRecommendation,
+    PermissionSummary,
+    PhaseTimings,
+    PlanOutput,
+    RunHistoryRecord,
+    RunOutput,
+    SourceOutput,
+    StateOutput,
+    TableCheckOutput,
+    TableErrorOutput,
+    TableOutput,
+    TestFailure,
+    TestOutput,
+)
+
+
+# ---------------------------------------------------------------------------
 # Union type and parser
 # ---------------------------------------------------------------------------
 
@@ -900,67 +964,3 @@ def parse_rocky_output(json_str: str) -> RockyOutput:
         return _SIMPLE_DISPATCH[command].model_validate(data)
 
     raise ValueError(f"Unknown Rocky command type: {command!r}")
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 round 9 — generated types bridge
-# ---------------------------------------------------------------------------
-#
-# As of Phase 2, every Rocky CLI command's JSON output has a typed Rust
-# struct deriving JsonSchema. The schemars-generated Pydantic v2 models live
-# in `dagster_rocky.types_generated`. This section re-exports them from
-# `dagster_rocky.types` so consumers have ONE place to import from.
-#
-# Naming convention: the generated classes use the Rust field-struct names
-# Generated Pydantic models from JSON schemas (via datamodel-codegen).
-# The generated names use the Rust struct names (`DiscoverOutput`,
-# `RunOutput`, etc.) while the hand-written classes above use
-# Python-flavored names (`DiscoverResult`, `RunResult`, etc.).
-# Both remain importable. The hand-written classes are the public API.
-
-from .types_generated import (  # noqa: E402, F401
-    AiExplainOutput,
-    AiGenerateOutput,
-    AiSyncOutput,
-    AiTestOutput,
-    AnomalyOutput,
-    ChecksConfigOutput,
-    CiDiffOutput,
-    CiOutput,
-    DiffResult,
-    DiffSummary,
-    ColumnLineageOutput,
-    ColumnTrendPoint,
-    CompileOutput,
-    DiscoverOutput,
-    DoctorOutput,
-    DriftActionOutput,
-    DriftOutput,
-    DriftSummary,
-    FreshnessConfigOutput,
-    HistoryOutput,
-    LineageColumnDef,
-    LineageEdgeRecord,
-    LineageOutput,
-    LineageQualifiedColumn,
-    MaterializationOutput,
-    MetricsAlert,
-    MetricsOutput,
-    MetricsSnapshotEntry,
-    ModelExecutionRecord,
-    ModelHistoryOutput,
-    OptimizeOutput,
-    OptimizeRecommendation,
-    PermissionSummary,
-    PhaseTimings,
-    PlanOutput,
-    RunHistoryRecord,
-    RunOutput,
-    SourceOutput,
-    StateOutput,
-    TableCheckOutput,
-    TableErrorOutput,
-    TableOutput,
-    TestFailure,
-    TestOutput,
-)
