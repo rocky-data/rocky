@@ -456,6 +456,52 @@ impl RockyLsp {
         }
     }
 
+    /// Extract a macro name when the cursor is on `@macro_name(...)`.
+    ///
+    /// Returns the identifier portion (without `@`) if the cursor sits on
+    /// or immediately after the `@` prefix of a macro invocation.
+    fn macro_at_position(text: &str, line: u32, col: u32) -> Option<String> {
+        let target_line = text.lines().nth(line as usize)?;
+        let col = col as usize;
+        if col > target_line.len() {
+            return None;
+        }
+
+        // Walk left from cursor to find the identifier start.
+        let start = target_line[..col]
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // Walk right from cursor to find identifier end.
+        let end = target_line[col..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + col)
+            .unwrap_or(target_line.len());
+
+        if start == 0 {
+            return None;
+        }
+
+        // The character immediately before `start` must be `@`.
+        let prefix_pos = start - 1;
+        if target_line.as_bytes().get(prefix_pos).copied() != Some(b'@') {
+            return None;
+        }
+
+        // And the character after the name should be `(` (macro call, not
+        // a bare `@identifier` like `@start_date`).
+        if target_line.as_bytes().get(end).copied() != Some(b'(') {
+            return None;
+        }
+
+        let name = &target_line[start..end];
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
     /// Convert a RefLocation to an LSP Location.
     fn ref_to_location(r: &RefLocation) -> Option<Location> {
         let uri = Url::from_file_path(&r.file).ok()?;
@@ -755,6 +801,30 @@ impl LanguageServer for RockyLsp {
         let word = doc_text
             .as_deref()
             .and_then(|t| Self::word_at_position(t, pos.line, pos.character));
+
+        // Check if hovering on a macro invocation (@macro_name)
+        if let Some(macro_name) = doc_text
+            .as_deref()
+            .and_then(|t| Self::macro_at_position(t, pos.line, pos.character))
+        {
+            let models_dir = self.models_dir.read().await;
+            if let Some(ref dir) = *models_dir {
+                let macros_dir = std::path::PathBuf::from(dir).join("../macros");
+                if macros_dir.is_dir() {
+                    if let Ok(macro_defs) = rocky_core::macros::load_macros_from_dir(&macros_dir) {
+                        if let Some(m) = macro_defs.iter().find(|m| m.name == macro_name) {
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: m.hover_markdown(),
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
 
         // Check if hovering on a model name (could be a referenced model, not the current file's model)
         if let Some(ref w) = word {
