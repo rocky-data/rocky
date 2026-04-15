@@ -374,6 +374,12 @@ pub struct ModelDetail {
     /// `"explicit"` (via `--contracts` flag), or absent when no contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_source: Option<String>,
+    /// When the model uses `full_refresh` and has columns that look monotonic,
+    /// this hint suggests switching to incremental materialization. `None`
+    /// when the model already uses an incremental strategy or no candidates
+    /// were found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incrementality_hint: Option<rocky_compiler::incrementality::IncrementalityHint>,
 }
 
 impl CompileOutput {

@@ -1,6 +1,32 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "Confidence": {
+      "description": "Confidence level for an incrementality recommendation.",
+      "oneOf": [
+        {
+          "description": "Multiple strong signals (name + type + SQL context).",
+          "enum": [
+            "high"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Two signals (e.g., name + type, or name + SQL context).",
+          "enum": [
+            "medium"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Single signal (e.g., name pattern only).",
+          "enum": [
+            "low"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "Diagnostic": {
       "description": "A compiler diagnostic (error, warning, or informational message).",
       "properties": {
@@ -51,6 +77,41 @@
       ],
       "type": "object"
     },
+    "IncrementalityHint": {
+      "description": "A hint that a model could benefit from incremental materialization.\n\nReturned by [`infer_incrementality`] when a `full_refresh` model has columns that look monotonic. Surfaced in `rocky compile --output json` as part of each model's detail.",
+      "properties": {
+        "confidence": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Confidence"
+            }
+          ],
+          "description": "How confident the detector is in this recommendation."
+        },
+        "is_candidate": {
+          "description": "Whether the model is a candidate for incremental materialization.",
+          "type": "boolean"
+        },
+        "recommended_column": {
+          "description": "The column recommended as the watermark / timestamp column.",
+          "type": "string"
+        },
+        "signals": {
+          "description": "Human-readable reasons why this column was chosen.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "confidence",
+        "is_candidate",
+        "recommended_column",
+        "signals"
+      ],
+      "type": "object"
+    },
     "ModelDetail": {
       "description": "Per-model summary projected from `rocky_core::models::ModelConfig`.\n\nIntentionally excludes fields that change run-to-run (timings, diagnostics) — those live on the run-level outputs. This is the stable, declarative shape of one compiled model, suitable for orchestrators that build asset definitions ahead of execution.",
       "properties": {
@@ -71,6 +132,17 @@
             }
           ],
           "description": "Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured."
+        },
+        "incrementality_hint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/IncrementalityHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the model uses `full_refresh` and has columns that look monotonic, this hint suggests switching to incremental materialization. `None` when the model already uses an incremental strategy or no candidates were found."
         },
         "name": {
           "type": "string"

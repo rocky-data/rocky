@@ -12,6 +12,10 @@
  */
 export type Severity = "Error" | "Warning" | "Info";
 /**
+ * Confidence level for an incrementality recommendation.
+ */
+export type Confidence = "high" | "medium" | "low";
+/**
  * Materialization strategy for a model, defaulting to full refresh.
  */
 export type StrategyConfig =
@@ -178,6 +182,10 @@ export interface ModelDetail {
    * Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured.
    */
   freshness?: ModelFreshnessConfig | null;
+  /**
+   * When the model uses `full_refresh` and has columns that look monotonic, this hint suggests switching to incremental materialization. `None` when the model already uses an incremental strategy or no candidates were found.
+   */
+  incrementality_hint?: IncrementalityHint | null;
   name: string;
   /**
    * Materialization strategy as the wire-shape `StrategyConfig` (`{"type": "...", ...}`).
@@ -199,6 +207,30 @@ export interface ModelFreshnessConfig {
    * Maximum lag in seconds before the model is considered stale.
    */
   max_lag_seconds: number;
+  [k: string]: unknown;
+}
+/**
+ * A hint that a model could benefit from incremental materialization.
+ *
+ * Returned by [`infer_incrementality`] when a `full_refresh` model has columns that look monotonic. Surfaced in `rocky compile --output json` as part of each model's detail.
+ */
+export interface IncrementalityHint {
+  /**
+   * How confident the detector is in this recommendation.
+   */
+  confidence: Confidence;
+  /**
+   * Whether the model is a candidate for incremental materialization.
+   */
+  is_candidate: boolean;
+  /**
+   * The column recommended as the watermark / timestamp column.
+   */
+  recommended_column: string;
+  /**
+   * Human-readable reasons why this column was chosen.
+   */
+  signals: string[];
   [k: string]: unknown;
 }
 /**
