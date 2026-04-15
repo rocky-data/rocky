@@ -32,10 +32,7 @@ jobs:
       - run: npm ci
       - run: npm run compile
       - name: Run tests
-        uses: coactions/setup-xvfb@b6b4fcfb9f5a895edadc3bc76318fae0ac17c8b3 # v1
-        with:
-          working-directory: editors/vscode
-          run: npm test
+        run: xvfb-run -a npm test
 
   lint:
     name: Lint
