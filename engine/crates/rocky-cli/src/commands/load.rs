@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use rocky_adapter_sdk::{FileFormat, LoadOptions, LoaderAdapter, TableRef};
+use rocky_core::state::{LoadedFileRecord, StateStore};
 
 use crate::output::{LoadFileOutput, LoadOutput, print_json};
 use crate::registry::{AdapterRegistry, resolve_pipeline};
@@ -21,9 +22,12 @@ use crate::registry::{AdapterRegistry, resolve_pipeline};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky load`: discover files, load them into the target table(s).
+///
+/// CLI args override values from the load pipeline config. When `--source-dir`
+/// is omitted, the pipeline's `source_dir` from `rocky.toml` is used.
 pub async fn run_load(
     config_path: &Path,
-    source_dir: &Path,
+    cli_source_dir: Option<&Path>,
     format: Option<&str>,
     target_table: Option<&str>,
     pipeline: Option<&str>,
@@ -31,17 +35,6 @@ pub async fn run_load(
     json: bool,
 ) -> Result<()> {
     let start = Instant::now();
-
-    // Validate source directory exists.
-    if !source_dir.is_dir() {
-        bail!("source directory does not exist: {}", source_dir.display());
-    }
-
-    // Parse the requested format (if any).
-    let requested_format = match format {
-        Some(f) => Some(parse_format(f)?),
-        None => None,
-    };
 
     // Load config and build adapter registry.
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -51,8 +44,62 @@ pub async fn run_load(
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
 
     // Resolve pipeline to get the target adapter.
-    let (_pipeline_name, pipeline_cfg) =
+    let (pipeline_name, pipeline_cfg) =
         resolve_pipeline(&rocky_cfg, pipeline).context("failed to resolve pipeline for load")?;
+    let load_cfg = pipeline_cfg.as_load();
+
+    // Resolve source directory: CLI overrides config.
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let source_dir_buf;
+    let source_dir: &Path = if let Some(dir) = cli_source_dir {
+        dir
+    } else if let Some(lc) = load_cfg {
+        source_dir_buf = config_dir.join(&lc.source_dir);
+        &source_dir_buf
+    } else {
+        bail!(
+            "no --source-dir provided and the pipeline is not type = \"load\"; \
+             either pass --source-dir or configure a load pipeline in rocky.toml"
+        );
+    };
+
+    if !source_dir.is_dir() {
+        bail!("source directory does not exist: {}", source_dir.display());
+    }
+
+    // Resolve format: CLI > config > auto-detect.
+    let requested_format = match format {
+        Some(f) => Some(parse_format(f)?),
+        None => load_cfg
+            .as_ref()
+            .and_then(|lc| lc.format)
+            .map(config_format_to_sdk),
+    };
+
+    // Resolve target catalog/schema from config, falling back to defaults.
+    let target_catalog = load_cfg
+        .as_ref()
+        .map(|lc| lc.target.catalog.as_str())
+        .unwrap_or("");
+    let target_schema = load_cfg
+        .as_ref()
+        .map(|lc| lc.target.schema.as_str())
+        .unwrap_or("main");
+    let config_target_table = load_cfg.as_ref().and_then(|lc| lc.target.table.as_deref());
+
+    // Resolve load options from config, with CLI overrides.
+    let base_options = load_cfg
+        .as_ref()
+        .map(|lc| config_options_to_sdk(&lc.options))
+        .unwrap_or_default();
+
+    // Open the state store for tracking loaded files.
+    let state_path = config_dir.join(".rocky_state");
+    let state_store = StateStore::open(&state_path).context(format!(
+        "failed to open state store at {}",
+        state_path.display()
+    ))?;
+
     let adapter_name = pipeline_cfg.target_adapter();
 
     // Build a DuckDB loader adapter if the adapter type is DuckDB.
@@ -91,13 +138,15 @@ pub async fn run_load(
     // Discover files in the source directory.
     let files = discover_files(source_dir, requested_format)?;
 
+    let format_label = format.unwrap_or("auto");
+
     if files.is_empty() {
         if json {
             let output = LoadOutput {
                 version: VERSION.into(),
                 command: "load".into(),
                 source_dir: source_dir.display().to_string(),
-                format: format.unwrap_or("auto").to_string(),
+                format: format_label.to_string(),
                 files_loaded: 0,
                 files_failed: 0,
                 total_rows: 0,
@@ -125,25 +174,33 @@ pub async fn run_load(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        // Derive the target table name: use the explicit target or the file stem.
-        let table_name = target_table.unwrap_or(file_name);
+        // Derive the target table name: CLI > config > file stem.
+        let table_name = target_table.or(config_target_table).unwrap_or(file_name);
 
         let target = TableRef {
-            catalog: String::new(),
-            schema: "main".into(),
+            catalog: target_catalog.to_string(),
+            schema: target_schema.to_string(),
             table: table_name.to_string(),
         };
 
+        let target_display = if target_catalog.is_empty() {
+            format!("{target_schema}.{table_name}")
+        } else {
+            format!("{target_catalog}.{target_schema}.{table_name}")
+        };
+
         let options = LoadOptions {
-            format: requested_format,
-            create_table: true,
-            truncate_first: truncate,
-            ..Default::default()
+            format: requested_format.or(base_options.format),
+            create_table: base_options.create_table,
+            truncate_first: truncate || base_options.truncate_first,
+            batch_size: base_options.batch_size,
+            csv_delimiter: base_options.csv_delimiter,
+            csv_has_header: base_options.csv_has_header,
         };
 
         info!(
             file = %file_path.display(),
-            target = %table_name,
+            target = %target_display,
             "loading file"
         );
 
@@ -159,9 +216,30 @@ pub async fn run_load(
                 );
                 total_rows += result.rows_loaded;
                 total_bytes += result.bytes_read;
+
+                // Record the loaded file in the state store for incremental tracking.
+                let record = LoadedFileRecord {
+                    loaded_at: chrono::Utc::now(),
+                    rows_loaded: result.rows_loaded,
+                    bytes_read: result.bytes_read,
+                    duration_ms: duration,
+                    file_hash: None,
+                };
+                if let Err(e) = state_store.record_loaded_file(
+                    pipeline_name,
+                    &file_path.display().to_string(),
+                    &record,
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        file = %file_path.display(),
+                        "failed to record loaded file in state store"
+                    );
+                }
+
                 file_results.push(LoadFileOutput {
                     file: file_path.display().to_string(),
-                    target: format!("main.{table_name}"),
+                    target: target_display,
                     rows_loaded: result.rows_loaded,
                     bytes_read: result.bytes_read,
                     duration_ms: duration,
@@ -179,7 +257,7 @@ pub async fn run_load(
                 );
                 file_results.push(LoadFileOutput {
                     file: file_path.display().to_string(),
-                    target: format!("main.{table_name}"),
+                    target: target_display,
                     rows_loaded: 0,
                     bytes_read: 0,
                     duration_ms: duration,
@@ -197,7 +275,7 @@ pub async fn run_load(
             version: VERSION.into(),
             command: "load".into(),
             source_dir: source_dir.display().to_string(),
-            format: format.unwrap_or("auto").to_string(),
+            format: format_label.to_string(),
             files_loaded,
             files_failed,
             total_rows,
@@ -229,6 +307,27 @@ pub async fn run_load(
     }
 
     Ok(())
+}
+
+/// Convert a config `LoadFileFormat` to the adapter SDK `FileFormat`.
+fn config_format_to_sdk(fmt: rocky_core::config::LoadFileFormat) -> FileFormat {
+    match fmt {
+        rocky_core::config::LoadFileFormat::Csv => FileFormat::Csv,
+        rocky_core::config::LoadFileFormat::Parquet => FileFormat::Parquet,
+        rocky_core::config::LoadFileFormat::JsonLines => FileFormat::JsonLines,
+    }
+}
+
+/// Convert config `LoadOptionsConfig` to the adapter SDK `LoadOptions`.
+fn config_options_to_sdk(opts: &rocky_core::config::LoadOptionsConfig) -> LoadOptions {
+    LoadOptions {
+        batch_size: opts.batch_size,
+        create_table: opts.create_table,
+        truncate_first: opts.truncate_first,
+        format: None,
+        csv_delimiter: opts.csv_delimiter.chars().next().unwrap_or(','),
+        csv_has_header: opts.csv_has_header,
+    }
 }
 
 /// Parse a format string into a [`FileFormat`].
@@ -346,5 +445,160 @@ mod tests {
     fn test_discover_files_nonexistent_dir() {
         let result = discover_files(Path::new("/nonexistent/path"), None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_format_to_sdk() {
+        assert_eq!(
+            config_format_to_sdk(rocky_core::config::LoadFileFormat::Csv),
+            FileFormat::Csv
+        );
+        assert_eq!(
+            config_format_to_sdk(rocky_core::config::LoadFileFormat::Parquet),
+            FileFormat::Parquet
+        );
+        assert_eq!(
+            config_format_to_sdk(rocky_core::config::LoadFileFormat::JsonLines),
+            FileFormat::JsonLines
+        );
+    }
+
+    #[test]
+    fn test_config_options_to_sdk_defaults() {
+        let config_opts = rocky_core::config::LoadOptionsConfig::default();
+        let sdk_opts = config_options_to_sdk(&config_opts);
+        assert_eq!(sdk_opts.batch_size, 10_000);
+        assert!(sdk_opts.create_table);
+        assert!(!sdk_opts.truncate_first);
+        assert_eq!(sdk_opts.csv_delimiter, ',');
+        assert!(sdk_opts.csv_has_header);
+    }
+
+    #[test]
+    fn test_config_options_to_sdk_custom() {
+        let config_opts = rocky_core::config::LoadOptionsConfig {
+            batch_size: 5000,
+            create_table: false,
+            truncate_first: true,
+            csv_delimiter: "\t".to_string(),
+            csv_has_header: false,
+        };
+        let sdk_opts = config_options_to_sdk(&config_opts);
+        assert_eq!(sdk_opts.batch_size, 5000);
+        assert!(!sdk_opts.create_table);
+        assert!(sdk_opts.truncate_first);
+        assert_eq!(sdk_opts.csv_delimiter, '\t');
+        assert!(!sdk_opts.csv_has_header);
+    }
+
+    /// Config-driven round-trip: parse load pipeline config, construct loader,
+    /// load a file, verify data and state tracking.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_config_driven_load_roundtrip() {
+        use rocky_duckdb::loader::DuckDbLoaderAdapter;
+
+        // Create a temp directory with a CSV file and a rocky.toml.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let csv_path = data_dir.join("orders.csv");
+        std::fs::write(
+            &csv_path,
+            "id,product,qty\n1,Widget,10\n2,Gadget,5\n3,Doohickey,3\n",
+        )
+        .unwrap();
+
+        let toml_content = r#"
+[adapter.default]
+type = "duckdb"
+
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+format = "csv"
+
+[pipeline.ingest.target]
+adapter = "default"
+catalog = ""
+schema = "main"
+
+[pipeline.ingest.options]
+batch_size = 1000
+create_table = true
+"#;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        // Parse the config.
+        let rocky_cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let pipeline = rocky_cfg.pipelines.get("ingest").unwrap();
+        let load_cfg = pipeline.as_load().unwrap();
+
+        // Verify config values parsed correctly.
+        assert_eq!(load_cfg.source_dir, "data/");
+        assert_eq!(
+            load_cfg.format,
+            Some(rocky_core::config::LoadFileFormat::Csv)
+        );
+        assert_eq!(load_cfg.target.schema, "main");
+        assert_eq!(load_cfg.options.batch_size, 1000);
+
+        // Build the loader adapter from the config.
+        let loader = DuckDbLoaderAdapter::in_memory().unwrap();
+
+        // Convert config options to SDK options.
+        let options = config_options_to_sdk(&load_cfg.options);
+        let target = rocky_adapter_sdk::TableRef {
+            catalog: load_cfg.target.catalog.clone(),
+            schema: load_cfg.target.schema.clone(),
+            table: "orders".into(),
+        };
+
+        // Load the file.
+        let result = loader
+            .load_file(&csv_path, &target, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_loaded, 3);
+        assert!(result.bytes_read > 0);
+
+        // Verify data in the table.
+        let conn = loader.shared_connector();
+        let guard = conn.lock().unwrap();
+        let qr = guard
+            .execute_sql("SELECT product FROM main.orders ORDER BY id")
+            .unwrap();
+        assert_eq!(qr.rows.len(), 3);
+        assert_eq!(qr.rows[0][0], "Widget");
+        assert_eq!(qr.rows[1][0], "Gadget");
+        assert_eq!(qr.rows[2][0], "Doohickey");
+
+        // Verify state tracking round-trip.
+        let state_path = dir.path().join(".rocky_state");
+        let state_store = StateStore::open(&state_path).unwrap();
+        let record = LoadedFileRecord {
+            loaded_at: chrono::Utc::now(),
+            rows_loaded: result.rows_loaded,
+            bytes_read: result.bytes_read,
+            duration_ms: result.duration_ms,
+            file_hash: None,
+        };
+        state_store
+            .record_loaded_file("ingest", &csv_path.display().to_string(), &record)
+            .unwrap();
+
+        // Confirm the state was recorded.
+        let retrieved = state_store
+            .get_loaded_file("ingest", &csv_path.display().to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.rows_loaded, 3);
+
+        // Confirm listing works.
+        let files = state_store.list_loaded_files("ingest").unwrap();
+        assert_eq!(files.len(), 1);
     }
 }
