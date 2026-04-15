@@ -96,6 +96,9 @@ regex = "1"
 hmac = "0.13"
 sha2 = "0.11"
 
+# Content-addressed hashing (row-level dedup calibration)
+blake3 = "1"
+
 # JWT / RSA / Base64
 jsonwebtoken = "10"
 rsa = { version = "0.9", features = ["pem"] }
