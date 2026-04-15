@@ -1,6 +1,6 @@
 [package]
 name = "rocky-wasm"
-version = "1.0.0"
+version = "1.0.1"
 description = "WASM bindings for Rocky's pure-Rust compiler pipeline"
 edition.workspace = true
 license.workspace = true
