@@ -69,7 +69,7 @@ pub struct PipesEmitter {
     /// File handle protected by a mutex so multiple threads (e.g. the
     /// `--parallel` partition execution path) can emit concurrently
     /// without interleaving lines.
-    channel: Mutex<Box<dyn Write + Send>>,
+    pub(crate) channel: Mutex<Box<dyn Write + Send>>,
 }
 
 impl std::fmt::Debug for PipesEmitter {
