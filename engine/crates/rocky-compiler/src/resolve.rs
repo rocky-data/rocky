@@ -197,6 +197,7 @@ mod tests {
                     table: name.to_string(),
                 },
                 sources: vec![],
+                adapter: None,
                 intent: None,
                 freshness: None,
                 tests: vec![],

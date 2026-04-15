@@ -140,6 +140,7 @@ fn validate_generated_code(source: &str, format: &str) -> Result<String, String>
                 table: name.clone(),
             },
             sources: vec![],
+            adapter: None,
             intent: None,
             freshness: None,
             tests: vec![],

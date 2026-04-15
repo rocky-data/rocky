@@ -688,6 +688,7 @@ mod tests {
                     table: name.into(),
                 },
                 sources: vec![],
+                adapter: None,
                 intent: None,
                 freshness: None,
                 tests,

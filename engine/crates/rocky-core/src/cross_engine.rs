@@ -12,14 +12,18 @@
 //! - [`validate_cross_engine_deps`] — checks for latency and consistency
 //!   risks when pipeline A's target feeds pipeline B's source across
 //!   different warehouses.
+//! - [`validate_cross_engine_config`] — hard validation that returns errors
+//!   (not warnings) for broken cross-engine configs.
 //! - [`resolve_execution_graph`] — topological sort of pipelines respecting
 //!   `depends_on`, producing an ordered list of [`PipelineResolution`]s.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::bridge;
 use crate::config::{PipelineConfig, RockyConfig};
 use crate::dag::{self, DagNode};
+use crate::models::Model;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -117,6 +121,19 @@ pub enum CrossEngineError {
     #[error("pipeline '{pipeline}' references unknown adapter '{adapter}'")]
     UnknownAdapter { pipeline: String, adapter: String },
 
+    #[error(
+        "model '{model}' in pipeline '{pipeline}' overrides adapter to '{adapter}', \
+         which is not defined in [adapter.*]"
+    )]
+    UnknownModelAdapter {
+        model: String,
+        pipeline: String,
+        adapter: String,
+    },
+
+    #[error("cross-warehouse dependency is not feasible: {reason}")]
+    InfeasibleBridge { reason: String },
+
     #[error(transparent)]
     DagError(#[from] dag::DagError),
 }
@@ -211,6 +228,73 @@ pub fn validate_cross_engine_deps(config: &RockyConfig) -> Vec<CrossEngineWarnin
     }
 
     warnings
+}
+
+// ---------------------------------------------------------------------------
+// Hard config validation
+// ---------------------------------------------------------------------------
+
+/// Validates cross-engine configuration for correctness.
+///
+/// Unlike [`validate_cross_engine_deps`] (which emits warnings for risks that
+/// the user may accept), this function returns hard errors for configurations
+/// that **cannot work**:
+///
+/// - A model's `adapter` override references an adapter not defined in
+///   `[adapter.*]`.
+/// - A cross-warehouse edge involves adapter types that cannot participate
+///   in data transfer (e.g., discovery-only adapters used as bridge endpoints).
+///
+/// Call this during `rocky validate` and before `rocky run` to catch
+/// misconfigurations early.
+pub fn validate_cross_engine_config(
+    config: &RockyConfig,
+    models: &[Model],
+) -> Result<(), CrossEngineError> {
+    // 1. Validate per-model adapter overrides reference existing adapters.
+    for model in models {
+        if let Some(ref adapter_name) = model.config.adapter {
+            if !config.adapters.contains_key(adapter_name) {
+                // Find which pipeline this model belongs to (best effort).
+                let pipeline_name = model
+                    .file_path
+                    .split('/')
+                    .find(|seg| config.pipelines.contains_key(*seg))
+                    .unwrap_or("unknown")
+                    .to_owned();
+
+                return Err(CrossEngineError::UnknownModelAdapter {
+                    model: model.config.name.clone(),
+                    pipeline: pipeline_name,
+                    adapter: adapter_name.clone(),
+                });
+            }
+        }
+    }
+
+    // 2. Validate that cross-warehouse edges can actually be bridged.
+    let project = build_cross_engine_project(config)?;
+    let bridge_errors = bridge::validate_bridge_feasibility(&project);
+    if let Some(first_error) = bridge_errors.into_iter().next() {
+        return Err(CrossEngineError::InfeasibleBridge {
+            reason: format!("{first_error}"),
+        });
+    }
+
+    Ok(())
+}
+
+/// Resolves the effective adapter name for a model, considering per-model
+/// overrides.
+///
+/// Returns the model's `adapter` field if set, otherwise falls back to
+/// the pipeline's target adapter.
+pub fn effective_model_adapter<'a>(model: &'a Model, pipeline_target_adapter: &'a str) -> &'a str {
+    model
+        .config
+        .adapter
+        .as_deref()
+        .unwrap_or(pipeline_target_adapter)
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +940,108 @@ mod tests {
         assert!(
             names.iter().position(|&n| n == "c").unwrap()
                 < names.iter().position(|&n| n == "d").unwrap()
+        );
+    }
+
+    // -- validate_cross_engine_config tests --
+
+    fn make_model(name: &str, adapter_override: Option<&str>) -> crate::models::Model {
+        crate::models::Model {
+            config: crate::models::ModelConfig {
+                name: name.to_owned(),
+                depends_on: vec![],
+                strategy: crate::models::StrategyConfig::default(),
+                target: crate::models::TargetConfig {
+                    catalog: "warehouse".into(),
+                    schema: "silver".into(),
+                    table: name.into(),
+                },
+                sources: vec![],
+                adapter: adapter_override.map(String::from),
+                intent: None,
+                freshness: None,
+                tests: vec![],
+                format: None,
+                format_options: None,
+            },
+            sql: format!("SELECT * FROM upstream_{name}"),
+            file_path: format!("models/{name}.sql"),
+            contract_path: None,
+        }
+    }
+
+    #[test]
+    fn validate_config_ok_with_no_adapter_overrides() {
+        let cfg = config(
+            vec![("db", "databricks")],
+            vec![("bronze", replication_pipeline("db", "db", vec![]))],
+        );
+        let models = vec![make_model("stg_orders", None)];
+        assert!(validate_cross_engine_config(&cfg, &models).is_ok());
+    }
+
+    #[test]
+    fn validate_config_ok_with_valid_adapter_override() {
+        let cfg = config(
+            vec![("db", "databricks"), ("sf", "snowflake")],
+            vec![("bronze", replication_pipeline("db", "db", vec![]))],
+        );
+        let models = vec![make_model("stg_orders", Some("sf"))];
+        assert!(validate_cross_engine_config(&cfg, &models).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_unknown_model_adapter() {
+        let cfg = config(
+            vec![("db", "databricks")],
+            vec![("bronze", replication_pipeline("db", "db", vec![]))],
+        );
+        let models = vec![make_model("stg_orders", Some("nonexistent"))];
+        let result = validate_cross_engine_config(&cfg, &models);
+        assert!(
+            matches!(result, Err(CrossEngineError::UnknownModelAdapter { .. })),
+            "expected UnknownModelAdapter, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_infeasible_bridge() {
+        // fivetran -> databricks is infeasible because fivetran can't export
+        let cfg = config(
+            vec![("ft", "fivetran"), ("db", "databricks")],
+            vec![
+                ("ingest", replication_pipeline("ft", "ft", vec![])),
+                (
+                    "transform",
+                    transformation_pipeline("db", vec!["ingest".into()]),
+                ),
+            ],
+        );
+        let models: Vec<crate::models::Model> = vec![];
+        let result = validate_cross_engine_config(&cfg, &models);
+        assert!(
+            matches!(result, Err(CrossEngineError::InfeasibleBridge { .. })),
+            "expected InfeasibleBridge, got: {result:?}"
+        );
+    }
+
+    // -- effective_model_adapter tests --
+
+    #[test]
+    fn effective_adapter_returns_override_when_set() {
+        let model = make_model("orders", Some("snowflake_prod"));
+        assert_eq!(
+            effective_model_adapter(&model, "databricks_default"),
+            "snowflake_prod"
+        );
+    }
+
+    #[test]
+    fn effective_adapter_returns_pipeline_default_when_no_override() {
+        let model = make_model("orders", None);
+        assert_eq!(
+            effective_model_adapter(&model, "databricks_default"),
+            "databricks_default"
         );
     }
 }
