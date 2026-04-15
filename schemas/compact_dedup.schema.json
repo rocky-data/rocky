@@ -192,6 +192,10 @@
       ],
       "description": "Dedup computed over all columns (what a byte-level chunk store would actually deduplicate)."
     },
+    "scope": {
+      "description": "Whether the measurement was scoped to Rocky-managed tables (`\"managed\"`) or included all warehouse tables (`\"all\"`).",
+      "type": "string"
+    },
     "semantic": {
       "allOf": [
         {
@@ -226,6 +230,7 @@
     "per_table",
     "project",
     "raw",
+    "scope",
     "semantic",
     "tables_scanned",
     "top_dedup_pairs",

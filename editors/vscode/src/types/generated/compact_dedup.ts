@@ -2,7 +2,7 @@
 /**
  * AUTO-GENERATED — do not edit by hand.
  * Source: schemas/compact_dedup.schema.json
- * Run `just codegen` from the monorepo root to regenerate.
+ * Run just codegen from the monorepo root to regenerate.
  */
 
 /**
@@ -41,6 +41,10 @@ export interface CompactDedupOutput {
    * Dedup computed over all columns (what a byte-level chunk store would actually deduplicate).
    */
   raw: DedupSummary;
+  /**
+   * Whether the measurement was scoped to Rocky-managed tables (`"managed"`) or included all warehouse tables (`"all"`).
+   */
+  scope: string;
   /**
    * Dedup computed after excluding Rocky-owned metadata columns. The gap between `raw` and `semantic` is "dedup we'd unlock if we ignored Rocky's own per-row metadata."
    */

@@ -2,7 +2,7 @@
 /**
  * AUTO-GENERATED — do not edit by hand.
  * Source: schemas/compare.schema.json
- * Run `just codegen` from the monorepo root to regenerate.
+ * Run just codegen from the monorepo root to regenerate.
  */
 
 /**
