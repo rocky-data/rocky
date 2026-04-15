@@ -3057,7 +3057,7 @@ mod tests {
         };
 
         let output = RunOutput {
-            version: "1.0.1".into(),
+            version: "1.0.2".into(),
             command: "run".into(),
             pipeline_type: None,
             filter: "tenant=acme".into(),

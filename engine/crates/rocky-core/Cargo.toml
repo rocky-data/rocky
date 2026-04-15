@@ -1,6 +1,6 @@
 [package]
 name = "rocky-core"
-version = "1.0.1"
+version = "1.0.2"
 description = "Core SQL transformation engine for Rocky"
 edition.workspace = true
 license.workspace = true
