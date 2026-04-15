@@ -18,6 +18,14 @@ const RUN_PROGRESS: TableDefinition<&str, &[u8]> = TableDefinition::new("run_pro
 /// Authoritative source for "did partition X compute"; consulted by
 /// `--missing` discovery.
 const PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
+/// Grace-period tracking for columns dropped from the source.
+///
+/// Key format: `"{table_key}|{column_name}"` (e.g.
+/// `"acme_warehouse.staging.orders|old_col"`). Value: serialized
+/// `GracePeriodRecord`. When a column reappears in the source the record
+/// is deleted; when the grace period expires the column is dropped from
+/// the target and the record is removed.
+const GRACE_PERIODS: TableDefinition<&str, &[u8]> = TableDefinition::new("grace_periods");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -26,7 +34,7 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 /// Increment this constant whenever a table is added, removed, or structurally
 /// changed in a way that is incompatible with an older binary. Rocky will
 /// refuse to open a database whose stored version exceeds this value.
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -112,11 +120,15 @@ impl StateStore {
                             path: path.display().to_string(),
                         });
                     }
-                    // found <= CURRENT_SCHEMA_VERSION: future migration hook point
+                    // Upgrade stamp so future migrations can branch on
+                    // the actual version stored on disk.
+                    if found < CURRENT_SCHEMA_VERSION {
+                        metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
+                    }
                 }
                 None => {
                     // Fresh database or pre-versioning database — stamp the version.
-                    metadata.insert("schema_version", "1")?;
+                    metadata.insert("schema_version", "2")?;
                 }
             }
 
@@ -127,6 +139,7 @@ impl StateStore {
             let _table = txn.open_table(DAG_SNAPSHOTS)?;
             let _table = txn.open_table(RUN_PROGRESS)?;
             let _table = txn.open_table(PARTITIONS)?;
+            let _table = txn.open_table(GRACE_PERIODS)?;
         }
         txn.commit()?;
 
@@ -711,6 +724,103 @@ impl StateStore {
             }
         }
         Ok(latest)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grace-period column drop tracking
+// ---------------------------------------------------------------------------
+
+/// Record for a column that exists in the target but has been dropped from
+/// the source. Stored in the `GRACE_PERIODS` redb table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GracePeriodRecord {
+    /// Fully-qualified table key (catalog.schema.table).
+    pub table_key: String,
+    /// Column name in the target table.
+    pub column_name: String,
+    /// Column data type in the target table.
+    pub data_type: String,
+    /// When the column was first detected as missing from the source.
+    pub first_seen_at: chrono::DateTime<chrono::Utc>,
+    /// When the grace period expires (first_seen_at + grace_period_days).
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Compose the redb key for a `GracePeriodRecord`.
+fn grace_period_key(table_key: &str, column_name: &str) -> String {
+    format!("{table_key}|{column_name}")
+}
+
+impl StateStore {
+    /// Records a new grace-period entry for a column.
+    pub fn set_grace_period(&self, record: &GracePeriodRecord) -> Result<(), StateError> {
+        let key = grace_period_key(&record.table_key, &record.column_name);
+        let bytes = serde_json::to_vec(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(GRACE_PERIODS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Gets the grace-period record for a specific table + column.
+    pub fn get_grace_period(
+        &self,
+        table_key: &str,
+        column_name: &str,
+    ) -> Result<Option<GracePeriodRecord>, StateError> {
+        let key = grace_period_key(table_key, column_name);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(GRACE_PERIODS)?;
+        match table.get(key.as_str())? {
+            Some(value) => {
+                let record: GracePeriodRecord = serde_json::from_slice(value.value())?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists all grace-period records for a given table.
+    pub fn list_grace_periods(
+        &self,
+        table_key: &str,
+    ) -> Result<Vec<GracePeriodRecord>, StateError> {
+        let prefix = format!("{table_key}|");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(GRACE_PERIODS)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if !key.value().starts_with(&prefix) {
+                continue;
+            }
+            let record: GracePeriodRecord = serde_json::from_slice(value.value())?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    /// Deletes the grace-period record for a column (e.g., when the column
+    /// reappears in the source or after the column is actually dropped).
+    /// Returns true if a record was removed.
+    pub fn delete_grace_period(
+        &self,
+        table_key: &str,
+        column_name: &str,
+    ) -> Result<bool, StateError> {
+        let key = grace_period_key(table_key, column_name);
+        let txn = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = txn.open_table(GRACE_PERIODS)?;
+            removed = table.remove(key.as_str())?.is_some();
+        }
+        txn.commit()?;
+        Ok(removed)
     }
 }
 

@@ -1586,3 +1586,173 @@ mod time_interval_e2e {
         );
     }
 }
+
+// ===========================================================================
+// Test 21: Grace-period column drop lifecycle with state store
+// ===========================================================================
+
+#[test]
+fn test_grace_period_column_drop_lifecycle() {
+    use chrono::{Duration, Utc};
+    use rocky_core::drift::{detect_column_drops, generate_drop_column_sql};
+
+    let (store, _dir) = temp_state();
+    let table_key = "acme_warehouse.staging.orders";
+    let table = TableRef {
+        catalog: "acme_warehouse".into(),
+        schema: "staging".into(),
+        table: "orders".into(),
+    };
+
+    let source = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: "INT".into(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "amount".into(),
+            data_type: "DOUBLE".into(),
+            nullable: true,
+        },
+    ];
+    let target = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: "INT".into(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "amount".into(),
+            data_type: "DOUBLE".into(),
+            nullable: true,
+        },
+        ColumnInfo {
+            name: "old_status".into(),
+            data_type: "STRING".into(),
+            nullable: true,
+        },
+    ];
+
+    let now = Utc::now();
+
+    // --- Phase 1: First detection — column enters grace period ---
+    let existing = store.list_grace_periods(table_key).unwrap();
+    assert!(existing.is_empty());
+
+    let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+    assert_eq!(result.new_records.len(), 1);
+    assert_eq!(result.new_records[0].column_name, "old_status");
+    assert_eq!(result.in_grace_period.len(), 1);
+    assert!(result.expired.is_empty());
+
+    // Persist the new record.
+    let mut record = result.new_records[0].clone();
+    record.table_key = table_key.to_string();
+    store.set_grace_period(&record).unwrap();
+
+    // Verify it persisted.
+    let stored = store
+        .get_grace_period(table_key, "old_status")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.column_name, "old_status");
+
+    // --- Phase 2: Mid-grace-period run — column is still in grace period ---
+    let mid_run = now + Duration::days(3);
+    let existing = store.list_grace_periods(table_key).unwrap();
+    let result = detect_column_drops(&source, &target, 7, &existing, mid_run);
+
+    assert!(result.new_records.is_empty());
+    assert_eq!(result.in_grace_period.len(), 1);
+    assert_eq!(result.in_grace_period[0].days_remaining, 4);
+    assert!(result.expired.is_empty());
+
+    // --- Phase 3: Past grace period — column should be dropped ---
+    let past_grace = now + Duration::days(8);
+    let existing = store.list_grace_periods(table_key).unwrap();
+    let result = detect_column_drops(&source, &target, 7, &existing, past_grace);
+
+    assert!(result.new_records.is_empty());
+    assert!(result.in_grace_period.is_empty());
+    assert_eq!(result.expired.len(), 1);
+    assert_eq!(result.expired[0], "old_status");
+
+    // Generate DROP COLUMN SQL.
+    let dialect = TestDialect;
+    let drop_stmts = generate_drop_column_sql(&table, &result.expired, &dialect).unwrap();
+    assert_eq!(drop_stmts.len(), 1);
+    assert!(drop_stmts[0].contains("DROP COLUMN old_status"));
+
+    // Clean up state.
+    let removed = store.delete_grace_period(table_key, "old_status").unwrap();
+    assert!(removed);
+    assert!(store.list_grace_periods(table_key).unwrap().is_empty());
+}
+
+// ===========================================================================
+// Test 22: Grace-period column reappears in source
+// ===========================================================================
+
+#[test]
+fn test_grace_period_column_reappears() {
+    use chrono::Utc;
+    use rocky_core::drift::detect_column_drops;
+    use rocky_core::state::GracePeriodRecord;
+
+    let (store, _dir) = temp_state();
+    let table_key = "acme_warehouse.staging.orders";
+
+    let now = Utc::now();
+
+    // Column was detected as dropped 2 days ago.
+    let record = GracePeriodRecord {
+        table_key: table_key.to_string(),
+        column_name: "status".into(),
+        data_type: "STRING".into(),
+        first_seen_at: now - chrono::Duration::days(2),
+        expires_at: now + chrono::Duration::days(5),
+    };
+    store.set_grace_period(&record).unwrap();
+
+    // Now the source has the column again.
+    let source = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: "INT".into(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "status".into(),
+            data_type: "STRING".into(),
+            nullable: true,
+        },
+    ];
+    let target = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: "INT".into(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "status".into(),
+            data_type: "STRING".into(),
+            nullable: true,
+        },
+    ];
+
+    let existing = store.list_grace_periods(table_key).unwrap();
+    let result = detect_column_drops(&source, &target, 7, &existing, now);
+
+    // Column reappeared — record should be cleaned up.
+    assert!(result.new_records.is_empty());
+    assert!(result.in_grace_period.is_empty());
+    assert!(result.expired.is_empty());
+    assert_eq!(result.reappeared.len(), 1);
+    assert_eq!(result.reappeared[0], "status");
+
+    // Clean up state.
+    store.delete_grace_period(table_key, "status").unwrap();
+    assert!(store.list_grace_periods(table_key).unwrap().is_empty());
+}

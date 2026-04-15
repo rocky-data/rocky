@@ -538,6 +538,34 @@ pub struct GovernanceOverride {
     pub schema_grants: Vec<GrantConfig>,
 }
 
+/// Schema evolution configuration.
+///
+/// Controls how Rocky handles columns that disappear from the source but
+/// still exist in the target table. Instead of immediately dropping them,
+/// Rocky can keep them for a grace period (filling with NULL) so downstream
+/// consumers have time to adapt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaEvolutionConfig {
+    /// Number of days to keep a dropped column before removing it from the
+    /// target table. During this window the column is filled with NULL for
+    /// new rows and a warning is emitted on every run.
+    /// Default: 7.
+    #[serde(default = "default_grace_period_days")]
+    pub grace_period_days: u32,
+}
+
+fn default_grace_period_days() -> u32 {
+    7
+}
+
+impl Default for SchemaEvolutionConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_days: default_grace_period_days(),
+        }
+    }
+}
+
 /// Cost estimation configuration.
 ///
 /// Controls pricing assumptions used by [`crate::optimize::recommend_strategy`]
@@ -697,6 +725,10 @@ pub struct RockyConfig {
     /// Cost estimation configuration.
     #[serde(default)]
     pub cost: CostSection,
+
+    /// Schema evolution configuration (grace-period column drops).
+    #[serde(default)]
+    pub schema_evolution: SchemaEvolutionConfig,
 }
 
 /// Configuration for a named adapter instance.
