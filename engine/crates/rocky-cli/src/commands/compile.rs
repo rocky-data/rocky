@@ -123,6 +123,7 @@ pub fn run_compile(
                     contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                     incrementality_hint,
                     cost_hint,
+                    depends_on: model.config.depends_on.clone(),
                 }
             })
             .collect();

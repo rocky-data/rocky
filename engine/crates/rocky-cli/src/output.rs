@@ -385,6 +385,11 @@ pub struct ModelDetail {
     /// `None` when no upstream table statistics are available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_hint: Option<CostHint>,
+    /// Names of models this model directly depends on. Derived from the
+    /// model's TOML `depends_on` list or auto-resolved from SQL table
+    /// references. Empty when the model has no upstream dependencies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// Heuristic cost estimate derived from DAG-aware cardinality propagation.
