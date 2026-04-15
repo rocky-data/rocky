@@ -4,6 +4,7 @@
 //! dedup-measurement experiment (`run_measure_dedup`). See
 //! `plans/rocky-storage-layer-0.md` for the scope + decision gate.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -116,9 +117,11 @@ fn default_metadata_columns() -> Vec<String> {
 ///   practice yet; `resolve_pipeline(..., None)` errors cleanly if
 ///   multiple are defined and prompts the user to narrow. (Decision
 ///   4(c) from the plan review.)
-/// - **Partition-level only.** `--calibrate-bytes` logs a warning and
-///   proceeds without the byte-level calibration. The plan's §6 says
-///   calibration is recommended but not mandatory for an initial run.
+/// - **`--calibrate-bytes` is row-level.** When passed, samples up to
+///   3 tables from the top dedup pairs, pulls their first 10k rows via
+///   `SELECT *`, hashes each row with blake3, and cross-compares to
+///   produce a byte-level dedup percentage alongside the partition-level
+///   one. Not a random sample — uses the warehouse's natural row order.
 /// - **No UNION ALL batching.** Each table gets two unbatched queries
 ///   (raw + semantic). Fine for projects under ~100 tables; batching
 ///   via the `rocky-databricks::batch` UNION ALL pattern is a follow-up
@@ -164,15 +167,6 @@ pub(crate) async fn compute_measure_dedup(
 ) -> Result<CompactDedupOutput> {
     let started_at = Utc::now();
     let start = Instant::now();
-
-    if calibrate_bytes {
-        tracing::warn!(
-            "`--calibrate-bytes` is not yet implemented (Layer 0 Step 4 \
-             ships partition-level only; byte-level calibration lands in a \
-             follow-up per plans/rocky-storage-layer-0.md §4 Step 4 point 9). \
-             Proceeding without calibration."
-        );
-    }
 
     // 1. Load config and build the adapter registry.
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -282,7 +276,14 @@ pub(crate) async fn compute_measure_dedup(
     let semantic_stats = compute_dedup_stats(&semantic_per_table);
     let partitions_scanned = raw_stats.total_partitions;
 
-    // 8. Convert to the CLI output type.
+    // 8. Byte-level calibration via blake3 row hashing (when requested).
+    let calibration = if calibrate_bytes {
+        Some(calibrate_byte_dedup(adapter.as_ref(), &semantic_stats, &semantic_per_table).await?)
+    } else {
+        None
+    };
+
+    // 9. Convert to the CLI output type.
     let output = build_compact_dedup_output(
         engine,
         project,
@@ -291,7 +292,7 @@ pub(crate) async fn compute_measure_dedup(
         &raw_stats,
         &semantic_stats,
         excluded_columns,
-        None, // calibration deferred
+        calibration,
         started_at,
         start.elapsed().as_millis() as u64,
     );
@@ -537,11 +538,31 @@ fn render_measure_dedup_human(output: &CompactDedupOutput) {
         println!();
     }
 
-    println!("Interpretation: Partition-level measurement is a LOWER bound on byte-level");
-    println!("dedup. Two partitions that share 99% of their row groups but differ on one");
-    println!("row will appear fully distinct here. To get a byte-level calibration on a");
-    println!("sample, re-run with --calibrate-bytes (not yet implemented).");
-    println!();
+    if let Some(cal) = &output.calibration {
+        println!(
+            "Byte-level calibration (blake3, {} tables sampled):",
+            cal.tables_sampled.len()
+        );
+        for t in &cal.tables_sampled {
+            println!("  - {t}");
+        }
+        println!(
+            "  Partition dedup (sample): {:>6.1}%",
+            cal.partition_dedup_pct
+        );
+        println!("  Byte dedup (blake3):      {:>6.1}%", cal.byte_dedup_pct);
+        println!(
+            "  Lower-bound multiplier:   {:>6.2}x",
+            cal.lower_bound_multiplier
+        );
+        println!();
+    } else {
+        println!("Interpretation: Partition-level measurement is a LOWER bound on byte-level");
+        println!("dedup. Two partitions that share 99% of their row groups but differ on one");
+        println!("row will appear fully distinct here. To get a byte-level calibration on a");
+        println!("sample, re-run with --calibrate-bytes.");
+        println!();
+    }
 
     let (verdict, message) = verdict_for_semantic(output.semantic.dedup_ratio);
     println!("Decision gate (see plans/rocky-storage-layer-0.md §6):");
@@ -600,6 +621,188 @@ fn verdict_for_semantic(semantic_ratio: f64) -> (&'static str, &'static str) {
              byte-level sample before killing the vision (see §6).",
         )
     }
+}
+
+/// Default number of rows sampled per table during `--calibrate-bytes`.
+///
+/// 10 000 rows is enough to give a statistically meaningful signal
+/// without pulling excessive data over the wire. The warehouse's natural
+/// row ordering is used (no `ORDER BY`), which is fine for same-engine
+/// calibration: if the first N rows of two identical tables don't match,
+/// the tables aren't duplicates at the row level either.
+const CALIBRATE_SAMPLE_ROWS: usize = 10_000;
+
+/// Maximum number of tables to sample during `--calibrate-bytes`.
+///
+/// Preferentially picks tables that appear in the top dedup pairs (the
+/// ones with the highest partition-level sharing signal) so the
+/// calibration measures where the action is.
+const CALIBRATE_MAX_TABLES: usize = 3;
+
+/// Produce a blake3 hash for a single row (a slice of JSON cells).
+///
+/// Deterministic within the same engine: cells are serialized by
+/// `serde_json::to_string`, which is stable for the value types
+/// warehouses return (numbers, strings, nulls, booleans). Cross-engine
+/// comparisons are not meaningful because different drivers may
+/// serialize the same SQL value differently — but that's already true
+/// for the partition-level `HASH()`, and the `engine` field in the
+/// output scopes every result.
+fn hash_row_blake3(row: &[serde_json::Value]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    for (i, cell) in row.iter().enumerate() {
+        if i > 0 {
+            // Field separator so adjacent null + string can't collide
+            // with a single string that happens to contain "null".
+            hasher.update(b"\x1f");
+        }
+        // Compact JSON serialization — deterministic for the primitive
+        // types warehouses return.
+        let bytes = serde_json::to_string(cell).unwrap_or_default();
+        hasher.update(bytes.as_bytes());
+    }
+    hasher.finalize()
+}
+
+/// Run byte-level blake3 calibration on a sampled subset of tables.
+///
+/// Picks up to [`CALIBRATE_MAX_TABLES`] tables from the top dedup pairs
+/// (highest sharing signal), pulls their first [`CALIBRATE_SAMPLE_ROWS`]
+/// rows via `SELECT *`, hashes each row with blake3, and cross-compares
+/// hashes to compute byte-level dedup on the sample.
+///
+/// Returns a [`ByteCalibration`] comparing the byte-level result against
+/// the partition-level result on the same subset, producing a
+/// `lower_bound_multiplier` that tells the user how tight the cheap
+/// partition-level measurement really is.
+async fn calibrate_byte_dedup(
+    adapter: &dyn WarehouseAdapter,
+    semantic_stats: &DedupStats,
+    semantic_per_table: &[(String, Vec<PartitionChecksum>)],
+) -> Result<ByteCalibration> {
+    // 1. Pick sample tables — prefer those in the top dedup pairs.
+    let sample_tables = pick_sample_tables(semantic_stats, CALIBRATE_MAX_TABLES);
+
+    if sample_tables.len() < 2 {
+        // With fewer than 2 tables we can't do cross-table comparison.
+        // Return a degenerate calibration block.
+        tracing::warn!(
+            "fewer than 2 tables eligible for byte-level calibration; \
+             returning zero-dedup calibration"
+        );
+        return Ok(ByteCalibration {
+            tables_sampled: sample_tables,
+            partition_dedup_pct: 0.0,
+            byte_dedup_pct: 0.0,
+            lower_bound_multiplier: 1.0,
+        });
+    }
+
+    tracing::info!(
+        tables = ?sample_tables,
+        sample_rows = CALIBRATE_SAMPLE_ROWS,
+        "calibrate-bytes: pulling rows and hashing with blake3"
+    );
+
+    // 2. Pull rows and hash each with blake3.
+    //    Key: blake3 hash -> list of table names that contain that row.
+    let mut hash_index: HashMap<blake3::Hash, Vec<String>> = HashMap::new();
+    let mut total_rows: u64 = 0;
+
+    for table_name in &sample_tables {
+        let sql = format!("SELECT * FROM {table_name} LIMIT {CALIBRATE_SAMPLE_ROWS}");
+        let result = adapter
+            .execute_query(&sql)
+            .await
+            .map_err(|e| anyhow!("calibrate-bytes: query failed for {table_name}: {e}"))?;
+
+        for row in &result.rows {
+            total_rows += 1;
+            let hash = hash_row_blake3(row);
+            hash_index.entry(hash).or_default().push(table_name.clone());
+        }
+    }
+
+    // 3. Count byte-level duplicates: rows whose hash appears in 2+
+    //    distinct tables.
+    let mut duplicate_rows: u64 = 0;
+    for holders in hash_index.values() {
+        if holders.len() > 1 {
+            // Deduplicate to distinct tables — the same row might
+            // appear multiple times within one table.
+            let mut distinct_tables: Vec<&str> = holders.iter().map(String::as_str).collect();
+            distinct_tables.sort_unstable();
+            distinct_tables.dedup();
+            if distinct_tables.len() > 1 {
+                // All copies beyond the canonical one are duplicates.
+                let extra = holders.len() as u64 - 1;
+                duplicate_rows += extra;
+            }
+        }
+    }
+
+    let byte_dedup_pct = if total_rows == 0 {
+        0.0
+    } else {
+        (duplicate_rows as f64 / total_rows as f64) * 100.0
+    };
+
+    // 4. Recompute partition-level dedup on just the sampled tables so
+    //    the two percentages are directly comparable.
+    let sampled_subset: Vec<(String, Vec<PartitionChecksum>)> = semantic_per_table
+        .iter()
+        .filter(|(name, _)| sample_tables.contains(name))
+        .cloned()
+        .collect();
+    let subset_stats = compute_dedup_stats(&sampled_subset);
+    let partition_dedup_pct = subset_stats.dedup_ratio * 100.0;
+
+    // 5. Multiplier: how much the byte-level measurement amplifies over
+    //    the partition-level one. Guard against division by zero.
+    let lower_bound_multiplier = if partition_dedup_pct > 0.0 {
+        byte_dedup_pct / partition_dedup_pct
+    } else {
+        1.0
+    };
+
+    Ok(ByteCalibration {
+        tables_sampled: sample_tables,
+        partition_dedup_pct,
+        byte_dedup_pct,
+        lower_bound_multiplier,
+    })
+}
+
+/// Pick up to `max` tables for byte-level calibration, preferring
+/// tables that appear in the top dedup pairs (they have the highest
+/// signal for cross-table duplication).
+fn pick_sample_tables(stats: &DedupStats, max: usize) -> Vec<String> {
+    let mut tables = Vec::with_capacity(max);
+    // First pass: collect from top dedup pairs.
+    for pair in &stats.top_dedup_pairs {
+        if tables.len() >= max {
+            break;
+        }
+        if !tables.contains(&pair.table_a) {
+            tables.push(pair.table_a.clone());
+        }
+        if tables.len() < max && !tables.contains(&pair.table_b) {
+            tables.push(pair.table_b.clone());
+        }
+    }
+    // Second pass: fill from per_table (already sorted by contribution).
+    if tables.len() < max {
+        for t in &stats.per_table {
+            if tables.len() >= max {
+                break;
+            }
+            if !tables.contains(&t.table) {
+                tables.push(t.table.clone());
+            }
+        }
+    }
+    tables.sort();
+    tables
 }
 
 /// Generates OPTIMIZE and VACUUM SQL for a given model.
@@ -803,9 +1006,266 @@ schema_template = "staging__{{source}}"
         assert_eq!(bronze_distinct.partitions_shared_with_others, 0);
         assert_eq!(bronze_distinct.contribution_pct, 0.0);
 
-        // Calibration is None — Layer 0 Step 4 deferred byte-level
-        // calibration to a follow-up.
+        // Calibration is None because we passed `false`.
         assert!(output.calibration.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hash_row_blake3_deterministic() {
+        let row = vec![
+            serde_json::json!(1),
+            serde_json::json!("hello"),
+            serde_json::json!(null),
+        ];
+        let h1 = hash_row_blake3(&row);
+        let h2 = hash_row_blake3(&row);
+        assert_eq!(h1, h2, "same content should produce same hash");
+    }
+
+    #[test]
+    fn hash_row_blake3_distinguishes_different_content() {
+        let row_a = vec![serde_json::json!(1), serde_json::json!("hello")];
+        let row_b = vec![serde_json::json!(2), serde_json::json!("hello")];
+        let row_c = vec![serde_json::json!(1), serde_json::json!("world")];
+        assert_ne!(hash_row_blake3(&row_a), hash_row_blake3(&row_b));
+        assert_ne!(hash_row_blake3(&row_a), hash_row_blake3(&row_c));
+    }
+
+    #[test]
+    fn hash_row_blake3_field_separator_prevents_collisions() {
+        // Without a field separator, ["null", "x"] and [null, "x"] could
+        // collide because serde_json serializes null as "null". The \x1f
+        // separator prevents this.
+        let row_a = vec![serde_json::json!(null), serde_json::json!("x")];
+        let row_b = vec![serde_json::json!("null"), serde_json::json!("x")];
+        assert_ne!(
+            hash_row_blake3(&row_a),
+            hash_row_blake3(&row_b),
+            "null literal and \"null\" string should hash differently"
+        );
+    }
+
+    #[test]
+    fn pick_sample_tables_prefers_top_pairs() {
+        use rocky_core::dedup_analysis::{DedupPairStat, DedupStats, TableDedupStat};
+
+        let stats = DedupStats {
+            total_partitions: 10,
+            unique_partitions: 7,
+            duplicate_partitions: 3,
+            total_rows: 1000,
+            dedup_ratio: 0.3,
+            estimated_savings_pct: 30.0,
+            top_dedup_pairs: vec![
+                DedupPairStat {
+                    table_a: "db.bronze.orders".into(),
+                    table_b: "db.silver.orders".into(),
+                    shared_partitions: 3,
+                    shared_rows: 300,
+                },
+                DedupPairStat {
+                    table_a: "db.bronze.events".into(),
+                    table_b: "db.silver.events".into(),
+                    shared_partitions: 1,
+                    shared_rows: 100,
+                },
+            ],
+            per_table: vec![
+                TableDedupStat {
+                    table: "db.bronze.orders".into(),
+                    partitions: 3,
+                    partitions_shared_with_others: 3,
+                    contribution_pct: 100.0,
+                },
+                TableDedupStat {
+                    table: "db.silver.orders".into(),
+                    partitions: 3,
+                    partitions_shared_with_others: 3,
+                    contribution_pct: 100.0,
+                },
+                TableDedupStat {
+                    table: "db.bronze.events".into(),
+                    partitions: 2,
+                    partitions_shared_with_others: 1,
+                    contribution_pct: 50.0,
+                },
+                TableDedupStat {
+                    table: "db.silver.events".into(),
+                    partitions: 2,
+                    partitions_shared_with_others: 1,
+                    contribution_pct: 50.0,
+                },
+            ],
+        };
+
+        let sample = pick_sample_tables(&stats, 3);
+        assert_eq!(sample.len(), 3);
+        // Should include both tables from the top pair plus one from the
+        // second pair. The result is sorted alphabetically.
+        assert!(sample.contains(&"db.bronze.orders".to_string()));
+        assert!(sample.contains(&"db.silver.orders".to_string()));
+        // Third slot goes to table_a of the second pair.
+        assert!(sample.contains(&"db.bronze.events".to_string()));
+    }
+
+    #[test]
+    fn pick_sample_tables_caps_at_max() {
+        use rocky_core::dedup_analysis::{DedupPairStat, DedupStats, TableDedupStat};
+
+        let stats = DedupStats {
+            total_partitions: 6,
+            unique_partitions: 4,
+            duplicate_partitions: 2,
+            total_rows: 600,
+            dedup_ratio: 0.33,
+            estimated_savings_pct: 33.0,
+            top_dedup_pairs: vec![DedupPairStat {
+                table_a: "a".into(),
+                table_b: "b".into(),
+                shared_partitions: 2,
+                shared_rows: 200,
+            }],
+            per_table: vec![
+                TableDedupStat {
+                    table: "a".into(),
+                    partitions: 3,
+                    partitions_shared_with_others: 2,
+                    contribution_pct: 66.7,
+                },
+                TableDedupStat {
+                    table: "b".into(),
+                    partitions: 3,
+                    partitions_shared_with_others: 2,
+                    contribution_pct: 66.7,
+                },
+            ],
+        };
+
+        // Ask for max 2 — should not exceed it.
+        let sample = pick_sample_tables(&stats, 2);
+        assert_eq!(sample.len(), 2);
+    }
+
+    /// E2E test for `compute_measure_dedup` with `--calibrate-bytes`
+    /// enabled against an ephemeral DuckDB.
+    ///
+    /// Uses the same three-table setup as the partition-level test:
+    /// - bronze.orders and silver.orders are identical (100 rows each)
+    /// - bronze.distinct has different content (50 rows)
+    ///
+    /// With calibration enabled, the byte-level blake3 dedup should
+    /// detect that bronze.orders and silver.orders share the same rows.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn calibrate_bytes_detects_row_level_dedup_against_real_duckdb() -> Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test_cal.duckdb");
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path)
+                .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
+            for sql in &[
+                "CREATE SCHEMA bronze",
+                "CREATE SCHEMA silver",
+                "CREATE TABLE bronze.orders AS \
+                 SELECT i AS id, ('row_' || i) AS name \
+                 FROM generate_series(1, 100) t(i)",
+                "CREATE TABLE silver.orders AS \
+                 SELECT i AS id, ('row_' || i) AS name \
+                 FROM generate_series(1, 100) t(i)",
+                "CREATE TABLE bronze.distinct AS \
+                 SELECT i AS id FROM generate_series(1, 50) t(i)",
+            ] {
+                adapter
+                    .execute_statement(sql)
+                    .await
+                    .map_err(|e| anyhow!("setup: {sql}: {e}"))?;
+            }
+        }
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        let output = compute_measure_dedup(&config_path, None, true).await?;
+
+        // Calibration should now be present.
+        let cal = output
+            .calibration
+            .as_ref()
+            .expect("calibration should be Some when --calibrate-bytes is passed");
+
+        // At least 2 tables should have been sampled (bronze.orders +
+        // silver.orders are the top dedup pair).
+        assert!(
+            cal.tables_sampled.len() >= 2,
+            "expected at least 2 sampled tables, got {}",
+            cal.tables_sampled.len()
+        );
+
+        // Both duplicate tables should be in the sample.
+        let has_bronze = cal
+            .tables_sampled
+            .iter()
+            .any(|t| t.ends_with("bronze.orders"));
+        let has_silver = cal
+            .tables_sampled
+            .iter()
+            .any(|t| t.ends_with("silver.orders"));
+        assert!(
+            has_bronze && has_silver,
+            "sample should include both bronze.orders and silver.orders, got {:?}",
+            cal.tables_sampled
+        );
+
+        // Byte-level dedup should be > 0 because bronze.orders and
+        // silver.orders have identical rows.
+        assert!(
+            cal.byte_dedup_pct > 0.0,
+            "byte_dedup_pct should be > 0 for identical tables, got {}",
+            cal.byte_dedup_pct
+        );
+
+        // Partition-level dedup on the sample should also be > 0.
+        assert!(
+            cal.partition_dedup_pct > 0.0,
+            "partition_dedup_pct should be > 0, got {}",
+            cal.partition_dedup_pct
+        );
+
+        // The multiplier should be >= 1.0 (byte-level should find at
+        // least as much dedup as partition-level, often more).
+        assert!(
+            cal.lower_bound_multiplier >= 1.0,
+            "lower_bound_multiplier should be >= 1.0, got {}",
+            cal.lower_bound_multiplier
+        );
 
         Ok(())
     }
