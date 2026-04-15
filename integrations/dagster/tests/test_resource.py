@@ -686,6 +686,82 @@ def test_run_default_omits_all_partition_flags():
         assert flag not in args, f"unexpected {flag} in {args}"
 
 
+# ---------------------------------------------------------------------------
+# Shadow suffix plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_run_with_shadow_suffix_appends_shadow_flags():
+    """shadow_suffix enables shadow mode and passes the suffix to the CLI."""
+    rocky = RockyResource()
+    captured, fake_run = _capture_run_args()
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.run(filter="tenant=acme", shadow_suffix="_dagster_pr_42")
+    args = captured[0]
+    assert "--shadow" in args
+    shadow_idx = args.index("--shadow-suffix")
+    assert args[shadow_idx + 1] == "_dagster_pr_42"
+
+
+def test_run_without_shadow_suffix_omits_shadow_flags():
+    """When shadow_suffix is None, no --shadow flags appear."""
+    rocky = RockyResource()
+    captured, fake_run = _capture_run_args()
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.run(filter="tenant=acme")
+    args = captured[0]
+    assert "--shadow" not in args
+    assert "--shadow-suffix" not in args
+
+
+def test_run_streaming_with_shadow_suffix():
+    """run_streaming threads shadow_suffix through to the CLI command."""
+    rocky = RockyResource()
+    context = _captured_log_context()
+    proc = _streaming_popen_mock(stdout=_run_json(), stderr_lines=[])
+
+    captured_cmd: list[list[str]] = []
+
+    def fake_popen(cmd, **kwargs):
+        captured_cmd.append(cmd)
+        return proc
+
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
+    ):
+        rocky.run_streaming(
+            context,
+            filter="tenant=acme",
+            shadow_suffix="_dagster_pr_99",
+        )
+
+    cmd = captured_cmd[0]
+    assert "--shadow" in cmd
+    shadow_idx = cmd.index("--shadow-suffix")
+    assert cmd[shadow_idx + 1] == "_dagster_pr_99"
+
+
+def test_run_pipes_with_shadow_suffix():
+    """run_pipes threads shadow_suffix through to the CLI command."""
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    rocky.run_pipes(
+        context,
+        filter="tenant=acme",
+        shadow_suffix="_dagster_pr_7",
+        pipes_client=fake_client,
+    )
+
+    cmd = fake_client.run.call_args.kwargs["command"]
+    assert "--shadow" in cmd
+    shadow_idx = cmd.index("--shadow-suffix")
+    assert cmd[shadow_idx + 1] == "_dagster_pr_7"
+
+
 def test_compile_uses_http_when_server_url_is_set():
     rocky = RockyResource(server_url="http://localhost:8080")
     payload = (

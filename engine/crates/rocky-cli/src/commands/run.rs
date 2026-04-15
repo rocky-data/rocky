@@ -1724,11 +1724,23 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
         }
     }
 
-    // Drift actions: surface as log messages so they appear in the
-    // Dagster run viewer's structured logs. Drift is a structural
-    // event, not pass/fail; the dagster-rocky integration converts
-    // these to AssetObservation events on its own side.
+    // Drift actions: emit as asset checks (severity=WARN, passed=true)
+    // so they surface as structured events in the Dagster run viewer.
+    // The check name is "drift" (grouped per table); action details go
+    // into metadata so the UI doesn't fragment by action type.
+    // Also emit a log line for human-readable visibility.
     for action in &output.drift.actions_taken {
+        pipes.report_asset_check(
+            &action.table,
+            "drift",
+            true,
+            crate::pipes::PipesCheckSeverity::Warn,
+            &json!({
+                "table": action.table,
+                "action": action.action,
+                "reason": action.reason,
+            }),
+        );
         pipes.log(
             "WARN",
             &format!(
@@ -3022,5 +3034,102 @@ mod tests {
 
         // Verify metrics
         assert_eq!(throttle.rate_limits_total(), 2);
+    }
+
+    #[test]
+    fn test_emit_pipes_drift_produces_structured_check_and_log() {
+        use crate::output::{
+            DriftActionOutput, DriftSummary, ExecutionSummary, PermissionSummary, RunOutput,
+        };
+        use crate::pipes::PipesEmitter;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_drift.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+        };
+
+        let output = RunOutput {
+            version: "1.0.2".into(),
+            command: "run".into(),
+            pipeline_type: None,
+            filter: "tenant=acme".into(),
+            duration_ms: 100,
+            tables_copied: 0,
+            tables_failed: 0,
+            tables_skipped: 0,
+            excluded_tables: vec![],
+            resumed_from: None,
+            shadow: false,
+            materializations: vec![],
+            check_results: vec![],
+            anomalies: vec![],
+            errors: vec![],
+            execution: ExecutionSummary {
+                concurrency: 1,
+                tables_processed: 0,
+                tables_failed: 0,
+                adaptive_concurrency: false,
+                final_concurrency: None,
+                rate_limits_detected: None,
+            },
+            metrics: None,
+            permissions: PermissionSummary {
+                grants_added: 0,
+                grants_revoked: 0,
+                catalogs_created: 0,
+                schemas_created: 0,
+            },
+            drift: DriftSummary {
+                tables_checked: 1,
+                tables_drifted: 1,
+                actions_taken: vec![DriftActionOutput {
+                    table: "acme.raw_orders".into(),
+                    action: "add_column".into(),
+                    reason: "column 'email' found in source but not target".into(),
+                }],
+            },
+            partition_summaries: vec![],
+        };
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Should produce 2 messages: one report_asset_check + one log
+        assert_eq!(lines.len(), 2);
+
+        // First: structured check
+        let check = &lines[0];
+        assert_eq!(check["method"], "report_asset_check");
+        assert_eq!(check["params"]["check_name"], "drift");
+        assert_eq!(check["params"]["passed"], true);
+        assert_eq!(check["params"]["severity"], "WARN");
+        assert_eq!(check["params"]["metadata"]["table"], "acme.raw_orders");
+        assert_eq!(check["params"]["metadata"]["action"], "add_column");
+
+        // Second: human-readable log
+        let log = &lines[1];
+        assert_eq!(log["method"], "log");
+        assert_eq!(log["params"]["level"], "WARN");
+        let msg = log["params"]["message"].as_str().unwrap();
+        assert!(msg.contains("acme.raw_orders"));
+        assert!(msg.contains("add_column"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rocky-cache"
-version = "1.0.1"
+version = "1.0.2"
 description = "Caching layer for Rocky (memory LRU + distributed cache)"
 edition.workspace = true
 license.workspace = true

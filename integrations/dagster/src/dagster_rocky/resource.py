@@ -288,13 +288,11 @@ class RockyResource(dg.ConfigurableResource):
         in the Dagster run viewer in real time, and the integration
         gets the typed result back at the end.
 
-        Note: this is "Pipes-style" rather than full Dagster Pipes
-        because rocky-cli does not yet emit Dagster Pipes protocol
-        messages. When the engine adds that, this method can be
-        upgraded to use ``PipesSubprocessClient`` for per-model
-        materialization-event streaming. Until then, what users get is
-        live log streaming + final result parsing — a meaningful
-        improvement over the buffered ``run()`` path.
+        For full Dagster Pipes integration with structured per-model
+        materialization and check events, use
+        :meth:`RockyResource.run_pipes` instead. This method provides
+        live log streaming + final result parsing without requiring
+        the Pipes protocol.
 
         Args:
             args: CLI arguments after the global flags. ``--config``,
@@ -418,6 +416,7 @@ class RockyResource(dg.ConfigurableResource):
         missing: bool = False,
         lookback: int | None = None,
         parallel: int | None = None,
+        shadow_suffix: str | None = None,
     ) -> RunResult:
         """Run ``rocky run --filter <key=value>`` and return the parsed result.
 
@@ -448,6 +447,9 @@ class RockyResource(dg.ConfigurableResource):
                 the selected ones. Overrides the model's TOML ``lookback``.
             parallel: Run N partitions concurrently (warehouse-query
                 parallelism only). Defaults to 1 on the engine side.
+            shadow_suffix: When set, enables shadow mode and uses the given
+                suffix for shadow table names (e.g. ``"_dagster_pr_42"``).
+                Typically derived from :func:`.branch_deploy.branch_deploy_shadow_suffix`.
         """
         args = self._build_run_args(
             filter,
@@ -460,6 +462,7 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
+            shadow_suffix=shadow_suffix,
         )
         return RunResult.model_validate_json(self._run_rocky(args, allow_partial=True))
 
@@ -477,8 +480,9 @@ class RockyResource(dg.ConfigurableResource):
         missing: bool = False,
         lookback: int | None = None,
         parallel: int | None = None,
+        shadow_suffix: str | None = None,
     ) -> RunResult:
-        """Pipes-style ``rocky run`` with live stderr streaming to ``context.log``.
+        """``rocky run`` with live stderr streaming to ``context.log``.
 
         Same semantics as :meth:`run` but spawns the binary via
         ``subprocess.Popen`` and forwards rocky's stderr (where the
@@ -488,15 +492,11 @@ class RockyResource(dg.ConfigurableResource):
         Use this method from inside a Dagster ``@multi_asset`` /
         ``@op`` for runs longer than a few seconds — users will see
         progress in the run viewer as it happens, instead of waiting
-        for the full output to buffer at the end.
+        for the full output to buffer at the end. For full Dagster
+        Pipes integration with structured materialization and check
+        events, use :meth:`run_pipes` instead.
 
-        Background: this is "Pipes-style" rather than full Dagster
-        Pipes (``PipesSubprocessClient``) because rocky-cli does not
-        yet emit the Dagster Pipes message protocol. When the engine
-        adds Pipes message emission, this method can be upgraded to
-        use ``PipesSubprocessClient`` for per-model materialization
-        events streaming live (instead of all at once at the end).
-        Until then, what users get from this method is:
+        What users get from this method:
 
         * Live stderr → ``context.log.info`` streaming (every Rust
           ``info!()`` / ``warn!()`` macro shows up in the run viewer
@@ -518,6 +518,7 @@ class RockyResource(dg.ConfigurableResource):
             partition / partition_from / partition_to / latest /
             missing / lookback / parallel: Same as :meth:`run` —
                 Phase 3 partition selection flags.
+            shadow_suffix: Same as :meth:`run`.
 
         Returns:
             The parsed :class:`RunResult` from stdout after the
@@ -534,6 +535,7 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
+            shadow_suffix=shadow_suffix,
         )
         return RunResult.model_validate_json(
             self._run_rocky_streaming(args, context, allow_partial=True)
@@ -552,21 +554,24 @@ class RockyResource(dg.ConfigurableResource):
         missing: bool,
         lookback: int | None,
         parallel: int | None,
+        shadow_suffix: str | None = None,
     ) -> list[str]:
-        """Shared argv builder used by both :meth:`run` and :meth:`run_streaming`.
+        """Shared argv builder used by :meth:`run`, :meth:`run_streaming`, and :meth:`run_pipes`.
 
-        Single source of truth for the partition flag plumbing so
-        adding a new flag is a one-place change. The flags are
-        defensive: ``partition_from`` without ``partition_to`` emits
-        neither (rocky requires both for range mode), and the engine
-        enforces mutual-exclusion via clap so we trust it to error
-        helpfully if multiple selection flags are passed simultaneously.
+        Single source of truth for the flag plumbing so adding a new
+        flag is a one-place change. The flags are defensive:
+        ``partition_from`` without ``partition_to`` emits neither
+        (rocky requires both for range mode), and the engine enforces
+        mutual-exclusion via clap so we trust it to error helpfully if
+        multiple selection flags are passed simultaneously.
         """
         args = ["run", "--filter", filter]
         if governance_override:
             args.extend(["--governance-override", json.dumps(governance_override)])
         if run_models:
             args.extend(["--models", self.models_dir, "--all"])
+        if shadow_suffix is not None:
+            args.extend(["--shadow", "--shadow-suffix", shadow_suffix])
         if partition is not None:
             args.extend(["--partition", partition])
         if partition_from is not None and partition_to is not None:
@@ -595,6 +600,7 @@ class RockyResource(dg.ConfigurableResource):
         missing: bool = False,
         lookback: int | None = None,
         parallel: int | None = None,
+        shadow_suffix: str | None = None,
         pipes_client: dg.PipesSubprocessClient | None = None,
     ) -> dg.PipesClientCompletedInvocation:
         """Full Dagster Pipes execution: structured events streamed via the protocol.
@@ -610,9 +616,9 @@ class RockyResource(dg.ConfigurableResource):
         * ``MaterializationEvent`` per copied table (with rocky/strategy,
           duration_ms, rows_copied, target_table_full_name, sql_hash,
           partition_key when set)
-        * ``AssetCheckEvaluation`` per Rocky check
+        * ``AssetCheckEvaluation`` per Rocky check and drift observation
         * ``log`` events for the rocky run starting / completing
-          messages and any drift actions
+          messages and drift action details
 
         Use this method from a ``@dg.asset`` or ``@dg.multi_asset``
         when you want **structured** Dagster events from the rocky
@@ -638,7 +644,8 @@ class RockyResource(dg.ConfigurableResource):
                 :meth:`run_streaming` — required for Pipes context
                 injection (run id, partition key, asset keys, etc.).
             filter: Component filter (e.g. ``"tenant=acme"``).
-            governance_override / run_models / partition / ... :
+            governance_override / run_models / partition /
+            shadow_suffix / ... :
                 Same as :meth:`run` and :meth:`run_streaming`. Threaded
                 into the rocky CLI command via :meth:`_build_run_args`.
             pipes_client: Optional pre-configured
@@ -667,6 +674,7 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
+            shadow_suffix=shadow_suffix,
         )
         client = pipes_client or dg.PipesSubprocessClient()
         return client.run(
