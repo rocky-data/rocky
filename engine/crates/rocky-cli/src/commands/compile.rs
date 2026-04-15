@@ -7,6 +7,7 @@ use anyhow::Result;
 
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::diagnostic::{self, Severity};
+use rocky_compiler::incrementality;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
 
 use crate::output::{CompileOutput, ModelDetail, print_json};
@@ -72,12 +73,27 @@ pub fn run_compile(
             .project
             .models
             .iter()
-            .map(|model| ModelDetail {
-                name: model.config.name.clone(),
-                strategy: model.config.strategy.clone(),
-                target: model.config.target.clone(),
-                freshness: model.config.freshness.clone(),
-                contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
+            .map(|model| {
+                let typed_cols = result
+                    .type_check
+                    .typed_models
+                    .get(&model.config.name)
+                    .map(std::vec::Vec::as_slice)
+                    .unwrap_or_default();
+                let incrementality_hint = incrementality::infer_incrementality(
+                    &model.config.name,
+                    typed_cols,
+                    &model.sql,
+                    &model.config.strategy,
+                );
+                ModelDetail {
+                    name: model.config.name.clone(),
+                    strategy: model.config.strategy.clone(),
+                    target: model.config.target.clone(),
+                    freshness: model.config.freshness.clone(),
+                    contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
+                    incrementality_hint,
+                }
             })
             .collect();
         let output = CompileOutput::new(
