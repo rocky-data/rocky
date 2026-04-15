@@ -308,6 +308,7 @@
   <div class="mode-tabs">
     <button class="mode-tab active" data-mode="sql">SQL</button>
     <button class="mode-tab" data-mode="rocky">Rocky DSL</button>
+    <button class="mode-tab" data-mode="transpile">Transpile</button>
     <button class="mode-tab" data-mode="identifier">Identifier</button>
   </div>
   <div class="toolbar-sep"></div>
@@ -330,6 +331,10 @@
       <option value="sql-lineage">column lineage (JOIN)</option>
       <option value="sql-join">JOIN lineage (GROUP BY)</option>
     </optgroup>
+    <optgroup label="Transpile">
+      <option value="transpile-snowflake">Snowflake SQL</option>
+      <option value="transpile-bigquery">BigQuery SQL</option>
+    </optgroup>
     <optgroup label="Identifiers">
       <option value="identifier-valid">valid identifier</option>
       <option value="identifier-invalid">invalid identifier</option>
@@ -342,9 +347,29 @@
     <button id="btn-parse" disabled title="Parse Rocky DSL into JSON AST (parse_rocky)">Parse Rocky</button>
     <button id="btn-lower" disabled title="Lower Rocky DSL to SQL (lower_rocky_to_sql)">Lower to SQL</button>
     <button id="btn-check" disabled title="Check Rocky DSL for parse errors (get_parse_errors)">Check Syntax</button>
+    <button id="btn-format" disabled title="Format Rocky DSL source (format_rocky)">Format</button>
+    <button id="btn-compile-model" disabled title="Full pipeline: parse + lower + lineage (compile_rocky_model)">Compile Model</button>
+    <button id="btn-transpile" disabled title="Transpile SQL between dialects (transpile_sql)">Transpile</button>
     <button id="btn-validate" disabled title="Check if text is a valid SQL identifier (validate_identifier)">Validate</button>
   </div>
   <div class="toolbar-sep"></div>
+  <span id="dialect-controls" style="display:none">
+    <label>From</label>
+    <select id="from-dialect" title="Source dialect">
+      <option value="snowflake">Snowflake</option>
+      <option value="databricks">Databricks</option>
+      <option value="bigquery">BigQuery</option>
+      <option value="duckdb">DuckDB</option>
+    </select>
+    <label>To</label>
+    <select id="to-dialect" title="Target dialect">
+      <option value="bigquery">BigQuery</option>
+      <option value="databricks">Databricks</option>
+      <option value="snowflake">Snowflake</option>
+      <option value="duckdb">DuckDB</option>
+    </select>
+    <div class="toolbar-sep"></div>
+  </span>
   <button id="btn-clear" title="Clear the output panel">Clear Output</button>
 </div>
 
@@ -384,17 +409,19 @@ WHERE o.order_date >= '2024-01-01'</textarea>
   let wasmReady = false;
 
   const modeButtons = {
-    sql:        { enabled: ['btn-compile'],                              primary: 'btn-compile' },
-    rocky:      { enabled: ['btn-parse', 'btn-lower', 'btn-check'],     primary: 'btn-lower' },
-    identifier: { enabled: ['btn-validate'],                            primary: 'btn-validate' },
+    sql:        { enabled: ['btn-compile'],                                                        primary: 'btn-compile' },
+    rocky:      { enabled: ['btn-parse', 'btn-lower', 'btn-check', 'btn-format', 'btn-compile-model'], primary: 'btn-compile-model' },
+    transpile:  { enabled: ['btn-transpile'],                                                      primary: 'btn-transpile' },
+    identifier: { enabled: ['btn-validate'],                                                       primary: 'btn-validate' },
   };
 
-  const allActionIds = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-check', 'btn-validate'];
+  const allActionIds = ['btn-compile', 'btn-parse', 'btn-lower', 'btn-check', 'btn-format', 'btn-compile-model', 'btn-transpile', 'btn-validate'];
 
   // Map snippet keys to modes
   function snippetMode(key) {
     if (key.startsWith('rocky-')) return 'rocky';
     if (key.startsWith('sql-')) return 'sql';
+    if (key.startsWith('transpile-')) return 'transpile';
     if (key.startsWith('identifier-')) return 'identifier';
     return null;
   }
@@ -415,6 +442,10 @@ WHERE o.order_date >= '2024-01-01'</textarea>
       btn.classList.toggle('primary', id === cfg.primary);
     });
 
+    // Show/hide dialect controls for transpile mode
+    document.getElementById('dialect-controls').style.display =
+      mode === 'transpile' ? '' : 'none';
+
     // Filter snippet picker to show relevant optgroup
     filterSnippets(mode);
 
@@ -427,7 +458,7 @@ WHERE o.order_date >= '2024-01-01'</textarea>
   const optgroups = snippetPicker.querySelectorAll('optgroup');
 
   function filterSnippets(mode) {
-    const groupMap = { sql: 'SQL Lineage', rocky: 'Rocky DSL', identifier: 'Identifiers' };
+    const groupMap = { sql: 'SQL Lineage', rocky: 'Rocky DSL', transpile: 'Transpile', identifier: 'Identifiers' };
     optgroups.forEach(og => {
       og.style.display = og.label === groupMap[mode] ? '' : 'none';
     });
@@ -629,6 +660,71 @@ WHERE o.order_date >= '2024-01-01'</textarea>
     }
   });
 
+  document.getElementById('btn-format').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.format_rocky(input, '    ');
+    const ms = (performance.now() - t0).toFixed(1);
+    editorEl.value = result;
+    updateParseStatus();
+    setOutput(
+      '<span class="out-comment">// format_rocky (' + ms + ' ms)</span>\n\n' +
+      '<span class="out-success">Source formatted in-place.</span>'
+    );
+  });
+
+  document.getElementById('btn-compile-model').addEventListener('click', () => {
+    const input = getInput();
+    const t0 = performance.now();
+    const result = wasm.compile_rocky_model(input);
+    const ms = (performance.now() - t0).toFixed(1);
+    const parsed = JSON.parse(result);
+    const hasErrors = parsed.errors && parsed.errors.length > 0;
+    const label = hasErrors
+      ? '<span class="out-error">Compile Errors</span>'
+      : '<span class="out-success">Compiled Model</span>';
+    setOutput(
+      '<span class="out-comment">// compile_rocky_model (' + ms + ' ms)</span>\n' +
+      label + '\n\n' +
+      highlightJson(result)
+    );
+  });
+
+  document.getElementById('btn-transpile').addEventListener('click', () => {
+    const input = getInput();
+    const from = document.getElementById('from-dialect').value;
+    const to = document.getElementById('to-dialect').value;
+    const t0 = performance.now();
+    const result = wasm.transpile_sql(input, from, to);
+    const ms = (performance.now() - t0).toFixed(1);
+    const parsed = JSON.parse(result);
+
+    if (parsed.error) {
+      setOutput(
+        '<span class="out-comment">// transpile_sql (' + ms + ' ms)</span>\n' +
+        '<span class="out-error">Error</span>\n\n' +
+        '<span class="out-error">' + escHtml(parsed.error) + '</span>'
+      );
+    } else {
+      let warningText = '';
+      if (parsed.warnings && parsed.warnings.length > 0) {
+        warningText = '\n\n<span class="out-comment">Warnings:</span>\n';
+        parsed.warnings.forEach(w => {
+          warningText += '<span class="out-error">  ' + escHtml(w.original) + ':</span> ' + escHtml(w.reason) + '\n';
+          if (w.suggestion) {
+            warningText += '<span class="out-comment">    Suggestion: ' + escHtml(w.suggestion) + '</span>\n';
+          }
+        });
+      }
+      setOutput(
+        '<span class="out-comment">// transpile_sql ' + escHtml(from) + ' -> ' + escHtml(to) + ' (' + ms + ' ms, ' + parsed.replacements + ' replacements)</span>\n' +
+        '<span class="out-success">Transpiled SQL</span>\n\n' +
+        highlightSql(parsed.sql) +
+        warningText
+      );
+    }
+  });
+
   document.getElementById('btn-clear').addEventListener('click', () => {
     setOutput('<span class="out-comment">-- Output cleared.</span>');
   });
@@ -758,6 +854,24 @@ JOIN catalog.sales.order_items AS oi
     ON p.product_id = oi.product_id
 GROUP BY p.product_id, p.product_name
 ORDER BY revenue DESC`,
+    'transpile-snowflake':
+`-- Snowflake SQL (try transpiling to BigQuery or Databricks)
+SELECT
+    NVL(customer_name, 'Unknown') AS customer_name,
+    DATEDIFF(day, first_order, last_order) AS days_active,
+    LEN(customer_name) AS name_length,
+    TO_VARCHAR(created_at, 'YYYY-MM-DD') AS created_date
+FROM warehouse.analytics.customers
+WHERE created_at >= '2024-01-01'`,
+    'transpile-bigquery':
+`-- BigQuery SQL (try transpiling to Snowflake or Databricks)
+SELECT
+    IFNULL(customer_name, 'Unknown') AS customer_name,
+    DATE_DIFF(last_order, first_order, DAY) AS days_active,
+    LENGTH(customer_name) AS name_length,
+    FORMAT_TIMESTAMP('%Y-%m-%d', created_at) AS created_date
+FROM \`project.dataset.customers\`
+WHERE created_at >= '2024-01-01'`,
     'identifier-valid': 'my_table_name',
     'identifier-invalid': 'DROP TABLE users--'
   };
