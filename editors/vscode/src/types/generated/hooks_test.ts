@@ -2,7 +2,7 @@
 /**
  * AUTO-GENERATED — do not edit by hand.
  * Source: schemas/hooks_test.schema.json
- * Run `just codegen` from the monorepo root to regenerate.
+ * Run just codegen from the monorepo root to regenerate.
  */
 
 /**

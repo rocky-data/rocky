@@ -557,6 +557,11 @@ enum Command {
         /// number alongside the cheap partition-level one.
         #[arg(long, requires = "measure_dedup")]
         calibrate_bytes: bool,
+        /// Scan all warehouse tables instead of only Rocky-managed ones.
+        /// By default, `--measure-dedup` scopes to tables the pipeline
+        /// manages (discovered via source adapters or model configs).
+        #[arg(long, requires = "measure_dedup")]
+        all_tables: bool,
     },
 
     /// Profile storage and recommend column encodings
@@ -645,7 +650,7 @@ enum Command {
     ExportSchemas {
         /// Output directory for the .schema.json files
         #[arg(default_value = "schemas")]
-        output: PathBuf,
+        output_dir: PathBuf,
     },
 }
 
@@ -1048,6 +1053,7 @@ async fn main() -> Result<()> {
             measure_dedup,
             exclude_columns,
             calibrate_bytes,
+            all_tables,
         } => {
             if measure_dedup {
                 let cols = exclude_columns.as_deref().map(|s| {
@@ -1056,8 +1062,14 @@ async fn main() -> Result<()> {
                         .map(String::from)
                         .collect::<Vec<_>>()
                 });
-                rocky_cli::commands::run_measure_dedup(&cli.config, cols, calibrate_bytes, json)
-                    .await
+                rocky_cli::commands::run_measure_dedup(
+                    &cli.config,
+                    cols,
+                    calibrate_bytes,
+                    all_tables,
+                    json,
+                )
+                .await
             } else {
                 // `required_unless_present = "measure_dedup"` on `model`
                 // guarantees this branch always has a model.
@@ -1110,7 +1122,7 @@ async fn main() -> Result<()> {
             rocky_cli::commands::run_watch(&models, contracts.as_deref(), json).await
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
-        Command::ExportSchemas { output } => rocky_cli::commands::export_schemas(&output),
+        Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
     };
 
     // In text mode, try to upgrade config errors to rich miette diagnostics
