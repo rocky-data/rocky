@@ -133,7 +133,7 @@ enum Command {
     Plan {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long, long_help = FILTER_LONG_HELP)]
-        filter: String,
+        filter: Option<String>,
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
@@ -143,7 +143,7 @@ enum Command {
     Run {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long, long_help = FILTER_LONG_HELP)]
-        filter: String,
+        filter: Option<String>,
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
@@ -208,7 +208,7 @@ enum Command {
     Compare {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long, long_help = FILTER_LONG_HELP)]
-        filter: String,
+        filter: Option<String>,
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
@@ -724,7 +724,8 @@ async fn main() -> Result<()> {
             rocky_cli::commands::discover(&cli.config, pipeline.as_deref(), json).await
         }
         Command::Plan { filter, pipeline } => {
-            rocky_cli::commands::plan(&cli.config, &filter, pipeline.as_deref(), json).await
+            rocky_cli::commands::plan(&cli.config, filter.as_deref(), pipeline.as_deref(), json)
+                .await
         }
         Command::Run {
             filter,
@@ -785,7 +786,7 @@ async fn main() -> Result<()> {
 
             let run_future = rocky_cli::commands::run(
                 &cli.config,
-                &filter,
+                filter.as_deref(),
                 pipeline.as_deref(),
                 &cli.state_path,
                 gov_override.as_ref(),
@@ -825,7 +826,7 @@ async fn main() -> Result<()> {
             };
             rocky_cli::commands::compare(
                 &cli.config,
-                &filter,
+                filter.as_deref(),
                 pipeline.as_deref(),
                 &shadow_cfg,
                 &thresholds,

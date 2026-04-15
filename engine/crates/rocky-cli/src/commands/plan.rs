@@ -13,7 +13,7 @@ use super::{matches_filter, parse_filter};
 /// Execute `rocky plan` — dry-run SQL generation.
 pub async fn plan(
     config_path: &Path,
-    filter: &str,
+    filter: Option<&str>,
     pipeline_name: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -23,7 +23,7 @@ pub async fn plan(
     ))?;
     let (_name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
     let pattern = pipeline.schema_pattern()?;
-    let (filter_key, filter_value) = parse_filter(filter)?;
+    let parsed_filter = filter.map(parse_filter).transpose()?;
 
     let adapter_registry = registry::AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
@@ -39,7 +39,7 @@ pub async fn plan(
         anyhow::bail!("no discovery adapter configured for this pipeline")
     };
 
-    let mut output = PlanOutput::new(filter.to_string());
+    let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
     // support (DuckDB, Postgres, ...) return `None` from `create_catalog_sql`,
@@ -53,8 +53,10 @@ pub async fn plan(
             Err(_) => continue,
         };
 
-        if !matches_filter(conn, &parsed, &filter_key, &filter_value) {
-            continue;
+        if let Some((ref filter_key, ref filter_value)) = parsed_filter {
+            if !matches_filter(conn, &parsed, filter_key, filter_value) {
+                continue;
+            }
         }
 
         let target_sep = pipeline

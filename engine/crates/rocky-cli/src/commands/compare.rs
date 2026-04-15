@@ -22,7 +22,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub async fn compare(
     config_path: &Path,
-    filter: &str,
+    filter: Option<&str>,
     pipeline_name_arg: Option<&str>,
     shadow_config: &ShadowConfig,
     thresholds: &ComparisonThresholds,
@@ -38,7 +38,7 @@ pub async fn compare(
     let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     let pattern = pipeline.schema_pattern()?;
-    let (filter_key, filter_value) = parse_filter(filter)?;
+    let parsed_filter = filter.map(parse_filter).transpose()?;
 
     // Discover connectors to find table pairs
     let connectors = if let Some(ref disc) = pipeline.source.discovery {
@@ -57,7 +57,7 @@ pub async fn compare(
     let mut output = CompareOutput {
         version: VERSION.to_string(),
         command: "compare".to_string(),
-        filter: filter.to_string(),
+        filter: filter.unwrap_or("").to_string(),
         tables_compared: 0,
         tables_passed: 0,
         tables_warned: 0,
@@ -72,8 +72,10 @@ pub async fn compare(
             Err(_) => continue,
         };
 
-        if !matches_filter(conn, &parsed, &filter_key, &filter_value) {
-            continue;
+        if let Some((ref filter_key, ref filter_value)) = parsed_filter {
+            if !matches_filter(conn, &parsed, filter_key, filter_value) {
+                continue;
+            }
         }
 
         let target_sep = pipeline
