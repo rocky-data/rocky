@@ -11,6 +11,10 @@
 export type CheckResult = CheckResult1 & {
   name: string;
   passed: boolean;
+  /**
+   * Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+   */
+  severity?: TestSeverity & string;
   [k: string]: unknown;
 };
 export type CheckResult1 =
@@ -36,11 +40,30 @@ export type CheckResult1 =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Column under test, when the assertion has one.
+       */
+      column?: string | null;
+      /**
+       * Number of failing rows (0 when passed). For `row_count_range`, this stores the observed total row count.
+       */
+      failing_rows: number;
+      /**
+       * Assertion kind — the `TestType` discriminant serialized as snake_case (e.g., `"not_null"`, `"accepted_values"`).
+       */
+      kind: string;
+      [k: string]: unknown;
+    }
+  | {
       query: string;
       result_value: number;
       threshold: number;
       [k: string]: unknown;
     };
+/**
+ * Severity of a test failure.
+ */
+export type TestSeverity = "error" | "warning";
 
 /**
  * JSON output for `rocky run`.

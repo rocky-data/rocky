@@ -120,6 +120,33 @@
           "type": "object"
         },
         {
+          "description": "Row-level assertion evaluated via the `TestDecl` surface (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`).\n\n`failing_rows` is the count of rows that violated the assertion; `0` means the check passed. For `row_count_range`, `failing_rows` stores the observed row count (the caller asserts pass/fail via the configured bounds).",
+          "properties": {
+            "column": {
+              "description": "Column under test, when the assertion has one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failing_rows": {
+              "description": "Number of failing rows (0 when passed). For `row_count_range`, this stores the observed total row count.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "description": "Assertion kind — the `TestType` discriminant serialized as snake_case (e.g., `\"not_null\"`, `\"accepted_values\"`).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "failing_rows",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
           "description": "User-defined SQL check evaluated against a threshold.",
           "properties": {
             "query": {
@@ -151,6 +178,15 @@
         },
         "passed": {
           "type": "boolean"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run."
         }
       },
       "required": [
@@ -598,6 +634,25 @@
         "error"
       ],
       "type": "object"
+    },
+    "TestSeverity": {
+      "description": "Severity of a test failure.",
+      "oneOf": [
+        {
+          "description": "Test failure is a hard error — pipeline fails.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Test failure is a warning — pipeline continues.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
     }
   },
   "description": "JSON output for `rocky run`.",

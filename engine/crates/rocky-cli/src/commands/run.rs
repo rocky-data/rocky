@@ -733,8 +733,8 @@ pub async fn run(
                         }
                         prefix
                     },
-                    check_column_match: pipeline.checks.column_match,
-                    check_row_count: pipeline.checks.row_count,
+                    check_column_match: pipeline.checks.column_match.enabled(),
+                    check_row_count: pipeline.checks.row_count.enabled(),
                     check_freshness: pipeline.checks.freshness.is_some(),
                     column_match_exclude: pipeline
                         .metadata_columns
@@ -1328,7 +1328,7 @@ pub async fn run(
     let _checks_span = info_span!("batched_checks").entered();
     let checks_start = Instant::now();
 
-    let row_count_enabled = pipeline.checks.row_count && !source_batch_refs.is_empty();
+    let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
 
     if row_count_enabled || freshness_enabled {
@@ -1558,7 +1558,8 @@ pub async fn run(
             let key = fr.table.full_name();
             if let Some(ts) = fr.max_timestamp {
                 let lag = (now - ts).num_seconds().unsigned_abs();
-                let check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
+                let mut check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
+                check.severity = freshness_cfg.severity;
 
                 if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
                     let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {

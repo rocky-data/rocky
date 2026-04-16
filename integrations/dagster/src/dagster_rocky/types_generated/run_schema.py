@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import AwareDatetime, BaseModel, conint
 
 
@@ -16,63 +18,6 @@ class AnomalyOutput(BaseModel):
     deviation_pct: float
     reason: str
     table: str
-
-
-class CheckResult1(BaseModel):
-    """
-    Row count comparison between source and target tables.
-    """
-
-    name: str
-    passed: bool
-    source_count: conint(ge=0)
-    target_count: conint(ge=0)
-
-
-class CheckResult2(BaseModel):
-    """
-    Column presence comparison between source and target schemas.
-    """
-
-    name: str
-    passed: bool
-    extra: list[str]
-    missing: list[str]
-
-
-class CheckResult3(BaseModel):
-    """
-    Data freshness measured as lag from the max timestamp to now.
-    """
-
-    name: str
-    passed: bool
-    lag_seconds: conint(ge=0)
-    threshold_seconds: conint(ge=0)
-
-
-class CheckResult4(BaseModel):
-    """
-    Null rate for a specific column, sampled via TABLESAMPLE.
-    """
-
-    name: str
-    passed: bool
-    column: str
-    null_rate: float
-    threshold: float
-
-
-class CheckResult5(BaseModel):
-    """
-    User-defined SQL check evaluated against a threshold.
-    """
-
-    name: str
-    passed: bool
-    query: str
-    result_value: conint(ge=0)
-    threshold: conint(ge=0)
 
 
 class DriftActionOutput(BaseModel):
@@ -210,13 +155,6 @@ class PermissionSummary(BaseModel):
     schemas_created: conint(ge=0)
 
 
-class TableCheckOutput(BaseModel):
-    asset_key: list[str]
-    checks: list[
-        CheckResult1 | CheckResult2 | CheckResult3 | CheckResult4 | CheckResult5
-    ]
-
-
 class TableErrorOutput(BaseModel):
     """
     Error from a table that failed during parallel processing.
@@ -224,6 +162,126 @@ class TableErrorOutput(BaseModel):
 
     asset_key: list[str]
     error: str
+
+
+class TestSeverity1(StrEnum):
+    """
+    Test failure is a hard error — pipeline fails.
+    """
+
+    error = "error"
+
+
+class TestSeverity2(StrEnum):
+    """
+    Test failure is a warning — pipeline continues.
+    """
+
+    warning = "warning"
+
+
+class CheckResult1(BaseModel):
+    """
+    Row count comparison between source and target tables.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    source_count: conint(ge=0)
+    target_count: conint(ge=0)
+
+
+class CheckResult2(BaseModel):
+    """
+    Column presence comparison between source and target schemas.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    extra: list[str]
+    missing: list[str]
+
+
+class CheckResult3(BaseModel):
+    """
+    Data freshness measured as lag from the max timestamp to now.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    lag_seconds: conint(ge=0)
+    threshold_seconds: conint(ge=0)
+
+
+class CheckResult4(BaseModel):
+    """
+    Null rate for a specific column, sampled via TABLESAMPLE.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    column: str
+    null_rate: float
+    threshold: float
+
+
+class CheckResult5(BaseModel):
+    """
+    Row-level assertion evaluated via the `TestDecl` surface (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`).
+
+    `failing_rows` is the count of rows that violated the assertion; `0` means the check passed. For `row_count_range`, `failing_rows` stores the observed row count (the caller asserts pass/fail via the configured bounds).
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    column: str | None = None
+    """
+    Column under test, when the assertion has one.
+    """
+    failing_rows: conint(ge=0)
+    """
+    Number of failing rows (0 when passed). For `row_count_range`, this stores the observed total row count.
+    """
+    kind: str
+    """
+    Assertion kind — the `TestType` discriminant serialized as snake_case (e.g., `"not_null"`, `"accepted_values"`).
+    """
+
+
+class CheckResult6(BaseModel):
+    """
+    User-defined SQL check evaluated against a threshold.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    query: str
+    result_value: conint(ge=0)
+    threshold: conint(ge=0)
 
 
 class MaterializationOutput(BaseModel):
@@ -235,6 +293,18 @@ class MaterializationOutput(BaseModel):
     Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge).
     """
     rows_copied: conint(ge=0) | None = None
+
+
+class TableCheckOutput(BaseModel):
+    asset_key: list[str]
+    checks: list[
+        CheckResult1
+        | CheckResult2
+        | CheckResult3
+        | CheckResult4
+        | CheckResult5
+        | CheckResult6
+    ]
 
 
 class RunOutput(BaseModel):

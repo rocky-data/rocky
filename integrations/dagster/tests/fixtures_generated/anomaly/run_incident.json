@@ -33,6 +33,7 @@
         {
           "name": "row_count",
           "passed": true,
+          "severity": "error",
           "source_count": 5,
           "target_count": 5
         }

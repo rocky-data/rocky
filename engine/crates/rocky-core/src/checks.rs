@@ -7,6 +7,7 @@ use crate::column_map;
 
 use crate::ir::{ColumnInfo, TableRef};
 use crate::sql_gen::SqlGenError;
+use crate::tests::TestSeverity;
 use crate::traits::SqlDialect;
 
 /// Result of a single data quality check.
@@ -14,6 +15,11 @@ use crate::traits::SqlDialect;
 pub struct CheckResult {
     pub name: String,
     pub passed: bool,
+    /// Severity reported when the check fails. `error` causes the quality
+    /// pipeline to exit non-zero (subject to `fail_on_error`); `warning`
+    /// is advisory and does not fail the run.
+    #[serde(default)]
+    pub severity: TestSeverity,
     #[serde(flatten)]
     pub details: CheckDetails,
 }
@@ -42,6 +48,25 @@ pub enum CheckDetails {
         column: String,
         null_rate: f64,
         threshold: f64,
+    },
+    /// Row-level assertion evaluated via the `TestDecl` surface
+    /// (`not_null`, `unique`, `accepted_values`, `relationships`,
+    /// `expression`, `row_count_range`).
+    ///
+    /// `failing_rows` is the count of rows that violated the assertion;
+    /// `0` means the check passed. For `row_count_range`, `failing_rows`
+    /// stores the observed row count (the caller asserts pass/fail via
+    /// the configured bounds).
+    Assertion {
+        /// Assertion kind — the `TestType` discriminant serialized as
+        /// snake_case (e.g., `"not_null"`, `"accepted_values"`).
+        kind: String,
+        /// Column under test, when the assertion has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<String>,
+        /// Number of failing rows (0 when passed). For `row_count_range`,
+        /// this stores the observed total row count.
+        failing_rows: u64,
     },
     /// User-defined SQL check evaluated against a threshold.
     Custom {
@@ -152,6 +177,7 @@ pub fn check_row_count(source_count: u64, target_count: u64) -> CheckResult {
     CheckResult {
         name: "row_count".to_string(),
         passed: source_count == target_count,
+        severity: TestSeverity::Error,
         details: CheckDetails::RowCount {
             source_count,
             target_count,
@@ -179,6 +205,7 @@ pub fn check_column_match(
     CheckResult {
         name: "column_match".to_string(),
         passed,
+        severity: TestSeverity::Error,
         details: CheckDetails::ColumnMatch { missing, extra },
     }
 }
@@ -188,6 +215,7 @@ pub fn check_null_rate(column: &str, null_rate: f64, threshold: f64) -> CheckRes
     CheckResult {
         name: "null_rate".to_string(),
         passed: null_rate <= threshold,
+        severity: TestSeverity::Error,
         details: CheckDetails::NullRate {
             column: column.to_string(),
             null_rate,
@@ -201,10 +229,38 @@ pub fn check_custom(name: &str, query: &str, result_value: u64, threshold: u64) 
     CheckResult {
         name: name.to_string(),
         passed: result_value <= threshold,
+        severity: TestSeverity::Error,
         details: CheckDetails::Custom {
             query: query.to_string(),
             result_value,
             threshold,
+        },
+    }
+}
+
+/// Builds a `CheckResult` for a row-level assertion.
+///
+/// `kind` is the `TestType` discriminant in snake_case (e.g. `"not_null"`).
+/// `passed` is classified by the caller — the classification is
+/// kind-dependent (count-based for `not_null`/`expression`,
+/// empty-result-set for `unique`/`accepted_values`/`relationships`,
+/// range-check for `row_count_range`).
+pub fn check_assertion(
+    name: impl Into<String>,
+    kind: impl Into<String>,
+    column: Option<String>,
+    failing_rows: u64,
+    passed: bool,
+    severity: TestSeverity,
+) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed,
+        severity,
+        details: CheckDetails::Assertion {
+            kind: kind.into(),
+            column,
+            failing_rows,
         },
     }
 }
@@ -214,6 +270,7 @@ pub fn check_freshness(lag_seconds: u64, threshold_seconds: u64) -> CheckResult 
     CheckResult {
         name: "freshness".to_string(),
         passed: lag_seconds <= threshold_seconds,
+        severity: TestSeverity::Error,
         details: CheckDetails::Freshness {
             lag_seconds,
             threshold_seconds,
