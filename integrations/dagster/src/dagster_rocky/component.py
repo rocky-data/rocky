@@ -410,8 +410,10 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             self.dag_mode = False
             return self.build_defs_from_state(context, state_path)
 
-        dag_result = DagResult.model_validate(raw["dag"])
-        discover_result = DiscoverResult.model_validate(raw["discover"])
+        # Use model_validate_json to correctly handle Pydantic field aliases
+        # (e.g., "from" → from_, "schema" → schema_).
+        dag_result = DagResult.model_validate_json(json.dumps(raw["dag"]))
+        discover_result = DiscoverResult.model_validate_json(json.dumps(raw["discover"]))
         translator = self._get_translator()
         rocky = self._get_rocky_resource()
 
