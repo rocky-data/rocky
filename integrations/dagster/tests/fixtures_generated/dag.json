@@ -1,0 +1,45 @@
+{
+  "version": "1.0.3",
+  "command": "dag",
+  "nodes": [
+    {
+      "id": "source:playground",
+      "kind": "source",
+      "label": "playground (source)",
+      "pipeline": "playground"
+    },
+    {
+      "id": "load:playground",
+      "kind": "load",
+      "label": "playground (load)",
+      "pipeline": "playground",
+      "depends_on": [
+        "source:playground"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "source:playground",
+      "to": "load:playground",
+      "edge_type": "data"
+    }
+  ],
+  "execution_layers": [
+    [
+      "source:playground"
+    ],
+    [
+      "load:playground"
+    ]
+  ],
+  "summary": {
+    "total_nodes": 2,
+    "total_edges": 1,
+    "execution_layers": 2,
+    "counts_by_kind": {
+      "source": 1,
+      "load": 1
+    }
+  }
+}

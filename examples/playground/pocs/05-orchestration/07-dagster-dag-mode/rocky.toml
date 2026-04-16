@@ -1,0 +1,36 @@
+# Dagster dag_mode — full lineage from Rocky's unified DAG
+#
+# This pipeline defines both replication and transformation stages so
+# `rocky dag` produces a connected graph: source → load → models.
+# dagster-rocky's `dag_mode=True` renders this as a single connected
+# asset graph in the Dagster UI.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+timestamp_column = "_updated_at"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.ingest.target.governance]
+auto_create_schemas = true
+
+[pipeline.transform]
+type = "transformation"
+depends_on = ["ingest"]
+
+[pipeline.transform.target]
+adapter = "default"

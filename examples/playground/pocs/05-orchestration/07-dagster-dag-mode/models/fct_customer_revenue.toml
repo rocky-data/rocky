@@ -1,0 +1,4 @@
+depends_on = ["stg_orders"]
+
+[target]
+schema = "gold"

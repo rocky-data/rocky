@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "command": "run",
   "pipeline_type": "replication",
   "filter": "source=orders",
@@ -17,7 +17,7 @@
       "duration_ms": 0,
       "metadata": {
         "strategy": "full_refresh",
-        "watermark": "2026-04-15T21:54:14.146401Z",
+        "watermark": "2026-04-16T00:24:53.217839Z",
         "target_table_full_name": "poc.staging__orders.orders"
       }
     }

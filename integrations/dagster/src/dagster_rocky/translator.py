@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import dagster as dg
 
 from .types import ModelDetail, SourceInfo, TableInfo
+
+if TYPE_CHECKING:
+    from .types import DagNodeOutput
+
+import re
+
+_INVALID_CHARS = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _sanitize_key_part(s: str) -> str:
+    """Replace characters invalid in Dagster names with underscores."""
+    return _INVALID_CHARS.sub("_", s)
 
 
 class RockyDagsterTranslator:
@@ -154,3 +168,48 @@ class RockyDagsterTranslator:
                 str(model.strategy.get("type", "")) if isinstance(model.strategy, dict) else ""
             ),
         }
+
+    # ------------------------------------------------------------------ #
+    # DAG-mode translation (unified DAG nodes)                           #
+    # ------------------------------------------------------------------ #
+
+    def get_dag_node_asset_key(self, node: DagNodeOutput) -> dg.AssetKey:
+        """Returns the Dagster asset key for a unified DAG node.
+
+        Dispatches by node kind:
+
+        - ``transformation`` → ``[catalog, schema, table]`` from target
+        - ``seed`` → ``["seed", label]``
+        - ``source`` → ``[pipeline, "source", label]``
+        - ``load`` → ``[pipeline, label]``
+        - ``quality`` → ``["quality", pipeline, label]``
+        - ``snapshot`` → ``["snapshot", pipeline, label]``
+
+        Override to customize key derivation for your pipeline layout.
+        """
+        pipeline = node.pipeline or "default"
+        if node.kind == "transformation" and node.target is not None:
+            return dg.AssetKey([node.target.catalog, node.target.schema_, node.target.table])
+        if node.kind == "seed":
+            return dg.AssetKey(["seed", node.label])
+        if node.kind == "source":
+            return dg.AssetKey([pipeline, "source"])
+        if node.kind == "load":
+            return dg.AssetKey([pipeline, "load"])
+        if node.kind == "quality":
+            return dg.AssetKey(["quality", pipeline])
+        if node.kind == "snapshot":
+            return dg.AssetKey(["snapshot", pipeline])
+        return dg.AssetKey([_sanitize_key_part(node.id)])
+
+    def get_dag_group_name(self, node: DagNodeOutput) -> str:
+        """Returns the Dagster group name for a unified DAG node.
+
+        Default: target schema for transformation nodes, pipeline name
+        for everything else, ``"default"`` as fallback.
+        """
+        if node.kind == "transformation" and node.target is not None:
+            return node.target.schema_
+        if node.pipeline is not None:
+            return node.pipeline
+        return "default"

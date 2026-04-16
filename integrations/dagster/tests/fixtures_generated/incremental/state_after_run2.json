@@ -1,10 +1,10 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "command": "state",
   "watermarks": [
     {
       "table": "poc.staging__events.events",
-      "last_value": "2026-04-15T21:54:14.458696Z",
+      "last_value": "2026-04-16T00:24:53.545139Z",
       "updated_at": "2000-01-01T00:00:00Z"
     }
   ]
