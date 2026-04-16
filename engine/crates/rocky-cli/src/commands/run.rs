@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use rocky_databricks::throttle::AdaptiveThrottle;
+use rocky_adapter_sdk::throttle::AdaptiveThrottle;
 
 use rocky_core::checks;
 use rocky_core::config::{GovernanceOverride, ReplicationPipelineConfig};
@@ -17,9 +17,10 @@ use rocky_core::drift;
 use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
-use rocky_core::traits::{GovernanceAdapter, TagTarget, WarehouseAdapter};
-use rocky_databricks::batch::{self, BatchTableRef};
-use rocky_databricks::governance::DatabricksGovernanceAdapter;
+use rocky_core::traits::{
+    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
+    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+};
 
 use crate::output::*;
 use crate::registry::{self, AdapterRegistry};
@@ -38,9 +39,9 @@ struct TableResult {
     drift_checked: bool,
     drift_detected: Option<DriftActionOutput>,
     column_match_check: Option<rocky_core::checks::CheckResult>,
-    source_batch_ref: Option<BatchTableRef>,
-    target_batch_ref: Option<BatchTableRef>,
-    freshness_batch_ref: Option<BatchTableRef>,
+    source_batch_ref: Option<TableRef>,
+    target_batch_ref: Option<TableRef>,
+    freshness_batch_ref: Option<TableRef>,
     asset_key: Vec<String>,
     target_full_name: String,
     /// Deferred governance tags — applied in a post-run batch phase instead
@@ -359,42 +360,21 @@ pub async fn run(
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    // Databricks connector is optional — only present when the target adapter
-    // is Databricks. Used for batch operations (describe, row counts, freshness)
-    // and governance. Non-Databricks adapters fall back to per-table checks via
-    // WarehouseAdapter trait methods.
-    let db_connector = adapter_registry
-        .databricks_connector(&pipeline.target.adapter)
-        .ok();
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
+    // Batch check adapter (optional): present when the warehouse has an
+    // optimised UNION-ALL / information_schema path (Databricks today).
+    // When absent, run.rs falls back to per-table queries via the
+    // generic WarehouseAdapter methods — same observable behaviour.
+    let batch_check_adapter: Option<Arc<dyn BatchCheckAdapter>> =
+        adapter_registry.batch_check_adapter(&pipeline.target.adapter);
+
     // Governance adapter: wraps catalog/permission/workspace managers behind
-    // the GovernanceAdapter trait. Workspace binding is best-effort (requires
-    // auth credentials). Plan 01: run.rs governance operations now go through
-    // this trait object instead of importing Databricks types directly.
-    // When the target adapter is not Databricks, use NoopGovernanceAdapter.
-    let governance_adapter: Box<dyn GovernanceAdapter + '_> =
-        if let Some(ref db_conn) = db_connector {
-            let adapter_cfg = adapter_registry.adapter_config(&pipeline.target.adapter);
-            let auth = adapter_cfg.and_then(|cfg| {
-                rocky_databricks::auth::Auth::from_config(rocky_databricks::auth::AuthConfig {
-                    host: cfg.host.clone().unwrap_or_default(),
-                    token: cfg.token.as_ref().map(|s| s.expose().to_string()),
-                    client_id: cfg.client_id.clone(),
-                    client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
-                })
-                .ok()
-            });
-            match auth {
-                Some(a) => {
-                    let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
-                    Box::new(DatabricksGovernanceAdapter::new(db_conn, host, a))
-                }
-                None => Box::new(DatabricksGovernanceAdapter::without_workspace(db_conn)),
-            }
-        } else {
-            Box::new(rocky_core::traits::NoopGovernanceAdapter)
-        };
+    // the GovernanceAdapter trait. Constructed by the registry so run.rs is
+    // agnostic to the underlying warehouse kind. When the target adapter
+    // doesn't support governance, the registry returns a NoopGovernanceAdapter.
+    let governance_adapter: Box<dyn GovernanceAdapter> =
+        adapter_registry.governance_adapter(&pipeline.target.adapter);
 
     let state_store = StateStore::open(state_path).context(format!(
         "failed to open state store at {}",
@@ -423,9 +403,9 @@ pub async fn run(
     let mut schemas_created: usize = 0;
     let mut created_catalogs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut source_batch_refs: Vec<BatchTableRef> = Vec::new();
-    let mut target_batch_refs: Vec<BatchTableRef> = Vec::new();
-    let mut freshness_batch_refs: Vec<BatchTableRef> = Vec::new();
+    let mut source_batch_refs: Vec<TableRef> = Vec::new();
+    let mut target_batch_refs: Vec<TableRef> = Vec::new();
+    let mut freshness_batch_refs: Vec<TableRef> = Vec::new();
     let mut batch_asset_keys: Vec<(String, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
@@ -864,12 +844,10 @@ pub async fn run(
 
     // --- Batch column pre-fetch: replace N×2 DESCRIBE TABLE calls with
     //     one information_schema query per unique schema pair. ---
-    // Only available when we have a Databricks connector; non-Databricks
-    // adapters fall back to per-table DESCRIBE via WarehouseAdapter in
-    // process_table().
-    if let Some(ref db_conn) = db_connector {
-        use rocky_databricks::batch::execute_batch_describe;
-
+    // Only available when the warehouse implements BatchCheckAdapter
+    // (Databricks today); other adapters fall back to per-table DESCRIBE
+    // via WarehouseAdapter in process_table().
+    if let Some(ref bc_adapter) = batch_check_adapter {
         // Collect unique (catalog, schema) pairs for source and target
         let source_schemas: std::collections::HashSet<(String, String)> = tables_to_process
             .iter()
@@ -895,23 +873,13 @@ pub async fn run(
             std::collections::HashMap<String, Vec<ColumnInfo>>,
         > = std::collections::HashMap::new();
 
-        type DescribeResult<'a> = (
-            &'a str,
-            String,
-            String,
-            Result<
-                std::collections::HashMap<String, Vec<ColumnInfo>>,
-                rocky_databricks::batch::BatchError,
-            >,
-        );
-
-        let describe_results: Vec<DescribeResult<'_>> =
+        let describe_results =
             futures::future::join_all(describe_futures.iter().map(|(side, cat, sch)| {
                 let cat = cat.clone();
                 let sch = sch.clone();
-                let connector = db_conn;
+                let bc = bc_adapter.clone();
                 async move {
-                    let result = execute_batch_describe(connector, &cat, &sch).await;
+                    let result = bc.batch_describe_schema(&cat, &sch).await;
                     (*side, cat, sch, result)
                 }
             }))
@@ -976,7 +944,7 @@ pub async fn run(
     };
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let shared_connector = db_connector.clone();
+    let shared_batch_check = batch_check_adapter.clone();
     let shared_warehouse = warehouse_adapter.clone();
     let shared_state = Arc::new(Mutex::new(state_store));
     let shared_run_id = run_id.clone();
@@ -1314,43 +1282,42 @@ pub async fn run(
     }
 
     // --- Batch table tagging (concurrent, outside the main processing loop) ---
-    // Table tagging uses CatalogManager which requires the Databricks connector.
-    // For non-Databricks adapters, tagging was already handled via GovernanceAdapter
-    // (NoopGovernanceAdapter silently succeeds) so deferred_tags will be empty.
+    // Tagging is dispatched through the GovernanceAdapter trait, so it works
+    // for any warehouse whose adapter registers a governance implementation.
+    // The NoopGovernanceAdapter silently succeeds, which matches the previous
+    // behaviour for non-Databricks targets (deferred_tags was never populated
+    // into SQL calls before either).
     if !deferred_tags.is_empty() {
-        if let Some(ref db_conn) = shared_connector {
-            let tag_start = Instant::now();
+        let tag_start = Instant::now();
 
-            let tag_results: Vec<_> = futures::future::join_all(deferred_tags.iter().map(|dt| {
-                let catalog_mgr = rocky_databricks::catalog::CatalogManager::new(db_conn);
-                async move {
-                    catalog_mgr
-                        .set_table_tags(&dt.catalog, &dt.schema, &dt.table, &dt.tags)
-                        .await
-                        .map_err(|e| (format!("{}.{}.{}", dt.catalog, dt.schema, dt.table), e))
-                }
-            }))
-            .await;
-
-            let mut tag_failures = 0usize;
-            for result in &tag_results {
-                if let Err((table, e)) = result {
-                    warn!(table, error = %e, "table tagging failed");
-                    tag_failures += 1;
-                }
+        let tag_results: Vec<_> = futures::future::join_all(deferred_tags.iter().map(|dt| {
+            let gov = &governance_adapter;
+            let target = TagTarget::Table {
+                catalog: dt.catalog.clone(),
+                schema: dt.schema.clone(),
+                table: dt.table.clone(),
+            };
+            async move {
+                gov.set_tags(&target, &dt.tags)
+                    .await
+                    .map_err(|e| (format!("{}.{}.{}", dt.catalog, dt.schema, dt.table), e))
             }
-            debug!(
-                tables = deferred_tags.len(),
-                failures = tag_failures,
-                elapsed_ms = tag_start.elapsed().as_millis() as u64,
-                "batch tagging complete"
-            );
-        } else {
-            warn!(
-                tables = deferred_tags.len(),
-                "skipping batch table tagging — no Databricks connector available"
-            );
+        }))
+        .await;
+
+        let mut tag_failures = 0usize;
+        for result in &tag_results {
+            if let Err((table, e)) = result {
+                warn!(table, error = %e, "table tagging failed");
+                tag_failures += 1;
+            }
         }
+        debug!(
+            tables = deferred_tags.len(),
+            failures = tag_failures,
+            elapsed_ms = tag_start.elapsed().as_millis() as u64,
+            "batch tagging complete"
+        );
     }
 
     let state_store = Arc::try_unwrap(shared_state)
@@ -1372,45 +1339,48 @@ pub async fn run(
         );
     }
 
-    // Batch checks use the Databricks connector when available (UNION ALL
-    // batching). Otherwise, fall back to per-table queries via WarehouseAdapter.
-    let (source_counts, target_counts, freshness_results) = if let Some(ref db_conn) =
-        shared_connector
-    {
-        tokio::try_join!(
+    // Batch checks dispatch through the BatchCheckAdapter trait when the
+    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
+    // per-table queries via the generic WarehouseAdapter — same observable
+    // check results, just more round-trips.
+    let (source_counts, target_counts, freshness_results): (
+        Vec<BatchRowCountResult>,
+        Vec<BatchRowCountResult>,
+        Vec<BatchFreshnessResult>,
+    ) = if let Some(ref bc) = shared_batch_check {
+        let (src, tgt, fresh) = tokio::try_join!(
             async {
                 if row_count_enabled {
-                    batch::execute_batch_row_counts(db_conn, &source_batch_refs).await
+                    bc.batch_row_counts(&source_batch_refs).await
                 } else {
                     Ok(vec![])
                 }
             },
             async {
                 if row_count_enabled {
-                    batch::execute_batch_row_counts(db_conn, &target_batch_refs).await
+                    bc.batch_row_counts(&target_batch_refs).await
                 } else {
                     Ok(vec![])
                 }
             },
             async {
                 if freshness_enabled {
-                    batch::execute_batch_freshness(
-                        db_conn,
-                        &freshness_batch_refs,
-                        &pipeline.timestamp_column,
-                    )
-                    .await
+                    bc.batch_freshness(&freshness_batch_refs, &pipeline.timestamp_column)
+                        .await
                 } else {
                     Ok(vec![])
                 }
             },
-        )?
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        (src, tgt, fresh)
     } else {
-        // Per-table fallback via WarehouseAdapter for non-Databricks targets
+        // Per-table fallback via WarehouseAdapter for adapters with no
+        // BatchCheckAdapter implementation.
         let dialect = shared_warehouse.dialect();
         let mut src_counts = Vec::new();
         let mut tgt_counts = Vec::new();
-        let mut fresh_results: Vec<batch::FreshnessResult> = Vec::new();
+        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
 
         if row_count_enabled {
             for br in &source_batch_refs {
@@ -1429,10 +1399,8 @@ pub async fn run(
                                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                             })
                             .unwrap_or(0);
-                        src_counts.push(batch::RowCountResult {
-                            catalog: br.catalog.clone(),
-                            schema: br.schema.clone(),
-                            table: br.table.clone(),
+                        src_counts.push(BatchRowCountResult {
+                            table: br.clone(),
                             count,
                         });
                     }
@@ -1457,10 +1425,8 @@ pub async fn run(
                                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                             })
                             .unwrap_or(0);
-                        tgt_counts.push(batch::RowCountResult {
-                            catalog: br.catalog.clone(),
-                            schema: br.schema.clone(),
-                            table: br.table.clone(),
+                        tgt_counts.push(BatchRowCountResult {
+                            table: br.clone(),
                             count,
                         });
                     }
@@ -1484,11 +1450,21 @@ pub async fn run(
                             .first()
                             .and_then(|r| r.first())
                             .and_then(|v| v.as_str())
-                            .map(std::string::ToString::to_string);
-                        fresh_results.push(batch::FreshnessResult {
-                            catalog: br.catalog.clone(),
-                            schema: br.schema.clone(),
-                            table: br.table.clone(),
+                            .and_then(|s| {
+                                s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
+                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                                        .or_else(|_| {
+                                            chrono::NaiveDateTime::parse_from_str(
+                                                s,
+                                                "%Y-%m-%d %H:%M:%S",
+                                            )
+                                        })
+                                        .ok()
+                                        .map(|naive| naive.and_utc())
+                                })
+                            });
+                        fresh_results.push(BatchFreshnessResult {
+                            table: br.clone(),
                             max_timestamp: max_ts,
                         });
                     }
@@ -1506,19 +1482,19 @@ pub async fn run(
     if row_count_enabled {
         let source_map: HashMap<String, u64> = source_counts
             .iter()
-            .map(|r| (format!("{}.{}.{}", r.catalog, r.schema, r.table), r.count))
+            .map(|r| (r.table.full_name(), r.count))
             .collect();
         let target_map: HashMap<String, u64> = target_counts
             .iter()
-            .map(|r| (format!("{}.{}.{}", r.catalog, r.schema, r.table), r.count))
+            .map(|r| (r.table.full_name(), r.count))
             .collect();
 
         for (target_key, asset_key) in &batch_asset_keys {
             let src_ref = &source_batch_refs
                 .iter()
                 .zip(target_batch_refs.iter())
-                .find(|(_, t)| format!("{}.{}.{}", t.catalog, t.schema, t.table) == *target_key)
-                .map(|(s, _)| format!("{}.{}.{}", s.catalog, s.schema, s.table));
+                .find(|(_, t)| t.full_name() == *target_key)
+                .map(|(s, _)| s.full_name());
 
             if let Some(src_key) = src_ref {
                 let src_count = source_map.get(src_key).copied().unwrap_or(0);
@@ -1542,7 +1518,7 @@ pub async fn run(
             for (target_key, _) in &batch_asset_keys {
                 let tgt_count = target_counts
                     .iter()
-                    .find(|r| format!("{}.{}.{}", r.catalog, r.schema, r.table) == *target_key)
+                    .find(|r| r.table.full_name() == *target_key)
                     .map(|r| r.count)
                     .unwrap_or(0);
 
@@ -1579,27 +1555,17 @@ pub async fn run(
     if let Some(ref freshness_cfg) = pipeline.checks.freshness {
         let now = Utc::now();
         for fr in &freshness_results {
-            let key = format!("{}.{}.{}", fr.catalog, fr.schema, fr.table);
-            if let Some(ts_str) = &fr.max_timestamp {
-                // Try RFC 3339 first, then Databricks format ("YYYY-MM-DD HH:MM:SS.fff")
-                let parsed = ts_str.parse::<chrono::DateTime<Utc>>().or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f")
-                        .or_else(|_| {
-                            chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-                        })
-                        .map(|naive| naive.and_utc())
-                });
-                if let Ok(ts) = parsed {
-                    let lag = (now - ts).num_seconds().unsigned_abs();
-                    let check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
+            let key = fr.table.full_name();
+            if let Some(ts) = fr.max_timestamp {
+                let lag = (now - ts).num_seconds().unsigned_abs();
+                let check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
 
-                    if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
-                        let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
-                            asset_key: asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                        entry.checks.push(check);
-                    }
+                if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
+                    let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    });
+                    entry.checks.push(check);
                 }
             }
         }
@@ -2561,7 +2527,7 @@ async fn process_table(
     };
 
     let source_batch_ref = if task.check_row_count {
-        Some(BatchTableRef {
+        Some(TableRef {
             catalog: source_table.catalog.clone(),
             schema: source_table.schema.clone(),
             table: source_table.table.clone(),
@@ -2571,7 +2537,7 @@ async fn process_table(
     };
 
     let target_batch_ref = if task.check_row_count {
-        Some(BatchTableRef {
+        Some(TableRef {
             catalog: target_table.catalog.clone(),
             schema: target_table.schema.clone(),
             table: target_table.table.clone(),
@@ -2581,7 +2547,7 @@ async fn process_table(
     };
 
     let freshness_batch_ref = if task.check_freshness {
-        Some(BatchTableRef {
+        Some(TableRef {
             catalog: target_table.catalog.clone(),
             schema: target_table.schema.clone(),
             table: target_table.table.clone(),
@@ -2685,9 +2651,9 @@ async fn process_completed_result(
     semaphore_capacity: &mut usize,
     output: &mut RunOutput,
     pending_checks: &mut HashMap<String, PendingCheck>,
-    source_batch_refs: &mut Vec<BatchTableRef>,
-    target_batch_refs: &mut Vec<BatchTableRef>,
-    freshness_batch_refs: &mut Vec<BatchTableRef>,
+    source_batch_refs: &mut Vec<TableRef>,
+    target_batch_refs: &mut Vec<TableRef>,
+    freshness_batch_refs: &mut Vec<TableRef>,
     batch_asset_keys: &mut Vec<(String, Vec<String>)>,
     table_errors: &mut Vec<TableError>,
     deferred_tags: &mut Vec<DeferredTagging>,

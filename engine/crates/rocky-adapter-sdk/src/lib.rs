@@ -18,6 +18,7 @@
 pub mod conformance;
 pub mod manifest;
 pub mod process;
+pub mod throttle;
 pub mod traits;
 
 /// Semantic version for the adapter protocol.

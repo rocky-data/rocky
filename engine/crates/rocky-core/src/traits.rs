@@ -440,6 +440,24 @@ pub trait BatchCheckAdapter: Send + Sync {
         tables: &[TableRef],
         timestamp_col: &str,
     ) -> AdapterResult<Vec<FreshnessResult>>;
+
+    /// Describe all tables in a schema in a single batched query.
+    ///
+    /// Replaces N per-table `DESCRIBE TABLE` calls with a single
+    /// `information_schema.columns` query when the warehouse supports it.
+    /// Returns column metadata keyed by table name (lowercase).
+    ///
+    /// Default: returns a `not supported` error so callers fall back to the
+    /// per-table [`WarehouseAdapter::describe_table`] path.
+    async fn batch_describe_schema(
+        &self,
+        _catalog: &str,
+        _schema: &str,
+    ) -> AdapterResult<std::collections::HashMap<String, Vec<ColumnInfo>>> {
+        Err(AdapterError::msg(
+            "batch_describe_schema not supported by this adapter",
+        ))
+    }
 }
 
 #[cfg(test)]

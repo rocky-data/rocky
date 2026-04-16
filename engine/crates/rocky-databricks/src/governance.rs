@@ -4,6 +4,7 @@
 //! isolation behind a single trait interface.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -18,13 +19,17 @@ use crate::workspace::WorkspaceManager;
 
 /// Databricks governance adapter combining catalog management,
 /// permission reconciliation, and workspace isolation.
-pub struct DatabricksGovernanceAdapter<'a> {
-    connector: &'a DatabricksConnector,
+///
+/// Owns an [`Arc<DatabricksConnector>`] so it can be constructed by the
+/// adapter registry and returned as a `Box<dyn GovernanceAdapter>` without
+/// borrowing from a shorter-lived handle.
+pub struct DatabricksGovernanceAdapter {
+    connector: Arc<DatabricksConnector>,
     workspace_mgr: Option<WorkspaceManager>,
 }
 
-impl<'a> DatabricksGovernanceAdapter<'a> {
-    pub fn new(connector: &'a DatabricksConnector, host: &str, auth: Auth) -> Self {
+impl DatabricksGovernanceAdapter {
+    pub fn new(connector: Arc<DatabricksConnector>, host: &str, auth: Auth) -> Self {
         Self {
             connector,
             workspace_mgr: Some(WorkspaceManager::new(host.to_string(), auth)),
@@ -32,7 +37,7 @@ impl<'a> DatabricksGovernanceAdapter<'a> {
     }
 
     /// Create without workspace manager (for environments without isolation).
-    pub fn without_workspace(connector: &'a DatabricksConnector) -> Self {
+    pub fn without_workspace(connector: Arc<DatabricksConnector>) -> Self {
         Self {
             connector,
             workspace_mgr: None,
@@ -41,13 +46,13 @@ impl<'a> DatabricksGovernanceAdapter<'a> {
 }
 
 #[async_trait]
-impl GovernanceAdapter for DatabricksGovernanceAdapter<'_> {
+impl GovernanceAdapter for DatabricksGovernanceAdapter {
     async fn set_tags(
         &self,
         target: &TagTarget,
         tags: &BTreeMap<String, String>,
     ) -> AdapterResult<()> {
-        let mgr = CatalogManager::new(self.connector);
+        let mgr = CatalogManager::new(&self.connector);
         match target {
             TagTarget::Catalog(catalog) => mgr
                 .set_catalog_tags(catalog, tags)
@@ -69,7 +74,7 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter<'_> {
     }
 
     async fn get_grants(&self, target: &GrantTarget) -> AdapterResult<Vec<Grant>> {
-        let perm_mgr = PermissionManager::new(self.connector);
+        let perm_mgr = PermissionManager::new(&self.connector);
         match target {
             GrantTarget::Catalog(catalog) => perm_mgr
                 .get_catalog_grants(catalog)
@@ -83,7 +88,7 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter<'_> {
     }
 
     async fn apply_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
-        let perm_mgr = PermissionManager::new(self.connector);
+        let perm_mgr = PermissionManager::new(&self.connector);
         let diff = PermissionDiff {
             grants_to_add: grants.to_vec(),
             grants_to_revoke: vec![],
@@ -92,7 +97,7 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter<'_> {
     }
 
     async fn revoke_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
-        let perm_mgr = PermissionManager::new(self.connector);
+        let perm_mgr = PermissionManager::new(&self.connector);
         let diff = PermissionDiff {
             grants_to_add: vec![],
             grants_to_revoke: grants.to_vec(),
