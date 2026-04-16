@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-04-16
+
+### Added — Adapter `kind` field
+
+`[adapter.*]` blocks in `rocky.toml` now accept `kind = "data" | "discovery"` to declare the role the adapter plays. Required on discovery-only types (`fivetran`, `airbyte`, `iceberg`, `manual`) so the role is self-evident in the raw config file without knowing the Rust trait surface of each adapter. Optional (defaults to `"data"`) for warehouse types (`databricks`, `snowflake`, `bigquery`); optional for the dual-role `duckdb` type, where absent means "register both roles".
+
+A new canonical `rocky_core::adapter_capability` table backs the validation and replaces the discovery-only string match that used to live in `bridge::adapter_capabilities`.
+
+**Breaking:** existing `rocky.toml` files with `type = "fivetran"` / `"airbyte"` / `"iceberg"` / `"manual"` adapter blocks must add `kind = "discovery"`. Parse-time error points at the exact fix. Data-only and DuckDB configs are unaffected.
+
+### Added — Structured V032/V033 diagnostics in `rocky validate`
+
+`rocky validate` now emits dedicated codes for adapter-kind issues:
+
+- **V032** — `[adapter.*]` kind invariants (missing required `kind = "discovery"`, or a declared kind that the adapter's type doesn't support). `field` points at `adapter.<name>.kind`.
+- **V033** — pipeline cross-reference role mismatches (`source.adapter` references an adapter whose role excludes data movement, or `source.discovery.adapter` references an adapter whose role excludes discovery). `field` points at the offending pipeline key.
+
+A config with multiple independent kind issues now surfaces every one in a single `rocky validate` run instead of bailing on the first through the V001 catch-all. Production code paths still fail fast via `load_rocky_config`; the new public `rocky_core::config::parse_rocky_config` is the lenient counterpart used by the validate command.
+
+### Changed — `validate_adapter_kinds` signature
+
+`rocky_core::config::validate_adapter_kinds(&RockyConfig)` now returns `Vec<ConfigError>` (all issues) instead of `Result<(), ConfigError>` (first). `load_rocky_config` preserves fail-fast behaviour by taking the first error from the vec.
+
+**Breaking:** direct callers of `validate_adapter_kinds` in the public Rust API must adapt. Only consumers embedding the engine as a library are affected; CLI users see no difference.
+
+### Changed — Bridge capabilities driven from canonical table
+
+`rocky_core::bridge::adapter_capabilities` now derives `can_export` / `can_import` from `rocky_core::adapter_capability::capability_for` instead of a hard-coded match on adapter-type strings. `cloud_storage` stays as a small local `matches!` (orthogonal bridge-specific concern). Behaviour is unchanged for every adapter.
+
+### Fixed — Clippy 1.95 lints on `main`
+
+- `rocky-sql::transpile`: collapse nested `if` inside a match arm into a match guard (`collapsible_match`).
+- `rocky-core::state`: replace `sort_by(|a, b| b.x.cmp(&a.x))` descending-sort helpers in `get_run_history` and `get_quality_history` with `sort_by_key(|r| std::cmp::Reverse(r.x))` (`unnecessary_sort_by`).
+
 ## [1.2.0] — 2026-04-16
 
 ### Added — `LoaderAdapter` widened to support cloud URIs
