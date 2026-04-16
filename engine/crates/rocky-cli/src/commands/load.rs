@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
-use rocky_adapter_sdk::{FileFormat, LoadOptions, LoaderAdapter, TableRef};
+use rocky_adapter_sdk::{FileFormat, LoadOptions, LoadSource, LoaderAdapter, TableRef};
 use rocky_core::state::{LoadedFileRecord, StateStore};
 
 use crate::output::{LoadFileOutput, LoadOutput, print_json};
@@ -204,7 +204,8 @@ pub async fn run_load(
             "loading file"
         );
 
-        match loader.load_file(file_path, &target, &options).await {
+        let load_source = LoadSource::LocalFile(file_path.clone());
+        match loader.load(&load_source, &target, &options).await {
             Ok(result) => {
                 let duration = file_start.elapsed().as_millis() as u64;
                 info!(
