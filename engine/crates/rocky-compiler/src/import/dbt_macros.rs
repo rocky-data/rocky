@@ -191,7 +191,7 @@ pub fn resolve_macros(
     // Process macros from end to start so byte offsets remain valid
     let mut result = sql.to_string();
     let mut sorted_macros: Vec<&MacroUsage> = macros.iter().collect();
-    sorted_macros.sort_by(|a, b| b.span.0.cmp(&a.span.0));
+    sorted_macros.sort_by_key(|m| std::cmp::Reverse(m.span.0));
 
     for m in sorted_macros {
         let full_name = match &m.package {
