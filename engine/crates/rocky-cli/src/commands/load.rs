@@ -107,33 +107,7 @@ pub async fn run_load(
         .adapter_config(adapter_name)
         .context(format!("no adapter config for '{adapter_name}'"))?;
 
-    let loader: Box<dyn LoaderAdapter> = match adapter_cfg.adapter_type.as_str() {
-        #[cfg(feature = "duckdb")]
-        "duckdb" => {
-            use rocky_duckdb::loader::DuckDbLoaderAdapter;
-
-            let db_adapter = if let Some(p) = adapter_cfg.path.as_deref() {
-                DuckDbLoaderAdapter::new(
-                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(std::path::Path::new(p))
-                        .context(format!("failed to open DuckDB at '{p}'"))?
-                        .shared_connector(),
-                )
-            } else {
-                DuckDbLoaderAdapter::in_memory().context("failed to create in-memory DuckDB")?
-            };
-            Box::new(db_adapter)
-        }
-        #[cfg(not(feature = "duckdb"))]
-        "duckdb" => {
-            bail!("DuckDB support not compiled in (enable 'duckdb' feature)");
-        }
-        other => {
-            bail!(
-                "adapter type '{other}' does not support the load command yet; \
-                 only 'duckdb' is supported"
-            );
-        }
-    };
+    let loader: Box<dyn LoaderAdapter> = build_loader(adapter_name, adapter_cfg, &registry)?;
 
     // Discover files in the source directory.
     let files = discover_files(source_dir, requested_format)?;
@@ -338,6 +312,49 @@ fn parse_format(format: &str) -> Result<FileFormat> {
         "parquet" => Ok(FileFormat::Parquet),
         "jsonl" | "jsonlines" | "ndjson" => Ok(FileFormat::JsonLines),
         other => bail!("unsupported format '{other}'; supported: csv, parquet, jsonl"),
+    }
+}
+
+/// Build a `LoaderAdapter` for the given warehouse adapter, dispatching on
+/// the adapter type string from config.
+///
+/// Each warehouse adapter has a dedicated `LoaderAdapter` impl with its own
+/// bulk-load semantics (DuckDB COPY, Databricks COPY INTO, Snowflake stages,
+/// BigQuery INSERT fallback).
+fn build_loader(
+    adapter_name: &str,
+    adapter_cfg: &rocky_core::config::AdapterConfig,
+    registry: &AdapterRegistry,
+) -> Result<Box<dyn LoaderAdapter>> {
+    match adapter_cfg.adapter_type.as_str() {
+        #[cfg(feature = "duckdb")]
+        "duckdb" => {
+            use rocky_duckdb::loader::DuckDbLoaderAdapter;
+
+            let db_adapter = if let Some(p) = adapter_cfg.path.as_deref() {
+                DuckDbLoaderAdapter::new(
+                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(std::path::Path::new(p))
+                        .context(format!("failed to open DuckDB at '{p}'"))?
+                        .shared_connector(),
+                )
+            } else {
+                DuckDbLoaderAdapter::in_memory().context("failed to create in-memory DuckDB")?
+            };
+            Ok(Box::new(db_adapter))
+        }
+        #[cfg(not(feature = "duckdb"))]
+        "duckdb" => {
+            bail!("DuckDB support not compiled in (enable 'duckdb' feature)");
+        }
+        "bigquery" => registry.bigquery_loader(adapter_name),
+        "databricks" => registry.databricks_loader(adapter_name),
+        "snowflake" => registry.snowflake_loader(adapter_name),
+        other => {
+            bail!(
+                "adapter type '{other}' does not support the load command yet; \
+                 supported: duckdb, bigquery, databricks, snowflake"
+            );
+        }
     }
 }
 
