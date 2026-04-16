@@ -100,7 +100,8 @@ codegen-dagster:
         --use-schema-description \
         --use-field-description \
         --collapse-root-models \
-        --use-double-quotes
+        --use-double-quotes \
+        --disable-timestamp
     # Restore the curated __init__.py barrel from git (datamodel-codegen
     # overwrote it with a stub).
     cd ../..

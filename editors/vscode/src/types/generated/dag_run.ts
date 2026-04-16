@@ -1,4 +1,9 @@
 /* eslint-disable */
+/**
+ * AUTO-GENERATED — do not edit by hand.
+ * Source: schemas/dag_run.schema.json
+ * Run `just codegen` from the monorepo root to regenerate.
+ */
 
 /**
  * Output of `rocky run --dag`: per-node execution results plus aggregate counts.
