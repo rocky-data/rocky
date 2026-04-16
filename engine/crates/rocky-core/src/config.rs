@@ -575,6 +575,7 @@ impl AggregateCheckToggle {
 ///
 /// ```toml
 /// [[pipeline.nightly_dq.checks.assertions]]
+/// name     = "orders_customer_id_not_null"  # optional
 /// table    = "orders"
 /// type     = "not_null"
 /// column   = "customer_id"
@@ -589,6 +590,12 @@ pub struct QualityAssertion {
     /// from one of the pipeline's `[[tables]]` entries (by unqualified
     /// table name).
     pub table: String,
+    /// Optional identifier used as the `CheckResult.name` in the JSON
+    /// output. When unset, a synthesized `"{kind}:{column}"` name is
+    /// used — which can collide if multiple assertions share the same
+    /// table, kind, and column. Set `name` explicitly to disambiguate.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The declarative test (flattened: `type`, `column`, severity, and
     /// type-specific fields like `values` / `to_table`).
     #[serde(flatten)]
@@ -3104,6 +3111,7 @@ type = "not_null"
 column = "customer_id"
 
 [[pipeline.nightly_dq.checks.assertions]]
+name = "orders_status_allowed"
 table = "orders"
 type = "accepted_values"
 column = "status"
@@ -3119,10 +3127,15 @@ expression = "total >= 0"
         let q = config.pipelines["nightly_dq"].as_quality().unwrap();
         assert_eq!(q.checks.assertions.len(), 3);
         assert_eq!(q.checks.assertions[0].table, "orders");
+        assert!(q.checks.assertions[0].name.is_none());
         assert!(matches!(
             q.checks.assertions[0].test.test_type,
             crate::tests::TestType::NotNull
         ));
+        assert_eq!(
+            q.checks.assertions[1].name.as_deref(),
+            Some("orders_status_allowed")
+        );
         assert_eq!(
             q.checks.assertions[1].test.severity,
             crate::tests::TestSeverity::Warning
