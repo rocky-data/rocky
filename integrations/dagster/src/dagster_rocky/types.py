@@ -850,6 +850,10 @@ from .types_generated import (  # noqa: E402, F401
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,
+    DagEdgeOutput,
+    DagNodeOutput,
+    DagOutput,
+    DagSummaryOutput,
     DiffResult,
     DiffSummary,
     DiscoverOutput,
@@ -871,6 +875,7 @@ from .types_generated import (  # noqa: E402, F401
     ModelHistoryOutput,
     OptimizeOutput,
     OptimizeRecommendation,
+    PartitionShapeOutput,
     PermissionSummary,
     PhaseTimings,
     PlanOutput,
@@ -884,6 +889,11 @@ from .types_generated import (  # noqa: E402, F401
     TestFailure,
     TestOutput,
 )
+
+# Python-flavored bridge aliases for the DAG output types.
+DagResult = DagOutput
+DagNode = DagNodeOutput
+DagEdge = DagEdgeOutput
 
 # ---------------------------------------------------------------------------
 # Union type and parser
@@ -912,6 +922,7 @@ RockyOutput = (
     | ConformanceResult
     | DoctorResult
     | DriftDetectResult
+    | DagResult
 )
 
 
@@ -937,6 +948,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "test-adapter": ConformanceResult,
     "doctor": DoctorResult,
     "drift": DriftDetectResult,
+    "dag": DagResult,
 }
 
 

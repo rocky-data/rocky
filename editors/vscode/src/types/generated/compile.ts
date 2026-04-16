@@ -183,6 +183,10 @@ export interface ModelDetail {
    */
   cost_hint?: CostHint | null;
   /**
+   * Names of models this model directly depends on. Derived from the model's TOML `depends_on` list or auto-resolved from SQL table references. Empty when the model has no upstream dependencies.
+   */
+  depends_on?: string[];
+  /**
    * Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured.
    */
   freshness?: ModelFreshnessConfig | null;

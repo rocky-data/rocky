@@ -66,6 +66,7 @@ pub async fn run_transformation(
             Some(&state_store),
             partition_opts,
             &run_id,
+            None, // no model filter in local execution path
             &mut output,
         )
         .await?;

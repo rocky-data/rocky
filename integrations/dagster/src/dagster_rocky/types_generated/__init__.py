@@ -60,6 +60,15 @@ from .ci_diff_schema import CiDiffOutput, DiffResult, DiffSummary
 # Column lineage (per-column shape of `rocky lineage --column <col>`)
 from .column_lineage_schema import ColumnLineageOutput
 
+# DAG command — unified pipeline DAG with enriched orchestration metadata
+from .dag_schema import (
+    DagEdgeOutput,
+    DagNodeOutput,
+    DagOutput,
+    DagSummaryOutput,
+    PartitionShapeOutput,
+)
+
 # Compile command — canonical source for shared compiler types
 from .compile_schema import (
     CompileOutput,
@@ -174,6 +183,12 @@ __all__ = [
     "DiffSummary",
     # column lineage
     "ColumnLineageOutput",
+    # dag
+    "DagEdgeOutput",
+    "DagNodeOutput",
+    "DagOutput",
+    "DagSummaryOutput",
+    "PartitionShapeOutput",
     # compile (shared types)
     "CompileOutput",
     "Diagnostic",

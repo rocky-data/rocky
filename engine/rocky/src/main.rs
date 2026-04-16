@@ -147,6 +147,10 @@ enum Command {
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
+        /// Execute a single compiled model by name (skips replication).
+        /// Alternative to --filter for model-only execution.
+        #[arg(long)]
+        model: Option<String>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
         governance_override: Option<String>,
@@ -292,6 +296,22 @@ enum Command {
         /// Show expanded SQL after macro substitution
         #[arg(long)]
         expand_macros: bool,
+    },
+
+    /// Show the full unified DAG (all pipeline stages and dependencies)
+    Dag {
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+        /// Seeds directory
+        #[arg(long)]
+        seeds: Option<PathBuf>,
+        /// Contracts directory
+        #[arg(long)]
+        contracts: Option<PathBuf>,
+        /// Include column-level lineage edges (requires compilation)
+        #[arg(long)]
+        column_lineage: bool,
     },
 
     /// Show column-level lineage for a model
@@ -753,6 +773,7 @@ async fn main() -> Result<()> {
         Command::Run {
             filter,
             pipeline,
+            model,
             governance_override,
             models: models_dir,
             all: run_all,
@@ -820,6 +841,7 @@ async fn main() -> Result<()> {
                 resume_latest,
                 shadow_config.as_ref(),
                 &partition_opts,
+                model.as_deref(),
             );
             tokio::select! {
                 result = run_future => result,
@@ -908,6 +930,19 @@ async fn main() -> Result<()> {
             model.as_deref(),
             json,
             expand_macros,
+        ),
+        Command::Dag {
+            models,
+            seeds,
+            contracts,
+            column_lineage,
+        } => rocky_cli::commands::run_dag(
+            &cli.config,
+            &models,
+            seeds.as_deref(),
+            contracts.as_deref(),
+            column_lineage,
+            json,
         ),
         Command::Lineage {
             target,

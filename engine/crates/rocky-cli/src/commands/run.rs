@@ -207,6 +207,7 @@ pub async fn run(
     resume_latest: bool,
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     partition_opts: &PartitionRunOptions,
+    model_name_filter: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -225,6 +226,71 @@ pub async fn run(
         "failed to load config from {}",
         config_path.display()
     ))?;
+
+    // Model-only execution: skip the entire replication path and execute
+    // just the named model. Dagster uses this for per-asset materialization
+    // when it controls the DAG scheduling.
+    if let Some(target_model) = model_name_filter {
+        let mdir = models_dir.unwrap_or_else(|| Path::new("models"));
+        anyhow::ensure!(
+            mdir.exists(),
+            "models directory '{}' not found (required for --model)",
+            mdir.display()
+        );
+
+        let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+        // Use the first transformation pipeline's target adapter, or fall back
+        // to the first replication pipeline's target adapter.
+        let target_adapter_name = rocky_cfg
+            .pipelines
+            .values()
+            .find_map(|p| match p {
+                rocky_core::config::PipelineConfig::Transformation(t) => {
+                    Some(t.target.adapter.clone())
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                rocky_cfg.pipelines.values().find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Replication(r) => {
+                        Some(r.target.adapter.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "default".to_string());
+
+        let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+        let state_store = rocky_core::state::StateStore::open(state_path).ok();
+        let run_id = format!(
+            "model-{}-{}",
+            target_model,
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let mut output = RunOutput::new(
+            filter.unwrap_or("").to_string(),
+            0, // duration filled at end
+            1, // concurrency
+        );
+
+        execute_models(
+            mdir,
+            warehouse.as_ref(),
+            state_store.as_ref(),
+            partition_opts,
+            &run_id,
+            Some(target_model),
+            &mut output,
+        )
+        .await?;
+
+        output.duration_ms = start.elapsed().as_millis() as u64;
+        if output_json {
+            print_json(&output)?;
+        }
+        return Ok(());
+    }
+
     let (pipeline_name, pipeline_config) =
         registry::resolve_pipeline(&rocky_cfg, pipeline_name_arg)?;
 
@@ -1559,6 +1625,7 @@ pub async fn run(
                 state_store.as_ref(),
                 partition_opts,
                 &run_id,
+                None, // no model filter in replication path
                 &mut output,
             )
             .await?;
@@ -1767,6 +1834,7 @@ pub(crate) async fn execute_models(
     state_store: Option<&StateStore>,
     partition_opts: &PartitionRunOptions,
     run_id: &str,
+    model_name_filter: Option<&str>,
     output: &mut RunOutput,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
@@ -1816,6 +1884,13 @@ pub(crate) async fn execute_models(
 
     for layer in &compile_result.project.layers {
         for model_name in layer {
+            // When a model name filter is active, skip models that don't match.
+            if let Some(target) = model_name_filter {
+                if model_name != target {
+                    continue;
+                }
+            }
+
             let Some(model) = compile_result.project.model(model_name) else {
                 continue;
             };
