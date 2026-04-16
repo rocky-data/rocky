@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-04-16
+
+### Fixed
+
+- Lineage webview no longer fails to load: added `wasm-unsafe-eval` to the
+  webview's Content Security Policy directive (PR #84). The lineage view
+  loads a WASM bundle for column-lineage extraction; without this CSP, the
+  bundle was rejected and the panel rendered blank in production builds.
+
+### Added — `DagRunOutput` TypeScript interface
+
+Regenerated `src/types/generated/dag_run.ts` (via `just codegen`) exposes
+the typed shape of `rocky run --dag --output json` from engine 1.2.0:
+`DagRunOutput` and `DagRunNodeOutput` (per-node id, kind, label, layer,
+status, duration_ms, error). Consumers can now parse the new DAG run
+output without manual typing.
+
+No source code changes in the extension itself for this addition — pure
+binding regeneration to keep the typed surface in sync with the engine.
+
 ## [1.0.1] — 2026-04-14
 
 ### Fixed

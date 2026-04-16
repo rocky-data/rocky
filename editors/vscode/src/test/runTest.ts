@@ -6,7 +6,17 @@ async function main() {
     const extensionDevelopmentPath = path.resolve(__dirname, "../../");
     const extensionTestsPath = path.resolve(__dirname, "./suite/index");
 
+    // Pin a specific VS Code version instead of the default `"stable"`, which
+    // causes @vscode/test-electron to query
+    // `https://update.code.visualstudio.com/api/releases/stable`. That
+    // endpoint rate-limits aggressively (HTTP 429 with a text/html body) and
+    // the response then fails JSON.parse, killing the test run with
+    // "Failed to parse response ... as JSON". Pinning a version skips the
+    // lookup entirely. Override with VSCODE_TEST_VERSION when needed.
+    const version = process.env.VSCODE_TEST_VERSION ?? "1.105.0";
+
     await runTests({
+      version,
       extensionDevelopmentPath,
       extensionTestsPath,
       // Open the extension folder itself as the workspace so APIs that depend
