@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 
 import dagster as dg
 
-from .column_lineage import build_column_lineage
 from .freshness import freshness_policy_from_model
 
 if TYPE_CHECKING:
@@ -35,7 +34,6 @@ if TYPE_CHECKING:
         DagNodeOutput,
         DagResult,
         LineageEdgeRecord,
-        ModelLineageResult,
         OptimizeResult,
     )
 

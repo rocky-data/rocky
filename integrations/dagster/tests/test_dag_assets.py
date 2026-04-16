@@ -5,7 +5,6 @@ from __future__ import annotations
 import dagster as dg
 
 from dagster_rocky.dag_assets import (
-    DagAssetGroup,
     build_dag_specs,
     split_dag_specs_by_group,
 )

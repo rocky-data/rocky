@@ -385,7 +385,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         Falls back to the discover-based flow if the DAG slot is missing
         from the cached state (e.g., first run before ``dag_mode`` was set).
         """
-        from .dag_assets import build_dag_specs, split_dag_specs_by_group
+        from .dag_assets import build_dag_specs
 
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         if "dag" not in raw:

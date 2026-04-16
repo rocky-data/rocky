@@ -246,7 +246,7 @@ fn build_column_lineage_from_models(
 ) -> Result<Vec<LineageEdgeRecord>> {
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: contracts_dir.map(|p| p.to_path_buf()),
+        contracts_dir: contracts_dir.map(Path::to_path_buf),
         source_schemas: std::collections::HashMap::new(),
         source_column_info: std::collections::HashMap::new(),
     };

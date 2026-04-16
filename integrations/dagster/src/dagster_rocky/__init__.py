@@ -164,6 +164,13 @@ __all__ = [
     "discover_contract_rules",
     "contract_check_specs_for_model",
     "contract_check_results_from_diagnostics",
+    # DAG-driven asset builder
+    "DagAssetGroup",
+    "build_dag_specs",
+    "split_dag_specs_by_group",
+    "DagResult",
+    "DagNode",
+    "DagEdge",
     # Derived-model surfacing (Tier 4 / Tier 3 wiring)
     "ModelGroup",
     "build_model_specs",
