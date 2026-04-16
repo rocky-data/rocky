@@ -30,11 +30,13 @@ pub fn validate(config_path: &Path, json: bool) -> Result<()> {
 fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     let mut out = ValidateOutput::new();
 
-    // Parse config (with env var substitution).
-    // load_rocky_config returns ConfigError::FileNotFound for missing
+    // Parse config (with env var substitution) — use the lenient parser
+    // so every `kind`-field issue surfaces as its own V032 / V033
+    // diagnostic instead of the V001 catch-all bailing on the first one.
+    // parse_rocky_config returns ConfigError::FileNotFound for missing
     // files, which the CLI error reporter upgrades to a rich miette
     // diagnostic with `rocky init` / `rocky playground` hints.
-    let cfg = match rocky_core::config::load_rocky_config(config_path) {
+    let cfg = match rocky_core::config::parse_rocky_config(config_path) {
         Ok(cfg) => {
             out.push(ValidateMessage {
                 severity: "ok".into(),
@@ -56,6 +58,13 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             return Ok(out);
         }
     };
+
+    // Emit a structured diagnostic for every adapter-kind / pipeline-role
+    // issue. V032 covers `[adapter.*]` `kind` invariants; V033 covers
+    // `source.adapter` / `source.discovery.adapter` role mismatches.
+    for err in rocky_core::config::validate_adapter_kinds(&cfg) {
+        out.push(kind_diagnostic(&err, config_path));
+    }
 
     // Validate adapters
     if cfg.adapters.is_empty() {
@@ -224,6 +233,36 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     lint_config(&cfg, &loaded_models, &mut out);
 
     Ok(out)
+}
+
+/// Converts a `kind`-validation error into a `ValidateMessage` with a
+/// structured V-code and a `field` path that points an IDE at the
+/// offending key in `rocky.toml`.
+fn kind_diagnostic(err: &rocky_core::config::ConfigError, config_path: &Path) -> ValidateMessage {
+    use rocky_core::config::ConfigError;
+
+    let (code, field) = match err {
+        ConfigError::AdapterMissingDiscoveryKind { name, .. }
+        | ConfigError::AdapterKindUnsupported { name, .. } => {
+            ("V032", Some(format!("adapter.{name}.kind")))
+        }
+        ConfigError::PipelineSourceAdapterNotData { pipeline, .. } => {
+            ("V033", Some(format!("pipeline.{pipeline}.source.adapter")))
+        }
+        ConfigError::PipelineDiscoveryAdapterNotDiscovery { pipeline, .. } => (
+            "V033",
+            Some(format!("pipeline.{pipeline}.source.discovery.adapter")),
+        ),
+        _ => ("V001", None),
+    };
+
+    ValidateMessage {
+        severity: "error".into(),
+        code: code.into(),
+        message: err.to_string(),
+        file: Some(config_path.display().to_string()),
+        field,
+    }
 }
 
 fn validate_adapter(
@@ -903,6 +942,138 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    #[test]
+    fn test_missing_discovery_kind_emits_v032() {
+        let out = validate_toml(
+            r#"
+[adapter.fivetran_main]
+type = "fivetran"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+"#,
+        );
+        let errors: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.severity == "error" && m.code == "V032")
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one V032 diagnostic: {:?}",
+            out.messages
+        );
+        assert!(errors[0].message.contains("discovery-only"));
+        assert_eq!(
+            errors[0].field.as_deref(),
+            Some("adapter.fivetran_main.kind")
+        );
+    }
+
+    #[test]
+    fn test_adapter_kind_mismatch_emits_v032() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "databricks"
+kind = "discovery"
+host = "h"
+http_path = "p"
+token = "t"
+"#,
+        );
+        let errors: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.severity == "error" && m.code == "V032")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("only supports data"));
+    }
+
+    #[test]
+    fn test_pipeline_discovery_to_data_only_emits_v033() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "databricks"
+host = "h"
+http_path = "p"
+token = "t"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "db"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.source.discovery]
+adapter = "db"
+
+[pipeline.poc.target]
+adapter = "db"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let errors: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.severity == "error" && m.code == "V033")
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one V033 diagnostic: {:?}",
+            out.messages
+        );
+        assert_eq!(
+            errors[0].field.as_deref(),
+            Some("pipeline.poc.source.discovery.adapter")
+        );
+    }
+
+    #[test]
+    fn test_multiple_kind_issues_all_surface() {
+        // Two unrelated kind issues in the same file — both should
+        // surface as separate diagnostics instead of bailing on the
+        // first one at parse time.
+        let out = validate_toml(
+            r#"
+[adapter.fivetran_main]
+type = "fivetran"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+
+[adapter.db]
+type = "databricks"
+kind = "discovery"
+host = "h"
+http_path = "p"
+token = "t"
+"#,
+        );
+        let v032: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V032" && m.severity == "error")
+            .collect();
+        assert_eq!(
+            v032.len(),
+            2,
+            "both V032 issues should surface: {:?}",
+            out.messages
+        );
     }
 
     #[test]
