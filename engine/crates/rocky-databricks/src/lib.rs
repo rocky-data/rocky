@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod connector;
 pub mod dialect;
 pub mod governance;
+pub mod loader;
 pub mod permissions;
 pub mod throttle;
 pub mod types;

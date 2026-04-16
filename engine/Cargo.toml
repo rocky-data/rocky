@@ -83,6 +83,11 @@ futures = "0.3"
 # Redis/Valkey
 redis = "1.2"
 
+# Cloud object store (unified S3/GCS/Azure backend for state sync + loaders)
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+bytes = "1"
+url = "2"
+
 # DuckDB
 duckdb = { version = "1", features = ["bundled"] }
 

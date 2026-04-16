@@ -12,6 +12,7 @@ use tracing::warn;
 
 use crate::error_reporter;
 
+use rocky_adapter_sdk::LoaderAdapter;
 use rocky_core::config::{AdapterConfig, RockyConfig};
 use rocky_core::traits::{DiscoveryAdapter, WarehouseAdapter};
 
@@ -339,6 +340,100 @@ impl AdapterRegistry {
     pub fn batch_check_adapter(&self, name: &str) -> Result<DatabricksBatchCheckAdapter> {
         let connector = self.databricks_connector(name)?;
         Ok(DatabricksBatchCheckAdapter::new(connector))
+    }
+
+    /// Build a BigQuery `LoaderAdapter` wrapping the registered warehouse adapter.
+    ///
+    /// Returns an INSERT-fallback loader (CSV-only, small datasets). Production-
+    /// scale loading will require the Storage Write API (deferred).
+    pub fn bigquery_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
+        let adapter_cfg = self
+            .adapter_config(name)
+            .context(format!("no adapter config for '{name}'"))?;
+        if adapter_cfg.adapter_type != "bigquery" {
+            bail!(
+                "adapter '{name}' is type '{}', not 'bigquery'",
+                adapter_cfg.adapter_type
+            );
+        }
+
+        let project_id = adapter_cfg
+            .project_id
+            .as_deref()
+            .context(format!("adapters.{name}: project_id required for bigquery"))?;
+        let location = adapter_cfg.location.as_deref().unwrap_or("US");
+
+        let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
+            .context(format!("adapters.{name}: auth configuration error"))?;
+
+        let adapter =
+            rocky_bigquery::connector::BigQueryAdapter::new(project_id, location, bq_auth)
+                .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300));
+        Ok(Box::new(rocky_bigquery::BigQueryLoaderAdapter::new(
+            Arc::new(adapter),
+        )))
+    }
+
+    /// Build a Databricks `LoaderAdapter` (COPY INTO based).
+    pub fn databricks_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
+        let connector = self.databricks_connector(name)?;
+        Ok(Box::new(
+            rocky_databricks::loader::DatabricksLoaderAdapter::new(connector),
+        ))
+    }
+
+    /// Build a Snowflake `LoaderAdapter` (stage-based COPY INTO).
+    pub fn snowflake_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
+        let adapter_cfg = self
+            .adapter_config(name)
+            .context(format!("no adapter config for '{name}'"))?;
+        if adapter_cfg.adapter_type != "snowflake" {
+            bail!(
+                "adapter '{name}' is type '{}', not 'snowflake'",
+                adapter_cfg.adapter_type
+            );
+        }
+
+        let account = adapter_cfg
+            .account
+            .as_deref()
+            .context(format!("adapters.{name}: account required for snowflake"))?;
+        let sf_warehouse = adapter_cfg
+            .warehouse
+            .as_deref()
+            .context(format!("adapters.{name}: warehouse required for snowflake"))?;
+
+        let sf_auth = rocky_snowflake::auth::Auth::from_config(rocky_snowflake::auth::AuthConfig {
+            account: account.to_string(),
+            username: adapter_cfg.username.clone(),
+            password: adapter_cfg
+                .password
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+            oauth_token: adapter_cfg
+                .oauth_token
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+            private_key_path: adapter_cfg.private_key_path.clone(),
+        })
+        .context(format!("adapters.{name}: auth configuration error"))?;
+
+        let sf_connector = SnowflakeConnector::new(
+            rocky_snowflake::connector::ConnectorConfig {
+                account: account.to_string(),
+                warehouse: sf_warehouse.to_string(),
+                database: adapter_cfg.database.clone(),
+                schema: None,
+                role: adapter_cfg.role.clone(),
+                timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
+                retry: adapter_cfg.retry.clone(),
+            },
+            sf_auth,
+        );
+
+        Ok(Box::new(
+            rocky_snowflake::loader::SnowflakeLoaderAdapter::new(Arc::new(sf_connector)),
+        ))
     }
 }
 

@@ -1,9 +1,4 @@
 /* eslint-disable */
-/**
- * AUTO-GENERATED — do not edit by hand.
- * Source: schemas/dag.schema.json
- * Run just codegen from the monorepo root to regenerate.
- */
 
 /**
  * Materialization strategy for a model, defaulting to full refresh.

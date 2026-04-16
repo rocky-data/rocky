@@ -1783,6 +1783,50 @@ pub struct DagSummaryOutput {
     pub counts_by_kind: HashMap<String, usize>,
 }
 
+/// Output of `rocky run --dag`: per-node execution results plus aggregate counts.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagRunOutput {
+    pub version: String,
+    pub command: String,
+    /// Total nodes across all layers.
+    pub total_nodes: usize,
+    /// Number of execution layers (Kahn topological depth).
+    pub total_layers: usize,
+    /// Nodes that completed successfully.
+    pub completed: usize,
+    /// Nodes whose dispatcher returned an error.
+    pub failed: usize,
+    /// Nodes skipped because an upstream failed (or because the dispatcher
+    /// declined to handle them, e.g. Test nodes).
+    pub skipped: usize,
+    /// Wall-clock duration of the entire DAG execution.
+    pub duration_ms: u64,
+    /// Per-node execution records, sorted by (layer, id).
+    pub nodes: Vec<DagRunNodeOutput>,
+}
+
+/// Per-node record in a [`DagRunOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DagRunNodeOutput {
+    /// Node identifier (e.g. `transformation:stg_orders`).
+    pub id: String,
+    /// Node kind: `source`, `replication`, `transformation`, `quality`,
+    /// `snapshot`, `load`, `seed`, `test`.
+    pub kind: String,
+    /// Human-readable label (usually the pipeline or model name).
+    pub label: String,
+    /// Layer index (0-based; nodes in the same layer ran concurrently).
+    pub layer: usize,
+    /// Status: `pending`, `running`, `completed`, `failed`, `skipped`.
+    pub status: String,
+    /// Wall-clock duration of this node's execution.
+    pub duration_ms: u64,
+    /// Failure reason. Present iff `status = "failed"` (or `"skipped"` due to
+    /// upstream failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Prints output as JSON or formatted table.
 pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(output)?;

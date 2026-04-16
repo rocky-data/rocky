@@ -1,9 +1,4 @@
 /* eslint-disable */
-/**
- * AUTO-GENERATED — do not edit by hand.
- * Source: schemas/ci_diff.schema.json
- * Run just codegen from the monorepo root to regenerate.
- */
 
 /**
  * The kind of change observed for a single column.

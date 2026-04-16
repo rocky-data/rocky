@@ -7,10 +7,12 @@
 //! - **Parquet:** `COPY <target> FROM '<path>' (FORMAT PARQUET)`
 //! - **JSONL:** `CREATE TABLE <target> AS SELECT * FROM read_json_auto('<path>')`
 //!
+//! Cloud URIs (`s3://`, `gs://`) are passed through verbatim — DuckDB's httpfs
+//! extension handles them natively when loaded at runtime.
+//!
 //! All DuckDB calls are synchronous. The adapter wraps them in
 //! [`tokio::task::spawn_blocking`] to avoid blocking the async runtime.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,7 +20,8 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use rocky_adapter_sdk::{
-    AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoaderAdapter, TableRef,
+    AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
+    TableRef,
 };
 
 use crate::DuckDbConnector;
@@ -54,14 +57,11 @@ impl DuckDbLoaderAdapter {
 
 /// Resolve the file format, preferring the explicit option then falling back
 /// to extension-based detection.
-fn resolve_format(path: &Path, options: &LoadOptions) -> AdapterResult<FileFormat> {
+fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<FileFormat> {
     if let Some(fmt) = options.format {
         return Ok(fmt);
     }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
+    let ext = source.extension().unwrap_or_default();
     FileFormat::from_extension(ext).ok_or_else(|| {
         AdapterError::msg(format!(
             "cannot detect file format from extension '{ext}'; set options.format explicitly"
@@ -79,12 +79,26 @@ fn format_target(target: &TableRef) -> String {
     }
 }
 
-/// Build the COPY/read SQL for loading a file into a target table.
+/// Render a [`LoadSource`] as a SQL path string suitable for DuckDB COPY/read
+/// functions. Local paths use `Path::display()`; cloud URIs pass through.
+fn source_path_str(source: &LoadSource) -> String {
+    match source {
+        LoadSource::LocalFile(p) => p.display().to_string(),
+        LoadSource::CloudUri(uri) => uri.clone(),
+    }
+}
+
+/// Build the COPY/read SQL for loading a source into a target table.
 ///
 /// The caller is responsible for handling `create_table` and `truncate_first`
 /// options separately — this function only produces the load statement itself.
-fn load_sql(path: &Path, target_ref: &str, format: FileFormat, options: &LoadOptions) -> String {
-    let path_str = path.display();
+fn load_sql(
+    source: &LoadSource,
+    target_ref: &str,
+    format: FileFormat,
+    options: &LoadOptions,
+) -> String {
+    let path_str = source_path_str(source);
     match format {
         FileFormat::Csv => {
             let header = if options.csv_has_header {
@@ -107,9 +121,9 @@ fn load_sql(path: &Path, target_ref: &str, format: FileFormat, options: &LoadOpt
 }
 
 /// Build a `CREATE TABLE ... AS SELECT` statement that infers the schema from
-/// the file itself, used when `create_table` is true.
-fn create_table_sql(path: &Path, target_ref: &str, format: FileFormat) -> String {
-    let path_str = path.display();
+/// the source itself, used when `create_table` is true.
+fn create_table_sql(source: &LoadSource, target_ref: &str, format: FileFormat) -> String {
+    let path_str = source_path_str(source);
     match format {
         FileFormat::Csv => {
             format!("CREATE TABLE {target_ref} AS SELECT * FROM read_csv_auto('{path_str}')")
@@ -125,17 +139,21 @@ fn create_table_sql(path: &Path, target_ref: &str, format: FileFormat) -> String
 
 #[async_trait]
 impl LoaderAdapter for DuckDbLoaderAdapter {
-    async fn load_file(
+    async fn load(
         &self,
-        path: &Path,
+        source: &LoadSource,
         target: &TableRef,
         options: &LoadOptions,
     ) -> AdapterResult<LoadResult> {
-        let format = resolve_format(path, options)?;
+        let format = resolve_format(source, options)?;
         let target_ref = format_target(target);
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or_default();
+        // Only local files have filesystem metadata; cloud sources report 0.
+        let file_size = match source {
+            LoadSource::LocalFile(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or_default(),
+            LoadSource::CloudUri(_) => 0,
+        };
 
-        let path = path.to_path_buf();
+        let source = source.clone();
         let connector = Arc::clone(&self.connector);
         let create_table = options.create_table;
         let truncate_first = options.truncate_first;
@@ -159,9 +177,9 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                 .unwrap_or(false);
 
             if !table_exists && create_table {
-                // Let DuckDB infer the schema from the file.
-                let sql = create_table_sql(&path, &target_ref, format);
-                debug!(sql = %sql, "creating table from file");
+                // Let DuckDB infer the schema from the source.
+                let sql = create_table_sql(&source, &target_ref, format);
+                debug!(sql = %sql, "creating table from source");
                 conn.execute_statement(&sql).map_err(AdapterError::new)?;
             } else {
                 // Table exists (or we were told not to create it).
@@ -171,8 +189,8 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                     conn.execute_statement(&sql).map_err(AdapterError::new)?;
                 }
 
-                let sql = load_sql(&path, &target_ref, format, &options);
-                debug!(sql = %sql, "loading file into existing table");
+                let sql = load_sql(&source, &target_ref, format, &options);
+                debug!(sql = %sql, "loading source into existing table");
                 conn.execute_statement(&sql).map_err(AdapterError::new)?;
             }
 
@@ -207,6 +225,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
     use tempfile::NamedTempFile;
 
     /// Helper: create an in-memory loader and its shared connector.
@@ -229,6 +248,10 @@ mod tests {
         }
     }
 
+    fn local(path: &Path) -> LoadSource {
+        LoadSource::LocalFile(path.to_path_buf())
+    }
+
     // ------------------------------------------------------------------
     // CSV
     // ------------------------------------------------------------------
@@ -239,7 +262,11 @@ mod tests {
         let file = csv_file("id,name\n1,Alice\n2,Bob\n3,Carol\n");
 
         let result = adapter
-            .load_file(file.path(), &target("people"), &LoadOptions::default())
+            .load(
+                &local(file.path()),
+                &target("people"),
+                &LoadOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -276,7 +303,7 @@ mod tests {
             ..Default::default()
         };
         let result = adapter
-            .load_file(file.path(), &target("items"), &opts)
+            .load(&local(file.path()), &target("items"), &opts)
             .await
             .unwrap();
 
@@ -305,7 +332,7 @@ mod tests {
             ..Default::default()
         };
         let result = adapter
-            .load_file(file.path(), &target("t"), &opts)
+            .load(&local(file.path()), &target("t"), &opts)
             .await
             .unwrap();
 
@@ -325,7 +352,7 @@ mod tests {
             ..Default::default()
         };
         let result = adapter
-            .load_file(f.path(), &target("tab_data"), &opts)
+            .load(&local(f.path()), &target("tab_data"), &opts)
             .await
             .unwrap();
 
@@ -345,7 +372,7 @@ mod tests {
         f.flush().unwrap();
 
         let result = adapter
-            .load_file(f.path(), &target("colors"), &LoadOptions::default())
+            .load(&local(f.path()), &target("colors"), &LoadOptions::default())
             .await
             .unwrap();
 
@@ -361,7 +388,7 @@ mod tests {
         let adapter = loader();
         let f = NamedTempFile::with_suffix(".xlsx").unwrap();
         let result = adapter
-            .load_file(f.path(), &target("x"), &LoadOptions::default())
+            .load(&local(f.path()), &target("x"), &LoadOptions::default())
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -381,7 +408,7 @@ mod tests {
             ..Default::default()
         };
         let result = adapter
-            .load_file(f.path(), &target("txt_as_csv"), &opts)
+            .load(&local(f.path()), &target("txt_as_csv"), &opts)
             .await
             .unwrap();
 
@@ -407,30 +434,39 @@ mod tests {
 
     #[test]
     fn test_resolve_format_csv() {
-        let p = Path::new("/tmp/data.csv");
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
         assert_eq!(
-            resolve_format(p, &LoadOptions::default()).unwrap(),
+            resolve_format(&src, &LoadOptions::default()).unwrap(),
             FileFormat::Csv
         );
     }
 
     #[test]
     fn test_resolve_format_parquet() {
-        let p = Path::new("/tmp/data.parquet");
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.parquet"));
         assert_eq!(
-            resolve_format(p, &LoadOptions::default()).unwrap(),
+            resolve_format(&src, &LoadOptions::default()).unwrap(),
             FileFormat::Parquet
         );
     }
 
     #[test]
     fn test_resolve_format_explicit_wins() {
-        let p = Path::new("/tmp/data.csv");
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
         let opts = LoadOptions {
             format: Some(FileFormat::JsonLines),
             ..Default::default()
         };
-        assert_eq!(resolve_format(p, &opts).unwrap(), FileFormat::JsonLines);
+        assert_eq!(resolve_format(&src, &opts).unwrap(), FileFormat::JsonLines);
+    }
+
+    #[test]
+    fn test_resolve_format_cloud_uri() {
+        let src = LoadSource::CloudUri("s3://bucket/data.parquet".into());
+        assert_eq!(
+            resolve_format(&src, &LoadOptions::default()).unwrap(),
+            FileFormat::Parquet
+        );
     }
 
     #[test]
@@ -455,12 +491,8 @@ mod tests {
 
     #[test]
     fn test_load_sql_csv() {
-        let sql = load_sql(
-            Path::new("/tmp/data.csv"),
-            "main.t",
-            FileFormat::Csv,
-            &LoadOptions::default(),
-        );
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
+        let sql = load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default());
         assert!(sql.contains("COPY main.t FROM '/tmp/data.csv'"));
         assert!(sql.contains("HEADER"));
         assert!(sql.contains("DELIMITER ','"));
@@ -468,19 +500,16 @@ mod tests {
 
     #[test]
     fn test_load_sql_parquet() {
-        let sql = load_sql(
-            Path::new("/tmp/data.parquet"),
-            "main.t",
-            FileFormat::Parquet,
-            &LoadOptions::default(),
-        );
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.parquet"));
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
         assert_eq!(sql, "COPY main.t FROM '/tmp/data.parquet' (FORMAT PARQUET)");
     }
 
     #[test]
     fn test_load_sql_jsonl() {
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.jsonl"));
         let sql = load_sql(
-            Path::new("/tmp/data.jsonl"),
+            &src,
             "main.t",
             FileFormat::JsonLines,
             &LoadOptions::default(),
@@ -490,20 +519,45 @@ mod tests {
     }
 
     #[test]
+    fn test_load_sql_cloud_uri() {
+        let src = LoadSource::CloudUri("s3://bucket/data.parquet".into());
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
+        assert_eq!(
+            sql,
+            "COPY main.t FROM 's3://bucket/data.parquet' (FORMAT PARQUET)"
+        );
+    }
+
+    #[test]
     fn test_create_table_sql_csv() {
-        let sql = create_table_sql(Path::new("/tmp/d.csv"), "main.t", FileFormat::Csv);
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.csv"));
+        let sql = create_table_sql(&src, "main.t", FileFormat::Csv);
         assert!(sql.contains("CREATE TABLE main.t AS SELECT * FROM read_csv_auto"));
     }
 
     #[test]
     fn test_create_table_sql_parquet() {
-        let sql = create_table_sql(Path::new("/tmp/d.parquet"), "main.t", FileFormat::Parquet);
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.parquet"));
+        let sql = create_table_sql(&src, "main.t", FileFormat::Parquet);
         assert!(sql.contains("read_parquet"));
     }
 
     #[test]
     fn test_create_table_sql_jsonl() {
-        let sql = create_table_sql(Path::new("/tmp/d.jsonl"), "main.t", FileFormat::JsonLines);
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.jsonl"));
+        let sql = create_table_sql(&src, "main.t", FileFormat::JsonLines);
         assert!(sql.contains("read_json_auto"));
+    }
+
+    #[test]
+    fn test_source_path_str_local() {
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
+        assert_eq!(source_path_str(&src), "/tmp/data.csv");
+    }
+
+    #[test]
+    fn test_source_path_str_cloud() {
+        let src = LoadSource::CloudUri("s3://bucket/data.csv".into());
+        assert_eq!(source_path_str(&src), "s3://bucket/data.csv");
     }
 }

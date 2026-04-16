@@ -17,4 +17,6 @@ pub mod auth;
 pub mod connector;
 pub mod dialect;
 pub mod governance;
+pub mod loader;
+pub mod stage;
 pub mod types;

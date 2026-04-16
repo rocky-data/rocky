@@ -206,6 +206,12 @@ enum Command {
         /// parallelism only — state writes serialize through redb.
         #[arg(long, default_value = "1")]
         parallel: u32,
+
+        /// Run all pipelines as a unified DAG, in dependency order.
+        /// Each pipeline is a node; cross-pipeline `depends_on` edges define
+        /// execution order. Layers run in parallel.
+        #[arg(long)]
+        dag: bool,
     },
 
     /// Compare shadow tables against production tables
@@ -789,6 +795,7 @@ async fn main() -> Result<()> {
             missing,
             lookback,
             parallel,
+            dag,
         } => {
             // Parse governance override (JSON string or @file.json)
             let gov_override = match governance_override {
@@ -828,26 +835,37 @@ async fn main() -> Result<()> {
                 parallel,
             };
 
-            let run_future = rocky_cli::commands::run(
-                &cli.config,
-                filter.as_deref(),
-                pipeline.as_deref(),
-                &cli.state_path,
-                gov_override.as_ref(),
-                json,
-                models_dir.as_deref(),
-                run_all,
-                resume.as_deref(),
-                resume_latest,
-                shadow_config.as_ref(),
-                &partition_opts,
-                model.as_deref(),
-            );
-            tokio::select! {
-                result = run_future => result,
-                _ = shutdown_signal() => {
-                    warn!("received shutdown signal, aborting run");
-                    anyhow::bail!("interrupted by shutdown signal")
+            if dag {
+                let run_future = rocky_cli::commands::run_with_dag(&cli.config, json);
+                tokio::select! {
+                    result = run_future => result,
+                    _ = shutdown_signal() => {
+                        warn!("received shutdown signal, aborting DAG run");
+                        anyhow::bail!("interrupted by shutdown signal")
+                    }
+                }
+            } else {
+                let run_future = rocky_cli::commands::run(
+                    &cli.config,
+                    filter.as_deref(),
+                    pipeline.as_deref(),
+                    &cli.state_path,
+                    gov_override.as_ref(),
+                    json,
+                    models_dir.as_deref(),
+                    run_all,
+                    resume.as_deref(),
+                    resume_latest,
+                    shadow_config.as_ref(),
+                    &partition_opts,
+                    model.as_deref(),
+                );
+                tokio::select! {
+                    result = run_future => result,
+                    _ = shutdown_signal() => {
+                        warn!("received shutdown signal, aborting run");
+                        anyhow::bail!("interrupted by shutdown signal")
+                    }
                 }
             }
         }

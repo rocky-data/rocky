@@ -10,6 +10,7 @@
 //! GET  /api/v1/compile                         → full compile result
 //! GET  /api/v1/dag                             → full DAG
 //! GET  /api/v1/dag/layers                      → execution layers
+//! GET  /api/v1/dag/status                      → latest DAG run status
 //! POST /api/v1/compile                         → trigger recompilation
 //! ```
 
@@ -42,8 +43,23 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/compile", post(trigger_compile))
         .route("/api/v1/dag", get(full_dag))
         .route("/api/v1/dag/layers", get(dag_layers))
+        .route("/api/v1/dag/status", get(dag_status))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// `GET /api/v1/dag/status` — latest DAG execution status.
+///
+/// Returns 503 Service Unavailable when no DAG run has been recorded yet.
+/// Otherwise the body matches the [`DagStatus`][rocky_core::dag_status::DagStatus]
+/// struct (completed_at + the full DagExecutionResult).
+async fn dag_status(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.dag_status.get().await {
+        Some(status) => Ok(Json(serde_json::json!(status))),
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 /// Start the HTTP server.
@@ -332,6 +348,7 @@ mod tests {
             contracts_dir: None,
             config_path: None,
             compile_result: tokio::sync::RwLock::new(None),
+            dag_status: rocky_core::dag_status::DagStatusStore::new(),
         })
     }
 

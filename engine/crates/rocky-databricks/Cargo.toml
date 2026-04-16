@@ -10,6 +10,7 @@ rust-version.workspace = true
 rocky-core = { path = "../rocky-core" }
 rocky-observe = { path = "../rocky-observe" }
 rocky-sql = { path = "../rocky-sql" }
+rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

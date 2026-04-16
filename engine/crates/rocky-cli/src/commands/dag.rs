@@ -278,7 +278,7 @@ fn build_column_lineage_from_models(
 /// Duplicated from `list.rs` — both commands need the same recursive
 /// model loading. A shared helper would be ideal but this keeps the
 /// diff contained for now.
-fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
+pub(super) fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
     let mut all = rocky_core::models::load_models_from_dir(models_dir).context(format!(
         "failed to load models from {}",
         models_dir.display()

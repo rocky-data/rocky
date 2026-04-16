@@ -7,6 +7,8 @@ pub mod auth;
 pub mod connector;
 pub mod dialect;
 pub mod governance;
+pub mod loader;
 
 pub use connector::BigQueryAdapter;
 pub use dialect::BigQueryDialect;
+pub use loader::BigQueryLoaderAdapter;

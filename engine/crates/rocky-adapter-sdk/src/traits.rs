@@ -509,27 +509,80 @@ pub struct LoadResult {
     pub duration_ms: u64,
 }
 
+/// Where data to be loaded resides.
+///
+/// Local files use [`LocalFile`](Self::LocalFile); cloud storage URIs
+/// (e.g. `s3://bucket/path`, `gs://bucket/path`) use
+/// [`CloudUri`](Self::CloudUri).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadSource {
+    /// A file on the local filesystem.
+    LocalFile(std::path::PathBuf),
+    /// A URI pointing to a file in cloud storage (S3, GCS, ADLS).
+    CloudUri(String),
+}
+
+impl LoadSource {
+    /// Returns the file extension (without leading dot), if detectable.
+    pub fn extension(&self) -> Option<&str> {
+        match self {
+            Self::LocalFile(p) => p.extension().and_then(|e| e.to_str()),
+            Self::CloudUri(uri) => {
+                let path = uri.rsplit('/').next().unwrap_or("");
+                path.rsplit('.')
+                    .next()
+                    .filter(|e| !e.is_empty() && *e != path)
+            }
+        }
+    }
+
+    /// Returns a display-friendly string for logging and output.
+    pub fn display_path(&self) -> String {
+        match self {
+            Self::LocalFile(p) => p.display().to_string(),
+            Self::CloudUri(uri) => uri.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for LoadSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalFile(p) => write!(f, "{}", p.display()),
+            Self::CloudUri(uri) => write!(f, "{uri}"),
+        }
+    }
+}
+
+/// Returns `true` if `s` starts with a recognized cloud storage URI scheme.
+pub fn is_cloud_uri(s: &str) -> bool {
+    s.starts_with("s3://")
+        || s.starts_with("s3a://")
+        || s.starts_with("gs://")
+        || s.starts_with("az://")
+        || s.starts_with("abfs://")
+        || s.starts_with("abfss://")
+}
+
 /// Load data from files into a warehouse table.
 ///
-/// This trait enables the `load` pipeline type, which ingests local files
+/// This trait enables the `load` pipeline type, which ingests files
 /// (CSV, Parquet, JSONL) into warehouse tables. Adapters that support file
 /// loading implement this trait alongside [`WarehouseAdapter`].
 ///
-/// File parsing is the caller's responsibility; the adapter receives typed
-/// rows or raw file paths depending on the warehouse's native bulk-load
-/// capabilities.
+/// Sources can be local files or cloud storage URIs — see [`LoadSource`].
 #[async_trait]
 pub trait LoaderAdapter: Send + Sync {
-    /// Load a single file into a target table.
+    /// Load a single source into a target table.
     ///
     /// The adapter should:
     /// 1. Detect or use the explicit format from `options.format`
     /// 2. Optionally create the target table if `options.create_table` is true
     /// 3. Optionally truncate the target table if `options.truncate_first` is true
-    /// 4. Read the file and insert rows in batches of `options.batch_size`
-    async fn load_file(
+    /// 4. Read the source and insert rows in batches of `options.batch_size`
+    async fn load(
         &self,
-        path: &std::path::Path,
+        source: &LoadSource,
         target: &TableRef,
         options: &LoadOptions,
     ) -> AdapterResult<LoadResult>;
@@ -692,5 +745,47 @@ mod tests {
         assert_eq!(deserialized.rows_loaded, 42_000);
         assert_eq!(deserialized.bytes_read, 1_024_000);
         assert_eq!(deserialized.duration_ms, 3500);
+    }
+
+    // --- LoadSource tests ---
+
+    #[test]
+    fn test_load_source_local_file_extension() {
+        let src = LoadSource::LocalFile(std::path::PathBuf::from("/tmp/data.csv"));
+        assert_eq!(src.extension(), Some("csv"));
+    }
+
+    #[test]
+    fn test_load_source_cloud_uri_extension() {
+        let src = LoadSource::CloudUri("s3://bucket/path/file.parquet".into());
+        assert_eq!(src.extension(), Some("parquet"));
+    }
+
+    #[test]
+    fn test_load_source_cloud_uri_no_extension() {
+        let src = LoadSource::CloudUri("s3://bucket/path/file".into());
+        assert_eq!(src.extension(), None);
+    }
+
+    #[test]
+    fn test_load_source_display() {
+        let local = LoadSource::LocalFile(std::path::PathBuf::from("/tmp/data.csv"));
+        assert_eq!(local.to_string(), "/tmp/data.csv");
+
+        let cloud = LoadSource::CloudUri("s3://bucket/data.csv".into());
+        assert_eq!(cloud.to_string(), "s3://bucket/data.csv");
+    }
+
+    #[test]
+    fn test_is_cloud_uri() {
+        assert!(is_cloud_uri("s3://bucket/key"));
+        assert!(is_cloud_uri("s3a://bucket/key"));
+        assert!(is_cloud_uri("gs://bucket/key"));
+        assert!(is_cloud_uri("az://container/blob"));
+        assert!(is_cloud_uri("abfs://container@account/path"));
+        assert!(is_cloud_uri("abfss://container@account/path"));
+        assert!(!is_cloud_uri("/local/path"));
+        assert!(!is_cloud_uri("relative/path"));
+        assert!(!is_cloud_uri("http://example.com"));
     }
 }
