@@ -396,6 +396,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             return self.build_defs_from_state(context, state_path)
 
         dag_result = DagResult.model_validate(raw["dag"])
+        discover_result = DiscoverResult.model_validate(raw["discover"])
         translator = self._get_translator()
         rocky = self._get_rocky_resource()
 
@@ -403,6 +404,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             dag_result,
             rocky=rocky,
             translator=translator,
+            discover_result=discover_result,
         )
 
         return dg.Definitions(

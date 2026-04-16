@@ -409,6 +409,7 @@ class RockyResource(dg.ConfigurableResource):
         filter: str,
         governance_override: dict | None = None,
         *,
+        pipeline: str | None = None,
         run_models: bool = False,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -455,6 +456,7 @@ class RockyResource(dg.ConfigurableResource):
         args = self._build_run_args(
             filter,
             governance_override=governance_override,
+            pipeline=pipeline,
             run_models=run_models,
             partition=partition,
             partition_from=partition_from,
@@ -547,6 +549,7 @@ class RockyResource(dg.ConfigurableResource):
         filter: str,
         *,
         governance_override: dict | None,
+        pipeline: str | None = None,
         run_models: bool,
         partition: str | None,
         partition_from: str | None,
@@ -567,6 +570,8 @@ class RockyResource(dg.ConfigurableResource):
         multiple selection flags are passed simultaneously.
         """
         args = ["run", "--filter", filter]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
         if governance_override:
             args.extend(["--governance-override", json.dumps(governance_override)])
         if run_models:

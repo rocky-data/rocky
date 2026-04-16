@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import dagster as dg
@@ -10,8 +11,6 @@ from .types import ModelDetail, SourceInfo, TableInfo
 
 if TYPE_CHECKING:
     from .types import DagNodeOutput
-
-import re
 
 _INVALID_CHARS = re.compile(r"[^A-Za-z0-9_]")
 

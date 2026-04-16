@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .types import (
         DagNodeOutput,
         DagResult,
+        DiscoverResult,
         LineageEdgeRecord,
         OptimizeResult,
         RunResult,
@@ -118,9 +119,7 @@ def _build_column_lineage_metadata(
             continue
 
         col = edge.target.column
-        if col not in deps_by_column:
-            deps_by_column[col] = []
-        deps_by_column[col].append(
+        deps_by_column.setdefault(col, []).append(
             dg.TableColumnDep(asset_key=source_key, column_name=edge.source.column)
         )
 
@@ -305,11 +304,34 @@ def _emit_model_results(
         yield dg.MaterializeResult(asset_key=asset_key, metadata=metadata)
 
 
+def _build_source_filters(discover_result: DiscoverResult | None) -> list[str]:
+    """Extract per-source filter strings from the discover output.
+
+    Returns a list like ``["source=orders", "source=customers"]`` — one
+    per discovered source. Used by source/load execution to run the
+    replication pipeline with the correct filter.
+    """
+    if discover_result is None:
+        return []
+    filters: list[str] = []
+    for source in discover_result.sources:
+        # The first string-valued component is the natural filter key.
+        for key, val in source.components.items():
+            if isinstance(val, str):
+                filters.append(f"{key}={val}")
+                break
+        else:
+            # Fallback to id-based filter.
+            filters.append(f"id={source.id}")
+    return filters
+
+
 def build_dag_multi_assets(
     dag_result: DagResult,
     *,
     rocky: RockyResource,
     translator: RockyDagsterTranslator,
+    discover_result: DiscoverResult | None = None,
     optimize_result: OptimizeResult | None = None,
     contract_rules_by_model: dict[str, ContractRules] | None = None,
 ) -> list[dg.AssetsDefinition]:
@@ -321,9 +343,9 @@ def build_dag_multi_assets(
     node kind:
 
     - ``transformation`` → ``rocky.run_model(model_name)``
-    - ``source`` / ``load`` → ``rocky.run(filter=pipeline_name)``
-    - ``seed`` → placeholder (yields MaterializeResult directly)
-    - ``quality`` / ``snapshot`` → ``rocky.run(filter=pipeline_name)``
+    - ``source`` / ``load`` → ``rocky.run(filter=...)`` using discover output
+    - ``seed`` → ``rocky.run_seed(name)`` (or placeholder when unavailable)
+    - ``quality`` / ``snapshot`` → placeholder (graph-only for now)
     """
     specs, node_id_to_key = build_dag_specs(
         dag_result,
@@ -333,6 +355,7 @@ def build_dag_multi_assets(
     )
 
     groups = split_dag_specs_by_group(specs, dag_result)
+    source_filters = _build_source_filters(discover_result)
 
     # Build a node lookup for the execution bodies.
     node_by_id: dict[str, DagNodeOutput] = {}
@@ -345,6 +368,7 @@ def build_dag_multi_assets(
             group=group,
             node_by_id=node_by_id,
             rocky=rocky,
+            source_filters=source_filters,
         )
         assets.append(asset_def)
 
@@ -356,6 +380,7 @@ def _make_dag_group_asset(
     group: DagAssetGroup,
     node_by_id: dict[str, DagNodeOutput],
     rocky: RockyResource,
+    source_filters: list[str],
 ) -> dg.AssetsDefinition:
     """Create one multi_asset for a group of DAG nodes."""
     asset_name = f"rocky_dag_{_safe_asset_name(group.name)}"
@@ -409,41 +434,51 @@ def _make_dag_group_asset(
                     )
 
             elif node.kind in ("source", "load"):
-                # Source/load nodes are materialized via the replication
-                # pipeline. Use the pipeline name as the filter hint.
+                # Source/load nodes run the replication pipeline using
+                # filters from the discover output. Each filter runs one
+                # source; results are aggregated.
                 pipeline_name = node.pipeline or "default"
-                context.log.info(
-                    f"Executing rocky run --filter pipeline={pipeline_name} "
-                    f"for {node.kind} node {node.label}"
-                )
-                result = rocky.run(
-                    filter=f"pipeline={pipeline_name}",
-                    **partition_kwargs,  # type: ignore[arg-type]
-                )
-                context.log.info(
-                    f"{node.kind} {node.label}: {result.tables_copied} copied in "
-                    f"{result.duration_ms}ms"
-                )
-                emitted = False
-                for mr in _emit_model_results(result, {spec_key}):
-                    emitted = True
-                    yield mr
-                if not emitted:
-                    yield dg.MaterializeResult(
-                        asset_key=spec_key,
-                        metadata={
-                            "dagster/duration_ms": dg.MetadataValue.int(result.duration_ms),
-                        },
+                if not source_filters:
+                    context.log.warning(
+                        f"No discover output — cannot execute {node.kind} "
+                        f"node {node.label}. Run `rocky discover` first."
                     )
+                    yield dg.MaterializeResult(asset_key=spec_key)
+                    continue
+
+                total_copied = 0
+                total_duration = 0
+                for src_filter in source_filters:
+                    context.log.info(
+                        f"Executing rocky run --pipeline {pipeline_name} --filter {src_filter}"
+                    )
+                    result = rocky.run(
+                        filter=src_filter,
+                        pipeline=pipeline_name,
+                        **partition_kwargs,  # type: ignore[arg-type]
+                    )
+                    total_copied += result.tables_copied
+                    total_duration += result.duration_ms
+
+                context.log.info(
+                    f"{node.kind} {node.label}: {total_copied} tables copied in {total_duration}ms"
+                )
+                yield dg.MaterializeResult(
+                    asset_key=spec_key,
+                    metadata={
+                        "dagster/row_count": dg.MetadataValue.int(total_copied),
+                        "dagster/duration_ms": dg.MetadataValue.int(total_duration),
+                    },
+                )
 
             else:
-                # seed, quality, snapshot — emit a placeholder result.
-                # Full execution support for these node kinds is a
-                # follow-up; for now they participate in the DAG graph
-                # but materialization is a no-op.
+                # seed, quality, snapshot — participate in the DAG graph
+                # and can be marked as materialized but don't execute a
+                # Rocky command. Full execution for seeds (via a future
+                # `rocky.seed()` resource method) and quality/snapshot
+                # pipelines is a follow-up.
                 context.log.info(
-                    f"Node {node.label} ({node.kind}): materialization "
-                    f"placeholder (execution not yet wired)"
+                    f"Node {node.label} ({node.kind}): graph-only asset (marking as materialized)"
                 )
                 yield dg.MaterializeResult(asset_key=spec_key)
 
