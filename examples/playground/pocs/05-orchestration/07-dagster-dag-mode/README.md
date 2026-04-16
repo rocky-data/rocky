@@ -19,7 +19,11 @@ Demonstrates `dag_mode=True` on `RockyComponent`: Rocky reports the full unified
 ```
 .
 ├── README.md              this file
-├── definitions.py         Dagster code location (< 10 lines)
+├── pyproject.toml         Dagster project config (deps + [tool.dg])
+├── src/rocky_dag_mode_poc/
+│   ├── definitions.py    Loads components via load_from_defs_folder
+│   └── defs/rocky/
+│       └── defs.yaml     RockyComponent with dag_mode: true
 ├── rocky.toml             Pipeline config: ingest (replication) + transform
 ├── run.sh                 Seeds data, runs pipeline, prints DAG
 ├── data/
@@ -36,8 +40,7 @@ Demonstrates `dag_mode=True` on `RockyComponent`: Rocky reports the full unified
 
 - `rocky` on PATH (>= 1.1.0)
 - `duckdb` CLI for seeding (`brew install duckdb`)
-- `dagster-rocky` >= 1.2.0 (for `dag_mode`)
-- `dagster` >= 1.13.0
+- `uv` for dependency management
 
 ## Run
 
@@ -45,8 +48,8 @@ Demonstrates `dag_mode=True` on `RockyComponent`: Rocky reports the full unified
 # Verify the DAG structure
 ./run.sh
 
-# Launch Dagster UI
-uv run dg dev
+# Install deps + launch Dagster UI
+uv sync && uv run dg dev
 ```
 
 Open http://localhost:3000 and verify:

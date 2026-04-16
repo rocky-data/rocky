@@ -320,8 +320,23 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         """
         rocky = self._get_rocky_resource()
 
+        try:
+            discover_payload = json.loads(
+                rocky.discover().model_dump_json()
+            )
+        except dg.Failure:
+            # Discover can fail on multi-pipeline configs without a pipeline
+            # arg, or when no replication pipeline exists. In dag_mode the
+            # DAG output is the primary data source, so an empty discover
+            # envelope is acceptable.
+            discover_payload = {
+                "version": "0.0.0",
+                "command": "discover",
+                "sources": [],
+            }
+
         state: dict = {
-            "discover": json.loads(rocky.discover().model_dump_json()),
+            "discover": discover_payload,
         }
 
         compile_payload = self._compile_payload(rocky)
