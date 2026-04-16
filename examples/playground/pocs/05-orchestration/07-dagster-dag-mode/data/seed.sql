@@ -3,6 +3,8 @@
 -- and the transformation models aggregate.
 
 CREATE SCHEMA IF NOT EXISTS raw__orders;
+CREATE SCHEMA IF NOT EXISTS poc.staging;
+CREATE SCHEMA IF NOT EXISTS poc.gold;
 
 CREATE OR REPLACE TABLE raw__orders.orders AS
 SELECT
