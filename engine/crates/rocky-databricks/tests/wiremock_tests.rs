@@ -4,12 +4,15 @@
 //! verifying correct behavior for happy paths, auth failures, retries,
 //! and malformed responses.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter, TableRef};
 use rocky_core::config::RetryConfig;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, ConnectorError, DatabricksConnector};
-use wiremock::matchers::{header, method, path};
+use rocky_databricks::loader::DatabricksLoaderAdapter;
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Creates a PAT-authenticated connector pointing at the given wiremock server.
@@ -416,6 +419,97 @@ async fn test_empty_result_set() {
     assert_eq!(result.columns.len(), 1);
     assert!(result.rows.is_empty());
     assert_eq!(result.total_row_count, Some(0));
+}
+
+/// End-to-end: `DatabricksLoaderAdapter::load` parses `num_affected_rows`
+/// from the COPY INTO response and surfaces it as `LoadResult.rows_loaded`.
+#[tokio::test]
+async fn test_loader_surfaces_num_affected_rows() {
+    let server = MockServer::start().await;
+
+    // Mock COPY INTO response: a single-row result set whose first column is
+    // `num_affected_rows`. This matches Databricks' observed REST shape for
+    // DML statements (including COPY INTO).
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-copy-001",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "num_affected_rows", "type_name": "LONG", "position": 0},
+                        {"name": "num_inserted_rows", "type_name": "LONG", "position": 1}
+                    ]
+                },
+                "total_row_count": 1
+            },
+            "result": {
+                "data_array": [["1234", "1234"]]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector);
+
+    let source = LoadSource::CloudUri("s3://bucket/users.csv".into());
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "users".into(),
+    };
+
+    let result = loader
+        .load(&source, &target, &LoadOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.rows_loaded, 1234,
+        "loader should surface num_affected_rows from COPY INTO"
+    );
+}
+
+/// Loader degrades gracefully when `num_affected_rows` isn't in the response:
+/// the load still succeeds with `rows_loaded = 0` rather than erroring.
+#[tokio::test]
+async fn test_loader_missing_num_affected_rows() {
+    let server = MockServer::start().await;
+
+    // No manifest / no results — older API shapes or unexpected responses.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-copy-002",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector);
+
+    let source = LoadSource::CloudUri("s3://bucket/users.csv".into());
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "users".into(),
+    };
+
+    let result = loader
+        .load(&source, &target, &LoadOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows_loaded, 0);
 }
 
 /// Bearer token is sent correctly in the Authorization header.
