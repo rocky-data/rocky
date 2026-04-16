@@ -11,6 +11,7 @@ pub mod contracts;
 pub mod cost;
 pub mod cross_engine;
 pub mod dag;
+pub mod dag_executor;
 pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;

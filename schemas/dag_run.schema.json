@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DagRunNodeOutput": {
+      "description": "Per-node record in a [`DagRunOutput`].",
+      "properties": {
+        "duration_ms": {
+          "description": "Wall-clock duration of this node's execution.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "Failure reason. Present iff `status = \"failed\"` (or `\"skipped\"` due to upstream failure).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Node identifier (e.g. `transformation:stg_orders`).",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Node kind: `source`, `replication`, `transformation`, `quality`, `snapshot`, `load`, `seed`, `test`.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human-readable label (usually the pipeline or model name).",
+          "type": "string"
+        },
+        "layer": {
+          "description": "Layer index (0-based; nodes in the same layer ran concurrently).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "description": "Status: `pending`, `running`, `completed`, `failed`, `skipped`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "id",
+        "kind",
+        "label",
+        "layer",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Output of `rocky run --dag`: per-node execution results plus aggregate counts.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "completed": {
+      "description": "Nodes that completed successfully.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "duration_ms": {
+      "description": "Wall-clock duration of the entire DAG execution.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "failed": {
+      "description": "Nodes whose dispatcher returned an error.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "nodes": {
+      "description": "Per-node execution records, sorted by (layer, id).",
+      "items": {
+        "$ref": "#/definitions/DagRunNodeOutput"
+      },
+      "type": "array"
+    },
+    "skipped": {
+      "description": "Nodes skipped because an upstream failed (or because the dispatcher declined to handle them, e.g. Test nodes).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total_layers": {
+      "description": "Number of execution layers (Kahn topological depth).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "total_nodes": {
+      "description": "Total nodes across all layers.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "completed",
+    "duration_ms",
+    "failed",
+    "nodes",
+    "skipped",
+    "total_layers",
+    "total_nodes",
+    "version"
+  ],
+  "title": "DagRunOutput",
+  "type": "object"
+}

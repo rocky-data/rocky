@@ -1,9 +1,4 @@
 /* eslint-disable */
-/**
- * AUTO-GENERATED — do not edit by hand.
- * Source: schemas/column_lineage.schema.json
- * Run just codegen from the monorepo root to regenerate.
- */
 
 /**
  * JSON output for `rocky lineage <model> --column <col>`.
