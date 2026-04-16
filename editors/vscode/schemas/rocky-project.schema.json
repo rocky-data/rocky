@@ -102,6 +102,11 @@
           "enum": ["databricks", "fivetran", "duckdb", "snowflake"],
           "description": "Adapter type"
         },
+        "kind": {
+          "type": "string",
+          "enum": ["data", "discovery"],
+          "description": "Role this adapter block plays: 'data' for warehouse read/write, 'discovery' for metadata-only connector enumeration. Required on discovery-only adapter types (fivetran, airbyte, iceberg, manual). Optional for warehouse types (defaults to 'data') and for dual-role DuckDB (absent means both)."
+        },
         "host": {
           "type": "string",
           "description": "Databricks workspace host (e.g., 'adb-1234567890.12.azuredatabricks.net')"

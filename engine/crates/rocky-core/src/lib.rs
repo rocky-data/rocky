@@ -1,4 +1,5 @@
 pub mod access;
+pub mod adapter_capability;
 pub mod arrow_loader;
 pub mod bridge;
 pub mod catalog;
