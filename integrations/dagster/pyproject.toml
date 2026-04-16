@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.2.5"
+version = "1.2.6"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.6] — 2026-04-16
+
+### Added — `DagRunOutput` Pydantic model
+
+Regenerated bindings (via `just codegen`) include the new
+`dagster_rocky.types_generated.dag_run_schema.DagRunOutput` and
+`DagRunNodeOutput` Pydantic models, picked up from engine 1.2.0's
+`rocky run --dag` output. Dagster consumers can now `model_validate_json`
+on the output of `rocky run --dag --output json` to get typed per-node
+execution results (id, kind, label, layer, status, duration_ms, error).
+
+No source code changes in `dagster_rocky` itself — pure binding
+regeneration to keep the typed surface in sync with the engine.
+
+## [Unreleased pre-1.2.6]
+
 ### v0.4 — First-class Dagster integration
 
 dagster-rocky 0.4 closes most of the meaningful gaps between dagster-rocky and a "first-class
