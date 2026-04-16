@@ -575,10 +575,8 @@ create_table = true
         };
 
         // Load the file.
-        let result = loader
-            .load_file(&csv_path, &target, &options)
-            .await
-            .unwrap();
+        let source = rocky_adapter_sdk::LoadSource::LocalFile(csv_path.clone());
+        let result = loader.load(&source, &target, &options).await.unwrap();
 
         assert_eq!(result.rows_loaded, 3);
         assert!(result.bytes_read > 0);

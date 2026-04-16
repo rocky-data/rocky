@@ -395,22 +395,31 @@ impl AdapterRegistry {
             .account
             .as_deref()
             .context(format!("adapters.{name}: account required for snowflake"))?;
-        let warehouse = adapter_cfg
+        let sf_warehouse = adapter_cfg
             .warehouse
             .as_deref()
             .context(format!("adapters.{name}: warehouse required for snowflake"))?;
-        let database = adapter_cfg
-            .database
-            .as_deref()
-            .context(format!("adapters.{name}: database required for snowflake"))?;
 
-        let sf_auth = rocky_snowflake::auth::SnowflakeAuth::from_config(adapter_cfg)
-            .context(format!("adapters.{name}: auth configuration error"))?;
+        let sf_auth = rocky_snowflake::auth::Auth::from_config(rocky_snowflake::auth::AuthConfig {
+            account: account.to_string(),
+            username: adapter_cfg.username.clone(),
+            password: adapter_cfg
+                .password
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+            oauth_token: adapter_cfg
+                .oauth_token
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+            private_key_path: adapter_cfg.private_key_path.clone(),
+        })
+        .context(format!("adapters.{name}: auth configuration error"))?;
+
         let sf_connector = SnowflakeConnector::new(
-            rocky_snowflake::connector::SnowflakeConnectorConfig {
+            rocky_snowflake::connector::ConnectorConfig {
                 account: account.to_string(),
-                warehouse: warehouse.to_string(),
-                database: database.to_string(),
+                warehouse: sf_warehouse.to_string(),
+                database: adapter_cfg.database.clone(),
                 schema: None,
                 role: adapter_cfg.role.clone(),
                 timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
@@ -419,9 +428,9 @@ impl AdapterRegistry {
             sf_auth,
         );
 
-        Ok(Box::new(rocky_snowflake::loader::SnowflakeLoaderAdapter::new(
-            Arc::new(sf_connector),
-        )))
+        Ok(Box::new(
+            rocky_snowflake::loader::SnowflakeLoaderAdapter::new(Arc::new(sf_connector)),
+        ))
     }
 }
 
