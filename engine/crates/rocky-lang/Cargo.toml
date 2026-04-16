@@ -1,6 +1,6 @@
 [package]
 name = "rocky-lang"
-version = "1.2.0"
+version = "1.3.0"
 description = "Rocky DSL: pipeline-oriented language for SQL transformations"
 edition.workspace = true
 license.workspace = true
