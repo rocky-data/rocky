@@ -626,6 +626,87 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 }
 
 // ---------------------------------------------------------------------------
+// Runtime cross-pipeline dependency inference
+// ---------------------------------------------------------------------------
+
+/// Augment a DAG with edges inferred from model SQL `FROM` references.
+///
+/// `build_unified_dag` resolves only edges from explicit `depends_on` config.
+/// This pass parses each model's SQL, extracts the tables it references, and
+/// adds [`EdgeType::DataDependency`] edges from the producing nodes (other
+/// transformations, seeds, replication loads) to the consuming model — even
+/// when no explicit `depends_on` is declared.
+///
+/// `model_sql_by_name` maps model name → compiled SQL text. The caller is
+/// responsible for compiling models first; this function does no IO.
+///
+/// Inferred edges are de-duplicated against existing ones, so calling this
+/// repeatedly is idempotent.
+pub fn infer_runtime_dependencies(
+    dag: &mut UnifiedDag,
+    model_sql_by_name: &HashMap<String, String>,
+) {
+    // Build a set of producing node names (everything that creates a table:
+    // transformations, seeds, loads). Maps logical table name → NodeId.
+    let mut producers: HashMap<String, NodeId> = HashMap::new();
+    for node in &dag.nodes {
+        match node.kind {
+            NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
+                // Index by lowercase label so case-insensitive SQL refs match.
+                producers.insert(node.label.to_lowercase(), node.id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Existing edges as a set so we don't double-add.
+    let mut existing: HashSet<(NodeId, NodeId)> = dag
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+
+    let mut new_edges = Vec::new();
+
+    for node in &dag.nodes {
+        if node.kind != NodeKind::Transformation {
+            continue;
+        }
+        let Some(sql) = model_sql_by_name.get(&node.label) else {
+            continue;
+        };
+        let Ok(refs) = rocky_sql::lineage::referenced_tables(sql) else {
+            continue;
+        };
+        for table_name in refs {
+            // Match by the bare table name (last segment of any qualified ref).
+            let bare = table_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&table_name)
+                .to_lowercase();
+            let Some(producer_id) = producers.get(&bare) else {
+                continue;
+            };
+            // Skip self-references and already-known edges.
+            if *producer_id == node.id {
+                continue;
+            }
+            let key = (producer_id.clone(), node.id.clone());
+            if existing.insert(key) {
+                new_edges.push(UnifiedEdge {
+                    from: producer_id.clone(),
+                    to: node.id.clone(),
+                    edge_type: EdgeType::DataDependency,
+                });
+            }
+        }
+    }
+
+    dag.edges.extend(new_edges);
+}
+
+// ---------------------------------------------------------------------------
 // Execution phases (parallel layers)
 // ---------------------------------------------------------------------------
 
@@ -1627,5 +1708,135 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, UnifiedDagError::CyclicDependency { .. }))
         );
+    }
+
+    // ---------- infer_runtime_dependencies ----------
+
+    fn dag_with_models(models: &[(&str, NodeKind)]) -> UnifiedDag {
+        let nodes = models
+            .iter()
+            .map(|(name, kind)| UnifiedNode {
+                id: NodeId::new(&kind.to_string(), name),
+                kind: *kind,
+                label: (*name).to_string(),
+                pipeline: None,
+            })
+            .collect();
+        UnifiedDag {
+            nodes,
+            edges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_infer_adds_edge_from_sql_ref() {
+        let mut dag = dag_with_models(&[
+            ("orders", NodeKind::Transformation),
+            ("stg_orders", NodeKind::Transformation),
+        ]);
+
+        let mut sql = HashMap::new();
+        sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
+
+        infer_runtime_dependencies(&mut dag, &sql);
+
+        assert_eq!(dag.edges.len(), 1);
+        assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
+        assert_eq!(
+            dag.edges[0].to,
+            NodeId::new("transformation", "stg_orders")
+        );
+        assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
+    }
+
+    #[test]
+    fn test_infer_handles_qualified_names() {
+        let mut dag = dag_with_models(&[
+            ("customers", NodeKind::Seed),
+            ("dim_customer", NodeKind::Transformation),
+        ]);
+
+        let mut sql = HashMap::new();
+        sql.insert(
+            "dim_customer".into(),
+            "SELECT * FROM main.raw.customers".into(),
+        );
+
+        infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(dag.edges.len(), 1);
+        assert_eq!(dag.edges[0].from, NodeId::new("seed", "customers"));
+    }
+
+    #[test]
+    fn test_infer_skips_existing_edges() {
+        let mut dag = dag_with_models(&[
+            ("orders", NodeKind::Transformation),
+            ("stg_orders", NodeKind::Transformation),
+        ]);
+        // Pre-existing edge.
+        dag.edges.push(UnifiedEdge {
+            from: NodeId::new("transformation", "orders"),
+            to: NodeId::new("transformation", "stg_orders"),
+            edge_type: EdgeType::DataDependency,
+        });
+
+        let mut sql = HashMap::new();
+        sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
+
+        infer_runtime_dependencies(&mut dag, &sql);
+
+        // No duplicate added.
+        assert_eq!(dag.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_infer_ignores_self_reference() {
+        let mut dag = dag_with_models(&[("loop_model", NodeKind::Transformation)]);
+        let mut sql = HashMap::new();
+        sql.insert("loop_model".into(), "SELECT * FROM loop_model".into());
+
+        infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(dag.edges.len(), 0);
+    }
+
+    #[test]
+    fn test_infer_idempotent() {
+        let mut dag = dag_with_models(&[
+            ("orders", NodeKind::Load),
+            ("stg_orders", NodeKind::Transformation),
+        ]);
+
+        let mut sql = HashMap::new();
+        sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
+
+        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql);
+
+        assert_eq!(dag.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_infer_no_match_for_unknown_table() {
+        let mut dag = dag_with_models(&[("model_a", NodeKind::Transformation)]);
+
+        let mut sql = HashMap::new();
+        sql.insert(
+            "model_a".into(),
+            "SELECT * FROM nonexistent_external_table".into(),
+        );
+
+        infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(dag.edges.len(), 0);
+    }
+
+    #[test]
+    fn test_infer_handles_invalid_sql_gracefully() {
+        let mut dag = dag_with_models(&[("model_a", NodeKind::Transformation)]);
+        let mut sql = HashMap::new();
+        sql.insert("model_a".into(), "this is not sql".into());
+
+        // Should not panic; invalid SQL just yields no inferred edges.
+        infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(dag.edges.len(), 0);
     }
 }
