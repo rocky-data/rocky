@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.3.0",
   "command": "dag",
   "nodes": [
     {
@@ -38,8 +38,8 @@
     "total_edges": 1,
     "execution_layers": 2,
     "counts_by_kind": {
-      "source": 1,
-      "load": 1
+      "load": 1,
+      "source": 1
     }
   }
 }
