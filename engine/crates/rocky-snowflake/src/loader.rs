@@ -21,7 +21,7 @@ use rocky_adapter_sdk::{
     TableRef,
 };
 
-use crate::connector::SnowflakeConnector;
+use crate::connector::{QueryResult, SnowflakeConnector};
 use crate::stage::{
     copy_into_sql, create_external_stage_sql, create_temporary_stage_sql, drop_stage_sql,
     generate_stage_name, put_file_sql,
@@ -39,12 +39,21 @@ impl SnowflakeLoaderAdapter {
     }
 
     /// Execute a statement, mapping connector errors into the adapter's
-    /// error type.
+    /// error type. Used when the caller doesn't need the result rows.
     async fn exec(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)
             .await
             .map(|_| ())
+            .map_err(|e| AdapterError::msg(e.to_string()))
+    }
+
+    /// Execute a statement and return the full result set. Used by COPY INTO
+    /// so we can parse per-file `rows_loaded` from the response.
+    async fn exec_with_rows(&self, sql: &str) -> AdapterResult<QueryResult> {
+        self.connector
+            .execute_sql(sql)
+            .await
             .map_err(|e| AdapterError::msg(e.to_string()))
     }
 }
@@ -101,7 +110,7 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
         }
 
         // Build and run the appropriate sequence for the source type.
-        let file_size = match source {
+        let (rows_loaded, file_size) = match source {
             LoadSource::CloudUri(uri) => {
                 // External stage path: one CREATE, one COPY, one DROP.
                 let create_sql = create_external_stage_sql(&stage, uri, format, options);
@@ -110,7 +119,7 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
 
                 let copy_sql = copy_into_sql(&target_ref, &stage);
                 info!(sql = %copy_sql, "snowflake COPY INTO (external stage)");
-                let copy_result = self.exec(&copy_sql).await;
+                let copy_result = self.exec_with_rows(&copy_sql).await;
 
                 // Drop stage regardless of COPY result to tidy up.
                 let drop_sql = drop_stage_sql(&stage);
@@ -118,8 +127,8 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
                     warn!(error = %e, stage = %stage, "failed to drop stage (non-fatal)");
                 }
 
-                copy_result?;
-                0u64 // No local byte count for cloud sources.
+                let rows = rows_from_copy_result(&copy_result?);
+                (rows, 0u64) // No local byte count for cloud sources.
             }
             LoadSource::LocalFile(local_path) => {
                 // Internal stage path: CREATE, PUT, COPY, DROP.
@@ -143,26 +152,23 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
 
                 let copy_sql = copy_into_sql(&target_ref, &stage);
                 info!(sql = %copy_sql, "snowflake COPY INTO (internal stage)");
-                let copy_result = self.exec(&copy_sql).await;
+                let copy_result = self.exec_with_rows(&copy_sql).await;
 
                 let drop_sql = drop_stage_sql(&stage);
                 if let Err(e) = self.exec(&drop_sql).await {
                     warn!(error = %e, stage = %stage, "failed to drop stage (non-fatal)");
                 }
 
-                copy_result?;
-
-                std::fs::metadata(local_path)
+                let rows = rows_from_copy_result(&copy_result?);
+                let bytes = std::fs::metadata(local_path)
                     .map(|m| m.len())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (rows, bytes)
             }
         };
 
         Ok(LoadResult {
-            // Snowflake's COPY INTO returns row counts in the response payload,
-            // but `execute_statement` here surfaces only success/failure. A
-            // follow-up could parse counts from the connector's result row.
-            rows_loaded: 0,
+            rows_loaded,
             bytes_read: file_size,
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -171,6 +177,58 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
     fn supported_formats(&self) -> Vec<FileFormat> {
         vec![FileFormat::Csv, FileFormat::Parquet, FileFormat::JsonLines]
     }
+}
+
+/// Extract the total `rows_loaded` from a COPY INTO response, warning when
+/// the column is missing so unexpected API shapes are visible in logs.
+///
+/// Returns `0` (rather than failing the load) when the column isn't present.
+fn rows_from_copy_result(result: &QueryResult) -> u64 {
+    match sum_rows_loaded(result) {
+        Some(n) => n,
+        None => {
+            warn!(
+                statement_handle = %result.statement_handle,
+                "snowflake COPY INTO response missing `rows_loaded` column; \
+                 reporting 0 rows loaded"
+            );
+            0
+        }
+    }
+}
+
+/// Sum the `rows_loaded` column across every row of a COPY INTO result.
+///
+/// Snowflake's COPY INTO returns one row per source file loaded with
+/// columns including `FILE`, `STATUS`, `ROWS_PARSED`, `ROWS_LOADED`,
+/// `ERRORS_SEEN`, etc. Summing `rows_loaded` across files gives the total
+/// rows appended to the target table for this COPY INTO call.
+///
+/// Returns `None` when the column is missing from the response schema —
+/// callers should default to 0 so unexpected API shapes don't fail the
+/// load.
+fn sum_rows_loaded(result: &QueryResult) -> Option<u64> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case("rows_loaded"))?;
+    let mut total: u64 = 0;
+    for row in &result.rows {
+        let Some(cell) = row.get(idx) else {
+            continue;
+        };
+        let parsed = match cell {
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        };
+        if let Some(v) = parsed {
+            total = total.saturating_add(v);
+        }
+    }
+    Some(total)
 }
 
 /// Convert a local path to a string for SQL interpolation, rejecting paths
@@ -239,5 +297,92 @@ mod tests {
     fn test_local_path_str_accepts_normal() {
         let p = PathBuf::from("/tmp/data.csv");
         assert_eq!(local_path_str(&p).unwrap(), "/tmp/data.csv");
+    }
+
+    fn copy_into_result(columns: &[&str], rows: Vec<Vec<serde_json::Value>>) -> QueryResult {
+        use crate::connector::ColumnMetaData;
+        let columns = columns
+            .iter()
+            .map(|n| ColumnMetaData {
+                name: (*n).to_string(),
+                type_name: Some("FIXED".into()),
+                nullable: Some(true),
+            })
+            .collect();
+        let row_count = rows.len() as u64;
+        QueryResult {
+            statement_handle: "sf-copy".into(),
+            columns,
+            rows,
+            total_row_count: Some(row_count),
+        }
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_single_file() {
+        let qr = copy_into_result(
+            &[
+                "file",
+                "status",
+                "rows_parsed",
+                "rows_loaded",
+                "errors_seen",
+            ],
+            vec![vec![
+                serde_json::json!("users_1.csv"),
+                serde_json::json!("LOADED"),
+                serde_json::json!(100),
+                serde_json::json!(100),
+                serde_json::json!(0),
+            ]],
+        );
+        assert_eq!(sum_rows_loaded(&qr), Some(100));
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_multiple_files() {
+        let qr = copy_into_result(
+            &["file", "rows_loaded"],
+            vec![
+                vec![serde_json::json!("a.csv"), serde_json::json!(10)],
+                vec![serde_json::json!("b.csv"), serde_json::json!(20)],
+                vec![serde_json::json!("c.csv"), serde_json::json!(30)],
+            ],
+        );
+        assert_eq!(sum_rows_loaded(&qr), Some(60));
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_string_values() {
+        // Snowflake's REST API returns numeric columns as JSON strings.
+        let qr = copy_into_result(
+            &["rows_loaded"],
+            vec![vec![serde_json::json!("50")], vec![serde_json::json!("75")]],
+        );
+        assert_eq!(sum_rows_loaded(&qr), Some(125));
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_case_insensitive() {
+        let qr = copy_into_result(&["ROWS_LOADED"], vec![vec![serde_json::json!(42)]]);
+        assert_eq!(sum_rows_loaded(&qr), Some(42));
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_missing_column() {
+        let qr = copy_into_result(
+            &["file", "status"],
+            vec![vec![
+                serde_json::json!("users.csv"),
+                serde_json::json!("LOADED"),
+            ]],
+        );
+        assert_eq!(sum_rows_loaded(&qr), None);
+    }
+
+    #[test]
+    fn test_sum_rows_loaded_empty_result() {
+        let qr = copy_into_result(&["rows_loaded"], vec![]);
+        assert_eq!(sum_rows_loaded(&qr), Some(0));
     }
 }
