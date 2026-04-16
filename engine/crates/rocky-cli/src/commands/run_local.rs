@@ -117,6 +117,9 @@ pub async fn run_quality(
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
 ) -> Result<()> {
+    use rocky_core::checks::{CheckDetails, CheckResult};
+    use rocky_core::tests::generate_test_sql;
+
     let start = Instant::now();
 
     let pipes = crate::pipes::PipesEmitter::detect();
@@ -135,6 +138,8 @@ pub async fn run_quality(
     );
     output.pipeline_type = Some("quality".to_string());
 
+    let row_count_severity = pipeline.checks.row_count.severity();
+
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
     } else {
@@ -142,7 +147,6 @@ pub async fn run_quality(
             let tables_to_check: Vec<String> = if let Some(ref table) = table_ref.table {
                 vec![table.clone()]
             } else {
-                // List tables in schema via warehouse adapter
                 match warehouse_adapter
                     .execute_query(&format!(
                         "SELECT table_name FROM {}.information_schema.tables WHERE table_schema = '{}'",
@@ -182,7 +186,7 @@ pub async fn run_quality(
                 let mut checks = Vec::new();
 
                 // Row count check
-                if pipeline.checks.row_count {
+                if pipeline.checks.row_count.enabled() {
                     match warehouse_adapter
                         .execute_query(&format!("SELECT COUNT(*) FROM {full_table}"))
                         .await
@@ -197,20 +201,22 @@ pub async fn run_quality(
                                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                                 })
                                 .unwrap_or(0);
-                            checks.push(rocky_core::checks::CheckResult {
+                            checks.push(CheckResult {
                                 name: "row_count".into(),
                                 passed: count > 0,
-                                details: rocky_core::checks::CheckDetails::RowCount {
+                                severity: row_count_severity,
+                                details: CheckDetails::RowCount {
                                     source_count: count,
                                     target_count: count,
                                 },
                             });
                         }
                         Err(e) => {
-                            checks.push(rocky_core::checks::CheckResult {
+                            checks.push(CheckResult {
                                 name: "row_count".into(),
                                 passed: false,
-                                details: rocky_core::checks::CheckDetails::Custom {
+                                severity: row_count_severity,
+                                details: CheckDetails::Custom {
                                     query: format!("SELECT COUNT(*) FROM {full_table}"),
                                     result_value: 0,
                                     threshold: 1,
@@ -224,6 +230,7 @@ pub async fn run_quality(
                 // Custom checks
                 for custom in &pipeline.checks.custom {
                     let sql = custom.sql.replace("{table}", &full_table);
+                    let severity = custom.severity;
                     match warehouse_adapter.execute_query(&sql).await {
                         Ok(result) => {
                             let result_value: u64 = result
@@ -235,10 +242,11 @@ pub async fn run_quality(
                                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                                 })
                                 .unwrap_or(0);
-                            checks.push(rocky_core::checks::CheckResult {
+                            checks.push(CheckResult {
                                 name: custom.name.clone(),
                                 passed: result_value >= custom.threshold,
-                                details: rocky_core::checks::CheckDetails::Custom {
+                                severity,
+                                details: CheckDetails::Custom {
                                     query: sql,
                                     result_value,
                                     threshold: custom.threshold,
@@ -246,16 +254,73 @@ pub async fn run_quality(
                             });
                         }
                         Err(e) => {
-                            checks.push(rocky_core::checks::CheckResult {
+                            checks.push(CheckResult {
                                 name: custom.name.clone(),
                                 passed: false,
-                                details: rocky_core::checks::CheckDetails::Custom {
+                                severity,
+                                details: CheckDetails::Custom {
                                     query: sql,
                                     result_value: 0,
                                     threshold: custom.threshold,
                                 },
                             });
                             warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
+                        }
+                    }
+                }
+
+                // Row-level assertions — match by unqualified table name.
+                for assertion in &pipeline.checks.assertions {
+                    if assertion.table != *table_name {
+                        continue;
+                    }
+                    let test = &assertion.test;
+                    let sql = match generate_test_sql(test, &full_table) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                table = %full_table,
+                                "failed to generate assertion SQL — skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    let kind = test_type_kind(&test.test_type);
+                    let name = format!("{kind}:{}", test.column.as_deref().unwrap_or("-"));
+
+                    match warehouse_adapter.execute_query(&sql).await {
+                        Ok(result) => {
+                            let (passed, failing_rows) =
+                                classify_assertion(&test.test_type, &result.rows);
+                            checks.push(CheckResult {
+                                name,
+                                passed,
+                                severity: test.severity,
+                                details: CheckDetails::Assertion {
+                                    kind: kind.to_string(),
+                                    column: test.column.clone(),
+                                    failing_rows,
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                table = %full_table,
+                                assertion = %name,
+                                "assertion query failed"
+                            );
+                            checks.push(CheckResult {
+                                name,
+                                passed: false,
+                                severity: test.severity,
+                                details: CheckDetails::Assertion {
+                                    kind: kind.to_string(),
+                                    column: test.column.clone(),
+                                    failing_rows: 0,
+                                },
+                            });
                         }
                     }
                 }
@@ -273,24 +338,97 @@ pub async fn run_quality(
         super::run::emit_pipes_events(p, &output);
     }
 
+    let (error_failures, warning_failures) = count_failures_by_severity(&output);
+
     if output_json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let total_checks: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
-        let failed: usize = output
-            .check_results
-            .iter()
-            .flat_map(|t| &t.checks)
-            .filter(|r| !r.passed)
-            .count();
         println!(
-            "quality pipeline complete: {total_checks} check(s) across {} table(s), {failed} failed, in {}ms",
+            "quality pipeline complete: {total_checks} check(s) across {} table(s), {error_failures} error / {warning_failures} warning failed, in {}ms",
             output.check_results.len(),
             output.duration_ms
         );
     }
 
+    if error_failures > 0 && pipeline.checks.fail_on_error {
+        anyhow::bail!("quality pipeline failed: {error_failures} error-severity check(s) failed");
+    }
+
     Ok(())
+}
+
+/// Short snake_case tag for each `TestType` variant — embedded in check
+/// result details so downstream consumers can distinguish assertion kinds.
+fn test_type_kind(t: &rocky_core::tests::TestType) -> &'static str {
+    use rocky_core::tests::TestType;
+    match t {
+        TestType::NotNull => "not_null",
+        TestType::Unique => "unique",
+        TestType::AcceptedValues { .. } => "accepted_values",
+        TestType::Relationships { .. } => "relationships",
+        TestType::Expression { .. } => "expression",
+        TestType::RowCountRange { .. } => "row_count_range",
+    }
+}
+
+/// Classify an assertion query's result into `(passed, failing_rows)`.
+///
+/// The classification is kind-dependent:
+/// - `NotNull` / `Expression`: first cell is a failure count; 0 passes.
+/// - `Unique` / `AcceptedValues` / `Relationships`: every result row is a
+///   violation; empty result passes. `failing_rows` is the row count.
+/// - `RowCountRange`: first cell is the total row count; pass/fail decided
+///   by the caller against `min`/`max` (handled below).
+fn classify_assertion(
+    t: &rocky_core::tests::TestType,
+    rows: &[Vec<serde_json::Value>],
+) -> (bool, u64) {
+    use rocky_core::tests::TestType;
+    let first_cell_u64 = || -> u64 {
+        rows.first()
+            .and_then(|r| r.first())
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0)
+    };
+    match t {
+        TestType::NotNull | TestType::Expression { .. } => {
+            let n = first_cell_u64();
+            (n == 0, n)
+        }
+        TestType::Unique | TestType::AcceptedValues { .. } | TestType::Relationships { .. } => {
+            let n = rows.len() as u64;
+            (n == 0, n)
+        }
+        TestType::RowCountRange { min, max } => {
+            let n = first_cell_u64();
+            let within_min = min.map(|m| n >= m).unwrap_or(true);
+            let within_max = max.map(|m| n <= m).unwrap_or(true);
+            (within_min && within_max, n)
+        }
+    }
+}
+
+/// Count failed checks bucketed by severity across every table result.
+fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
+    use rocky_core::tests::TestSeverity;
+    let mut error = 0usize;
+    let mut warning = 0usize;
+    for t in &output.check_results {
+        for c in &t.checks {
+            if c.passed {
+                continue;
+            }
+            match c.severity {
+                TestSeverity::Error => error += 1,
+                TestSeverity::Warning => warning += 1,
+            }
+        }
+    }
+    (error, warning)
 }
 
 /// Execute `rocky run` for a snapshot (SCD Type 2) pipeline.

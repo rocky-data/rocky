@@ -484,23 +484,115 @@ pub struct ChecksConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub row_count: bool,
+    pub row_count: AggregateCheckToggle,
     #[serde(default)]
-    pub column_match: bool,
+    pub column_match: AggregateCheckToggle,
     #[serde(default)]
     pub freshness: Option<FreshnessConfig>,
     #[serde(default)]
     pub null_rate: Option<NullRateConfig>,
     #[serde(default)]
     pub custom: Vec<CustomCheckConfig>,
+    /// Row-level assertions (`not_null`, `unique`, `accepted_values`,
+    /// `relationships`, `expression`, `row_count_range`) executed against
+    /// specific tables in the quality pipeline. Each entry targets a single
+    /// table by name and reuses the `TestDecl` surface from declarative
+    /// model tests.
+    #[serde(default)]
+    pub assertions: Vec<QualityAssertion>,
     /// Row count anomaly detection threshold (percentage deviation from baseline).
     /// Default: 50.0 (50% deviation triggers anomaly). Set to 0 to disable.
     #[serde(default = "default_anomaly_threshold_pct")]
     pub anomaly_threshold_pct: f64,
+    /// When `true` (default), the quality run exits non-zero if any
+    /// error-severity check fails. Set `false` to force the pipeline to
+    /// always succeed and leave failure handling to downstream consumers
+    /// of the JSON output.
+    #[serde(default = "default_fail_on_error")]
+    pub fail_on_error: bool,
 }
 
 fn default_anomaly_threshold_pct() -> f64 {
     50.0
+}
+
+fn default_fail_on_error() -> bool {
+    true
+}
+
+/// Per-check-kind toggle that accepts either a plain boolean (legacy form)
+/// or a struct with `enabled` + `severity`.
+///
+/// ```toml
+/// # Legacy — still supported
+/// row_count = true
+///
+/// # New — per-check severity
+/// [pipeline.x.checks.row_count]
+/// enabled  = true
+/// severity = "warning"
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AggregateCheckToggle {
+    /// Legacy boolean toggle. Severity defaults to `error`.
+    Bool(bool),
+    /// Explicit struct form with per-check severity.
+    Detailed {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        severity: crate::tests::TestSeverity,
+    },
+}
+
+impl Default for AggregateCheckToggle {
+    fn default() -> Self {
+        AggregateCheckToggle::Bool(false)
+    }
+}
+
+impl AggregateCheckToggle {
+    /// Whether this check is enabled.
+    pub fn enabled(&self) -> bool {
+        match self {
+            AggregateCheckToggle::Bool(b) => *b,
+            AggregateCheckToggle::Detailed { enabled, .. } => *enabled,
+        }
+    }
+
+    /// Severity reported when this check fails. Defaults to `error`.
+    pub fn severity(&self) -> crate::tests::TestSeverity {
+        match self {
+            AggregateCheckToggle::Bool(_) => crate::tests::TestSeverity::Error,
+            AggregateCheckToggle::Detailed { severity, .. } => *severity,
+        }
+    }
+}
+
+/// A single row-level assertion attached to a quality pipeline, scoped to
+/// one table in the pipeline's `tables` list.
+///
+/// ```toml
+/// [[pipeline.nightly_dq.checks.assertions]]
+/// table    = "orders"
+/// type     = "not_null"
+/// column   = "customer_id"
+/// severity = "error"
+/// ```
+///
+/// The `type`-specific fields (and `column`, `severity`) are flattened
+/// from `TestDecl` — the same surface used by declarative model tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityAssertion {
+    /// Table name this assertion applies to. Must match a table discovered
+    /// from one of the pipeline's `[[tables]]` entries (by unqualified
+    /// table name).
+    pub table: String,
+    /// The declarative test (flattened: `type`, `column`, severity, and
+    /// type-specific fields like `values` / `to_table`).
+    #[serde(flatten)]
+    pub test: crate::tests::TestDecl,
 }
 
 /// Freshness check configuration with optional per-schema overrides.
@@ -511,6 +603,9 @@ pub struct FreshnessConfig {
     /// value overrides threshold_seconds for matching schemas.
     #[serde(default)]
     pub overrides: std::collections::HashMap<String, u64>,
+    /// Severity reported when freshness lag exceeds the threshold.
+    #[serde(default)]
+    pub severity: crate::tests::TestSeverity,
 }
 
 /// Null rate check configuration: columns to check, threshold, and sample size.
@@ -520,6 +615,9 @@ pub struct NullRateConfig {
     pub threshold: f64,
     #[serde(default = "default_sample_percent")]
     pub sample_percent: u32,
+    /// Severity reported when a column's null rate exceeds the threshold.
+    #[serde(default)]
+    pub severity: crate::tests::TestSeverity,
 }
 
 fn default_sample_percent() -> u32 {
@@ -533,6 +631,9 @@ pub struct CustomCheckConfig {
     pub sql: String,
     #[serde(default)]
     pub threshold: u64,
+    /// Severity reported when this check fails.
+    #[serde(default)]
+    pub severity: crate::tests::TestSeverity,
 }
 
 /// Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
@@ -2968,9 +3069,184 @@ fail_fast = true
         assert_eq!(q.tables[0].table.as_deref(), Some("orders"));
         assert!(q.tables[1].table.is_none()); // all tables in schema
         assert!(q.checks.enabled);
-        assert!(q.checks.row_count);
+        assert!(q.checks.row_count.enabled());
         assert_eq!(q.checks.custom.len(), 1);
         assert_eq!(q.execution.concurrency, ConcurrencyMode::Fixed(2));
+    }
+
+    // --- Phase 1+2: unified check surface + severity ---
+
+    #[test]
+    fn test_parse_quality_pipeline_with_assertions() {
+        let toml_str = r#"
+[adapter.db]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.nightly_dq]
+type = "quality"
+
+[pipeline.nightly_dq.target]
+adapter = "db"
+
+[[pipeline.nightly_dq.tables]]
+catalog = "poc"
+schema = "staging"
+table = "orders"
+
+[pipeline.nightly_dq.checks]
+enabled = true
+row_count = true
+
+[[pipeline.nightly_dq.checks.assertions]]
+table = "orders"
+type = "not_null"
+column = "customer_id"
+
+[[pipeline.nightly_dq.checks.assertions]]
+table = "orders"
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped"]
+severity = "warning"
+
+[[pipeline.nightly_dq.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "total >= 0"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let q = config.pipelines["nightly_dq"].as_quality().unwrap();
+        assert_eq!(q.checks.assertions.len(), 3);
+        assert_eq!(q.checks.assertions[0].table, "orders");
+        assert!(matches!(
+            q.checks.assertions[0].test.test_type,
+            crate::tests::TestType::NotNull
+        ));
+        assert_eq!(
+            q.checks.assertions[1].test.severity,
+            crate::tests::TestSeverity::Warning
+        );
+        assert!(matches!(
+            q.checks.assertions[2].test.test_type,
+            crate::tests::TestType::Expression { .. }
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_check_toggle_bool_legacy() {
+        let toml_str = r#"
+[adapter.db]
+type = "duckdb"
+path = "p"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "db"
+
+[[pipeline.q.tables]]
+catalog = "c"
+schema = "s"
+
+[pipeline.q.checks]
+enabled = true
+row_count = true
+column_match = false
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let q = config.pipelines["q"].as_quality().unwrap();
+        assert!(q.checks.row_count.enabled());
+        assert_eq!(
+            q.checks.row_count.severity(),
+            crate::tests::TestSeverity::Error
+        );
+        assert!(!q.checks.column_match.enabled());
+    }
+
+    #[test]
+    fn test_aggregate_check_toggle_detailed() {
+        let toml_str = r#"
+[adapter.db]
+type = "duckdb"
+path = "p"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "db"
+
+[[pipeline.q.tables]]
+catalog = "c"
+schema = "s"
+
+[pipeline.q.checks]
+enabled = true
+
+[pipeline.q.checks.row_count]
+enabled = true
+severity = "warning"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let q = config.pipelines["q"].as_quality().unwrap();
+        assert!(q.checks.row_count.enabled());
+        assert_eq!(
+            q.checks.row_count.severity(),
+            crate::tests::TestSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn test_fail_on_error_defaults_true() {
+        let toml_str = r#"
+[adapter.db]
+type = "duckdb"
+path = "p"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "db"
+
+[[pipeline.q.tables]]
+catalog = "c"
+schema = "s"
+
+[pipeline.q.checks]
+enabled = true
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let q = config.pipelines["q"].as_quality().unwrap();
+        assert!(q.checks.fail_on_error);
+    }
+
+    #[test]
+    fn test_fail_on_error_false_escape_hatch() {
+        let toml_str = r#"
+[adapter.db]
+type = "duckdb"
+path = "p"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "db"
+
+[[pipeline.q.tables]]
+catalog = "c"
+schema = "s"
+
+[pipeline.q.checks]
+enabled = true
+fail_on_error = false
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let q = config.pipelines["q"].as_quality().unwrap();
+        assert!(!q.checks.fail_on_error);
     }
 
     // --- Snapshot pipeline tests ---
@@ -3203,7 +3479,7 @@ concurrency = 2
         assert_eq!(l.options.csv_delimiter, "\t");
         assert!(!l.options.csv_has_header);
         assert!(l.checks.enabled);
-        assert!(l.checks.row_count);
+        assert!(l.checks.row_count.enabled());
         assert_eq!(l.execution.concurrency, ConcurrencyMode::Fixed(2));
     }
 

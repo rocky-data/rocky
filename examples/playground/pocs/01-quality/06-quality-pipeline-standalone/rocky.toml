@@ -4,39 +4,75 @@
 type = "duckdb"
 path = "poc.duckdb"
 
-# Replication pipeline to set up data first
-[pipeline.ingest]
-strategy = "full_refresh"
-
-[pipeline.ingest.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.ingest.target]
-catalog_template = "poc"
-schema_template = "staging__{source}"
-
-# Quality pipeline — runs checks against existing tables
 [pipeline.nightly_dq]
 type = "quality"
-depends_on = ["ingest"]
 
 [pipeline.nightly_dq.target]
 adapter = "default"
 
+# Target named tables directly (avoids depending on information_schema).
 [[pipeline.nightly_dq.tables]]
 catalog = "poc"
-schema = "staging__orders"
+schema  = "staging__orders"
+table   = "orders"
 
 [[pipeline.nightly_dq.tables]]
 catalog = "poc"
-schema = "staging__customers"
+schema  = "staging__customers"
+table   = "customers"
 
 [pipeline.nightly_dq.checks]
 enabled = true
 row_count = true
-column_match = true
-freshness = { threshold_seconds = 86400 }
-null_rate = { threshold_pct = 5 }
+column_match = { enabled = true, severity = "warning" }
+freshness = { threshold_seconds = 86400, severity = "warning" }
 anomaly_threshold_pct = 30.0
+# Phase 2 escape hatch: keep the POC green while surfacing failing rows.
+# Remove (or set `true`) to fail CI on any error-severity violation.
+fail_on_error = false
+
+# --- Phase 1: row-level assertions (unified surface) ---
+
+# not_null — 2 rows (order_id 7, 42) violate this.
+[[pipeline.nightly_dq.checks.assertions]]
+table    = "orders"
+type     = "not_null"
+column   = "customer_id"
+severity = "error"
+
+# accepted_values — 1 row (order_id 13) with status = 'unknown' violates.
+[[pipeline.nightly_dq.checks.assertions]]
+table    = "orders"
+type     = "accepted_values"
+column   = "status"
+values   = ["pending", "shipped", "delivered", "cancelled"]
+severity = "error"
+
+# expression — 1 row (order_id 99) with amount = -5 violates.
+[[pipeline.nightly_dq.checks.assertions]]
+table      = "orders"
+type       = "expression"
+expression = "amount >= 0"
+severity   = "warning"
+
+# unique — passes; customer_id generated sequentially.
+[[pipeline.nightly_dq.checks.assertions]]
+table    = "customers"
+type     = "unique"
+column   = "customer_id"
+severity = "error"
+
+# not_null email — passes; seed never sets NULL email.
+[[pipeline.nightly_dq.checks.assertions]]
+table    = "customers"
+type     = "not_null"
+column   = "email"
+severity = "error"
+
+# row_count_range — customers has exactly 50 rows.
+[[pipeline.nightly_dq.checks.assertions]]
+table    = "customers"
+type     = "row_count_range"
+min      = 40
+max      = 60
+severity = "error"

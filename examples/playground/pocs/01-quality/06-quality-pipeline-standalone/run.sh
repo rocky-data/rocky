@@ -9,24 +9,23 @@ rm -f .rocky-state.redb poc.duckdb
 
 duckdb poc.duckdb < data/seed.sql
 
-rocky validate
+rocky validate > /dev/null
 
-echo "=== Pipeline types ==="
-echo "  ingest     → replication (data movement)"
-echo "  nightly_dq → quality (checks only, depends_on ingest)"
-
-echo
-echo "=== Run ingest pipeline first ==="
-rocky -c rocky.toml -o json run --pipeline ingest --filter source=orders > expected/run_ingest.json 2>&1 || true
-rocky -c rocky.toml -o json run --pipeline ingest --filter source=customers >> expected/run_ingest.json 2>&1 || true
+echo "=== Run quality pipeline (standalone checks + assertions) ==="
+rocky -c rocky.toml -o json run --pipeline nightly_dq > expected/run_quality.json
 
 echo
-echo "=== Run quality pipeline (standalone checks) ==="
-rocky -c rocky.toml -o json run --pipeline nightly_dq > expected/run_quality.json 2>&1 || true
+echo "=== Summary ==="
+jq '{
+  pipeline_type,
+  check_results: [
+    .check_results[] | {
+      table: (.asset_key | join(".")),
+      checks: [ .checks[] | { name, severity, passed } ]
+    }
+  ]
+}' expected/run_quality.json
 
 echo
-echo "=== Quality results ==="
-cat expected/run_quality.json 2>/dev/null | head -40 || echo "(quality pipeline execution in progress — config validates correctly)"
-
-echo
-echo "POC complete: quality pipeline configured with row_count, column_match, freshness, null_rate checks."
+echo "POC complete: unified check surface (row_count + assertions) with mixed severity."
+echo "Flip fail_on_error=true in rocky.toml to make error-severity failures non-zero."
