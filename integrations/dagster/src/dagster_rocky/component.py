@@ -386,7 +386,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         not block state persistence.
         """
         try:
-            return json.loads(rocky.dag(column_lineage=True).model_dump_json())
+            return json.loads(rocky.dag(column_lineage=True).model_dump_json(by_alias=True))
         except dg.Failure:
             return None
 
