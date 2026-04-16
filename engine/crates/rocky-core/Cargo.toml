@@ -37,6 +37,10 @@ rayon = "1"
 tempfile = "3"
 rocky-duckdb = { path = "../rocky-duckdb" }
 tokio = { workspace = true }
+# JSON Schema validator used in `tests/adapter_schema.rs` to assert every
+# committed `rocky.toml` under `examples/playground/pocs/` passes the
+# schemars-generated AdapterConfig schema.
+jsonschema = { version = "0.30", default-features = false }
 
 [lints]
 workspace = true

@@ -1,0 +1,269 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AdapterKind": {
+      "description": "Role an adapter block plays in the pipeline.\n\nSet via `kind = \"data\"` or `kind = \"discovery\"` in an `[adapter.*]` block. Required on discovery-only adapter types (`fivetran`, `airbyte`, `iceberg`, `manual`) so the adapter's role is self-evident in the raw config file — a reader shouldn't have to know the Rust trait surface of each adapter to tell whether it moves data.\n\nOptional on single-role warehouse types (defaults to `Data`) and on the dual-capable DuckDB adapter (absent means \"register both roles\").",
+      "oneOf": [
+        {
+          "description": "Warehouse data movement (reads / writes table bytes).",
+          "enum": [
+            "data"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Metadata-only discovery (enumerates source schemas / connectors).",
+          "enum": [
+            "discovery"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RedactedString": {
+      "type": "string"
+    },
+    "RetryConfig": {
+      "description": "Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).\n\nRocky retries transient errors with exponential backoff and optional jitter to prevent thundering herd across concurrent runs.",
+      "properties": {
+        "backoff_multiplier": {
+          "default": 2.0,
+          "description": "Backoff multiplier applied after each retry (e.g. 2.0 = double each time).",
+          "format": "double",
+          "type": "number"
+        },
+        "circuit_breaker_threshold": {
+          "default": 5,
+          "description": "Circuit breaker: trip after this many consecutive transient failures across statements. Once tripped, all subsequent statements fail immediately without attempting execution. Default: 5. Set to 0 to disable.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "initial_backoff_ms": {
+          "default": 1000,
+          "description": "Initial backoff duration in milliseconds before the first retry.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "jitter": {
+          "default": true,
+          "description": "Add random jitter to prevent concurrent runs from retrying in lockstep.",
+          "type": "boolean"
+        },
+        "max_backoff_ms": {
+          "default": 30000,
+          "description": "Maximum backoff duration in milliseconds (caps exponential growth).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_retries": {
+          "default": 3,
+          "description": "Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Configuration for a named adapter instance.\n\nThe `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.\n\nCredential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.",
+  "properties": {
+    "account": {
+      "description": "Snowflake account identifier (e.g., \"xy12345.us-east-1\").",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "api_key": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "api_secret": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "client_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "client_secret": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "database": {
+      "description": "Default database for the session.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "host": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "http_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AdapterKind"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Role this adapter block plays. See [`AdapterKind`] for the required-vs-optional rules per adapter type."
+    },
+    "location": {
+      "description": "BigQuery processing location (e.g., \"US\", \"EU\", \"us-central1\").",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "oauth_token": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "OAuth access token (pre-obtained from an IdP)."
+    },
+    "password": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Snowflake password (for password auth)."
+    },
+    "path": {
+      "description": "Optional file path for a persistent DuckDB database. When unset, the adapter uses an in-memory database. A persistent path is required when the same DuckDB adapter is also used as a discovery source — discovery and warehouse share the same database.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "private_key_path": {
+      "description": "Path to RSA private key file (PEM) for key-pair auth.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project_id": {
+      "description": "Google Cloud project ID.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retry": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RetryConfig"
+        }
+      ],
+      "default": {
+        "backoff_multiplier": 2.0,
+        "circuit_breaker_threshold": 5,
+        "initial_backoff_ms": 1000,
+        "jitter": true,
+        "max_backoff_ms": 30000,
+        "max_retries": 3
+      },
+      "description": "Retry policy for this adapter."
+    },
+    "role": {
+      "description": "Snowflake role to use for the session.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeout_secs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "token": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RedactedString"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "type": {
+      "description": "Adapter type: \"databricks\", \"fivetran\", \"duckdb\", etc.",
+      "type": "string"
+    },
+    "username": {
+      "description": "Snowflake username (for password or key-pair auth).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warehouse": {
+      "description": "Snowflake warehouse to use for query execution.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "type"
+  ],
+  "title": "AdapterConfig",
+  "type": "object"
+}

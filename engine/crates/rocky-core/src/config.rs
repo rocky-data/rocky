@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use indexmap::IndexMap;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -391,7 +392,7 @@ pub struct StateConfig {
 ///
 /// Rocky retries transient errors with exponential backoff and optional jitter
 /// to prevent thundering herd across concurrent runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
     #[serde(default = "default_max_retries")]
@@ -858,7 +859,7 @@ pub struct RockyConfig {
 ///
 /// Optional on single-role warehouse types (defaults to `Data`) and on
 /// the dual-capable DuckDB adapter (absent means "register both roles").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
     /// Warehouse data movement (reads / writes table bytes).
@@ -875,7 +876,7 @@ pub enum AdapterKind {
 /// Credential fields (`token`, `client_secret`, `api_key`, `api_secret`,
 /// `password`, `oauth_token`) are wrapped in [`RedactedString`] so that
 /// `Debug` output never leaks secrets.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterConfig {
     /// Adapter type: "databricks", "fivetran", "duckdb", etc.
     #[serde(rename = "type")]

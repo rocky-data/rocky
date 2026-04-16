@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rocky_core::config::AdapterConfig;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 
@@ -78,6 +79,13 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<LoadOutput>("load"),
         entry::<DagOutput>("dag"),
         entry::<DagRunOutput>("dag_run"),
+        // Phase 1: config types feeding the VS Code project schema. Not a
+        // CLI command output, but exported through the same pipeline so the
+        // IDE-facing rocky-project.schema.json can eventually be auto-
+        // generated. Phase 2 (PipelineConfig) is deferred — it has a custom
+        // Deserialize impl handling the `type` discriminator that a naive
+        // schemars derive would not match.
+        entry::<AdapterConfig>("adapter_config"),
     ]
 }
 

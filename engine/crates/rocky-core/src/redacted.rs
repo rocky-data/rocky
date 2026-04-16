@@ -11,6 +11,9 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::Schema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A string whose `Debug` and `Display` impls print `***` instead of the
@@ -67,6 +70,20 @@ impl Serialize for RedactedString {
 impl<'de> Deserialize<'de> for RedactedString {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(RedactedString)
+    }
+}
+
+/// `JsonSchema` is implemented by delegating to [`String`], so
+/// `RedactedString` appears in generated schemas as a plain `string`.
+/// The `***` redaction is a runtime Debug/Display concern; the serialized
+/// wire value is a string, and that is what the schema must describe.
+impl JsonSchema for RedactedString {
+    fn schema_name() -> String {
+        "RedactedString".to_owned()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
     }
 }
 
