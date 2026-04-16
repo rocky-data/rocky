@@ -166,6 +166,32 @@ pub enum ConfigError {
 
     #[error("invalid schema pattern: {0}")]
     InvalidPattern(#[from] crate::schema::SchemaError),
+
+    #[error(
+        "adapter '{name}' (type '{adapter_type}') is discovery-only; \
+         add `kind = \"discovery\"` to the [adapter.{name}] block"
+    )]
+    AdapterMissingDiscoveryKind { name: String, adapter_type: String },
+
+    #[error(
+        "adapter '{name}' has `kind = \"{declared}\"` but type '{adapter_type}' only supports {supported}"
+    )]
+    AdapterKindUnsupported {
+        name: String,
+        adapter_type: String,
+        declared: String,
+        supported: String,
+    },
+
+    #[error(
+        "pipeline '{pipeline}' source.adapter = '{adapter}' points to an adapter whose `kind` excludes data movement"
+    )]
+    PipelineSourceAdapterNotData { pipeline: String, adapter: String },
+
+    #[error(
+        "pipeline '{pipeline}' source.discovery.adapter = '{adapter}' points to an adapter whose `kind` excludes discovery"
+    )]
+    PipelineDiscoveryAdapterNotDiscovery { pipeline: String, adapter: String },
 }
 
 /// Concurrency strategy for table processing.
@@ -822,6 +848,25 @@ pub struct RockyConfig {
     pub schema_evolution: SchemaEvolutionConfig,
 }
 
+/// Role an adapter block plays in the pipeline.
+///
+/// Set via `kind = "data"` or `kind = "discovery"` in an `[adapter.*]`
+/// block. Required on discovery-only adapter types (`fivetran`,
+/// `airbyte`, `iceberg`, `manual`) so the adapter's role is self-evident
+/// in the raw config file — a reader shouldn't have to know the Rust
+/// trait surface of each adapter to tell whether it moves data.
+///
+/// Optional on single-role warehouse types (defaults to `Data`) and on
+/// the dual-capable DuckDB adapter (absent means "register both roles").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdapterKind {
+    /// Warehouse data movement (reads / writes table bytes).
+    Data,
+    /// Metadata-only discovery (enumerates source schemas / connectors).
+    Discovery,
+}
+
 /// Configuration for a named adapter instance.
 ///
 /// The `type` field determines which adapter crate handles this config.
@@ -835,6 +880,11 @@ pub struct AdapterConfig {
     /// Adapter type: "databricks", "fivetran", "duckdb", etc.
     #[serde(rename = "type")]
     pub adapter_type: String,
+
+    /// Role this adapter block plays. See [`AdapterKind`] for the
+    /// required-vs-optional rules per adapter type.
+    #[serde(default)]
+    pub kind: Option<AdapterKind>,
 
     // -- Databricks fields --
     pub host: Option<String>,
@@ -889,6 +939,7 @@ impl std::fmt::Debug for AdapterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdapterConfig")
             .field("adapter_type", &self.adapter_type)
+            .field("kind", &self.kind)
             .field("host", &self.host)
             .field("http_path", &self.http_path)
             .field("token", &self.token.as_ref().map(|_| "***"))
@@ -1547,6 +1598,118 @@ pub struct PipelineTargetConfig {
     pub governance: GovernanceConfig,
 }
 
+/// Validates the `kind` field on every adapter block and every
+/// `source.adapter` / `source.discovery.adapter` reference.
+///
+/// Runs after deserialization so parse-time errors point readers at the
+/// exact config fix (e.g. "add `kind = \"discovery\"` to
+/// [adapter.fivetran_main]") rather than failing deep inside the CLI
+/// adapter registry at runtime.
+///
+/// Orthogonal to [`crate::config`]-level issues like unknown adapter types
+/// or missing pipeline adapter references — those are surfaced by the
+/// `rocky validate` command as rich diagnostics and by the CLI registry
+/// at instantiation time. This function narrows its focus to the `kind`
+/// invariants so the two error paths don't double-report.
+pub fn validate_adapter_kinds(config: &RockyConfig) -> Result<(), ConfigError> {
+    use crate::adapter_capability::capability_for;
+
+    for (name, adapter) in &config.adapters {
+        let Some(cap) = capability_for(&adapter.adapter_type) else {
+            continue;
+        };
+
+        match (adapter.kind, cap.supports_data, cap.supports_discovery) {
+            // Discovery-only type — `kind = "discovery"` is required so
+            // the role is self-evident in the raw config file.
+            (None, false, true) => {
+                return Err(ConfigError::AdapterMissingDiscoveryKind {
+                    name: name.clone(),
+                    adapter_type: adapter.adapter_type.clone(),
+                });
+            }
+            // Declared `kind` must be a role the adapter actually supports.
+            (Some(AdapterKind::Data), false, _) => {
+                return Err(ConfigError::AdapterKindUnsupported {
+                    name: name.clone(),
+                    adapter_type: adapter.adapter_type.clone(),
+                    declared: "data".to_owned(),
+                    supported: "discovery".to_owned(),
+                });
+            }
+            (Some(AdapterKind::Discovery), _, false) => {
+                return Err(ConfigError::AdapterKindUnsupported {
+                    name: name.clone(),
+                    adapter_type: adapter.adapter_type.clone(),
+                    declared: "discovery".to_owned(),
+                    supported: "data".to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+
+        // Skip missing / unknown-type references — those are reported by
+        // `rocky validate` (V022 / V017) or by the registry at runtime.
+        if let Some(source_cfg) = config.adapters.get(&replication.source.adapter) {
+            if capability_for(&source_cfg.adapter_type).is_some()
+                && !adapter_role_active(source_cfg, AdapterKind::Data)
+            {
+                return Err(ConfigError::PipelineSourceAdapterNotData {
+                    pipeline: pipeline_name.clone(),
+                    adapter: replication.source.adapter.clone(),
+                });
+            }
+        }
+
+        if let Some(discovery) = &replication.source.discovery {
+            if let Some(disc_cfg) = config.adapters.get(&discovery.adapter) {
+                if capability_for(&disc_cfg.adapter_type).is_some()
+                    && !adapter_role_active(disc_cfg, AdapterKind::Discovery)
+                {
+                    return Err(ConfigError::PipelineDiscoveryAdapterNotDiscovery {
+                        pipeline: pipeline_name.clone(),
+                        adapter: discovery.adapter.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Does this adapter actively serve `role`?
+///
+/// An adapter block actively serves a role when:
+/// - its type supports that role, AND
+/// - the user hasn't narrowed `kind` to a *different* role.
+///
+/// `kind = None` on a dual-role type (DuckDB) means both roles are active.
+fn adapter_role_active(adapter: &AdapterConfig, role: AdapterKind) -> bool {
+    let Some(cap) = crate::adapter_capability::capability_for(&adapter.adapter_type) else {
+        return false;
+    };
+
+    let supports = match role {
+        AdapterKind::Data => cap.supports_data,
+        AdapterKind::Discovery => cap.supports_discovery,
+    };
+    if !supports {
+        return false;
+    }
+
+    match adapter.kind {
+        None => true,
+        Some(declared) => declared == role,
+    }
+}
+
 /// Loads and parses a Rocky configuration from a TOML file (v2 format only).
 ///
 /// Environment variables are substituted before parsing. Supports both named
@@ -1558,6 +1721,9 @@ pub struct PipelineTargetConfig {
 /// a `tracing::warn!` is emitted for each one. Callers that need to surface
 /// deprecation warnings programmatically (e.g., `rocky doctor`, `rocky
 /// validate`) can use [`check_config_deprecations`] on the raw TOML string.
+///
+/// Also validates adapter `kind` fields and pipeline adapter references —
+/// see [`validate_adapter_kinds`].
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -1573,6 +1739,7 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     apply_deprecations(&mut value);
     normalize_toml_shorthands(&mut value);
     let config: RockyConfig = value.try_into()?;
+    validate_adapter_kinds(&config)?;
     Ok(config)
 }
 
@@ -1737,6 +1904,204 @@ mod tests {
         ));
     }
 
+    // --- adapter kind validation ---
+
+    fn parse(toml_str: &str) -> RockyConfig {
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        normalize_toml_shorthands(&mut value);
+        value.try_into().unwrap()
+    }
+
+    #[test]
+    fn discovery_only_adapter_requires_kind_field() {
+        let cfg = parse(
+            r#"
+[adapter.fivetran_main]
+type = "fivetran"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+"#,
+        );
+        let err = validate_adapter_kinds(&cfg).unwrap_err();
+        match err {
+            ConfigError::AdapterMissingDiscoveryKind { name, adapter_type } => {
+                assert_eq!(name, "fivetran_main");
+                assert_eq!(adapter_type, "fivetran");
+            }
+            other => panic!("expected AdapterMissingDiscoveryKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discovery_only_adapter_with_kind_field_validates() {
+        let cfg = parse(
+            r#"
+[adapter.fivetran_main]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+"#,
+        );
+        validate_adapter_kinds(&cfg).expect("config should validate");
+    }
+
+    #[test]
+    fn data_only_adapter_rejects_discovery_kind() {
+        let cfg = parse(
+            r#"
+[adapter.db]
+type = "databricks"
+kind = "discovery"
+host = "h"
+http_path = "p"
+token = "t"
+"#,
+        );
+        let err = validate_adapter_kinds(&cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::AdapterKindUnsupported { ref declared, .. }
+                if declared == "discovery"
+        ));
+    }
+
+    #[test]
+    fn data_only_adapter_without_kind_validates() {
+        let cfg = parse(
+            r#"
+[adapter.db]
+type = "databricks"
+host = "h"
+http_path = "p"
+token = "t"
+"#,
+        );
+        validate_adapter_kinds(&cfg).expect("config should validate");
+    }
+
+    #[test]
+    fn duckdb_without_kind_validates_as_both_roles() {
+        let cfg = parse(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.source.discovery]
+adapter = "local"
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        validate_adapter_kinds(&cfg).expect("duckdb should serve both roles without kind");
+    }
+
+    #[test]
+    fn pipeline_discovery_reference_to_data_only_adapter_errors() {
+        let cfg = parse(
+            r#"
+[adapter.db]
+type = "databricks"
+host = "h"
+http_path = "p"
+token = "t"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "db"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.source.discovery]
+adapter = "db"
+
+[pipeline.poc.target]
+adapter = "db"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let err = validate_adapter_kinds(&cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PipelineDiscoveryAdapterNotDiscovery { .. }
+        ));
+    }
+
+    #[test]
+    fn pipeline_source_reference_to_discovery_only_adapter_errors() {
+        // Fivetran's role is narrowed to discovery; trying to use it as
+        // a data source at `source.adapter` should be rejected at parse.
+        let cfg = parse(
+            r#"
+[adapter.fivetran_main]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "fivetran_main"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "fivetran_main"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let err = validate_adapter_kinds(&cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PipelineSourceAdapterNotData { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_adapter_type_is_ignored_by_kind_validation() {
+        // Unknown adapter types are reported by `rocky validate` (V017)
+        // and by the registry at runtime — not by kind validation.
+        let cfg = parse(
+            r#"
+[adapter.mystery]
+type = "postgres"
+"#,
+        );
+        validate_adapter_kinds(&cfg).expect("unknown adapter type is someone else's problem");
+    }
+
     // --- v2 config tests ---
 
     #[test]
@@ -1755,6 +2120,7 @@ timeout_secs = 300
 
 [adapter.fivetran_main]
 type = "fivetran"
+kind = "discovery"
 destination_id = "dest_123"
 api_key = "key_abc"
 api_secret = "secret_xyz"
@@ -3003,6 +3369,7 @@ table = "customers_history"
     fn adapter_config_debug_hides_secrets() {
         let cfg = AdapterConfig {
             adapter_type: "databricks".into(),
+            kind: None,
             host: Some("workspace.cloud.databricks.com".into()),
             http_path: Some("/sql/1.0/warehouses/abc".into()),
             token: Some(RedactedString::new("dapi_SUPER_SECRET_TOKEN".into())),

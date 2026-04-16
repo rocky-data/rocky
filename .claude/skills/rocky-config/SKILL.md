@@ -50,6 +50,18 @@ Substitution happens in `rocky-core/src/config.rs` before serde sees the value.
 
 An unnamed `[adapter]` with a `type` key auto-wraps as `adapter.default`. Pipeline adapter refs default to `"default"` — so you can omit `adapter = "default"` lines everywhere.
 
+### The `kind` field
+
+`kind` declares the role an `[adapter.*]` block plays. Two valid values: `"data"` (warehouse read/write) and `"discovery"` (metadata enumeration).
+
+| Adapter type | `kind` rule |
+|---|---|
+| `databricks`, `snowflake`, `bigquery` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
+| `fivetran`, `airbyte`, `iceberg`, `manual` | **Required — must be `"discovery"`.** Omitting it is a parse error: these adapters have no data path. |
+| `duckdb` | Optional — absent means "register both roles" (the common DuckDB case). Setting `"data"` or `"discovery"` narrows to a single role. |
+
+Requiring `kind` on discovery-only adapter types is deliberate: a reader should be able to tell from the raw config alone that `[adapter.fivetran]` is metadata-only, without knowing the Rust trait surface.
+
 ### DuckDB (no credentials)
 
 ```toml
@@ -91,15 +103,18 @@ private_key_path = "${SNOWFLAKE_KEY_PATH}"
 # password = "${SNOWFLAKE_PASSWORD}"
 ```
 
-### Fivetran (source adapter)
+### Fivetran (discovery-only)
 
 ```toml
 [adapter.fivetran]
 type           = "fivetran"
+kind           = "discovery"                     # required: fivetran has no data path
 destination_id = "${FIVETRAN_DESTINATION_ID}"
 api_key        = "${FIVETRAN_API_KEY}"
 api_secret     = "${FIVETRAN_API_SECRET}"
 ```
+
+Use this block in `pipeline.*.source.discovery.adapter` to let Rocky query the Fivetran REST API for the list of schemas to sync. Data itself flows through whichever warehouse adapter is referenced by `pipeline.*.source.adapter` (usually Databricks or Snowflake — the destination Fivetran populates).
 
 ### Named adapters (multi-adapter configs)
 
@@ -110,6 +125,7 @@ type = "databricks"
 
 [adapter.source]
 type = "fivetran"
+kind = "discovery"
 # …
 
 [pipeline.raw]

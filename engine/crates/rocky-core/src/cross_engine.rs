@@ -482,6 +482,7 @@ mod tests {
     fn adapter(adapter_type: &str) -> AdapterConfig {
         AdapterConfig {
             adapter_type: adapter_type.to_owned(),
+            kind: None,
             host: None,
             http_path: None,
             token: None,

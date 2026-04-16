@@ -150,6 +150,10 @@ token = "${DATABRICKS_TOKEN:-}"
 
 [adapter.fivetran_main]
 type = "fivetran"
+# Fivetran is metadata-only: Rocky calls the Fivetran REST API to
+# enumerate connectors. It does not move data — that's the warehouse
+# adapter above.
+kind = "discovery"
 destination_id = "${FIVETRAN_DESTINATION_ID}"
 api_key = "${FIVETRAN_API_KEY}"
 api_secret = "${FIVETRAN_API_SECRET}"
