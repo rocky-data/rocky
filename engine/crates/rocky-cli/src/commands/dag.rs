@@ -8,7 +8,7 @@
 //! Consumers (dagster-rocky) can build a complete, connected Dagster asset
 //! graph from a single `rocky dag --output json` call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -175,7 +175,7 @@ fn build_dag_output(
         .collect();
 
     // Summary.
-    let mut counts_by_kind: HashMap<String, usize> = HashMap::new();
+    let mut counts_by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for node in &dag.nodes {
         *counts_by_kind.entry(node.kind.to_string()).or_default() += 1;
     }

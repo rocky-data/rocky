@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.3.0",
   "command": "compile",
   "models": 3,
   "execution_layers": 3,

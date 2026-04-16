@@ -91,17 +91,21 @@ path = sys.argv[1]
 # Numeric timing fields (durations) — zeroed for determinism.
 TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
 # Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics rows. Replaced with
-# a fixed sentinel so the corpus is byte-stable across regen runs. NOTE we
-# do NOT touch ``last_value`` (the watermark itself, which is a logical
-# value derived from the seeded data and IS deterministic) or anything in
-# the `data` payload — only fields whose name matches the wall-clock set.
+# current time when it writes state / history / metrics / run-metadata rows.
+# Replaced with a fixed sentinel so the corpus is byte-stable across regen
+# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
+# materialization metadata) are both wall-clock under the current engine
+# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
+# than a data-derived value. A future change that makes these data-derived
+# would need to drop them from this set.
 WALL_CLOCK_FIELDS = {
     "updated_at",
     "started_at",
     "finished_at",
     "timestamp",
     "captured_at",
+    "last_value",
+    "watermark",
 }
 SENTINEL_TS = "2000-01-01T00:00:00Z"
 def normalize(node):
@@ -180,17 +184,21 @@ path = sys.argv[1]
 # Numeric timing fields (durations) — zeroed for determinism.
 TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
 # Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics rows. Replaced with
-# a fixed sentinel so the corpus is byte-stable across regen runs. NOTE we
-# do NOT touch ``last_value`` (the watermark itself, which is a logical
-# value derived from the seeded data and IS deterministic) or anything in
-# the `data` payload — only fields whose name matches the wall-clock set.
+# current time when it writes state / history / metrics / run-metadata rows.
+# Replaced with a fixed sentinel so the corpus is byte-stable across regen
+# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
+# materialization metadata) are both wall-clock under the current engine
+# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
+# than a data-derived value. A future change that makes these data-derived
+# would need to drop them from this set.
 WALL_CLOCK_FIELDS = {
     "updated_at",
     "started_at",
     "finished_at",
     "timestamp",
     "captured_at",
+    "last_value",
+    "watermark",
 }
 SENTINEL_TS = "2000-01-01T00:00:00Z"
 def normalize(node):
@@ -281,17 +289,21 @@ path = sys.argv[1]
 # Numeric timing fields (durations) — zeroed for determinism.
 TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
 # Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics rows. Replaced with
-# a fixed sentinel so the corpus is byte-stable across regen runs. NOTE we
-# do NOT touch ``last_value`` (the watermark itself, which is a logical
-# value derived from the seeded data and IS deterministic) or anything in
-# the `data` payload — only fields whose name matches the wall-clock set.
+# current time when it writes state / history / metrics / run-metadata rows.
+# Replaced with a fixed sentinel so the corpus is byte-stable across regen
+# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
+# materialization metadata) are both wall-clock under the current engine
+# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
+# than a data-derived value. A future change that makes these data-derived
+# would need to drop them from this set.
 WALL_CLOCK_FIELDS = {
     "updated_at",
     "started_at",
     "finished_at",
     "timestamp",
     "captured_at",
+    "last_value",
+    "watermark",
 }
 SENTINEL_TS = "2000-01-01T00:00:00Z"
 def normalize(node):

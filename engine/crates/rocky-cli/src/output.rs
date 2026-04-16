@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use chrono::{DateTime, Utc};
@@ -1780,7 +1780,7 @@ pub struct DagSummaryOutput {
     pub total_nodes: usize,
     pub total_edges: usize,
     pub execution_layers: usize,
-    pub counts_by_kind: HashMap<String, usize>,
+    pub counts_by_kind: BTreeMap<String, usize>,
 }
 
 /// Output of `rocky run --dag`: per-node execution results plus aggregate counts.
