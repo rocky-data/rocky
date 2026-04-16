@@ -529,7 +529,9 @@ impl LoadSource {
             Self::LocalFile(p) => p.extension().and_then(|e| e.to_str()),
             Self::CloudUri(uri) => {
                 let path = uri.rsplit('/').next().unwrap_or("");
-                path.rsplit('.').next().filter(|e| !e.is_empty() && *e != path)
+                path.rsplit('.')
+                    .next()
+                    .filter(|e| !e.is_empty() && *e != path)
             }
         }
     }

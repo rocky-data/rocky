@@ -73,7 +73,10 @@ fn format_target(target: &TableRef) -> String {
     if target.catalog.is_empty() {
         format!("`{}`.`{}`", target.schema, target.table)
     } else {
-        format!("`{}`.`{}`.`{}`", target.catalog, target.schema, target.table)
+        format!(
+            "`{}`.`{}`.`{}`",
+            target.catalog, target.schema, target.table
+        )
     }
 }
 
@@ -131,19 +134,17 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
         if options.create_table {
             let columns = reader.column_names();
             if !columns.is_empty() {
-                let col_defs: Vec<String> = columns
-                    .iter()
-                    .map(|c| format!("`{c}` STRING"))
-                    .collect();
+                let col_defs: Vec<String> =
+                    columns.iter().map(|c| format!("`{c}` STRING")).collect();
                 let sql = format!(
                     "CREATE TABLE IF NOT EXISTS {target_ref} ({})",
                     col_defs.join(", ")
                 );
                 debug!(sql = %sql, "ensuring target table exists");
                 self.adapter
-                .execute_statement(&sql)
-                .await
-                .map_err(|e| AdapterError::msg(e.to_string()))?;
+                    .execute_statement(&sql)
+                    .await
+                    .map_err(|e| AdapterError::msg(e.to_string()))?;
             }
         }
 
@@ -151,8 +152,8 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
         let dialect = self.adapter.dialect();
 
         for batch_res in reader {
-            let batch =
-                batch_res.map_err(|e| AdapterError::msg(format!("failed to read CSV batch: {e}")))?;
+            let batch = batch_res
+                .map_err(|e| AdapterError::msg(format!("failed to read CSV batch: {e}")))?;
             let batch_row_count = batch.row_count as u64;
             let sql = generate_batch_insert_sql(&batch, &target_ref, dialect)
                 .map_err(|e| AdapterError::msg(format!("failed to build INSERT SQL: {e}")))?;

@@ -26,10 +26,7 @@ impl StageName {
         if name.is_empty() {
             return Err(AdapterError::msg("stage name cannot be empty"));
         }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(AdapterError::msg(format!(
                 "invalid stage name '{name}' — must be [A-Za-z0-9_]+"
             )));
@@ -59,7 +56,11 @@ impl std::fmt::Display for StageName {
 /// Temporary stages are dropped automatically when the session ends, so a
 /// failed load still cleans up resources. Includes FILE_FORMAT defaults for
 /// the given [`FileFormat`] so COPY INTO doesn't need to re-specify them.
-pub fn create_temporary_stage_sql(name: &StageName, format: FileFormat, options: &LoadOptions) -> String {
+pub fn create_temporary_stage_sql(
+    name: &StageName,
+    format: FileFormat,
+    options: &LoadOptions,
+) -> String {
     format!(
         "CREATE TEMPORARY STAGE {name} FILE_FORMAT = ({})",
         file_format_clause(format, options)

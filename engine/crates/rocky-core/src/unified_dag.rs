@@ -1742,10 +1742,7 @@ mod tests {
 
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
-        assert_eq!(
-            dag.edges[0].to,
-            NodeId::new("transformation", "stg_orders")
-        );
+        assert_eq!(dag.edges[0].to, NodeId::new("transformation", "stg_orders"));
         assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
     }
 

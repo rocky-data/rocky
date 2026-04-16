@@ -64,10 +64,7 @@ fn cloud_provider(
 }
 
 /// Downloads state from remote storage to a local file before a run.
-pub async fn download_state(
-    config: &StateConfig,
-    local_path: &Path,
-) -> Result<(), StateSyncError> {
+pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
@@ -115,10 +112,7 @@ pub async fn download_state(
 }
 
 /// Uploads state from a local file to remote storage after a run.
-pub async fn upload_state(
-    config: &StateConfig,
-    local_path: &Path,
-) -> Result<(), StateSyncError> {
+pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     if !local_path.exists() {
         debug!("No local state file to upload");
         return Ok(());
@@ -222,10 +216,14 @@ async fn upload_to_object_store(
 
 /// Download state from Valkey/Redis.
 fn download_from_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
-    let url = config.valkey_url.as_deref().ok_or_else(|| {
-        StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into())
-    })?;
-    let prefix = config.valkey_prefix.as_deref().unwrap_or(DEFAULT_VALKEY_PREFIX);
+    let url = config
+        .valkey_url
+        .as_deref()
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?;
+    let prefix = config
+        .valkey_prefix
+        .as_deref()
+        .unwrap_or(DEFAULT_VALKEY_PREFIX);
     let key = format!("{prefix}{STATE_FILE}");
 
     info!(key = key, "downloading state from Valkey");
@@ -257,10 +255,14 @@ fn download_from_valkey(config: &StateConfig, local_path: &Path) -> Result<(), S
 
 /// Upload state to Valkey/Redis.
 fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
-    let url = config.valkey_url.as_deref().ok_or_else(|| {
-        StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into())
-    })?;
-    let prefix = config.valkey_prefix.as_deref().unwrap_or(DEFAULT_VALKEY_PREFIX);
+    let url = config
+        .valkey_url
+        .as_deref()
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?;
+    let prefix = config
+        .valkey_prefix
+        .as_deref()
+        .unwrap_or(DEFAULT_VALKEY_PREFIX);
     let key = format!("{prefix}{STATE_FILE}");
 
     let data = std::fs::read(local_path)?;

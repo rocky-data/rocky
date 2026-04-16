@@ -348,6 +348,7 @@ mod tests {
             contracts_dir: None,
             config_path: None,
             compile_result: tokio::sync::RwLock::new(None),
+            dag_status: rocky_core::dag_status::DagStatusStore::new(),
         })
     }
 

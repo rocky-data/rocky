@@ -88,12 +88,16 @@ impl ObjectStoreProvider {
             .host_str()
             .ok_or_else(|| ObjectStoreError::InvalidUri(uri.into(), "missing host/bucket".into()))?
             .to_string();
-        let prefix = parsed.path().trim_start_matches('/').trim_end_matches('/').to_string();
+        let prefix = parsed
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
 
         let store: Arc<dyn ObjectStore> = match scheme.as_str() {
             "s3" | "s3a" => {
-                let builder = object_store::aws::AmazonS3Builder::from_env()
-                    .with_bucket_name(&bucket);
+                let builder =
+                    object_store::aws::AmazonS3Builder::from_env().with_bucket_name(&bucket);
                 Arc::new(builder.build()?)
             }
             "gs" | "gcs" => {
@@ -236,7 +240,10 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_put_get() {
         let provider = ObjectStoreProvider::in_memory();
-        provider.put("key1", Bytes::from_static(b"hello")).await.unwrap();
+        provider
+            .put("key1", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
         let got = provider.get("key1").await.unwrap();
         assert_eq!(got.as_ref(), b"hello");
     }
@@ -244,9 +251,18 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_list() {
         let provider = ObjectStoreProvider::in_memory();
-        provider.put("a/1.txt", Bytes::from_static(b"1")).await.unwrap();
-        provider.put("a/2.txt", Bytes::from_static(b"2")).await.unwrap();
-        provider.put("b/3.txt", Bytes::from_static(b"3")).await.unwrap();
+        provider
+            .put("a/1.txt", Bytes::from_static(b"1"))
+            .await
+            .unwrap();
+        provider
+            .put("a/2.txt", Bytes::from_static(b"2"))
+            .await
+            .unwrap();
+        provider
+            .put("b/3.txt", Bytes::from_static(b"3"))
+            .await
+            .unwrap();
 
         let mut paths = provider.list("a").await.unwrap();
         paths.sort();

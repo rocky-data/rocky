@@ -262,7 +262,11 @@ mod tests {
         let file = csv_file("id,name\n1,Alice\n2,Bob\n3,Carol\n");
 
         let result = adapter
-            .load(&local(file.path()), &target("people"), &LoadOptions::default())
+            .load(
+                &local(file.path()),
+                &target("people"),
+                &LoadOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -497,12 +501,7 @@ mod tests {
     #[test]
     fn test_load_sql_parquet() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.parquet"));
-        let sql = load_sql(
-            &src,
-            "main.t",
-            FileFormat::Parquet,
-            &LoadOptions::default(),
-        );
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
         assert_eq!(sql, "COPY main.t FROM '/tmp/data.parquet' (FORMAT PARQUET)");
     }
 
@@ -522,12 +521,7 @@ mod tests {
     #[test]
     fn test_load_sql_cloud_uri() {
         let src = LoadSource::CloudUri("s3://bucket/data.parquet".into());
-        let sql = load_sql(
-            &src,
-            "main.t",
-            FileFormat::Parquet,
-            &LoadOptions::default(),
-        );
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
         assert_eq!(
             sql,
             "COPY main.t FROM 's3://bucket/data.parquet' (FORMAT PARQUET)"

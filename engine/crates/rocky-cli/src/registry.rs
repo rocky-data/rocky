@@ -366,8 +366,9 @@ impl AdapterRegistry {
         let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
             .context(format!("adapters.{name}: auth configuration error"))?;
 
-        let adapter = rocky_bigquery::connector::BigQueryAdapter::new(project_id, location, bq_auth)
-            .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300));
+        let adapter =
+            rocky_bigquery::connector::BigQueryAdapter::new(project_id, location, bq_auth)
+                .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300));
         Ok(Box::new(rocky_bigquery::BigQueryLoaderAdapter::new(
             Arc::new(adapter),
         )))
@@ -376,7 +377,9 @@ impl AdapterRegistry {
     /// Build a Databricks `LoaderAdapter` (COPY INTO based).
     pub fn databricks_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
         let connector = self.databricks_connector(name)?;
-        Ok(Box::new(rocky_databricks::loader::DatabricksLoaderAdapter::new(connector)))
+        Ok(Box::new(
+            rocky_databricks::loader::DatabricksLoaderAdapter::new(connector),
+        ))
     }
 
     /// Build a Snowflake `LoaderAdapter` (stage-based COPY INTO).

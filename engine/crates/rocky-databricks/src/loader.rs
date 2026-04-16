@@ -80,7 +80,11 @@ fn file_format_clause(format: FileFormat) -> &'static str {
 fn format_options_clause(format: FileFormat, options: &LoadOptions) -> Option<String> {
     match format {
         FileFormat::Csv => {
-            let header = if options.csv_has_header { "true" } else { "false" };
+            let header = if options.csv_has_header {
+                "true"
+            } else {
+                "false"
+            };
             let delim = options.csv_delimiter;
             Some(format!(
                 "FORMAT_OPTIONS ('header' = '{header}', 'delimiter' = '{delim}')"

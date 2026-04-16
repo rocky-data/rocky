@@ -304,10 +304,7 @@ mod tests {
     #[tokio::test]
     async fn test_executes_simple_chain() {
         let dag = UnifiedDag {
-            nodes: vec![
-                n("a", NodeKind::Source),
-                n("b", NodeKind::Transformation),
-            ],
+            nodes: vec![n("a", NodeKind::Source), n("b", NodeKind::Transformation)],
             edges: vec![e("a", "b")],
         };
         let counter = Arc::new(AtomicUsize::new(0));

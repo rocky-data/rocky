@@ -10,7 +10,6 @@
 //! up. The explicit `DROP STAGE IF EXISTS` after each load keeps long-running
 //! sessions tidy.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -174,10 +173,9 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
     }
 }
 
-/// Convert a local [`PathBuf`] to a string for SQL interpolation, rejecting
-/// paths that contain single quotes (which would break the `file://` URI
-/// literal).
-fn local_path_str(path: &PathBuf) -> AdapterResult<String> {
+/// Convert a local path to a string for SQL interpolation, rejecting paths
+/// that contain single quotes (which would break the `file://` URI literal).
+fn local_path_str(path: &std::path::Path) -> AdapterResult<String> {
     let s = path.display().to_string();
     if s.contains('\'') {
         return Err(AdapterError::msg(format!(
@@ -191,6 +189,7 @@ fn local_path_str(path: &PathBuf) -> AdapterResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_format_target_fully_qualified() {
