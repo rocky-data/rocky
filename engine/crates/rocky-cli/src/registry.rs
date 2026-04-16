@@ -14,11 +14,14 @@ use crate::error_reporter;
 
 use rocky_adapter_sdk::LoaderAdapter;
 use rocky_core::config::{AdapterConfig, RockyConfig};
-use rocky_core::traits::{DiscoveryAdapter, WarehouseAdapter};
+use rocky_core::traits::{
+    BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, NoopGovernanceAdapter, WarehouseAdapter,
+};
 
 use rocky_databricks::adapter::{DatabricksBatchCheckAdapter, DatabricksWarehouseAdapter};
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+use rocky_databricks::governance::DatabricksGovernanceAdapter;
 
 #[cfg(feature = "duckdb")]
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -336,10 +339,46 @@ impl AdapterRegistry {
         self.discovery.keys().cloned().collect()
     }
 
-    /// Create a batch check adapter for a Databricks warehouse adapter.
-    pub fn batch_check_adapter(&self, name: &str) -> Result<DatabricksBatchCheckAdapter> {
-        let connector = self.databricks_connector(name)?;
-        Ok(DatabricksBatchCheckAdapter::new(connector))
+    /// Create a batch check adapter for the named warehouse, if one is
+    /// available. Returns `None` when the warehouse has no batch-optimised
+    /// check implementation — callers fall back to the per-table
+    /// [`WarehouseAdapter`] trait methods.
+    ///
+    /// Currently only Databricks implements [`BatchCheckAdapter`] (UNION ALL
+    /// row counts + freshness + `information_schema.columns` describe).
+    pub fn batch_check_adapter(&self, name: &str) -> Option<Arc<dyn BatchCheckAdapter>> {
+        let connector = self.connectors.get(name)?.clone();
+        Some(Arc::new(DatabricksBatchCheckAdapter::new(connector)))
+    }
+
+    /// Build a governance adapter for the named warehouse.
+    ///
+    /// Returns a Databricks-backed [`GovernanceAdapter`] when the target
+    /// adapter is Databricks (with Unity Catalog tagging, permissions, and
+    /// workspace binding). For every other adapter kind this returns a
+    /// [`NoopGovernanceAdapter`], which silently succeeds — governance
+    /// operations are skipped rather than failing.
+    pub fn governance_adapter(&self, name: &str) -> Box<dyn GovernanceAdapter> {
+        let Some(connector) = self.connectors.get(name).cloned() else {
+            return Box::new(NoopGovernanceAdapter);
+        };
+        let adapter_cfg = self.adapter_configs.get(name);
+        let auth = adapter_cfg.and_then(|cfg| {
+            Auth::from_config(AuthConfig {
+                host: cfg.host.clone().unwrap_or_default(),
+                token: cfg.token.as_ref().map(|s| s.expose().to_string()),
+                client_id: cfg.client_id.clone(),
+                client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
+            })
+            .ok()
+        });
+        match auth {
+            Some(a) => {
+                let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
+                Box::new(DatabricksGovernanceAdapter::new(connector, host, a))
+            }
+            None => Box::new(DatabricksGovernanceAdapter::without_workspace(connector)),
+        }
     }
 
     /// Build a BigQuery `LoaderAdapter` wrapping the registered warehouse adapter.
