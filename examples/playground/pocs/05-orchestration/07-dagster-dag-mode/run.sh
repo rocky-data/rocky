@@ -63,7 +63,7 @@ echo ""
 echo "To test dag_mode in the Dagster UI:"
 echo ""
 echo "  cd $HERE"
-echo "  uv run dg dev"
+echo "  uv sync && uv run dg dev"
 echo ""
 echo "Then open http://localhost:3000 and verify:"
 echo "  1. Asset graph shows: source:ingest -> load:ingest -> stg_orders -> fct_customer_revenue"
@@ -71,6 +71,7 @@ echo "  2. Dependencies are connected (click any node to see upstream/downstream
 echo "  3. 'Materialize all' executes successfully"
 echo ""
 
-# --- Cleanup ---
-rm -f poc.duckdb .rocky-state.redb
-echo "POC complete."
+# NOTE: poc.duckdb and .rocky-state.redb are left in place so
+# `uv run dg dev` can load the cached state. Clean up manually
+# with: rm -f poc.duckdb .rocky-state.redb
+echo "POC complete. Run 'uv sync && uv run dg dev' to open the Dagster UI."

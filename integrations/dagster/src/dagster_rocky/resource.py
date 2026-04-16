@@ -396,9 +396,17 @@ class RockyResource(dg.ConfigurableResource):
     # Discovery & execution (always CLI)                                 #
     # ------------------------------------------------------------------ #
 
-    def discover(self) -> DiscoverResult:
-        """Run ``rocky discover`` and return the parsed result."""
-        return DiscoverResult.model_validate_json(self._run_rocky(["discover"]))
+    def discover(self, *, pipeline: str | None = None) -> DiscoverResult:
+        """Run ``rocky discover`` and return the parsed result.
+
+        Args:
+            pipeline: Pipeline name (required when multiple pipelines are
+                defined in ``rocky.toml``).
+        """
+        args = ["discover"]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
+        return DiscoverResult.model_validate_json(self._run_rocky(args))
 
     def plan(self, filter: str) -> PlanResult:
         """Run ``rocky plan --filter <key=value>`` and return the parsed result."""

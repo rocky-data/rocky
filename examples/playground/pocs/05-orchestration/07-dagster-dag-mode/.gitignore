@@ -1,0 +1,6 @@
+.venv/
+uv.lock
+*.egg-info/
+poc.duckdb
+.rocky-state.redb
+expected/
