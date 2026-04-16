@@ -8,12 +8,6 @@ sidebar:
 ## Install the package
 
 ```bash
-pip install dagster-rocky
-```
-
-Or with `uv`:
-
-```bash
 uv add dagster-rocky
 ```
 

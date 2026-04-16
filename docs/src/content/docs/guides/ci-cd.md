@@ -312,10 +312,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Python dependencies
-        run: pip install dagster dagster-rocky
+        run: uv add dagster dagster-rocky
 
       - name: Validate Dagster definitions
-        run: dagster definitions validate
+        run: uv run dg check defs
 ```
 
 Rocky's `ci` command validates the models independently. Dagster's `definitions validate` ensures the orchestration layer can load and wire the models into assets.

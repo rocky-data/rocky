@@ -10,8 +10,6 @@ and quality metrics surfaced as native Dagster events.
 
 ```bash
 uv add dagster-rocky
-# or
-pip install dagster-rocky
 ```
 
 You'll also need the Rocky CLI on your `$PATH`:
