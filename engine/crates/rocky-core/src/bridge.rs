@@ -142,42 +142,19 @@ pub struct BridgeCapability {
 
 /// Returns the bridge capabilities for a known adapter type.
 ///
-/// Adapter types that are discovery-only (fivetran, airbyte, iceberg) cannot
-/// participate in bridges — they have no warehouse execution capabilities.
+/// Data-plane capabilities (`can_export` / `can_import`) are derived from
+/// the canonical [`adapter_capability::capability_for`] table — any
+/// adapter without a `supports_data` role cannot participate in bridges.
+/// `cloud_storage` is orthogonal (it's about COPY INTO / UNLOAD support,
+/// not trait impls) and kept as a small local enumeration.
 pub fn adapter_capabilities(adapter_type: &str) -> BridgeCapability {
-    match adapter_type {
-        "databricks" => BridgeCapability {
-            can_export: true,
-            can_import: true,
-            cloud_storage: true,
-        },
-        "snowflake" => BridgeCapability {
-            can_export: true,
-            can_import: true,
-            cloud_storage: true,
-        },
-        "bigquery" => BridgeCapability {
-            can_export: true,
-            can_import: true,
-            cloud_storage: true,
-        },
-        "duckdb" => BridgeCapability {
-            can_export: true,
-            can_import: true,
-            cloud_storage: false,
-        },
-        // Discovery-only adapters cannot export or import.
-        "fivetran" | "airbyte" | "iceberg" | "manual" => BridgeCapability {
-            can_export: false,
-            can_import: false,
-            cloud_storage: false,
-        },
-        // Unknown adapter types — assume no capabilities.
-        _ => BridgeCapability {
-            can_export: false,
-            can_import: false,
-            cloud_storage: false,
-        },
+    let supports_data = crate::adapter_capability::capability_for(adapter_type)
+        .is_some_and(|cap| cap.supports_data);
+    let cloud_storage = matches!(adapter_type, "databricks" | "snowflake" | "bigquery");
+    BridgeCapability {
+        can_export: supports_data,
+        can_import: supports_data,
+        cloud_storage,
     }
 }
 
