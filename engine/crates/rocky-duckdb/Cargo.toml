@@ -1,6 +1,6 @@
 [package]
 name = "rocky-duckdb"
-version = "1.1.0"
+version = "1.2.0"
 description = "DuckDB local execution adapter for Rocky"
 edition.workspace = true
 license.workspace = true

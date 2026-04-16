@@ -712,9 +712,17 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
 
     let mut child = cmd.spawn()?;
 
-    // Write JSON context to stdin, then close it
+    // Write JSON context to stdin, then close it.
+    //
+    // Hooks that don't read stdin (e.g. `test "$VAR" = "x"`) may exit before
+    // we finish writing, closing the pipe and producing `EPIPE`. Treat that
+    // as success — the hook simply chose to ignore its stdin, which is fine.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(json.as_bytes()).await?;
+        match stdin.write_all(json.as_bytes()).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(HookError::Io(e)),
+        }
         drop(stdin); // close stdin so the child sees EOF
     }
 

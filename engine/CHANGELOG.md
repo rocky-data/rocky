@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-04-16
+
+### Added — `LoaderAdapter` widened to support cloud URIs
+
+`LoaderAdapter::load_file(&Path, ...)` is replaced by `load(&LoadSource, ...)`,
+where `LoadSource` is `LocalFile(PathBuf)` or `CloudUri(String)`. Recognized
+schemes: `s3://`, `s3a://`, `gs://`, `az://`, `abfs://`, `abfss://`. DuckDB's
+httpfs extension consumes the URI verbatim; cloud warehouse loaders generate
+COPY-style SQL pointing at the URI directly.
+
+### Added — Cloud object store provider (`ObjectStoreProvider`)
+
+New `rocky_core::object_store::ObjectStoreProvider` wraps Apache `object_store`
+with one async API for S3, GCS, Azure, local files, and an in-memory backend.
+Credential resolution follows the standard provider chains (`AWS_*` env vars,
+`GOOGLE_APPLICATION_CREDENTIALS`, etc.) — Rocky does not re-implement
+credential handling.
+
+### Added — Databricks `LoaderAdapter` (`COPY INTO`)
+
+New `rocky_databricks::loader::DatabricksLoaderAdapter` generates
+`COPY INTO catalog.schema.table FROM '<uri>' FILEFORMAT = ...` SQL for sources
+already in cloud storage. Supports CSV, Parquet, JSON. Local-file sources are
+rejected with a clear error message — Databricks reads from cloud URIs
+directly, so the user is expected to upload first.
+
+### Added — Snowflake `LoaderAdapter` (stage + `COPY INTO`)
+
+New `rocky_snowflake::loader::SnowflakeLoaderAdapter` and
+`rocky_snowflake::stage` module. Two execution paths:
+
+- **Local file:** `CREATE TEMPORARY STAGE → PUT file://... @stg → COPY INTO → DROP`
+- **Cloud URI:** `CREATE TEMPORARY STAGE ... URL = 's3://...' → COPY INTO → DROP`
+
+Temporary stages auto-expire at session end, so failed loads still clean up.
+Explicit `DROP STAGE IF EXISTS` after each load keeps long-running sessions
+tidy. Stage names are validated as SQL identifiers and generated with unique
+timestamp suffixes to avoid concurrent collisions.
+
+### Added — BigQuery `LoaderAdapter` (INSERT fallback)
+
+New `rocky_bigquery::loader::BigQueryLoaderAdapter` streams local CSVs through
+`CsvBatchReader` + `generate_batch_insert_sql` and dispatches the batches via
+the existing BigQuery REST connector. **Status: starter / dev-scale only** —
+INSERT-over-REST is orders of magnitude slower than native bulk load.
+Production-scale BigQuery loading needs the Storage Write API (gRPC streaming
+via `tonic`), deferred until demand appears. Cloud URIs and Parquet/JSON are
+also not supported in this iteration.
+
+### Added — `state_sync` migrated to `object_store`, plus GCS backend
+
+`state_sync` no longer shells out to `aws s3 cp`. The S3 path goes through
+`ObjectStoreProvider::download_file` / `upload_file`, eliminating the runtime
+dependency on the AWS CLI binary. New `StateBackend::Gcs` variant plus
+`gcs_bucket` / `gcs_prefix` fields on `StateConfig` add Google Cloud Storage
+as a first-class state backend.
+
+### Added — DAG-driven execution (`rocky run --dag`)
+
+`rocky run --dag` walks the unified DAG via `execution_phases()` and
+dispatches every node to its matching per-pipeline executor (replication,
+transformation, quality, snapshot, load, seed). Skip-downstream-on-failure:
+when a node fails, every node whose ancestor set contains the failed node is
+reported as `Skipped` rather than executed. Unrelated branches still run to
+completion.
+
+Layers respect Kahn topology; nodes within a layer run sequentially on the
+current task — within-layer parallelism is a follow-up (blocked on
+`tracing::EnteredSpan` not being `Send` in `run.rs`).
+
+New JSON output `DagRunOutput` is registered in `export_schemas`; the codegen
+cascade refreshed `integrations/dagster/.../types_generated/` and
+`editors/vscode/src/types/generated/`.
+
+### Added — DAG status tracking + `GET /api/v1/dag/status`
+
+New `DagStatusStore` on `ServerState` records the most recent DAG execution
+result. The HTTP endpoint returns `DagStatus { completed_at, result }` (full
+per-node breakdown), or `503` when no DAG run has been recorded.
+
+### Added — Runtime cross-pipeline dependency inference
+
+`unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name)` augments a
+DAG with `DataDependency` edges discovered by parsing each model's SQL and
+matching `FROM` references against producing nodes. Idempotent;
+case-insensitive; ignores self-refs; gracefully tolerates invalid SQL. Lets
+users skip per-model `depends_on` declarations when the SQL already makes
+the dependency obvious.
+
+### Added — `rocky run` Load pipeline dispatch
+
+`rocky run --pipeline X` now supports Load pipelines by delegating to the
+`rocky load` command. Previously hit an explicit bail; this is also the
+prerequisite that makes Load nodes in DAG execution work.
+
+### Notes
+
+- The DAG executor composes over the existing per-pipeline executors, so
+  `commands/run.rs` retains its direct `rocky_databricks::throttle` /
+  `::batch` / `::governance` imports for the replication path. Deeper
+  decoupling behind the adapter trait boundary is deferred.
+- `rows_loaded` is currently 0 for the Databricks and Snowflake loaders
+  (their COPY INTO responses contain row counts that aren't surfaced by
+  `execute_statement` today). Will be addressed in a follow-up.
+
 ### Added — Dagster Pipes protocol emitter (T2)
 
 `rocky run` now speaks the [Dagster Pipes](https://docs.dagster.io/concepts/dagster-pipes)
