@@ -10,7 +10,7 @@ Dagster (orchestrator)
   +-- dagster-rocky.RockyComponent
   |     |
   |     +-- rocky discover  -->  AssetSpecs (cached, no API calls on reload)
-  |     +-- rocky plan      -->  Preview SQL
+  |     +-- rocky dag       -->  Full unified DAG (dag_mode)
   |     +-- rocky run       -->  Execute pipeline
   |
   +-- rocky.toml (Rocky config)
@@ -40,6 +40,8 @@ dagster-integration/
 1. **`write_state_to_path()`** calls `rocky discover`, serializes to JSON, and saves to a state file
 2. **`build_defs_from_state()`** reads the cached JSON and creates `AssetSpec` objects without API calls
 
+With `dag_mode=True`, the component also calls `rocky dag` to build a fully connected asset graph where every pipeline stage (source, load, transformation) becomes a Dagster asset with resolved dependencies.
+
 ### RockyResource
 
 `RockyResource` wraps the Rocky CLI binary. Use it inside asset functions to run discover, plan, and run commands.
@@ -48,21 +50,17 @@ dagster-integration/
 
 ```bash
 # Install dagster-rocky
-pip install dagster-rocky
+uv add dagster-rocky
 
 # Ensure rocky binary is on PATH
-cargo install rocky
+rocky --version
 
 # Start Dagster dev server
-dagster dev -f definitions.py
+uv run dg dev
 ```
 
 ## Running
 
 ```bash
-# Preview what Dagster will see
-dagster dev -f definitions.py
-
-# Or use dg CLI
-dg dev
+uv run dg dev
 ```
