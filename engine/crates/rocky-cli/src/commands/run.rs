@@ -321,9 +321,19 @@ pub async fn run(
         }
         rocky_core::config::PipelineConfig::Replication(_) => {}
         rocky_core::config::PipelineConfig::Load(_) => {
-            anyhow::bail!(
-                "load pipelines are not yet supported by `rocky run`; use the adapter SDK directly"
-            );
+            // Delegate to the `rocky load` command, driving with the pipeline's
+            // own source_dir/format/target. This lets `rocky run --pipeline X`
+            // work uniformly across all pipeline types.
+            return super::load::run_load(
+                config_path,
+                None, // cli_source_dir — take from config
+                None, // format — take from config
+                None, // target_table — take from config
+                Some(pipeline_name),
+                false, // truncate — honour config only
+                output_json,
+            )
+            .await;
         }
     }
 
