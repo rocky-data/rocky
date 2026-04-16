@@ -13,6 +13,7 @@ echo ""
 
 # --- Cleanup ---
 rm -f poc.duckdb .rocky-state.redb
+rm -rf src/rocky_dag_mode_poc/defs/.local_defs_state
 mkdir -p expected
 
 # --- Seed ---
