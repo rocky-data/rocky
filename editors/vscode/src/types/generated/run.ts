@@ -1,4 +1,9 @@
 /* eslint-disable */
+/**
+ * AUTO-GENERATED — do not edit by hand.
+ * Source: schemas/run.schema.json
+ * Run `just codegen` from the monorepo root to regenerate.
+ */
 
 /**
  * Result of a single data quality check.

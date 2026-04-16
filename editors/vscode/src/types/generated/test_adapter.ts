@@ -1,4 +1,9 @@
 /* eslint-disable */
+/**
+ * AUTO-GENERATED — do not edit by hand.
+ * Source: schemas/test_adapter.schema.json
+ * Run `just codegen` from the monorepo root to regenerate.
+ */
 
 /**
  * JSON output for `rocky test-adapter`.

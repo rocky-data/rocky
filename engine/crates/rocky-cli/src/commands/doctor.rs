@@ -125,11 +125,9 @@ pub async fn doctor(
                             adapter_ok = false;
                         }
                     }
-                    "fivetran" => {
-                        if adapter.api_key.is_none() {
-                            suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
-                            adapter_ok = false;
-                        }
+                    "fivetran" if adapter.api_key.is_none() => {
+                        suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
+                        adapter_ok = false;
                     }
                     _ => {}
                 }
