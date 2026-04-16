@@ -118,7 +118,7 @@ pub async fn run_quality(
     output_json: bool,
 ) -> Result<()> {
     use rocky_core::checks::{CheckDetails, CheckResult};
-    use rocky_core::tests::{TestSeverity, generate_test_sql};
+    use rocky_core::tests::generate_test_sql;
 
     let start = Instant::now();
 
@@ -139,7 +139,6 @@ pub async fn run_quality(
     output.pipeline_type = Some("quality".to_string());
 
     let row_count_severity = pipeline.checks.row_count.severity();
-    let custom_default_severity = TestSeverity::Error;
 
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
@@ -231,11 +230,7 @@ pub async fn run_quality(
                 // Custom checks
                 for custom in &pipeline.checks.custom {
                     let sql = custom.sql.replace("{table}", &full_table);
-                    let severity = if custom.severity == TestSeverity::default() {
-                        custom_default_severity
-                    } else {
-                        custom.severity
-                    };
+                    let severity = custom.severity;
                     match warehouse_adapter.execute_query(&sql).await {
                         Ok(result) => {
                             let result_value: u64 = result
