@@ -37,9 +37,7 @@ pub fn run_dag(
 
     // Load seeds if the directory exists.
     let seeds = match seeds_dir {
-        Some(dir) if dir.exists() => {
-            rocky_core::seeds::discover_seeds(dir).unwrap_or_default()
-        }
+        Some(dir) if dir.exists() => rocky_core::seeds::discover_seeds(dir).unwrap_or_default(),
         _ => {
             // Try default "seeds" relative to config dir.
             let default_seeds = config_path
@@ -59,12 +57,18 @@ pub fn run_dag(
         .context("failed to build unified DAG")?;
 
     // Compute execution phases (topological layers).
-    let phases = unified_dag::execution_phases(&dag)
-        .context("failed to compute execution phases")?;
+    let phases =
+        unified_dag::execution_phases(&dag).context("failed to compute execution phases")?;
 
     // Build the enriched output.
     let output = build_dag_output(
-        &dag, &phases, &models, &seeds, include_column_lineage, models_dir, contracts_dir,
+        &dag,
+        &phases,
+        &models,
+        &seeds,
+        include_column_lineage,
+        models_dir,
+        contracts_dir,
     )?;
 
     if json {
@@ -86,15 +90,10 @@ fn build_dag_output(
     contracts_dir: Option<&Path>,
 ) -> Result<DagOutput> {
     // Build lookup maps.
-    let model_map: HashMap<&str, &Model> = models
-        .iter()
-        .map(|m| (m.config.name.as_str(), m))
-        .collect();
+    let model_map: HashMap<&str, &Model> =
+        models.iter().map(|m| (m.config.name.as_str(), m)).collect();
 
-    let seed_map: HashMap<&str, &SeedFile> = seeds
-        .iter()
-        .map(|s| (s.name.as_str(), s))
-        .collect();
+    let seed_map: HashMap<&str, &SeedFile> = seeds.iter().map(|s| (s.name.as_str(), s)).collect();
 
     // Project nodes.
     let nodes: Vec<DagNodeOutput> = dag
@@ -128,9 +127,7 @@ fn build_dag_output(
                                 catalog: seed_target
                                     .and_then(|t| t.catalog.clone())
                                     .unwrap_or_default(),
-                                schema: seed_target
-                                    .map(|t| t.schema.clone())
-                                    .unwrap_or_default(),
+                                schema: seed_target.map(|t| t.schema.clone()).unwrap_or_default(),
                                 table: seed_target
                                     .and_then(|t| t.table.clone())
                                     .unwrap_or_else(|| seed.name.clone()),

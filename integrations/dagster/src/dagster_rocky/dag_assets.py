@@ -61,11 +61,13 @@ def _asset_key_for_node(
 ) -> dg.AssetKey:
     """Derive a Dagster AssetKey from a DAG node based on its kind."""
     if node.kind == "transformation" and node.target is not None:
-        return dg.AssetKey([
-            node.target.catalog,
-            node.target.schema_,
-            node.target.table,
-        ])
+        return dg.AssetKey(
+            [
+                node.target.catalog,
+                node.target.schema_,
+                node.target.table,
+            ]
+        )
     if node.kind == "seed":
         return dg.AssetKey(["seed", node.label])
     if node.kind == "source":
@@ -134,9 +136,7 @@ def _build_column_lineage_metadata(
         return None
 
     # Filter edges targeting this node's model.
-    model_edges = [
-        e for e in column_lineage_edges if e.target.model == node.label
-    ]
+    model_edges = [e for e in column_lineage_edges if e.target.model == node.label]
     if not model_edges:
         return None
 
@@ -199,11 +199,7 @@ def build_dag_specs(
 
         # Resolve upstream dependencies.
         deps_list = node.depends_on or []
-        deps = [
-            node_id_to_key[dep_id]
-            for dep_id in deps_list
-            if dep_id in node_id_to_key
-        ]
+        deps = [node_id_to_key[dep_id] for dep_id in deps_list if dep_id in node_id_to_key]
 
         # Build metadata.
         metadata: dict[str, object] = {
@@ -215,7 +211,9 @@ def build_dag_specs(
 
         # Column lineage.
         col_lineage_meta = _build_column_lineage_metadata(
-            node, column_lineage_edges, node_id_to_key,
+            node,
+            column_lineage_edges,
+            node_id_to_key,
         )
         if col_lineage_meta:
             metadata.update(col_lineage_meta)

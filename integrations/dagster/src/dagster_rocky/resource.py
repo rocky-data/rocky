@@ -806,9 +806,7 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--lookback", str(lookback)])
         if parallel is not None:
             args.extend(["--parallel", str(parallel)])
-        return RunResult.model_validate_json(
-            self._run_rocky(args, allow_partial=True)
-        )
+        return RunResult.model_validate_json(self._run_rocky(args, allow_partial=True))
 
     # ------------------------------------------------------------------ #
     # Local testing (always CLI)                                         #
