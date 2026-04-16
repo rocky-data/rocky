@@ -3,5 +3,5 @@ SELECT
     SUM(amount) AS total_revenue,
     COUNT(*) AS order_count,
     MIN(order_date) AS first_order
-FROM stg_orders
+FROM staging.stg_orders
 GROUP BY customer_id
