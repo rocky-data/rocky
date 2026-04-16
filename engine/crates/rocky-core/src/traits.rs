@@ -273,6 +273,29 @@ pub trait SqlDialect: Send + Sync {
     fn delete_where(&self, target: &str, where_clause: &str) -> String {
         format!("DELETE FROM {target} WHERE {where_clause}")
     }
+
+    /// SQL query that returns one row per user table in a catalog/schema,
+    /// with `table_name` as the first column.
+    ///
+    /// Used by the quality pipeline when a `[[tables]]` entry omits
+    /// `table` — every table in the schema is then checked.
+    ///
+    /// Default implementation uses the ANSI catalog-prefixed
+    /// `information_schema` form (`{catalog}.information_schema.tables`
+    /// filtered by `table_schema`), which works for Databricks Unity
+    /// Catalog, Snowflake, and BigQuery. Warehouses without a
+    /// catalog-prefixed information schema (e.g. DuckDB) must override.
+    ///
+    /// `catalog` and `schema` are validated as SQL identifiers before
+    /// interpolation; callers should pass the already-validated values.
+    fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
+        rocky_sql::validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(schema).map_err(AdapterError::new)?;
+        Ok(format!(
+            "SELECT table_name FROM {catalog}.information_schema.tables \
+             WHERE table_schema = '{schema}'"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

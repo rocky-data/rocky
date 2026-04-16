@@ -326,6 +326,21 @@ mod tests {
     }
 
     #[test]
+    fn test_list_tables_sql_uses_catalog_prefix() {
+        let d = dialect();
+        let sql = d.list_tables_sql("acme", "staging__orders").unwrap();
+        // Databricks Unity Catalog exposes per-catalog information_schema.
+        assert!(
+            sql.contains("FROM acme.information_schema.tables"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains("table_schema = 'staging__orders'"),
+            "sql: {sql}"
+        );
+    }
+
+    #[test]
     fn test_insert_overwrite_partition_single_replace_where() {
         // Databricks Delta: single REPLACE WHERE statement, atomic.
         let d = dialect();

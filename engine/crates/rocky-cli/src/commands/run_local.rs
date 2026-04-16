@@ -147,13 +147,20 @@ pub async fn run_quality(
             let tables_to_check: Vec<String> = if let Some(ref table) = table_ref.table {
                 vec![table.clone()]
             } else {
-                match warehouse_adapter
-                    .execute_query(&format!(
-                        "SELECT table_name FROM {}.information_schema.tables WHERE table_schema = '{}'",
-                        table_ref.catalog, table_ref.schema
-                    ))
-                    .await
+                let list_sql = match dialect.list_tables_sql(&table_ref.catalog, &table_ref.schema)
                 {
+                    Ok(sql) => sql,
+                    Err(e) => {
+                        warn!(
+                            catalog = table_ref.catalog.as_str(),
+                            schema = table_ref.schema.as_str(),
+                            error = %e,
+                            "failed to build list-tables SQL — skipping"
+                        );
+                        continue;
+                    }
+                };
+                match warehouse_adapter.execute_query(&list_sql).await {
                     Ok(result) => result
                         .rows
                         .into_iter()
@@ -287,7 +294,9 @@ pub async fn run_quality(
                         }
                     };
                     let kind = test_type_kind(&test.test_type);
-                    let name = format!("{kind}:{}", test.column.as_deref().unwrap_or("-"));
+                    let name = assertion.name.clone().unwrap_or_else(|| {
+                        format!("{kind}:{}", test.column.as_deref().unwrap_or("-"))
+                    });
 
                     match warehouse_adapter.execute_query(&sql).await {
                         Ok(result) => {

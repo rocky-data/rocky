@@ -10,7 +10,8 @@ type = "quality"
 [pipeline.nightly_dq.target]
 adapter = "default"
 
-# Target named tables directly (avoids depending on information_schema).
+# `orders` is targeted by name; `customers` uses schema-level targeting
+# (omit `table`) to exercise the dialect's `list_tables_sql` path.
 [[pipeline.nightly_dq.tables]]
 catalog = "poc"
 schema  = "staging__orders"
@@ -19,7 +20,6 @@ table   = "orders"
 [[pipeline.nightly_dq.tables]]
 catalog = "poc"
 schema  = "staging__customers"
-table   = "customers"
 
 [pipeline.nightly_dq.checks]
 enabled = true
@@ -35,6 +35,7 @@ fail_on_error = false
 
 # not_null — 2 rows (order_id 7, 42) violate this.
 [[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_customer_id_required"
 table    = "orders"
 type     = "not_null"
 column   = "customer_id"
@@ -42,6 +43,7 @@ severity = "error"
 
 # accepted_values — 1 row (order_id 13) with status = 'unknown' violates.
 [[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_status_allowed"
 table    = "orders"
 type     = "accepted_values"
 column   = "status"

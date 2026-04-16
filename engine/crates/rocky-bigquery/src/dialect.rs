@@ -150,6 +150,23 @@ impl SqlDialect for BigQueryDialect {
             "COMMIT TRANSACTION".to_string(),
         ])
     }
+
+    fn list_tables_sql(
+        &self,
+        catalog: &str,
+        schema: &str,
+    ) -> rocky_core::traits::AdapterResult<String> {
+        // BigQuery's INFORMATION_SCHEMA.TABLES lives per-dataset, so the
+        // four-part `project.dataset.INFORMATION_SCHEMA.TABLES` form is
+        // required. Backtick-quote project + dataset per BQ conventions.
+        rocky_sql::validation::validate_identifier(catalog)
+            .map_err(rocky_core::traits::AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(schema)
+            .map_err(rocky_core::traits::AdapterError::new)?;
+        Ok(format!(
+            "SELECT table_name FROM `{catalog}`.`{schema}`.INFORMATION_SCHEMA.TABLES"
+        ))
+    }
 }
 
 #[cfg(test)]

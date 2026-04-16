@@ -174,6 +174,20 @@ impl SqlDialect for DuckDbSqlDialect {
             "COMMIT".into(),
         ])
     }
+
+    fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
+        // DuckDB's information_schema is a flat, un-prefixed catalog —
+        // the catalog name has to be pushed into a WHERE filter instead
+        // of the `FROM` expression.
+        rocky_sql::validation::validate_identifier(catalog)
+            .map_err(rocky_core::traits::AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(schema)
+            .map_err(rocky_core::traits::AdapterError::new)?;
+        Ok(format!(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_catalog = '{catalog}' AND table_schema = '{schema}'"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +249,26 @@ mod tests {
             d.tablesample_clause(10).unwrap(),
             "USING SAMPLE 10 PERCENT (bernoulli)"
         );
+    }
+
+    #[test]
+    fn test_list_tables_sql_filters_catalog_and_schema() {
+        let d = dialect();
+        let sql = d.list_tables_sql("poc", "staging__orders").unwrap();
+        // DuckDB requires the un-prefixed information_schema + catalog filter.
+        assert!(sql.contains("FROM information_schema.tables"), "sql: {sql}");
+        assert!(sql.contains("table_catalog = 'poc'"), "sql: {sql}");
+        assert!(
+            sql.contains("table_schema = 'staging__orders'"),
+            "sql: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_list_tables_sql_rejects_injection() {
+        let d = dialect();
+        assert!(d.list_tables_sql("poc; DROP TABLE users; --", "s").is_err());
+        assert!(d.list_tables_sql("poc", "s'; --").is_err());
     }
 
     #[test]
