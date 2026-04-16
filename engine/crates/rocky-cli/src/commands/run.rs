@@ -342,8 +342,8 @@ pub async fn run(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
-    // Download state from remote storage (S3/Valkey) if configured
-    if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path) {
+    // Download state from remote storage (S3/GCS/Valkey) if configured
+    if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path).await {
         warn!(error = %e, "state download failed, continuing with local state");
     }
 
@@ -980,7 +980,7 @@ pub async fn run(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                if let Err(e) = rocky_core::state_sync::upload_state(&state_cfg, &state_p) {
+                if let Err(e) = rocky_core::state_sync::upload_state(&state_cfg, &state_p).await {
                     warn!(error = %e, "periodic state sync failed");
                 }
             }
@@ -1638,7 +1638,7 @@ pub async fn run(
     output.metrics = Some(rocky_observe::metrics::METRICS.snapshot());
 
     // Upload state to remote storage
-    if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path) {
+    if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
         warn!(error = %e, "state upload failed");
     }
 

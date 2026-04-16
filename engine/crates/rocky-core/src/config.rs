@@ -312,8 +312,10 @@ pub enum StateBackend {
     /// State stored on local disk (default). No sync needed.
     #[default]
     Local,
-    /// State synced to/from an S3 bucket via the `aws` CLI.
+    /// State synced to/from an S3 bucket via the `object_store` crate.
     S3,
+    /// State synced to/from a Google Cloud Storage bucket.
+    Gcs,
     /// State synced to/from a Valkey/Redis instance.
     Valkey,
     /// Tiered: Valkey (fast) with S3 fallback (durable).
@@ -325,6 +327,7 @@ impl std::fmt::Display for StateBackend {
         match self {
             StateBackend::Local => write!(f, "local"),
             StateBackend::S3 => write!(f, "s3"),
+            StateBackend::Gcs => write!(f, "gcs"),
             StateBackend::Valkey => write!(f, "valkey"),
             StateBackend::Tiered => write!(f, "tiered"),
         }
@@ -334,20 +337,24 @@ impl std::fmt::Display for StateBackend {
 /// State persistence configuration.
 ///
 /// Controls where Rocky stores watermarks and anomaly history between runs.
-/// On ephemeral environments (EKS pods), use S3 or Valkey for persistence.
+/// On ephemeral environments (EKS pods), use S3, GCS, or Valkey for persistence.
 ///
 /// When both S3 and Valkey are configured (`backend = "tiered"`):
 /// - Download: Valkey first (fast), S3 fallback (durable)
 /// - Upload: write to both Valkey + S3
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateConfig {
-    /// Storage backend: local (default), s3, valkey, or tiered (valkey + s3 fallback)
+    /// Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
     #[serde(default)]
     pub backend: StateBackend,
     /// S3 bucket for state persistence
     pub s3_bucket: Option<String>,
     /// S3 key prefix (default: "rocky/state/")
     pub s3_prefix: Option<String>,
+    /// GCS bucket for state persistence
+    pub gcs_bucket: Option<String>,
+    /// GCS key prefix (default: "rocky/state/")
+    pub gcs_prefix: Option<String>,
     /// Valkey/Redis URL for state persistence
     pub valkey_url: Option<String>,
     /// Valkey key prefix (default: "rocky:state:")
