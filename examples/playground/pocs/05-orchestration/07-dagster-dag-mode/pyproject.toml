@@ -1,7 +1,7 @@
 [project]
 name = "rocky-dag-mode-poc"
 version = "0.0.0"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "dagster>=1.13.0",
     "dagster-rocky>=1.2.2",
