@@ -98,17 +98,15 @@ pub fn transpile(sql: &str, from: Dialect, to: Dialect) -> TranspileResult {
     // Dialect-specific transformations
     match (from, to) {
         // Snowflake QUALIFY → subquery wrapper
-        (Dialect::Snowflake, Dialect::DuckDB) => {
-            if result.to_uppercase().contains("QUALIFY") {
-                warnings.push(TranspileWarning {
-                    original: "QUALIFY clause".to_string(),
-                    reason: format!("{to} does not support QUALIFY — manual rewrite needed"),
-                    suggestion: Some(
-                        "Wrap the query in a subquery and move the QUALIFY condition to WHERE"
-                            .to_string(),
-                    ),
-                });
-            }
+        (Dialect::Snowflake, Dialect::DuckDB) if result.to_uppercase().contains("QUALIFY") => {
+            warnings.push(TranspileWarning {
+                original: "QUALIFY clause".to_string(),
+                reason: format!("{to} does not support QUALIFY — manual rewrite needed"),
+                suggestion: Some(
+                    "Wrap the query in a subquery and move the QUALIFY condition to WHERE"
+                        .to_string(),
+                ),
+            });
         }
         // BigQuery supports QUALIFY natively since 2023 — no change needed
         (_, Dialect::Snowflake) | (_, Dialect::Databricks) => {
