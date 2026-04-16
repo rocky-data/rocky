@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Loader `rows_loaded` accuracy (Databricks + Snowflake)
+
+The Databricks and Snowflake loaders now report the actual number of rows
+written by their COPY INTO statements instead of always reporting `0` in
+`LoadFileOutput.rows_loaded`.
+
+- **Databricks** parses `num_affected_rows` from the COPY INTO response's
+  single-row result set. `DatabricksLoaderAdapter::load` switched from
+  `execute_statement` (returns only the statement id) to `execute_sql`
+  (returns the full `QueryResult`) for the COPY INTO call; the redundant
+  `SELECT COUNT(*)` follow-up was removed.
+- **Snowflake** parses `ROWS_LOADED` from the per-file result set that COPY
+  INTO returns and sums across files. The cloud-URI and local-file paths
+  both capture the count; the trailing `DROP STAGE` still runs via
+  `execute_statement`.
+
+Both implementations fall back to `0` rather than erroring when the column
+is missing from the response, so unexpected API shapes still produce a
+usable load result. Surfaces via `rocky run --output json` and the Dagster
+integration's `RockyLoadFile.rows_loaded`.
+
 ## [1.3.0] — 2026-04-16
 
 ### Added — Adapter `kind` field
@@ -142,9 +163,6 @@ prerequisite that makes Load nodes in DAG execution work.
   `commands/run.rs` retains its direct `rocky_databricks::throttle` /
   `::batch` / `::governance` imports for the replication path. Deeper
   decoupling behind the adapter trait boundary is deferred.
-- `rows_loaded` is currently 0 for the Databricks and Snowflake loaders
-  (their COPY INTO responses contain row counts that aren't surfaced by
-  `execute_statement` today). Will be addressed in a follow-up.
 
 ### Added — Dagster Pipes protocol emitter (T2)
 

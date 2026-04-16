@@ -4,12 +4,15 @@
 //! verifying correct behavior for happy paths, auth failures, retries,
 //! and malformed responses.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter, TableRef};
 use rocky_core::config::RetryConfig;
 use rocky_snowflake::auth::{Auth, AuthConfig};
 use rocky_snowflake::connector::{ConnectorConfig, ConnectorError, SnowflakeConnector};
-use wiremock::matchers::{header, method, path};
+use rocky_snowflake::loader::SnowflakeLoaderAdapter;
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Creates an OAuth-authenticated connector pointing at the given wiremock server.
@@ -393,6 +396,158 @@ async fn test_empty_result_set() {
     assert_eq!(result.columns.len(), 1);
     assert!(result.rows.is_empty());
     assert_eq!(result.total_row_count, Some(0));
+}
+
+/// End-to-end: `SnowflakeLoaderAdapter::load` parses per-file `rows_loaded`
+/// from the COPY INTO response and surfaces the sum as `LoadResult.rows_loaded`.
+#[tokio::test]
+async fn test_loader_surfaces_rows_loaded() {
+    let server = MockServer::start().await;
+
+    // CREATE TEMPORARY STAGE — result set not inspected.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("CREATE TEMPORARY STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-create-stage",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .mount(&server)
+        .await;
+
+    // COPY INTO — Snowflake returns one row per source file, with
+    // `rows_loaded` as one of the columns. Mocks two files summing to 300.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-copy-001",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 2,
+                "rowType": [
+                    {"name": "file", "type": "TEXT", "nullable": false},
+                    {"name": "status", "type": "TEXT", "nullable": false},
+                    {"name": "rows_parsed", "type": "FIXED", "nullable": false},
+                    {"name": "rows_loaded", "type": "FIXED", "nullable": false},
+                    {"name": "errors_seen", "type": "FIXED", "nullable": false}
+                ]
+            },
+            "data": [
+                ["s3://bucket/users_1.csv", "LOADED", "100", "100", "0"],
+                ["s3://bucket/users_2.csv", "LOADED", "200", "200", "0"]
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // DROP STAGE IF EXISTS — fires after COPY INTO, result ignored.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("DROP STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-drop-stage",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = SnowflakeLoaderAdapter::new(connector);
+
+    let source = LoadSource::CloudUri("s3://bucket/users/".into());
+    let target = TableRef {
+        catalog: "DB".into(),
+        schema: "RAW".into(),
+        table: "USERS".into(),
+    };
+
+    let options = LoadOptions {
+        format: Some(rocky_adapter_sdk::FileFormat::Csv),
+        ..Default::default()
+    };
+    let result = loader.load(&source, &target, &options).await.unwrap();
+
+    assert_eq!(
+        result.rows_loaded, 300,
+        "loader should sum per-file rows_loaded from COPY INTO response"
+    );
+}
+
+/// Loader degrades gracefully when the COPY INTO response doesn't carry a
+/// `rows_loaded` column: the load still succeeds with `rows_loaded = 0`.
+#[tokio::test]
+async fn test_loader_missing_rows_loaded_column() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("CREATE TEMPORARY STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-create",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-copy",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("DROP STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-drop",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = SnowflakeLoaderAdapter::new(connector);
+    let source = LoadSource::CloudUri("s3://bucket/data.csv".into());
+    let target = TableRef {
+        catalog: "DB".into(),
+        schema: "RAW".into(),
+        table: "USERS".into(),
+    };
+    let result = loader
+        .load(&source, &target, &LoadOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows_loaded, 0);
 }
 
 /// Bearer token is sent correctly in the Authorization header.

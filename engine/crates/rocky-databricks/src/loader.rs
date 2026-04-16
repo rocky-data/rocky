@@ -18,14 +18,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
 
-use crate::connector::DatabricksConnector;
+use crate::connector::{DatabricksConnector, QueryResult};
 
 /// Databricks loader adapter using COPY INTO.
 pub struct DatabricksLoaderAdapter {
@@ -94,6 +94,33 @@ fn format_options_clause(format: FileFormat, options: &LoadOptions) -> Option<St
     }
 }
 
+/// Extract the `num_affected_rows` count from a COPY INTO response.
+///
+/// Databricks' COPY INTO returns a single-row result set whose schema
+/// exposes per-operation counters (`num_affected_rows`, `num_inserted_rows`,
+/// `num_skipped_corrupt_files`, …). We read `num_affected_rows` since it
+/// represents the rows written by this COPY INTO call (matches COPY INTO
+/// semantics for append-only + merge-schema loads).
+///
+/// Returns `None` when the column is missing, the result is empty, or the
+/// value isn't a non-negative integer — the caller should default to 0 in
+/// that case rather than fail the load.
+fn extract_num_affected_rows(result: &QueryResult) -> Option<u64> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case("num_affected_rows"))?;
+    let first_row = result.rows.first()?;
+    let cell = first_row.get(idx)?;
+    match cell {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 /// Build the full `COPY INTO ... FROM '<uri>'` SQL statement.
 fn build_copy_into_sql(
     uri: &str,
@@ -153,28 +180,31 @@ impl LoaderAdapter for DatabricksLoaderAdapter {
 
         let sql = build_copy_into_sql(&uri, &target_ref, format, options);
         info!(sql = %sql, "databricks COPY INTO");
-        self.connector
-            .execute_statement(&sql)
+        let copy_result = self
+            .connector
+            .execute_sql(&sql)
             .await
             .map_err(|e| AdapterError::msg(e.to_string()))?;
 
-        // COPY INTO doesn't return an affected-row count in its REST response
-        // shape used here. We follow up with a SELECT COUNT(*) so the caller
-        // gets an accurate `rows_loaded` value.
-        let count_sql = format!("SELECT COUNT(*) FROM {target_ref}");
-        let count_result = self
-            .connector
-            .execute_statement(&count_sql)
-            .await
-            .map_err(|e| AdapterError::msg(e.to_string()))?;
-        // execute_statement returns a statement-id string; we'd need
-        // execute_query to read the count. Falling back to 0 here since
-        // Databricks' bulk-load path doesn't expose a cheap row count without
-        // another query round-trip — left as a follow-up.
-        let _ = count_result;
+        // Databricks' COPY INTO returns a single-row result set whose
+        // schema includes `num_affected_rows` (the count of rows written
+        // into the target table for this call). Parse it from the result;
+        // if the column isn't present we fall back to 0 rather than fail,
+        // so older/non-standard API shapes still return a usable load.
+        let rows_loaded = match extract_num_affected_rows(&copy_result) {
+            Some(n) => n,
+            None => {
+                warn!(
+                    statement_id = %copy_result.statement_id,
+                    "databricks COPY INTO response missing `num_affected_rows` \
+                     column; reporting 0 rows loaded"
+                );
+                0
+            }
+        };
 
         Ok(LoadResult {
-            rows_loaded: 0,
+            rows_loaded,
             bytes_read: 0, // Cloud-URI sources: no local byte count.
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -294,5 +324,52 @@ mod tests {
             resolve_format(&src, &LoadOptions::default()).unwrap(),
             FileFormat::Parquet
         );
+    }
+
+    fn copy_into_result(column: &str, value: serde_json::Value) -> QueryResult {
+        use crate::connector::ColumnSchema;
+        QueryResult {
+            statement_id: "stmt-copy".into(),
+            columns: vec![ColumnSchema {
+                name: column.into(),
+                type_name: "LONG".into(),
+                position: 0,
+            }],
+            rows: vec![vec![value]],
+            total_row_count: Some(1),
+        }
+    }
+
+    #[test]
+    fn test_extract_num_affected_rows_number() {
+        let qr = copy_into_result("num_affected_rows", serde_json::json!(1234));
+        assert_eq!(extract_num_affected_rows(&qr), Some(1234));
+    }
+
+    #[test]
+    fn test_extract_num_affected_rows_string() {
+        // Databricks sometimes returns numeric columns as JSON strings in
+        // JSON_ARRAY disposition (SQL LONGs don't fit in JSON numbers).
+        let qr = copy_into_result("num_affected_rows", serde_json::json!("4242"));
+        assert_eq!(extract_num_affected_rows(&qr), Some(4242));
+    }
+
+    #[test]
+    fn test_extract_num_affected_rows_case_insensitive() {
+        let qr = copy_into_result("NUM_AFFECTED_ROWS", serde_json::json!(7));
+        assert_eq!(extract_num_affected_rows(&qr), Some(7));
+    }
+
+    #[test]
+    fn test_extract_num_affected_rows_missing_column() {
+        let qr = copy_into_result("num_inserted_rows", serde_json::json!(5));
+        assert_eq!(extract_num_affected_rows(&qr), None);
+    }
+
+    #[test]
+    fn test_extract_num_affected_rows_empty_rows() {
+        let mut qr = copy_into_result("num_affected_rows", serde_json::json!(9));
+        qr.rows.clear();
+        assert_eq!(extract_num_affected_rows(&qr), None);
     }
 }
