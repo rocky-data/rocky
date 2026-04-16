@@ -137,6 +137,7 @@ capture doctor doctor
 capture history history
 capture metrics metrics revenue_summary
 capture optimize optimize
+capture dag dag --models models
 
 # Drift detection requires the engine to detect schema changes against an
 # already-existing target. The 00-playground-default POC always uses

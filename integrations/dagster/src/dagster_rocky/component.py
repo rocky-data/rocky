@@ -377,31 +377,36 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         except dg.Failure:
             return None
 
-    def _build_defs_from_dag(self, state_path: Path) -> dg.Definitions:
+    def _build_defs_from_dag(
+        self,
+        context: dg.ComponentLoadContext,
+        state_path: Path,
+    ) -> dg.Definitions:
         """Build asset definitions from the cached ``rocky dag`` output.
 
         Falls back to the discover-based flow if the DAG slot is missing
         from the cached state (e.g., first run before ``dag_mode`` was set).
         """
-        from .dag_assets import build_dag_specs
+        from .dag_assets import build_dag_multi_assets
 
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         if "dag" not in raw:
             # Graceful fallback: re-enter the non-DAG path.
             self.dag_mode = False
-            return self.build_defs_from_state(None, state_path)
+            return self.build_defs_from_state(context, state_path)
 
         dag_result = DagResult.model_validate(raw["dag"])
         translator = self._get_translator()
         rocky = self._get_rocky_resource()
 
-        specs, node_id_to_key = build_dag_specs(
+        assets = build_dag_multi_assets(
             dag_result,
+            rocky=rocky,
             translator=translator,
         )
 
         return dg.Definitions(
-            assets=specs,
+            assets=assets,
             resources={"rocky": rocky},
         )
 
@@ -420,7 +425,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
 
         # DAG-mode: build the full connected asset graph from ``rocky dag``.
         if self.dag_mode:
-            return self._build_defs_from_dag(state_path)
+            return self._build_defs_from_dag(context, state_path)
 
         discover, compile_result, optimize_result = _load_state(state_path)
         compile_state = _CompileState.from_result(compile_result)

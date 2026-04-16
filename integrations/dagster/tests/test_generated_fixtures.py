@@ -32,6 +32,7 @@ from dagster_rocky.types import (
     CiResult,
     ColumnLineageResult,
     CompileResult,
+    DagResult,
     DiscoverResult,
     DoctorResult,
     HistoryResult,
@@ -66,6 +67,7 @@ EXPECTED_TYPES: dict[str, type] = {
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
     "doctor": DoctorResult,
+    "dag": DagResult,
 }
 
 

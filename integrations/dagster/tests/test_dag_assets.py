@@ -5,11 +5,12 @@ from __future__ import annotations
 import dagster as dg
 
 from dagster_rocky.dag_assets import (
+    build_dag_multi_assets,
     build_dag_specs,
     split_dag_specs_by_group,
 )
 from dagster_rocky.translator import RockyDagsterTranslator
-from dagster_rocky.types import DagResult
+from dagster_rocky.types import DagNodeOutput, DagResult
 
 
 def _make_dag_result(
@@ -330,3 +331,125 @@ def test_dag_result_in_parse_rocky_output():
     )
     result = parse_rocky_output(payload)
     assert isinstance(result, DagResult)
+
+
+# ---------------------------------------------------------------------------
+# Translator DAG-mode methods
+# ---------------------------------------------------------------------------
+
+
+def test_translator_get_dag_node_asset_key_transformation():
+    """Translator maps transformation nodes to [catalog, schema, table]."""
+    translator = RockyDagsterTranslator()
+    node = DagNodeOutput.model_validate(
+        {
+            "id": "transformation:orders",
+            "kind": "transformation",
+            "label": "orders",
+            "target": {"catalog": "w", "schema": "marts", "table": "orders"},
+        }
+    )
+    assert translator.get_dag_node_asset_key(node) == dg.AssetKey(["w", "marts", "orders"])
+
+
+def test_translator_get_dag_node_asset_key_source():
+    """Translator maps source nodes to [pipeline, 'source']."""
+    translator = RockyDagsterTranslator()
+    node = DagNodeOutput.model_validate(
+        {"id": "source:raw", "kind": "source", "label": "raw (source)", "pipeline": "raw"}
+    )
+    assert translator.get_dag_node_asset_key(node) == dg.AssetKey(["raw", "source"])
+
+
+def test_translator_get_dag_group_name():
+    """Translator group name uses target schema for transformations, pipeline for others."""
+    translator = RockyDagsterTranslator()
+    transform_node = DagNodeOutput.model_validate(
+        {
+            "id": "transformation:m1",
+            "kind": "transformation",
+            "label": "m1",
+            "target": {"catalog": "w", "schema": "staging", "table": "m1"},
+        }
+    )
+    assert translator.get_dag_group_name(transform_node) == "staging"
+
+    source_node = DagNodeOutput.model_validate(
+        {"id": "source:raw", "kind": "source", "label": "raw", "pipeline": "ingest"}
+    )
+    assert translator.get_dag_group_name(source_node) == "ingest"
+
+
+def test_translator_override_dag_node_asset_key():
+    """Custom translator can override DAG node key derivation."""
+
+    class PrefixedTranslator(RockyDagsterTranslator):
+        def get_dag_node_asset_key(self, node):
+            base = super().get_dag_node_asset_key(node)
+            return dg.AssetKey(["my_prefix", *base.path])
+
+    translator = PrefixedTranslator()
+    node = DagNodeOutput.model_validate(
+        {"id": "seed:countries", "kind": "seed", "label": "countries"}
+    )
+    assert translator.get_dag_node_asset_key(node) == dg.AssetKey(
+        ["my_prefix", "seed", "countries"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_dag_multi_assets
+# ---------------------------------------------------------------------------
+
+
+def test_build_dag_multi_assets_returns_assets_definitions():
+    """build_dag_multi_assets returns AssetsDefinition objects, not bare specs."""
+    from unittest.mock import MagicMock
+
+    dag = _make_dag_result(
+        nodes=[
+            {"id": "source:raw", "kind": "source", "label": "raw (source)", "pipeline": "raw"},
+            {
+                "id": "transformation:m1",
+                "kind": "transformation",
+                "label": "m1",
+                "target": {"catalog": "w", "schema": "s", "table": "m1"},
+                "depends_on": ["source:raw"],
+            },
+        ]
+    )
+    mock_rocky = MagicMock()
+    assets = build_dag_multi_assets(
+        dag,
+        rocky=mock_rocky,
+        translator=RockyDagsterTranslator(),
+    )
+    assert len(assets) > 0
+    for asset in assets:
+        assert isinstance(asset, dg.AssetsDefinition)
+
+
+def test_build_dag_multi_assets_groups_by_kind():
+    """Multi-assets are grouped by node kind."""
+    from unittest.mock import MagicMock
+
+    dag = _make_dag_result(
+        nodes=[
+            {"id": "source:raw", "kind": "source", "label": "raw", "pipeline": "raw"},
+            {"id": "load:raw", "kind": "load", "label": "raw (load)", "pipeline": "raw"},
+            {
+                "id": "transformation:m1",
+                "kind": "transformation",
+                "label": "m1",
+                "target": {"catalog": "w", "schema": "s", "table": "m1"},
+            },
+        ]
+    )
+    mock_rocky = MagicMock()
+    assets = build_dag_multi_assets(
+        dag,
+        rocky=mock_rocky,
+        translator=RockyDagsterTranslator(),
+    )
+    # source, load, and transformation are different kinds → 3 groups.
+    assert len(assets) == 3

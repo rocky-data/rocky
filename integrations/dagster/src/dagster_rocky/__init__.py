@@ -28,6 +28,7 @@ from .contracts import (
 )
 from .dag_assets import (
     DagAssetGroup,
+    build_dag_multi_assets,
     build_dag_specs,
     split_dag_specs_by_group,
 )
@@ -166,6 +167,7 @@ __all__ = [
     "contract_check_results_from_diagnostics",
     # DAG-driven asset builder
     "DagAssetGroup",
+    "build_dag_multi_assets",
     "build_dag_specs",
     "split_dag_specs_by_group",
     "DagResult",
