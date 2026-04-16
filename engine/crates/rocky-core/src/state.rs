@@ -554,7 +554,7 @@ impl StateStore {
             runs.push(run);
         }
         // Sort by started_at descending
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
         runs.truncate(limit);
         Ok(runs)
     }
@@ -622,7 +622,7 @@ impl StateStore {
                 snapshots.push(snapshot);
             }
         }
-        snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.timestamp));
         snapshots.truncate(limit);
         Ok(snapshots)
     }
