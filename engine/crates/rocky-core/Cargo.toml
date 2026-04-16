@@ -25,6 +25,10 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
 lasso = { version = "0.7", features = ["multi-threaded"] }
 memmap2 = "0.9"
 rayon = "1"

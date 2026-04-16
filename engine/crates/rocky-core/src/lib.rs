@@ -21,6 +21,7 @@ pub mod lakehouse;
 pub mod macros;
 pub mod mmap;
 pub mod models;
+pub mod object_store;
 pub mod optimize;
 pub mod plan_partition;
 pub mod preview;
