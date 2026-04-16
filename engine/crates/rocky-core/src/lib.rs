@@ -12,6 +12,7 @@ pub mod cost;
 pub mod cross_engine;
 pub mod dag;
 pub mod dag_executor;
+pub mod dag_status;
 pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;

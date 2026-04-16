@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
+use rocky_core::dag_status::DagStatusStore;
 
 /// Shared server state holding the latest compilation result.
 pub struct ServerState {
@@ -18,6 +19,8 @@ pub struct ServerState {
     pub contracts_dir: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub compile_result: RwLock<Option<CompileResult>>,
+    /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
+    pub dag_status: DagStatusStore,
 }
 
 impl ServerState {
@@ -32,6 +35,7 @@ impl ServerState {
             contracts_dir,
             config_path,
             compile_result: RwLock::new(None),
+            dag_status: DagStatusStore::new(),
         });
 
         // Initial compile
