@@ -46,7 +46,7 @@ Demonstrates `dag_mode=True` on `RockyComponent`: Rocky reports the full unified
 ./run.sh
 
 # Launch Dagster UI
-dagster dev -f definitions.py
+uv run dg dev
 ```
 
 Open http://localhost:3000 and verify:

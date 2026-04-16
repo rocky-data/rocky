@@ -7,7 +7,7 @@ transformations — with zero hand-written Python asset definitions.
 Run:
     cd examples/playground/pocs/05-orchestration/07-dagster-dag-mode
     ./run.sh          # seeds data + caches state
-    dagster dev -f definitions.py
+    uv run dg dev
 
 Then open http://localhost:3000 and verify:
     1. The asset graph shows: source:ingest → load:ingest → stg_orders → fct_customer_revenue
