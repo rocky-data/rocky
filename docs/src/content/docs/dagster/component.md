@@ -36,6 +36,36 @@ By default, the component stores its state on the local filesystem. This is conf
 - **Resilience** -- If an external API is temporarily unavailable, the cached state ensures assets remain visible.
 - **Scalability** -- Works well with large numbers of sources and tables without adding latency to code location startup.
 
+## DAG mode
+
+When `dag_mode: true` is set, the component calls `rocky dag` to build a fully connected asset graph where every pipeline stage — source, load, transformation, seed, quality, snapshot — becomes a Dagster asset with resolved upstream dependencies. This replaces the separate `discover` + `surface_derived_models` paths with a single unified DAG.
+
+```yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  binary_path: rocky
+  config_path: rocky.toml
+  models_dir: models
+  dag_mode: true
+  defs_state:
+    management_type: LOCAL_FILESYSTEM
+```
+
+With `dag_mode`, the asset graph automatically shows:
+- **Source → Load** edges from replication pipelines
+- **Load → Model** edges from pipeline `depends_on` declarations
+- **Model → Model** edges from model `depends_on` in TOML sidecars
+- **Freshness policies** auto-mapped from model sidecar `[freshness]`
+- **Partition definitions** auto-mapped from `time_interval` strategies
+- **Column-level lineage** when `--column-lineage` is enabled
+
+Materialization dispatches to the right Rocky command per node kind:
+- Transformation nodes → `rocky run --model <name>`
+- Source/load nodes → `rocky run --filter <source>`
+- Seed/quality/snapshot → graph-only (placeholder materialization)
+
+Override key derivation by subclassing `RockyDagsterTranslator` and implementing `get_dag_node_asset_key()` and `get_dag_group_name()`.
+
 ## Refreshing state
 
 To update the cached state with the latest discovery results, call `write_state_to_path()`. This is typically done as part of a scheduled job or a manual refresh operation, separate from the normal code location reload cycle.

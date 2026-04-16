@@ -110,24 +110,27 @@ Dagster's execution context:
 - `context.partition_key` → `--partition <key>`
 - `context.partition_key_range` → `--from <start> --to <end>`
 
-## Limitation: `can_subset=False`
+## Per-model execution with `dag_mode`
 
-Derived-model multi-assets use `can_subset=False` because Rocky's
-`rocky run` does not yet support per-model selection (`--model <name>`
-filters compile diagnostics, not execution). Selecting any subset of a
-derived-model multi-asset's keys materializes the **whole group**.
+With `dag_mode=True` on `RockyComponent`, derived-model multi-assets use
+`can_subset=True` and execute individual models via
+`rocky run --model <name>`. Dagster controls the execution order based on
+the DAG, and each model runs independently.
 
-This limitation will be lifted when the engine adds per-model run
-filtering. Until then:
+This is the recommended approach for new projects. See
+[RockyComponent — DAG mode](/dagster/component/#dag-mode) for setup.
 
-- Materializing one model in a group runs all models in the group.
-- Per-asset freshness, partition, optimize, and contract metadata
-  still works correctly.
-- The asset graph still renders cross-model lineage arrows correctly.
+## Legacy: `surface_derived_models` with `can_subset=False`
 
-If you need fine-grained subset materialization today, split your models
-across multiple `RockyComponent` instances with different `models_dir`
-values.
+When using `surface_derived_models=True` (without `dag_mode`),
+derived-model multi-assets use `can_subset=False` because this path runs
+`rocky run --models <dir> --all` which executes all models at once.
+Selecting any subset of a derived-model multi-asset's keys materializes
+the **whole group**.
+
+If you need fine-grained subset materialization without `dag_mode`,
+split your models across multiple `RockyComponent` instances with
+different `models_dir` values.
 
 ## Standalone helpers
 

@@ -13,7 +13,7 @@ sidebar:
 - **`RockyDagsterTranslator`** — Controls how Rocky sources and tables map to Dagster asset keys, groups, tags, and metadata.
 - **`load_rocky_assets()`** — Calls `rocky discover` and returns a list of Dagster `AssetSpec` objects, one per enabled table.
 - **`emit_check_results()` / `emit_materializations()`** — Convert Rocky's check and materialization results into Dagster events that appear in the UI.
-- **`RockyComponent`** — A state-backed Dagster component that caches discovery output, avoiding API calls on every code location reload.
+- **`RockyComponent`** — A state-backed Dagster component that caches discovery output, avoiding API calls on every code location reload. With `dag_mode=True`, builds the full connected asset graph from `rocky dag`.
 
 ## Architecture
 
@@ -37,7 +37,8 @@ Rocky handles the SQL transformation layer: DAG resolution, incremental logic, S
 
 `RockyResource` exposes one Python method per Rocky CLI command. The full set includes:
 
-- **Core Pipeline** — `discover`, `plan`, `run`, `run_streaming`, `run_pipes`, `state`, `resume_run`
+- **Core Pipeline** — `discover`, `plan`, `run`, `run_model`, `run_streaming`, `run_pipes`, `state`, `resume_run`
+- **DAG** — `dag` (full unified DAG with enriched metadata)
 - **Modeling** — `compile`, `lineage`, `test`, `ci`
 - **AI** — `ai`, `ai_sync`, `ai_explain`, `ai_test`
 - **Observability** — `history`, `metrics`, `optimize`
