@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use rocky_core::models;
-use rocky_core::tests::{TestSeverity, TestType, generate_test_sql};
+use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_with_dialect};
 use rocky_core::traits::WarehouseAdapter;
 
 use crate::output::{
@@ -252,7 +252,7 @@ async fn execute_one_test(
     };
 
     // Generate SQL.
-    let sql = match generate_test_sql(test_decl, fq_table) {
+    let sql = match generate_test_sql_with_dialect(test_decl, fq_table, adapter.dialect()) {
         Ok(sql) => sql,
         Err(e) => {
             return DeclarativeTestResult {
@@ -313,14 +313,19 @@ fn interpret_result(
     result: &rocky_core::traits::QueryResult,
 ) -> (String, Option<String>) {
     match test_type {
-        // not_null / expression: SELECT COUNT(*) — pass when count == 0
-        TestType::NotNull | TestType::Expression { .. } => {
+        // not_null / expression / in_range / regex_match: SELECT COUNT(*) — pass when count == 0
+        TestType::NotNull
+        | TestType::Expression { .. }
+        | TestType::InRange { .. }
+        | TestType::RegexMatch { .. } => {
             let count = first_row_count(result);
             if count == 0 {
                 ("pass".to_string(), None)
             } else {
                 let what = match test_type {
                     TestType::NotNull => "NULL row(s)",
+                    TestType::InRange { .. } => "out-of-range row(s)",
+                    TestType::RegexMatch { .. } => "non-matching row(s)",
                     _ => "violating row(s)",
                 };
                 ("fail".to_string(), Some(format!("{count} {what} found")))
@@ -393,5 +398,7 @@ fn test_type_label(tt: &TestType) -> &'static str {
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",
         TestType::RowCountRange { .. } => "row_count_range",
+        TestType::InRange { .. } => "in_range",
+        TestType::RegexMatch { .. } => "regex_match",
     }
 }

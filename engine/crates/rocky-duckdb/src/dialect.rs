@@ -188,6 +188,10 @@ impl SqlDialect for DuckDbSqlDialect {
              WHERE table_catalog = '{catalog}' AND table_schema = '{schema}'"
         ))
     }
+
+    fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
+        Ok(format!("regexp_matches({column}, '{pattern}')"))
+    }
 }
 
 #[cfg(test)]

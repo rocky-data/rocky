@@ -617,6 +617,8 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",
         TestType::RowCountRange { .. } => "row_count_range",
+        TestType::InRange { .. } => "in_range",
+        TestType::RegexMatch { .. } => "regex_match",
     };
 
     match &test.column {
@@ -1117,11 +1119,13 @@ mod tests {
                 test_type: TestType::NotNull,
                 column: Some("order_id".into()),
                 severity: TestSeverity::Error,
+                filter: None,
             },
             TestDecl {
                 test_type: TestType::Unique,
                 column: Some("order_id".into()),
                 severity: TestSeverity::Error,
+                filter: None,
             },
         ];
 
@@ -1375,6 +1379,7 @@ mod tests {
             test_type: TestType::NotNull,
             column: Some("id".into()),
             severity: TestSeverity::Error,
+            filter: None,
         }];
 
         let models = vec![model("stg_orders", vec![], test_decls)];
@@ -1482,6 +1487,7 @@ mod tests {
             test_type: TestType::NotNull,
             column: Some("order_id".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let label = format_test_label("stg_orders", &test, 0);
         assert_eq!(label, "stg_orders::not_null_order_id");
@@ -1496,6 +1502,7 @@ mod tests {
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let label = format_test_label("stg_orders", &test, 2);
         assert_eq!(label, "stg_orders::row_count_range_2");

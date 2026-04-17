@@ -163,6 +163,14 @@ impl SqlDialect for DatabricksSqlDialect {
     fn tablesample_clause(&self, percent: u32) -> Option<String> {
         Some(format!("TABLESAMPLE ({percent} PERCENT)"))
     }
+
+    fn regex_match_predicate(
+        &self,
+        column: &str,
+        pattern: &str,
+    ) -> rocky_core::traits::AdapterResult<String> {
+        Ok(format!("{column} RLIKE '{pattern}'"))
+    }
 }
 
 #[cfg(test)]

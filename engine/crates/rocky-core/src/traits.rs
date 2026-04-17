@@ -296,6 +296,21 @@ pub trait SqlDialect: Send + Sync {
              WHERE table_schema = '{schema}'"
         ))
     }
+
+    /// Build a dialect-specific boolean SQL predicate that matches when
+    /// `column` matches `pattern` (`REGEXP` / `RLIKE` / `REGEXP_LIKE` /
+    /// `REGEXP_CONTAINS`, depending on the warehouse).
+    ///
+    /// Used by `TestType::RegexMatch` (Phase 4a). The default impl
+    /// returns an error — adapters that support regex must override.
+    /// `column` is already validated as a SQL identifier; `pattern` is
+    /// already validated against the strict allowlist
+    /// ([`crate::tests::validate_regex_pattern`]).
+    fn regex_match_predicate(&self, _column: &str, _pattern: &str) -> AdapterResult<String> {
+        Err(AdapterError::msg(
+            "regex_match not supported by this dialect",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

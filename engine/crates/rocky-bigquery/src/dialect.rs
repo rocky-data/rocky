@@ -167,6 +167,14 @@ impl SqlDialect for BigQueryDialect {
             "SELECT table_name FROM `{catalog}`.`{schema}`.INFORMATION_SCHEMA.TABLES"
         ))
     }
+
+    fn regex_match_predicate(
+        &self,
+        column: &str,
+        pattern: &str,
+    ) -> rocky_core::traits::AdapterResult<String> {
+        Ok(format!("REGEXP_CONTAINS({column}, r'{pattern}')"))
+    }
 }
 
 #[cfg(test)]

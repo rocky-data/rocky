@@ -89,3 +89,42 @@ type     = "row_count_range"
 min      = 40
 max      = 60
 severity = "error"
+
+# --- Phase 4a: in_range + regex_match + per-check filter ---
+
+# in_range — amount should be within [0, 10000]. Row 99 has amount = -5
+# (failing) but the `expression` assertion above already catches it at
+# warning severity. This error-severity `in_range` will both count the
+# failure AND quarantine the row (predicate lowers into the split).
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_amount_in_range"
+table    = "orders"
+type     = "in_range"
+column   = "amount"
+min      = "0"
+max      = "10000"
+severity = "error"
+
+# regex_match — the `email` column in `customers` should match an email
+# pattern. Seed data uses `customer{i}@example.com`; this should pass.
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "customers_email_format"
+table    = "customers"
+type     = "regex_match"
+column   = "email"
+pattern  = "^[a-z0-9_]+@[a-z0-9.]+$"
+severity = "warning"
+
+# filter — scope a check to a subset of rows. This `not_null` on
+# `customer_id` only applies to rows where status = 'shipped'; the
+# quarantine wraps the base predicate in `CASE WHEN (filter) THEN base
+# ELSE TRUE END` so out-of-scope rows (e.g. pending) stay valid even if
+# customer_id is NULL. Note: the broader error-severity `not_null` on
+# customer_id above still applies to all rows.
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_shipped_customer_id_present"
+table    = "orders"
+type     = "not_null"
+column   = "customer_id"
+filter   = "status = 'shipped'"
+severity = "warning"
