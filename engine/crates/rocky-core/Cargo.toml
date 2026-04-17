@@ -18,6 +18,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 redb = { workspace = true }
+fs4 = { workspace = true }
 redis = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }
