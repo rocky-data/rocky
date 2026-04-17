@@ -42,6 +42,11 @@ tokio = { workspace = true }
 # committed `rocky.toml` under `examples/playground/pocs/` passes the
 # schemars-generated AdapterConfig schema.
 jsonschema = { version = "0.30", default-features = false }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "dag_execute"
+harness = false
 
 [lints]
 workspace = true

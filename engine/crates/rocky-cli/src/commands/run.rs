@@ -423,7 +423,11 @@ pub async fn run(
     // Governance operations route through the GovernanceAdapter trait
     // (Plan 01: genericize run.rs). Catalog/schema creation uses
     // SqlDialect + WarehouseAdapter for SQL generation + execution.
-    let _governance_span = info_span!("governance_setup").entered();
+    // Span kept as a declaration only; `.entered()` would hold an
+    // `EnteredSpan` (!Send) across the awaits below and break the DAG
+    // executor's per-layer parallelism. Tracing events below remain at the
+    // subscriber's root context — acceptable for a setup block.
+    let _governance_span = info_span!("governance_setup");
     {
         let dialect = warehouse_adapter.dialect();
 
@@ -765,8 +769,6 @@ pub async fn run(
             }
         }
     }
-    drop(_governance_span);
-
     // --- Checkpoint / resume: filter already-completed tables ---
     let run_id = format!("run-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
 
@@ -1325,7 +1327,8 @@ pub async fn run(
         .map(tokio::sync::Mutex::into_inner);
 
     // --- Batched checks ---
-    let _checks_span = info_span!("batched_checks").entered();
+    // See the `_governance_span` note above — same reason.
+    let _checks_span = info_span!("batched_checks");
     let checks_start = Instant::now();
 
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
@@ -1589,8 +1592,6 @@ pub async fn run(
             "batched checks complete"
         );
     }
-    drop(_checks_span);
-
     // --- Compiled model execution (--all or --models) ---
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));

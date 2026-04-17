@@ -3431,6 +3431,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "criterion",
  "csv",
  "fs4",
  "futures",
