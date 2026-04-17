@@ -1,6 +1,6 @@
 ---
 name: rocky-release
-description: Tag-namespaced release workflow for the Rocky monorepo. Engine releases are CI-driven (tag and push, `engine-release.yml` builds all 5 platforms); dagster + vscode are local-build because publishing to PyPI / Marketplace uses user-local tokens. Use when cutting any Rocky release.
+description: Tag-namespaced release workflow for the Rocky monorepo. All three artifacts (engine, dagster-rocky, vscode) are CI-driven — land a release PR with the version bump + CHANGELOG, tag the merged commit, push the tag, and the matching release workflow handles everything. Use when cutting any Rocky release.
 ---
 
 # Rocky release workflow
@@ -9,23 +9,29 @@ Three artifacts ship independently from one monorepo, each with its own tag name
 
 | Artifact | Tag | Destination | Build path |
 |---|---|---|---|
-| Engine binary (`rocky`) | `engine-v<version>` | GitHub Release (5 platforms) | **CI** builds everything on tag push |
-| `dagster-rocky` wheel | `dagster-v<version>` | GitHub Release, optionally PyPI | **Local** via `uv build` |
-| Rocky VS Code extension | `vscode-v<version>` | GitHub Release, optionally VS Code Marketplace | **Local** via `npx vsce` |
+| Engine binary (`rocky`) | `engine-v<version>` | GitHub Release (5 platforms) | **CI** — `engine-release.yml` |
+| `dagster-rocky` wheel | `dagster-v<version>` | GitHub Release + PyPI | **CI** — `dagster-release.yml` (OIDC → PyPI) |
+| Rocky VS Code extension | `vscode-v<version>` | GitHub Release + VS Code Marketplace | **CI** — `vscode-release.yml` (`VSCE_PAT` secret → Marketplace) |
 
 **Never** tag a release as bare `v0.1.0` — the tag namespace is how `engine/install.sh`, `engine/install.ps1`, and downstream consumers filter for their artifact.
 
 ## When to use this skill
 
 - Cutting any Rocky release (engine, dagster, vscode)
-- Debugging a release failure — engine failures are usually in `engine-release.yml` logs; dagster/vscode failures are local script issues
-- Deciding whether an engine release needs the local-build fallback (only when CI runner credits are exhausted)
+- Debugging a release failure — the failing job is always in the relevant `*-release.yml` logs
+- Deciding whether a release needs the local-build fallback (only when CI runner credits are exhausted or a workflow itself is broken)
 
-## The split: engine is CI-first, dagster + vscode are local-first
+## The flow: release PR → merge → tag → push
 
-**Engine** (`engine-release.yml`): the workflow owns the entire release. An `ensure-release` job creates the GitHub Release with auto-generated notes; a matrix job builds all 5 platforms (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) and attaches binaries; a checksum job uploads a `SHA256SUMS` file. Rocky used to be a local-build monoculture, but the engine matrix was migrated to CI because macOS+Linux+Windows cross-compilation at release time is painful on a solo laptop. `scripts/release.sh` survives as a hotfix fallback when CI credits are exhausted.
+All three artifacts follow the same pattern:
 
-**Dagster + VS Code**: still local-build because publishing to PyPI (via `uv publish`) and VS Code Marketplace (via `vsce publish`) uses tokens held on the maintainer's machine — bringing those secrets into CI isn't worth the setup for a solo project.
+1. **Land a release PR** that bumps the version file(s) + updates the changelog.
+2. **Tag the merged commit** with the namespaced tag (`engine-v*`, `dagster-v*`, `vscode-v*`).
+3. **Push the tag** — this triggers the matching `*-release.yml` workflow.
+
+The workflow handles the GitHub Release creation, build, and (for dagster/vscode) the publish to the external registry.
+
+`scripts/release.sh` + the `just release-engine|dagster|vscode` recipes survive as **local-build fallbacks** when CI is unavailable. The local path also works — it creates the GH Release + uploads artifacts, and `ensure-release` is idempotent.
 
 ## Engine release (default: just tag and push)
 
@@ -67,31 +73,59 @@ This builds macOS locally (`cargo --release`), cross-builds Linux via `cargo-zig
 
 **Only reach for this when CI is genuinely unavailable.** It's slower, riskier, and produces artifacts signed by your laptop instead of the GitHub runner.
 
-## Dagster release
+## Dagster release (default: just tag and push)
+
+```bash
+# 1. Bump pyproject.toml + CHANGELOG in a PR, merge to main.
+# 2. Tag the merged commit and push:
+git tag -a dagster-v0.4.0 -m "Release dagster-v0.4.0"
+git push origin dagster-v0.4.0
+```
+
+The tag push triggers `dagster-release.yml`, which:
+
+1. `ensure-release` — creates the `dagster-v0.4.0` GitHub Release if missing.
+2. `build` — `uv build` produces the wheel + sdist, uploads them to the GH Release.
+3. `publish` — `uv publish` pushes to PyPI via **OIDC** (trusted publisher; no token in repo secrets).
+
+### Dagster fallback: local build
 
 ```bash
 just release-dagster 0.4.0                # GH release only
-just release-dagster 0.4.0 --publish      # + publish to PyPI
+just release-dagster 0.4.0 --publish      # + PyPI via UV_PUBLISH_TOKEN or ~/.pypirc
 ```
 
-Local `uv build` produces the wheel + sdist. `gh release create` makes the `dagster-v0.4.0` GitHub Release and uploads the artifacts. With `--publish`, `uv publish` pushes to PyPI using `UV_PUBLISH_TOKEN` or `~/.pypirc`.
+The local path is idempotent with CI — `ensure-release` detects an existing release. Only reach for this when the CI workflow itself is broken.
 
-## VS Code release
+## VS Code release (default: just tag and push)
+
+```bash
+# 1. Bump package.json + CHANGELOG in a PR, merge to main.
+# 2. Tag the merged commit and push:
+git tag -a vscode-v0.3.0 -m "Release vscode-v0.3.0"
+git push origin vscode-v0.3.0
+```
+
+The tag push triggers `vscode-release.yml`, which:
+
+1. `ensure-release` — creates the `vscode-v0.3.0` GitHub Release if missing.
+2. `package` — `npx vsce package` produces the VSIX, uploads it to the GH Release.
+3. `publish` — `vsce publish` pushes to the VS Code Marketplace using the `VSCE_PAT` repo secret.
+
+### VS Code fallback: local build
 
 ```bash
 just release-vscode 0.3.0                 # GH release only
-just release-vscode 0.3.0 --publish       # + publish to VS Code Marketplace
+just release-vscode 0.3.0 --publish       # + Marketplace via local VSCE_PAT
 ```
-
-`npx vsce package` produces the VSIX. `gh release create` makes the `vscode-v0.3.0` GitHub Release and uploads it. With `--publish`, `vsce publish` pushes to the Marketplace using `VSCE_PAT`.
 
 ## Prerequisites
 
-| Artifact | Default path | Fallback path |
+| Artifact | Default path (CI) | Local fallback |
 |---|---|---|
 | Engine | `git` + `gh` CLI | plus `cargo`, `cargo-zigbuild` + `zig` (or Docker) for local Linux cross-compile |
-| Dagster | `uv` + `gh`; `--publish` needs `UV_PUBLISH_TOKEN` or `~/.pypirc` | — |
-| VS Code | `npm`, `npx` + `gh`; `--publish` needs `VSCE_PAT` | — |
+| Dagster | `git` + `gh` CLI; PyPI OIDC trusted-publisher configured on the project | `uv` + `gh`; `--publish` needs `UV_PUBLISH_TOKEN` or `~/.pypirc` |
+| VS Code | `git` + `gh` CLI; `VSCE_PAT` configured as a repo secret | `npm`, `npx` + `gh`; `--publish` needs `VSCE_PAT` in the shell environment |
 
 `gh` must be authenticated against `rocky-data/rocky` with release-write permission for all paths.
 
