@@ -69,7 +69,7 @@ pub async fn doctor(
     // 2. State store
     if should_run("state", check_filter) {
         let start = Instant::now();
-        match rocky_core::state::StateStore::open(state_path) {
+        match rocky_core::state::StateStore::open_read_only(state_path) {
             Ok(store) => {
                 // Try reading watermarks to verify the DB is healthy
                 match store.list_watermarks() {

@@ -845,7 +845,14 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                let run_future = rocky_cli::commands::run(
+                // `rocky_cli::commands::run` handles SIGINT internally so it
+                // can flush watermarks + mark in-flight tables as
+                // `Interrupted` in the state store. On first Ctrl-C it
+                // returns `Err` wrapping `rocky_cli::commands::Interrupted`;
+                // the main() error handler below maps that to exit code 130.
+                // No outer `select!` here — letting the internal handler own
+                // the signal is what makes graceful cancellation possible.
+                rocky_cli::commands::run(
                     &cli.config,
                     filter.as_deref(),
                     pipeline.as_deref(),
@@ -859,14 +866,8 @@ async fn main() -> Result<()> {
                     shadow_config.as_ref(),
                     &partition_opts,
                     model.as_deref(),
-                );
-                tokio::select! {
-                    result = run_future => result,
-                    _ = shutdown_signal() => {
-                        warn!("received shutdown signal, aborting run");
-                        anyhow::bail!("interrupted by shutdown signal")
-                    }
-                }
+                )
+                .await
             }
         }
         Command::Compare {
@@ -1204,6 +1205,18 @@ async fn main() -> Result<()> {
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
     };
+
+    // SIGINT: map `commands::Interrupted` to the conventional shell exit
+    // code (128 + SIGINT). Only `rocky run` currently emits this; other
+    // commands fall through to the default exit-1-on-error below.
+    if let Err(ref err) = result {
+        if err
+            .downcast_ref::<rocky_cli::commands::Interrupted>()
+            .is_some()
+        {
+            std::process::exit(130);
+        }
+    }
 
     // In text mode, try to upgrade config errors to rich miette diagnostics
     // with source spans and suggestions. JSON mode returns structured errors

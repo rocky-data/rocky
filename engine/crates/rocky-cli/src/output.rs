@@ -139,6 +139,13 @@ pub struct RunOutput {
     /// didn't execute any partitioned models.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partition_summaries: Vec<PartitionSummary>,
+    /// `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so
+    /// orchestrators can distinguish "user interrupted" from "run failed".
+    /// Tables that hadn't reached `Success` or `Failed` at interrupt time
+    /// are recorded as `TableStatus::Interrupted` in the state store.
+    /// Always serialised (even when `false`) so consumers don't have to
+    /// treat its absence specially.
+    pub interrupted: bool,
 }
 
 fn is_zero(v: &usize) -> bool {
@@ -1706,6 +1713,7 @@ impl RunOutput {
                 actions_taken: vec![],
             },
             partition_summaries: vec![],
+            interrupted: false,
         }
     }
 }

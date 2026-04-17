@@ -1,5 +1,7 @@
+use std::fs::File;
 use std::path::Path;
 
+use fs4::fs_std::FileExt;
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
@@ -77,6 +79,19 @@ pub enum StateError {
 
     #[error("state schema version is corrupt: expected an integer, found {0:?}")]
     VersionParse(String),
+
+    #[error(
+        "state store at {path} is locked by another process; only one rocky writer \
+         can run at a time against the same state file"
+    )]
+    LockHeldByOther { path: String },
+
+    #[error("i/o error opening state lock file at {path}: {source}")]
+    LockIo {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl From<redb::TransactionError> for StateError {
@@ -88,10 +103,22 @@ impl From<redb::TransactionError> for StateError {
 /// Embedded state store backed by redb for tracking watermarks and run history.
 pub struct StateStore {
     db: Database,
+    // Held exclusive advisory lock on `<path>.lock`. `None` for read-only opens.
+    // Released automatically when the `File` is dropped.
+    _lock_file: Option<File>,
 }
 
 impl StateStore {
-    /// Opens or creates a state store at the given path.
+    /// Opens or creates a state store at the given path for **writing**.
+    ///
+    /// Takes an exclusive advisory lock on `<path>.lock`. If another process
+    /// already holds the lock the call fails with
+    /// [`StateError::LockHeldByOther`] — this guarantees only one writer can
+    /// mutate the state file at a time, which prevents the silent-corruption
+    /// race where two `rocky run` processes interleave writes.
+    ///
+    /// Use [`StateStore::open_read_only`] for inspection commands that must not
+    /// contend with a concurrent writer.
     ///
     /// On first open the schema version is written to the `metadata` table.
     /// On subsequent opens the stored version is compared to
@@ -99,6 +126,50 @@ impl StateStore {
     /// binary (stored > current) an error is returned immediately so that the
     /// caller can surface a clear message rather than silently misreading data.
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        Self::open_inner(path, true)
+    }
+
+    /// Opens an existing state store for **read-only** access.
+    ///
+    /// Does NOT take the advisory write lock — multiple readers (and one
+    /// concurrent writer) can safely call this at the same time. Redb's own
+    /// MVCC guarantees consistent reads. Use this for inspection commands
+    /// (`rocky state`, `rocky history`, `rocky doctor`, `rocky metrics`,
+    /// `rocky optimize`, server APIs) so they don't block a live `rocky run`.
+    pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(path: &Path, lock: bool) -> Result<Self, StateError> {
+        // Acquire the advisory lock BEFORE opening the database — otherwise two
+        // concurrent writers could both pass `Database::create` before either
+        // of them reaches the lock check.
+        let lock_file = if lock {
+            let lock_path = path.with_extension("redb.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| StateError::LockIo {
+                    path: lock_path.display().to_string(),
+                    source: e,
+                })?;
+            FileExt::try_lock_exclusive(&file)
+                .map_err(|e| StateError::LockIo {
+                    path: lock_path.display().to_string(),
+                    source: e,
+                })?
+                .then_some(())
+                .ok_or_else(|| StateError::LockHeldByOther {
+                    path: path.display().to_string(),
+                })?;
+            Some(file)
+        } else {
+            None
+        };
+
         let db = Database::create(path)?;
 
         // Single write transaction: check/write schema version AND ensure all
@@ -151,7 +222,10 @@ impl StateStore {
         }
         txn.commit()?;
 
-        Ok(StateStore { db })
+        Ok(StateStore {
+            db,
+            _lock_file: lock_file,
+        })
     }
 
     /// Gets the watermark for a table (keyed by `catalog.schema.table`).
@@ -486,6 +560,10 @@ pub enum TableStatus {
     Success,
     Failed,
     Skipped,
+    /// Table was cancelled by a SIGINT (Ctrl-C) before it completed —
+    /// distinct from `Failed` so `--resume-latest` knows to retry it and
+    /// JSON consumers can show "interrupted" in the UI.
+    Interrupted,
 }
 
 /// Execution record for a single table within a run.
