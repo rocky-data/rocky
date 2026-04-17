@@ -85,5 +85,6 @@
       "partitions_succeeded": 1,
       "partitions_failed": 0
     }
-  ]
+  ],
+  "interrupted": false
 }

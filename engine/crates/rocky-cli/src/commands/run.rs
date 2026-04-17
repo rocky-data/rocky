@@ -75,25 +75,28 @@ struct TableError {
     task_index: Option<usize>,
 }
 
-/// Sentinel error signalling that `rocky run` was cancelled by a SIGINT
-/// (first Ctrl-C). The outer binary (`rocky/src/main.rs`) downcasts this
-/// off the `anyhow::Error` chain and maps it to exit code 130 so callers
-/// (shell, CI, orchestrators) can distinguish "user cancelled" from a
-/// generic run failure. A second SIGINT bypasses this path entirely and
-/// calls `std::process::exit(130)` directly.
+/// Sentinel error signalling that `rocky run` was cancelled by a shutdown
+/// signal (SIGINT / Ctrl-C, or SIGTERM on Unix — typically sent by
+/// Kubernetes during pod eviction). The outer binary
+/// (`rocky/src/main.rs`) downcasts this off the `anyhow::Error` chain and
+/// maps it to exit code 130 so callers (shell, CI, orchestrators) can
+/// distinguish "interrupted" from a generic run failure. A second signal
+/// bypasses this path entirely and calls `std::process::exit(130)`
+/// directly via the watcher armed on first signal.
 #[derive(Debug, thiserror::Error)]
-#[error("run was interrupted by SIGINT")]
+#[error("run was interrupted by a shutdown signal")]
 pub struct Interrupted;
 
 /// Arm a background watcher that hard-exits with code 130 on a *second*
-/// SIGINT. The first SIGINT is handled by the outer `tokio::select!`
-/// branch — this watcher's job is to give the user an out when graceful
-/// cleanup itself hangs (e.g. a stuck warehouse query that ignores
-/// cancellation). Idempotent in practice: we only call it from the
-/// single-arm branch that flips `interrupted = true`.
-fn arm_second_sigint_watcher() {
+/// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
+/// `tokio::select!` branch — this watcher gives the user an out when
+/// graceful cleanup itself hangs (e.g. a stuck warehouse query that
+/// ignores cancellation). Only SIGINT is watched here because K8s escalates
+/// SIGTERM → SIGKILL itself after `terminationGracePeriodSeconds`; the
+/// hard-exit we care about is the interactive "Ctrl-C again" case.
+fn arm_hard_exit_on_second_signal() {
     eprintln!(
-        "\n[rocky] interrupt received — finishing in-flight statements; press Ctrl-C again to terminate"
+        "\n[rocky] shutdown signal received — finishing in-flight statements; press Ctrl-C again to terminate"
     );
     tokio::spawn(async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1006,14 +1009,20 @@ pub async fn run(
     let error_rate_abort_pct = pipeline.execution.error_rate_abort_pct;
     let mut total_completed: usize = 0;
 
-    // SIGINT handling: a single pinned `ctrl_c()` future drives both the
-    // spawn loop's permit-wait and the drain loop below. On first Ctrl-C we
-    // spawn a hard-exit watcher for a second Ctrl-C, set `interrupted`, and
-    // stop issuing new work. In-flight tasks drain naturally so state
-    // updates remain consistent; anything not yet `Success` or `Failed` in
-    // the state store after drain is marked `Interrupted`.
+    // Shutdown-signal handling: a single pinned future per signal source
+    // drives both the spawn loop's permit-wait and the drain loop below.
+    // On first SIGINT (Ctrl-C) or SIGTERM (K8s pod eviction) we arm a
+    // hard-exit watcher for a second SIGINT, set `interrupted`, and stop
+    // issuing new work. In-flight tasks drain naturally so state updates
+    // remain consistent; anything not yet `Success` or `Failed` in the
+    // state store after drain is marked `Interrupted`.
     let ctrl_c_signal = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c_signal);
+    // SIGTERM only on Unix — Windows doesn't have it, so the future is
+    // wrapped in an `Option` and a `#[cfg(unix)]`-guarded branch.
+    #[cfg(unix)]
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut interrupted = false;
 
     for (idx, task) in tables_to_process.iter().enumerate() {
@@ -1053,7 +1062,21 @@ pub async fn run(
         let permit = tokio::select! {
             permit = semaphore.clone().acquire_owned() => permit?,
             _ = &mut ctrl_c_signal, if !interrupted => {
-                arm_second_sigint_watcher();
+                arm_hard_exit_on_second_signal();
+                interrupted = true;
+                break;
+            }
+            _ = async {
+                #[cfg(unix)]
+                if let Some(s) = sigterm_stream.as_mut() {
+                    let _ = s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            }, if !interrupted => {
+                arm_hard_exit_on_second_signal();
                 interrupted = true;
                 break;
             }
@@ -1081,7 +1104,21 @@ pub async fn run(
                 None => break,
             },
             _ = &mut ctrl_c_signal, if !interrupted => {
-                arm_second_sigint_watcher();
+                arm_hard_exit_on_second_signal();
+                interrupted = true;
+                continue;
+            }
+            _ = async {
+                #[cfg(unix)]
+                if let Some(s) = sigterm_stream.as_mut() {
+                    let _ = s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            }, if !interrupted => {
+                arm_hard_exit_on_second_signal();
                 interrupted = true;
                 continue;
             }

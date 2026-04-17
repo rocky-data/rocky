@@ -62,5 +62,6 @@
         "reason": "column 'amount' changed VARCHAR \u2192 DECIMAL(10,2)"
       }
     ]
-  }
+  },
+  "interrupted": false
 }
