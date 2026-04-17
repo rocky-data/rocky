@@ -1,6 +1,6 @@
 [package]
 name = "rocky-observe"
-version = "1.6.0"
+version = "1.7.0"
 description = "Observability for Rocky (structured logging, metrics, events)"
 edition.workspace = true
 license.workspace = true
