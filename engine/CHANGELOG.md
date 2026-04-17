@@ -7,26 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-04-17
+
+### Breaking — Quality pipelines fail on error-severity check failures by default
+
+Quality pipelines now exit non-zero when any error-severity check fails. The previous behavior (always `Ok(())`) silently swallowed failures and forced orchestrators to parse the JSON output to detect them.
+
+- Each `CheckResult` now carries `severity: "error" | "warning"` (default `error`).
+- `ChecksConfig.fail_on_error` (default `true`) gates the exit behavior. Set `fail_on_error = false` to restore the pre-1.5.0 always-succeed semantics while still surfacing failing checks in the JSON output.
+- Per-check severity on aggregate checks via the new `AggregateCheckToggle` untagged enum — `row_count = true` (legacy) and `row_count = { enabled = true, severity = "warning" }` (new) both parse.
+- Freshness / null-rate / custom check configs all grow a `severity` field.
+
+**Migration:** Configs with silently failing checks will start failing the run. If you want to keep the old behavior, add `fail_on_error = false` to every `[pipeline.x.checks]` block. Prefer to audit your checks and upgrade failure handling in the orchestrator.
+
+### Added — Unified row-level assertions in the quality pipeline
+
+`[[pipeline.x.checks.assertions]]` now accepts every declarative test type (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`) via the same `TestDecl` surface used by `rocky test` model sidecars. Each entry targets a single table by name and carries its own `severity`.
+
+```toml
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_customer_id_required"
+table    = "orders"
+type     = "not_null"
+column   = "customer_id"
+severity = "error"
+```
+
+Optional `name` disambiguates assertions that share table + kind + column. `SqlDialect::list_tables_sql(catalog, schema)` supports schema-level targeting (omit `table`) with DuckDB + BigQuery overrides.
+
+### Added — Row quarantine (`split` / `tag` / `drop`)
+
+`[pipeline.x.checks.quarantine]` compiles error-severity row-level assertions into a boolean predicate per table and emits CTAS statements that split the source:
+
+- `mode = "split"` (default) — writes `<table>__valid` (passing rows) and `<table>__quarantine` (failing rows with per-assertion `_error_<name>` label columns).
+- `mode = "tag"` — rewrites the source in-place with `_error_<name>` columns populated on failing rows.
+- `mode = "drop"` — writes only the valid half; failing rows discarded.
+
+Only `NotNull`, `AcceptedValues`, `Expression` at error severity drive the split (aggregate / set-based kinds like `Unique`, `Relationships`, `RowCountRange` stay observational). NULL-permissive predicates match existing `rocky test` semantics. Quarantine statements run before the valid statement so a partial failure leaves a stray quarantine table rather than a stale valid one. New `RunOutput.quarantine` field reports per-table mode, target tables, row counts, and error state.
+
+### Added — `JsonSchema` on `AdapterConfig`
+
+`AdapterConfig` / `AdapterKind` / `RetryConfig` now derive `JsonSchema`. The schema ships as `schemas/adapter_config.schema.json` and drives a new integration test that walks all 46 POC `rocky.toml` files and validates every `[adapter.*]` block against the generated schema. `RedactedString` got a manual `JsonSchema` impl (surface as plain `string`, never leak values). Groundwork for the broader `rocky-project.schema.json` autogen effort.
+
+### Added — `[adapter.*] kind` field
+
+`kind = "data" | "discovery"` declares the role the adapter plays. Required on discovery-only types (`fivetran`, `airbyte`, `iceberg`, `manual`); optional on warehouse types (default `"data"`); optional on dual-role `duckdb` (absent registers both roles). Backed by a canonical `rocky_core::adapter_capability` table, surfaced by `rocky validate` as V032 / V033 structured diagnostics.
+
+### Refactored — `run.rs` decoupled from `rocky-databricks`
+
+`AdaptiveThrottle` moved to `rocky-adapter-sdk::throttle` as a generic AIMD implementation; `BatchCheckAdapter` gained `batch_describe_schema`; `GovernanceAdapter` became registry-constructible as `Box<dyn GovernanceAdapter>`; `BatchTableRef` replaced with the canonical `rocky_core::ir::TableRef`. Zero ripple into other adapters. `rg "rocky_databricks::" run.rs` → 0.
+
 ### Fixed — Loader `rows_loaded` accuracy (Databricks + Snowflake)
 
-The Databricks and Snowflake loaders now report the actual number of rows
-written by their COPY INTO statements instead of always reporting `0` in
-`LoadFileOutput.rows_loaded`.
+The Databricks and Snowflake loaders now report the actual number of rows written by their COPY INTO statements instead of always reporting `0` in `LoadFileOutput.rows_loaded`.
 
-- **Databricks** parses `num_affected_rows` from the COPY INTO response's
-  single-row result set. `DatabricksLoaderAdapter::load` switched from
-  `execute_statement` (returns only the statement id) to `execute_sql`
-  (returns the full `QueryResult`) for the COPY INTO call; the redundant
-  `SELECT COUNT(*)` follow-up was removed.
-- **Snowflake** parses `ROWS_LOADED` from the per-file result set that COPY
-  INTO returns and sums across files. The cloud-URI and local-file paths
-  both capture the count; the trailing `DROP STAGE` still runs via
-  `execute_statement`.
+- **Databricks** parses `num_affected_rows` from the COPY INTO response's single-row result set. `DatabricksLoaderAdapter::load` switched from `execute_statement` to `execute_sql` (returns the full `QueryResult`); the redundant `SELECT COUNT(*)` follow-up was removed.
+- **Snowflake** parses `ROWS_LOADED` from the per-file COPY INTO result set and sums across files. Both the cloud-URI and local-file paths capture the count.
 
-Both implementations fall back to `0` rather than erroring when the column
-is missing from the response, so unexpected API shapes still produce a
-usable load result. Surfaces via `rocky run --output json` and the Dagster
-integration's `RockyLoadFile.rows_loaded`.
+Both implementations fall back to `0` rather than erroring when the column is missing from the response.
+
+### Fixed — Codegen-drift determinism
+
+Fixtures previously captured wall-clock `watermark` / `last_value` timestamps from the full-refresh path, failing `codegen-drift.yml` CI on every re-run. Added both fields to `WALL_CLOCK_FIELDS` sanitization; `DagSummaryOutput.counts_by_kind` swapped from `HashMap` to `BTreeMap` for deterministic iteration. All 35 fixtures regenerated against the 1.5.0 output schema.
 
 ## [1.3.0] — 2026-04-16
 
