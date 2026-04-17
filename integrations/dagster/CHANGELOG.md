@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-04-17
+
+### Added — Regenerated Pydantic bindings for engine 1.5.0 + 1.6.0
+
+Engine-side DQX parity work (Phases 1–4) and the `AdapterConfig` JsonSchema derive landed a large crop of new fields in the typed output surface. The regenerated bindings (via `just codegen`) now include:
+
+- **`RunOutput.quarantine: list[QuarantineOutput]`** — row-quarantine outcomes per table (mode, valid/quarantine table names, row counts, ok/error state).
+- **`CheckResult.severity: Literal["error", "warning"]`** — per-check severity on every quality check.
+- **`CheckDetails.Assertion { kind, column, failing_rows }`** — new variant covering row-level assertions (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`).
+- **`AdapterConfig`, `AdapterKind`, `RetryConfig`** — new `adapter_config_schema.py` module with typed models for the adapter-config section.
+- Refreshed test fixtures in `tests/fixtures_generated/` with the 1.6.0 version stamp.
+
+No source code changes in `dagster_rocky` itself — pure binding regeneration plus the version bump. Consumers upgrading to engine 1.5.0+ get typed access to every new field; older configs continue to parse because the new fields are all optional / default-empty.
+
+### Upgrading the vendored binary
+
+`dagster-rocky` ships independently from the engine. To consume engine 1.6.0 features, either install `engine-v1.6.0` on the orchestrator's `$PATH` or re-vendor the binary via `scripts/vendor_rocky.sh` before updating your pipeline code.
+
 ## [1.2.6] — 2026-04-16
 
 ### Added — `DagRunOutput` Pydantic model
