@@ -4,6 +4,7 @@
 //! for Google BigQuery using the REST API (jobs.query + jobs.getQueryResults).
 
 pub mod auth;
+pub mod batch;
 pub mod connector;
 pub mod dialect;
 pub mod governance;

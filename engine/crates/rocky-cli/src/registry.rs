@@ -41,6 +41,7 @@ use rocky_snowflake::adapter::SnowflakeWarehouseAdapter;
 use rocky_snowflake::batch::SnowflakeBatchCheckAdapter;
 use rocky_snowflake::connector::SnowflakeConnector;
 
+use rocky_bigquery::batch::BigQueryBatchCheckAdapter;
 use rocky_bigquery::connector::BigQueryAdapter;
 
 /// Holds constructed adapter instances, keyed by name from the config.
@@ -52,6 +53,10 @@ pub struct AdapterRegistry {
     /// Databricks-typed). Used by `batch_check_adapter` to dispatch the
     /// Snowflake-specific `INFORMATION_SCHEMA.COLUMNS` describe query.
     snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>>,
+    /// Typed BigQuery adapters so `batch_check_adapter` can run the
+    /// `INFORMATION_SCHEMA.COLUMNS` describe query through the same
+    /// authenticated HTTP client that the generic warehouse adapter uses.
+    bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>>,
     adapter_configs: HashMap<String, AdapterConfig>,
 }
 
@@ -62,6 +67,7 @@ impl AdapterRegistry {
         let mut discovery = HashMap::new();
         let mut connectors = HashMap::new();
         let mut snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>> = HashMap::new();
+        let mut bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>> = HashMap::new();
         let mut adapter_configs = HashMap::new();
 
         for (name, adapter_cfg) in &config.adapters {
@@ -277,9 +283,12 @@ impl AdapterRegistry {
                     let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
                         .context(format!("adapters.{name}: auth configuration error"))?;
 
-                    let adapter = BigQueryAdapter::new(project_id, location, bq_auth)
-                        .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300));
-                    warehouse.insert(name.clone(), Arc::new(adapter));
+                    let adapter = Arc::new(
+                        BigQueryAdapter::new(project_id, location, bq_auth)
+                            .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300)),
+                    );
+                    bigquery_adapters.insert(name.clone(), adapter.clone());
+                    warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
                 other => {
                     let mut msg = format!(
@@ -312,6 +321,7 @@ impl AdapterRegistry {
             discovery,
             connectors,
             snowflake_connectors,
+            bigquery_adapters,
             adapter_configs,
         })
     }
@@ -361,10 +371,10 @@ impl AdapterRegistry {
     /// [`WarehouseAdapter`] trait methods.
     ///
     /// Databricks implements all three batch methods (UNION ALL row counts +
-    /// freshness + `information_schema.columns` describe). Snowflake
-    /// currently only batches describe; its row-counts / freshness methods
-    /// return "not yet implemented" so `run.rs` falls back to per-table
-    /// queries for those.
+    /// freshness + `information_schema.columns` describe). Snowflake and
+    /// BigQuery batch only describe for now; their row-count / freshness
+    /// methods return "not yet implemented" so `run.rs` falls back to
+    /// per-table queries for those.
     pub fn batch_check_adapter(&self, name: &str) -> Option<Arc<dyn BatchCheckAdapter>> {
         if let Some(connector) = self.connectors.get(name) {
             return Some(Arc::new(DatabricksBatchCheckAdapter::new(
@@ -373,6 +383,9 @@ impl AdapterRegistry {
         }
         if let Some(connector) = self.snowflake_connectors.get(name) {
             return Some(Arc::new(SnowflakeBatchCheckAdapter::new(connector.clone())));
+        }
+        if let Some(adapter) = self.bigquery_adapters.get(name) {
+            return Some(Arc::new(BigQueryBatchCheckAdapter::new(adapter.clone())));
         }
         None
     }
