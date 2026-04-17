@@ -215,9 +215,10 @@ struct LabeledPredicate {
 
 /// Whether a test kind lowers cleanly to a row-level boolean predicate.
 ///
-/// `unique` / `relationships` / `row_count_range` are aggregate / set-based
-/// — they stay observational. `expression` and `regex_match` are
-/// trusted user SQL (same contract as [`crate::tests::generate_test_sql`]).
+/// `unique` / `relationships` / `row_count_range` / `aggregate` /
+/// `composite` are aggregate / set-based — they stay observational.
+/// `expression` and `regex_match` are trusted user SQL (same contract as
+/// [`crate::tests::generate_test_sql`]).
 pub fn is_quarantinable(test_type: &TestType) -> bool {
     matches!(
         test_type,
@@ -226,6 +227,8 @@ pub fn is_quarantinable(test_type: &TestType) -> bool {
             | TestType::Expression { .. }
             | TestType::InRange { .. }
             | TestType::RegexMatch { .. }
+            | TestType::NotInFuture
+            | TestType::OlderThanNDays { .. }
     )
 }
 
@@ -273,6 +276,10 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
         TestType::RowCountRange { .. } => "row_count_range",
         TestType::InRange { .. } => "in_range",
         TestType::RegexMatch { .. } => "regex_match",
+        TestType::Aggregate { .. } => "aggregate",
+        TestType::Composite { .. } => "composite",
+        TestType::NotInFuture => "not_in_future",
+        TestType::OlderThanNDays { .. } => "older_than_n_days",
     };
     match column {
         Some(c) if validation::validate_identifier(c).is_ok() => format!("{kind}_{c}"),
@@ -361,10 +368,31 @@ fn lower_valid_predicate(
             // NULL-permissive: (col IS NULL OR <match>)
             Ok(format!("({col} IS NULL OR {match_pred})"))
         }
-        // Non-quarantinable kinds filtered upstream by `is_quarantinable`.
-        TestType::Unique | TestType::Relationships { .. } | TestType::RowCountRange { .. } => {
-            Err(QuarantineError::EmptyExpression)
+        TestType::NotInFuture => {
+            let col = required_column(column, label)?;
+            validation::validate_identifier(col)?;
+            let now = dialect.current_timestamp_expr();
+            // NULL-permissive: (col IS NULL OR col <= <now>)
+            Ok(format!("({col} IS NULL OR {col} <= {now})"))
         }
+        TestType::OlderThanNDays { days } => {
+            let col = required_column(column, label)?;
+            validation::validate_identifier(col)?;
+            if *days == 0 {
+                return Err(QuarantineError::InvalidInRangeBound { value: "0".into() });
+            }
+            let bound = dialect
+                .date_minus_days_expr(*days)
+                .map_err(QuarantineError::from)?;
+            // NULL-permissive: (col IS NULL OR col <= <N days ago>)
+            Ok(format!("({col} IS NULL OR {col} <= ({bound}))"))
+        }
+        // Non-quarantinable kinds filtered upstream by `is_quarantinable`.
+        TestType::Unique
+        | TestType::Relationships { .. }
+        | TestType::RowCountRange { .. }
+        | TestType::Aggregate { .. }
+        | TestType::Composite { .. } => Err(QuarantineError::EmptyExpression),
     }
 }
 

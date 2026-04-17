@@ -128,3 +128,37 @@ type     = "not_null"
 column   = "customer_id"
 filter   = "status = 'shipped'"
 severity = "warning"
+
+# --- Phase 4b: aggregate + composite unique + time_window ---
+
+# aggregate — sum(amount) must be > 0. Passes because positive amounts
+# dominate (the single row with amount = -5 doesn't flip the sign).
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_positive_total"
+table    = "orders"
+type     = "aggregate"
+op       = "sum"
+column   = "amount"
+cmp      = ">"
+value    = "0"
+severity = "warning"
+
+# composite unique — (order_id, customer_id) pair. order_id is already
+# globally unique so this passes trivially; real configs pair keys that
+# aren't individually unique (e.g. `["order_id", "line_item_id"]`).
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_composite_unique"
+table    = "orders"
+type     = "composite"
+kind     = "unique"
+columns  = ["order_id", "customer_id"]
+severity = "warning"
+
+# not_in_future — created_at must not be in the future. Seed generates
+# timestamps around 2026-04-01; all should pass.
+[[pipeline.nightly_dq.checks.assertions]]
+name     = "orders_created_at_not_in_future"
+table    = "orders"
+type     = "not_in_future"
+column   = "created_at"
+severity = "error"

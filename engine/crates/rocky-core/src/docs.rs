@@ -403,6 +403,10 @@ fn test_type_label(test_type: &crate::tests::TestType) -> String {
         crate::tests::TestType::RowCountRange { .. } => "row_count_range".into(),
         crate::tests::TestType::InRange { .. } => "in_range".into(),
         crate::tests::TestType::RegexMatch { .. } => "regex_match".into(),
+        crate::tests::TestType::Aggregate { .. } => "aggregate".into(),
+        crate::tests::TestType::Composite { .. } => "composite".into(),
+        crate::tests::TestType::NotInFuture => "not_in_future".into(),
+        crate::tests::TestType::OlderThanNDays { .. } => "older_than_n_days".into(),
     }
 }
 

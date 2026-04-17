@@ -311,6 +311,26 @@ pub trait SqlDialect: Send + Sync {
             "regex_match not supported by this dialect",
         ))
     }
+
+    /// Build a dialect-specific SQL expression equivalent to
+    /// `CURRENT_DATE - N days`. Used by `TestType::OlderThanNDays`
+    /// (Phase 4b). The default impl uses the ANSI
+    /// `CURRENT_DATE - INTERVAL 'N' DAY` form, which works for
+    /// Databricks, Snowflake, and DuckDB. BigQuery overrides because
+    /// it requires `DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)`.
+    fn date_minus_days_expr(&self, days: u32) -> AdapterResult<String> {
+        Ok(format!("CURRENT_DATE - INTERVAL '{days}' DAY"))
+    }
+
+    /// SQL expression returning the current timestamp. Used by
+    /// `TestType::NotInFuture` (Phase 4b).
+    ///
+    /// Default: `CURRENT_TIMESTAMP` (ANSI keyword, no parens). Works for
+    /// Databricks, Snowflake, DuckDB. BigQuery overrides to
+    /// `CURRENT_TIMESTAMP()` because it requires the function form.
+    fn current_timestamp_expr(&self) -> &'static str {
+        "CURRENT_TIMESTAMP"
+    }
 }
 
 // ---------------------------------------------------------------------------
