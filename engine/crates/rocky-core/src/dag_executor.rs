@@ -36,9 +36,9 @@ use crate::unified_dag::{NodeId, NodeKind, UnifiedDag, UnifiedDagError, executio
 /// concurrent children).
 type NodeTaskOutput = (
     NodeId,
-    String,         // id string
-    String,         // kind string
-    String,         // label
+    String, // id string
+    String, // kind string
+    String, // label
     NodeStatus,
     u64,            // duration_ms
     Option<String>, // error
@@ -186,7 +186,10 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                 let label = node.label.clone();
 
                 let ancestors_for_node = ancestors.get(&id).cloned().unwrap_or_default();
-                if ancestors_for_node.iter().any(|a| failed_snapshot.contains(a)) {
+                if ancestors_for_node
+                    .iter()
+                    .any(|a| failed_snapshot.contains(a))
+                {
                     warn!(node = %id, "skipping node — upstream failure");
                     results.push(NodeResult {
                         id: id.0.clone(),
@@ -241,7 +244,15 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                             }
                         };
                         let duration_ms = node_start.elapsed().as_millis() as u64;
-                        (id, id_str, kind_str, label_for_task, status, duration_ms, error)
+                        (
+                            id,
+                            id_str,
+                            kind_str,
+                            label_for_task,
+                            status,
+                            duration_ms,
+                            error,
+                        )
                     }
                     .instrument(span),
                 );
