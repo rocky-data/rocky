@@ -84,10 +84,6 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // `editors/vscode/schemas/rocky-project.schema.json` is generated
         // from Rust types. The `just codegen` recipe copies `rocky_project`
         // into the editor directory after this command runs.
-        //
-        // `rocky_project` uses a permissive placeholder for the `pipeline.*`
-        // section (see `PipelineConfigSchemaPlaceholder` in rocky-core). The
-        // per-variant pipeline schema lands in PR-b of the schema-autogen arc.
         entry::<AdapterConfig>("adapter_config"),
         entry::<RockyConfig>("rocky_project"),
     ]

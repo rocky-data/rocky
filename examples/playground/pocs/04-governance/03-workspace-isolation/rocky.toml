@@ -29,4 +29,4 @@ auto_create_schemas = true
 enabled = true
 [[pipeline.poc.target.governance.isolation.workspace_ids]]
 id = 1234567890123456
-binding_type = "BINDING_TYPE_READ_WRITE"
+binding_type = "READ_WRITE"

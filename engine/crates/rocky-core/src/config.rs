@@ -283,11 +283,50 @@ impl<'de> Deserialize<'de> for ConcurrencyMode {
     }
 }
 
+impl JsonSchema for ConcurrencyMode {
+    fn schema_name() -> String {
+        "ConcurrencyMode".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Mirrors the custom Deserialize: either the literal "adaptive" or
+        // a positive integer. Schemars can't derive this — `ConcurrencyMode`
+        // doesn't have `Serialize`/`Deserialize` derive flags it can read.
+        let adaptive = schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            enum_values: Some(vec![serde_json::Value::String("adaptive".to_owned())]),
+            ..Default::default()
+        });
+        let fixed = schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
+            number: Some(Box::new(schemars::schema::NumberValidation {
+                minimum: Some(1.0),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency.".to_owned(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                any_of: Some(vec![adaptive, fixed]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// Controls parallelism and error handling for table processing.
 ///
 /// Rocky processes tables within a run concurrently using async tasks.
 /// Tune `concurrency` based on your warehouse capacity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     /// Concurrency strategy (default: `"adaptive"`).
     ///
@@ -452,7 +491,8 @@ fn default_jitter() -> bool {
 }
 
 /// Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaPatternConfig {
     pub prefix: String,
     pub separator: String,
@@ -472,7 +512,8 @@ impl SchemaPatternConfig {
 }
 
 /// A metadata column added during replication (e.g., `_loaded_by`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataColumnConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -481,7 +522,8 @@ pub struct MetadataColumnConfig {
 }
 
 /// Data quality checks configuration (row count, column match, freshness, null rate, custom).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChecksConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -538,7 +580,7 @@ fn default_fail_on_error() -> bool {
 /// enabled  = true
 /// severity = "warning"
 /// ```
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum AggregateCheckToggle {
     /// Legacy boolean toggle. Severity defaults to `error`.
@@ -590,7 +632,7 @@ impl AggregateCheckToggle {
 ///
 /// The `type`-specific fields (and `column`, `severity`) are flattened
 /// from `TestDecl` — the same surface used by declarative model tests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QualityAssertion {
     /// Table name this assertion applies to. Must match a table discovered
     /// from one of the pipeline's `[[tables]]` entries (by unqualified
@@ -609,7 +651,7 @@ pub struct QualityAssertion {
 }
 
 /// How to handle rows that fail error-severity row-level assertions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QuarantineMode {
     /// Write a `<table>__valid` table with passing rows and a
@@ -644,7 +686,8 @@ pub enum QuarantineMode {
 /// # suffix_valid       = "__valid"
 /// # suffix_quarantine  = "__quarantine"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineConfig {
     /// Enable quarantine. Default: `false`.
     #[serde(default)]
@@ -680,7 +723,8 @@ fn default_suffix_quarantine() -> String {
 }
 
 /// Freshness check configuration with optional per-schema overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FreshnessConfig {
     pub threshold_seconds: u64,
     /// Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"),
@@ -693,7 +737,8 @@ pub struct FreshnessConfig {
 }
 
 /// Null rate check configuration: columns to check, threshold, and sample size.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NullRateConfig {
     pub columns: Vec<String>,
     pub threshold: f64,
@@ -709,7 +754,8 @@ fn default_sample_percent() -> u32 {
 }
 
 /// A user-defined SQL check with a name, query template, and pass/fail threshold.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CustomCheckConfig {
     pub name: String,
     pub sql: String,
@@ -721,7 +767,8 @@ pub struct CustomCheckConfig {
 }
 
 /// Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GovernanceConfig {
     #[serde(default)]
     pub auto_create_catalogs: bool,
@@ -766,7 +813,7 @@ impl GovernanceConfig {
 }
 
 /// Workspace binding access level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BindingType {
     #[default]
@@ -791,7 +838,8 @@ impl BindingType {
 }
 
 /// A workspace binding with ID and access level.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBindingConfig {
     pub id: u64,
     #[serde(default)]
@@ -812,7 +860,8 @@ pub struct WorkspaceBindingConfig {
 /// id = 7474647537929812
 /// binding_type = "READ_ONLY"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IsolationConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -821,7 +870,8 @@ pub struct IsolationConfig {
 }
 
 /// A permission grant to apply to catalogs or schemas.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GrantConfig {
     pub principal: String,
     pub permissions: Vec<String>,
@@ -1039,43 +1089,6 @@ pub struct RockyConfig {
     pub schema_evolution: SchemaEvolutionConfig,
 }
 
-/// Placeholder used by [`RockyConfig`] to produce a permissive `[pipeline.*]`
-/// schema in the generated `rocky-project.schema.json`.
-///
-/// The deserializer for [`PipelineConfig`] is unaffected — it still
-/// validates pipelines at parse time. Only the IDE schema is permissive
-/// for now: any object shape is accepted under `pipeline.*`.
-///
-/// To replace this placeholder: derive `JsonSchema` on each of the five
-/// `*PipelineConfig` variant structs and hand-write a `JsonSchema` impl
-/// on [`PipelineConfig`] that emits an `anyOf` of five arms — `type`
-/// optional with const `"replication"` for the back-compat default,
-/// `type` required for the other four. The custom `Deserialize` impl
-/// above accepts more shapes than `#[derive(JsonSchema)]` would emit, so
-/// the impl must be written by hand to match.
-#[doc(hidden)]
-pub struct PipelineConfigSchemaPlaceholder;
-
-impl schemars::JsonSchema for PipelineConfigSchemaPlaceholder {
-    fn schema_name() -> String {
-        "PipelineConfig".to_owned()
-    }
-
-    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::Object.into()),
-            metadata: Some(Box::new(schemars::schema::Metadata {
-                description: Some(
-                    "Pipeline configuration. The full per-variant schema is generated by PR-b of the rocky-project-schema-autogen arc — until then any object shape is accepted by the IDE schema and the deserializer continues to validate at parse time."
-                        .to_owned(),
-                ),
-                ..Default::default()
-            })),
-            ..Default::default()
-        })
-    }
-}
-
 /// Schema-only helper that mirrors the deserializer's acceptance of both
 /// flat (`[adapter] type = "..."`) and named (`[adapter.foo] type = "..."`)
 /// adapter shapes.
@@ -1101,28 +1114,17 @@ pub enum AdaptersFieldSchema {
 /// The flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but
 /// is unused across all committed POCs; including it in the schema is
 /// defensive — a user typing `[pipeline] source = ...` shouldn't see a
-/// false IDE error. The pipeline payload still goes through the
-/// [`PipelineConfigSchemaPlaceholder`] until PR-b lands.
+/// false IDE error. The pipeline payload references [`PipelineConfig`]
+/// directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the
+/// five pipeline variants.
 #[doc(hidden)]
 #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PipelinesFieldSchema {
     /// Flat `[pipeline]` block (single pipeline, auto-named `default`).
-    Flat(PipelineConfigSchemaPlaceholder),
+    Flat(Box<PipelineConfig>),
     /// Named `[pipeline.<name>]` blocks.
-    Nested(IndexMap<String, PipelineConfigSchemaPlaceholder>),
-}
-
-impl serde::Serialize for PipelineConfigSchemaPlaceholder {
-    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
-        unreachable!("PipelineConfigSchemaPlaceholder is schema-only — never instantiated")
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for PipelineConfigSchemaPlaceholder {
-    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        unreachable!("PipelineConfigSchemaPlaceholder is schema-only — never instantiated")
-    }
+    Nested(IndexMap<String, PipelineConfig>),
 }
 
 /// Role an adapter block plays in the pipeline.
@@ -1306,6 +1308,92 @@ impl<'de> Deserialize<'de> for PipelineConfig {
     }
 }
 
+impl JsonSchema for PipelineConfig {
+    fn schema_name() -> String {
+        "PipelineConfig".to_owned()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Hand-written to mirror the custom `Deserialize` impl. A
+        // `#[derive(JsonSchema)]` would derive from the struct shape and
+        // miss two things: (a) the back-compat default that lets a
+        // `[pipeline.x]` block omit `type` and parse as Replication, and
+        // (b) the lowercased-on-disk discriminator value. Both are
+        // empirically required: 43 of 47 committed POC pipelines omit
+        // `type` (back-compat replication); the schema must accept that.
+        //
+        // Each arm composes the variant subschema with a `type` property
+        // constraint via `allOf`. The variant structs deliberately omit
+        // `serde(deny_unknown_fields)` — see the comment on
+        // [`ReplicationPipelineConfig`] for the JSON Schema evaluation
+        // detail that forces that choice. We use `anyOf` rather than
+        // `oneOf` (which requires exactly-one match) because variant
+        // shapes can overlap once `type` is omitted from the back-compat
+        // arm; `anyOf` is the standard shape for tagged unions.
+        use schemars::schema::{InstanceType, Schema, SchemaObject, SubschemaValidation};
+
+        fn type_constraint(name: &'static str, required: bool) -> Schema {
+            let const_schema = Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                enum_values: Some(vec![serde_json::Value::String(name.to_owned())]),
+                ..Default::default()
+            });
+            let mut obj = SchemaObject {
+                instance_type: Some(InstanceType::Object.into()),
+                ..Default::default()
+            };
+            obj.object()
+                .properties
+                .insert("type".to_owned(), const_schema);
+            if required {
+                obj.object().required.insert("type".to_owned());
+            }
+            Schema::Object(obj)
+        }
+
+        fn arm(variant_schema: Schema, type_name: &'static str, type_required: bool) -> Schema {
+            Schema::Object(SchemaObject {
+                subschemas: Some(Box::new(SubschemaValidation {
+                    all_of: Some(vec![
+                        variant_schema,
+                        type_constraint(type_name, type_required),
+                    ]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        }
+
+        let replication = generator.subschema_for::<ReplicationPipelineConfig>();
+        let transformation = generator.subschema_for::<TransformationPipelineConfig>();
+        let quality = generator.subschema_for::<QualityPipelineConfig>();
+        let snapshot = generator.subschema_for::<SnapshotPipelineConfig>();
+        let load = generator.subschema_for::<LoadPipelineConfig>();
+
+        let arms = vec![
+            arm(replication, "replication", false),
+            arm(transformation, "transformation", true),
+            arm(quality, "quality", true),
+            arm(snapshot, "snapshot", true),
+            arm(load, "load", true),
+        ];
+
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.".to_owned(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                any_of: Some(arms),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 impl PipelineConfig {
     /// Returns the pipeline type as a display string.
     pub fn pipeline_type_str(&self) -> &'static str {
@@ -1408,7 +1496,17 @@ impl PipelineConfig {
 /// Copies tables from a source to a target using schema pattern discovery,
 /// with optional incremental strategy, metadata columns, governance, and
 /// data quality checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `deny_unknown_fields` is intentionally absent from the 5 pipeline variant
+// structs: the IDE schema's `PipelineConfig::json_schema` impl injects the
+// `type` discriminator via an `allOf` branch, which under JSON Schema's
+// Draft-07 evaluation model is rejected by the variant struct's
+// `additionalProperties: false`. The deserializer for `PipelineConfig`
+// strips `type` before delegating to the variant — runtime parsing is
+// unaffected — but the IDE validates raw TOML, so the schema must permit
+// `type` as an explicit property without falling back to declaring it on
+// every variant struct. Net: pipeline-block typos slip past the IDE
+// schema; everything outside the pipeline section stays strict.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReplicationPipelineConfig {
     /// Replication strategy: "incremental" or "full_refresh".
     #[serde(default = "default_strategy")]
@@ -1464,7 +1562,8 @@ pub type PipelineConfigV2 = ReplicationPipelineConfig;
 /// [pipeline.silver.execution]
 /// concurrency = 8
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// See note on [`ReplicationPipelineConfig`] for why no `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TransformationPipelineConfig {
     /// Glob pattern for model files, relative to the config file directory.
     /// Default: `"models/**"`.
@@ -1497,7 +1596,8 @@ fn default_models_glob() -> String {
 /// for dynamic routing), transformation targets only need an adapter reference
 /// and optional governance — the actual catalog/schema/table is defined per-model
 /// in sidecar TOML files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransformationTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     /// Defaults to `"default"`.
@@ -1530,7 +1630,8 @@ pub struct TransformationTargetConfig {
 /// enabled = true
 /// freshness = { threshold_seconds = 86400 }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// See note on [`ReplicationPipelineConfig`] for why no `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QualityPipelineConfig {
     /// Target adapter for running check queries.
     pub target: QualityTargetConfig,
@@ -1553,7 +1654,8 @@ pub struct QualityPipelineConfig {
 }
 
 /// Target configuration for quality pipelines (adapter reference only).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QualityTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
@@ -1562,7 +1664,8 @@ pub struct QualityTargetConfig {
 
 /// A reference to a specific catalog/schema/table for quality checks
 /// and snapshot pipelines.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TableRef {
     pub catalog: String,
     pub schema: String,
@@ -1596,7 +1699,8 @@ pub struct TableRef {
 /// schema = "silver__scd"
 /// table = "customers_history"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// See note on [`ReplicationPipelineConfig`] for why no `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotPipelineConfig {
     /// Column(s) that uniquely identify a row in the source table.
     pub unique_key: Vec<String>,
@@ -1629,7 +1733,8 @@ pub struct SnapshotPipelineConfig {
 }
 
 /// Source table for a snapshot pipeline (explicit single-table reference).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotSourceConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
@@ -1640,7 +1745,8 @@ pub struct SnapshotSourceConfig {
 }
 
 /// Target table for a snapshot pipeline (explicit single-table reference + governance).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
@@ -1677,7 +1783,8 @@ pub struct SnapshotTargetConfig {
 /// csv_delimiter = ","
 /// csv_has_header = true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// See note on [`ReplicationPipelineConfig`] for why no `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LoadPipelineConfig {
     /// Directory or glob pattern for source files, relative to the config file.
     pub source_dir: String,
@@ -1710,7 +1817,7 @@ pub struct LoadPipelineConfig {
 ///
 /// Mirrors `rocky_adapter_sdk::FileFormat` but lives in rocky-core to
 /// avoid a hard dependency from config parsing to the adapter SDK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadFileFormat {
     Csv,
@@ -1730,7 +1837,8 @@ impl std::fmt::Display for LoadFileFormat {
 }
 
 /// Target configuration for load pipelines.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LoadTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
@@ -1753,7 +1861,8 @@ pub struct LoadTargetConfig {
 }
 
 /// Load-specific options parsed from TOML.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LoadOptionsConfig {
     /// Number of rows per INSERT batch. Default: 10,000.
     #[serde(default = "default_load_batch_size")]
@@ -1819,7 +1928,8 @@ fn default_timestamp_column() -> String {
 }
 
 /// Pipeline source configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineSourceConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     /// Defaults to `"default"` — resolved against the adapter map in
@@ -1839,7 +1949,8 @@ pub struct PipelineSourceConfig {
 }
 
 /// Discovery configuration within a pipeline source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     /// Name of the adapter to use for discovery (references a key in `[adapter.*]`).
     /// Defaults to `"default"`.
@@ -1848,7 +1959,8 @@ pub struct DiscoveryConfig {
 }
 
 /// Pipeline target configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     /// Defaults to `"default"`.
