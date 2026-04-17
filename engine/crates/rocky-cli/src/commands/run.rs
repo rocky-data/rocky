@@ -75,6 +75,33 @@ struct TableError {
     task_index: Option<usize>,
 }
 
+/// Sentinel error signalling that `rocky run` was cancelled by a SIGINT
+/// (first Ctrl-C). The outer binary (`rocky/src/main.rs`) downcasts this
+/// off the `anyhow::Error` chain and maps it to exit code 130 so callers
+/// (shell, CI, orchestrators) can distinguish "user cancelled" from a
+/// generic run failure. A second SIGINT bypasses this path entirely and
+/// calls `std::process::exit(130)` directly.
+#[derive(Debug, thiserror::Error)]
+#[error("run was interrupted by SIGINT")]
+pub struct Interrupted;
+
+/// Arm a background watcher that hard-exits with code 130 on a *second*
+/// SIGINT. The first SIGINT is handled by the outer `tokio::select!`
+/// branch — this watcher's job is to give the user an out when graceful
+/// cleanup itself hangs (e.g. a stuck warehouse query that ignores
+/// cancellation). Idempotent in practice: we only call it from the
+/// single-arm branch that flips `interrupted = true`.
+fn arm_second_sigint_watcher() {
+    eprintln!(
+        "\n[rocky] interrupt received — finishing in-flight statements; press Ctrl-C again to terminate"
+    );
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\n[rocky] second SIGINT — terminating");
+        std::process::exit(130);
+    });
+}
+
 /// Input for a single table processing task.
 #[derive(Clone)]
 struct TableTask {
@@ -979,7 +1006,21 @@ pub async fn run(
     let error_rate_abort_pct = pipeline.execution.error_rate_abort_pct;
     let mut total_completed: usize = 0;
 
+    // SIGINT handling: a single pinned `ctrl_c()` future drives both the
+    // spawn loop's permit-wait and the drain loop below. On first Ctrl-C we
+    // spawn a hard-exit watcher for a second Ctrl-C, set `interrupted`, and
+    // stop issuing new work. In-flight tasks drain naturally so state
+    // updates remain consistent; anything not yet `Success` or `Failed` in
+    // the state store after drain is marked `Interrupted`.
+    let ctrl_c_signal = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c_signal);
+    let mut interrupted = false;
+
     for (idx, task) in tables_to_process.iter().enumerate() {
+        if interrupted {
+            break;
+        }
+
         // When adaptive concurrency is active, drain completed results before
         // spawning so we can adjust the semaphore to match the throttle's
         // recommendation before acquiring the next permit. This interleaves
@@ -1009,7 +1050,14 @@ pub async fn run(
             }
         }
 
-        let permit = semaphore.clone().acquire_owned().await?;
+        let permit = tokio::select! {
+            permit = semaphore.clone().acquire_owned() => permit?,
+            _ = &mut ctrl_c_signal, if !interrupted => {
+                arm_second_sigint_watcher();
+                interrupted = true;
+                break;
+            }
+        };
         let warehouse = shared_warehouse.clone();
         let state = shared_state.clone();
         let pipeline_ref = shared_pipeline.clone();
@@ -1022,8 +1070,22 @@ pub async fn run(
         });
     }
 
-    // Collect remaining results with adaptive error rate monitoring
-    while let Some(result) = join_set.join_next().await {
+    // Collect remaining results with adaptive error rate monitoring.
+    // Driven as a `loop { tokio::select! }` so a first SIGINT fires the
+    // hard-exit watcher and flips `interrupted = true`; tasks already in
+    // flight keep running and their results are still collected below.
+    loop {
+        let result = tokio::select! {
+            res = join_set.join_next() => match res {
+                Some(r) => r,
+                None => break,
+            },
+            _ = &mut ctrl_c_signal, if !interrupted => {
+                arm_second_sigint_watcher();
+                interrupted = true;
+                continue;
+            }
+        };
         total_completed += 1;
 
         match result {
@@ -1199,6 +1261,93 @@ pub async fn run(
                 break;
             }
         }
+    }
+
+    // SIGINT cleanup: flush watermarks for tables that completed, mark
+    // everything not-yet-`Success`/`Failed` as `Interrupted`, emit partial
+    // JSON, and return the sentinel error. Auto-retry + downstream phases
+    // are all skipped — they implicitly need a "successful" run baseline.
+    if interrupted {
+        output.interrupted = true;
+
+        {
+            let state = shared_state.lock().await;
+            for wm in &deferred_watermarks {
+                let _ = state.set_watermark(
+                    &wm.state_key,
+                    &WatermarkState {
+                        last_value: wm.timestamp,
+                        updated_at: wm.timestamp,
+                    },
+                );
+            }
+        }
+
+        // Diff: plan \ {Success|Failed} → mark as Interrupted. Uses the
+        // state store as source of truth for what already committed.
+        let settled: std::collections::HashSet<String> = {
+            let state = shared_state.lock().await;
+            state
+                .get_run_progress(&shared_run_id)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    p.tables
+                        .iter()
+                        .filter(|t| {
+                            matches!(
+                                t.status,
+                                rocky_core::state::TableStatus::Success
+                                    | rocky_core::state::TableStatus::Failed
+                            )
+                        })
+                        .map(|t| t.table_key.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        {
+            let state = shared_state.lock().await;
+            for (idx, task) in tables_to_process.iter().enumerate() {
+                let key = format!(
+                    "{}.{}.{}",
+                    task.target_catalog, task.target_schema, task.table_name
+                );
+                if !settled.contains(&key) {
+                    let mut asset_key = task.asset_key_prefix.clone();
+                    asset_key.push(task.table_name.clone());
+                    let _ = state.record_table_progress(
+                        &shared_run_id,
+                        &rocky_core::state::TableProgress {
+                            index: idx,
+                            table_key: key,
+                            asset_key,
+                            status: rocky_core::state::TableStatus::Interrupted,
+                            error: None,
+                            duration_ms: 0,
+                            completed_at: Utc::now(),
+                        },
+                    );
+                }
+            }
+        }
+
+        state_sync_handle.abort();
+
+        output.duration_ms = start.elapsed().as_millis() as u64;
+        if output_json {
+            print_json(&output)?;
+        } else {
+            eprintln!(
+                "[rocky] interrupted at {}/{} tables (run_id: {})",
+                total_completed,
+                tables_to_process.len(),
+                shared_run_id
+            );
+        }
+
+        return Err(anyhow::Error::new(Interrupted));
     }
 
     // Auto-retry failed tables
@@ -3150,6 +3299,7 @@ mod tests {
                 }],
             },
             partition_summaries: vec![],
+            interrupted: false,
         };
 
         emit_pipes_events(&emitter, &output);

@@ -41,6 +41,11 @@ pub enum PartitionStatus {
     /// Compute is in flight (set at the start of a partition run, cleared at
     /// the end). A long-lived `InProgress` row indicates a crashed runner.
     InProgress,
+    /// Compute was cancelled by a SIGINT (Ctrl-C) before it completed.
+    /// Distinguishable from `Failed` so `--resume-latest` / `--missing` can
+    /// tell "user interrupted" from "query failed" and surface it in JSON
+    /// output.
+    Interrupted,
 }
 
 /// State-store record for a single partition of a `time_interval` model.

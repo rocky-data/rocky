@@ -365,6 +365,10 @@ class RunOutput(BaseModel):
     """
     execution: ExecutionSummary
     filter: str
+    interrupted: bool
+    """
+    `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so orchestrators can distinguish "user interrupted" from "run failed". Tables that hadn't reached `Success` or `Failed` at interrupt time are recorded as `TableStatus::Interrupted` in the state store. Always serialised (even when `false`) so consumers don't have to treat its absence specially.
+    """
     materializations: list[MaterializationOutput]
     metrics: MetricsSnapshot | None = None
     partition_summaries: list[PartitionSummary]

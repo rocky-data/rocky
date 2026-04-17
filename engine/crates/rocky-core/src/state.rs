@@ -486,6 +486,10 @@ pub enum TableStatus {
     Success,
     Failed,
     Skipped,
+    /// Table was cancelled by a SIGINT (Ctrl-C) before it completed —
+    /// distinct from `Failed` so `--resume-latest` knows to retry it and
+    /// JSON consumers can show "interrupted" in the UI.
+    Interrupted,
 }
 
 /// Execution record for a single table within a run.
