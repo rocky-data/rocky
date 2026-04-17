@@ -313,11 +313,15 @@ fn interpret_result(
     result: &rocky_core::traits::QueryResult,
 ) -> (String, Option<String>) {
     match test_type {
-        // not_null / expression / in_range / regex_match: SELECT COUNT(*) — pass when count == 0
+        // not_null / expression / in_range / regex_match / time_window / aggregate:
+        // single-cell numeric result — 0 = pass, >0 = fail.
         TestType::NotNull
         | TestType::Expression { .. }
         | TestType::InRange { .. }
-        | TestType::RegexMatch { .. } => {
+        | TestType::RegexMatch { .. }
+        | TestType::NotInFuture
+        | TestType::OlderThanNDays { .. }
+        | TestType::Aggregate { .. } => {
             let count = first_row_count(result);
             if count == 0 {
                 ("pass".to_string(), None)
@@ -326,14 +330,20 @@ fn interpret_result(
                     TestType::NotNull => "NULL row(s)",
                     TestType::InRange { .. } => "out-of-range row(s)",
                     TestType::RegexMatch { .. } => "non-matching row(s)",
+                    TestType::NotInFuture => "future-timestamped row(s)",
+                    TestType::OlderThanNDays { .. } => "too-recent row(s)",
+                    TestType::Aggregate { .. } => "aggregate failure",
                     _ => "violating row(s)",
                 };
                 ("fail".to_string(), Some(format!("{count} {what} found")))
             }
         }
 
-        // unique / accepted_values / relationships: rows returned = failures
-        TestType::Unique | TestType::AcceptedValues { .. } | TestType::Relationships { .. } => {
+        // unique / accepted_values / relationships / composite: rows returned = failures
+        TestType::Unique
+        | TestType::AcceptedValues { .. }
+        | TestType::Relationships { .. }
+        | TestType::Composite { .. } => {
             let row_count = result.rows.len();
             if row_count == 0 {
                 ("pass".to_string(), None)
@@ -342,6 +352,7 @@ fn interpret_result(
                     TestType::Unique => "duplicate value(s)",
                     TestType::AcceptedValues { .. } => "unexpected value(s)",
                     TestType::Relationships { .. } => "orphaned row(s)",
+                    TestType::Composite { .. } => "duplicate key(s)",
                     _ => unreachable!(),
                 };
                 (
@@ -400,5 +411,9 @@ fn test_type_label(tt: &TestType) -> &'static str {
         TestType::RowCountRange { .. } => "row_count_range",
         TestType::InRange { .. } => "in_range",
         TestType::RegexMatch { .. } => "regex_match",
+        TestType::Aggregate { .. } => "aggregate",
+        TestType::Composite { .. } => "composite",
+        TestType::NotInFuture => "not_in_future",
+        TestType::OlderThanNDays { .. } => "older_than_n_days",
     }
 }

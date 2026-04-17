@@ -619,6 +619,10 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
         TestType::RowCountRange { .. } => "row_count_range",
         TestType::InRange { .. } => "in_range",
         TestType::RegexMatch { .. } => "regex_match",
+        TestType::Aggregate { .. } => "aggregate",
+        TestType::Composite { .. } => "composite",
+        TestType::NotInFuture => "not_in_future",
+        TestType::OlderThanNDays { .. } => "older_than_n_days",
     };
 
     match &test.column {

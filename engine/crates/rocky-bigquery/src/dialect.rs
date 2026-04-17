@@ -175,6 +175,14 @@ impl SqlDialect for BigQueryDialect {
     ) -> rocky_core::traits::AdapterResult<String> {
         Ok(format!("REGEXP_CONTAINS({column}, r'{pattern}')"))
     }
+
+    fn date_minus_days_expr(&self, days: u32) -> rocky_core::traits::AdapterResult<String> {
+        Ok(format!("DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)"))
+    }
+
+    fn current_timestamp_expr(&self) -> &'static str {
+        "CURRENT_TIMESTAMP()"
+    }
 }
 
 #[cfg(test)]

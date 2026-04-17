@@ -43,6 +43,21 @@ pub enum TestGenError {
 
     #[error("regex_match test is not supported by this adapter: {0}")]
     RegexNotSupported(String),
+
+    #[error("aggregate test op '{op}' requires a 'column' (not needed only for 'count')")]
+    AggregateMissingColumn { op: String },
+
+    #[error("aggregate test 'value' '{value}' must parse as a number")]
+    InvalidAggregateValue { value: String },
+
+    #[error("composite test requires at least two columns in 'columns'")]
+    CompositeTooFewColumns,
+
+    #[error("time_window 'older_than_n_days' requires a 'days' field")]
+    TimeWindowMissingDays,
+
+    #[error("time_window test is not supported by this adapter: {0}")]
+    TimeWindowNotSupported(String),
 }
 
 /// Severity of a test failure.
@@ -119,6 +134,127 @@ pub enum TestType {
         /// portable subset (character classes, anchors, quantifiers).
         pattern: String,
     },
+    /// Assert that an aggregate (`sum`, `count`, `avg`, `min`, `max`) of
+    /// a column satisfies a comparison against a numeric threshold. The
+    /// comparison is what **passes** — e.g. `op = "sum", cmp = "gt",
+    /// value = "0"` means "sum(col) > 0 passes; otherwise fails".
+    ///
+    /// Table-level; not quarantinable. Use `count` (no column) for the
+    /// row-count-based variants that `row_count_range` can't express
+    /// (equality, strict inequalities).
+    Aggregate {
+        /// Aggregate operator.
+        op: AggregateOp,
+        /// Comparison between `op(column)` and `value`. The check passes
+        /// when the comparison is true.
+        cmp: AggregateCmp,
+        /// Threshold to compare against. Parsed as `f64`.
+        value: String,
+    },
+    /// Assert that a combination of columns is unique across all rows.
+    /// Extends [`TestType::Unique`] to composite keys.
+    ///
+    /// Set-based; not quarantinable.
+    Composite {
+        /// The kind of composite assertion. Currently `unique` only —
+        /// kept as an enum to leave room for `not_null_any` /
+        /// `not_null_all` in a later phase without another TestType.
+        kind: CompositeKind,
+        /// Columns that together form the key. Must have at least two
+        /// entries (single-column uniqueness is covered by `Unique`).
+        columns: Vec<String>,
+    },
+    /// First-class sugar for `col <= CURRENT_TIMESTAMP()` — no timestamp
+    /// in the future. Row-level; quarantinable (NULL column values pass).
+    NotInFuture,
+    /// First-class sugar for `col <= CURRENT_DATE - N days` — every row's
+    /// timestamp must be at least `days` days old. Row-level;
+    /// quarantinable (NULL column values pass). Dialect-specific: uses
+    /// [`SqlDialect::date_minus_days_expr`].
+    OlderThanNDays {
+        /// N — days in the past. Must be > 0.
+        days: u32,
+    },
+}
+
+/// Aggregate operator used by [`TestType::Aggregate`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateOp {
+    /// `SUM(column)` — column required.
+    Sum,
+    /// `COUNT(*)` — column ignored.
+    Count,
+    /// `AVG(column)` — column required.
+    Avg,
+    /// `MIN(column)` — column required.
+    Min,
+    /// `MAX(column)` — column required.
+    Max,
+}
+
+impl AggregateOp {
+    fn sql(&self, column: Option<&str>) -> Result<String, TestGenError> {
+        match self {
+            AggregateOp::Count => Ok("COUNT(*)".to_string()),
+            other => {
+                let col = column.ok_or_else(|| TestGenError::AggregateMissingColumn {
+                    op: format!("{other:?}").to_lowercase(),
+                })?;
+                validation::validate_identifier(col)?;
+                let name = match other {
+                    AggregateOp::Sum => "SUM",
+                    AggregateOp::Avg => "AVG",
+                    AggregateOp::Min => "MIN",
+                    AggregateOp::Max => "MAX",
+                    AggregateOp::Count => unreachable!(),
+                };
+                Ok(format!("{name}({col})"))
+            }
+        }
+    }
+}
+
+/// Comparison operator used by [`TestType::Aggregate`].
+///
+/// Deserialized from the tokens `"lt"`, `"lte"`, `"gt"`, `"gte"`, `"eq"`,
+/// `"ne"` (and their symbolic aliases `"<"`, `"<="`, `">"`, `">="`,
+/// `"=="`, `"!="`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum AggregateCmp {
+    #[serde(rename = "lt", alias = "<")]
+    Lt,
+    #[serde(rename = "lte", alias = "<=")]
+    Lte,
+    #[serde(rename = "gt", alias = ">")]
+    Gt,
+    #[serde(rename = "gte", alias = ">=")]
+    Gte,
+    #[serde(rename = "eq", alias = "==")]
+    Eq,
+    #[serde(rename = "ne", alias = "!=")]
+    Ne,
+}
+
+impl AggregateCmp {
+    fn sql(&self) -> &'static str {
+        match self {
+            AggregateCmp::Lt => "<",
+            AggregateCmp::Lte => "<=",
+            AggregateCmp::Gt => ">",
+            AggregateCmp::Gte => ">=",
+            AggregateCmp::Eq => "=",
+            AggregateCmp::Ne => "<>",
+        }
+    }
+}
+
+/// Kind of composite (multi-column) assertion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeKind {
+    /// `(col1, col2, ...)` is unique across all rows.
+    Unique,
 }
 
 /// A single declarative test declared in a model sidecar TOML.
@@ -319,6 +455,73 @@ fn generate_test_sql_inner(
                 .map_err(|e| TestGenError::RegexNotSupported(e.to_string()))?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({match_pred})",
+                filter_and(filter),
+            ))
+        }
+        TestType::Aggregate { op, cmp, value } => {
+            // Validate the threshold parses as a number; emit as SQL literal.
+            let n = value
+                .parse::<f64>()
+                .map_err(|_| TestGenError::InvalidAggregateValue {
+                    value: value.clone(),
+                })?;
+            let op_sql = op.sql(test.column.as_deref())?;
+            let cmp_sql = cmp.sql();
+            let lit = format_numeric(n);
+            let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
+            // Return a single cell: 0 when the aggregate *passes* (cmp
+            // holds), 1 otherwise. The caller treats 0 as pass, >0 as fail.
+            Ok(format!(
+                "SELECT CASE WHEN {op_sql} {cmp_sql} {lit} THEN 0 ELSE 1 END FROM {table}{where_clause}"
+            ))
+        }
+        TestType::Composite { kind, columns } => {
+            if columns.len() < 2 {
+                return Err(TestGenError::CompositeTooFewColumns);
+            }
+            for col in columns {
+                validation::validate_identifier(col)?;
+            }
+            let cols = columns.join(", ");
+            let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
+            match kind {
+                CompositeKind::Unique => Ok(format!(
+                    "SELECT {cols}, COUNT(*) FROM {table}{where_clause} GROUP BY {cols} HAVING COUNT(*) > 1"
+                )),
+            }
+        }
+        TestType::NotInFuture => {
+            let col = require_column(test, "not_in_future")?;
+            validation::validate_identifier(col)?;
+            let dialect = dialect.ok_or_else(|| {
+                TestGenError::TimeWindowNotSupported(
+                    "use generate_test_sql_with_dialect for not_in_future".into(),
+                )
+            })?;
+            let now = dialect.current_timestamp_expr();
+            // Failing rows: timestamp strictly in the future.
+            Ok(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}{col} > {now}",
+                filter_and(filter),
+            ))
+        }
+        TestType::OlderThanNDays { days } => {
+            if *days == 0 {
+                return Err(TestGenError::TimeWindowMissingDays);
+            }
+            let col = require_column(test, "older_than_n_days")?;
+            validation::validate_identifier(col)?;
+            let dialect = dialect.ok_or_else(|| {
+                TestGenError::TimeWindowNotSupported(
+                    "use generate_test_sql_with_dialect for older_than_n_days".into(),
+                )
+            })?;
+            let bound = dialect
+                .date_minus_days_expr(*days)
+                .map_err(|e| TestGenError::TimeWindowNotSupported(e.to_string()))?;
+            // Failing rows: timestamp more recent than the bound.
+            Ok(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}{col} > ({bound})",
                 filter_and(filter),
             ))
         }
@@ -1036,5 +1239,188 @@ pattern = "^[a-z]+@example\\.com$"
         };
         let sql = generate_test_sql(&decl, "t").unwrap();
         assert_eq!(sql, "SELECT COUNT(*) FROM t WHERE id IS NULL");
+    }
+
+    // ----- Phase 4b: Aggregate -----
+
+    #[test]
+    fn test_aggregate_sum_gt() {
+        let decl = TestDecl {
+            test_type: TestType::Aggregate {
+                op: AggregateOp::Sum,
+                cmp: AggregateCmp::Gt,
+                value: "0".into(),
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT CASE WHEN SUM(amount) > 0 THEN 0 ELSE 1 END FROM orders"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_count_no_column() {
+        let decl = TestDecl {
+            test_type: TestType::Aggregate {
+                op: AggregateOp::Count,
+                cmp: AggregateCmp::Gte,
+                value: "10".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT CASE WHEN COUNT(*) >= 10 THEN 0 ELSE 1 END FROM orders"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_avg_with_filter() {
+        let decl = TestDecl {
+            test_type: TestType::Aggregate {
+                op: AggregateOp::Avg,
+                cmp: AggregateCmp::Lte,
+                value: "100".into(),
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Warning,
+            filter: Some("status = 'shipped'".into()),
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT CASE WHEN AVG(amount) <= 100 THEN 0 ELSE 1 END FROM orders WHERE (status = 'shipped')"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_rejects_non_numeric_value() {
+        let decl = TestDecl {
+            test_type: TestType::Aggregate {
+                op: AggregateOp::Sum,
+                cmp: AggregateCmp::Gt,
+                value: "hello".into(),
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("must parse as a number"));
+    }
+
+    #[test]
+    fn test_aggregate_sum_requires_column() {
+        let decl = TestDecl {
+            test_type: TestType::Aggregate {
+                op: AggregateOp::Sum,
+                cmp: AggregateCmp::Gt,
+                value: "0".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("requires a 'column'"));
+    }
+
+    #[test]
+    fn test_aggregate_cmp_symbolic_aliases() {
+        let toml_str = r#"
+type = "aggregate"
+op = "sum"
+column = "amount"
+cmp = ">="
+value = "0"
+"#;
+        let decl: TestDecl = toml::from_str(toml_str).unwrap();
+        if let TestType::Aggregate { cmp, .. } = &decl.test_type {
+            assert_eq!(*cmp, AggregateCmp::Gte);
+        } else {
+            panic!("expected Aggregate");
+        }
+    }
+
+    // ----- Phase 4b: Composite -----
+
+    #[test]
+    fn test_composite_unique_two_columns() {
+        let decl = TestDecl {
+            test_type: TestType::Composite {
+                kind: CompositeKind::Unique,
+                columns: vec!["order_id".into(), "line_item_id".into()],
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "order_lines").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT order_id, line_item_id, COUNT(*) FROM order_lines GROUP BY order_id, line_item_id HAVING COUNT(*) > 1"
+        );
+    }
+
+    #[test]
+    fn test_composite_rejects_single_column() {
+        let decl = TestDecl {
+            test_type: TestType::Composite {
+                kind: CompositeKind::Unique,
+                columns: vec!["order_id".into()],
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("at least two columns"));
+    }
+
+    // ----- Phase 4b: TimeWindow -----
+
+    #[test]
+    fn test_not_in_future_needs_dialect() {
+        // Plain `generate_test_sql` errors on NotInFuture — it needs a
+        // dialect to emit the correct CURRENT_TIMESTAMP form.
+        let decl = TestDecl {
+            test_type: TestType::NotInFuture,
+            column: Some("created_at".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn test_older_than_n_days_needs_dialect() {
+        let decl = TestDecl {
+            test_type: TestType::OlderThanNDays { days: 30 },
+            column: Some("created_at".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn test_older_than_n_days_rejects_zero() {
+        let decl = TestDecl {
+            test_type: TestType::OlderThanNDays { days: 0 },
+            column: Some("created_at".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("requires a 'days' field"));
     }
 }

@@ -431,6 +431,10 @@ fn test_type_kind(t: &rocky_core::tests::TestType) -> &'static str {
         TestType::RowCountRange { .. } => "row_count_range",
         TestType::InRange { .. } => "in_range",
         TestType::RegexMatch { .. } => "regex_match",
+        TestType::Aggregate { .. } => "aggregate",
+        TestType::Composite { .. } => "composite",
+        TestType::NotInFuture => "not_in_future",
+        TestType::OlderThanNDays { .. } => "older_than_n_days",
     }
 }
 
@@ -461,12 +465,17 @@ fn classify_assertion(
         TestType::NotNull
         | TestType::Expression { .. }
         | TestType::InRange { .. }
-        | TestType::RegexMatch { .. } => {
+        | TestType::RegexMatch { .. }
+        | TestType::NotInFuture
+        | TestType::OlderThanNDays { .. } => {
             let n = first_cell_u64();
             (n == 0, n)
         }
         // Row-set-based: every returned row is a violation.
-        TestType::Unique | TestType::AcceptedValues { .. } | TestType::Relationships { .. } => {
+        TestType::Unique
+        | TestType::AcceptedValues { .. }
+        | TestType::Relationships { .. }
+        | TestType::Composite { .. } => {
             let n = rows.len() as u64;
             (n == 0, n)
         }
@@ -475,6 +484,11 @@ fn classify_assertion(
             let within_min = min.map(|m| n >= m).unwrap_or(true);
             let within_max = max.map(|m| n <= m).unwrap_or(true);
             (within_min && within_max, n)
+        }
+        // Aggregate: the test SQL returns a single 0/1 cell (0 = pass).
+        TestType::Aggregate { .. } => {
+            let n = first_cell_u64();
+            (n == 0, n)
         }
     }
 }
