@@ -1,6 +1,6 @@
 [package]
 name = "rocky-iceberg"
-version = "1.3.0"
+version = "1.5.0"
 description = "Apache Iceberg source adapter for Rocky"
 edition.workspace = true
 license.workspace = true
