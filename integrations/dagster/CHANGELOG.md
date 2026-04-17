@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-04-17
+
+### Added — `RunOutput.interrupted` and regenerated Pydantic bindings for engine 1.8.0
+
+Engine 1.8.0 shipped graceful SIGINT / SIGTERM handling for `rocky run` and a silent-wrong-result fix for BigQuery async polling. On the dagster side, the regenerated bindings surface a new required field on the run payload:
+
+- **`RunOutput.interrupted: bool`** — `true` when the run was cancelled by a shutdown signal. Paired with the engine-side `TableStatus.INTERRUPTED` enum value on the corresponding `TableProgress` rows, so orchestrators can distinguish "user interrupted / pod evicted" from "run failed" and from "run succeeded".
+
+`interrupted` is always serialised by the engine (no skip-if-false), so existing consumers pick it up without code changes — but old Rocky binaries that don't emit the field will now produce a Pydantic validation error. Pin \`rocky >= 1.8.0\` in orchestrator environments when upgrading.
+
+No source code changes in `dagster_rocky` itself — \`RockyResource\` + \`RockyComponent\` + the Pipes path all continue to work unchanged against engine 1.8.0. The regenerated model in \`types_generated/run_schema.py\` picks up the field automatically.
+
+Fixture refresh via \`just regen-fixtures\` against the 1.8.0 binary.
+
+### Upgrading
+
+\`dagster-rocky\` ships independently from the engine. To consume engine 1.8.0 features, either install \`engine-v1.8.0\` on the orchestrator's \`$PATH\` or re-vendor the binary via \`scripts/vendor_rocky.sh\` before updating your pipeline code. Pair updates are recommended: the engine's interrupt-handling and BigQuery polling fixes are silently beneficial on the runtime side even if you don't read \`RunOutput.interrupted\` yet.
+
 ## [1.4.0] — 2026-04-17
 
 ### Added — Pydantic models for the `rocky_project` schema
