@@ -333,7 +333,7 @@ fn default_table_retries() -> u32 {
 }
 
 /// State storage backend variants.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StateBackend {
     /// State stored on local disk (default). No sync needed.
@@ -369,7 +369,8 @@ impl std::fmt::Display for StateBackend {
 /// When both S3 and Valkey are configured (`backend = "tiered"`):
 /// - Download: Valkey first (fast), S3 fallback (durable)
 /// - Upload: write to both Valkey + S3
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StateConfig {
     /// Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
     #[serde(default)]
@@ -393,6 +394,7 @@ pub struct StateConfig {
 /// Rocky retries transient errors with exponential backoff and optional jitter
 /// to prevent thundering herd across concurrent runs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
     #[serde(default = "default_max_retries")]
@@ -845,7 +847,8 @@ pub struct GovernanceOverride {
 /// still exist in the target table. Instead of immediately dropping them,
 /// Rocky can keep them for a grace period (filling with NULL) so downstream
 /// consumers have time to adapt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaEvolutionConfig {
     /// Number of days to keep a dropped column before removing it from the
     /// target table. During this window the column is filled with NULL for
@@ -871,7 +874,8 @@ impl Default for SchemaEvolutionConfig {
 ///
 /// Controls pricing assumptions used by [`crate::optimize::recommend_strategy`]
 /// when analyzing materialization costs and generating recommendations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CostSection {
     /// Cost per GB of storage per month (default: $0.023).
     #[serde(default = "default_storage_cost")]
@@ -1005,7 +1009,8 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
 /// type = "replication"
 /// ...
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RockyConfig {
     /// Global state persistence configuration.
     #[serde(default)]
@@ -1013,10 +1018,12 @@ pub struct RockyConfig {
 
     /// Named adapter configurations (keyed by adapter name).
     #[serde(default, rename = "adapter", alias = "adapters")]
+    #[schemars(with = "AdaptersFieldSchema")]
     pub adapters: IndexMap<String, AdapterConfig>,
 
     /// Named pipeline configurations (keyed by pipeline name).
     #[serde(default, rename = "pipeline", alias = "pipelines")]
+    #[schemars(with = "PipelinesFieldSchema")]
     pub pipelines: IndexMap<String, PipelineConfig>,
 
     /// Shell hooks configuration.
@@ -1030,6 +1037,92 @@ pub struct RockyConfig {
     /// Schema evolution configuration (grace-period column drops).
     #[serde(default)]
     pub schema_evolution: SchemaEvolutionConfig,
+}
+
+/// Placeholder used by [`RockyConfig`] to produce a permissive `[pipeline.*]`
+/// schema in the generated `rocky-project.schema.json`.
+///
+/// The deserializer for [`PipelineConfig`] is unaffected — it still
+/// validates pipelines at parse time. Only the IDE schema is permissive
+/// for now: any object shape is accepted under `pipeline.*`.
+///
+/// To replace this placeholder: derive `JsonSchema` on each of the five
+/// `*PipelineConfig` variant structs and hand-write a `JsonSchema` impl
+/// on [`PipelineConfig`] that emits an `anyOf` of five arms — `type`
+/// optional with const `"replication"` for the back-compat default,
+/// `type` required for the other four. The custom `Deserialize` impl
+/// above accepts more shapes than `#[derive(JsonSchema)]` would emit, so
+/// the impl must be written by hand to match.
+#[doc(hidden)]
+pub struct PipelineConfigSchemaPlaceholder;
+
+impl schemars::JsonSchema for PipelineConfigSchemaPlaceholder {
+    fn schema_name() -> String {
+        "PipelineConfig".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::Object.into()),
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Pipeline configuration. The full per-variant schema is generated by PR-b of the rocky-project-schema-autogen arc — until then any object shape is accepted by the IDE schema and the deserializer continues to validate at parse time."
+                        .to_owned(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+/// Schema-only helper that mirrors the deserializer's acceptance of both
+/// flat (`[adapter] type = "..."`) and named (`[adapter.foo] type = "..."`)
+/// adapter shapes.
+///
+/// [`normalize_toml_shorthands`] rewrites the flat form into
+/// `adapter.default` before [`RockyConfig`] is deserialized, so the Rust
+/// type only sees the named form. The IDE schema, however, validates the
+/// raw TOML — so it must accept both shapes directly. 38 of 46 committed
+/// POC `rocky.toml` files use the flat form; the schema would reject all
+/// of them without this anyOf.
+#[doc(hidden)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AdaptersFieldSchema {
+    /// Flat `[adapter]` block with `type` directly under it (single adapter).
+    Flat(Box<AdapterConfig>),
+    /// Named `[adapter.<name>]` blocks (one or more adapters keyed by name).
+    Nested(IndexMap<String, AdapterConfig>),
+}
+
+/// Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.
+///
+/// The flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but
+/// is unused across all committed POCs; including it in the schema is
+/// defensive — a user typing `[pipeline] source = ...` shouldn't see a
+/// false IDE error. The pipeline payload still goes through the
+/// [`PipelineConfigSchemaPlaceholder`] until PR-b lands.
+#[doc(hidden)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PipelinesFieldSchema {
+    /// Flat `[pipeline]` block (single pipeline, auto-named `default`).
+    Flat(PipelineConfigSchemaPlaceholder),
+    /// Named `[pipeline.<name>]` blocks.
+    Nested(IndexMap<String, PipelineConfigSchemaPlaceholder>),
+}
+
+impl serde::Serialize for PipelineConfigSchemaPlaceholder {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        unreachable!("PipelineConfigSchemaPlaceholder is schema-only — never instantiated")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PipelineConfigSchemaPlaceholder {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        unreachable!("PipelineConfigSchemaPlaceholder is schema-only — never instantiated")
+    }
 }
 
 /// Role an adapter block plays in the pipeline.
@@ -1060,6 +1153,7 @@ pub enum AdapterKind {
 /// `password`, `oauth_token`) are wrapped in [`RedactedString`] so that
 /// `Debug` output never leaks secrets.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterConfig {
     /// Adapter type: "databricks", "fivetran", "duckdb", etc.
     #[serde(rename = "type")]

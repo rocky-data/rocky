@@ -1,14 +1,21 @@
 //! Validates that every `rocky.toml` under `examples/playground/pocs/`
-//! produces `[adapter.*]` blocks accepted by the schemars-generated
-//! [`AdapterConfig`] JSON Schema.
+//! parses cleanly against the schemars-generated [`RockyConfig`] and
+//! [`AdapterConfig`] schemas.
 //!
-//! This is the Phase 1 invariant for the VS Code project-schema
-//! migration: the IDE-facing `editors/vscode/schemas/rocky-project.schema.json`
-//! is still hand-maintained, but the generated schema from `AdapterConfig`
-//! must remain a valid describer of the configs we actually ship. If this
-//! test fails, either the config-struct shape drifted from reality or a
-//! new POC introduced an adapter shape the struct doesn't cover — both
-//! signal a real problem worth investigating before shipping.
+//! Two complementary checks:
+//!
+//! 1. `every_committed_poc_adapter_block_matches_generated_schema` — focused
+//!    check on `[adapter.*]` blocks. Predates the project-level schema and
+//!    catches any drift in the [`AdapterConfig`] struct shape.
+//!
+//! 2. `every_committed_poc_matches_project_schema` — validates the full
+//!    `rocky.toml` against the [`RockyConfig`] schema (top-level state,
+//!    cost, hooks, schema_evolution, adapters). Pipelines pass through the
+//!    permissive PR-a placeholder; PR-b adds the per-variant schema.
+//!
+//! When either fails, either the config-struct shape drifted from reality
+//! or a POC introduced a shape the struct doesn't cover — both are real
+//! problems to investigate before shipping.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +23,7 @@ use std::path::{Path, PathBuf};
 use jsonschema::Validator;
 use schemars::schema_for;
 
-use rocky_core::config::AdapterConfig;
+use rocky_core::config::{AdapterConfig, RockyConfig};
 
 /// Resolve the repo-root `examples/playground/pocs/` directory, or return
 /// `None` when the crate is checked out in isolation (e.g. packaged into
@@ -162,6 +169,82 @@ fn every_committed_poc_adapter_block_matches_generated_schema() {
     assert!(
         failures.is_empty(),
         "generated AdapterConfig schema rejects committed POC adapter blocks:\n{}",
+        failures
+            .iter()
+            .map(|(file, errs)| format!("- {file}\n{}", errs.join("\n")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn every_committed_poc_matches_project_schema() {
+    let Some(root) = pocs_root() else {
+        eprintln!(
+            "skipping every_committed_poc_matches_project_schema: \
+             examples/playground/pocs not reachable from CARGO_MANIFEST_DIR"
+        );
+        return;
+    };
+
+    let schema_value =
+        serde_json::to_value(schema_for!(RockyConfig)).expect("schema serialization is infallible");
+    let validator = Validator::new(&schema_value).expect("generated schema is valid JSON Schema");
+
+    let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut total = 0usize;
+
+    for toml_path in walk_rocky_tomls(&root) {
+        total += 1;
+        let rel = toml_path
+            .strip_prefix(&root)
+            .unwrap_or(&toml_path)
+            .display()
+            .to_string();
+
+        let raw = match std::fs::read_to_string(&toml_path) {
+            Ok(s) => s,
+            Err(e) => {
+                failures.entry(rel).or_default().push(format!("read: {e}"));
+                continue;
+            }
+        };
+        let doc: toml::Value = match toml::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.entry(rel).or_default().push(format!("toml: {e}"));
+                continue;
+            }
+        };
+        let json = match serde_json::to_value(&doc) {
+            Ok(v) => v,
+            Err(e) => {
+                failures
+                    .entry(rel)
+                    .or_default()
+                    .push(format!("toml→json: {e}"));
+                continue;
+            }
+        };
+
+        let errs: Vec<String> = validator
+            .iter_errors(&json)
+            .map(|e| format!("  {e} at {}", e.instance_path))
+            .collect();
+        if !errs.is_empty() {
+            failures.entry(rel).or_default().extend(errs);
+        }
+    }
+
+    assert!(
+        total > 0,
+        "expected at least one rocky.toml under {}; found none",
+        root.display()
+    );
+
+    assert!(
+        failures.is_empty(),
+        "generated RockyConfig schema rejects committed POC rocky.toml files:\n{}",
         failures
             .iter()
             .map(|(file, errs)| format!("- {file}\n{}", errs.join("\n")))

@@ -53,7 +53,8 @@ fn default_retry_delay_ms() -> u64 {
 }
 
 /// Configuration for a single webhook endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     /// Target URL for the webhook request.
     pub url: String,

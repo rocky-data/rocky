@@ -20,11 +20,11 @@ schema_template = "staging__{source}"
 [pipeline.poc.execution]
 concurrency = 4
 
-# Distributed cache — schema metadata + discovery results cached in Valkey
-[cache]
-valkey_url = "${VALKEY_URL:-redis://localhost:6379}"
-
 # Tiered state backend — local redb + Valkey for cross-instance coordination
+# (Note: a top-level `[cache]` block was removed — `CacheConfig` is defined
+# but not yet wired into `RockyConfig`. The Valkey caching surface is the
+# `tiered` state backend below; standalone metadata caching is tracked
+# separately.)
 [state]
 backend = "tiered"
 valkey_url = "${VALKEY_URL:-redis://localhost:6379}"

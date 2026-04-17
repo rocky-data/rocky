@@ -46,7 +46,7 @@ pub enum HookError {
 // HookEvent — the 18 lifecycle points
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
     // Pipeline lifecycle
@@ -159,7 +159,7 @@ impl fmt::Display for HookEvent {
 // FailureAction — what to do when a hook command fails
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureAction {
     /// Stop pipeline immediately.
@@ -179,7 +179,8 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HookConfig {
     /// Shell command to execute (passed to `sh -c`).
     pub command: String,
@@ -441,7 +442,7 @@ pub enum HookResult {
 /// a single hook config (TOML table) or an array of hook configs (TOML array of tables).
 ///
 /// Webhook entries live under `[hook.webhooks.on_<event>]` or `[[hook.webhooks.on_<event>]]`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksConfig {
     /// Webhook configurations keyed by event name.
     #[serde(default)]
@@ -456,7 +457,7 @@ pub struct HooksConfig {
 ///
 /// Single: `[hook.webhooks.on_pipeline_start]`
 /// Multiple: `[[hook.webhooks.on_pipeline_start]]`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum WebhookConfigOrList {
     Single(WebhookConfig),
@@ -467,7 +468,7 @@ pub enum WebhookConfigOrList {
 ///
 /// Single: `[hook.on_pipeline_start]`
 /// Multiple: `[[hook.on_after_checks]]`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum HookConfigOrList {
     Single(HookConfig),

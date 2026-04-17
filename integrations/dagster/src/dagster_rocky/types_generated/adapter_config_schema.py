@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, ConfigDict, Field, conint
 
 
 class AdapterKind1(StrEnum):
@@ -31,6 +31,9 @@ class RetryConfig(BaseModel):
     Rocky retries transient errors with exponential backoff and optional jitter to prevent thundering herd across concurrent runs.
     """
 
+    model_config = ConfigDict(
+        extra="forbid",
+    )
     backoff_multiplier: float | None = 2.0
     """
     Backoff multiplier applied after each retry (e.g. 2.0 = double each time).
@@ -66,6 +69,9 @@ class AdapterConfig(BaseModel):
     Credential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.
     """
 
+    model_config = ConfigDict(
+        extra="forbid",
+    )
     account: str | None = None
     """
     Snowflake account identifier (e.g., "xy12345.us-east-1").
