@@ -400,17 +400,20 @@ The binding type maps to the Databricks API values `BINDING_TYPE_READ_WRITE` and
 
 ### `[pipeline.NAME.checks]`
 
-Post-replication data quality checks.
+Rocky runs quality checks inline during replication. Two surfaces share this section: pipeline-level switches (row count, column match, freshness, null rate, custom SQL, anomaly detection) and model-level `[[assertions]]` blocks covering the DQX parity surface (`not_null`, `unique`, `in_range`, `regex_match`, etc.). Full semantic reference: [Data Quality Checks](/features/data-quality-checks/).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `false` | Master switch to enable or disable all checks. |
+| `enabled` | bool | `false` | Master switch for the pipeline-level checks below. |
+| `fail_on_error` | bool | `true` | When `false`, downgrades every `error`-severity assertion to a non-fatal result. |
 | `row_count` | bool | `false` | Compare row counts between source and target. |
 | `column_match` | bool | `false` | Verify source and target have the same column sets. |
 | `freshness` | table | | `{ threshold_seconds = N, overrides = { ... } }`. |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 to disable. |
+| `quarantine` | table | | `{ mode = "split" \| "tag" \| "drop" }`. See below. |
+| `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
 
 ```toml
 [pipeline.bronze.checks]
@@ -420,6 +423,73 @@ column_match = true
 freshness = { threshold_seconds = 86400 }
 anomaly_threshold_pct = 50.0
 ```
+
+#### `[[pipeline.NAME.checks.assertions]]`
+
+Declarative model-level assertions. Each block declares a `type` and type-specific parameters. All assertions share the same base fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | (required) | One of: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
+| `column` | string | | Required for row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
+| `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
+| `filter` | string | | SQL boolean predicate that scopes the assertion to a subset of rows. |
+
+Type-specific parameters:
+
+| Type | Additional fields |
+|---|---|
+| `accepted_values` | `values: [String]` |
+| `relationships` | `to_table: String`, `to_column: String` |
+| `expression` | `expression: String` (SQL boolean predicate) |
+| `row_count_range` | `min: u64?`, `max: u64?` |
+| `in_range` | `min: String?`, `max: String?` (numeric literals) |
+| `regex_match` | `pattern: String` (dialect-specific regex; no single quotes, backticks, or semicolons) |
+| `aggregate` | `op: sum\|count\|avg\|min\|max`, `cmp: lt\|lte\|gt\|gte\|eq\|ne`, `value: String` |
+| `composite` | `kind: "unique"`, `columns: [String]` (≥2) |
+| `older_than_n_days` | `days: u32` |
+
+```toml
+[[pipeline.silver.checks.assertions]]
+type = "not_null"
+column = "order_id"
+
+[[pipeline.silver.checks.assertions]]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "delivered"]
+severity = "warning"
+
+[[pipeline.silver.checks.assertions]]
+type = "in_range"
+column = "amount_cents"
+min = "0"
+filter = "region = 'US' AND status != 'cancelled'"
+
+[[pipeline.silver.checks.assertions]]
+type = "aggregate"
+op = "sum"
+cmp = "gt"
+value = "0"
+column = "amount_cents"
+
+[[pipeline.silver.checks.assertions]]
+type = "composite"
+kind = "unique"
+columns = ["order_id", "line_item_id"]
+```
+
+#### `[pipeline.NAME.checks.quarantine]`
+
+Route failing rows from row-level assertions into a dedicated table or column instead of just reporting a count.
+
+| Mode | Behavior |
+|---|---|
+| `split` | Materializes `<target>` (valid rows) and `<target>__quarantine` (failing rows). Downstream models see only the clean table. |
+| `tag` | Adds `__dqx_valid` boolean column; failing rows stay with `__dqx_valid = FALSE`. |
+| `drop` | Drops failing rows from `<target>`. |
+
+Set-based and table-level assertions (`unique`, `composite`, `row_count_range`, `aggregate`) run as post-hoc checks regardless of mode.
 
 ### `[pipeline.NAME.execution]`
 

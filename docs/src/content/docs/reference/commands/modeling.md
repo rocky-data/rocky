@@ -35,7 +35,7 @@ rocky compile
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "compile",
   "models_compiled": 14,
   "errors": [],
@@ -55,7 +55,7 @@ rocky compile --model fct_revenue --contracts contracts/
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "compile",
   "models_compiled": 1,
   "errors": [],
@@ -119,7 +119,7 @@ rocky lineage fct_revenue
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "lineage",
   "model": "fct_revenue",
   "columns": [
@@ -193,7 +193,7 @@ rocky test
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "test",
   "models_tested": 14,
   "passed": 12,
@@ -222,7 +222,7 @@ rocky test --model fct_revenue --contracts contracts/
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "test",
   "models_tested": 1,
   "passed": 1,
@@ -266,7 +266,7 @@ rocky ci
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ci",
   "compile": {
     "models_compiled": 14,
@@ -290,7 +290,7 @@ rocky ci --models src/models --contracts src/contracts
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ci",
   "compile": {
     "models_compiled": 14,

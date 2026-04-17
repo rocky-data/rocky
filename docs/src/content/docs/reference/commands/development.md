@@ -96,7 +96,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "import-dbt",
   "models_imported": 24,
   "sources_imported": 6,
@@ -116,7 +116,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt --output src/models
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "import-dbt",
   "models_imported": 24,
   "sources_imported": 6,

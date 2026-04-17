@@ -164,7 +164,7 @@ The JSON output includes materializations, check results, drift actions, and per
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "run",
   "filter": "tenant=acme",
   "duration_ms": 45200,

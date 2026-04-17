@@ -161,6 +161,6 @@ python visualize.py results/benchmark_*.json
 | Rocky 0.1.0 | 1.33 s | 133 µs | 116 MB |
 | Rocky 0.3.0 | 1.20 s | 120 µs | 125 MB |
 | Rocky 0.3.0 (optimized) | 1.00 s | 100 µs | 147 MB |
-| Rocky 1.0.3 (current) | **1.00 s** | **100 µs** | 147 MB |
+| Rocky 1.0.3 | **1.00 s** | **100 µs** | 147 MB |
 
-Cumulative: **25% faster** compile since v0.1.0. Performance has held steady through 1.0 as new features (drift detection, lineage, cost estimation) were added without regressing the compile path. The memory increase (116 → 147 MB) is a deliberate tradeoff — caching and pre-allocation that trade ~31 MB for 39% faster warm compiles.
+Cumulative: **25% faster** compile since v0.1.0. The compile path has held through the 1.x series — features shipped in 1.1–1.6 (warehouse loaders, Dagster DAG mode, DQX parity phases 1–4, adapter-kind diagnostics) added surface area without regressing compile. The memory increase (116 → 147 MB) is a deliberate tradeoff: caching and pre-allocation that trade ~31 MB for 39% faster warm compiles. Re-run the suite against your current engine (`engine/target/release/rocky`) to get numbers pinned to your release.

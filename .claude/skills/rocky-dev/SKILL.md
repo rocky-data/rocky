@@ -51,10 +51,10 @@ Each subproject's native tool (`cargo`, `uv`, `npm`) also works directly from in
 → **`rocky-config`** skill. Covers the 4 pipeline types (replication / transformation / quality / snapshot), adapter variants (duckdb / databricks / snowflake / fivetran), minimal-config defaults, env-var substitution (`${VAR:-default}`), governance, checks, contracts, state backends, hooks. Also lists the pre-Phase-2 legacy keys that no longer work (`[source]`, `[warehouse]`, `[replication]`, `[checks]` at top level).
 
 ### "Cut a release"
-→ **`rocky-release`** skill. Tag-namespaced (`engine-v*`, `dagster-v*`, `vscode-v*`). Local build via `scripts/release.sh`; only Windows runs in CI for engine releases. Use `just release-engine`, `just release-dagster`, `just release-vscode`.
+→ **`rocky-release`** skill. Tag-namespaced (`engine-v*`, `dagster-v*`, `vscode-v*`). All three artifacts are CI-driven — land a release PR with the version bump + CHANGELOG entry, tag the merged commit, push the tag, and the matching release workflow handles the build and publish. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine`, `just release-dagster`, `just release-vscode`.
 
 ### "Change Databricks / Snowflake / Fivetran integration behavior"
-→ Use the `databricks-api`, `fivetran-api`, or engine-local `rocky` skills in `engine/.claude/skills/` — they're activated automatically when you're in the engine directory and contain the REST API references.
+→ Use the `databricks`, `fivetran`, or engine-local `rocky` skills in `engine/.claude/skills/` — they're activated automatically when you're in the engine directory and contain the REST API references.
 
 ### "Something Dagster-specific"
 → Also install and use the **`dagster-expert`** Claude Code skill (marketplace). The integration at `integrations/dagster/` leans on Dagster's current component/pipes/asset model, which evolves quickly.
@@ -102,7 +102,7 @@ See the `rocky-release` skill for the full checklist.
 - `CLAUDE.md` (root) — monorepo-wide cascade rules
 - `engine/CLAUDE.md` — engine coding standards, JSON output schema table, Databricks SQL patterns, auth flows
 - `integrations/dagster/CLAUDE.md` — dagster layer architecture, "Adding support for a new Rocky CLI command" 9-step checklist
-- `editors/vscode/CLAUDE.md` — vscode extension architecture, 25 command list
+- `editors/vscode/CLAUDE.md` — vscode extension architecture, 30 command list
 - `examples/playground/CLAUDE.md` — POC authoring conventions
 - `justfile` (root) — orchestration recipes (build, test, lint, codegen, release, fixtures)
 - `.github/workflows/` — path-filtered CI per subproject

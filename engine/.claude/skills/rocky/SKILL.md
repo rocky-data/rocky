@@ -69,7 +69,7 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 
 ## JSON output shape
 
-Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. There are **29 schemas** total; full list in `engine/CLAUDE.md` → "JSON Output Schema". Highlights:
+Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. There are **37 schemas** total; full list in `engine/CLAUDE.md` → "JSON Output Schema". Highlights:
 
 ```
 discover  → { connectors: [{ id, client, components, tables, excluded_tables }] }

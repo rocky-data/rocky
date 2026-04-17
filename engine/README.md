@@ -30,7 +30,7 @@ The playground creates a self-contained project with sample models, contracts, a
 | **AI** | Intent metadata, `ai-sync` (schema change propagation), `ai-explain`, `ai-test` (assertion generation) |
 | **IDE** | VS Code extension, LSP with completion, hover, go-to-definition, find references, rename, code actions, inlay hints, semantic tokens, signature help |
 | **Execution** | DuckDB (local/testing), Databricks (production), Snowflake (beta) adapters |
-| **Quality** | Row count, column match, freshness, null rate, anomaly detection, custom SQL checks |
+| **Quality** | Row count, column match, freshness, null rate, anomaly detection, custom SQL, declarative assertions (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`), per-check severity and filter, row quarantine (split / tag / drop) |
 | **Optimization** | Cost-based materialization, storage profiling, compaction, partition archival |
 | **Integration** | Dagster ([dagster-rocky](https://github.com/rocky-data/rocky/tree/main/integrations/dagster)), dbt import, CI pipeline |
 | **Governance** | Unity Catalog tags, workspace isolation, declarative RBAC with GRANT/REVOKE diffing |
