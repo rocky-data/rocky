@@ -24,17 +24,33 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::unified_dag::{NodeId, NodeKind, UnifiedDag, UnifiedDagError, execution_phases};
 
-/// A boxed future returning the outcome of a single node execution.
+/// Task output carried across the `JoinSet` boundary: everything the
+/// aggregation loop needs to build a [`NodeResult`] plus the node's `NodeId`
+/// so we can update `failed_nodes` in the parent task (not inside the
+/// concurrent children).
+type NodeTaskOutput = (
+    NodeId,
+    String,         // id string
+    String,         // kind string
+    String,         // label
+    NodeStatus,
+    u64,            // duration_ms
+    Option<String>, // error
+);
+
+/// A boxed, `Send`-safe future returning the outcome of a single node execution.
 ///
-/// Not required to be `Send` — within a layer, nodes are awaited sequentially
-/// on the current task. This lets node implementations use `!Send` types (such
-/// as `tracing`'s `EnteredSpan`) without having to refactor for cross-thread
-/// safety. Layer-level dependency ordering is preserved.
-pub type NodeFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+/// Must be `Send` so the DAG executor can drive nodes concurrently within a
+/// layer via [`tokio::task::JoinSet`]. Node implementations therefore must
+/// not hold `!Send` types (e.g. `tracing::span::EnteredSpan`) across an
+/// await — use `.instrument(span)` on the future instead.
+pub type NodeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 /// Dispatcher that maps a [`NodeKind`] + node identity to an executor future.
 ///
@@ -127,9 +143,11 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
     /// Execute the entire DAG, layer by layer.
     ///
     /// Layers respect topological dependencies (Kahn's algorithm). Nodes
-    /// within a layer run sequentially on the current task — within-layer
-    /// parallelism is a future enhancement (blocked on making per-node
-    /// executors `Send`-safe; tracing spans currently aren't).
+    /// within a single layer are dispatched concurrently via
+    /// [`tokio::task::JoinSet`], bounded by `max_concurrency`
+    /// (`usize::MAX` if unset). Kahn's layering guarantees no intra-layer
+    /// dependencies, so the `failed_nodes` snapshot captured on layer entry
+    /// is correct for the whole layer's skip decisions.
     pub async fn execute(&self, dag: &UnifiedDag) -> Result<DagExecutionResult, DagExecutorError> {
         let start = Instant::now();
         let layers = execution_phases(dag)?;
@@ -139,6 +157,15 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
         let mut results: Vec<NodeResult> = Vec::new();
         let ancestors = build_ancestor_map(dag);
 
+        // `tokio::sync::Semaphore::new` rejects more permits than
+        // `Semaphore::MAX_PERMITS` (~2^61), so saturate at that cap when the
+        // caller hasn't pinned a concurrency ceiling.
+        let permits = self
+            .max_concurrency
+            .unwrap_or(Semaphore::MAX_PERMITS)
+            .min(Semaphore::MAX_PERMITS);
+        let semaphore = Arc::new(Semaphore::new(permits));
+
         for (layer_idx, layer_nodes) in layers.iter().enumerate() {
             info!(
                 layer = layer_idx,
@@ -146,15 +173,20 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                 "executing DAG layer"
             );
 
+            // Snapshot failed set at layer entry so every node in this layer
+            // makes the same skip decision — Kahn's layering guarantees there
+            // are no dependencies between nodes within a single layer.
+            let failed_snapshot = failed_nodes.clone();
+
+            let mut join_set: JoinSet<NodeTaskOutput> = JoinSet::new();
+
             for node in layer_nodes {
                 let id = node.id.clone();
                 let kind = node.kind;
                 let label = node.label.clone();
 
-                // Skip if any ancestor has failed.
                 let ancestors_for_node = ancestors.get(&id).cloned().unwrap_or_default();
-                let should_skip = ancestors_for_node.iter().any(|a| failed_nodes.contains(a));
-                if should_skip {
+                if ancestors_for_node.iter().any(|a| failed_snapshot.contains(a)) {
                     warn!(node = %id, "skipping node — upstream failure");
                     results.push(NodeResult {
                         id: id.0.clone(),
@@ -168,27 +200,68 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                     continue;
                 }
 
-                let node_start = Instant::now();
                 let dispatched = self.dispatcher.dispatch(&id, kind, &label);
-                let (status, error) = match dispatched {
-                    None => (NodeStatus::Skipped, None),
-                    Some(fut) => match fut.await {
-                        Ok(()) => (NodeStatus::Completed, None),
-                        Err(e) => {
-                            warn!(node = %id, error = %e, "node failed");
-                            failed_nodes.insert(id.clone());
-                            (NodeStatus::Failed, Some(e))
-                        }
-                    },
+                let Some(fut) = dispatched else {
+                    // Dispatcher opted out (e.g. Test nodes handled inside
+                    // their parent transformation). Mark skipped without
+                    // consuming a concurrency permit.
+                    results.push(NodeResult {
+                        id: id.0.clone(),
+                        kind: kind.to_string(),
+                        label,
+                        status: NodeStatus::Skipped,
+                        layer: layer_idx,
+                        duration_ms: 0,
+                        error: None,
+                    });
+                    continue;
                 };
 
+                let semaphore = Arc::clone(&semaphore);
+                let kind_str = kind.to_string();
+                let id_str = id.0.clone();
+                let label_for_task = label.clone();
+                let span = info_span!("dag_node", id = %id, kind = %kind);
+
+                join_set.spawn(
+                    async move {
+                        // Held for the lifetime of the node's execution;
+                        // permit is released on drop regardless of how the
+                        // future resolves.
+                        let _permit = semaphore
+                            .acquire_owned()
+                            .await
+                            .expect("dag_executor semaphore closed unexpectedly");
+                        let node_start = Instant::now();
+                        let (status, error) = match fut.await {
+                            Ok(()) => (NodeStatus::Completed, None),
+                            Err(e) => {
+                                warn!(node = %id, error = %e, "node failed");
+                                (NodeStatus::Failed, Some(e))
+                            }
+                        };
+                        let duration_ms = node_start.elapsed().as_millis() as u64;
+                        (id, id_str, kind_str, label_for_task, status, duration_ms, error)
+                    }
+                    .instrument(span),
+                );
+            }
+
+            while let Some(join_res) = join_set.join_next().await {
+                let (node_id, id_str, kind_str, label, status, duration_ms, error) = join_res
+                    .expect("dag_executor task panicked — this indicates a bug in a dispatcher");
+
+                if status == NodeStatus::Failed {
+                    failed_nodes.insert(node_id);
+                }
+
                 results.push(NodeResult {
-                    id: id.0.clone(),
-                    kind: kind.to_string(),
+                    id: id_str,
+                    kind: kind_str,
                     label,
                     status,
                     layer: layer_idx,
-                    duration_ms: node_start.elapsed().as_millis() as u64,
+                    duration_ms,
                     error,
                 });
             }

@@ -3421,6 +3421,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "criterion",
  "csv",
  "futures",
  "hmac",
