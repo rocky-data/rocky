@@ -1,8 +1,11 @@
 //! BigQuery REST API connector — jobs.query + jobs.getQueryResults.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use rocky_core::ir::{ColumnInfo, TableRef};
@@ -49,6 +52,24 @@ impl std::fmt::Debug for BigQueryAdapter {
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Maximum number of rows returned per query page.
 const MAX_RESULTS_PER_PAGE: u32 = 10_000;
+
+/// Fixed polling delays (ms) for the first 5 `jobs.getQueryResults` checks.
+/// Matches the Databricks connector's ladder so a long BigQuery query has
+/// the same observable cadence. After step 5, exponential growth capped at
+/// [`MAX_POLL_DELAY_MS`].
+const POLL_DELAY_STEPS_MS: [u64; 5] = [100, 200, 500, 1000, 2000];
+/// Maximum polling delay after exponential growth.
+const MAX_POLL_DELAY_MS: u64 = 5000;
+
+fn poll_delay(attempt: usize) -> Duration {
+    let delay_ms = if attempt < POLL_DELAY_STEPS_MS.len() {
+        POLL_DELAY_STEPS_MS[attempt]
+    } else {
+        let extra = attempt - POLL_DELAY_STEPS_MS.len();
+        (2000u64 * (1u64 << extra.min(3))).min(MAX_POLL_DELAY_MS)
+    };
+    Duration::from_millis(delay_ms)
+}
 
 impl BigQueryAdapter {
     /// Create a new BigQuery adapter.
@@ -122,20 +143,90 @@ impl BigQueryAdapter {
 
         let response: BigQueryResponse = resp.json().await?;
 
-        // Handle job not complete — poll for results
-        if !response.job_complete {
-            let job_id = response
-                .job_reference
-                .as_ref()
-                .map(|r| r.job_id.as_str())
-                .unwrap_or("unknown");
-            warn!(
-                job_id = job_id,
-                "BigQuery query not complete — polling not yet implemented"
-            );
+        if response.job_complete {
+            return Ok(response);
         }
 
-        Ok(response)
+        // Async job: BigQuery deferred the result. Poll jobs.getQueryResults
+        // until it reports `job_complete=true` or `timeout_secs` elapses.
+        // Without this, the previous behaviour silently returned an empty
+        // rows array for any query slower than BigQuery's sync window.
+        let job_ref = response
+            .job_reference
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message: "BigQuery returned job_complete=false with no job_reference; cannot poll"
+                    .into(),
+            })?;
+        self.poll_query_results(&job_ref).await
+    }
+
+    /// Poll `jobs.getQueryResults` until the job finishes or the configured
+    /// timeout elapses.
+    ///
+    /// Mirrors the polling shape used by the Databricks connector's
+    /// statement-execution loop (same fixed ladder → exponential cap). The
+    /// endpoint accepts an optional `timeoutMs` query param that lets
+    /// BigQuery hold the connection open for up to 60 s per poll, which
+    /// keeps attempt count low on fast jobs without burning API quota.
+    async fn poll_query_results(
+        &self,
+        job_ref: &JobReference,
+    ) -> Result<BigQueryResponse, BigQueryError> {
+        let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries/{}",
+            self.project_id, job_ref.job_id
+        );
+
+        for attempt in 0..usize::MAX {
+            if Instant::now() >= deadline {
+                return Err(BigQueryError::Timeout {
+                    timeout_secs: self.timeout_secs,
+                });
+            }
+
+            tokio::time::sleep(poll_delay(attempt)).await;
+
+            // Ask BigQuery to wait up to 10 s on its side before returning —
+            // cheap early-exit if the job finishes while we're blocked,
+            // bounded so we can re-check the deadline quickly on slow jobs.
+            let resp = self
+                .client
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[
+                    ("location", self.location.as_str()),
+                    ("maxResults", "10000"),
+                    ("timeoutMs", "10000"),
+                ])
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status().to_string();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(BigQueryError::ApiError {
+                    status,
+                    message: body,
+                });
+            }
+
+            let response: BigQueryResponse = resp.json().await?;
+            if response.job_complete {
+                debug!(
+                    job_id = %job_ref.job_id,
+                    attempts = attempt + 1,
+                    "BigQuery query completed"
+                );
+                return Ok(response);
+            }
+        }
+
+        Err(BigQueryError::Timeout {
+            timeout_secs: self.timeout_secs,
+        })
     }
 }
 
@@ -327,6 +418,47 @@ mod tests {
         assert!(resp.job_complete);
         assert!(resp.schema.is_none());
         assert!(resp.rows.is_none());
+    }
+
+    #[test]
+    fn poll_delay_follows_fixed_ladder_then_exponential_cap() {
+        // First 5 polls: fixed ladder.
+        assert_eq!(poll_delay(0), Duration::from_millis(100));
+        assert_eq!(poll_delay(1), Duration::from_millis(200));
+        assert_eq!(poll_delay(2), Duration::from_millis(500));
+        assert_eq!(poll_delay(3), Duration::from_millis(1000));
+        assert_eq!(poll_delay(4), Duration::from_millis(2000));
+
+        // Past the ladder: exponential growth capped at MAX_POLL_DELAY_MS.
+        // step 0 → 2000*1 = 2000, step 1 → 4000, step 2 → 8000 → capped at 5000.
+        assert_eq!(poll_delay(5), Duration::from_millis(2000));
+        assert_eq!(poll_delay(6), Duration::from_millis(4000));
+        assert_eq!(poll_delay(7), Duration::from_millis(MAX_POLL_DELAY_MS));
+        assert_eq!(poll_delay(100), Duration::from_millis(MAX_POLL_DELAY_MS));
+    }
+
+    #[test]
+    fn response_with_job_complete_false_still_deserializes() {
+        // Regression: the polling loop's `Err(missing jobReference)` branch
+        // only triggers when BigQuery returns `jobComplete=false` with no
+        // `jobReference`, which is the precondition we need to surface.
+        let json = r#"{"jobComplete": false}"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.job_complete);
+        assert!(resp.job_reference.is_none());
+    }
+
+    #[test]
+    fn response_with_job_complete_false_and_job_reference_deserializes() {
+        // Happy path into the polling loop: async job, reference present.
+        let json = r#"{
+            "jobComplete": false,
+            "jobReference": {"projectId": "p", "jobId": "job_abc"}
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.job_complete);
+        let job_ref = resp.job_reference.unwrap();
+        assert_eq!(job_ref.job_id, "job_abc");
     }
 
     #[test]
