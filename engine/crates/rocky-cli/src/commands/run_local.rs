@@ -118,7 +118,7 @@ pub async fn run_quality(
     output_json: bool,
 ) -> Result<()> {
     use rocky_core::checks::{CheckDetails, CheckResult};
-    use rocky_core::tests::generate_test_sql;
+    use rocky_core::tests::generate_test_sql_with_dialect;
 
     let start = Instant::now();
 
@@ -282,7 +282,7 @@ pub async fn run_quality(
                         continue;
                     }
                     let test = &assertion.test;
-                    let sql = match generate_test_sql(test, &full_table) {
+                    let sql = match generate_test_sql_with_dialect(test, &full_table, dialect) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(
@@ -429,6 +429,8 @@ fn test_type_kind(t: &rocky_core::tests::TestType) -> &'static str {
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",
         TestType::RowCountRange { .. } => "row_count_range",
+        TestType::InRange { .. } => "in_range",
+        TestType::RegexMatch { .. } => "regex_match",
     }
 }
 
@@ -455,10 +457,15 @@ fn classify_assertion(
             .unwrap_or(0)
     };
     match t {
-        TestType::NotNull | TestType::Expression { .. } => {
+        // Count-based: first cell is the count of failing rows.
+        TestType::NotNull
+        | TestType::Expression { .. }
+        | TestType::InRange { .. }
+        | TestType::RegexMatch { .. } => {
             let n = first_cell_u64();
             (n == 0, n)
         }
+        // Row-set-based: every returned row is a violation.
         TestType::Unique | TestType::AcceptedValues { .. } | TestType::Relationships { .. } => {
             let n = rows.len() as u64;
             (n == 0, n)

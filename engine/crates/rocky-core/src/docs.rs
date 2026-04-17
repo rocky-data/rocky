@@ -401,6 +401,8 @@ fn test_type_label(test_type: &crate::tests::TestType) -> String {
         crate::tests::TestType::Relationships { .. } => "relationships".into(),
         crate::tests::TestType::Expression { .. } => "expression".into(),
         crate::tests::TestType::RowCountRange { .. } => "row_count_range".into(),
+        crate::tests::TestType::InRange { .. } => "in_range".into(),
+        crate::tests::TestType::RegexMatch { .. } => "regex_match".into(),
     }
 }
 
@@ -444,11 +446,13 @@ mod tests {
                             test_type: TestType::NotNull,
                             column: Some("order_id".into()),
                             severity: TestSeverity::Error,
+                            filter: None,
                         },
                         TestDecl {
                             test_type: TestType::Unique,
                             column: Some("order_id".into()),
                             severity: TestSeverity::Error,
+                            filter: None,
                         },
                         TestDecl {
                             test_type: TestType::AcceptedValues {
@@ -460,6 +464,7 @@ mod tests {
                             },
                             column: Some("status".into()),
                             severity: TestSeverity::Warning,
+                            filter: None,
                         },
                     ],
                 },
@@ -477,6 +482,7 @@ mod tests {
                         },
                         column: None,
                         severity: TestSeverity::Error,
+                        filter: None,
                     }],
                 },
             ],

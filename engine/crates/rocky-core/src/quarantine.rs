@@ -41,6 +41,12 @@ pub enum QuarantineError {
 
     #[error("expression assertion has an empty expression")]
     EmptyExpression,
+
+    #[error("in_range bound '{value}' must parse as a number")]
+    InvalidInRangeBound { value: String },
+
+    #[error("regex_match assertion '{name}' contains an unsafe pattern")]
+    UnsafeRegexPattern { name: String },
 }
 
 impl From<AdapterError> for QuarantineError {
@@ -139,8 +145,13 @@ pub fn compile_quarantine_sql(
     let mut labeled: Vec<LabeledPredicate> = Vec::with_capacity(quarantinable.len());
     for assertion in &quarantinable {
         let label = safe_error_label(assertion, &mut names)?;
-        let valid_pred =
-            lower_valid_predicate(&assertion.test.test_type, &assertion.test.column, &label)?;
+        let base_pred = lower_valid_predicate(
+            &assertion.test.test_type,
+            &assertion.test.column,
+            &label,
+            dialect,
+        )?;
+        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred);
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
@@ -205,12 +216,16 @@ struct LabeledPredicate {
 /// Whether a test kind lowers cleanly to a row-level boolean predicate.
 ///
 /// `unique` / `relationships` / `row_count_range` are aggregate / set-based
-/// — they stay observational. `expression` is trusted user SQL (same
-/// contract as [`crate::tests::generate_test_sql`]).
+/// — they stay observational. `expression` and `regex_match` are
+/// trusted user SQL (same contract as [`crate::tests::generate_test_sql`]).
 pub fn is_quarantinable(test_type: &TestType) -> bool {
     matches!(
         test_type,
-        TestType::NotNull | TestType::AcceptedValues { .. } | TestType::Expression { .. }
+        TestType::NotNull
+            | TestType::AcceptedValues { .. }
+            | TestType::Expression { .. }
+            | TestType::InRange { .. }
+            | TestType::RegexMatch { .. }
     )
 }
 
@@ -256,6 +271,8 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
         TestType::Unique => "unique",
         TestType::Relationships { .. } => "relationships",
         TestType::RowCountRange { .. } => "row_count_range",
+        TestType::InRange { .. } => "in_range",
+        TestType::RegexMatch { .. } => "regex_match",
     };
     match column {
         Some(c) if validation::validate_identifier(c).is_ok() => format!("{kind}_{c}"),
@@ -271,6 +288,8 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
 ///   as excluded) → `(col IS NULL OR col IN (...))`.
 /// - `Expression`: NULL passes (existing `WHERE NOT (expr)` treats NULL
 ///   as excluded) → `COALESCE((expr), TRUE)`.
+/// - `InRange`: NULL passes → `(col IS NULL OR NOT (col < min OR col > max))`.
+/// - `RegexMatch`: NULL passes → `(col IS NULL OR <dialect regex match>)`.
 ///
 /// The returned predicate is total — it evaluates to `TRUE` or `FALSE`,
 /// never NULL — so the top-level `AND` and `NOT` cannot propagate NULL.
@@ -278,23 +297,16 @@ fn lower_valid_predicate(
     test_type: &TestType,
     column: &Option<String>,
     label: &str,
+    dialect: &dyn SqlDialect,
 ) -> Result<String, QuarantineError> {
     match test_type {
         TestType::NotNull => {
-            let col = column
-                .as_deref()
-                .ok_or_else(|| QuarantineError::MissingColumn {
-                    name: label.to_string(),
-                })?;
+            let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
             Ok(format!("{col} IS NOT NULL"))
         }
         TestType::AcceptedValues { values } => {
-            let col = column
-                .as_deref()
-                .ok_or_else(|| QuarantineError::MissingColumn {
-                    name: label.to_string(),
-                })?;
+            let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
             if values.is_empty() {
                 return Err(QuarantineError::EmptyAcceptedValues {
@@ -318,10 +330,68 @@ fn lower_valid_predicate(
             // `WHERE NOT (expression)` semantic.
             Ok(format!("COALESCE(({expression}), TRUE)"))
         }
+        TestType::InRange { min, max } => {
+            let col = required_column(column, label)?;
+            validation::validate_identifier(col)?;
+            let fail_pred =
+                crate::tests::in_range_fail_predicate_public(col, min.as_deref(), max.as_deref())
+                    .map_err(|e| match e {
+                    crate::tests::TestGenError::MissingInRangeBound => {
+                        QuarantineError::EmptyExpression
+                    }
+                    crate::tests::TestGenError::InvalidInRangeBound { value } => {
+                        QuarantineError::InvalidInRangeBound { value }
+                    }
+                    _ => QuarantineError::EmptyExpression,
+                })?;
+            // NULL-permissive: (col IS NULL OR NOT (col < min OR col > max))
+            Ok(format!("({col} IS NULL OR NOT ({fail_pred}))"))
+        }
+        TestType::RegexMatch { pattern } => {
+            let col = required_column(column, label)?;
+            validation::validate_identifier(col)?;
+            crate::tests::validate_regex_pattern(pattern).map_err(|_| {
+                QuarantineError::UnsafeRegexPattern {
+                    name: label.to_string(),
+                }
+            })?;
+            let match_pred = dialect
+                .regex_match_predicate(col, pattern)
+                .map_err(QuarantineError::from)?;
+            // NULL-permissive: (col IS NULL OR <match>)
+            Ok(format!("({col} IS NULL OR {match_pred})"))
+        }
         // Non-quarantinable kinds filtered upstream by `is_quarantinable`.
         TestType::Unique | TestType::Relationships { .. } | TestType::RowCountRange { .. } => {
             Err(QuarantineError::EmptyExpression)
         }
+    }
+}
+
+fn required_column<'a>(
+    column: &'a Option<String>,
+    label: &str,
+) -> Result<&'a str, QuarantineError> {
+    column
+        .as_deref()
+        .ok_or_else(|| QuarantineError::MissingColumn {
+            name: label.to_string(),
+        })
+}
+
+/// Apply a per-check `filter` to a base valid predicate.
+///
+/// Model: if the filter is FALSE or NULL, the row is "out of scope" for
+/// this assertion and passes unconditionally. If the filter is TRUE, the
+/// base predicate decides.
+///
+/// Implemented as `CASE WHEN (filter) THEN base ELSE TRUE END` — a total
+/// boolean across all rows, so the top-level `AND` / `NOT` can't
+/// propagate NULL.
+fn wrap_filter(filter: &Option<String>, base_pred: &str) -> String {
+    match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(f) => format!("(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"),
+        None => base_pred.to_string(),
     }
 }
 
@@ -459,6 +529,9 @@ mod unit_tests {
         ) -> AdapterResult<Vec<String>> {
             unimplemented!()
         }
+        fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
+            Ok(format!("regexp_matches({column}, '{pattern}')"))
+        }
     }
 
     fn table() -> TableRef {
@@ -482,6 +555,7 @@ mod unit_tests {
                 test_type: kind,
                 column: column.map(str::to_string),
                 severity,
+                filter: None,
             },
         }
     }
@@ -818,5 +892,151 @@ mod unit_tests {
         )];
         let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).err();
         assert!(err.is_some());
+    }
+
+    // ----- Phase 4a -----
+
+    fn assertion_with_filter(
+        kind: TestType,
+        column: Option<&str>,
+        filter: Option<&str>,
+    ) -> QualityAssertion {
+        QualityAssertion {
+            table: "orders".into(),
+            name: None,
+            test: TestDecl {
+                test_type: kind,
+                column: column.map(str::to_string),
+                severity: TestSeverity::Error,
+                filter: filter.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn in_range_lowers_to_null_permissive_valid_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::InRange {
+                min: Some("0".into()),
+                max: Some("1000".into()),
+            },
+            Some("amount"),
+            TestSeverity::Error,
+        )];
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap()
+            .unwrap();
+        // Valid CTAS: (amount IS NULL OR NOT (amount < 0 OR amount > 1000))
+        assert!(
+            plan.statements[1]
+                .sql
+                .contains("(amount IS NULL OR NOT (amount < 0 OR amount > 1000))")
+        );
+    }
+
+    #[test]
+    fn regex_match_lowers_to_null_permissive_valid_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::RegexMatch {
+                pattern: "^[a-z]+$".into(),
+            },
+            Some("email"),
+            TestSeverity::Error,
+        )];
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap()
+            .unwrap();
+        // Valid CTAS: (email IS NULL OR regexp_matches(email, '^[a-z]+$'))
+        assert!(
+            plan.statements[1]
+                .sql
+                .contains("(email IS NULL OR regexp_matches(email, '^[a-z]+$'))")
+        );
+    }
+
+    #[test]
+    fn filter_wraps_valid_predicate_with_case() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("region = 'US'"),
+        )];
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap()
+            .unwrap();
+        // Out-of-scope rows (filter false/null) pass unconditionally:
+        // (CASE WHEN (region = 'US') THEN (customer_id IS NOT NULL) ELSE TRUE END)
+        assert!(
+            plan.statements[1]
+                .sql
+                .contains("CASE WHEN (region = 'US') THEN (customer_id IS NOT NULL) ELSE TRUE END")
+        );
+    }
+
+    #[test]
+    fn in_range_rejects_non_numeric_bounds() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::InRange {
+                min: Some("yesterday".into()),
+                max: None,
+            },
+            Some("amount"),
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .err()
+            .unwrap();
+        assert!(matches!(err, QuarantineError::InvalidInRangeBound { .. }));
+    }
+
+    #[test]
+    fn regex_match_rejects_unsafe_pattern() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::RegexMatch {
+                pattern: "foo'; DROP TABLE".into(),
+            },
+            Some("email"),
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .err()
+            .unwrap();
+        assert!(matches!(err, QuarantineError::UnsafeRegexPattern { .. }));
+    }
+
+    #[test]
+    fn all_phase4a_kinds_covered_by_is_quarantinable() {
+        assert!(is_quarantinable(&TestType::NotNull));
+        assert!(is_quarantinable(&TestType::AcceptedValues {
+            values: vec!["a".into()]
+        }));
+        assert!(is_quarantinable(&TestType::Expression {
+            expression: "x > 0".into()
+        }));
+        assert!(is_quarantinable(&TestType::InRange {
+            min: Some("0".into()),
+            max: Some("1".into()),
+        }));
+        assert!(is_quarantinable(&TestType::RegexMatch {
+            pattern: "x".into()
+        }));
+        assert!(!is_quarantinable(&TestType::Unique));
+        assert!(!is_quarantinable(&TestType::Relationships {
+            to_table: "t".into(),
+            to_column: "c".into(),
+        }));
+        assert!(!is_quarantinable(&TestType::RowCountRange {
+            min: None,
+            max: Some(10),
+        }));
     }
 }

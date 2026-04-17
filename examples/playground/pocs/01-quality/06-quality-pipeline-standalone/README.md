@@ -3,7 +3,7 @@
 > **Category:** 01-quality
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 15s
-> **Rocky features:** `type = "quality"`, `depends_on`, `tables`, aggregate checks (row_count / column_match / freshness), unified row-level `[[checks.assertions]]` (not_null, unique, accepted_values, expression, row_count_range), per-check `severity`, `fail_on_error`, row `[checks.quarantine]` (split / tag / drop)
+> **Rocky features:** `type = "quality"`, `depends_on`, `tables`, aggregate checks (row_count / column_match / freshness), unified row-level `[[checks.assertions]]` (not_null, unique, accepted_values, expression, row_count_range, in_range, regex_match), per-check `filter`, per-check `severity`, `fail_on_error`, row `[checks.quarantine]` (split / tag / drop)
 
 ## What it shows
 
@@ -13,9 +13,11 @@ Rocky's quality pipeline type — a dedicated pipeline that runs data quality ch
 - Targeted at specific schemas/tables
 - Chainable via `depends_on` (runs after ingest completes)
 - Able to express DQX-parity row-level assertions (`not_null`, `unique`,
-  `accepted_values`, `relationships`, `expression`, `row_count_range`) via
-  `[[pipeline.x.checks.assertions]]` blocks on the same surface used by
-  declarative model tests
+  `accepted_values`, `relationships`, `expression`, `row_count_range`,
+  `in_range`, `regex_match`) via `[[pipeline.x.checks.assertions]]` blocks
+  on the same surface used by declarative model tests
+- Each assertion can carry a `filter` SQL predicate to scope it to a
+  subset of rows (e.g. only the last 30 days, only shipped orders)
 
 ## Why it's distinctive
 

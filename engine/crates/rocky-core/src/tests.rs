@@ -24,6 +24,25 @@ pub enum TestGenError {
 
     #[error("row_count_range test requires at least one of 'min' or 'max'")]
     MissingRange,
+
+    #[error("in_range test requires at least one of 'min' or 'max'")]
+    MissingInRangeBound,
+
+    #[error(
+        "in_range bound '{value}' must parse as a number (Phase 4a supports numeric ranges only; use `time_window` or `expression` for temporal bounds)"
+    )]
+    InvalidInRangeBound { value: String },
+
+    #[error("regex_match test requires a non-empty 'pattern'")]
+    EmptyRegexPattern,
+
+    #[error(
+        "regex_match pattern contains unsafe character '{found}'; patterns may not contain single quotes, backticks, or semicolons"
+    )]
+    UnsafeRegexPattern { found: char },
+
+    #[error("regex_match test is not supported by this adapter: {0}")]
+    RegexNotSupported(String),
 }
 
 /// Severity of a test failure.
@@ -72,6 +91,34 @@ pub enum TestType {
         #[serde(default)]
         max: Option<u64>,
     },
+    /// Assert that a column's values fall within a numeric range
+    /// (inclusive, half-open either side). Phase 4a supports numeric
+    /// bounds only — use `time_window` (Phase 4b) or `expression` for
+    /// temporal comparisons.
+    ///
+    /// NULL column values pass (consistent with existing `NOT IN` /
+    /// `NOT (expr)` semantics).
+    InRange {
+        /// Minimum value (inclusive). `None` means no lower bound.
+        #[serde(default)]
+        min: Option<String>,
+        /// Maximum value (inclusive). `None` means no upper bound.
+        #[serde(default)]
+        max: Option<String>,
+    },
+    /// Assert that a column's values match a regular expression.
+    ///
+    /// Dialect-specific operator (`REGEXP` / `RLIKE` / `REGEXP_LIKE` /
+    /// `REGEXP_CONTAINS`) is produced by [`SqlDialect::regex_match_predicate`].
+    /// Patterns are validated against a strict allowlist that rejects
+    /// single quotes, backticks, and semicolons.
+    ///
+    /// NULL column values pass.
+    RegexMatch {
+        /// The regex pattern. Dialect-specific syntax — stick to the
+        /// portable subset (character classes, anchors, quantifiers).
+        pattern: String,
+    },
 }
 
 /// A single declarative test declared in a model sidecar TOML.
@@ -99,14 +146,27 @@ pub struct TestDecl {
     pub test_type: TestType,
 
     /// Column under test. Required for `not_null`, `unique`,
-    /// `accepted_values`, and `relationships`. Ignored for `expression`
-    /// and `row_count_range`.
+    /// `accepted_values`, `relationships`, `in_range`, `regex_match`.
+    /// Ignored for `expression` and `row_count_range`.
     #[serde(default)]
     pub column: Option<String>,
 
     /// Severity of failure. Defaults to `error`.
     #[serde(default)]
     pub severity: TestSeverity,
+
+    /// Optional SQL boolean predicate that scopes the assertion to a
+    /// subset of rows. When set, only rows where `(filter)` evaluates
+    /// to `TRUE` are subject to the assertion — rows where the filter
+    /// is `FALSE` or `NULL` pass unconditionally.
+    ///
+    /// Filter is user-supplied SQL; the caller is responsible for
+    /// sandboxing execution (same contract as `expression`).
+    ///
+    /// Example: `filter = "created_at > current_date - interval 30 day"`
+    /// restricts a `not_null` check to rows created in the last 30 days.
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +174,10 @@ pub struct TestDecl {
 // ---------------------------------------------------------------------------
 
 /// Generates the assertion SQL for a declarative test.
+///
+/// Dialect-agnostic subset — for `RegexMatch` use
+/// [`generate_test_sql_with_dialect`] instead. This wrapper returns
+/// [`TestGenError::RegexNotSupported`] if the test is a `RegexMatch`.
 ///
 /// The returned SQL is designed to be evaluated against the model's target
 /// table. The caller checks the result:
@@ -125,7 +189,27 @@ pub struct TestDecl {
 /// - **`expression`**: returns the count of violating rows. Pass if 0.
 /// - **`row_count_range`**: returns the total row count. Caller asserts
 ///   the value falls within `[min, max]`.
+/// - **`in_range`**: returns the count of rows outside `[min, max]`. Pass if 0.
 pub fn generate_test_sql(test: &TestDecl, table: &str) -> Result<String, TestGenError> {
+    generate_test_sql_inner(test, table, None)
+}
+
+/// Dialect-aware variant of [`generate_test_sql`]. Required for
+/// `RegexMatch` (which needs a dialect-specific operator) and accepted
+/// for any other kind.
+pub fn generate_test_sql_with_dialect(
+    test: &TestDecl,
+    table: &str,
+    dialect: &dyn crate::traits::SqlDialect,
+) -> Result<String, TestGenError> {
+    generate_test_sql_inner(test, table, Some(dialect))
+}
+
+fn generate_test_sql_inner(
+    test: &TestDecl,
+    table: &str,
+    dialect: Option<&dyn crate::traits::SqlDialect>,
+) -> Result<String, TestGenError> {
     // Table may be fully-qualified (catalog.schema.table), so validate each
     // dot-separated component individually — same approach as the
     // `Relationships` variant uses for `to_table`.
@@ -133,17 +217,30 @@ pub fn generate_test_sql(test: &TestDecl, table: &str) -> Result<String, TestGen
         validation::validate_identifier(part)?;
     }
 
+    // Optional per-check `filter` applies to every kind by prefixing the
+    // row-level WHERE clause. Unique / Relationships / RowCountRange
+    // weave it in differently (see each arm).
+    let filter = test
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     match &test.test_type {
         TestType::NotNull => {
             let col = require_column(test, "not_null")?;
             validation::validate_identifier(col)?;
-            Ok(format!("SELECT COUNT(*) FROM {table} WHERE {col} IS NULL"))
+            Ok(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}{col} IS NULL",
+                filter_and(filter),
+            ))
         }
         TestType::Unique => {
             let col = require_column(test, "unique")?;
             validation::validate_identifier(col)?;
+            let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
-                "SELECT {col}, COUNT(*) FROM {table} GROUP BY {col} HAVING COUNT(*) > 1"
+                "SELECT {col}, COUNT(*) FROM {table}{where_clause} GROUP BY {col} HAVING COUNT(*) > 1"
             ))
         }
         TestType::AcceptedValues { values } => {
@@ -158,7 +255,8 @@ pub fn generate_test_sql(test: &TestDecl, table: &str) -> Result<String, TestGen
                 .collect::<Vec<_>>()
                 .join(", ");
             Ok(format!(
-                "SELECT DISTINCT {col} FROM {table} WHERE {col} NOT IN ({in_list})"
+                "SELECT DISTINCT {col} FROM {table} WHERE {}{col} NOT IN ({in_list})",
+                filter_and(filter),
             ))
         }
         TestType::Relationships {
@@ -173,10 +271,11 @@ pub fn generate_test_sql(test: &TestDecl, table: &str) -> Result<String, TestGen
                 validation::validate_identifier(part)?;
             }
             validation::validate_identifier(to_column)?;
+            let filter_clause = filter.map(|f| format!("({f}) AND ")).unwrap_or_default();
             Ok(format!(
                 "SELECT t.{col} FROM {table} t \
                  LEFT JOIN {to_table} r ON t.{col} = r.{to_column} \
-                 WHERE r.{to_column} IS NULL AND t.{col} IS NOT NULL"
+                 WHERE {filter_clause}r.{to_column} IS NULL AND t.{col} IS NOT NULL"
             ))
         }
         TestType::Expression { expression } => {
@@ -186,16 +285,118 @@ pub fn generate_test_sql(test: &TestDecl, table: &str) -> Result<String, TestGen
             // Expression is user-supplied SQL — we cannot validate it as an
             // identifier. The caller is responsible for sandboxing execution.
             Ok(format!(
-                "SELECT COUNT(*) FROM {table} WHERE NOT ({expression})"
+                "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
+                filter_and(filter),
             ))
         }
         TestType::RowCountRange { min, max } => {
             if min.is_none() && max.is_none() {
                 return Err(TestGenError::MissingRange);
             }
-            Ok(format!("SELECT COUNT(*) FROM {table}"))
+            let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
+            Ok(format!("SELECT COUNT(*) FROM {table}{where_clause}"))
+        }
+        TestType::InRange { min, max } => {
+            let col = require_column(test, "in_range")?;
+            validation::validate_identifier(col)?;
+            let predicate = in_range_fail_predicate(col, min.as_deref(), max.as_deref())?;
+            Ok(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}({predicate})",
+                filter_and(filter),
+            ))
+        }
+        TestType::RegexMatch { pattern } => {
+            let col = require_column(test, "regex_match")?;
+            validation::validate_identifier(col)?;
+            validate_regex_pattern(pattern)?;
+            let dialect = dialect.ok_or_else(|| {
+                TestGenError::RegexNotSupported(
+                    "use generate_test_sql_with_dialect for regex_match".into(),
+                )
+            })?;
+            let match_pred = dialect
+                .regex_match_predicate(col, pattern)
+                .map_err(|e| TestGenError::RegexNotSupported(e.to_string()))?;
+            Ok(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}NOT ({match_pred})",
+                filter_and(filter),
+            ))
         }
     }
+}
+
+/// Returns `"(filter) AND "` or `""` for embedding into a WHERE clause
+/// that already has a trailing predicate.
+fn filter_and(filter: Option<&str>) -> String {
+    filter.map(|f| format!("({f}) AND ")).unwrap_or_default()
+}
+
+/// Public re-export of [`in_range_fail_predicate`] for
+/// [`crate::quarantine`], which needs the same numeric-range lowering
+/// when building the NULL-permissive valid predicate.
+pub fn in_range_fail_predicate_public(
+    col: &str,
+    min: Option<&str>,
+    max: Option<&str>,
+) -> Result<String, TestGenError> {
+    in_range_fail_predicate(col, min, max)
+}
+
+/// Build the "failing" predicate for `in_range`: `col < min OR col > max`,
+/// collapsing to one side when only one bound is set. Bounds are
+/// parsed as `f64` and re-emitted as SQL numeric literals — no string
+/// interpolation of user-supplied SQL text.
+fn in_range_fail_predicate(
+    col: &str,
+    min: Option<&str>,
+    max: Option<&str>,
+) -> Result<String, TestGenError> {
+    if min.is_none() && max.is_none() {
+        return Err(TestGenError::MissingInRangeBound);
+    }
+    let min_n = min.map(parse_numeric_bound).transpose()?;
+    let max_n = max.map(parse_numeric_bound).transpose()?;
+    let parts: Vec<String> = [
+        min_n.map(|n| format!("{col} < {}", format_numeric(n))),
+        max_n.map(|n| format!("{col} > {}", format_numeric(n))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(parts.join(" OR "))
+}
+
+fn parse_numeric_bound(s: &str) -> Result<f64, TestGenError> {
+    s.parse::<f64>()
+        .map_err(|_| TestGenError::InvalidInRangeBound {
+            value: s.to_string(),
+        })
+}
+
+/// Format a parsed numeric bound as SQL. Prefers integer form when the
+/// value is integral to avoid `42.0` where `42` is natural.
+fn format_numeric(n: f64) -> String {
+    if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e18 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Strict allowlist for regex patterns. Rejects characters that could
+/// escape the single-quoted SQL literal context. No other regex-syntax
+/// validation is performed — the dialect's regex engine decides at query
+/// time whether the pattern is well-formed.
+pub fn validate_regex_pattern(pattern: &str) -> Result<(), TestGenError> {
+    if pattern.is_empty() {
+        return Err(TestGenError::EmptyRegexPattern);
+    }
+    for ch in pattern.chars() {
+        if matches!(ch, '\'' | '`' | ';') {
+            return Err(TestGenError::UnsafeRegexPattern { found: ch });
+        }
+    }
+    Ok(())
 }
 
 /// Extracts the required column from a test declaration, returning an error
@@ -402,6 +603,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::NotNull,
             column: Some("order_id".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "fct_orders").unwrap();
         assert_eq!(
@@ -416,6 +618,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::Unique,
             column: Some("email".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "fct_orders").unwrap();
         assert_eq!(
@@ -432,6 +635,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: Some("status".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "orders").unwrap();
         assert_eq!(
@@ -448,6 +652,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: Some("name".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "t").unwrap();
         assert!(sql.contains("'it''s'"), "single quotes should be escaped");
@@ -462,6 +667,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: Some("customer_id".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "fct_orders").unwrap();
         assert_eq!(
@@ -480,6 +686,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "orders").unwrap();
         assert_eq!(sql, "SELECT COUNT(*) FROM orders WHERE NOT (amount > 0)");
@@ -494,6 +701,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let sql = generate_test_sql(&decl, "orders").unwrap();
         assert_eq!(sql, "SELECT COUNT(*) FROM orders");
@@ -507,6 +715,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::NotNull,
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -520,6 +729,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::Unique,
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -531,6 +741,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::AcceptedValues { values: vec![] },
             column: Some("status".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -546,6 +757,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -560,6 +772,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -573,6 +786,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -589,6 +803,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             },
             column: None,
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
@@ -602,6 +817,7 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::NotNull,
             column: Some("col".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "drop table; --");
         assert!(result.is_err());
@@ -613,8 +829,212 @@ target = { catalog = "c", schema = "s", table = "t" }
             test_type: TestType::NotNull,
             column: Some("col; DROP TABLE".into()),
             severity: TestSeverity::Error,
+            filter: None,
         };
         let result = generate_test_sql(&decl, "t");
         assert!(result.is_err());
+    }
+
+    // ----- Phase 4a: InRange -----
+
+    #[test]
+    fn test_in_range_deser_both_bounds() {
+        let toml_str = r#"
+type = "in_range"
+column = "amount"
+min = "0"
+max = "1000"
+"#;
+        let decl: TestDecl = toml::from_str(toml_str).unwrap();
+        if let TestType::InRange { min, max } = &decl.test_type {
+            assert_eq!(min.as_deref(), Some("0"));
+            assert_eq!(max.as_deref(), Some("1000"));
+        } else {
+            panic!("expected InRange");
+        }
+    }
+
+    #[test]
+    fn test_sql_in_range_numeric_both() {
+        let decl = TestDecl {
+            test_type: TestType::InRange {
+                min: Some("0".into()),
+                max: Some("1000".into()),
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM orders WHERE (amount < 0 OR amount > 1000)"
+        );
+    }
+
+    #[test]
+    fn test_sql_in_range_min_only() {
+        let decl = TestDecl {
+            test_type: TestType::InRange {
+                min: Some("1".into()),
+                max: None,
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(sql, "SELECT COUNT(*) FROM orders WHERE (amount < 1)");
+    }
+
+    #[test]
+    fn test_sql_in_range_formats_decimal_bounds() {
+        let decl = TestDecl {
+            test_type: TestType::InRange {
+                min: Some("0.5".into()),
+                max: Some("99.95".into()),
+            },
+            column: Some("ratio".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "t").unwrap();
+        assert!(sql.contains("ratio < 0.5"));
+        assert!(sql.contains("ratio > 99.95"));
+    }
+
+    #[test]
+    fn test_in_range_rejects_non_numeric() {
+        let decl = TestDecl {
+            test_type: TestType::InRange {
+                min: Some("2026-01-01".into()),
+                max: None,
+            },
+            column: Some("created_at".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let result = generate_test_sql(&decl, "t");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("numeric ranges only")
+        );
+    }
+
+    #[test]
+    fn test_in_range_requires_at_least_one_bound() {
+        let decl = TestDecl {
+            test_type: TestType::InRange {
+                min: None,
+                max: None,
+            },
+            column: Some("amount".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let result = generate_test_sql(&decl, "t");
+        assert!(result.is_err());
+    }
+
+    // ----- Phase 4a: RegexMatch -----
+
+    #[test]
+    fn test_regex_match_deser() {
+        let toml_str = r#"
+type = "regex_match"
+column = "email"
+pattern = "^[a-z]+@example\\.com$"
+"#;
+        let decl: TestDecl = toml::from_str(toml_str).unwrap();
+        if let TestType::RegexMatch { pattern } = &decl.test_type {
+            assert_eq!(pattern, r"^[a-z]+@example\.com$");
+        } else {
+            panic!("expected RegexMatch");
+        }
+    }
+
+    #[test]
+    fn test_regex_match_needs_dialect() {
+        // Non-dialect helper errors on RegexMatch (matches SQL needs dialect).
+        let decl = TestDecl {
+            test_type: TestType::RegexMatch {
+                pattern: "^[a-z]+$".into(),
+            },
+            column: Some("email".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let result = generate_test_sql(&decl, "t");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_allowlist() {
+        assert!(validate_regex_pattern("^[a-z]+@example\\.com$").is_ok());
+        assert!(validate_regex_pattern("").is_err());
+        assert!(validate_regex_pattern("foo'bar").is_err()); // single quote
+        assert!(validate_regex_pattern("foo;bar").is_err()); // semicolon
+        assert!(validate_regex_pattern("foo`bar").is_err()); // backtick
+    }
+
+    // ----- Phase 4a: filter -----
+
+    #[test]
+    fn test_filter_wraps_not_null() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("customer_id".into()),
+            severity: TestSeverity::Error,
+            filter: Some("created_at > '2026-01-01'".into()),
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM orders WHERE (created_at > '2026-01-01') AND customer_id IS NULL"
+        );
+    }
+
+    #[test]
+    fn test_filter_wraps_unique() {
+        let decl = TestDecl {
+            test_type: TestType::Unique,
+            column: Some("email".into()),
+            severity: TestSeverity::Error,
+            filter: Some("active = true".into()),
+        };
+        let sql = generate_test_sql(&decl, "customers").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT email, COUNT(*) FROM customers WHERE (active = true) GROUP BY email HAVING COUNT(*) > 1"
+        );
+    }
+
+    #[test]
+    fn test_filter_wraps_accepted_values() {
+        let decl = TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: vec!["pending".into(), "shipped".into()],
+            },
+            column: Some("status".into()),
+            severity: TestSeverity::Error,
+            filter: Some("region = 'US'".into()),
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert!(sql.contains("WHERE (region = 'US') AND status NOT IN"));
+    }
+
+    #[test]
+    fn test_filter_blank_is_ignored() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("id".into()),
+            severity: TestSeverity::Error,
+            filter: Some("   ".into()),
+        };
+        let sql = generate_test_sql(&decl, "t").unwrap();
+        assert_eq!(sql, "SELECT COUNT(*) FROM t WHERE id IS NULL");
     }
 }

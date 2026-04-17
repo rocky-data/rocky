@@ -182,6 +182,14 @@ impl SqlDialect for SnowflakeSqlDialect {
             "COMMIT".into(),
         ])
     }
+
+    fn regex_match_predicate(
+        &self,
+        column: &str,
+        pattern: &str,
+    ) -> rocky_core::traits::AdapterResult<String> {
+        Ok(format!("REGEXP_LIKE({column}, '{pattern}')"))
+    }
 }
 
 #[cfg(test)]
