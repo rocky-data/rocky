@@ -1,6 +1,6 @@
 [package]
 name = "rocky-adapter-sdk"
-version = "1.6.0"
+version = "1.7.0"
 description = "Adapter SDK for Rocky — stable traits, process protocol, and conformance harness"
 edition.workspace = true
 license.workspace = true
