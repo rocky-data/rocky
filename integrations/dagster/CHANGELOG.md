@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-04-17
+
+### Added — Pydantic models for the `rocky_project` schema
+
+Engine 1.7.0 closed the `rocky-project.schema.json` autogen arc — the VS Code-facing project config schema is now fully generated from Rust types. The regenerated bindings ship a new `dagster_rocky.types_generated.rocky_project_schema` module with typed models covering every `RockyConfig` field: `RockyConfig`, `StateConfig`, `CostSection`, `HooksConfig`, `SchemaEvolutionConfig`, `AdapterConfig`, `RetryConfig`, plus the full pipeline surface (`ReplicationPipelineConfig`, `TransformationPipelineConfig`, `QualityPipelineConfig`, `SnapshotPipelineConfig`, `LoadPipelineConfig`) and every assertion / quarantine / governance / load subtype.
+
+No source code changes in `dagster_rocky` itself — the models are published for parity with the CLI-output bindings and as the typed foundation for future orchestrator-side config introspection. Existing consumers are unaffected; `RockyResource` continues to invoke `rocky` as a subprocess.
+
+Fixture refresh via `just regen-fixtures` under the 1.7.0 binary.
+
+### Upgrading
+
+`dagster-rocky` ships independently from the engine. To consume engine 1.7.0 features, either install `engine-v1.7.0` on the orchestrator's `$PATH` or re-vendor the binary via `scripts/vendor_rocky.sh` before updating your pipeline code.
+
 ## [1.3.0] — 2026-04-17
 
 ### Added — Regenerated Pydantic bindings for engine 1.5.0 + 1.6.0
