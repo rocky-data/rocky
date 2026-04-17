@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-04-17
+
+Closes out DQX quality parity Phase 4 — five new row-level / table-level assertion kinds plus per-check `filter`. Additive; no breaking change.
+
+### Added — Per-check `filter`
+
+`TestDecl.filter: Option<String>` — a SQL boolean predicate that scopes an assertion to a subset of rows. Rows where `(filter)` evaluates to `TRUE` are subject to the assertion; rows where it's `FALSE` or `NULL` pass unconditionally.
+
+- Applied to every `TestType` kind — wraps the generated WHERE clause (`(filter) AND ...`) for predicate-based kinds, pre-GROUP for set-based kinds.
+- Quarantine integration: `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END` — out-of-scope rows stay in `__valid` even when `base_valid_pred` would fail them.
+
+### Added — `TestType::InRange { min, max }`
+
+Numeric range assertion (inclusive, half-open either side). NULL column values pass (matches existing `NOT IN` / `NOT (expr)` semantics). Bounds parse as `f64` and emit as SQL numeric literals — no user-SQL interpolation on the value path. Lowers into quarantine predicates.
+
+**Temporal ranges stay on `NotInFuture` / `OlderThanNDays` (below) or `expression`.**
+
+### Added — `TestType::RegexMatch { pattern }`
+
+Dialect-specific regex match via the new `SqlDialect::regex_match_predicate` trait method. Default impl returns an error; the four production dialects override:
+
+- **DuckDB:** `regexp_matches(col, 'pat')`
+- **Databricks:** `col RLIKE 'pat'`
+- **Snowflake:** `REGEXP_LIKE(col, 'pat')`
+- **BigQuery:** `REGEXP_CONTAINS(col, r'pat')`
+
+Patterns are validated against a strict allowlist (no single quotes, backticks, semicolons). NULL column values pass. Lowers into quarantine predicates.
+
+### Added — `TestType::Aggregate { op, cmp, value }`
+
+Table-level aggregate assertion: `SUM` / `COUNT(*)` / `AVG` / `MIN` / `MAX` with a comparison threshold (`lt` / `lte` / `gt` / `gte` / `eq` / `ne`, plus symbolic aliases `<`, `<=`, `>`, `>=`, `==`, `!=`). Emits `SELECT CASE WHEN <op> <cmp> <value> THEN 0 ELSE 1 END FROM t`. Not quarantinable (table-scoped).
+
+### Added — `TestType::Composite { kind: "unique", columns }`
+
+Multi-column uniqueness (requires at least two columns — single-column uniqueness stays on `Unique`). Emits `GROUP BY c1, c2, ... HAVING COUNT(*) > 1`. Not quarantinable (set-based).
+
+### Added — `TestType::NotInFuture` + `TestType::OlderThanNDays { days }`
+
+First-class sugar for timestamp bounds:
+
+- `NotInFuture`: `col <= CURRENT_TIMESTAMP`.
+- `OlderThanNDays { days }`: `col <= CURRENT_DATE - N days`.
+
+Row-level, NULL-permissive, quarantinable. Two new `SqlDialect` trait methods with ANSI default impls:
+
+- `current_timestamp_expr()` — default `CURRENT_TIMESTAMP` (keyword form; works for Databricks, Snowflake, DuckDB); BigQuery overrides to `CURRENT_TIMESTAMP()`.
+- `date_minus_days_expr(days)` — default `CURRENT_DATE - INTERVAL 'N' DAY` (works for Databricks, Snowflake, DuckDB); BigQuery overrides to `DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)`.
+
+**DuckDB quirk:** rejects `CURRENT_TIMESTAMP()` with parens; default impl uses the keyword form.
+
+### Other
+
+- `rocky test` and `run_quality` both route through the new dialect-aware `generate_test_sql_with_dialect`, so every new kind works via both paths.
+- 34 new rocky-core unit tests (19 Phase 4a, 14 Phase 4b, 1 `is_quarantinable` coverage).
+- POC 06 (`examples/playground/pocs/01-quality/06-quality-pipeline-standalone`) extended to exercise every Phase 4 addition — 14 checks total, 196 valid / 4 quarantined rows on DuckDB.
+
 ## [1.5.0] — 2026-04-17
 
 ### Breaking — Quality pipelines fail on error-severity check failures by default
