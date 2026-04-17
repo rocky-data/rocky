@@ -8,7 +8,7 @@ use crate::output::*;
 
 /// Execute `rocky state show`.
 pub fn state_show(state_path: &Path, output_json: bool) -> Result<()> {
-    let store = StateStore::open(state_path).context(format!(
+    let store = StateStore::open_read_only(state_path).context(format!(
         "failed to open state store at {}",
         state_path.display()
     ))?;

@@ -19,7 +19,7 @@ pub fn run_optimize(
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let store = StateStore::open(state_path)?;
+    let store = StateStore::open_read_only(state_path)?;
     let config = CostConfig::default();
 
     // Get all runs to extract model names and compute stats

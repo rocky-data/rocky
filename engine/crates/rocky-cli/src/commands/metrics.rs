@@ -22,7 +22,7 @@ pub fn run_metrics(
     alerts: bool,
     output_json: bool,
 ) -> Result<()> {
-    let store = StateStore::open(state_path)?;
+    let store = StateStore::open_read_only(state_path)?;
 
     let snapshots = store.get_quality_trend(model_name, if trend { 20 } else { 1 })?;
 

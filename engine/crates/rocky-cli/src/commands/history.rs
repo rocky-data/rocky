@@ -21,7 +21,7 @@ pub fn run_history(
     since: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let store = StateStore::open(state_path)?;
+    let store = StateStore::open_read_only(state_path)?;
 
     let since_ts: Option<DateTime<Utc>> = since
         .map(|s| {

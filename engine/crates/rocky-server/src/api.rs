@@ -232,7 +232,7 @@ async fn list_runs(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let state_path = state.models_dir.join(".rocky-state.redb");
-    let store = rocky_core::state::StateStore::open(&state_path)
+    let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let runs = store
         .list_runs(50)
@@ -263,7 +263,7 @@ async fn model_history(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let state_path = state.models_dir.join(".rocky-state.redb");
-    let store = rocky_core::state::StateStore::open(&state_path)
+    let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let history = store
         .get_model_history(&name, 50)
@@ -296,7 +296,7 @@ async fn model_metrics(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let state_path = state.models_dir.join(".rocky-state.redb");
-    let store = rocky_core::state::StateStore::open(&state_path)
+    let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshots = store
         .get_quality_trend(&name, 20)
