@@ -62,8 +62,8 @@ vendor-dagster:
 
 # --- Phase 2 schema codegen ---
 
-# Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript
-codegen: codegen-rust codegen-dagster codegen-vscode
+# Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript + VS Code project schema
+codegen: codegen-rust codegen-dagster codegen-vscode codegen-vscode-project-schema
 
 # Export JSON schemas from the engine's typed CLI output structs.
 #
@@ -125,6 +125,14 @@ codegen-vscode:
     done
     # Restore the curated index.ts barrel from git.
     git checkout HEAD -- editors/vscode/src/types/generated/index.ts
+
+# Copy the schemars-generated rocky_project schema into the VS Code
+# extension's schemas/ directory. The extension's package.json points
+# `jsonValidation` at `editors/vscode/schemas/rocky-project.schema.json`,
+# which is now a generated artifact (PR-a of the schema-autogen arc).
+# Pipelines pass through a permissive placeholder until PR-b lands.
+codegen-vscode-project-schema:
+    python3 scripts/copy_project_schema.py
 
 # Regenerate dagster-rocky test fixtures from live `rocky --output json`
 # Captures the JSON output of every relevant command against the

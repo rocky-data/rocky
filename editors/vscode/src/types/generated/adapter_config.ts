@@ -88,7 +88,6 @@ export interface AdapterConfig {
    * Snowflake warehouse to use for query execution.
    */
   warehouse?: string | null;
-  [k: string]: unknown;
 }
 /**
  * Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).
@@ -120,5 +119,4 @@ export interface RetryConfig {
    * Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
    */
   max_retries?: number;
-  [k: string]: unknown;
 }

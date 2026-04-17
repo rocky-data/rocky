@@ -1,5 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
   "definitions": {
     "AdapterKind": {
       "description": "Role an adapter block plays in the pipeline.\n\nSet via `kind = \"data\"` or `kind = \"discovery\"` in an `[adapter.*]` block. Required on discovery-only adapter types (`fivetran`, `airbyte`, `iceberg`, `manual`) so the adapter's role is self-evident in the raw config file — a reader shouldn't have to know the Rust trait surface of each adapter to tell whether it moves data.\n\nOptional on single-role warehouse types (defaults to `Data`) and on the dual-capable DuckDB adapter (absent means \"register both roles\").",
@@ -24,6 +25,7 @@
       "type": "string"
     },
     "RetryConfig": {
+      "additionalProperties": false,
       "description": "Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).\n\nRocky retries transient errors with exponential backoff and optional jitter to prevent thundering herd across concurrent runs.",
       "properties": {
         "backoff_multiplier": {

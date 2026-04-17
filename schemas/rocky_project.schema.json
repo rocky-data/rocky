@@ -1,5 +1,4 @@
 {
-  "$comment": "AUTO-GENERATED — do not edit by hand. Source: schemas/rocky_project.schema.json (derived from rocky-core RockyConfig). Run `just codegen` from the monorepo root to regenerate.",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
