@@ -38,6 +38,7 @@ use rocky_iceberg::adapter::IcebergDiscoveryAdapter;
 use rocky_iceberg::client::IcebergCatalogClient;
 
 use rocky_snowflake::adapter::SnowflakeWarehouseAdapter;
+use rocky_snowflake::batch::SnowflakeBatchCheckAdapter;
 use rocky_snowflake::connector::SnowflakeConnector;
 
 use rocky_bigquery::connector::BigQueryAdapter;
@@ -47,6 +48,10 @@ pub struct AdapterRegistry {
     warehouse: HashMap<String, Arc<dyn WarehouseAdapter>>,
     discovery: HashMap<String, Arc<dyn DiscoveryAdapter>>,
     connectors: HashMap<String, Arc<DatabricksConnector>>,
+    /// Snowflake connectors tracked separately from `connectors` (which is
+    /// Databricks-typed). Used by `batch_check_adapter` to dispatch the
+    /// Snowflake-specific `INFORMATION_SCHEMA.COLUMNS` describe query.
+    snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>>,
     adapter_configs: HashMap<String, AdapterConfig>,
 }
 
@@ -56,6 +61,7 @@ impl AdapterRegistry {
         let mut warehouse = HashMap::new();
         let mut discovery = HashMap::new();
         let mut connectors = HashMap::new();
+        let mut snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>> = HashMap::new();
         let mut adapter_configs = HashMap::new();
 
         for (name, adapter_cfg) in &config.adapters {
@@ -236,20 +242,29 @@ impl AdapterRegistry {
                     )
                     .context(format!("adapters.{name}: auth configuration error"))?;
 
-                    let sf_connector = SnowflakeConnector::new(
-                        rocky_snowflake::connector::ConnectorConfig {
-                            account: account.to_string(),
-                            warehouse: sf_warehouse.to_string(),
-                            database: adapter_cfg.database.clone(),
-                            schema: None,
-                            role: adapter_cfg.role.clone(),
-                            timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
-                            retry: adapter_cfg.retry.clone(),
-                        },
-                        sf_auth,
-                    );
+                    let sf_connector_config = rocky_snowflake::connector::ConnectorConfig {
+                        account: account.to_string(),
+                        warehouse: sf_warehouse.to_string(),
+                        database: adapter_cfg.database.clone(),
+                        schema: None,
+                        role: adapter_cfg.role.clone(),
+                        timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
+                        retry: adapter_cfg.retry.clone(),
+                    };
 
-                    let adapter = SnowflakeWarehouseAdapter::new(sf_connector);
+                    // The warehouse adapter wraps its own connector; a second
+                    // connector with the same config drives the batch-check
+                    // path. Keeping it separate means the batch describe
+                    // query won't contend with in-flight `execute_statement`
+                    // calls on the warehouse adapter's connector.
+                    let sf_connector_for_batch = Arc::new(SnowflakeConnector::new(
+                        sf_connector_config.clone(),
+                        sf_auth.clone(),
+                    ));
+                    snowflake_connectors.insert(name.clone(), sf_connector_for_batch);
+
+                    let warehouse_connector = SnowflakeConnector::new(sf_connector_config, sf_auth);
+                    let adapter = SnowflakeWarehouseAdapter::new(warehouse_connector);
                     warehouse.insert(name.clone(), Arc::new(adapter));
                 }
                 "bigquery" => {
@@ -296,6 +311,7 @@ impl AdapterRegistry {
             warehouse,
             discovery,
             connectors,
+            snowflake_connectors,
             adapter_configs,
         })
     }
@@ -344,11 +360,21 @@ impl AdapterRegistry {
     /// check implementation — callers fall back to the per-table
     /// [`WarehouseAdapter`] trait methods.
     ///
-    /// Currently only Databricks implements [`BatchCheckAdapter`] (UNION ALL
-    /// row counts + freshness + `information_schema.columns` describe).
+    /// Databricks implements all three batch methods (UNION ALL row counts +
+    /// freshness + `information_schema.columns` describe). Snowflake
+    /// currently only batches describe; its row-counts / freshness methods
+    /// return "not yet implemented" so `run.rs` falls back to per-table
+    /// queries for those.
     pub fn batch_check_adapter(&self, name: &str) -> Option<Arc<dyn BatchCheckAdapter>> {
-        let connector = self.connectors.get(name)?.clone();
-        Some(Arc::new(DatabricksBatchCheckAdapter::new(connector)))
+        if let Some(connector) = self.connectors.get(name) {
+            return Some(Arc::new(DatabricksBatchCheckAdapter::new(
+                connector.clone(),
+            )));
+        }
+        if let Some(connector) = self.snowflake_connectors.get(name) {
+            return Some(Arc::new(SnowflakeBatchCheckAdapter::new(connector.clone())));
+        }
+        None
     }
 
     /// Build a governance adapter for the named warehouse.
