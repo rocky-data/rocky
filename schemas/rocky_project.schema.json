@@ -240,6 +240,213 @@
       ],
       "description": "Schema-only helper that mirrors the deserializer's acceptance of both flat (`[adapter] type = \"...\"`) and named (`[adapter.foo] type = \"...\"`) adapter shapes.\n\n[`normalize_toml_shorthands`] rewrites the flat form into `adapter.default` before [`RockyConfig`] is deserialized, so the Rust type only sees the named form. The IDE schema, however, validates the raw TOML — so it must accept both shapes directly. 38 of 46 committed POC `rocky.toml` files use the flat form; the schema would reject all of them without this anyOf."
     },
+    "AggregateCheckToggle": {
+      "anyOf": [
+        {
+          "description": "Legacy boolean toggle. Severity defaults to `error`.",
+          "type": "boolean"
+        },
+        {
+          "description": "Explicit struct form with per-check severity.",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TestSeverity"
+                }
+              ],
+              "default": "error"
+            }
+          },
+          "type": "object"
+        }
+      ],
+      "description": "Per-check-kind toggle that accepts either a plain boolean (legacy form) or a struct with `enabled` + `severity`.\n\n```toml # Legacy — still supported row_count = true\n\n# New — per-check severity [pipeline.x.checks.row_count] enabled  = true severity = \"warning\" ```"
+    },
+    "AggregateCmp": {
+      "description": "Comparison operator for `Aggregate` assertions. Each comparison has a long form (`lt`, `lte`, `gt`, `gte`, `eq`, `ne`) and an equivalent symbolic alias (`<`, `<=`, `>`, `>=`, `==`, `!=`).",
+      "enum": [
+        "lt",
+        "<",
+        "lte",
+        "<=",
+        "gt",
+        ">",
+        "gte",
+        ">=",
+        "eq",
+        "==",
+        "ne",
+        "!="
+      ],
+      "type": "string"
+    },
+    "AggregateOp": {
+      "description": "Aggregate operator used by [`TestType::Aggregate`].",
+      "oneOf": [
+        {
+          "description": "`SUM(column)` — column required.",
+          "enum": [
+            "sum"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`COUNT(*)` — column ignored.",
+          "enum": [
+            "count"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`AVG(column)` — column required.",
+          "enum": [
+            "avg"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`MIN(column)` — column required.",
+          "enum": [
+            "min"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`MAX(column)` — column required.",
+          "enum": [
+            "max"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "BindingType": {
+      "description": "Workspace binding access level.",
+      "enum": [
+        "READ_WRITE",
+        "READ_ONLY"
+      ],
+      "type": "string"
+    },
+    "ChecksConfig": {
+      "additionalProperties": false,
+      "description": "Data quality checks configuration (row count, column match, freshness, null rate, custom).",
+      "properties": {
+        "anomaly_threshold_pct": {
+          "default": 50.0,
+          "description": "Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly). Set to 0 to disable.",
+          "format": "double",
+          "type": "number"
+        },
+        "assertions": {
+          "default": [],
+          "description": "Row-level assertions (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`) executed against specific tables in the quality pipeline. Each entry targets a single table by name and reuses the `TestDecl` surface from declarative model tests.",
+          "items": {
+            "$ref": "#/definitions/QualityAssertion"
+          },
+          "type": "array"
+        },
+        "column_match": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AggregateCheckToggle"
+            }
+          ],
+          "default": false
+        },
+        "custom": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/CustomCheckConfig"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "fail_on_error": {
+          "default": true,
+          "description": "When `true` (default), the quality run exits non-zero if any error-severity check fails. Set `false` to force the pipeline to always succeed and leave failure handling to downstream consumers of the JSON output.",
+          "type": "boolean"
+        },
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FreshnessConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "null_rate": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NullRateConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "quarantine": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/QuarantineConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Row quarantine — split/tag/drop rows that violate error-severity row-level assertions. Disabled when unset. See [`QuarantineConfig`]."
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AggregateCheckToggle"
+            }
+          ],
+          "default": false
+        }
+      },
+      "type": "object"
+    },
+    "CompositeKind": {
+      "description": "Kind of composite (multi-column) assertion.",
+      "oneOf": [
+        {
+          "description": "`(col1, col2, ...)` is unique across all rows.",
+          "enum": [
+            "unique"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ConcurrencyMode": {
+      "anyOf": [
+        {
+          "enum": [
+            "adaptive"
+          ],
+          "type": "string"
+        },
+        {
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      ],
+      "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
+    },
     "CostSection": {
       "additionalProperties": false,
       "description": "Cost estimation configuration.\n\nControls pricing assumptions used by [`crate::optimize::recommend_strategy`] when analyzing materialization costs and generating recommendations.",
@@ -271,6 +478,85 @@
       },
       "type": "object"
     },
+    "CustomCheckConfig": {
+      "additionalProperties": false,
+      "description": "A user-defined SQL check with a name, query template, and pass/fail threshold.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity reported when this check fails."
+        },
+        "sql": {
+          "type": "string"
+        },
+        "threshold": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "sql"
+      ],
+      "type": "object"
+    },
+    "DiscoveryConfig": {
+      "additionalProperties": false,
+      "description": "Discovery configuration within a pipeline source.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `\"default\"`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ExecutionConfig": {
+      "additionalProperties": false,
+      "description": "Controls parallelism and error handling for table processing.\n\nRocky processes tables within a run concurrently using async tasks. Tune `concurrency` based on your warehouse capacity.",
+      "properties": {
+        "concurrency": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConcurrencyMode"
+            }
+          ],
+          "default": "adaptive",
+          "description": "Concurrency strategy (default: `\"adaptive\"`).\n\n- `\"adaptive\"` — AIMD throttle that starts at 32 and adjusts based on rate-limit signals. Best for remote warehouses (Databricks, Snowflake). - An integer (e.g. `8`) — fixed concurrency, always this many in-flight tables. Use for local adapters (DuckDB) or when you know the limit. - `1` — serial execution."
+        },
+        "error_rate_abort_pct": {
+          "default": 50,
+          "description": "Abort remaining tables if error rate exceeds this percentage (0-100). Prevents wasting compute when the warehouse is unhealthy. Default: 50 (abort if more than half of completed tables failed). Set to 0 to disable.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "fail_fast": {
+          "default": false,
+          "description": "If true, abort all remaining tables on first error. If false, process all tables and report errors at the end (partial success).",
+          "type": "boolean"
+        },
+        "table_retries": {
+          "default": 1,
+          "description": "Number of times to retry failed tables after the initial parallel phase. Default: 1. Set to 0 to disable auto-retry.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "FailureAction": {
       "oneOf": [
         {
@@ -295,6 +581,119 @@
           "type": "string"
         }
       ]
+    },
+    "FreshnessConfig": {
+      "additionalProperties": false,
+      "description": "Freshness check configuration with optional per-schema overrides.",
+      "properties": {
+        "overrides": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-schema freshness overrides. Key is a schema pattern (e.g., \"raw__us_west__shopify\"), value overrides threshold_seconds for matching schemas.",
+          "type": "object"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity reported when freshness lag exceeds the threshold."
+        },
+        "threshold_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "threshold_seconds"
+      ],
+      "type": "object"
+    },
+    "GovernanceConfig": {
+      "additionalProperties": false,
+      "description": "Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.",
+      "properties": {
+        "auto_create_catalogs": {
+          "default": false,
+          "type": "boolean"
+        },
+        "auto_create_schemas": {
+          "default": false,
+          "type": "boolean"
+        },
+        "grants": {
+          "default": [],
+          "description": "Permissions granted on every managed catalog.",
+          "items": {
+            "$ref": "#/definitions/GrantConfig"
+          },
+          "type": "array"
+        },
+        "isolation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/IsolationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Workspace isolation settings."
+        },
+        "schema_grants": {
+          "default": [],
+          "description": "Permissions granted on every managed schema.",
+          "items": {
+            "$ref": "#/definitions/GrantConfig"
+          },
+          "type": "array"
+        },
+        "tag_prefix": {
+          "default": null,
+          "description": "Optional prefix prepended to auto-generated component tag keys (e.g., `\"ge_\"` turns `client` → `ge_client`). Does not affect keys in `[governance.tags]` — those are used verbatim.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Tags applied to every managed catalog and schema.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "GrantConfig": {
+      "additionalProperties": false,
+      "description": "A permission grant to apply to catalogs or schemas.",
+      "properties": {
+        "permissions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "principal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "permissions",
+        "principal"
+      ],
+      "type": "object"
     },
     "HookConfig": {
       "additionalProperties": false,
@@ -361,8 +760,460 @@
       },
       "type": "object"
     },
+    "IsolationConfig": {
+      "additionalProperties": false,
+      "description": "Workspace isolation configuration (Databricks-specific).\n\n```toml [governance.isolation] enabled = true\n\n[[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = \"READ_WRITE\"\n\n[[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = \"READ_ONLY\" ```",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "workspace_ids": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorkspaceBindingConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "LoadFileFormat": {
+      "description": "File format for load pipelines, parsed from TOML.\n\nMirrors `rocky_adapter_sdk::FileFormat` but lives in rocky-core to avoid a hard dependency from config parsing to the adapter SDK.",
+      "enum": [
+        "csv",
+        "parquet",
+        "json_lines"
+      ],
+      "type": "string"
+    },
+    "LoadOptionsConfig": {
+      "additionalProperties": false,
+      "description": "Load-specific options parsed from TOML.",
+      "properties": {
+        "batch_size": {
+          "default": 10000,
+          "description": "Number of rows per INSERT batch. Default: 10,000.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "create_table": {
+          "default": true,
+          "description": "Create the target table if it does not exist. Default: true.",
+          "type": "boolean"
+        },
+        "csv_delimiter": {
+          "default": ",",
+          "description": "CSV-specific: field delimiter character. Default: `,`.",
+          "type": "string"
+        },
+        "csv_has_header": {
+          "default": true,
+          "description": "CSV-specific: whether the first row is a header. Default: true.",
+          "type": "boolean"
+        },
+        "truncate_first": {
+          "default": false,
+          "description": "Truncate the target table before loading. Default: false.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "LoadPipelineConfig": {
+      "description": "Load pipeline configuration -- ingest files (CSV, Parquet, JSONL) into a warehouse.\n\nLoads data from a local directory into a target catalog/schema. The format can be auto-detected from file extensions or set explicitly.\n\n```toml [pipeline.load_data] type = \"load\" source_dir = \"data/\" format = \"csv\"\n\n[pipeline.load_data.target] adapter = \"prod\" catalog = \"warehouse\" schema = \"raw\"\n\n[pipeline.load_data.options] batch_size = 5000 create_table = true truncate_first = false csv_delimiter = \",\" csv_has_header = true ```",
+      "properties": {
+        "checks": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChecksConfig"
+            }
+          ],
+          "default": {
+            "anomaly_threshold_pct": 0.0,
+            "assertions": [],
+            "column_match": false,
+            "custom": [],
+            "enabled": false,
+            "fail_on_error": false,
+            "freshness": null,
+            "null_rate": null,
+            "quarantine": null,
+            "row_count": false
+          },
+          "description": "Data quality checks run after loading."
+        },
+        "depends_on": {
+          "default": [],
+          "description": "Pipeline dependencies for chaining.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionConfig"
+            }
+          ],
+          "default": {
+            "concurrency": "adaptive",
+            "error_rate_abort_pct": 50,
+            "fail_fast": false,
+            "table_retries": 1
+          },
+          "description": "Execution settings (concurrency, retries, etc.)."
+        },
+        "format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LoadFileFormat"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit file format. When omitted, auto-detected from file extensions."
+        },
+        "options": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LoadOptionsConfig"
+            }
+          ],
+          "default": {
+            "batch_size": 10000,
+            "create_table": true,
+            "csv_delimiter": ",",
+            "csv_has_header": true,
+            "truncate_first": false
+          },
+          "description": "Load options (batch size, create/truncate behavior, CSV settings)."
+        },
+        "source_dir": {
+          "description": "Directory or glob pattern for source files, relative to the config file.",
+          "type": "string"
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LoadTargetConfig"
+            }
+          ],
+          "description": "Target table location."
+        }
+      },
+      "required": [
+        "source_dir",
+        "target"
+      ],
+      "type": "object"
+    },
+    "LoadTargetConfig": {
+      "additionalProperties": false,
+      "description": "Target configuration for load pipelines.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
+          "type": "string"
+        },
+        "catalog": {
+          "description": "Target catalog name.",
+          "type": "string"
+        },
+        "governance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConfig"
+            }
+          ],
+          "default": {
+            "auto_create_catalogs": false,
+            "auto_create_schemas": false,
+            "grants": [],
+            "isolation": null,
+            "schema_grants": [],
+            "tag_prefix": null,
+            "tags": {}
+          },
+          "description": "Governance settings for the target."
+        },
+        "schema": {
+          "description": "Target schema name.",
+          "type": "string"
+        },
+        "table": {
+          "default": null,
+          "description": "Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "catalog",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "MetadataColumnConfig": {
+      "additionalProperties": false,
+      "description": "A metadata column added during replication (e.g., `_loaded_by`).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "value"
+      ],
+      "type": "object"
+    },
+    "NullRateConfig": {
+      "additionalProperties": false,
+      "description": "Null rate check configuration: columns to check, threshold, and sample size.",
+      "properties": {
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sample_percent": {
+          "default": 10,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity reported when a column's null rate exceeds the threshold."
+        },
+        "threshold": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "columns",
+        "threshold"
+      ],
+      "type": "object"
+    },
     "PipelineConfig": {
-      "description": "Pipeline configuration. The full per-variant schema is generated by PR-b of the rocky-project-schema-autogen arc — until then any object shape is accepted by the IDE schema and the deserializer continues to validate at parse time.",
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReplicationPipelineConfig"
+            },
+            {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "replication"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TransformationPipelineConfig"
+            },
+            {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "transformation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/QualityPipelineConfig"
+            },
+            {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "quality"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SnapshotPipelineConfig"
+            },
+            {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "snapshot"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LoadPipelineConfig"
+            },
+            {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "load"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      ],
+      "description": "Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`."
+    },
+    "PipelineSourceConfig": {
+      "additionalProperties": false,
+      "description": "Pipeline source configuration.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `\"default\"` — resolved against the adapter map in [`normalize_rocky_config`].",
+          "type": "string"
+        },
+        "catalog": {
+          "description": "Source catalog name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "discovery": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiscoveryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional discovery configuration."
+        },
+        "schema_pattern": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SchemaPatternConfig"
+            }
+          ],
+          "description": "Schema pattern for parsing source schema names."
+        }
+      },
+      "required": [
+        "schema_pattern"
+      ],
+      "type": "object"
+    },
+    "PipelineTargetConfig": {
+      "additionalProperties": false,
+      "description": "Pipeline target configuration.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `\"default\"`.",
+          "type": "string"
+        },
+        "catalog_template": {
+          "description": "Template for the target catalog name.",
+          "type": "string"
+        },
+        "governance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConfig"
+            }
+          ],
+          "default": {
+            "auto_create_catalogs": false,
+            "auto_create_schemas": false,
+            "grants": [],
+            "isolation": null,
+            "schema_grants": [],
+            "tag_prefix": null,
+            "tags": {}
+          },
+          "description": "Governance settings for the target."
+        },
+        "schema_template": {
+          "description": "Template for the target schema name.",
+          "type": "string"
+        },
+        "separator": {
+          "default": null,
+          "description": "Separator for joining variadic components in target templates.\n\nWhen a source pattern uses `\"__\"` as its separator but the target templates use `\"_\"` between placeholders, set this to `\"_\"` so that multi-valued components (e.g., `{hierarchies}`) are joined correctly.\n\nDefaults to the source pattern separator when not set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "catalog_template",
+        "schema_template"
+      ],
       "type": "object"
     },
     "PipelinesFieldSchema": {
@@ -383,10 +1234,560 @@
           "type": "object"
         }
       ],
-      "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload still goes through the [`PipelineConfigSchemaPlaceholder`] until PR-b lands."
+      "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
+    },
+    "QualityAssertion": {
+      "description": "A single row-level assertion attached to a quality pipeline, scoped to one table in the pipeline's `tables` list.\n\n```toml [[pipeline.nightly_dq.checks.assertions]] name     = \"orders_customer_id_not_null\"  # optional table    = \"orders\" type     = \"not_null\" column   = \"customer_id\" severity = \"error\" ```\n\nThe `type`-specific fields (and `column`, `severity`) are flattened from `TestDecl` — the same surface used by declarative model tests.",
+      "oneOf": [
+        {
+          "description": "Assert that a column contains no NULL values.",
+          "properties": {
+            "type": {
+              "enum": [
+                "not_null"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a column contains only unique values.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unique"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a column contains only values from a fixed set.",
+          "properties": {
+            "type": {
+              "enum": [
+                "accepted_values"
+              ],
+              "type": "string"
+            },
+            "values": {
+              "description": "The allowed values. Compared as string literals.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "values"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that every non-NULL value in a column exists in a referenced table's column (referential integrity).",
+          "properties": {
+            "to_column": {
+              "description": "Column in the target table to join against.",
+              "type": "string"
+            },
+            "to_table": {
+              "description": "Fully-qualified target table (`catalog.schema.table`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "relationships"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "to_column",
+            "to_table",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a custom SQL expression holds for every row.",
+          "properties": {
+            "expression": {
+              "description": "A SQL boolean expression. Rows where `NOT (expression)` are failures.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "expression"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expression",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that the table's row count falls within an inclusive range.",
+          "properties": {
+            "max": {
+              "default": null,
+              "description": "Maximum row count (inclusive). `None` means no upper bound.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "min": {
+              "default": null,
+              "description": "Minimum row count (inclusive). `None` means no lower bound.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "row_count_range"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a column's values fall within a numeric range (inclusive, half-open either side). Phase 4a supports numeric bounds only — use `time_window` (Phase 4b) or `expression` for temporal comparisons.\n\nNULL column values pass (consistent with existing `NOT IN` / `NOT (expr)` semantics).",
+          "properties": {
+            "max": {
+              "default": null,
+              "description": "Maximum value (inclusive). `None` means no upper bound.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "min": {
+              "default": null,
+              "description": "Minimum value (inclusive). `None` means no lower bound.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "in_range"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a column's values match a regular expression.\n\nDialect-specific operator (`REGEXP` / `RLIKE` / `REGEXP_LIKE` / `REGEXP_CONTAINS`) is produced by [`SqlDialect::regex_match_predicate`]. Patterns are validated against a strict allowlist that rejects single quotes, backticks, and semicolons.\n\nNULL column values pass.",
+          "properties": {
+            "pattern": {
+              "description": "The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "regex_match"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that an aggregate (`sum`, `count`, `avg`, `min`, `max`) of a column satisfies a comparison against a numeric threshold. The comparison is what **passes** — e.g. `op = \"sum\", cmp = \"gt\", value = \"0\"` means \"sum(col) > 0 passes; otherwise fails\".\n\nTable-level; not quarantinable. Use `count` (no column) for the row-count-based variants that `row_count_range` can't express (equality, strict inequalities).",
+          "properties": {
+            "cmp": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AggregateCmp"
+                }
+              ],
+              "description": "Comparison between `op(column)` and `value`. The check passes when the comparison is true."
+            },
+            "op": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AggregateOp"
+                }
+              ],
+              "description": "Aggregate operator."
+            },
+            "type": {
+              "enum": [
+                "aggregate"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "Threshold to compare against. Parsed as `f64`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "cmp",
+            "op",
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert that a combination of columns is unique across all rows. Extends [`TestType::Unique`] to composite keys.\n\nSet-based; not quarantinable.",
+          "properties": {
+            "columns": {
+              "description": "Columns that together form the key. Must have at least two entries (single-column uniqueness is covered by `Unique`).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CompositeKind"
+                }
+              ],
+              "description": "The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType."
+            },
+            "type": {
+              "enum": [
+                "composite"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "columns",
+            "kind",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "First-class sugar for `col <= CURRENT_TIMESTAMP()` — no timestamp in the future. Row-level; quarantinable (NULL column values pass).",
+          "properties": {
+            "type": {
+              "enum": [
+                "not_in_future"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "First-class sugar for `col <= CURRENT_DATE - N days` — every row's timestamp must be at least `days` days old. Row-level; quarantinable (NULL column values pass). Dialect-specific: uses [`SqlDialect::date_minus_days_expr`].",
+          "properties": {
+            "days": {
+              "description": "N — days in the past. Must be > 0.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "older_than_n_days"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "days",
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "column": {
+          "default": null,
+          "description": "Column under test. Required for `not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`. Ignored for `expression` and `row_count_range`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filter": {
+          "default": null,
+          "description": "Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.\n\nFilter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).\n\nExample: `filter = \"created_at > current_date - interval 30 day\"` restricts a `not_null` check to rows created in the last 30 days.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `\"{kind}:{column}\"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity of failure. Defaults to `error`."
+        },
+        "table": {
+          "description": "Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table"
+      ],
+      "type": "object"
+    },
+    "QualityPipelineConfig": {
+      "description": "Quality pipeline configuration — standalone data quality checks.\n\nRuns checks against existing tables without any data movement.\n\n```toml [pipeline.nightly_dq] type = \"quality\"\n\n[pipeline.nightly_dq.target] adapter = \"databricks_prod\"\n\n[[pipeline.nightly_dq.tables]] catalog = \"acme_warehouse\" schema = \"raw__us_west__shopify\"\n\n[pipeline.nightly_dq.checks] enabled = true freshness = { threshold_seconds = 86400 } ```",
+      "properties": {
+        "checks": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChecksConfig"
+            }
+          ],
+          "description": "Data quality checks to run."
+        },
+        "depends_on": {
+          "default": [],
+          "description": "Pipeline dependencies for chaining.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionConfig"
+            }
+          ],
+          "default": {
+            "concurrency": "adaptive",
+            "error_rate_abort_pct": 50,
+            "fail_fast": false,
+            "table_retries": 1
+          },
+          "description": "Execution settings (concurrency, retries, etc.)."
+        },
+        "tables": {
+          "default": [],
+          "description": "Tables to check. Each entry specifies catalog + schema, and optionally a specific table (omit for all tables in the schema).",
+          "items": {
+            "$ref": "#/definitions/TableRef"
+          },
+          "type": "array"
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/QualityTargetConfig"
+            }
+          ],
+          "description": "Target adapter for running check queries."
+        }
+      },
+      "required": [
+        "checks",
+        "target"
+      ],
+      "type": "object"
+    },
+    "QualityTargetConfig": {
+      "additionalProperties": false,
+      "description": "Target configuration for quality pipelines (adapter reference only).",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "QuarantineConfig": {
+      "additionalProperties": false,
+      "description": "Row quarantine configuration. When enabled, error-severity row-level assertions (`not_null`, `accepted_values`, `expression`) on a given table are compiled into a single boolean row predicate. Rows matching the predicate go to the `__valid` table; rows that don't go to the `__quarantine` table (or are dropped / tagged, per `mode`).\n\nAggregate / set-based assertions (`unique`, `relationships`, `row_count_range`) are **not** lowered — they stay observational and produce `CheckResult` entries as before.\n\n```toml [pipeline.nightly_dq.checks.quarantine] enabled = true mode    = \"split\"          # \"split\" (default) | \"tag\" | \"drop\" # suffix_valid       = \"__valid\" # suffix_quarantine  = \"__quarantine\" ```",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable quarantine. Default: `false`.",
+          "type": "boolean"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/QuarantineMode"
+            }
+          ],
+          "default": "split",
+          "description": "How to split rows — see [`QuarantineMode`]."
+        },
+        "suffix_quarantine": {
+          "default": "__quarantine",
+          "description": "Table-name suffix for the failing-rows table. Default `\"__quarantine\"`.",
+          "type": "string"
+        },
+        "suffix_valid": {
+          "default": "__valid",
+          "description": "Table-name suffix for the passing-rows table. Default `\"__valid\"`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "QuarantineMode": {
+      "description": "How to handle rows that fail error-severity row-level assertions.",
+      "oneOf": [
+        {
+          "description": "Write a `<table>__valid` table with passing rows and a `<table>__quarantine` table with failing rows (plus per-assertion `_error_<name>` label columns). Original table untouched. Default.",
+          "enum": [
+            "split"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Replace `<table>` in place with a copy that has per-assertion `_error_<name>` label columns set for failing rows. Rewrites the source — use with care; not recommended when the source is a raw replication target.",
+          "enum": [
+            "tag"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Write only the `<table>__valid` half. Failing rows are discarded. Irreversible at run-time.",
+          "enum": [
+            "drop"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "RedactedString": {
       "type": "string"
+    },
+    "ReplicationPipelineConfig": {
+      "description": "Replication pipeline configuration.\n\nCopies tables from a source to a target using schema pattern discovery, with optional incremental strategy, metadata columns, governance, and data quality checks.",
+      "properties": {
+        "checks": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChecksConfig"
+            }
+          ],
+          "default": {
+            "anomaly_threshold_pct": 0.0,
+            "assertions": [],
+            "column_match": false,
+            "custom": [],
+            "enabled": false,
+            "fail_on_error": false,
+            "freshness": null,
+            "null_rate": null,
+            "quarantine": null,
+            "row_count": false
+          },
+          "description": "Data quality checks."
+        },
+        "depends_on": {
+          "default": [],
+          "description": "Pipeline dependencies for chaining (Phase 4).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionConfig"
+            }
+          ],
+          "default": {
+            "concurrency": "adaptive",
+            "error_rate_abort_pct": 50,
+            "fail_fast": false,
+            "table_retries": 1
+          },
+          "description": "Execution settings (concurrency, retries, etc.)."
+        },
+        "metadata_columns": {
+          "default": [],
+          "description": "Metadata columns added during replication.",
+          "items": {
+            "$ref": "#/definitions/MetadataColumnConfig"
+          },
+          "type": "array"
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PipelineSourceConfig"
+            }
+          ],
+          "description": "Source configuration."
+        },
+        "strategy": {
+          "default": "incremental",
+          "description": "Replication strategy: \"incremental\" or \"full_refresh\".",
+          "type": "string"
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PipelineTargetConfig"
+            }
+          ],
+          "description": "Target configuration."
+        },
+        "timestamp_column": {
+          "default": "_fivetran_synced",
+          "description": "Timestamp column for incremental strategy.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target"
+      ],
+      "type": "object"
     },
     "RetryConfig": {
       "additionalProperties": false,
@@ -446,6 +1847,184 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "SchemaPatternConfig": {
+      "additionalProperties": false,
+      "description": "Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.",
+      "properties": {
+        "components": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "separator": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "components",
+        "prefix",
+        "separator"
+      ],
+      "type": "object"
+    },
+    "SnapshotPipelineConfig": {
+      "description": "Snapshot pipeline configuration — SCD Type 2 slowly-changing dimension capture.\n\nTracks historical changes to a source table by maintaining `valid_from` / `valid_to` columns in the target history table.\n\n```toml [pipeline.customer_history] type = \"snapshot\" unique_key = [\"customer_id\"] updated_at = \"updated_at\"\n\n[pipeline.customer_history.source] adapter = \"databricks_prod\" catalog = \"raw_catalog\" schema = \"raw__us_west__shopify\" table = \"customers\"\n\n[pipeline.customer_history.target] adapter = \"databricks_prod\" catalog = \"acme_warehouse\" schema = \"silver__scd\" table = \"customers_history\" ```",
+      "properties": {
+        "checks": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChecksConfig"
+            }
+          ],
+          "default": {
+            "anomaly_threshold_pct": 0.0,
+            "assertions": [],
+            "column_match": false,
+            "custom": [],
+            "enabled": false,
+            "fail_on_error": false,
+            "freshness": null,
+            "null_rate": null,
+            "quarantine": null,
+            "row_count": false
+          },
+          "description": "Data quality checks run after snapshot."
+        },
+        "depends_on": {
+          "default": [],
+          "description": "Pipeline dependencies for chaining.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionConfig"
+            }
+          ],
+          "default": {
+            "concurrency": "adaptive",
+            "error_rate_abort_pct": 50,
+            "fail_fast": false,
+            "table_retries": 1
+          },
+          "description": "Execution settings."
+        },
+        "invalidate_hard_deletes": {
+          "default": false,
+          "description": "When true, rows deleted from the source get their `valid_to` set to the current timestamp in the target. Default: false.",
+          "type": "boolean"
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SnapshotSourceConfig"
+            }
+          ],
+          "description": "Source table reference (single table, not pattern-based discovery)."
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SnapshotTargetConfig"
+            }
+          ],
+          "description": "Target history table."
+        },
+        "unique_key": {
+          "description": "Column(s) that uniquely identify a row in the source table.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "updated_at": {
+          "description": "Column used to detect changes (compared between runs).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "unique_key",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "SnapshotSourceConfig": {
+      "additionalProperties": false,
+      "description": "Source table for a snapshot pipeline (explicit single-table reference).",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
+          "type": "string"
+        },
+        "catalog": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    },
+    "SnapshotTargetConfig": {
+      "additionalProperties": false,
+      "description": "Target table for a snapshot pipeline (explicit single-table reference + governance).",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
+          "type": "string"
+        },
+        "catalog": {
+          "type": "string"
+        },
+        "governance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConfig"
+            }
+          ],
+          "default": {
+            "auto_create_catalogs": false,
+            "auto_create_schemas": false,
+            "grants": [],
+            "isolation": null,
+            "schema_grants": [],
+            "tag_prefix": null,
+            "tags": {}
+          }
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
+      ],
       "type": "object"
     },
     "StateBackend": {
@@ -546,6 +2125,143 @@
       },
       "type": "object"
     },
+    "TableRef": {
+      "additionalProperties": false,
+      "description": "A reference to a specific catalog/schema/table for quality checks and snapshot pipelines.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "default": null,
+          "description": "Specific table name. When `None`, all tables in the schema are checked.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "catalog",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "TestSeverity": {
+      "description": "Severity of a test failure.",
+      "oneOf": [
+        {
+          "description": "Test failure is a hard error — pipeline fails.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Test failure is a warning — pipeline continues.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TransformationPipelineConfig": {
+      "description": "Transformation pipeline configuration.\n\nOrchestrates `.sql` / `.rocky` model compilation and execution as a first-class pipeline, with its own execution, checks, and governance settings. Model-level strategy (incremental, merge, time_interval, etc.) is defined in each model's sidecar TOML, not at the pipeline level.\n\n```toml [pipeline.silver] type = \"transformation\" models = \"models/**\"\n\n[pipeline.silver.target] adapter = \"databricks_prod\" [pipeline.silver.target.governance] auto_create_schemas = true\n\n[pipeline.silver.execution] concurrency = 8 ```",
+      "properties": {
+        "checks": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ChecksConfig"
+            }
+          ],
+          "default": {
+            "anomaly_threshold_pct": 0.0,
+            "assertions": [],
+            "column_match": false,
+            "custom": [],
+            "enabled": false,
+            "fail_on_error": false,
+            "freshness": null,
+            "null_rate": null,
+            "quarantine": null,
+            "row_count": false
+          },
+          "description": "Data quality checks run after model execution."
+        },
+        "depends_on": {
+          "default": [],
+          "description": "Pipeline dependencies for chaining.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecutionConfig"
+            }
+          ],
+          "default": {
+            "concurrency": "adaptive",
+            "error_rate_abort_pct": 50,
+            "fail_fast": false,
+            "table_retries": 1
+          },
+          "description": "Execution settings (concurrency, retries, etc.)."
+        },
+        "models": {
+          "default": "models/**",
+          "description": "Glob pattern for model files, relative to the config file directory. Default: `\"models/**\"`.",
+          "type": "string"
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TransformationTargetConfig"
+            }
+          ],
+          "description": "Target configuration (adapter + governance)."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "TransformationTargetConfig": {
+      "additionalProperties": false,
+      "description": "Target configuration for transformation pipelines.\n\nUnlike replication targets (which use `catalog_template` / `schema_template` for dynamic routing), transformation targets only need an adapter reference and optional governance — the actual catalog/schema/table is defined per-model in sidecar TOML files.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `\"default\"`.",
+          "type": "string"
+        },
+        "governance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GovernanceConfig"
+            }
+          ],
+          "default": {
+            "auto_create_catalogs": false,
+            "auto_create_schemas": false,
+            "grants": [],
+            "isolation": null,
+            "schema_grants": [],
+            "tag_prefix": null,
+            "tags": {}
+          },
+          "description": "Governance settings for the target."
+        }
+      },
+      "type": "object"
+    },
     "WebhookConfig": {
       "additionalProperties": false,
       "description": "Configuration for a single webhook endpoint.",
@@ -642,6 +2358,29 @@
         }
       ],
       "description": "Supports both single-webhook and multi-webhook syntax per event.\n\nSingle: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`"
+    },
+    "WorkspaceBindingConfig": {
+      "additionalProperties": false,
+      "description": "A workspace binding with ID and access level.",
+      "properties": {
+        "binding_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BindingType"
+            }
+          ],
+          "default": "READ_WRITE"
+        },
+        "id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
     }
   },
   "description": "Top-level Rocky configuration (v2 format).\n\nUses named adapters and named pipelines: ```toml [adapter.databricks_prod] type = \"databricks\" ...\n\n[pipeline.raw_replication] type = \"replication\" ... ```",

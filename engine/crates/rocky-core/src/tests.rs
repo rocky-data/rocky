@@ -220,7 +220,10 @@ impl AggregateOp {
 /// Deserialized from the tokens `"lt"`, `"lte"`, `"gt"`, `"gte"`, `"eq"`,
 /// `"ne"` (and their symbolic aliases `"<"`, `"<="`, `">"`, `">="`,
 /// `"=="`, `"!="`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+// `JsonSchema` is hand-written below — schemars derives the schema enum
+// from `rename` only, dropping the symbolic `alias` forms. The deserializer
+// accepts both shapes (`"lt"` and `"<"`); the IDE schema must too.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AggregateCmp {
     #[serde(rename = "lt", alias = "<")]
     Lt,
@@ -234,6 +237,29 @@ pub enum AggregateCmp {
     Eq,
     #[serde(rename = "ne", alias = "!=")]
     Ne,
+}
+
+impl JsonSchema for AggregateCmp {
+    fn schema_name() -> String {
+        "AggregateCmp".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        let values = [
+            "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "eq", "==", "ne", "!=",
+        ];
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            enum_values: Some(values.iter().map(|s| serde_json::Value::String((*s).to_owned())).collect()),
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Comparison operator for `Aggregate` assertions. Each comparison has a long form (`lt`, `lte`, `gt`, `gte`, `eq`, `ne`) and an equivalent symbolic alias (`<`, `<=`, `>`, `>=`, `==`, `!=`).".to_owned(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
 }
 
 impl AggregateCmp {

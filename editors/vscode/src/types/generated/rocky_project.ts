@@ -34,13 +34,228 @@ export type FailureAction = "abort" | "warn" | "ignore";
 /**
  * Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.
  *
- * The flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload still goes through the [`PipelineConfigSchemaPlaceholder`] until PR-b lands.
+ * The flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants.
  */
 export type PipelinesFieldSchema =
   | PipelineConfig
   | {
       [k: string]: PipelineConfig;
     };
+/**
+ * Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
+ */
+export type PipelineConfig =
+  | (ReplicationPipelineConfig & {
+      type?: "replication";
+      [k: string]: unknown;
+    })
+  | (TransformationPipelineConfig & {
+      type: "transformation";
+      [k: string]: unknown;
+    })
+  | (QualityPipelineConfig & {
+      type: "quality";
+      [k: string]: unknown;
+    })
+  | (SnapshotPipelineConfig & {
+      type: "snapshot";
+      [k: string]: unknown;
+    })
+  | (LoadPipelineConfig & {
+      type: "load";
+      [k: string]: unknown;
+    });
+/**
+ * A single row-level assertion attached to a quality pipeline, scoped to one table in the pipeline's `tables` list.
+ *
+ * ```toml [[pipeline.nightly_dq.checks.assertions]] name     = "orders_customer_id_not_null"  # optional table    = "orders" type     = "not_null" column   = "customer_id" severity = "error" ```
+ *
+ * The `type`-specific fields (and `column`, `severity`) are flattened from `TestDecl` — the same surface used by declarative model tests.
+ */
+export type QualityAssertion = {
+  /**
+   * Column under test. Required for `not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`. Ignored for `expression` and `row_count_range`.
+   */
+  column?: string | null;
+  /**
+   * Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
+   *
+   * Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+   *
+   * Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
+   */
+  filter?: string | null;
+  /**
+   * Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
+   */
+  name?: string | null;
+  /**
+   * Severity of failure. Defaults to `error`.
+   */
+  severity?: TestSeverity & string;
+  /**
+   * Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
+   */
+  table: string;
+  [k: string]: unknown;
+} & QualityAssertion1;
+/**
+ * Severity of a test failure.
+ */
+export type TestSeverity = "error" | "warning";
+export type QualityAssertion1 =
+  | {
+      type: "not_null";
+      [k: string]: unknown;
+    }
+  | {
+      type: "unique";
+      [k: string]: unknown;
+    }
+  | {
+      type: "accepted_values";
+      /**
+       * The allowed values. Compared as string literals.
+       */
+      values: string[];
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Column in the target table to join against.
+       */
+      to_column: string;
+      /**
+       * Fully-qualified target table (`catalog.schema.table`).
+       */
+      to_table: string;
+      type: "relationships";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * A SQL boolean expression. Rows where `NOT (expression)` are failures.
+       */
+      expression: string;
+      type: "expression";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Maximum row count (inclusive). `None` means no upper bound.
+       */
+      max?: number | null;
+      /**
+       * Minimum row count (inclusive). `None` means no lower bound.
+       */
+      min?: number | null;
+      type: "row_count_range";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Maximum value (inclusive). `None` means no upper bound.
+       */
+      max?: string | null;
+      /**
+       * Minimum value (inclusive). `None` means no lower bound.
+       */
+      min?: string | null;
+      type: "in_range";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
+       */
+      pattern: string;
+      type: "regex_match";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Comparison between `op(column)` and `value`. The check passes when the comparison is true.
+       */
+      cmp: AggregateCmp;
+      /**
+       * Aggregate operator.
+       */
+      op: AggregateOp;
+      type: "aggregate";
+      /**
+       * Threshold to compare against. Parsed as `f64`.
+       */
+      value: string;
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Columns that together form the key. Must have at least two entries (single-column uniqueness is covered by `Unique`).
+       */
+      columns: string[];
+      /**
+       * The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
+       */
+      kind: CompositeKind;
+      type: "composite";
+      [k: string]: unknown;
+    }
+  | {
+      type: "not_in_future";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * N — days in the past. Must be > 0.
+       */
+      days: number;
+      type: "older_than_n_days";
+      [k: string]: unknown;
+    };
+/**
+ * Comparison operator for `Aggregate` assertions. Each comparison has a long form (`lt`, `lte`, `gt`, `gte`, `eq`, `ne`) and an equivalent symbolic alias (`<`, `<=`, `>`, `>=`, `==`, `!=`).
+ */
+export type AggregateCmp = "lt" | "<" | "lte" | "<=" | "gt" | ">" | "gte" | ">=" | "eq" | "==" | "ne" | "!=";
+/**
+ * Aggregate operator used by [`TestType::Aggregate`].
+ */
+export type AggregateOp = "sum" | "count" | "avg" | "min" | "max";
+/**
+ * Kind of composite (multi-column) assertion.
+ */
+export type CompositeKind = "unique";
+/**
+ * Per-check-kind toggle that accepts either a plain boolean (legacy form) or a struct with `enabled` + `severity`.
+ *
+ * ```toml # Legacy — still supported row_count = true
+ *
+ * # New — per-check severity [pipeline.x.checks.row_count] enabled  = true severity = "warning" ```
+ */
+export type AggregateCheckToggle =
+  | boolean
+  | {
+      enabled?: boolean;
+      severity?: TestSeverity & string;
+      [k: string]: unknown;
+    };
+/**
+ * How to handle rows that fail error-severity row-level assertions.
+ */
+export type QuarantineMode = "split" | "tag" | "drop";
+/**
+ * Concurrency strategy: the literal `"adaptive"` for AIMD-based throttling, or a positive integer for fixed concurrency.
+ */
+export type ConcurrencyMode = "adaptive" | number;
+/**
+ * Workspace binding access level.
+ */
+export type BindingType = "READ_WRITE" | "READ_ONLY";
+/**
+ * File format for load pipelines, parsed from TOML.
+ *
+ * Mirrors `rocky_adapter_sdk::FileFormat` but lives in rocky-core to avoid a hard dependency from config parsing to the adapter SDK.
+ */
+export type LoadFileFormat = "csv" | "parquet" | "json_lines";
 /**
  * State storage backend variants.
  */
@@ -275,10 +490,560 @@ export interface WebhookConfig {
   url: string;
 }
 /**
- * Pipeline configuration. The full per-variant schema is generated by PR-b of the rocky-project-schema-autogen arc — until then any object shape is accepted by the IDE schema and the deserializer continues to validate at parse time.
+ * Replication pipeline configuration.
+ *
+ * Copies tables from a source to a target using schema pattern discovery, with optional incremental strategy, metadata columns, governance, and data quality checks.
  */
-export interface PipelineConfig {
+export interface ReplicationPipelineConfig {
+  /**
+   * Data quality checks.
+   */
+  checks?: ChecksConfig;
+  /**
+   * Pipeline dependencies for chaining (Phase 4).
+   */
+  depends_on?: string[];
+  /**
+   * Execution settings (concurrency, retries, etc.).
+   */
+  execution?: ExecutionConfig;
+  /**
+   * Metadata columns added during replication.
+   */
+  metadata_columns?: MetadataColumnConfig[];
+  /**
+   * Source configuration.
+   */
+  source: PipelineSourceConfig;
+  /**
+   * Replication strategy: "incremental" or "full_refresh".
+   */
+  strategy?: string;
+  /**
+   * Target configuration.
+   */
+  target: PipelineTargetConfig;
+  /**
+   * Timestamp column for incremental strategy.
+   */
+  timestamp_column?: string;
   [k: string]: unknown;
+}
+/**
+ * Data quality checks configuration (row count, column match, freshness, null rate, custom).
+ */
+export interface ChecksConfig {
+  /**
+   * Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly). Set to 0 to disable.
+   */
+  anomaly_threshold_pct?: number;
+  /**
+   * Row-level assertions (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`) executed against specific tables in the quality pipeline. Each entry targets a single table by name and reuses the `TestDecl` surface from declarative model tests.
+   */
+  assertions?: QualityAssertion[];
+  column_match?: AggregateCheckToggle & boolean;
+  custom?: CustomCheckConfig[];
+  enabled?: boolean;
+  /**
+   * When `true` (default), the quality run exits non-zero if any error-severity check fails. Set `false` to force the pipeline to always succeed and leave failure handling to downstream consumers of the JSON output.
+   */
+  fail_on_error?: boolean;
+  freshness?: FreshnessConfig | null;
+  null_rate?: NullRateConfig | null;
+  /**
+   * Row quarantine — split/tag/drop rows that violate error-severity row-level assertions. Disabled when unset. See [`QuarantineConfig`].
+   */
+  quarantine?: QuarantineConfig | null;
+  row_count?: AggregateCheckToggle & boolean;
+}
+/**
+ * A user-defined SQL check with a name, query template, and pass/fail threshold.
+ */
+export interface CustomCheckConfig {
+  name: string;
+  /**
+   * Severity reported when this check fails.
+   */
+  severity?: TestSeverity & string;
+  sql: string;
+  threshold?: number;
+}
+/**
+ * Freshness check configuration with optional per-schema overrides.
+ */
+export interface FreshnessConfig {
+  /**
+   * Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"), value overrides threshold_seconds for matching schemas.
+   */
+  overrides?: {
+    [k: string]: number;
+  };
+  /**
+   * Severity reported when freshness lag exceeds the threshold.
+   */
+  severity?: TestSeverity & string;
+  threshold_seconds: number;
+}
+/**
+ * Null rate check configuration: columns to check, threshold, and sample size.
+ */
+export interface NullRateConfig {
+  columns: string[];
+  sample_percent?: number;
+  /**
+   * Severity reported when a column's null rate exceeds the threshold.
+   */
+  severity?: TestSeverity & string;
+  threshold: number;
+}
+/**
+ * Row quarantine configuration. When enabled, error-severity row-level assertions (`not_null`, `accepted_values`, `expression`) on a given table are compiled into a single boolean row predicate. Rows matching the predicate go to the `__valid` table; rows that don't go to the `__quarantine` table (or are dropped / tagged, per `mode`).
+ *
+ * Aggregate / set-based assertions (`unique`, `relationships`, `row_count_range`) are **not** lowered — they stay observational and produce `CheckResult` entries as before.
+ *
+ * ```toml [pipeline.nightly_dq.checks.quarantine] enabled = true mode    = "split"          # "split" (default) | "tag" | "drop" # suffix_valid       = "__valid" # suffix_quarantine  = "__quarantine" ```
+ */
+export interface QuarantineConfig {
+  /**
+   * Enable quarantine. Default: `false`.
+   */
+  enabled?: boolean;
+  /**
+   * How to split rows — see [`QuarantineMode`].
+   */
+  mode?: QuarantineMode & string;
+  /**
+   * Table-name suffix for the failing-rows table. Default `"__quarantine"`.
+   */
+  suffix_quarantine?: string;
+  /**
+   * Table-name suffix for the passing-rows table. Default `"__valid"`.
+   */
+  suffix_valid?: string;
+}
+/**
+ * Controls parallelism and error handling for table processing.
+ *
+ * Rocky processes tables within a run concurrently using async tasks. Tune `concurrency` based on your warehouse capacity.
+ */
+export interface ExecutionConfig {
+  /**
+   * Concurrency strategy (default: `"adaptive"`).
+   *
+   * - `"adaptive"` — AIMD throttle that starts at 32 and adjusts based on rate-limit signals. Best for remote warehouses (Databricks, Snowflake). - An integer (e.g. `8`) — fixed concurrency, always this many in-flight tables. Use for local adapters (DuckDB) or when you know the limit. - `1` — serial execution.
+   */
+  concurrency?: ConcurrencyMode & string;
+  /**
+   * Abort remaining tables if error rate exceeds this percentage (0-100). Prevents wasting compute when the warehouse is unhealthy. Default: 50 (abort if more than half of completed tables failed). Set to 0 to disable.
+   */
+  error_rate_abort_pct?: number;
+  /**
+   * If true, abort all remaining tables on first error. If false, process all tables and report errors at the end (partial success).
+   */
+  fail_fast?: boolean;
+  /**
+   * Number of times to retry failed tables after the initial parallel phase. Default: 1. Set to 0 to disable auto-retry.
+   */
+  table_retries?: number;
+}
+/**
+ * A metadata column added during replication (e.g., `_loaded_by`).
+ */
+export interface MetadataColumnConfig {
+  name: string;
+  type: string;
+  value: string;
+}
+/**
+ * Pipeline source configuration.
+ */
+export interface PipelineSourceConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `"default"` — resolved against the adapter map in [`normalize_rocky_config`].
+   */
+  adapter?: string;
+  /**
+   * Source catalog name.
+   */
+  catalog?: string | null;
+  /**
+   * Optional discovery configuration.
+   */
+  discovery?: DiscoveryConfig | null;
+  /**
+   * Schema pattern for parsing source schema names.
+   */
+  schema_pattern: SchemaPatternConfig;
+}
+/**
+ * Discovery configuration within a pipeline source.
+ */
+export interface DiscoveryConfig {
+  /**
+   * Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
+   */
+  adapter?: string;
+}
+/**
+ * Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.
+ */
+export interface SchemaPatternConfig {
+  components: string[];
+  prefix: string;
+  separator: string;
+}
+/**
+ * Pipeline target configuration.
+ */
+export interface PipelineTargetConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `"default"`.
+   */
+  adapter?: string;
+  /**
+   * Template for the target catalog name.
+   */
+  catalog_template: string;
+  /**
+   * Governance settings for the target.
+   */
+  governance?: GovernanceConfig;
+  /**
+   * Template for the target schema name.
+   */
+  schema_template: string;
+  /**
+   * Separator for joining variadic components in target templates.
+   *
+   * When a source pattern uses `"__"` as its separator but the target templates use `"_"` between placeholders, set this to `"_"` so that multi-valued components (e.g., `{hierarchies}`) are joined correctly.
+   *
+   * Defaults to the source pattern separator when not set.
+   */
+  separator?: string | null;
+}
+/**
+ * Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
+ */
+export interface GovernanceConfig {
+  auto_create_catalogs?: boolean;
+  auto_create_schemas?: boolean;
+  /**
+   * Permissions granted on every managed catalog.
+   */
+  grants?: GrantConfig[];
+  /**
+   * Workspace isolation settings.
+   */
+  isolation?: IsolationConfig | null;
+  /**
+   * Permissions granted on every managed schema.
+   */
+  schema_grants?: GrantConfig[];
+  /**
+   * Optional prefix prepended to auto-generated component tag keys (e.g., `"ge_"` turns `client` → `ge_client`). Does not affect keys in `[governance.tags]` — those are used verbatim.
+   */
+  tag_prefix?: string | null;
+  /**
+   * Tags applied to every managed catalog and schema.
+   */
+  tags?: {
+    [k: string]: string;
+  };
+}
+/**
+ * A permission grant to apply to catalogs or schemas.
+ */
+export interface GrantConfig {
+  permissions: string[];
+  principal: string;
+}
+/**
+ * Workspace isolation configuration (Databricks-specific).
+ *
+ * ```toml [governance.isolation] enabled = true
+ *
+ * [[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = "READ_WRITE"
+ *
+ * [[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = "READ_ONLY" ```
+ */
+export interface IsolationConfig {
+  enabled?: boolean;
+  workspace_ids?: WorkspaceBindingConfig[];
+}
+/**
+ * A workspace binding with ID and access level.
+ */
+export interface WorkspaceBindingConfig {
+  binding_type?: BindingType & string;
+  id: number;
+}
+/**
+ * Transformation pipeline configuration.
+ *
+ * Orchestrates `.sql` / `.rocky` model compilation and execution as a first-class pipeline, with its own execution, checks, and governance settings. Model-level strategy (incremental, merge, time_interval, etc.) is defined in each model's sidecar TOML, not at the pipeline level.
+ *
+ * ```toml [pipeline.silver] type = "transformation" models = "models/**"
+ *
+ * [pipeline.silver.target] adapter = "databricks_prod" [pipeline.silver.target.governance] auto_create_schemas = true
+ *
+ * [pipeline.silver.execution] concurrency = 8 ```
+ */
+export interface TransformationPipelineConfig {
+  /**
+   * Data quality checks run after model execution.
+   */
+  checks?: ChecksConfig;
+  /**
+   * Pipeline dependencies for chaining.
+   */
+  depends_on?: string[];
+  /**
+   * Execution settings (concurrency, retries, etc.).
+   */
+  execution?: ExecutionConfig;
+  /**
+   * Glob pattern for model files, relative to the config file directory. Default: `"models/**"`.
+   */
+  models?: string;
+  /**
+   * Target configuration (adapter + governance).
+   */
+  target: TransformationTargetConfig;
+  [k: string]: unknown;
+}
+/**
+ * Target configuration for transformation pipelines.
+ *
+ * Unlike replication targets (which use `catalog_template` / `schema_template` for dynamic routing), transformation targets only need an adapter reference and optional governance — the actual catalog/schema/table is defined per-model in sidecar TOML files.
+ */
+export interface TransformationTargetConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `"default"`.
+   */
+  adapter?: string;
+  /**
+   * Governance settings for the target.
+   */
+  governance?: GovernanceConfig;
+}
+/**
+ * Quality pipeline configuration — standalone data quality checks.
+ *
+ * Runs checks against existing tables without any data movement.
+ *
+ * ```toml [pipeline.nightly_dq] type = "quality"
+ *
+ * [pipeline.nightly_dq.target] adapter = "databricks_prod"
+ *
+ * [[pipeline.nightly_dq.tables]] catalog = "acme_warehouse" schema = "raw__us_west__shopify"
+ *
+ * [pipeline.nightly_dq.checks] enabled = true freshness = { threshold_seconds = 86400 } ```
+ */
+export interface QualityPipelineConfig {
+  /**
+   * Data quality checks to run.
+   */
+  checks: ChecksConfig;
+  /**
+   * Pipeline dependencies for chaining.
+   */
+  depends_on?: string[];
+  /**
+   * Execution settings (concurrency, retries, etc.).
+   */
+  execution?: ExecutionConfig;
+  /**
+   * Tables to check. Each entry specifies catalog + schema, and optionally a specific table (omit for all tables in the schema).
+   */
+  tables?: TableRef[];
+  /**
+   * Target adapter for running check queries.
+   */
+  target: QualityTargetConfig;
+  [k: string]: unknown;
+}
+/**
+ * A reference to a specific catalog/schema/table for quality checks and snapshot pipelines.
+ */
+export interface TableRef {
+  catalog: string;
+  schema: string;
+  /**
+   * Specific table name. When `None`, all tables in the schema are checked.
+   */
+  table?: string | null;
+}
+/**
+ * Target configuration for quality pipelines (adapter reference only).
+ */
+export interface QualityTargetConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`).
+   */
+  adapter?: string;
+}
+/**
+ * Snapshot pipeline configuration — SCD Type 2 slowly-changing dimension capture.
+ *
+ * Tracks historical changes to a source table by maintaining `valid_from` / `valid_to` columns in the target history table.
+ *
+ * ```toml [pipeline.customer_history] type = "snapshot" unique_key = ["customer_id"] updated_at = "updated_at"
+ *
+ * [pipeline.customer_history.source] adapter = "databricks_prod" catalog = "raw_catalog" schema = "raw__us_west__shopify" table = "customers"
+ *
+ * [pipeline.customer_history.target] adapter = "databricks_prod" catalog = "acme_warehouse" schema = "silver__scd" table = "customers_history" ```
+ */
+export interface SnapshotPipelineConfig {
+  /**
+   * Data quality checks run after snapshot.
+   */
+  checks?: ChecksConfig;
+  /**
+   * Pipeline dependencies for chaining.
+   */
+  depends_on?: string[];
+  /**
+   * Execution settings.
+   */
+  execution?: ExecutionConfig;
+  /**
+   * When true, rows deleted from the source get their `valid_to` set to the current timestamp in the target. Default: false.
+   */
+  invalidate_hard_deletes?: boolean;
+  /**
+   * Source table reference (single table, not pattern-based discovery).
+   */
+  source: SnapshotSourceConfig;
+  /**
+   * Target history table.
+   */
+  target: SnapshotTargetConfig;
+  /**
+   * Column(s) that uniquely identify a row in the source table.
+   */
+  unique_key: string[];
+  /**
+   * Column used to detect changes (compared between runs).
+   */
+  updated_at: string;
+  [k: string]: unknown;
+}
+/**
+ * Source table for a snapshot pipeline (explicit single-table reference).
+ */
+export interface SnapshotSourceConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`).
+   */
+  adapter?: string;
+  catalog: string;
+  schema: string;
+  table: string;
+}
+/**
+ * Target table for a snapshot pipeline (explicit single-table reference + governance).
+ */
+export interface SnapshotTargetConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`).
+   */
+  adapter?: string;
+  catalog: string;
+  governance?: GovernanceConfig;
+  schema: string;
+  table: string;
+}
+/**
+ * Load pipeline configuration -- ingest files (CSV, Parquet, JSONL) into a warehouse.
+ *
+ * Loads data from a local directory into a target catalog/schema. The format can be auto-detected from file extensions or set explicitly.
+ *
+ * ```toml [pipeline.load_data] type = "load" source_dir = "data/" format = "csv"
+ *
+ * [pipeline.load_data.target] adapter = "prod" catalog = "warehouse" schema = "raw"
+ *
+ * [pipeline.load_data.options] batch_size = 5000 create_table = true truncate_first = false csv_delimiter = "," csv_has_header = true ```
+ */
+export interface LoadPipelineConfig {
+  /**
+   * Data quality checks run after loading.
+   */
+  checks?: ChecksConfig;
+  /**
+   * Pipeline dependencies for chaining.
+   */
+  depends_on?: string[];
+  /**
+   * Execution settings (concurrency, retries, etc.).
+   */
+  execution?: ExecutionConfig;
+  /**
+   * Explicit file format. When omitted, auto-detected from file extensions.
+   */
+  format?: LoadFileFormat | null;
+  /**
+   * Load options (batch size, create/truncate behavior, CSV settings).
+   */
+  options?: LoadOptionsConfig;
+  /**
+   * Directory or glob pattern for source files, relative to the config file.
+   */
+  source_dir: string;
+  /**
+   * Target table location.
+   */
+  target: LoadTargetConfig;
+  [k: string]: unknown;
+}
+/**
+ * Load-specific options parsed from TOML.
+ */
+export interface LoadOptionsConfig {
+  /**
+   * Number of rows per INSERT batch. Default: 10,000.
+   */
+  batch_size?: number;
+  /**
+   * Create the target table if it does not exist. Default: true.
+   */
+  create_table?: boolean;
+  /**
+   * CSV-specific: field delimiter character. Default: `,`.
+   */
+  csv_delimiter?: string;
+  /**
+   * CSV-specific: whether the first row is a header. Default: true.
+   */
+  csv_has_header?: boolean;
+  /**
+   * Truncate the target table before loading. Default: false.
+   */
+  truncate_first?: boolean;
+}
+/**
+ * Target configuration for load pipelines.
+ */
+export interface LoadTargetConfig {
+  /**
+   * Name of the adapter to use (references a key in `[adapter.*]`).
+   */
+  adapter?: string;
+  /**
+   * Target catalog name.
+   */
+  catalog: string;
+  /**
+   * Governance settings for the target.
+   */
+  governance?: GovernanceConfig;
+  /**
+   * Target schema name.
+   */
+  schema: string;
+  /**
+   * Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).
+   */
+  table?: string | null;
 }
 /**
  * Schema evolution configuration.

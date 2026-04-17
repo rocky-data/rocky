@@ -205,7 +205,7 @@ class TableErrorOutput(BaseModel):
     error: str
 
 
-class TestSeverity1(StrEnum):
+class TestSeverity3(StrEnum):
     """
     Test failure is a hard error — pipeline fails.
     """
@@ -213,7 +213,7 @@ class TestSeverity1(StrEnum):
     error = "error"
 
 
-class TestSeverity2(StrEnum):
+class TestSeverity4(StrEnum):
     """
     Test failure is a warning — pipeline continues.
     """
@@ -228,7 +228,7 @@ class CheckResult1(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
@@ -243,7 +243,7 @@ class CheckResult2(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
@@ -258,7 +258,7 @@ class CheckResult3(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
@@ -273,7 +273,7 @@ class CheckResult4(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
@@ -291,7 +291,7 @@ class CheckResult5(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
@@ -316,7 +316,7 @@ class CheckResult6(BaseModel):
 
     name: str
     passed: bool
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity3 | TestSeverity4 | None = "error"
     """
     Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
     """
