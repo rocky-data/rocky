@@ -30,7 +30,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
     Full language server: completion, hover, go-to-definition, find references, rename, code actions, inlay hints, and lineage visualization.
   </Card>
   <Card title="Quality Checks" icon="warning">
-    Row count, column match, freshness, null rate, anomaly detection, and custom SQL checks — inline with pipeline execution.
+    Pipeline-level row count / freshness / null rate / anomaly detection, plus declarative model-level assertions (`not_null`, `unique`, `in_range`, `regex_match`, `aggregate`, …) with per-check severity, filter, and row quarantine.
   </Card>
   <Card title="Dagster Integration" icon="puzzle">
     First-class integration via dagster-rocky. Auto-discover assets, emit materializations, and translate check results.

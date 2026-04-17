@@ -72,6 +72,8 @@ Partition-keyed materialization with:
 
 ## Data Quality Checks
 
+### Pipeline-level checks
+
 | Check | Description |
 |---|---|
 | **Row count** | Source vs target row count match |
@@ -81,7 +83,30 @@ Partition-keyed materialization with:
 | **Custom SQL** | Threshold-based checks with `{target}` placeholder |
 | **Anomaly detection** | Row count deviation from historical baselines |
 
-All checks run inline during pipeline execution, not as a separate step.
+### Declarative assertions (DQX parity)
+
+Model-level `[[assertions]]` blocks cover the full DQX surface:
+
+| Kind | Description |
+|---|---|
+| `not_null`, `unique` | Null / duplicate detection |
+| `accepted_values` | Value set membership |
+| `relationships` | Referential integrity against another table |
+| `expression` | Custom SQL boolean per row |
+| `row_count_range` | Table-level row-count bounds |
+| `in_range` | Numeric column bounds |
+| `regex_match` | Dialect-specific regex (REGEXP / RLIKE / REGEXP_LIKE / REGEXP_CONTAINS) |
+| `aggregate` | `SUM/COUNT/AVG/MIN/MAX(col) cmp value` |
+| `composite` | Multi-column uniqueness |
+| `not_in_future`, `older_than_n_days` | Time-window sugar |
+
+Every assertion supports `severity` (`error` / `warning`), `fail_on_error` (pipeline-level override), and a per-check `filter` SQL predicate.
+
+### Row quarantine
+
+Row-level assertions can route failing rows with `[quarantine] mode = "split" | "tag" | "drop"`. `split` writes a sibling `<target>__quarantine` table; `tag` adds `__dqx_valid` boolean; `drop` discards.
+
+All checks run inline during pipeline execution, not as a separate step. Full reference: [Data Quality Checks](/features/data-quality-checks/).
 
 ## Rocky DSL
 

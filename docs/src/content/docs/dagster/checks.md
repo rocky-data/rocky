@@ -24,15 +24,20 @@ An optional `translator` can be passed to control asset key mapping, ensuring co
 
 Converts Rocky check results into Dagster `AssetCheckResult` events.
 
-Handles all Rocky check types:
+Handles every Rocky check type, both pipeline-level and model-level:
 
+**Pipeline-level checks:**
 - **row_count** -- validates source and target row counts match
 - **column_match** -- validates columns exist in both source and target
 - **freshness** -- validates data is within a staleness threshold
 - **null_rate** -- validates null rates are below a threshold
-- **custom** -- any user-defined check
+- **anomaly** -- row count deviation from historical baselines
+- **custom** -- any user-defined SQL check
 
-All check metadata is propagated to the Dagster event for full observability.
+**Model-level assertions (DQX parity):**
+`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`) and an optional `filter` predicate; row-level assertions also surface `quarantined = true/false` when `[quarantine]` is configured on the pipeline.
+
+Severity maps to Dagster's `AssetCheckSeverity` (`ERROR` / `WARN`). Warnings never fail the asset check, even when the underlying assertion returned `passed = false`. All check metadata — SQL fingerprint, failing row count, quarantine state, filter used — is propagated to the Dagster event for full observability.
 
 ## Example
 
