@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-04-17
+
+### Added — Regenerated TypeScript bindings for engine 1.5.0 + 1.6.0
+
+Engine-side DQX parity work (Phases 1–4) and the `AdapterConfig` JsonSchema derive landed a large crop of new fields in the typed output surface. The regenerated bindings (via `just codegen`) now include:
+
+- **`RunOutput.quarantine: QuarantineOutput[]`** — row-quarantine outcomes per table.
+- **`CheckResult.severity`** — `"error" | "warning"` on every quality check.
+- **`CheckDetails.Assertion`** — new variant covering all row-level assertion kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`).
+- **`AdapterConfig`, `AdapterKind`, `RetryConfig`** — new `adapter_config.ts` module with the typed adapter-config shape.
+
+No source code changes in the extension itself — pure binding regeneration plus the version bump and the `engines.vscode` bound fix from PR #112 (`^1.105.0` so CI works against the minimum VS Code version the extension supports). LSP client, syntax highlighting, commands, lineage webview, and hover behavior are all unchanged.
+
+### Fixed
+
+- `engines.vscode` bound lowered to `^1.105.0` (PR #112) — was `^1.99.0`, causing CI to reject the package against the vscode test runner's minimum supported version. No effect on end users; `^1.105.0` matches what the extension actually requires.
+
 ## [1.1.1] — 2026-04-16
 
 ### Fixed
