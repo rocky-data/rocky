@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-04-17
+
+Perf-resilience sprint. Five engine changes that close the roadmap's "Top 5" pre-1.0 gaps plus two BigQuery quality-of-life fixes — broken out into this release because together they change Rocky's behaviour under failure, under concurrency, and against wide DAGs.
+
+### Added — within-layer DAG parallelism
+
+`DagExecutor::execute` now runs independent nodes in a single Kahn layer concurrently via `tokio::task::JoinSet` bounded by the existing `max_concurrency` knob. `NodeFuture` gained a `+ Send` bound. On a 50-wide bench (10 ms per node) this is 615 ms → 35 ms — **~17×** wall-clock speedup.
+
+Two `.entered()` tracing spans in `run.rs` (`governance_setup`, `batched_checks`) held across awaits were converted to plain `Span` declarations to satisfy the `Send` bound; events inside those blocks no longer parent to those spans. Minor observability regression, no behaviour change.
+
+### Added — graceful Ctrl-C / SIGTERM handling in `rocky run`
+
+First SIGINT or SIGTERM now triggers in-process cleanup instead of a hard bail:
+
+- Watermarks for completed tables are flushed.
+- Tables that were in-flight or not yet started are written as `TableStatus::Interrupted` in the state store, so `rocky run --resume-latest` retries them without redoing `Success` rows.
+- Partial JSON is emitted with the new `RunOutput.interrupted: bool` flag (always serialised).
+- Process exits with code 130 via `rocky_cli::commands::Interrupted` (downcast in `rocky/src/main.rs`).
+
+A watcher armed on the first signal hard-exits via `process::exit(130)` on a second Ctrl-C, so the user always has an escape hatch if cleanup itself hangs. SIGTERM is handled on Unix via a `#[cfg(unix)]` branch in the same `tokio::select!`; Windows falls back to default termination.
+
+Also adds `PartitionStatus::Interrupted` for symmetry in partition-based pipelines.
+
+### Added — advisory file lock on the state store
+
+`StateStore::open` now takes an exclusive `fs4` advisory lock on `<state>.redb.lock` before opening the redb database. Two concurrent `rocky run` invocations against the same state path previously silently raced on writes; the second call now fails fast with `StateError::LockHeldByOther { path }`.
+
+- New `StateStore::open_read_only` skips the lock for inspection paths (`rocky state`, `history`, `metrics`, `optimize`, `doctor`, the server APIs). Readers never block a live writer — redb's MVCC handles correctness.
+- Writers (`run`, `load`, `run_local`) keep calling `open`.
+
+### Added — `batch_describe_schema` for Snowflake and BigQuery
+
+`BatchCheckAdapter::batch_describe_schema` now has real implementations on `rocky-snowflake` and `rocky-bigquery`, replacing N per-table `DESCRIBE` round-trips with a single `INFORMATION_SCHEMA.COLUMNS` query per schema/dataset. At 100 ms RPC latency on a 100-table schema, this shaves ~10 s off pre-flight.
+
+- Snowflake scopes `{db}.information_schema.columns` with case-insensitive `UPPER(table_schema)` match.
+- BigQuery scopes to `` `{project}`.`{dataset}`.INFORMATION_SCHEMA.COLUMNS `` (per-dataset by design).
+- `batch_row_counts` / `batch_freshness` return "not yet implemented" for both — `run.rs` already falls back to per-table queries on error. Follow-ups.
+- `AdapterRegistry::batch_check_adapter` tries Databricks → Snowflake → BigQuery → `None`. New `snowflake_connectors` / `bigquery_adapters` maps hold the typed clients so the batch path can reach them.
+
+### Fixed — BigQuery async job polling
+
+Any BigQuery query slower than the server's sync window previously returned `jobComplete: false` with an empty rows array and the adapter silently treated it as an empty result. `run_query` now polls `jobs.getQueryResults` when the initial response is async, using a Databricks-style ladder (100/200/500/1000/2000 ms fixed → exponential cap at 5 s), bounded by the adapter's `timeout_secs`.
+
+Each poll asks BigQuery to hold the connection up to 10 s server-side via `timeoutMs`, so fast jobs don't pay a round-trip penalty while slow jobs re-check the client-side deadline promptly. On deadline, returns `BigQueryError::Timeout` instead of stale data.
+
+### Schema cascade
+
+`just codegen` regenerated `schemas/run.schema.json`, `integrations/dagster/.../run_schema.py`, and `editors/vscode/.../run.ts` for the new `RunOutput.interrupted` field. The dagster test fixtures under `tests/fixtures_generated/` were refreshed via `just regen-fixtures`.
+
+### Upgrading
+
+All changes are additive to the JSON output schema except `RunOutput.interrupted` which is always serialised (no skip-if-false). Pydantic and TypeScript consumers pick up the new field automatically after regenerating bindings. No config changes required.
+
 ## [1.7.0] — 2026-04-17
 
 Closes the `rocky-project.schema.json` autogen arc. `editors/vscode/schemas/rocky-project.schema.json` is now fully generated from Rust types by `just codegen` — up from a 696-line hand-maintained file to 2462 lines of complete coverage across every variant, assertion kind, quarantine setting, governance sub-block, and load option. Additive to runtime parsing; one deliberate validation-tightening behavior change (see below).
