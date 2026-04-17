@@ -3122,6 +3122,7 @@ mod tests {
             shadow: false,
             materializations: vec![],
             check_results: vec![],
+            quarantine: vec![],
             anomalies: vec![],
             errors: vec![],
             execution: ExecutionSummary {

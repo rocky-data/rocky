@@ -155,6 +155,47 @@ class PermissionSummary(BaseModel):
     schemas_created: conint(ge=0)
 
 
+class QuarantineOutput(BaseModel):
+    """
+    Row-quarantine outcome for a single table processed by the quality pipeline. Emitted when `[pipeline.x.checks.quarantine]` is enabled and the table has at least one error-severity row-level assertion that lowers to a boolean predicate.
+
+    Row counts are reported when the warehouse adapter supplies them. Adapters that cannot count rows written by a `CREATE OR REPLACE TABLE` leave the counts as `None`.
+    """
+
+    asset_key: list[str]
+    """
+    Dagster-style asset key path (`[catalog, schema, table]`) of the source table the quarantine acted on.
+    """
+    error: str | None = None
+    """
+    Error message from the first failing statement, if any.
+    """
+    mode: str
+    """
+    Quarantine mode that was applied. One of `"split"`, `"tag"`, `"drop"` (matches [`rocky_core::config::QuarantineMode`]).
+    """
+    ok: bool
+    """
+    `true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.
+    """
+    quarantine_table: str
+    """
+    Fully-qualified name of the `__quarantine` output table. Empty for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
+    """
+    quarantined_rows: conint(ge=0) | None = None
+    """
+    Number of rows in the `__quarantine` output, when the adapter can report it.
+    """
+    valid_rows: conint(ge=0) | None = None
+    """
+    Number of rows in the `__valid` output, when the adapter can report it.
+    """
+    valid_table: str
+    """
+    Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
+    """
+
+
 class TableErrorOutput(BaseModel):
     """
     Error from a table that failed during parallel processing.
@@ -334,6 +375,10 @@ class RunOutput(BaseModel):
     pipeline_type: str | None = None
     """
     Pipeline type that was executed (e.g., "replication").
+    """
+    quarantine: list[QuarantineOutput]
+    """
+    Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
     """
     resumed_from: str | None = None
     shadow: bool

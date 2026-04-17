@@ -31,6 +31,17 @@ anomaly_threshold_pct = 30.0
 # Remove (or set `true`) to fail CI on any error-severity violation.
 fail_on_error = false
 
+# --- Phase 3: row quarantine (split mode) ---
+# Splits `orders` into `orders__valid` (passing rows) and
+# `orders__quarantine` (failing rows with `_error_*` label columns).
+# Only error-severity row-level assertions on `orders` drive the split:
+# the `not_null` on customer_id and `accepted_values` on status.
+# The `expression` on `amount >= 0` is warning-severity — it stays
+# observational and does not send order_id=99 to the quarantine table.
+[pipeline.nightly_dq.checks.quarantine]
+enabled = true
+mode    = "split"
+
 # --- Phase 1: row-level assertions (unified surface) ---
 
 # not_null — 2 rows (order_id 7, 42) violate this.

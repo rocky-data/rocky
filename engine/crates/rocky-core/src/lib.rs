@@ -28,6 +28,7 @@ pub mod object_store;
 pub mod optimize;
 pub mod plan_partition;
 pub mod preview;
+pub mod quarantine;
 pub mod redacted;
 pub mod schema;
 pub mod seeds;

@@ -23,9 +23,21 @@ jq '{
       table: (.asset_key | join(".")),
       checks: [ .checks[] | { name, severity, passed } ]
     }
-  ]
+  ],
+  quarantine: (.quarantine // [])
 }' expected/run_quality.json
 
 echo
-echo "POC complete: unified check surface (row_count + assertions) with mixed severity."
+echo "=== Quarantine split (orders) ==="
+echo "orders__valid row count:"
+duckdb poc.duckdb -c "SELECT COUNT(*) AS valid_rows FROM staging__orders.orders__valid;"
+echo "orders__quarantine row count + _error_* label columns:"
+duckdb poc.duckdb -c "SELECT order_id, customer_id, status,
+    _error_orders_customer_id_required,
+    _error_orders_status_allowed
+  FROM staging__orders.orders__quarantine
+  ORDER BY order_id;"
+
+echo
+echo "POC complete: unified check surface + mixed severity + Phase 3 row quarantine (split)."
 echo "Flip fail_on_error=true in rocky.toml to make error-severity failures non-zero."

@@ -3,7 +3,7 @@
 > **Category:** 01-quality
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 15s
-> **Rocky features:** `type = "quality"`, `depends_on`, `tables`, aggregate checks (row_count / column_match / freshness), unified row-level `[[checks.assertions]]` (not_null, unique, accepted_values, expression, row_count_range), per-check `severity`, `fail_on_error`
+> **Rocky features:** `type = "quality"`, `depends_on`, `tables`, aggregate checks (row_count / column_match / freshness), unified row-level `[[checks.assertions]]` (not_null, unique, accepted_values, expression, row_count_range), per-check `severity`, `fail_on_error`, row `[checks.quarantine]` (split / tag / drop)
 
 ## What it shows
 
@@ -27,6 +27,12 @@ Rocky's quality pipeline type — a dedicated pipeline that runs data quality ch
 - **Severity-gated failures** — each check carries `severity = "error" | "warning"`;
   `fail_on_error` (default `true`) lets the run exit non-zero when any
   error-severity check fails
+- **Row quarantine** — `[checks.quarantine]` compiles error-severity row-level
+  assertions into a single boolean predicate per table and splits rows into
+  `<table>__valid` / `<table>__quarantine` CTASes. Each quarantined row carries
+  an `_error_<assertion>` label column identifying which assertion it
+  violated. Warning-severity assertions stay observational and do not drive
+  the split.
 - **dbt comparison:** dbt tests are tightly coupled to models; Rocky quality pipelines are standalone
 
 ## Layout
@@ -89,6 +95,13 @@ fail_on_error = false → pipeline exits 0 even with error-severity failures.
      each with its own `severity`
 4. `fail_on_error = false` suppresses the non-zero exit so the POC stays green.
    Remove it (or set `true`) to wire the quality pipeline into CI as a gate.
+5. **Row quarantine on `orders`:** `[checks.quarantine] mode = "split"` writes
+   `orders__valid` (197 rows) and `orders__quarantine` (3 rows). The
+   quarantine table carries `_error_orders_customer_id_required` /
+   `_error_orders_status_allowed` label columns — only the assertion that
+   each row violated is non-NULL. The warning-severity `amount >= 0`
+   assertion (row 99) is **not** lowered into the predicate and stays in
+   `orders__valid`.
 
 ## Related
 
