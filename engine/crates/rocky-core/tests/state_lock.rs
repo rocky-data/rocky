@@ -32,7 +32,10 @@ fn second_writer_fails_when_lock_held_externally() {
         .open(&lock_path)
         .unwrap();
     let acquired = FileExt::try_lock_exclusive(&external_lock).unwrap();
-    assert!(acquired, "external lock should be acquired in a clean temp dir");
+    assert!(
+        acquired,
+        "external lock should be acquired in a clean temp dir"
+    );
 
     match StateStore::open(&path) {
         Err(StateError::LockHeldByOther { .. }) => {}

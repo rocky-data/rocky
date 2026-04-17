@@ -76,17 +76,21 @@ fn bench_dag(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for (label, concurrency) in [("sequential", Some(1)), ("parallel", None)] {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &concurrency, |b, &cap| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let mut executor = DagExecutor::new(SleepDispatcher);
-                    if let Some(n) = cap {
-                        executor = executor.with_max_concurrency(n);
-                    }
-                    executor.execute(&dag).await.unwrap()
-                })
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &concurrency,
+            |b, &cap| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let mut executor = DagExecutor::new(SleepDispatcher);
+                        if let Some(n) = cap {
+                            executor = executor.with_max_concurrency(n);
+                        }
+                        executor.execute(&dag).await.unwrap()
+                    })
+                });
+            },
+        );
     }
 
     group.finish();
