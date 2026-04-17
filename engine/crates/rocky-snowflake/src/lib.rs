@@ -14,6 +14,7 @@
 
 pub mod adapter;
 pub mod auth;
+pub mod batch;
 pub mod connector;
 pub mod dialect;
 pub mod governance;
