@@ -91,29 +91,26 @@ The hand-written `integrations/dagster/src/dagster_rocky/types.py` and `editors/
 
 ## Releases
 
-Each artifact is released independently using a tag-namespaced scheme. The preferred method is the local release script, which builds artifacts on your machine and creates the GitHub Release via `gh` CLI:
-
-```bash
-# Engine — builds macOS (native) + Linux (Docker), Windows added by CI
-./scripts/release.sh engine 0.2.0
-# or: just release-engine 0.2.0
-
-# Dagster — builds wheel, optionally publishes to PyPI
-./scripts/release.sh dagster 0.4.0 --publish
-# or: just release-dagster 0.4.0 --publish
-
-# VS Code — builds VSIX, optionally publishes to Marketplace
-./scripts/release.sh vscode 0.3.0 --publish
-# or: just release-vscode 0.3.0 --publish
-```
-
-The script creates the git tag, pushes it, and creates the GitHub Release with the local artifacts. For engine releases, the tag push also triggers `engine-release.yml` which builds and attaches the Windows binary.
+Each artifact is released independently using a tag-namespaced scheme. Releases are **CI-driven** — land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag, and the matching release workflow does the rest:
 
 | Artifact | Tag pattern | CI workflow (on tag push) |
 |---|---|---|
-| Rocky CLI binary | `engine-v*` | `engine-release.yml` — Windows build only |
-| dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — PyPI publish via OIDC |
-| Rocky VSIX | `vscode-v*` | `vscode-release.yml` — VS Code Marketplace publish |
+| Rocky CLI binary | `engine-v*` | `engine-release.yml` — full 5-target matrix (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64), all attached to the GitHub Release |
+| dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — build + PyPI publish via OIDC |
+| Rocky VSIX | `vscode-v*` | `vscode-release.yml` — build + VS Code Marketplace publish |
+
+Canonical flow for each artifact:
+
+```bash
+# 1. Bump the version + update the CHANGELOG in a release PR; merge it.
+# 2. Tag the merged commit and push:
+git tag engine-v1.7.0
+git push origin engine-v1.7.0
+```
+
+For convenience, the monorepo exposes `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` — these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
+
+`scripts/release.sh engine|dagster|vscode <version>` remains as a **local-build fallback** for hotfix scenarios where CI is unavailable. It builds what it can locally (macOS natively, Linux via Docker) and attaches those artifacts to the GitHub Release. Prefer the CI-driven flow for normal releases.
 
 ## Pull requests
 

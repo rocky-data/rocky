@@ -123,7 +123,7 @@ Testing 12 models...
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "test",
   "total": 12,
   "passed": 10,
@@ -173,7 +173,7 @@ Rocky CI Pipeline
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ci",
   "compile_ok": true,
   "tests_ok": true,

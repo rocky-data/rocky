@@ -232,7 +232,7 @@ To change a CLI output:
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The schemas/ directory contains 31 schema files (one per top-level command output, including alternate shapes like `model_history` for `rocky history --model` and `column_lineage` for `rocky lineage --column`):
+Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The schemas/ directory contains 37 schema files (one per top-level command output, including alternate shapes like `model_history` for `rocky history --model`, `column_lineage` for `rocky lineage --column`, `dag_run` for `rocky dag --run`, `ci_diff` for `rocky ci --diff`, and the shared `adapter_config.schema.json`):
 
 | Command | Output struct |
 |---|---|
@@ -267,6 +267,13 @@ Every Rocky CLI command that emits `--output json` has a typed Rust output struc
 | `rocky validate --output json` | `ValidateOutput` |
 | `rocky compact --measure-dedup --output json` | `CompactDedupOutput` |
 | `rocky seed --output json` | `SeedOutput` |
+| `rocky dag --output json` | `DagOutput` |
+| `rocky dag --run --output json` | `DagRunOutput` |
+| `rocky ci --diff --output json` | `CiDiffOutput` |
+| `rocky estimate --output json` | `EstimateOutput` |
+| `rocky load --output json` | `LoadOutput` |
+
+Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema` since Phase 1 of the schemars migration in PR #107). It's embedded in other command outputs rather than emitted standalone.
 
 Test fixtures for the dagster integration are captured from the live binary by `../scripts/regen_fixtures.sh` (runs against `examples/playground/pocs/00-foundations/00-playground-default/`).
 

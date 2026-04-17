@@ -91,7 +91,7 @@ rocky ai "monthly revenue by category" -o json
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ai",
   "intent": "monthly revenue by category",
   "format": "rocky",

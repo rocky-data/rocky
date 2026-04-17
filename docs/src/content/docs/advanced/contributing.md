@@ -184,12 +184,17 @@ cd editors/vscode && npm test
 
 ## Releases
 
-Tag-namespaced — each artifact ships independently. Engine releases build all platforms in CI via `engine-release.yml` on tag push. `scripts/release.sh` is a local-build fallback:
+Tag-namespaced — each artifact ships independently. All three are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
+
+| Artifact | Tag | Workflow |
+|---|---|---|
+| Rocky CLI binary | `engine-v*` | `engine-release.yml` — 5-target matrix (macOS ARM64/Intel, Linux x86_64/ARM64, Windows) |
+| dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — PyPI publish via OIDC |
+| Rocky VSIX | `vscode-v*` | `vscode-release.yml` — VS Code Marketplace publish |
 
 ```bash
-./scripts/release.sh engine  0.2.0              # local fallback (macOS + Linux)
-./scripts/release.sh dagster 0.4.0 --publish    # wheel + PyPI
-./scripts/release.sh vscode  0.3.0 --publish    # VSIX + Marketplace
+git tag engine-v1.7.0
+git push origin engine-v1.7.0   # CI builds + publishes
 ```
 
-Or via `just release-engine <version>`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
+The `scripts/release.sh` helper remains as a **local-build fallback** for hotfix scenarios; `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` wrap it.

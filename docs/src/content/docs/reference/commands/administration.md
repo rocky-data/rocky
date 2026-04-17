@@ -34,7 +34,7 @@ rocky history
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "history",
   "runs": [
     {
@@ -67,7 +67,7 @@ rocky history --model fct_revenue --since 2026-03-01
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "history",
   "model": "fct_revenue",
   "executions": [
@@ -145,7 +145,7 @@ rocky metrics fct_revenue
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
   "row_count": 148203,
@@ -166,7 +166,7 @@ rocky metrics fct_revenue --trend
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
   "trend": [
@@ -185,7 +185,7 @@ rocky metrics fct_revenue --column net_revenue --alerts
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
   "column": "net_revenue",
@@ -232,7 +232,7 @@ rocky optimize
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "optimize",
   "recommendations": [
     {
@@ -267,7 +267,7 @@ rocky optimize --model dim_customers
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "optimize",
   "recommendations": [
     {
@@ -320,7 +320,7 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --dry-run
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
@@ -339,7 +339,7 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256M
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": false,
@@ -391,7 +391,7 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "profile-storage",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "total_size_mb": 890,
@@ -477,7 +477,7 @@ rocky archive --older-than 90d --dry-run
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "archive",
   "dry_run": true,
   "older_than": "90d",
@@ -507,7 +507,7 @@ rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.e
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "archive",
   "dry_run": false,
   "older_than": "6m",

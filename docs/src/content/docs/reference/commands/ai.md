@@ -39,7 +39,7 @@ rocky ai "monthly revenue by customer, joining orders and refunds"
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai",
   "model": {
     "name": "fct_monthly_revenue_by_customer",
@@ -112,7 +112,7 @@ rocky ai-sync
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-sync",
   "applied": false,
   "proposals": [
@@ -144,7 +144,7 @@ rocky ai-sync --model fct_revenue --apply
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-sync",
   "applied": true,
   "proposals": [
@@ -206,7 +206,7 @@ rocky ai-explain fct_revenue
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-explain",
   "explanations": [
     {
@@ -230,7 +230,7 @@ rocky ai-explain --all --save
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-explain",
   "explanations": [
     {
@@ -298,7 +298,7 @@ rocky ai-test fct_revenue
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-test",
   "tests": [
     {
@@ -336,7 +336,7 @@ rocky ai-test --all --save
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "ai-test",
   "tests": [
     {

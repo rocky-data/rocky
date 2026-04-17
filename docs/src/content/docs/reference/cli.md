@@ -124,7 +124,7 @@ rocky discover [--pipeline NAME]
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "discover",
   "sources": [
     {
@@ -173,7 +173,7 @@ rocky plan --filter <key=value> [--pipeline NAME]
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "plan",
   "filter": "tenant=acme",
   "statements": [
@@ -236,7 +236,7 @@ Governance (tags, workspace bindings, permissions) is NOT a separate CLI command
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "run",
   "filter": "tenant=acme",
   "duration_ms": 45200,
@@ -280,7 +280,7 @@ rocky doctor
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "doctor",
   "checks": [
     { "name": "config", "status": "ok", "message": "rocky.toml valid" },
@@ -326,7 +326,7 @@ playground                replication      default              default         
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "list_pipelines",
   "pipelines": [
     {
@@ -370,7 +370,7 @@ data_type = "DATE"
 **JSON output:**
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "seed",
   "tables": [
     { "name": "dim_date", "rows_loaded": 365, "columns": 4 }
@@ -401,7 +401,7 @@ rocky compare --filter <key=value> [flags]
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "compare",
   "comparisons": [
     {
@@ -435,7 +435,7 @@ rocky state
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "state",
   "watermarks": [
     {
@@ -513,7 +513,7 @@ table = "customers_history"
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "snapshot",
   "pipeline": "customers_history",
   "source": "main.raw.customers",
@@ -558,7 +558,7 @@ rocky docs --models models/ --output site/api.html  # Custom paths
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "docs",
   "output_path": "docs/catalog.html",
   "models_count": 12,

@@ -9,7 +9,9 @@ Rocky's JSON output is the interface contract between Rocky and orchestrators su
 
 ## Schema Version
 
-The current schema version is `0.3.0`. Every JSON response includes a top-level `version` field. Orchestrators should check this value and handle version mismatches gracefully.
+Every JSON response includes a top-level `version` field that tracks the Rocky engine release. It's set to `env!("CARGO_PKG_VERSION")` at compile time, so `rocky --output json` always reports the version of the binary producing the output. Examples on this page show `"version": "1.6.0"` to match the current engine release; your output will reflect whichever engine version you have installed.
+
+Additive changes (new fields) ship in minor releases and are backward compatible. Field removals or renames are breaking and only happen in a major release. Orchestrators should parse defensively and ignore unknown fields.
 
 ## Asset Key Format
 
@@ -37,7 +39,7 @@ Returns all discovered sources and their tables.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "discover",
   "sources": [
     {
@@ -84,7 +86,7 @@ Returns a complete summary of the pipeline execution.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "run",
   "pipeline_type": "replication",
   "filter": "tenant=acme",
@@ -246,7 +248,7 @@ Returns the SQL statements that would be executed, without running them.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "plan",
   "filter": "tenant=acme",
   "statements": [
@@ -285,7 +287,7 @@ Returns stored watermarks from the embedded state file.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "state",
   "watermarks": [
     {
@@ -348,7 +350,7 @@ Detect schema drift between source and target tables without running the pipelin
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "drift",
   "drift": {
     "tables_checked": 20,
@@ -387,7 +389,7 @@ Compare shadow tables against production targets after a shadow run.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "compare",
   "filter": "tenant=acme",
   "tables_compared": 20,
@@ -441,7 +443,7 @@ Compile models, resolve dependencies, type-check SQL, and build the semantic gra
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "compile",
   "models": 14,
   "execution_layers": 4,
@@ -489,7 +491,7 @@ Show model-level lineage with columns, upstream/downstream models, and column-le
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "lineage",
   "model": "fct_revenue",
   "columns": [
@@ -534,7 +536,7 @@ Trace a single column back through its upstream lineage chain.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "lineage",
   "model": "fct_revenue",
   "column": "net_revenue",
@@ -571,7 +573,7 @@ Run local model tests via DuckDB.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "test",
   "total": 14,
   "passed": 12,
@@ -601,7 +603,7 @@ Combined compile + test output for CI/CD pipelines.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ci",
   "compile_ok": true,
   "tests_ok": true,
@@ -637,7 +639,7 @@ Show recent pipeline run history.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "history",
   "runs": [
     {
@@ -678,7 +680,7 @@ Show execution history for a specific model.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "history",
   "model": "fct_revenue",
   "executions": [
@@ -721,7 +723,7 @@ Quality metrics for a model, including snapshots, alerts, and column trends.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
   "snapshots": [
@@ -784,7 +786,7 @@ Materialization strategy recommendations based on execution history and cost mod
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "optimize",
   "recommendations": [
     {
@@ -819,7 +821,7 @@ Generate `OPTIMIZE` and `VACUUM` SQL for Delta table compaction.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
@@ -849,7 +851,7 @@ Generate or execute `DELETE` and `VACUUM` SQL for archiving old data.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "archive",
   "model": "acme_warehouse.staging__us_west__shopify.events",
   "older_than": "90d",
@@ -887,7 +889,7 @@ Profile storage layout and generate encoding recommendations.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "profile-storage",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "profile_sql": "SELECT column_name, data_type, ... FROM information_schema.columns WHERE ...",
@@ -932,7 +934,7 @@ Import a dbt project and convert to Rocky models.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "import-dbt",
   "import_method": "directory",
   "project_name": "acme_analytics",
@@ -995,7 +997,7 @@ Compare a dbt project against its Rocky import to verify correctness.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "validate-migration",
   "project_name": "acme_analytics",
   "dbt_version": "1.7.0",
@@ -1170,7 +1172,7 @@ Generate a model from a natural language description.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ai",
   "intent": "monthly revenue by customer, joining orders and refunds",
   "format": "rocky",
@@ -1198,7 +1200,7 @@ Detect schema changes and propose intent-guided model updates.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ai-sync",
   "proposals": [
     {
@@ -1228,7 +1230,7 @@ Generate natural language intent descriptions from existing model SQL.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ai-explain",
   "explanations": [
     {
@@ -1261,7 +1263,7 @@ Generate test assertions from model intent and SQL logic.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "1.6.0",
   "command": "ai-test",
   "results": [
     {

@@ -60,7 +60,7 @@ rocky import-dbt --dbt-project ./my-dbt-project --output ./rocky-models -o json
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.6.0",
   "command": "import-dbt",
   "imported": 42,
   "warnings": 3,
