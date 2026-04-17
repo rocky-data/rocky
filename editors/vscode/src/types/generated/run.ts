@@ -81,6 +81,10 @@ export interface RunOutput {
   excluded_tables: ExcludedTableOutput[];
   execution: ExecutionSummary;
   filter: string;
+  /**
+   * `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so orchestrators can distinguish "user interrupted" from "run failed". Tables that hadn't reached `Success` or `Failed` at interrupt time are recorded as `TableStatus::Interrupted` in the state store. Always serialised (even when `false`) so consumers don't have to treat its absence specially.
+   */
+  interrupted: boolean;
   materializations: MaterializationOutput[];
   metrics?: MetricsSnapshot | null;
   /**

@@ -53,5 +53,6 @@
     "tables_checked": 1,
     "tables_drifted": 0,
     "actions_taken": []
-  }
+  },
+  "interrupted": false
 }
