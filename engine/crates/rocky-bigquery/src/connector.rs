@@ -151,11 +151,13 @@ impl BigQueryAdapter {
         // until it reports `job_complete=true` or `timeout_secs` elapses.
         // Without this, the previous behaviour silently returned an empty
         // rows array for any query slower than BigQuery's sync window.
-        let job_ref = response.job_reference.ok_or_else(|| BigQueryError::ApiError {
-            status: "missing jobReference".into(),
-            message: "BigQuery returned job_complete=false with no job_reference; cannot poll"
-                .into(),
-        })?;
+        let job_ref = response
+            .job_reference
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message: "BigQuery returned job_complete=false with no job_reference; cannot poll"
+                    .into(),
+            })?;
         self.poll_query_results(&job_ref).await
     }
 
