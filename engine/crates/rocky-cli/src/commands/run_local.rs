@@ -334,9 +334,47 @@ pub async fn run_quality(
                     }
                 }
 
-                output
-                    .check_results
-                    .push(TableCheckOutput { asset_key, checks });
+                output.check_results.push(TableCheckOutput {
+                    asset_key: asset_key.clone(),
+                    checks,
+                });
+
+                // Row quarantine — split/tag/drop rows that violate
+                // error-severity row-level assertions. Compiles from
+                // config (not from assertion query results) so a failed
+                // assertion query does not suppress quarantine.
+                if let Some(ref q_cfg) = pipeline.checks.quarantine
+                    && q_cfg.enabled
+                {
+                    let ir_ref = rocky_core::ir::TableRef {
+                        catalog: table_ref.catalog.clone(),
+                        schema: table_ref.schema.clone(),
+                        table: table_name.clone(),
+                    };
+                    match rocky_core::quarantine::compile_quarantine_sql(
+                        &pipeline.checks.assertions,
+                        table_name,
+                        &ir_ref,
+                        dialect,
+                        q_cfg,
+                    ) {
+                        Ok(Some(plan)) => {
+                            let q_output = execute_quarantine_plan(
+                                warehouse_adapter.as_ref(),
+                                asset_key,
+                                plan,
+                            )
+                            .await;
+                            output.quarantine.push(q_output);
+                        }
+                        Ok(None) => {} // no quarantinable assertions
+                        Err(e) => warn!(
+                            error = %e,
+                            table = %full_table,
+                            "failed to compile quarantine SQL — skipping"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -353,8 +391,21 @@ pub async fn run_quality(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let total_checks: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
+        let quarantine_summary = if output.quarantine.is_empty() {
+            String::new()
+        } else {
+            let total_q: u64 = output
+                .quarantine
+                .iter()
+                .filter_map(|q| q.quarantined_rows)
+                .sum();
+            format!(
+                ", quarantined {total_q} row(s) across {} table(s)",
+                output.quarantine.len()
+            )
+        };
         println!(
-            "quality pipeline complete: {total_checks} check(s) across {} table(s), {error_failures} error / {warning_failures} warning failed, in {}ms",
+            "quality pipeline complete: {total_checks} check(s) across {} table(s), {error_failures} error / {warning_failures} warning failed{quarantine_summary}, in {}ms",
             output.check_results.len(),
             output.duration_ms
         );
@@ -419,6 +470,80 @@ fn classify_assertion(
             (within_min && within_max, n)
         }
     }
+}
+
+/// Execute a compiled [`rocky_core::quarantine::QuarantinePlan`] against
+/// the warehouse and return a [`QuarantineOutput`] summarizing the result.
+///
+/// Statements execute in plan order — quarantine-first for `split` mode
+/// so a partial failure leaves a stray quarantine table rather than a
+/// stale valid table downstream pipelines might read. Row counts are
+/// captured via `SELECT COUNT(*)` against the written tables; adapters
+/// that cannot count leave the fields as `None`.
+async fn execute_quarantine_plan(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    asset_key: Vec<String>,
+    plan: rocky_core::quarantine::QuarantinePlan,
+) -> QuarantineOutput {
+    let mode_str = match plan.mode {
+        rocky_core::config::QuarantineMode::Split => "split",
+        rocky_core::config::QuarantineMode::Tag => "tag",
+        rocky_core::config::QuarantineMode::Drop => "drop",
+    };
+    let mut out = QuarantineOutput {
+        asset_key,
+        mode: mode_str.to_string(),
+        valid_table: plan.valid_table.clone(),
+        quarantine_table: plan.quarantine_table.clone(),
+        valid_rows: None,
+        quarantined_rows: None,
+        ok: true,
+        error: None,
+    };
+
+    for stmt in &plan.statements {
+        if let Err(e) = warehouse.execute_statement(&stmt.sql).await {
+            out.ok = false;
+            out.error = Some(format!("{}: {}", role_label(stmt.role), e));
+            warn!(
+                role = role_label(stmt.role),
+                target = stmt.target.as_str(),
+                error = %e,
+                "quarantine statement failed"
+            );
+            return out;
+        }
+    }
+
+    if !plan.valid_table.is_empty() {
+        out.valid_rows = count_rows(warehouse, &plan.valid_table).await;
+    }
+    if !plan.quarantine_table.is_empty() {
+        out.quarantined_rows = count_rows(warehouse, &plan.quarantine_table).await;
+    }
+
+    out
+}
+
+fn role_label(role: rocky_core::quarantine::StatementRole) -> &'static str {
+    use rocky_core::quarantine::StatementRole;
+    match role {
+        StatementRole::Quarantine => "quarantine",
+        StatementRole::Valid => "valid",
+        StatementRole::Tag => "tag",
+    }
+}
+
+async fn count_rows(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    full_table: &str,
+) -> Option<u64> {
+    let sql = format!("SELECT COUNT(*) FROM {full_table}");
+    let result = warehouse.execute_query(&sql).await.ok()?;
+    result.rows.first().and_then(|r| r.first()).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
 }
 
 /// Count failed checks bucketed by severity across every table result.

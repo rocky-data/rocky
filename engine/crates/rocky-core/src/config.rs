@@ -500,6 +500,10 @@ pub struct ChecksConfig {
     /// model tests.
     #[serde(default)]
     pub assertions: Vec<QualityAssertion>,
+    /// Row quarantine — split/tag/drop rows that violate error-severity
+    /// row-level assertions. Disabled when unset. See [`QuarantineConfig`].
+    #[serde(default)]
+    pub quarantine: Option<QuarantineConfig>,
     /// Row count anomaly detection threshold (percentage deviation from baseline).
     /// Default: 50.0 (50% deviation triggers anomaly). Set to 0 to disable.
     #[serde(default = "default_anomaly_threshold_pct")]
@@ -600,6 +604,77 @@ pub struct QualityAssertion {
     /// type-specific fields like `values` / `to_table`).
     #[serde(flatten)]
     pub test: crate::tests::TestDecl,
+}
+
+/// How to handle rows that fail error-severity row-level assertions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuarantineMode {
+    /// Write a `<table>__valid` table with passing rows and a
+    /// `<table>__quarantine` table with failing rows (plus per-assertion
+    /// `_error_<name>` label columns). Original table untouched. Default.
+    #[default]
+    Split,
+    /// Replace `<table>` in place with a copy that has per-assertion
+    /// `_error_<name>` label columns set for failing rows. Rewrites the
+    /// source — use with care; not recommended when the source is a raw
+    /// replication target.
+    Tag,
+    /// Write only the `<table>__valid` half. Failing rows are discarded.
+    /// Irreversible at run-time.
+    Drop,
+}
+
+/// Row quarantine configuration. When enabled, error-severity row-level
+/// assertions (`not_null`, `accepted_values`, `expression`) on a given
+/// table are compiled into a single boolean row predicate. Rows matching
+/// the predicate go to the `__valid` table; rows that don't go to the
+/// `__quarantine` table (or are dropped / tagged, per `mode`).
+///
+/// Aggregate / set-based assertions (`unique`, `relationships`,
+/// `row_count_range`) are **not** lowered — they stay observational and
+/// produce `CheckResult` entries as before.
+///
+/// ```toml
+/// [pipeline.nightly_dq.checks.quarantine]
+/// enabled = true
+/// mode    = "split"          # "split" (default) | "tag" | "drop"
+/// # suffix_valid       = "__valid"
+/// # suffix_quarantine  = "__quarantine"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineConfig {
+    /// Enable quarantine. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How to split rows — see [`QuarantineMode`].
+    #[serde(default)]
+    pub mode: QuarantineMode,
+    /// Table-name suffix for the passing-rows table. Default `"__valid"`.
+    #[serde(default = "default_suffix_valid")]
+    pub suffix_valid: String,
+    /// Table-name suffix for the failing-rows table. Default `"__quarantine"`.
+    #[serde(default = "default_suffix_quarantine")]
+    pub suffix_quarantine: String,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: QuarantineMode::default(),
+            suffix_valid: default_suffix_valid(),
+            suffix_quarantine: default_suffix_quarantine(),
+        }
+    }
+}
+
+fn default_suffix_valid() -> String {
+    "__valid".to_string()
+}
+
+fn default_suffix_quarantine() -> String {
+    "__quarantine".to_string()
 }
 
 /// Freshness check configuration with optional per-schema overrides.

@@ -92,6 +92,10 @@ export interface RunOutput {
    * Pipeline type that was executed (e.g., "replication").
    */
   pipeline_type?: string | null;
+  /**
+   * Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
+   */
+  quarantine: QuarantineOutput[];
   resumed_from?: string | null;
   /**
    * True when running in shadow mode (targets rewritten).
@@ -266,5 +270,45 @@ export interface PermissionSummary {
   grants_added: number;
   grants_revoked: number;
   schemas_created: number;
+  [k: string]: unknown;
+}
+/**
+ * Row-quarantine outcome for a single table processed by the quality pipeline. Emitted when `[pipeline.x.checks.quarantine]` is enabled and the table has at least one error-severity row-level assertion that lowers to a boolean predicate.
+ *
+ * Row counts are reported when the warehouse adapter supplies them. Adapters that cannot count rows written by a `CREATE OR REPLACE TABLE` leave the counts as `None`.
+ */
+export interface QuarantineOutput {
+  /**
+   * Dagster-style asset key path (`[catalog, schema, table]`) of the source table the quarantine acted on.
+   */
+  asset_key: string[];
+  /**
+   * Error message from the first failing statement, if any.
+   */
+  error?: string | null;
+  /**
+   * Quarantine mode that was applied. One of `"split"`, `"tag"`, `"drop"` (matches [`rocky_core::config::QuarantineMode`]).
+   */
+  mode: string;
+  /**
+   * `true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.
+   */
+  ok: boolean;
+  /**
+   * Fully-qualified name of the `__quarantine` output table. Empty for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
+   */
+  quarantine_table: string;
+  /**
+   * Number of rows in the `__quarantine` output, when the adapter can report it.
+   */
+  quarantined_rows?: number | null;
+  /**
+   * Number of rows in the `__valid` output, when the adapter can report it.
+   */
+  valid_rows?: number | null;
+  /**
+   * Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
+   */
+  valid_table: string;
   [k: string]: unknown;
 }

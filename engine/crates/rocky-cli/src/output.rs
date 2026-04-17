@@ -121,6 +121,11 @@ pub struct RunOutput {
     pub shadow: bool,
     pub materializations: Vec<MaterializationOutput>,
     pub check_results: Vec<TableCheckOutput>,
+    /// Row-quarantine outcomes — one entry per table the quality
+    /// pipeline quarantined. Empty for runs that did not use
+    /// `[pipeline.x.checks.quarantine]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quarantine: Vec<QuarantineOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -280,6 +285,48 @@ pub struct PartitionSummary {
 pub struct TableCheckOutput {
     pub asset_key: Vec<String>,
     pub checks: Vec<CheckResult>,
+}
+
+/// Row-quarantine outcome for a single table processed by the quality
+/// pipeline. Emitted when `[pipeline.x.checks.quarantine]` is enabled
+/// and the table has at least one error-severity row-level assertion
+/// that lowers to a boolean predicate.
+///
+/// Row counts are reported when the warehouse adapter supplies them.
+/// Adapters that cannot count rows written by a `CREATE OR REPLACE
+/// TABLE` leave the counts as `None`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct QuarantineOutput {
+    /// Dagster-style asset key path
+    /// (`[catalog, schema, table]`) of the source table the quarantine
+    /// acted on.
+    pub asset_key: Vec<String>,
+    /// Quarantine mode that was applied. One of `"split"`, `"tag"`,
+    /// `"drop"` (matches [`rocky_core::config::QuarantineMode`]).
+    pub mode: String,
+    /// Fully-qualified `catalog.schema.table` name of the `__valid`
+    /// output table. Empty for `mode = "tag"` (source is rewritten in
+    /// place).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub valid_table: String,
+    /// Fully-qualified name of the `__quarantine` output table. Empty
+    /// for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quarantine_table: String,
+    /// Number of rows in the `__valid` output, when the adapter can
+    /// report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_rows: Option<u64>,
+    /// Number of rows in the `__quarantine` output, when the adapter
+    /// can report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_rows: Option<u64>,
+    /// `true` when every quarantine statement executed successfully.
+    /// `false` means a partial failure — inspect `error` for details.
+    pub ok: bool,
+    /// Error message from the first failing statement, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1635,6 +1682,7 @@ impl RunOutput {
             shadow: false,
             materializations: vec![],
             check_results: vec![],
+            quarantine: vec![],
             anomalies: vec![],
             errors: vec![],
             execution: ExecutionSummary {
