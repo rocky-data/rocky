@@ -1180,7 +1180,7 @@ pub async fn run(
                 // Checkpoint: record successful table progress
                 {
                     let state = shared_state.lock().await;
-                    let _ = state.record_table_progress(
+                    if let Err(e) = state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
                             index: total_completed - 1,
@@ -1194,7 +1194,9 @@ pub async fn run(
                                 .map_or(0, |m| m.duration_ms),
                             completed_at: Utc::now(),
                         },
-                    );
+                    ) {
+                        tracing::warn!(error = %e, "failed to record table progress for run ");
+                    }
                 }
             }
             Ok((idx, Err(e))) => {
@@ -1230,7 +1232,7 @@ pub async fn run(
                         })
                         .unwrap_or_default();
                     let state = shared_state.lock().await;
-                    let _ = state.record_table_progress(
+                    if let Err(e) = state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
                             index: idx,
@@ -1241,7 +1243,9 @@ pub async fn run(
                             duration_ms: 0,
                             completed_at: Utc::now(),
                         },
-                    );
+                    ) {
+                        tracing::warn!(error = %e, "failed to record table progress for run ");
+                    }
                 }
 
                 table_errors.push(TableError {
@@ -1261,7 +1265,7 @@ pub async fn run(
                 // Checkpoint: record panicked task progress
                 {
                     let state = shared_state.lock().await;
-                    let _ = state.record_table_progress(
+                    if let Err(e) = state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
                             index: 0,
@@ -1272,7 +1276,9 @@ pub async fn run(
                             duration_ms: 0,
                             completed_at: Utc::now(),
                         },
-                    );
+                    ) {
+                        tracing::warn!(error = %e, "failed to record table progress for run ");
+                    }
                 }
 
                 table_errors.push(TableError {
@@ -1312,13 +1318,15 @@ pub async fn run(
         {
             let state = shared_state.lock().await;
             for wm in &deferred_watermarks {
-                let _ = state.set_watermark(
+                if let Err(e) = state.set_watermark(
                     &wm.state_key,
                     &WatermarkState {
                         last_value: wm.timestamp,
                         updated_at: wm.timestamp,
                     },
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to persist watermark for run ");
+                }
             }
         }
 
@@ -1356,7 +1364,7 @@ pub async fn run(
                 if !settled.contains(&key) {
                     let mut asset_key = task.asset_key_prefix.clone();
                     asset_key.push(task.table_name.clone());
-                    let _ = state.record_table_progress(
+                    if let Err(e) = state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
                             index: idx,
@@ -1367,7 +1375,9 @@ pub async fn run(
                             duration_ms: 0,
                             completed_at: Utc::now(),
                         },
-                    );
+                    ) {
+                        tracing::warn!(error = %e, "failed to record table progress for run ");
+                    }
                 }
             }
         }
@@ -1459,13 +1469,15 @@ pub async fn run(
     {
         let state = shared_state.lock().await;
         for wm in &deferred_watermarks {
-            let _ = state.set_watermark(
+            if let Err(e) = state.set_watermark(
                 &wm.state_key,
                 &WatermarkState {
                     last_value: wm.timestamp,
                     updated_at: wm.timestamp,
                 },
-            );
+            ) {
+                tracing::warn!(error = %e, "failed to persist watermark for run ");
+            }
         }
     }
 
@@ -2904,7 +2916,7 @@ async fn process_completed_result(
             // Checkpoint: record successful table progress
             {
                 let state = shared_state.lock().await;
-                let _ = state.record_table_progress(
+                if let Err(e) = state.record_table_progress(
                     shared_run_id,
                     &rocky_core::state::TableProgress {
                         index: *total_completed - 1,
@@ -2915,7 +2927,9 @@ async fn process_completed_result(
                         duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
                         completed_at: Utc::now(),
                     },
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to record table progress for run ");
+                }
             }
         }
         Ok((idx, Err(e))) => {
@@ -2947,7 +2961,7 @@ async fn process_completed_result(
                     .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
                     .unwrap_or_default();
                 let state = shared_state.lock().await;
-                let _ = state.record_table_progress(
+                if let Err(e) = state.record_table_progress(
                     shared_run_id,
                     &rocky_core::state::TableProgress {
                         index: idx,
@@ -2958,7 +2972,9 @@ async fn process_completed_result(
                         duration_ms: 0,
                         completed_at: Utc::now(),
                     },
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to record table progress for run ");
+                }
             }
 
             table_errors.push(TableError {
@@ -2974,7 +2990,7 @@ async fn process_completed_result(
             // Checkpoint: record panicked task progress
             {
                 let state = shared_state.lock().await;
-                let _ = state.record_table_progress(
+                if let Err(e) = state.record_table_progress(
                     shared_run_id,
                     &rocky_core::state::TableProgress {
                         index: 0,
@@ -2985,7 +3001,9 @@ async fn process_completed_result(
                         duration_ms: 0,
                         completed_at: Utc::now(),
                     },
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to record table progress for run ");
+                }
             }
 
             table_errors.push(TableError {

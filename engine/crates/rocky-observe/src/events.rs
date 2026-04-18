@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, trace};
 
 // ---------------------------------------------------------------------------
 // PipelineEvent
@@ -118,11 +118,15 @@ impl EventBus {
 
     /// Emit an event to all subscribers.
     ///
-    /// If no subscribers exist, the event is silently dropped.
+    /// If no subscribers exist, the event is dropped — `tokio::sync::broadcast::Sender::send`
+    /// only errors when there are zero active receivers, which is expected
+    /// for an event bus with no current listeners. The `debug!` above gives
+    /// operators visibility when that happens.
     pub fn emit(&self, event: PipelineEvent) {
         debug!(event_type = %event.event_type, target = ?event.target, "event emitted");
-        // Ignore send error (no receivers) — fire-and-forget observability
-        let _ = self.sender.send(event);
+        if self.sender.send(event).is_err() {
+            trace!("no subscribers; event dropped");
+        }
     }
 
     /// Subscribe to events. Returns a receiver that yields events.
