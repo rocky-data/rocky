@@ -8,12 +8,19 @@
 //! so credential resolution follows the standard AWS SDK / GCP ADC chains.
 
 use std::path::Path;
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::config::{StateBackend, StateConfig};
 use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
+
+/// Hard upper bound on any single remote state transfer. Belt-and-suspenders
+/// complement to the per-request timeout configured on the cloud client in
+/// [`crate::object_store`]: the client timeout handles stuck TCP; this outer
+/// bound catches unforeseen await paths (SDK retry loops, DNS, TLS).
+const STATE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
 pub enum StateSyncError {
@@ -40,6 +47,9 @@ pub enum StateSyncError {
 
     #[error("object store error: {0}")]
     ObjectStore(#[from] ObjectStoreError),
+
+    #[error("state transfer timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// State file name within the configured prefix.
@@ -178,24 +188,27 @@ async fn download_from_object_store(
         "downloading state from object store"
     );
 
-    match provider.exists(STATE_FILE).await {
-        Ok(true) => {
-            provider.download_file(STATE_FILE, local_path).await?;
-            info!(
-                size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
-                "state restored from object store"
-            );
-            Ok(())
+    with_transfer_timeout(async {
+        match provider.exists(STATE_FILE).await {
+            Ok(true) => {
+                provider.download_file(STATE_FILE, local_path).await?;
+                info!(
+                    size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                    "state restored from object store"
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                info!("No existing state in object store — starting fresh");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
+                Ok(())
+            }
         }
-        Ok(false) => {
-            info!("No existing state in object store — starting fresh");
-            Ok(())
-        }
-        Err(e) => {
-            warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
-            Ok(())
-        }
-    }
+    })
+    .await
 }
 
 /// Upload `STATE_FILE` to an object store rooted at `<scheme>://<bucket>/<prefix>`.
@@ -210,8 +223,25 @@ async fn upload_to_object_store(
         uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
         "uploading state to object store"
     );
-    provider.upload_file(local_path, STATE_FILE).await?;
+    with_transfer_timeout(async {
+        provider.upload_file(local_path, STATE_FILE).await?;
+        Ok::<(), StateSyncError>(())
+    })
+    .await?;
     Ok(())
+}
+
+/// Wrap a state-transfer future with [`STATE_TRANSFER_TIMEOUT`]. On elapse
+/// the returned error is `StateSyncError::Timeout` — distinct from the
+/// per-request timeout the client raises, so callers can tell the two apart.
+async fn with_transfer_timeout<F, T>(fut: F) -> Result<T, StateSyncError>
+where
+    F: std::future::Future<Output = Result<T, StateSyncError>>,
+{
+    match tokio::time::timeout(STATE_TRANSFER_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(StateSyncError::Timeout(STATE_TRANSFER_TIMEOUT)),
+    }
 }
 
 /// Download state from Valkey/Redis.
