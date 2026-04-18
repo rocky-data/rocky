@@ -17,12 +17,29 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{ClientOptions, ObjectStore, path::Path as ObjectPath};
 use thiserror::Error;
 use tracing::debug;
+
+/// Per-request HTTP timeout for the underlying cloud client. Without this the
+/// default is unbounded, so a stuck TCP connection can hang forever (see Gold
+/// run f107d533, 2026-04-18, where S3 state upload hung for ~7h before the
+/// run was externally canceled).
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connect-phase timeout. Shorter than the request timeout so unreachable
+/// endpoints fail fast rather than chewing through the retry budget.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn default_client_options() -> ClientOptions {
+    ClientOptions::new()
+        .with_timeout(CLIENT_REQUEST_TIMEOUT)
+        .with_connect_timeout(CLIENT_CONNECT_TIMEOUT)
+}
 
 /// Errors returned by [`ObjectStoreProvider`] operations.
 #[derive(Debug, Error)]
@@ -96,18 +113,21 @@ impl ObjectStoreProvider {
 
         let store: Arc<dyn ObjectStore> = match scheme.as_str() {
             "s3" | "s3a" => {
-                let builder =
-                    object_store::aws::AmazonS3Builder::from_env().with_bucket_name(&bucket);
+                let builder = object_store::aws::AmazonS3Builder::from_env()
+                    .with_bucket_name(&bucket)
+                    .with_client_options(default_client_options());
                 Arc::new(builder.build()?)
             }
             "gs" | "gcs" => {
                 let builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(&bucket);
+                    .with_bucket_name(&bucket)
+                    .with_client_options(default_client_options());
                 Arc::new(builder.build()?)
             }
             "az" | "abfs" | "abfss" => {
                 let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
-                    .with_container_name(&bucket);
+                    .with_container_name(&bucket)
+                    .with_client_options(default_client_options());
                 Arc::new(builder.build()?)
             }
             "file" => {
