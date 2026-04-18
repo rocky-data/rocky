@@ -17,11 +17,18 @@ export function showDoctorResult(result: DoctorResult): void {
 
   panel.webview.html = renderDoctorHtml(panel.webview, result);
 
-  panel.webview.onDidReceiveMessage((msg: { command: string }) => {
-    if (msg.command === "rerun") {
+  const allowedCommands = new Set(["rerun", "openSettings"] as const);
+  panel.webview.onDidReceiveMessage((raw: unknown) => {
+    // Treat all webview messages as untrusted — the webview's script is
+    // ours today, but a future CSP gap or injected iframe could forge one.
+    if (typeof raw !== "object" || raw === null) return;
+    const cmd = (raw as { command?: unknown }).command;
+    if (typeof cmd !== "string" || !allowedCommands.has(cmd as never)) return;
+
+    if (cmd === "rerun") {
       panel.dispose();
       void vscode.commands.executeCommand("rocky.doctor");
-    } else if (msg.command === "openSettings") {
+    } else if (cmd === "openSettings") {
       void vscode.commands.executeCommand(
         "workbench.action.openSettings",
         "rocky",
