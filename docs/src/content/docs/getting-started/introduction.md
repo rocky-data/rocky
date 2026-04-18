@@ -1,119 +1,78 @@
 ---
 title: Introduction
-description: What is Rocky and how it compares to dbt
+description: What Rocky is and how it compares to dbt
 sidebar:
   order: 1
 ---
 
-Rocky is a **compiled SQL transformation engine** written in Rust. It replaces dbt's core responsibilities — DAG resolution, incremental logic, SQL generation, and schema management — with a type-safe, config-driven approach.
+Rocky is a **compiled SQL transformation engine** written in Rust. It replaces dbt's core responsibilities — DAG resolution, incremental logic, SQL generation, schema management — with a type-safe, config-driven approach.
 
 No Jinja. No manifest. No parse step.
 
-Rocky follows the **ELT pattern** — it operates on data already in your warehouse, landed by ingestion tools like Fivetran or Airbyte. Rocky handles the **T** (transformation and replication within the warehouse), not the **E** or **L**.
+Rocky follows the **ELT pattern**: it operates on data already in the warehouse, landed by ingestion tools like Fivetran or Airbyte. Rocky owns the **T** (warehouse-side transformation and replication), not the E or L.
 
-## Why Rocky?
+## Why Rocky
 
-Traditional tools like dbt work well at small scale, but introduce significant overhead as pipelines grow:
+- **Fast.** Single binary, starts in under 100ms. Compiles 500 models in seconds, not minutes.
+- **Type-safe.** Column-level type inference catches schema errors at compile time.
+- **Pure SQL.** No Jinja templating; business logic stays in SQL.
+- **Config-first bronze.** Source replication is driven by `rocky.toml` — zero SQL files for 1:1 copies.
+- **Embedded state.** Watermarks live in a local `redb` database, with optional S3 / Valkey sync.
 
-- **Slow startup**: dbt takes 30-60 seconds just to start, then 2-3 minutes to parse 500 models
-- **Memory-hungry**: A mid-size dbt project consumes 500MB-2GB of RAM
-- **Jinja complexity**: Business logic buried in template macros is hard to test and debug
-- **Repetitive staging**: Writing `SELECT * FROM {{ source(...) }}` for every source table
+## Design principles
 
-Rocky eliminates these problems by compiling to a single binary that starts in under 100ms, parses instantly, and uses pure SQL instead of Jinja templates.
+1. **Adapter-based.** Source adapters (Fivetran, DuckDB, manual) handle discovery. Warehouse adapters (Databricks, Snowflake, BigQuery, DuckDB) handle execution. The core engine is warehouse-agnostic.
+2. **Config over code.** Bronze layer replication needs no SQL — just TOML.
+3. **Pure SQL models.** Silver-layer transformations use standard SQL plus a `.toml` sidecar.
+4. **Inline quality checks.** Data checks run during replication, not as a separate step.
+5. **Structured output.** Every command emits versioned JSON for orchestrator consumption.
 
-## Key Design Principles
+## How Rocky compares to dbt
 
-1. **Adapter-based architecture**: Source adapters (Fivetran, DuckDB, manual) handle discovery; warehouse adapters (Databricks, Snowflake, DuckDB) handle execution. The core engine is warehouse-agnostic.
-2. **Config over code**: The bronze layer (source replication) is driven entirely by `rocky.toml` — no SQL files needed for 1:1 copies
-3. **Pure SQL**: Transformation models use standard SQL with TOML configuration — no templating language
-4. **Inline quality checks**: Data checks run during replication, not as a separate step
-5. **Structured output**: All CLI output is versioned JSON, designed for orchestrator integration
-6. **Embedded state**: Watermarks stored in a local `redb` database, with optional remote sync to S3 or Valkey
-
-## How Rocky Compares to dbt
-
-| Concept | dbt | Rocky |
-|---------|-----|-------|
-| Project config | `dbt_project.yml` + `profiles.yml` | `rocky.toml` |
-| Connection config | `profiles.yml` | `[adapter.NAME]` blocks in `rocky.toml` |
-| Sources | `schema.yml` with `source()` macro | Auto-discovered (Fivetran, DuckDB, manual) |
-| Staging models | One `.sql` file per source table | Config-driven bronze layer (zero SQL) |
-| Transformation models | SQL + Jinja `{{ ref() }}` | SQL + TOML config |
-| Materialization config | `{{ config(materialized='...') }}` | `[strategy]` in TOML |
+| | dbt | Rocky |
+|---|---|---|
+| Templating | Jinja | None — pure SQL |
+| Staging models | One `.sql` per source table | Config-driven bronze (zero SQL) |
 | Dependencies | `{{ ref('model') }}` | `depends_on = ["model"]` |
-| Macros | Jinja macros | Not needed — pure SQL |
-| Seeds | CSV files loaded as tables | Not supported (out of scope) |
-| Snapshots | SCD Type 2 via snapshots | `merge` strategy with unique key |
-| Tests | `schema.yml` tests | Inline checks in `rocky.toml` |
-| Compile | `dbt compile` | `rocky plan` |
-| Run | `dbt run` | `rocky run` |
-| Test separately | `dbt test` | Built into `rocky run` |
+| Tests | `schema.yml` + `dbt test` | Inline checks + assertions built into `rocky run` |
 | State | `manifest.json` + `target/` | Embedded `redb` database |
 
-## Supported Adapters
+Full side-by-side comparison: [features/comparison](/features/comparison/).
 
-Rocky's adapter model separates *where data is discovered* from *where data is processed*:
+## Supported adapters
 
-| Role | Adapter | Description |
-|------|---------|-------------|
-| Source | Fivetran | Calls Fivetran REST API to discover connectors and enabled tables |
-| Source | DuckDB | Lists schemas and tables from a local DuckDB database via `information_schema` |
-| Source | Manual | Reads schema/table definitions from `rocky.toml` config |
-| Warehouse | Databricks | Executes SQL via SQL Statement API, manages Unity Catalog governance |
-| Warehouse | Snowflake | Executes SQL via Snowflake REST API; OAuth, key-pair JWT, and password auth |
-| Warehouse | BigQuery | Executes SQL via BigQuery API; service account and application default auth (Beta) |
-| Warehouse | DuckDB | Local in-process execution — runs `rocky validate/discover/plan/run` end-to-end with no credentials |
-
-Source adapters are metadata-only — they identify what schemas and tables exist, they do not extract or move data. The actual data must already be in the warehouse, landed by an ingestion tool.
-
-A single DuckDB adapter instance can act as both source and warehouse, which is how the playground and credential-free examples run end-to-end.
-
-Rocky is designed for extensibility — new source and warehouse adapters can be added through the [Adapter SDK](/concepts/adapters/) without modifying the core engine.
-
-## Monorepo
-
-Rocky lives in a single monorepo with four subprojects:
-
-| Path | Language | What it is |
+| Role | Adapter | Notes |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine (20-crate Cargo workspace) |
-| `integrations/dagster/` | Python | Dagster integration (`dagster-rocky` package) |
-| `editors/vscode/` | TypeScript | VS Code extension (LSP client + syntax highlighting) |
-| `examples/playground/` | Config only | Self-contained POC catalog (28 POCs) + benchmark suite |
+| Source | Fivetran | REST API discovery; metadata only |
+| Source | DuckDB | `information_schema` discovery |
+| Source | Manual | Tables declared in `rocky.toml` |
+| Warehouse | Databricks | SQL Statement API, Unity Catalog, adaptive concurrency |
+| Warehouse | Snowflake | REST API; OAuth / JWT / password (Beta) |
+| Warehouse | BigQuery | REST API; service account / ADC (Beta) |
+| Warehouse | DuckDB | In-process; powers the playground and `rocky test` |
 
-## Architecture
+Source adapters are metadata-only — they identify what exists. Actual data must already be in the warehouse. A single DuckDB instance can serve as both source and warehouse, which is how the credential-free playground works end-to-end.
 
-Rocky's engine is a Cargo workspace with 20 crates:
+New adapters plug in via the [Adapter SDK](/concepts/adapters/) without modifying the core engine.
 
-- **rocky-core** — Warehouse-agnostic transformation engine: IR, schema patterns, SQL generation, checks, state, hooks
-- **rocky-sql** — SQL parsing and validation (built on `sqlparser-rs`)
-- **rocky-lang** — Rocky DSL lexer and parser (`.rocky` files)
-- **rocky-compiler** — Type checking, semantic analysis, contract validation, diagnostics
-- **rocky-adapter-sdk** — Traits and conformance tests for building custom warehouse adapters
-- **rocky-databricks** — Databricks warehouse adapter: SQL Statement API, Unity Catalog governance, adaptive concurrency (AIMD)
-- **rocky-snowflake** — Snowflake warehouse adapter: REST API, OAuth + key-pair JWT + password auth
-- **rocky-duckdb** — DuckDB warehouse + discovery adapter, also used by `rocky test` and the bundled E2E suite
-- **rocky-fivetran** — Fivetran source adapter: REST API discovery (metadata only), schema config, sync detection
-- **rocky-engine** — Local query engine (DataFusion + Arrow) used for type inference and `rocky test`
-- **rocky-server** — HTTP API and LSP server (`rocky serve` / `rocky lsp`)
-- **rocky-cache** — Three-tier caching (memory, Valkey, API)
-- **rocky-ai** — AI intent layer (`explain`, `sync`, `test`, `generate`)
-- **rocky-observe** — Metrics, event bus, and structured JSON logging
-- **rocky-bigquery** — BigQuery warehouse adapter (connector, auth, dialect) (Beta)
-- **rocky-airbyte** — Airbyte source adapter (protocol integration)
-- **rocky-iceberg** — Apache Iceberg table format adapter (metadata + snapshot management)
-- **rocky-cli** — CLI commands, output formatting, Dagster Pipes protocol
-- **rocky-wasm** — WebAssembly exports for browser/edge execution
-- **rocky** — The binary crate
+## Monorepo layout
 
-## Community & Support
+| Path | Artifact | Language |
+|---|---|---|
+| `engine/` | `rocky` CLI | Rust (20-crate workspace) |
+| `integrations/dagster/` | `dagster-rocky` wheel | Python |
+| `editors/vscode/` | Rocky VSIX | TypeScript |
+| `examples/playground/` | POC catalog (47 POCs) | TOML / SQL |
 
-- **GitHub Discussions** — Questions, ideas, and show-and-tell: [rocky-data/rocky/discussions](https://github.com/rocky-data/rocky/discussions)
-- **Issues** — Bug reports and feature requests: [rocky-data/rocky/issues](https://github.com/rocky-data/rocky/issues)
-- **Email** — General inquiries: [hello@rocky-data.dev](mailto:hello@rocky-data.dev)
-- **Security** — Vulnerability reports: [security@rocky-data.dev](mailto:security@rocky-data.dev) (see [SECURITY.md](https://github.com/rocky-data/rocky/blob/main/SECURITY.md))
+Crate-level breakdown: [Architecture](/concepts/architecture/).
+
+## Community
+
+- **Discussions** — [github.com/rocky-data/rocky/discussions](https://github.com/rocky-data/rocky/discussions)
+- **Issues** — [github.com/rocky-data/rocky/issues](https://github.com/rocky-data/rocky/issues)
+- **Email** — [hello@rocky-data.dev](mailto:hello@rocky-data.dev)
+- **Security** — [security@rocky-data.dev](mailto:security@rocky-data.dev) ([SECURITY.md](https://github.com/rocky-data/rocky/blob/main/SECURITY.md))
 
 ## License
 
-Rocky is licensed under [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).

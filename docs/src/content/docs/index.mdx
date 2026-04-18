@@ -3,7 +3,7 @@ title: Rocky
 description: A SQL transformation engine built in Rust. Type-safe compilation, column-level lineage, AI-powered intent.
 template: splash
 hero:
-  tagline: A compiled SQL transformation engine built in Rust. Type-safe compilation, column-level lineage, AI-powered intent, and a language server — for data pipelines that don't break.
+  tagline: A compiled SQL transformation engine in Rust. Type-safe compilation, column-level lineage, and an AI intent layer — for data pipelines that don't break.
   actions:
     - text: Get Started in 60 Seconds
       link: /guides/playground/
@@ -18,22 +18,22 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 <CardGrid>
   <Card title="Type-Safe Compiler" icon="approve-check">
-    Column-level type inference, data contracts, and diagnostics with suggestions — errors caught before execution, not after.
+    Column-level type inference and data contracts catch errors before execution.
   </Card>
-  <Card title="Rocky DSL" icon="document">
-    Pipeline-oriented syntax with NULL-safe operators, window functions, and pattern matching. Or use standard SQL — your choice.
+  <Card title="Pure SQL or DSL" icon="document">
+    Write standard SQL with TOML config, or use the Rocky DSL for NULL-safe operators, windows, and pattern matching.
   </Card>
   <Card title="AI Intent Layer" icon="star">
-    Store intent as metadata. AI explains models, syncs them when upstream schemas change, and generates test assertions.
+    Store intent as metadata. AI explains models, syncs them when upstream schemas change, and generates tests.
   </Card>
   <Card title="VS Code Extension" icon="laptop">
-    Full language server: completion, hover, go-to-definition, find references, rename, code actions, inlay hints, and lineage visualization.
+    Full language server: completion, hover, go-to-definition, rename, code actions, and lineage visualization.
   </Card>
   <Card title="Quality Checks" icon="warning">
-    Pipeline-level row count / freshness / null rate / anomaly detection, plus declarative model-level assertions (`not_null`, `unique`, `in_range`, `regex_match`, `aggregate`, …) with per-check severity, filter, and row quarantine.
+    Inline pipeline checks (row count, freshness, null rate, anomaly) plus model-level assertions with severity and quarantine.
   </Card>
   <Card title="Dagster Integration" icon="puzzle">
-    First-class integration via dagster-rocky. Auto-discover assets, emit materializations, and translate check results.
+    Auto-discover assets, emit materializations, and translate check results — all via `dagster-rocky`.
   </Card>
 </CardGrid>
 
@@ -43,14 +43,14 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
 rocky playground my-first-project
 cd my-first-project
-rocky compile    # Type-check all models
-rocky test       # Run assertions locally
-rocky run        # Execute the pipeline
+rocky compile    # type-check
+rocky test       # run assertions locally
+rocky run        # execute the pipeline
 ```
 
-No credentials needed — the playground uses DuckDB locally.
+No credentials needed — the playground is DuckDB-backed.
 
 <CardGrid>
-  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Step-by-step migration guide: import your dbt project, convert tests to contracts, and adopt incrementally." />
-  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky provides auto-discovery, rich metadata, and check result integration." />
+  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Import your dbt project, convert tests to contracts, and adopt Rocky incrementally." />
+  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="Auto-discovery, rich metadata, and check-result integration via dagster-rocky." />
 </CardGrid>
