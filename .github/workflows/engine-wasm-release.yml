@@ -77,36 +77,44 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#engine-wasm-v}"
+          # Accept only SemVer-ish tokens so the value is safe to interpolate
+          # into package.json below.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing to publish: tag '${GITHUB_REF_NAME}' did not yield a SemVer version (got '${VERSION}')" >&2
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Write package.json with tag version
         working-directory: engine/crates/rocky-wasm/pkg
+        env:
+          PKG_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          cat > package.json <<PKGJSON
-          {
-            "name": "@rocky-data/compiler",
-            "version": "${{ steps.version.outputs.version }}",
-            "description": "WASM bindings for Rocky's Rust compiler pipeline — SQL lineage, Rocky DSL parsing, and identifier validation",
-            "main": "rocky_wasm.js",
-            "types": "rocky_wasm.d.ts",
-            "files": [
+          # Use `jq` rather than string interpolation so the version is quoted
+          # as a JSON value and never able to break out of the template.
+          jq -n --arg version "$PKG_VERSION" '{
+            name: "@rocky-data/compiler",
+            version: $version,
+            description: "WASM bindings for Rockys Rust compiler pipeline — SQL lineage, Rocky DSL parsing, and identifier validation",
+            main: "rocky_wasm.js",
+            types: "rocky_wasm.d.ts",
+            files: [
               "rocky_wasm_bg.wasm",
               "rocky_wasm.js",
               "rocky_wasm.d.ts",
               "rocky_wasm_bg.wasm.d.ts"
             ],
-            "repository": {
-              "type": "git",
-              "url": "https://github.com/rocky-data/rocky",
-              "directory": "engine/crates/rocky-wasm"
+            repository: {
+              type: "git",
+              url: "https://github.com/rocky-data/rocky",
+              directory: "engine/crates/rocky-wasm"
             },
-            "keywords": ["wasm", "sql", "lineage", "transformation", "rocky"],
-            "license": "Apache-2.0",
-            "publishConfig": {
-              "access": "public"
+            keywords: ["wasm", "sql", "lineage", "transformation", "rocky"],
+            license: "Apache-2.0",
+            publishConfig: {
+              access: "public"
             }
-          }
-          PKGJSON
+          }' > package.json
 
       - name: Archive WASM package
         run: tar czf rocky-wasm.tar.gz -C crates/rocky-wasm/pkg .
@@ -122,6 +130,9 @@ jobs:
       - name: Publish to npm
         working-directory: engine/crates/rocky-wasm/pkg
         env:
+          # `actions/setup-node` already wrote a registry-scoped .npmrc that
+          # reads $NODE_AUTH_TOKEN from the environment at publish time, so
+          # the token never hits disk.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then

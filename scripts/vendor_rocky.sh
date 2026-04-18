@@ -109,13 +109,20 @@ download_asset() {
             --dir /tmp \
             --clobber
     elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        if ! command -v jq >/dev/null 2>&1; then
+            echo "Error: jq is required when using GITHUB_TOKEN fallback (gh CLI is preferred)" >&2
+            exit 1
+        fi
+        # Parse the release JSON via jq rather than a grep/cut regex — `$asset`
+        # would otherwise be interpreted as a regex, so `.` / `+` / `?` in the
+        # filename silently match broader patterns than intended.
         local asset_url
         asset_url=$(curl -fsSL \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/releases/tags/${TAG_PREFIX}${VERSION}" \
-            | grep -o "\"browser_download_url\": \"[^\"]*$asset\"" \
-            | cut -d'"' -f4)
+            | jq -r --arg name "$asset" \
+                '.assets[] | select(.name == $name) | .browser_download_url')
         if [[ -z "$asset_url" ]]; then
             echo "Error: could not find $asset in release ${TAG_PREFIX}${VERSION}" >&2
             return 1

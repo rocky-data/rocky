@@ -30,6 +30,7 @@ readonly WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 readonly ROCKY="$WORKSPACE_ROOT/engine/target/release/rocky"
 readonly POC="$WORKSPACE_ROOT/examples/playground/pocs/00-foundations/00-playground-default"
 readonly PARTITION_POC="$WORKSPACE_ROOT/examples/playground/pocs/02-performance/03-partition-checksum"
+readonly NORMALIZER="$SCRIPT_DIR/_normalize_fixture.py"
 
 # Output directory: fixtures_generated/ by default, fixtures/ if --in-place.
 DEST="$WORKSPACE_ROOT/integrations/dagster/tests/fixtures_generated"
@@ -85,48 +86,7 @@ capture() {
     # out so the fixtures are stable across regen runs. Without this,
     # doctor's `duration_ms` and compile's `total_ms`/etc. drift by a few
     # milliseconds on every machine and break the codegen-drift CI check.
-    python3 - "$out_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-# Numeric timing fields (durations) — zeroed for determinism.
-TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
-# Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics / run-metadata rows.
-# Replaced with a fixed sentinel so the corpus is byte-stable across regen
-# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
-# materialization metadata) are both wall-clock under the current engine
-# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
-# than a data-derived value. A future change that makes these data-derived
-# would need to drop them from this set.
-WALL_CLOCK_FIELDS = {
-    "updated_at",
-    "started_at",
-    "finished_at",
-    "timestamp",
-    "captured_at",
-    "last_value",
-    "watermark",
-}
-SENTINEL_TS = "2000-01-01T00:00:00Z"
-def normalize(node):
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if isinstance(v, (int, float)) and any(k.endswith(s) for s in TIMING_SUFFIXES):
-                node[k] = 0
-            elif isinstance(v, str) and k in WALL_CLOCK_FIELDS:
-                node[k] = SENTINEL_TS
-            else:
-                normalize(v)
-    elif isinstance(node, list):
-        for item in node:
-            normalize(item)
-with open(path) as f:
-    data = json.load(f)
-normalize(data)
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
+    python3 "$NORMALIZER" "$out_file"
 }
 
 capture discover discover
@@ -178,48 +138,7 @@ capture_partition() {
     local out_file="$PARTITION_DEST/${name}.json"
     echo "==> partition/$name"
     "$ROCKY" "$@" 2>/dev/null > "$out_file" || true
-    python3 - "$out_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-# Numeric timing fields (durations) — zeroed for determinism.
-TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
-# Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics / run-metadata rows.
-# Replaced with a fixed sentinel so the corpus is byte-stable across regen
-# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
-# materialization metadata) are both wall-clock under the current engine
-# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
-# than a data-derived value. A future change that makes these data-derived
-# would need to drop them from this set.
-WALL_CLOCK_FIELDS = {
-    "updated_at",
-    "started_at",
-    "finished_at",
-    "timestamp",
-    "captured_at",
-    "last_value",
-    "watermark",
-}
-SENTINEL_TS = "2000-01-01T00:00:00Z"
-def normalize(node):
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if isinstance(v, (int, float)) and any(k.endswith(s) for s in TIMING_SUFFIXES):
-                node[k] = 0
-            elif isinstance(v, str) and k in WALL_CLOCK_FIELDS:
-                node[k] = SENTINEL_TS
-            else:
-                normalize(v)
-    elif isinstance(node, list):
-        for item in node:
-            normalize(item)
-with open(path) as f:
-    data = json.load(f)
-normalize(data)
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
+    python3 "$NORMALIZER" "$out_file"
 }
 
 if [[ -d "$PARTITION_POC" ]]; then
@@ -283,48 +202,7 @@ capture_into() {
     local out_file="$DEST/${subdir}/${name}.json"
     echo "==> ${subdir}/${name}"
     "$ROCKY" "$@" 2>/dev/null > "$out_file" || true
-    python3 - "$out_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-# Numeric timing fields (durations) — zeroed for determinism.
-TIMING_SUFFIXES = ("_ms", "_seconds", "_secs")
-# Wall-clock ISO-8601 timestamp fields that the engine stamps with the
-# current time when it writes state / history / metrics / run-metadata rows.
-# Replaced with a fixed sentinel so the corpus is byte-stable across regen
-# runs. ``last_value`` (state watermark) and ``watermark`` (run-output
-# materialization metadata) are both wall-clock under the current engine
-# behavior — full_refresh runs stamp NOW() as the "as-of" watermark rather
-# than a data-derived value. A future change that makes these data-derived
-# would need to drop them from this set.
-WALL_CLOCK_FIELDS = {
-    "updated_at",
-    "started_at",
-    "finished_at",
-    "timestamp",
-    "captured_at",
-    "last_value",
-    "watermark",
-}
-SENTINEL_TS = "2000-01-01T00:00:00Z"
-def normalize(node):
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if isinstance(v, (int, float)) and any(k.endswith(s) for s in TIMING_SUFFIXES):
-                node[k] = 0
-            elif isinstance(v, str) and k in WALL_CLOCK_FIELDS:
-                node[k] = SENTINEL_TS
-            else:
-                normalize(v)
-    elif isinstance(node, list):
-        for item in node:
-            normalize(item)
-with open(path) as f:
-    data = json.load(f)
-normalize(data)
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
+    python3 "$NORMALIZER" "$out_file"
 }
 
 POCS_ROOT="$WORKSPACE_ROOT/examples/playground/pocs"

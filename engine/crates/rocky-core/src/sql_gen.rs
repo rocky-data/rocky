@@ -5,7 +5,7 @@ use crate::ir::{
     MaterializationStrategy, PartitionWindow, ReplicationPlan, SnapshotPlan, TransformationPlan,
 };
 use crate::lakehouse::{self, LakehouseError};
-use crate::traits::SqlDialect;
+use crate::traits::{AdapterError, SqlDialect};
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
 #[derive(Debug, Error)]
@@ -26,6 +26,20 @@ pub enum SqlGenError {
 
     #[error("lakehouse DDL error: {0}")]
     Lakehouse(#[from] LakehouseError),
+
+    /// An adapter-level error surfaced while composing SQL (e.g. identifier
+    /// rejection from `SqlDialect::format_table_ref`). Keeping the source
+    /// error in the chain preserves the offending identifier rather than
+    /// stringifying it into an empty-`value` `UnsafeFragment`.
+    #[error("dialect error: {0}")]
+    Dialect(#[from] AdapterError),
+
+    /// SQL generation was invoked with an incompatible plan or arguments —
+    /// e.g. `MaterializationStrategy::DynamicTable` without a warehouse, or
+    /// a `check`-strategy snapshot without any `check_column`s. Distinct
+    /// from `UnsafeFragment`, which reports bad SQL content.
+    #[error("invalid SQL generation request: {0}")]
+    InvalidRequest(String),
 }
 
 /// Generates the SELECT SQL for a replication plan using the given dialect.
@@ -33,23 +47,13 @@ pub fn generate_select_sql(
     plan: &ReplicationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let select = dialect
-        .select_clause(&plan.columns, &plan.metadata_columns)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let select = dialect.select_clause(&plan.columns, &plan.metadata_columns)?;
 
-    let source = dialect
-        .format_table_ref(
-            &plan.source.catalog,
-            &plan.source.schema,
-            &plan.source.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let source = dialect.format_table_ref(
+        &plan.source.catalog,
+        &plan.source.schema,
+        &plan.source.table,
+    )?;
 
     let mut sql = format!("{select}\nFROM {source}");
 
@@ -57,23 +61,13 @@ pub fn generate_select_sql(
         timestamp_column, ..
     } = &plan.strategy
     {
-        let target = dialect
-            .format_table_ref(
-                &plan.target.catalog,
-                &plan.target.schema,
-                &plan.target.table,
-            )
-            .map_err(|e| SqlGenError::UnsafeFragment {
-                value: String::new(),
-                reason: e.to_string(),
-            })?;
+        let target = dialect.format_table_ref(
+            &plan.target.catalog,
+            &plan.target.schema,
+            &plan.target.table,
+        )?;
 
-        let where_clause = dialect
-            .watermark_where(timestamp_column, &target)
-            .map_err(|e| SqlGenError::UnsafeFragment {
-                value: String::new(),
-                reason: e.to_string(),
-            })?;
+        let where_clause = dialect.watermark_where(timestamp_column, &target)?;
 
         let _ = write!(sql, "\n{where_clause}");
     }
@@ -89,23 +83,13 @@ fn generate_select_sql_no_watermark(
     plan: &ReplicationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let select = dialect
-        .select_clause(&plan.columns, &plan.metadata_columns)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let select = dialect.select_clause(&plan.columns, &plan.metadata_columns)?;
 
-    let source = dialect
-        .format_table_ref(
-            &plan.source.catalog,
-            &plan.source.schema,
-            &plan.source.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let source = dialect.format_table_ref(
+        &plan.source.catalog,
+        &plan.source.schema,
+        &plan.source.table,
+    )?;
 
     Ok(format!("{select}\nFROM {source}"))
 }
@@ -115,16 +99,11 @@ pub fn generate_insert_sql(
     plan: &ReplicationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
     let select = generate_select_sql(plan, dialect)?;
     Ok(dialect.insert_into(&target, &select))
 }
@@ -134,16 +113,11 @@ pub fn generate_create_table_as_sql(
     plan: &ReplicationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     let select = generate_select_sql_no_watermark(plan, dialect)?;
 
@@ -155,16 +129,11 @@ pub fn generate_merge_sql(
     plan: &ReplicationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     let (unique_key, update_columns) = match &plan.strategy {
         MaterializationStrategy::Merge {
@@ -178,12 +147,7 @@ pub fn generate_merge_sql(
 
     let select = generate_select_sql_no_watermark(plan, dialect)?;
 
-    dialect
-        .merge_into(&target, &select, unique_key, update_columns)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })
+    Ok(dialect.merge_into(&target, &select, unique_key, update_columns)?)
 }
 
 /// Generates transformation SQL using the given dialect.
@@ -198,25 +162,15 @@ pub fn generate_transformation_sql(
     plan: &TransformationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     // Validate all source references
     for source in &plan.sources {
-        dialect
-            .format_table_ref(&source.catalog, &source.schema, &source.table)
-            .map_err(|e| SqlGenError::UnsafeFragment {
-                value: String::new(),
-                reason: e.to_string(),
-            })?;
+        dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
     }
 
     // If a lakehouse format is specified, use format-specific DDL generation
@@ -244,12 +198,7 @@ pub fn generate_transformation_sql(
             unique_key,
             update_columns,
         } => {
-            let stmt = dialect
-                .merge_into(&target, &plan.sql, unique_key, update_columns)
-                .map_err(|e| SqlGenError::UnsafeFragment {
-                    value: String::new(),
-                    reason: e.to_string(),
-                })?;
+            let stmt = dialect.merge_into(&target, &plan.sql, unique_key, update_columns)?;
             Ok(vec![stmt])
         }
         MaterializationStrategy::MaterializedView => {
@@ -258,10 +207,9 @@ pub fn generate_transformation_sql(
         MaterializationStrategy::DynamicTable { .. } => {
             // Dynamic tables require a warehouse parameter not available in the plan.
             // Use generate_dynamic_table_sql directly when warehouse is known.
-            Err(SqlGenError::UnsafeFragment {
-                value: String::new(),
-                reason: "DynamicTable strategy requires calling generate_dynamic_table_sql with warehouse parameter".to_string(),
-            })
+            Err(SqlGenError::InvalidRequest(
+                "DynamicTable strategy requires calling generate_dynamic_table_sql with warehouse parameter".to_string(),
+            ))
         }
         MaterializationStrategy::TimeInterval {
             time_column,
@@ -297,12 +245,7 @@ pub fn generate_transformation_sql(
 
             let substituted = substitute_partition_placeholders(&plan.sql, window);
 
-            dialect
-                .insert_overwrite_partition(&target, &filter, &substituted)
-                .map_err(|e| SqlGenError::UnsafeFragment {
-                    value: String::new(),
-                    reason: e.to_string(),
-                })
+            Ok(dialect.insert_overwrite_partition(&target, &filter, &substituted)?)
         }
         MaterializationStrategy::Ephemeral => {
             // Ephemeral models are not materialized — the compiler inlines
@@ -362,16 +305,11 @@ pub fn generate_time_interval_bootstrap_sql(
     plan: &TransformationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     // Sentinel window: start == end → half-open [start, end) is empty.
     // The chosen timestamp is well before any real partition boundary so
@@ -424,16 +362,11 @@ pub fn generate_transformation_initial_ddl(
     plan: &TransformationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     if let Some(ref format) = plan.format {
         let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
@@ -469,16 +402,11 @@ pub fn generate_materialized_view_sql(
     plan: &TransformationPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     Ok(format!(
         "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{sql}",
@@ -493,16 +421,11 @@ pub fn generate_dynamic_table_sql(
     warehouse: &str,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     // Validate target_lag and warehouse to prevent injection
     validate_sql_type(target_lag)?;
@@ -573,26 +496,16 @@ pub fn generate_snapshot_sql(
     plan: &SnapshotPlan,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let source = dialect
-        .format_table_ref(
-            &plan.source.catalog,
-            &plan.source.schema,
-            &plan.source.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
-    let target = dialect
-        .format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let source = dialect.format_table_ref(
+        &plan.source.catalog,
+        &plan.source.schema,
+        &plan.source.table,
+    )?;
+    let target = dialect.format_table_ref(
+        &plan.target.catalog,
+        &plan.target.schema,
+        &plan.target.table,
+    )?;
 
     if plan.unique_key.is_empty() {
         return Err(SqlGenError::MergeNoKey);

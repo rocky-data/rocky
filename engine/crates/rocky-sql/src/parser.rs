@@ -150,11 +150,13 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParseError> {
 
 /// Parses a SQL string expecting exactly one statement.
 pub fn parse_single_statement(sql: &str) -> Result<Statement, ParseError> {
-    let statements = parse_sql(sql)?;
+    let mut statements = parse_sql(sql)?;
     if statements.len() != 1 {
         return Err(ParseError::MultipleStatements(statements.len()));
     }
-    Ok(statements.into_iter().next().unwrap())
+    // Length is guaranteed to be 1 by the check above; `swap_remove(0)` gives
+    // us the Statement without an `unwrap()` on the iterator.
+    Ok(statements.swap_remove(0))
 }
 
 #[cfg(test)]

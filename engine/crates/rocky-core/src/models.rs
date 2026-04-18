@@ -679,16 +679,13 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start();
 
-    if !content.starts_with("---toml") {
-        return None;
-    }
+    // `strip_prefix` / `split_once` return &str slices on char boundaries, so
+    // malformed input (including non-UTF-8-boundary markers in the SQL body)
+    // can't panic the way raw `content[7..]` byte slicing could.
+    let after_start = content.strip_prefix("---toml")?;
+    let (frontmatter, sql) = after_start.split_once("\n---")?;
 
-    let after_start = &content[7..]; // skip "---toml"
-    let end_pos = after_start.find("\n---")?;
-    let frontmatter = after_start[..end_pos].trim();
-    let sql = after_start[end_pos + 4..].trim(); // skip "\n---"
-
-    Some((frontmatter, sql))
+    Some((frontmatter.trim(), sql.trim()))
 }
 
 #[cfg(test)]

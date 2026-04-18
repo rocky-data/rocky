@@ -85,11 +85,23 @@ function makeLens(
 }
 
 /**
+ * Single-quote an argument for POSIX shells; on Windows quote with `"` and
+ * double any embedded quotes. Callers route through `terminal.sendText`, which
+ * goes through the user's shell, so every interpolated token must be escaped.
+ */
+function shellQuote(arg: string): string {
+  if (process.platform === "win32") {
+    return `"${arg.replace(/"/g, '""')}"`;
+  }
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/**
  * Runs `rocky run --filter name=<model>` in the integrated terminal.
  */
 function runModelInTerminal(modelName: string): void {
   const cfg = getConfig();
-  const cmd = `${cfg.serverPath} run --filter name=${modelName} --output json`;
+  const cmd = `${shellQuote(cfg.serverPath)} run --filter name=${shellQuote(modelName)} --output json`;
   const terminal = vscode.window.createTerminal({
     name: `Rocky: run ${modelName}`,
     iconPath: new vscode.ThemeIcon("play"),
@@ -103,7 +115,7 @@ function runModelInTerminal(modelName: string): void {
  */
 function compileModelInTerminal(modelName: string): void {
   const cfg = getConfig();
-  const cmd = `${cfg.serverPath} compile --model ${modelName} --output json`;
+  const cmd = `${shellQuote(cfg.serverPath)} compile --model ${shellQuote(modelName)} --output json`;
   const terminal = vscode.window.createTerminal({
     name: `Rocky: compile ${modelName}`,
     iconPath: new vscode.ThemeIcon("file-code"),

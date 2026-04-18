@@ -150,7 +150,20 @@ jobs:
       - name: Generate checksums.txt
         run: |
           cd release-artifacts
-          sha256sum rocky-*.tar.gz rocky-*.zip > checksums.txt
+          # Require that at least one of each expected archive glob was
+          # actually downloaded — otherwise `sha256sum rocky-*.tar.gz` would
+          # happily write an empty checksums.txt (or a line for the literal
+          # glob string) and we'd publish unverifiable artifacts.
+          shopt -s nullglob
+          targz=( rocky-*.tar.gz )
+          zips=( rocky-*.zip )
+          shopt -u nullglob
+          if (( ${#targz[@]} == 0 || ${#zips[@]} == 0 )); then
+            echo "ERROR: expected at least one rocky-*.tar.gz and one rocky-*.zip in release-artifacts/" >&2
+            ls -la
+            exit 1
+          fi
+          sha256sum "${targz[@]}" "${zips[@]}" > checksums.txt
           cat checksums.txt
 
       - name: Upload checksums to release

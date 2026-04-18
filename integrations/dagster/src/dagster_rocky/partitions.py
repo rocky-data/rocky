@@ -54,6 +54,31 @@ if TYPE_CHECKING:
 TimeGrain = Literal["hour", "day", "month", "year"]
 
 
+#: Alternate grain vocabulary emitted by ``rocky dag --output json`` (see
+#: ``integrations/dagster/src/dagster_rocky/types_generated/dag_schema.py``).
+#: Kept as a lookup table rather than a second source of truth so the two
+#: code paths can't drift over time.
+_DAG_GRAIN_ALIASES: dict[str, TimeGrain] = {
+    "hourly": "hour",
+    "daily": "day",
+    "monthly": "month",
+    "yearly": "year",
+}
+
+
+def normalize_grain(grain: str) -> TimeGrain | None:
+    """Normalize any supported grain string to the canonical :data:`TimeGrain`.
+
+    Accepts both the ``rocky compile`` enum values (``hour`` / ``day`` / …)
+    and the ``rocky dag`` alias strings (``hourly`` / ``daily`` / …). Returns
+    ``None`` for unknown values so callers can fall back to "unpartitioned"
+    without having to catch an exception.
+    """
+    if grain in ("hour", "day", "month", "year"):
+        return grain  # type: ignore[return-value]
+    return _DAG_GRAIN_ALIASES.get(grain)
+
+
 def partitions_def_for_time_interval(
     *,
     granularity: TimeGrain | str,

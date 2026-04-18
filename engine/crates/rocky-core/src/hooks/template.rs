@@ -104,45 +104,41 @@ fn resolve_conditionals(
     input: &str,
     lookup: &HashMap<String, String>,
 ) -> Result<String, TemplateError> {
+    const IF_OPEN: &str = "{{#if ";
+    const IF_CLOSE: &str = "{{/if}}";
+    const EXPR_CLOSE: &str = "}}";
+
     let mut result = String::with_capacity(input.len());
     let mut remaining = input;
 
     loop {
-        // Find next {{#if ...}}
-        let Some(if_start) = remaining.find("{{#if ") else {
+        // Split on the next `{{#if ` marker. `split_once` returns &str slices
+        // on char boundaries, so malformed UTF-8 in the surrounding template
+        // body can't panic us the way raw byte offsets would.
+        let Some((before, after_if_open)) = remaining.split_once(IF_OPEN) else {
             result.push_str(remaining);
             break;
         };
+        result.push_str(before);
 
-        // Copy everything before the conditional
-        result.push_str(&remaining[..if_start]);
-
-        // Parse the field name
-        let after_if = &remaining[if_start + 6..]; // skip "{{#if "
-        let Some(close_brace) = after_if.find("}}") else {
-            // Malformed — treat as literal
-            result.push_str(&remaining[if_start..if_start + 6]);
-            remaining = after_if;
+        // Find the end of the `{{#if <field>}}` tag.
+        let Some((field_raw, after_open_tag)) = after_if_open.split_once(EXPR_CLOSE) else {
+            // Malformed — treat `{{#if ` as a literal and keep scanning.
+            result.push_str(IF_OPEN);
+            remaining = after_if_open;
             continue;
         };
+        let field = field_raw.trim();
 
-        let field = after_if[..close_brace].trim();
-        let after_open_tag = &after_if[close_brace + 2..];
-
-        // Find the matching {{/if}}
-        let Some(endif_pos) = after_open_tag.find("{{/if}}") else {
+        // Find the matching `{{/if}}`.
+        let Some((inner, after_endif)) = after_open_tag.split_once(IF_CLOSE) else {
             return Err(TemplateError::UnclosedConditional {
                 field: field.to_string(),
             });
         };
 
-        let inner = &after_open_tag[..endif_pos];
-        let after_endif = &after_open_tag[endif_pos + 7..]; // skip "{{/if}}"
-
-        // Include inner content only if field is present and non-empty
-        let field_present = lookup.get(field).is_some_and(|v| !v.is_empty());
-
-        if field_present {
+        // Include inner content only if field is present and non-empty.
+        if lookup.get(field).is_some_and(|v| !v.is_empty()) {
             result.push_str(inner);
         }
 
@@ -157,34 +153,33 @@ fn resolve_conditionals(
 // ---------------------------------------------------------------------------
 
 fn substitute_fields(input: &str, lookup: &HashMap<String, String>) -> String {
+    const OPEN: &str = "{{";
+    const CLOSE: &str = "}}";
+
     let mut result = String::with_capacity(input.len());
     let mut remaining = input;
 
     loop {
-        let Some(open) = remaining.find("{{") else {
+        let Some((before, after_open)) = remaining.split_once(OPEN) else {
             result.push_str(remaining);
             break;
         };
+        result.push_str(before);
 
-        result.push_str(&remaining[..open]);
-
-        let after_open = &remaining[open + 2..];
-        let Some(close) = after_open.find("}}") else {
-            // Unclosed — treat as literal
-            result.push_str("{{");
+        let Some((field_raw, after_close)) = after_open.split_once(CLOSE) else {
+            // Unclosed — emit the `{{` literally and keep scanning.
+            result.push_str(OPEN);
             remaining = after_open;
             continue;
         };
 
-        let field = after_open[..close].trim();
-
-        // Look up value; unknown fields resolve to empty string
+        let field = field_raw.trim();
         if let Some(value) = lookup.get(field) {
             result.push_str(value);
         }
-        // else: empty string (intentionally no output for unknown fields)
+        // else: empty string (intentionally no output for unknown fields).
 
-        remaining = &after_open[close + 2..];
+        remaining = after_close;
     }
 
     result

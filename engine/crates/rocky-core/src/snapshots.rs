@@ -220,10 +220,9 @@ pub fn generate_snapshot_sql(
         }
         SnapshotStrategy::Check { check_columns } => {
             if check_columns.is_empty() {
-                return Err(SqlGenError::UnsafeFragment {
-                    value: String::new(),
-                    reason: "check strategy requires at least one check_column".to_string(),
-                });
+                return Err(SqlGenError::InvalidRequest(
+                    "check strategy requires at least one check_column".to_string(),
+                ));
             }
             for col in check_columns {
                 validation::validate_identifier(col)?;
@@ -349,30 +348,20 @@ fn generate_snapshot_id(target: &TargetRef) -> String {
 
 /// Format and validate the source table reference.
 fn format_source(config: &SnapshotConfig, dialect: &dyn SqlDialect) -> Result<String, SqlGenError> {
-    dialect
-        .format_table_ref(
-            &config.source.catalog,
-            &config.source.schema,
-            &config.source.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })
+    Ok(dialect.format_table_ref(
+        &config.source.catalog,
+        &config.source.schema,
+        &config.source.table,
+    )?)
 }
 
 /// Format and validate the target table reference.
 fn format_target(config: &SnapshotConfig, dialect: &dyn SqlDialect) -> Result<String, SqlGenError> {
-    dialect
-        .format_table_ref(
-            &config.target.catalog,
-            &config.target.schema,
-            &config.target.table,
-        )
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })
+    Ok(dialect.format_table_ref(
+        &config.target.catalog,
+        &config.target.schema,
+        &config.target.table,
+    )?)
 }
 
 /// Build a `left.k1 = right.k1 AND left.k2 = right.k2` join condition.

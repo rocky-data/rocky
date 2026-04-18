@@ -540,7 +540,11 @@ pub fn resolve_pipeline<'a>(
         }
         None => {
             if config.pipelines.len() == 1 {
-                let (name, pipeline) = config.pipelines.iter().next().unwrap();
+                let (name, pipeline) = config
+                    .pipelines
+                    .iter()
+                    .next()
+                    .expect("len == 1 guarantees one entry");
                 Ok((name.as_str(), pipeline))
             } else if config.pipelines.is_empty() {
                 bail!("no pipelines defined in config")

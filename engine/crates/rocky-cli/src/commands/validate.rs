@@ -800,7 +800,11 @@ fn lint_config(
 
     // L007: single-adapter project repeats adapter name
     if cfg.adapters.len() == 1 {
-        let adapter_name = cfg.adapters.keys().next().unwrap();
+        let adapter_name = cfg
+            .adapters
+            .keys()
+            .next()
+            .expect("len == 1 guarantees one key");
         let mut ref_count = 0usize;
         for pc in cfg.pipelines.values() {
             // Count adapter references across all pipeline types

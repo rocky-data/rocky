@@ -58,12 +58,7 @@ pub fn generate_describe_table_sql(
     table: &TableRef,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(dialect.describe_table_sql(&ref_str))
 }
 
@@ -72,12 +67,7 @@ pub fn generate_drop_table_sql(
     table: &TableRef,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(dialect.drop_table_sql(&ref_str))
 }
 
@@ -166,12 +156,7 @@ pub fn generate_alter_column_sql(
     drifted_columns: &[DriftedColumn],
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let table_ref = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
 
     let mut statements = Vec::new();
     for col in drifted_columns {
@@ -314,12 +299,7 @@ pub fn generate_drop_column_sql(
     columns: &[String],
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let table_ref = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
 
     let mut statements = Vec::new();
     for col_name in columns {

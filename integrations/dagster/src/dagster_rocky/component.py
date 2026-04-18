@@ -1007,7 +1007,7 @@ def _emit_contract_check_results(
 
 
 def _log_compile_diagnostics(
-    context,
+    context: dg.AssetExecutionContext,
     compile_state: _CompileState,
 ) -> None:
     for diag in compile_state.diagnostics:
@@ -1023,7 +1023,7 @@ def _log_compile_diagnostics(
 def _select_filters(
     group: _GroupBuild,
     selected_keys: set[dg.AssetKey],
-    context,
+    context: dg.AssetExecutionContext,
 ) -> list[str]:
     """Pick group-level filter or per-source filters depending on subset."""
     needed_source_ids = {
@@ -1041,7 +1041,7 @@ def _select_filters(
 
 
 def _run_filters(
-    context,
+    context: dg.AssetExecutionContext,
     rocky: RockyResource,
     filters: list[str],
     *,
@@ -1070,7 +1070,7 @@ def _run_filters(
 
 
 def _log_run_diagnostics(
-    context,
+    context: dg.AssetExecutionContext,
     result: RunResult,
 ) -> None:
     """Log run-level errors and contract violations.

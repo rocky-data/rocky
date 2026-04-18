@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import dagster as dg
 
+from . import partitions
 from .freshness import freshness_policy_from_model
 
 if TYPE_CHECKING:
@@ -70,18 +71,22 @@ class DagAssetGroup:
 def _partitions_def_for_node(
     node: DagNodeOutput,
 ) -> dg.PartitionsDefinition | None:
-    """Create a Dagster PartitionsDefinition from a node's partition shape."""
+    """Create a Dagster PartitionsDefinition from a node's partition shape.
+
+    Delegates to :func:`partitions.partitions_def_for_time_interval` after
+    normalizing the dag-schema grain aliases (``daily`` / ``hourly`` / …) to
+    the canonical :data:`partitions.TimeGrain` enum so the two code paths
+    stay in lockstep.
+    """
     if node.partition_shape is None:
         return None
-    grain = node.partition_shape.granularity
-    start = node.partition_shape.first_partition or "2024-01-01"
-    if grain == "daily":
-        return dg.DailyPartitionsDefinition(start_date=start)
-    if grain == "hourly":
-        return dg.HourlyPartitionsDefinition(start_date=start)
-    if grain == "monthly":
-        return dg.MonthlyPartitionsDefinition(start_date=start)
-    return None
+    grain = partitions.normalize_grain(node.partition_shape.granularity)
+    if grain is None:
+        return None
+    return partitions.partitions_def_for_time_interval(
+        granularity=grain,
+        first_partition=node.partition_shape.first_partition,
+    )
 
 
 def _shape_key_for_node(node: DagNodeOutput) -> str:

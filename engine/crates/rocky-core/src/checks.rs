@@ -84,12 +84,7 @@ pub fn generate_null_rate_sql(
     sample_percent: u32,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
 
     let sample_clause = dialect
         .tablesample_clause(sample_percent)
@@ -129,12 +124,7 @@ pub fn generate_row_count_sql(
     table: &TableRef,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(format!("SELECT COUNT(*) AS cnt FROM {ref_str}"))
 }
 
@@ -145,12 +135,7 @@ pub fn generate_freshness_sql(
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
     rocky_sql::validation::validate_identifier(timestamp_column)?;
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(format!(
         "SELECT MAX({timestamp_column}) AS max_ts FROM {ref_str}"
     ))
@@ -163,12 +148,7 @@ pub fn generate_custom_check_sql(
     sql_template: &str,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let ref_str = dialect
-        .format_table_ref(&table.catalog, &table.schema, &table.table)
-        .map_err(|e| SqlGenError::UnsafeFragment {
-            value: String::new(),
-            reason: e.to_string(),
-        })?;
+    let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(sql_template.replace("{target}", &ref_str))
 }
 
