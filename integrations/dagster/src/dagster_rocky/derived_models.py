@@ -116,7 +116,9 @@ def build_model_specs(
         A list of ``dg.AssetSpec``, one per derived model. Empty when
         ``compile_result.models_detail`` is empty.
     """
-    del contract_rules_by_model  # noqa: F841 — reserved for future use
+    # Accepted for forward compatibility (see docstring); contract check
+    # specs are still emitted from the component layer.
+    _ = contract_rules_by_model
 
     # Build a name → asset_key map up front so depends_on can be resolved.
     model_to_key: dict[str, dg.AssetKey] = {}

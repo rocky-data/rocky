@@ -34,12 +34,15 @@ auto-wires them when ``contracts_dir`` is configured.
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import dagster as dg
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -116,6 +119,11 @@ def discover_contract_rules(contracts_dir: Path) -> dict[str, ContractRules]:
         # Filename: foo.contract.toml → model name "foo"
         stem = path.name.removesuffix(".contract.toml")
         if not stem:
+            # Degenerate filename (just `.contract.toml`). Skip but surface
+            # it — otherwise a misnamed file silently contributes nothing.
+            _log.warning(
+                "Ignoring contract file with empty model name: %s", path
+            )
             continue
         rules = _parse_contract_rules(path)
         if not rules.is_empty:

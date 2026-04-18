@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shutil
 import subprocess
 import threading
@@ -56,6 +57,8 @@ from .types import (
     ValidateMigrationResult,
 )
 
+_log = logging.getLogger(__name__)
+
 # Default subprocess timeout for any single Rocky CLI invocation. One hour is
 # generous enough for full pipeline runs but still bounds runaway processes.
 DEFAULT_TIMEOUT_SECONDS = 3600
@@ -87,25 +90,29 @@ def _forward_stderr_to_context(
        stderr (see ``engine/crates/rocky-observe/src/tracing_setup.rs``)
        so this captures every ``info!()`` / ``warn!()`` macro emission.
 
-    Silently swallows any exceptions reading the pipe so a crashed
-    reader thread doesn't take down the parent. The trade-off is that
-    on a corrupt pipe we lose live streaming but the subprocess still
-    completes and the final stdout parsing still runs.
+    On unexpected read errors the reader thread logs the error at WARN
+    via the module logger and exits cleanly so it doesn't take down the
+    parent. We still lose live streaming for the rest of the run, but
+    the subprocess completes and the final stdout parsing still runs.
     """
     if stderr is None:
         return
-    with contextlib.suppress(Exception):
-        # Outer suppress catches a broken pipe or any other read error so
-        # the reader thread exits cleanly without taking down the parent.
+    try:
         for raw in stderr:
             line = raw.rstrip("\n")
             if not line:
                 continue
             sink.append(line)
+            # `context.log` can raise mid-line if the run is being torn
+            # down — suppress and keep reading so `sink` stays populated
+            # for failure metadata.
             with contextlib.suppress(Exception):
-                # context.log can raise if the run is being torn down;
-                # don't crash the reader thread on shutdown races.
                 context.log.info(f"rocky: {line}")
+    except (OSError, ValueError) as exc:
+        # OSError covers broken-pipe / EBADF / closed-file on the subprocess
+        # stderr handle. ValueError covers "I/O operation on closed file"
+        # from CPython. Anything else escapes so we notice the real bug.
+        _log.warning("rocky stderr reader terminated: %s", exc)
 
 
 class RockyResource(dg.ConfigurableResource):
