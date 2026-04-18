@@ -121,9 +121,7 @@ def discover_contract_rules(contracts_dir: Path) -> dict[str, ContractRules]:
         if not stem:
             # Degenerate filename (just `.contract.toml`). Skip but surface
             # it — otherwise a misnamed file silently contributes nothing.
-            _log.warning(
-                "Ignoring contract file with empty model name: %s", path
-            )
+            _log.warning("Ignoring contract file with empty model name: %s", path)
             continue
         rules = _parse_contract_rules(path)
         if not rules.is_empty:
