@@ -26,7 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        # Pin to a specific version + --locked so a regression in a newer
+        # cargo-audit release can't silently change the weekly CI signal.
+        # Bump deliberately alongside any MSRV or advisory-db change.
+        run: cargo install cargo-audit --version 0.21.1 --locked
       - name: Run cargo audit
         run: cargo audit
 
@@ -45,7 +48,8 @@ jobs:
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       - run: sudo apt-get update && sudo apt-get install -y cmake
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        # Pinned + --locked for the same reason as cargo-audit above.
+        run: cargo install cargo-tarpaulin --version 0.31.2 --locked
       - name: Run coverage
         run: cargo tarpaulin --all-targets --timeout 600 --out xml --output-dir coverage/
       - name: Upload coverage report

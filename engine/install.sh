@@ -145,17 +145,31 @@ fi
 
 if [[ -n "${ACTUAL_HASH}" ]]; then
     echo "  SHA256: ${ACTUAL_HASH}"
-    if download_file "${CHECKSUMS_URL}" "${TMP}/checksums.txt" 2>/dev/null; then
-        EXPECTED_HASH="$(grep "${ARCHIVE}" "${TMP}/checksums.txt" | cut -d' ' -f1 || true)"
-        if [[ -n "${EXPECTED_HASH}" ]]; then
-            if [[ "${ACTUAL_HASH}" != "${EXPECTED_HASH}" ]]; then
-                echo "Error: Checksum mismatch!" >&2
-                echo "  Expected: ${EXPECTED_HASH}" >&2
-                echo "  Actual:   ${ACTUAL_HASH}" >&2
-                exit 1
-            fi
-            echo "  Checksum verified."
+    # checksums.txt is published alongside every engine release. If the
+    # download fails we must not silently skip verification — an attacker
+    # who can strip the file would otherwise downgrade us to no integrity
+    # check. Only skip when the host lacks any sha256 tooling (handled by
+    # the outer `if -n ACTUAL_HASH`).
+    if ! download_file "${CHECKSUMS_URL}" "${TMP}/checksums.txt"; then
+        echo "Error: Failed to download ${CHECKSUMS_URL}." >&2
+        echo "  Refusing to install an unverified binary. Retry, or set" >&2
+        echo "  ROCKY_SKIP_CHECKSUM=1 if you intentionally want to skip." >&2
+        if [[ "${ROCKY_SKIP_CHECKSUM:-}" != "1" ]]; then
+            exit 1
         fi
+    else
+        EXPECTED_HASH="$(grep "${ARCHIVE}" "${TMP}/checksums.txt" | cut -d' ' -f1 || true)"
+        if [[ -z "${EXPECTED_HASH}" ]]; then
+            echo "Error: checksums.txt did not contain an entry for ${ARCHIVE}." >&2
+            exit 1
+        fi
+        if [[ "${ACTUAL_HASH}" != "${EXPECTED_HASH}" ]]; then
+            echo "Error: Checksum mismatch!" >&2
+            echo "  Expected: ${EXPECTED_HASH}" >&2
+            echo "  Actual:   ${ACTUAL_HASH}" >&2
+            exit 1
+        fi
+        echo "  Checksum verified."
     fi
 fi
 

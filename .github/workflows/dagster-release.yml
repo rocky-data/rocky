@@ -63,6 +63,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${GITHUB_REF_NAME}" dist/* \
+          # Guard the glob so an empty dist/ (uv build silently produced no
+          # artifacts) doesn't send the literal string `dist/*` to the
+          # upload command.
+          shopt -s nullglob
+          artifacts=( dist/* )
+          shopt -u nullglob
+          if (( ${#artifacts[@]} == 0 )); then
+            echo "ERROR: no artifacts found under dist/" >&2
+            ls -la dist/ || true
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${artifacts[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber

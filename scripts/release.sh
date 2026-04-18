@@ -36,8 +36,18 @@ require_cmd() {
 
 confirm_tag() {
     local tag="$1"
-    if git -C "$WORKSPACE_ROOT" rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+    # `rev-parse --verify --quiet` returns non-zero only when the ref is
+    # missing or ambiguous; any other git failure (permission denied,
+    # corrupt repo) still bubbles up as an error rather than being
+    # papered over the way `rev-parse >/dev/null 2>&1` would.
+    if git -C "$WORKSPACE_ROOT" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
         die "Tag $tag already exists. Bump the version or delete the tag first."
+    fi
+    # Also refuse to create a tag that already exists on the remote —
+    # otherwise `git push origin <tag>` succeeds silently if the local tag
+    # happens to match the remote exactly.
+    if git -C "$WORKSPACE_ROOT" ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+        die "Tag $tag already exists on origin. Bump the version or delete the remote tag first."
     fi
 }
 
@@ -84,10 +94,14 @@ release_engine() {
     tar czf "$linux_archive" -C "$(dirname "$linux_bin")" --transform 's/rocky-linux-amd64/rocky/' rocky-linux-amd64
     info "Packaged $linux_archive ($(du -h "$linux_archive" | cut -f1))"
 
-    # 3. Tag and push
+    # 3. Tag and push. Each step is guarded so a tag-creation failure (e.g.
+    # unsigned config, protected ref) never proceeds to `push` on a missing
+    # or stale tag.
     info "Creating and pushing tag $tag"
-    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag"
-    git -C "$WORKSPACE_ROOT" push origin "$tag"
+    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag" \
+        || die "git tag -a $tag failed — aborting before push"
+    git -C "$WORKSPACE_ROOT" push origin "$tag" \
+        || die "git push origin $tag failed"
 
     # 4. Create GitHub Release with macOS + Linux
     # The tag push also triggers engine-release.yml which builds all 5 targets.
@@ -129,10 +143,14 @@ release_dagster() {
         (cd "$WORKSPACE_ROOT/integrations/dagster" && uv publish)
     fi
 
-    # 3. Tag and push
+    # 3. Tag and push. Each step is guarded so a tag-creation failure (e.g.
+    # unsigned config, protected ref) never proceeds to `push` on a missing
+    # or stale tag.
     info "Creating and pushing tag $tag"
-    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag"
-    git -C "$WORKSPACE_ROOT" push origin "$tag"
+    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag" \
+        || die "git tag -a $tag failed — aborting before push"
+    git -C "$WORKSPACE_ROOT" push origin "$tag" \
+        || die "git push origin $tag failed"
 
     # 4. Create GitHub Release
     create_release "$tag" \
@@ -176,10 +194,14 @@ release_vscode() {
         (cd "$WORKSPACE_ROOT/editors/vscode" && npx @vscode/vsce publish --pat "$VSCE_PAT")
     fi
 
-    # 3. Tag and push
+    # 3. Tag and push. Each step is guarded so a tag-creation failure (e.g.
+    # unsigned config, protected ref) never proceeds to `push` on a missing
+    # or stale tag.
     info "Creating and pushing tag $tag"
-    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag"
-    git -C "$WORKSPACE_ROOT" push origin "$tag"
+    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag" \
+        || die "git tag -a $tag failed — aborting before push"
+    git -C "$WORKSPACE_ROOT" push origin "$tag" \
+        || die "git push origin $tag failed"
 
     # 4. Create GitHub Release
     create_release "$tag" \
