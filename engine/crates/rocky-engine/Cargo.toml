@@ -1,6 +1,6 @@
 [package]
 name = "rocky-engine"
-version = "1.8.0"
+version = "1.8.1"
 description = "Rocky local execution engine: DataFusion-based testing, branching, CI"
 edition.workspace = true
 license.workspace = true

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-04-18
+
+Patch release. One bug fix addressing an indefinite hang on remote state sync.
+
+### Fixed — bounded HTTP timeouts on object store access
+
+`ObjectStoreProvider::from_uri` previously built `AmazonS3Builder` /
+`GoogleCloudStorageBuilder` / `MicrosoftAzureBuilder` without a `ClientOptions`,
+so the underlying HTTP client had no per-request timeout. A stuck TCP connection
+therefore hung the await indefinitely, and `object_store`'s own `RetryConfig`
+(180s default) never got a chance to trigger because each attempt never
+returned.
+
+Observed in production on 2026-04-18: a `rocky run` emitted
+`uploading state to object store` and then produced no further output for ~7h
+until the outer scheduler cancelled the run.
+
+Two fixes:
+
+1. Every cloud builder is now constructed with
+   `ClientOptions::new().with_timeout(60s).with_connect_timeout(10s)`, so any
+   single request that stalls is aborted and retried under the existing
+   `RetryConfig` budget.
+2. `state_sync::{upload,download}_to_object_store` wrap the transfer in
+   `tokio::time::timeout(300s, …)` as a belt-and-suspenders bound on the
+   total operation. A new `StateSyncError::Timeout` variant makes the outer
+   expiry distinguishable from per-request client timeouts for operators
+   triaging hangs.
+
+Both values are intentionally generous for the `state.redb` workload
+(sub-20MB transfers) while still giving operators a definitive hang
+guarantee.
+
 ## [1.8.0] — 2026-04-17
 
 Perf-resilience sprint. Five engine changes that close the roadmap's "Top 5" pre-1.0 gaps plus two BigQuery quality-of-life fixes — broken out into this release because together they change Rocky's behaviour under failure, under concurrency, and against wide DAGs.
