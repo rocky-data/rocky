@@ -1,85 +1,144 @@
 # Rocky
 
-> Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolution, incremental logic, SQL generation, schema management) with a compiled, type-safe approach. No Jinja. No manifest. No parse step.
+> A compiled SQL transformation engine written in Rust. Replaces dbt's DAG resolution, incremental logic, SQL generation, and schema management with a type-safe, config-driven approach. No Jinja. No manifest. No parse step.
 
-## Overview
+Rocky follows the ELT pattern: it operates on data already in the warehouse, landed by ingestion tools like Fivetran or Airbyte. Rocky owns the T (warehouse-side transformation and replication).
 
-Rocky is a monorepo containing a Rust CLI engine, a Dagster Python integration, a VS Code extension, and a curated catalog of 28 POCs.
+## Architecture at a glance
 
-Key concepts:
-- Bronze layer: Config-driven replication from sources (Fivetran, DuckDB, manual) into warehouses (Databricks, Snowflake, DuckDB) — no SQL files needed
-- Silver layer: Custom SQL models with TOML configuration (sidecar .sql + .toml files)
-- Rocky DSL: Pipeline-oriented syntax (.rocky files) as an alternative to SQL
-- Schema patterns: Parse source schema names into structured components for multi-tenant routing
-- Inline checks: Data quality checks (row count, column match, freshness, null rate, anomaly, custom) run during replication
-- Data contracts: Compile-time schema enforcement (required/protected columns, type checking)
-- AI intent: Generate models, explain logic, sync schema changes, generate tests with Claude
-- Embedded state: Watermarks stored in local redb database, with S3/Valkey/tiered sync
+- **Single binary** (`rocky`), starts in under 100ms.
+- **Adapter model** separates *source discovery* (Fivetran, DuckDB, manual) from *warehouse execution* (Databricks, Snowflake, BigQuery, DuckDB). The core is warehouse-agnostic.
+- **Bronze layer** (replication) is driven entirely by `rocky.toml` — zero SQL files for 1:1 copies.
+- **Silver layer** (transformation) is pure SQL with a sidecar `.toml` for config. No templating language.
+- **Rocky DSL** (`.rocky` files) is an optional pipeline-oriented syntax; raw SQL stays first-class.
+- **State** (watermarks, run history) lives in a local `redb` database with optional S3 / Valkey sync.
+- **JSON output** is versioned and schema-backed — designed for orchestrator consumption.
 
-## Commands
+## Monorepo
 
-### Core Pipeline
+| Path | Artifact | Purpose |
+|---|---|---|
+| `engine/` | `rocky` CLI | 20-crate Rust workspace |
+| `integrations/dagster/` | `dagster-rocky` PyPI wheel | Dagster resource + component |
+| `editors/vscode/` | Rocky VSIX | LSP client + AI commands |
+| `examples/playground/` | Config only | 47 POCs across 8 categories; DuckDB-backed, no credentials |
+
+## CLI commands
+
+### Core pipeline
 - `rocky init [path]` — Scaffold a new project
-- `rocky validate` — Check config without connecting to APIs
-- `rocky discover` — List available connectors and tables
-- `rocky plan --filter key=value` — Generate SQL without executing
-- `rocky run --filter key=value` — Execute the full pipeline
+- `rocky validate` — Check config without network calls
+- `rocky discover` — List connectors and tables
+- `rocky plan [--filter key=value]` — Generate SQL without executing
+- `rocky run [--filter key=value] [--resume-latest]` — Execute the pipeline
 - `rocky state` — Show stored watermarks
+- `rocky load` — Bulk load data from files into the warehouse
 
 ### Modeling
 - `rocky compile` — Type-check models, resolve DAG, validate contracts
-- `rocky lineage <model>` — Column-level lineage tracing
-- `rocky test` — Run model tests via DuckDB (no warehouse needed)
-- `rocky ci` — Compile + test in one step (for CI/CD)
+- `rocky lineage <model>` — Column-level lineage
+- `rocky test` — Run assertions locally via DuckDB
+- `rocky ci` — Compile + test in one step
+- `rocky ci-diff` — Diff current vs. base branch for PR feedback
+- `rocky dag` / `rocky dag-run` — Inspect / execute the DAG
+- `rocky drift` — Report schema drift between source and target
+- `rocky column-lineage <model>` — Column-level lineage JSON
+
+### Data quality
+- `rocky test` — Unit-style assertions (`not_null`, `unique`, `in_range`, `regex_match`, `aggregate`, custom SQL)
+- Inline pipeline checks: `row_count`, `column_match`, `freshness`, `null_rate`, `anomaly`, custom (configured in `rocky.toml`)
 
 ### AI
-- `rocky ai "<intent>"` — Generate model from natural language
-- `rocky ai-sync` — Detect schema changes, propose model updates
+- `rocky ai "<intent>"` — Generate a model from natural language
+- `rocky ai-sync` — Detect upstream schema changes, propose updates
 - `rocky ai-explain` — Generate intent descriptions from SQL
 - `rocky ai-test` — Generate test assertions from intent
 
 ### Administration
-- `rocky doctor` — Aggregate health checks
-- `rocky compare` — Shadow vs production comparison
-- `rocky history` — Run history and model execution history
+- `rocky doctor` — Aggregate health check
+- `rocky compare` — Shadow-vs-production comparison
+- `rocky history` — Run + model execution history
 - `rocky metrics <model>` — Quality metrics and trends
+- `rocky estimate` — Cost / row-count estimation
 - `rocky optimize` — Materialization strategy recommendations
-- `rocky compact <model>` — Storage compaction (OPTIMIZE/VACUUM)
-- `rocky archive` — Archive old data partitions
+- `rocky compact <model>` / `rocky compact-dedup` — Storage compaction (OPTIMIZE / VACUUM / dedup)
+- `rocky archive` — Archive old partitions
 - `rocky profile-storage` — Storage layout analysis
+- `rocky seed` — Load seed data
+- `rocky model-history <model>` — History for a single model
 
 ### Development
-- `rocky playground [path]` — Create credential-free DuckDB project
-- `rocky import-dbt` — Convert dbt project to Rocky
+- `rocky playground [path]` — Create a credential-free DuckDB project
+- `rocky import-dbt` — Convert a dbt project to Rocky
 - `rocky serve` — HTTP API server
-- `rocky lsp` — Language Server Protocol for IDE integration
-- `rocky hooks list/test` — Manage lifecycle hooks
+- `rocky lsp` — Language Server Protocol (IDE integration)
+- `rocky hooks list` / `rocky hooks test` — Manage lifecycle hooks
+- `rocky init-adapter <name>` — Scaffold a new warehouse adapter crate
+- `rocky test-adapter --adapter <name>` — Run conformance tests
+- `rocky validate-migration` — Validate a migration plan
 
-## Materialization Strategies
+### Global flags
+- `-c, --config <PATH>` — config file (default `rocky.toml`)
+- `-o, --output <FORMAT>` — `json` (default) or `table`
+- `--state-path <PATH>` — state store path (default `.rocky-state.redb`)
 
-- `full_refresh` — CREATE OR REPLACE TABLE
-- `incremental` — INSERT INTO WHERE ts > watermark
-- `merge` — MERGE INTO USING ON key
+## Materialization strategies
+
+- `full_refresh` — `CREATE OR REPLACE TABLE`
+- `incremental` — `INSERT INTO ... WHERE ts > watermark`
+- `merge` — `MERGE INTO ... USING ON key`
 - `materialized_view` — Databricks materialized views
 - `dynamic_table` — Snowflake dynamic tables with target lag
-- `time_interval` — Partition-keyed processing with @start_date/@end_date
+- `time_interval` — Partition-keyed processing with `@start_date` / `@end_date`
 
-## Configuration
+## Configuration (`rocky.toml`)
 
-Rocky reads `rocky.toml` with named adapters (`[adapter.NAME]`) and named pipelines (`[pipeline.NAME]`).
-Sections: adapters, pipelines (source, target, governance, checks, execution), state, cache, cost, hooks.
+Top-level sections:
 
-## Dagster Integration
+- `[adapter.NAME]` — named adapter connections (one per warehouse / source)
+- `[pipeline.NAME]` — named pipelines (one of: `replication`, `transformation`, `quality`, `snapshot`)
+- `[pipeline.NAME.source]` / `[pipeline.NAME.target]` — pipeline endpoints
+- `[pipeline.NAME.source.schema_pattern]` — multi-tenant schema name parser
+- `[pipeline.NAME.checks]` — inline data quality checks
+- `[pipeline.NAME.governance]` — tags, permissions, workspace isolation
+- `[state]` — watermark backend (`local`, `s3`, `valkey`)
+- `[cache]` / `[cost]` / `[hooks]` — optional subsystems
 
-The `dagster-rocky` Python package provides:
-- `RockyResource` — Dagster resource wrapping the CLI (20+ methods)
-- `load_rocky_assets()` — Auto-discover assets from Rocky sources
-- `emit_check_results()` / `emit_materializations()` — Convert results to Dagster events
-- `RockyComponent` — State-backed component for scalable discovery
-- `run_streaming()` / `run_pipes()` — Streaming and Dagster Pipes integration
-- Autogenerated Pydantic models for all 28 JSON output schemas
+Select pipelines at runtime with `--pipeline NAME`.
 
-## Docs
+## Supported adapters
+
+| Role | Adapter | Status |
+|---|---|---|
+| Source | Fivetran | Stable |
+| Source | DuckDB | Stable |
+| Source | Manual (TOML) | Stable |
+| Warehouse | Databricks | Stable — SQL Statement API, Unity Catalog, adaptive concurrency (AIMD) |
+| Warehouse | Snowflake | Beta — OAuth, key-pair JWT, password |
+| Warehouse | BigQuery | Beta — service account, ADC |
+| Warehouse | DuckDB | Stable — local in-process, used by playground and `rocky test` |
+
+A single DuckDB instance can act as both source and warehouse — that is how the playground runs end-to-end without credentials.
+
+## Dagster integration (`dagster-rocky`)
+
+- `RockyResource` — Configurable resource wrapping the CLI (20+ typed methods)
+- `load_rocky_assets()` — Auto-discover Dagster assets from Rocky sources
+- `emit_check_results()` / `emit_materializations()` — Convert JSON output to Dagster events
+- `RockyComponent` — State-backed `dg` component for scalable discovery
+- `run_streaming()` / `run_pipes()` — Streaming + Dagster Pipes
+- Autogenerated Pydantic v2 models for every CLI output schema
+
+## AI intent layer
+
+Intent is stored as model metadata in the `.toml` sidecar. Rocky's AI commands operate on that intent:
+
+- Generate a model from a prompt (`rocky ai`)
+- Keep models in sync when upstream schemas change (`rocky ai-sync`)
+- Backfill intent descriptions from existing SQL (`rocky ai-explain`)
+- Derive test assertions from intent (`rocky ai-test`)
+
+## Docs index
 
 - [Introduction](getting-started/introduction/)
 - [Installation](getting-started/installation/)
@@ -100,4 +159,5 @@ The `dagster-rocky` Python package provides:
 - [Data Governance](guides/governance/)
 - [CI/CD Integration](guides/ci-cd/)
 - [IDE Setup](guides/ide-setup/)
+- [Migrate from dbt](guides/migrate-from-dbt/)
 - [Contributing](advanced/contributing/)
