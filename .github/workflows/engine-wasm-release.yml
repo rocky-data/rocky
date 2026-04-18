@@ -56,8 +56,19 @@ jobs:
           workspaces: engine
           key: wasm
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
+      # Set up Node with the npm registry so `npm publish` picks up
+      # NODE_AUTH_TOKEN automatically (no hand-rolled .npmrc).
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      # Prebuilt binary — avoids ~40s of `cargo install wasm-pack --locked`
+      # per run and skips a transitive compilation that occasionally trips
+      # MSRV / yanked-crate failures.
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e0cafa345d365d15 # v0.4.0
+        with:
+          version: 'v0.13.1'
 
       - name: Build WASM (web target)
         run: wasm-pack build crates/rocky-wasm --target web
@@ -90,7 +101,10 @@ jobs:
               "directory": "engine/crates/rocky-wasm"
             },
             "keywords": ["wasm", "sql", "lineage", "transformation", "rocky"],
-            "license": "Apache-2.0"
+            "license": "Apache-2.0",
+            "publishConfig": {
+              "access": "public"
+            }
           }
           PKGJSON
 
@@ -98,19 +112,20 @@ jobs:
         run: tar czf rocky-wasm.tar.gz -C crates/rocky-wasm/pkg .
 
       - name: Attach to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" rocky-wasm.tar.gz \
-            --repo "${GITHUB_REPOSITORY}" \
-            --clobber
-        working-directory: engine
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: engine/rocky-wasm.tar.gz
 
+      # Guard inline so the step never parses `secrets.*` in a step-level
+      # `if:` (disallowed on public repos) and never depends on step-env
+      # visibility in the same step's `if:` (which is unreliable).
       - name: Publish to npm
-        if: env.NODE_AUTH_TOKEN != ''
         working-directory: engine/crates/rocky-wasm/pkg
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
-          npm publish --access public
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "NPM_TOKEN secret not set — skipping npm publish"
+            exit 0
+          fi
+          npm publish
