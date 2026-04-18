@@ -5,26 +5,20 @@ sidebar:
   order: 3
 ---
 
-This guide walks you through setting up a Rocky pipeline that replicates Fivetran-landed sources into Databricks. If you do not have warehouse credentials handy, the [Playground guide](/guides/playground/) does the same thing end-to-end against a local DuckDB file with no setup.
+This walks through a Rocky pipeline that replicates Fivetran-landed sources into Databricks. No credentials? The [Playground guide](/guides/playground/) runs the same flow against a local DuckDB file.
 
-## 1. Initialize a Project
+## 1. Scaffold
 
 ```bash
 rocky init my-pipeline
 cd my-pipeline
 ```
 
-This creates:
+Creates `rocky.toml` and an empty `models/` directory.
 
-```
-my-pipeline/
-├── rocky.toml      # Pipeline configuration (named adapters + named pipelines)
-└── models/         # Transformation models (SQL + TOML)
-```
+## 2. Configure
 
-## 2. Configure Your Pipeline
-
-Edit `rocky.toml` to declare a Fivetran source adapter, a Databricks warehouse adapter, and a pipeline that wires them together:
+Edit `rocky.toml` to declare a Fivetran source, a Databricks target, and a pipeline that wires them together.
 
 ```toml
 [adapter.fivetran]
@@ -43,9 +37,6 @@ token = "${DATABRICKS_TOKEN}"
 type = "replication"
 strategy = "incremental"
 timestamp_column = "_fivetran_synced"
-metadata_columns = [
-    { name = "_loaded_by", type = "STRING", value = "NULL" },
-]
 
 [pipeline.bronze.source]
 adapter = "fivetran"
@@ -74,52 +65,25 @@ freshness = { threshold_seconds = 86400 }
 backend = "local"
 ```
 
-The `[adapter.NAME]` blocks define connections; the `[pipeline.NAME]` block ties them together. You can declare additional adapters and pipelines in the same file and select between them with `--pipeline NAME`.
+`[adapter.*]` blocks define connections. `[pipeline.*]` blocks tie them together. Select between pipelines with `--pipeline NAME`.
 
-Set the environment variables:
+Export the referenced environment variables before running Rocky (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, etc.).
 
-```bash
-export DATABRICKS_HOST="your-workspace.cloud.databricks.com"
-export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/abc123"
-export DATABRICKS_TOKEN="dapi..."
-export FIVETRAN_DESTINATION_ID="your_destination_id"
-export FIVETRAN_API_KEY="your_api_key"
-export FIVETRAN_API_SECRET="your_api_secret"
-```
-
-## 3. Validate Your Config
+## 3. Validate
 
 ```bash
 rocky validate
 ```
 
-Expected output:
+Checks config syntax and adapter wiring. Does not call external APIs.
 
-```
-  ok  Config syntax valid (v2 format)
-  ok  adapter.fivetran: fivetran
-  ok  adapter.prod: databricks (auth configured)
-  ok  pipeline.bronze: schema pattern parseable
-  ok  pipeline.bronze: replication / incremental -> warehouse / stage__{source}
-
-Validation complete.
-```
-
-`rocky validate` only checks the config — it does not call the Fivetran or Databricks APIs.
-
-## 4. Discover Sources
+## 4. Discover
 
 ```bash
 rocky -o table discover
 ```
 
-This calls the Fivetran API and lists all connectors that match the schema pattern:
-
-```
-connector_abc | tenant=acme regions=[us_west] source=shopify | 12 tables
-connector_def | tenant=acme regions=[us_west] source=stripe  | 8 tables
-connector_ghi | tenant=globex regions=[emea] source=hubspot  | 15 tables
-```
+Calls the Fivetran API and lists connectors matching the schema pattern.
 
 ## 5. Preview the SQL
 
@@ -127,79 +91,34 @@ connector_ghi | tenant=globex regions=[emea] source=hubspot  | 15 tables
 rocky plan --filter tenant=acme
 ```
 
-This shows the SQL Rocky will generate without executing it:
+Shows the SQL Rocky will generate, without executing it.
 
-```sql
--- create_catalog (acme_warehouse)
-CREATE CATALOG IF NOT EXISTS acme_warehouse;
-
--- create_schema (acme_warehouse.staging__us_west__shopify)
-CREATE SCHEMA IF NOT EXISTS acme_warehouse.staging__us_west__shopify;
-
--- incremental_copy (acme_warehouse.staging__us_west__shopify.orders)
-INSERT INTO acme_warehouse.staging__us_west__shopify.orders
-SELECT *, CAST(NULL AS STRING) AS _loaded_by
-FROM source_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM acme_warehouse.staging__us_west__shopify.orders
-);
-```
-
-## 6. Run the Pipeline
+## 6. Run
 
 ```bash
 rocky run --filter tenant=acme
 ```
 
-This executes the full pipeline:
+Executes the full pipeline: discover → create catalogs/schemas → detect drift → copy data → run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
 
-1. Discovers sources from Fivetran
-2. Creates catalogs and schemas as needed and applies governance
-3. Detects schema drift between source and target
-4. Copies data incrementally (or full refresh if drift forces it)
-5. Runs data quality checks (row count, column match, freshness)
-
-The JSON output includes materializations, check results, drift actions, and permissions:
-
-```json
-{
-  "version": "1.6.0",
-  "command": "run",
-  "filter": "tenant=acme",
-  "duration_ms": 45200,
-  "tables_copied": 20,
-  "materializations": [...],
-  "check_results": [...],
-  "permissions": { "catalogs_created": 1, "schemas_created": 2 },
-  "drift": { "tables_checked": 20, "tables_drifted": 0 }
-}
-```
-
-If a run fails partway through, you can resume from the last checkpoint instead of rerunning everything:
+Resume from the last checkpoint after a failure:
 
 ```bash
 rocky run --filter tenant=acme --resume-latest
 ```
 
-## 7. Check State
+## 7. Inspect state
 
 ```bash
 rocky state
 ```
 
-Shows stored watermarks for each table:
+Shows stored watermarks for every table.
 
-```
-acme_warehouse.staging__us_west__shopify.orders | 2026-03-30T10:00:00Z | 2026-03-30T10:01:32Z
-acme_warehouse.staging__us_west__shopify.customers | 2026-03-30T10:00:00Z | 2026-03-30T10:01:35Z
-```
+## Next steps
 
-## Next Steps
-
-- Try the [playground](/guides/playground/) for a credential-free DuckDB version of this flow
-- Learn about [schema patterns](/concepts/schema-patterns/) to customize source-to-target mapping
-- Add [transformation models](/concepts/silver-layer/) for custom SQL
-- Configure [data quality checks](/features/data-quality-checks/)
-- Set up [permissions](/features/permissions/) for RBAC
-- Integrate with [Dagster](/dagster/introduction/) for orchestration
+- [Playground](/guides/playground/) — credential-free DuckDB version
+- [Schema patterns](/concepts/schema-patterns/) — customize source-to-target mapping
+- [Silver layer](/concepts/silver-layer/) — add transformation models
+- [Data quality checks](/features/data-quality-checks/)
+- [Dagster integration](/dagster/introduction/)
