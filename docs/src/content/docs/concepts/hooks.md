@@ -41,7 +41,9 @@ Events are organized into five phases:
 
 | Event | When | Use case |
 |-------|------|----------|
-| `check_result` | Quality check completes | Threshold alerting |
+| `before_checks` | Quality checks begin | Mute downstream alerts during expected check windows |
+| `check_result` | A quality check completes | Per-check threshold alerting |
+| `after_checks` | All checks finish | Aggregate summary to dashboards, gating on total pass rate |
 | `drift_detected` | Schema drift found | Schema change notification |
 | `anomaly_detected` | Row count anomaly | Data quality alert |
 

@@ -331,4 +331,73 @@ rocky ci --models src/models --contracts src/contracts
 
 - [`rocky compile`](#rocky-compile) -- compile step only
 - [`rocky test`](#rocky-test) -- test step only
+- [`rocky ci-diff`](#rocky-ci-diff) -- structural diff of changed models vs a base git ref
 - [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- validate config (often run before CI)
+
+---
+
+## `rocky ci-diff`
+
+Detect which models changed between a base git ref and `HEAD`, compile both sides, and report added/modified/removed columns. Emits both JSON (for CI pipelines) and a pre-rendered Markdown block suitable for posting as a PR comment.
+
+```bash
+rocky ci-diff [base_ref] [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-only <base_ref> HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+
+### Examples
+
+Diff the current branch against `main`:
+
+```bash
+rocky ci-diff
+```
+
+```json
+{
+  "version": "1.7.0",
+  "command": "ci-diff",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "summary": {
+    "added": 1,
+    "modified": 2,
+    "removed": 0
+  },
+  "models": [
+    {
+      "model": "fct_orders",
+      "status": "modified",
+      "columns": [
+        { "name": "order_status", "change": "added" },
+        { "name": "amount_cents", "change": "type_changed", "from": "INT", "to": "BIGINT" }
+      ]
+    }
+  ],
+  "markdown": "### Model diff vs `main`\n\n| Model | Status | ... |"
+}
+```
+
+Diff against a feature-branch base and a non-default models directory:
+
+```bash
+rocky ci-diff release/2026-04 --models src/models
+```
+
+The `markdown` field holds a ready-to-post report; in a GitHub Actions workflow you can `jq -r .markdown` the JSON output and feed it into `gh pr comment`.
+
+### Related Commands
+
+- [`rocky ci`](#rocky-ci) -- full compile + test for CI
+- [`rocky compile`](#rocky-compile) -- compile a single branch without diffing
