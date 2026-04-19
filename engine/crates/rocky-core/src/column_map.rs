@@ -19,10 +19,7 @@ pub fn build_column_map(columns: &[ColumnInfo]) -> HashMap<String, &ColumnInfo> 
 /// hoist the set construction so the lowercase pass happens once per
 /// exclude list, not once per call (§P4.1). Use
 /// [`build_exclude_set`] to construct one from a `&[String]`.
-pub fn build_column_name_set(
-    columns: &[ColumnInfo],
-    exclude: &HashSet<String>,
-) -> HashSet<String> {
+pub fn build_column_name_set(columns: &[ColumnInfo], exclude: &HashSet<String>) -> HashSet<String> {
     columns
         .iter()
         .map(|c| c.name.to_lowercase())

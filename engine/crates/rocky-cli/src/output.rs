@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{DefaultHasher, Hasher};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
