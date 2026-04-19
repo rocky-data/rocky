@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
+use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -277,6 +278,16 @@ impl DatabricksConnector {
                             );
                             return Err(ConnectorError::RetryBudgetExhausted { limit });
                         }
+                        // §P2.8 emit site: retry-about-to-fire with structured
+                        // attempt / classification so event-bus subscribers
+                        // (Dagster, dashboards) can tell "retry 2/5" from
+                        // terminal failure without string-matching.
+                        global_event_bus().emit(
+                            PipelineEvent::new("statement_retry")
+                                .with_error(err.to_string())
+                                .with_attempt(attempt + 1, retry.max_retries)
+                                .with_error_class(classify_error(&err)),
+                        );
                         rocky_observe::metrics::METRICS.inc_retries_attempted();
                         // 401 typically means the OAuth token expired between
                         // cache-mint and server-use. Drop the cache so the
@@ -473,6 +484,39 @@ fn is_transient(err: &ConnectorError) -> bool {
         | ConnectorError::UnexpectedState { .. }
         | ConnectorError::CircuitBreakerOpen { .. }
         | ConnectorError::RetryBudgetExhausted { .. } => false,
+    }
+}
+
+/// Maps a `ConnectorError` to the structured `ErrorClass` carried on
+/// `PipelineEvent` — §P2.8. Feeds the event-bus emission from the retry
+/// loop so downstream observers (metrics, Dagster) can distinguish
+/// transient from terminal without string-matching.
+fn classify_error(err: &ConnectorError) -> ErrorClass {
+    match err {
+        ConnectorError::ApiError { status: 401, .. } => ErrorClass::Auth,
+        ConnectorError::ApiError { status: 429, .. } => ErrorClass::RateLimit,
+        ConnectorError::ApiError { status, .. } if matches!(status, 502 | 503 | 504) => {
+            ErrorClass::Transient
+        }
+        ConnectorError::ApiError { status: 400, .. } => ErrorClass::Config,
+        ConnectorError::ApiError { .. } => ErrorClass::Permanent,
+        ConnectorError::Http(e) if e.is_timeout() => ErrorClass::Timeout,
+        ConnectorError::Http(e) if e.is_connect() => ErrorClass::Transient,
+        ConnectorError::Http(_) => ErrorClass::Transient,
+        ConnectorError::Timeout { .. } => ErrorClass::Timeout,
+        ConnectorError::Auth(_) => ErrorClass::Auth,
+        ConnectorError::CircuitBreakerOpen { .. } => ErrorClass::Transient,
+        ConnectorError::RetryBudgetExhausted { .. } => ErrorClass::Permanent,
+        ConnectorError::StatementFailed { .. } => {
+            if is_transient(err) {
+                ErrorClass::Transient
+            } else {
+                ErrorClass::Permanent
+            }
+        }
+        ConnectorError::Canceled { .. } | ConnectorError::UnexpectedState { .. } => {
+            ErrorClass::Permanent
+        }
     }
 }
 

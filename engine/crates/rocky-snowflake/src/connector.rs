@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
+use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -267,6 +268,13 @@ impl SnowflakeConnector {
                             );
                             return Err(ConnectorError::RetryBudgetExhausted { limit });
                         }
+                        // §P2.8 retry event emission — see databricks/connector.rs
+                        global_event_bus().emit(
+                            PipelineEvent::new("statement_retry")
+                                .with_error(err.to_string())
+                                .with_attempt(attempt + 1, retry.max_retries)
+                                .with_error_class(classify_error(&err)),
+                        );
                         // 401 from Snowflake often means the cached keypair
                         // JWT crossed the server-side expiry boundary between
                         // mint and request. Drop the cache so the next
@@ -445,6 +453,34 @@ fn is_transient(err: &ConnectorError) -> bool {
         ConnectorError::Auth(_)
         | ConnectorError::CircuitBreakerOpen { .. }
         | ConnectorError::RetryBudgetExhausted { .. } => false,
+    }
+}
+
+/// Maps `ConnectorError` to the structured [`ErrorClass`] surfaced on
+/// retry `PipelineEvent`s (§P2.8).
+fn classify_error(err: &ConnectorError) -> ErrorClass {
+    match err {
+        ConnectorError::ApiError { status: 401, .. } => ErrorClass::Auth,
+        ConnectorError::ApiError { status: 429, .. } => ErrorClass::RateLimit,
+        ConnectorError::ApiError { status, .. } if matches!(status, 502 | 503 | 504) => {
+            ErrorClass::Transient
+        }
+        ConnectorError::ApiError { status: 400, .. } => ErrorClass::Config,
+        ConnectorError::ApiError { .. } => ErrorClass::Permanent,
+        ConnectorError::Http(e) if e.is_timeout() => ErrorClass::Timeout,
+        ConnectorError::Http(e) if e.is_connect() => ErrorClass::Transient,
+        ConnectorError::Http(_) => ErrorClass::Transient,
+        ConnectorError::Timeout { .. } => ErrorClass::Timeout,
+        ConnectorError::Auth(_) => ErrorClass::Auth,
+        ConnectorError::CircuitBreakerOpen { .. } => ErrorClass::Transient,
+        ConnectorError::RetryBudgetExhausted { .. } => ErrorClass::Permanent,
+        ConnectorError::StatementFailed { .. } => {
+            if is_transient(err) {
+                ErrorClass::Transient
+            } else {
+                ErrorClass::Permanent
+            }
+        }
     }
 }
 

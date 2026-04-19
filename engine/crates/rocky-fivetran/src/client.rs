@@ -3,6 +3,7 @@ use std::time::Duration;
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::redacted::RedactedString;
+use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -106,6 +107,18 @@ impl FivetranClient {
         }
     }
 
+    /// §P2.8 retry-event emission. Every retry-about-to-fire point in `get` /
+    /// `get_single_page` should call this so event-bus subscribers see
+    /// structured attempt count + classification instead of free-form text.
+    fn emit_retry_event(&self, attempt: u32, reason: &str, class: ErrorClass) {
+        global_event_bus().emit(
+            PipelineEvent::new("http_retry")
+                .with_error(reason.to_string())
+                .with_attempt(attempt + 1, self.retry.max_retries)
+                .with_error_class(class),
+        );
+    }
+
     /// GET request with automatic response envelope unwrapping and retry on transient errors.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, FivetranError> {
         let url = format!("{}{}", self.base_url, path);
@@ -126,6 +139,12 @@ impl FivetranClient {
                     if attempt < self.retry.max_retries && (e.is_connect() || e.is_timeout()) =>
                 {
                     self.check_retry_budget()?;
+                    let class = if e.is_timeout() {
+                        ErrorClass::Timeout
+                    } else {
+                        ErrorClass::Transient
+                    };
+                    self.emit_retry_event(attempt, &e.to_string(), class);
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(attempt = attempt + 1, backoff_ms = backoff.as_millis() as u64, error = %e, "transient HTTP error, retrying");
                     tokio::time::sleep(backoff).await;
@@ -137,6 +156,7 @@ impl FivetranClient {
             if resp.status() == 429 {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
+                    self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
                         attempt = attempt + 1,
@@ -152,6 +172,11 @@ impl FivetranClient {
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
+                self.emit_retry_event(
+                    attempt,
+                    &format!("HTTP {status}"),
+                    ErrorClass::Transient,
+                );
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
                     attempt = attempt + 1,
@@ -244,6 +269,12 @@ impl FivetranClient {
                     if attempt < self.retry.max_retries && (e.is_connect() || e.is_timeout()) =>
                 {
                     self.check_retry_budget()?;
+                    let class = if e.is_timeout() {
+                        ErrorClass::Timeout
+                    } else {
+                        ErrorClass::Transient
+                    };
+                    self.emit_retry_event(attempt, &e.to_string(), class);
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(attempt = attempt + 1, backoff_ms = backoff.as_millis() as u64, error = %e, "transient HTTP error, retrying page");
                     tokio::time::sleep(backoff).await;
@@ -255,6 +286,7 @@ impl FivetranClient {
             if resp.status() == 429 {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
+                    self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
                         attempt = attempt + 1,
@@ -270,6 +302,11 @@ impl FivetranClient {
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
+                self.emit_retry_event(
+                    attempt,
+                    &format!("HTTP {status}"),
+                    ErrorClass::Transient,
+                );
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
                     attempt = attempt + 1,
