@@ -465,6 +465,17 @@ pub struct RetryConfig {
     /// Default: 5. Set to 0 to disable.
     #[serde(default = "default_circuit_breaker_threshold")]
     pub circuit_breaker_threshold: u32,
+    /// Cross-statement retry budget for a single run (§P2.7). When set,
+    /// adapters construct a [`crate::retry_budget::RetryBudget`] from this
+    /// value and decrement it on every retry; once exhausted, remaining
+    /// statements fail fast with adapter-specific `RetryBudgetExhausted`
+    /// errors instead of burning the warehouse's rate-limit quota.
+    ///
+    /// `None` (default) keeps legacy behaviour — per-statement
+    /// [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no
+    /// retries are allowed for the whole run.
+    #[serde(default)]
+    pub max_retries_per_run: Option<u32>,
 }
 
 impl Default for RetryConfig {
@@ -476,6 +487,7 @@ impl Default for RetryConfig {
             backoff_multiplier: default_backoff_multiplier(),
             jitter: default_jitter(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            max_retries_per_run: None,
         }
     }
 }

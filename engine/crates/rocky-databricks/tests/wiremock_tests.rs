@@ -59,6 +59,7 @@ fn test_connector_with_retries(server: &MockServer, max_retries: u32) -> Databri
             backoff_multiplier: 1.0,
             jitter: false,
             circuit_breaker_threshold: 0, // Disable circuit breaker for retry tests
+            ..Default::default()
         },
     };
 
@@ -218,6 +219,62 @@ async fn test_retry_on_429() {
     let result = connector.execute_sql("SELECT 1").await.unwrap();
 
     assert_eq!(result.statement_id, "stmt-retry");
+}
+
+/// §P2.7: retry budget caps total retries across the connector's lifetime.
+/// With max_retries=5 but budget=2, a 429-spewing server exhausts the budget
+/// on the second retry and short-circuits with `RetryBudgetExhausted`.
+#[tokio::test]
+async fn test_retry_budget_exhausted_short_circuits() {
+    let server = MockServer::start().await;
+
+    // Server always returns 429 — budget, not per-statement retries, should
+    // be what stops us.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = test_connector_with_retries(&server, 5)
+        .with_retry_budget(rocky_core::retry_budget::RetryBudget::new(2));
+
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("429-spewing server should error");
+    match err {
+        ConnectorError::RetryBudgetExhausted { limit } => assert_eq!(limit, 2),
+        other => panic!("expected RetryBudgetExhausted, got: {other:?}"),
+    }
+}
+
+/// §P2.7: an unbounded budget behaves like legacy — per-statement
+/// `max_retries` is the only cap. Exhausted per-statement retries surface as
+/// the underlying transient error, not `RetryBudgetExhausted`.
+#[tokio::test]
+async fn test_unbounded_budget_preserves_legacy_exhaustion() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    // max_retries = 1 → one attempt + one retry before legacy exhaustion.
+    let connector = test_connector_with_retries(&server, 1);
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("legacy retry limit should still fail");
+    match err {
+        ConnectorError::ApiError { status: 429, .. } => {} // expected
+        ConnectorError::RetryBudgetExhausted { .. } => {
+            panic!("unbounded budget should never produce RetryBudgetExhausted");
+        }
+        other => panic!("expected ApiError(429), got: {other:?}"),
+    }
 }
 
 /// Retry on 503: mock returns 503 once, then 200 on retry.

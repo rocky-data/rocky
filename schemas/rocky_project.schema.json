@@ -148,7 +148,8 @@
             "initial_backoff_ms": 1000,
             "jitter": true,
             "max_backoff_ms": 30000,
-            "max_retries": 3
+            "max_retries": 3,
+            "max_retries_per_run": null
           },
           "description": "Retry policy for this adapter."
         },
@@ -1831,6 +1832,16 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "max_retries_per_run": {
+          "default": null,
+          "description": "Cross-statement retry budget for a single run (§P2.7). When set, adapters construct a [`crate::retry_budget::RetryBudget`] from this value and decrement it on every retry; once exhausted, remaining statements fail fast with adapter-specific `RetryBudgetExhausted` errors instead of burning the warehouse's rate-limit quota.\n\n`None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"

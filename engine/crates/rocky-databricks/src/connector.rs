@@ -35,6 +35,9 @@ pub enum ConnectorError {
 
     #[error("circuit breaker tripped after {consecutive_failures} consecutive transient failures")]
     CircuitBreakerOpen { consecutive_failures: u32 },
+
+    #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
+    RetryBudgetExhausted { limit: u32 },
 }
 
 /// Configuration for the Databricks SQL connector.
@@ -68,6 +71,9 @@ pub struct DatabricksConnector {
     client: Client,
     /// Consecutive transient failures (shared across clones for circuit breaker).
     consecutive_failures: std::sync::Arc<AtomicU32>,
+    /// Shared retry budget across the run (§P2.7). Unbounded by default —
+    /// set via [`ConnectorConfig::retry::max_retries_per_run`].
+    retry_budget: rocky_core::retry_budget::RetryBudget,
     /// Override for the base URL scheme + host (used by tests to point at wiremock).
     #[cfg(any(test, feature = "test-support"))]
     base_url_override: Option<String>,
@@ -147,6 +153,8 @@ pub struct QueryResult {
 impl DatabricksConnector {
     /// Creates a new connector with the given configuration and auth provider.
     pub fn new(config: ConnectorConfig, auth: Auth) -> Self {
+        let retry_budget =
+            rocky_core::retry_budget::RetryBudget::from_config(config.retry.max_retries_per_run);
         DatabricksConnector {
             config,
             auth,
@@ -158,9 +166,19 @@ impl DatabricksConnector {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             consecutive_failures: std::sync::Arc::new(AtomicU32::new(0)),
+            retry_budget,
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }
+    }
+
+    /// Override the run-level [`RetryBudget`](rocky_core::retry_budget::RetryBudget).
+    /// Used by `rocky run` when multiple adapters should share one budget; not
+    /// required for single-adapter setups.
+    #[must_use]
+    pub fn with_retry_budget(mut self, budget: rocky_core::retry_budget::RetryBudget) -> Self {
+        self.retry_budget = budget;
+        self
     }
 
     /// Creates a connector that points at a custom base URL (for testing with wiremock).
@@ -244,6 +262,21 @@ impl DatabricksConnector {
                         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
+                        // Run-level retry budget (§P2.7). If exhausted, abort
+                        // remaining retries so one bad statement can't drain
+                        // the adapter's rate-limit quota for the rest of the
+                        // run. Unbounded budgets always consume successfully.
+                        if !self.retry_budget.try_consume() {
+                            let limit = self.retry_budget.total().unwrap_or(0);
+                            warn!(
+                                attempt = attempt + 1,
+                                max_retries = retry.max_retries,
+                                budget_limit = limit,
+                                error = %err,
+                                "retry budget exhausted for this run; aborting further retries",
+                            );
+                            return Err(ConnectorError::RetryBudgetExhausted { limit });
+                        }
                         rocky_observe::metrics::METRICS.inc_retries_attempted();
                         // 401 typically means the OAuth token expired between
                         // cache-mint and server-use. Drop the cache so the
@@ -438,7 +471,8 @@ fn is_transient(err: &ConnectorError) -> bool {
         ConnectorError::Auth(_)
         | ConnectorError::Canceled { .. }
         | ConnectorError::UnexpectedState { .. }
-        | ConnectorError::CircuitBreakerOpen { .. } => false,
+        | ConnectorError::CircuitBreakerOpen { .. }
+        | ConnectorError::RetryBudgetExhausted { .. } => false,
     }
 }
 

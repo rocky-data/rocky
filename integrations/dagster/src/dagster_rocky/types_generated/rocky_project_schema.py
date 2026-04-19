@@ -449,6 +449,12 @@ class RetryConfig(BaseModel):
     """
     Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
     """
+    max_retries_per_run: conint(ge=0) | None = None
+    """
+    Cross-statement retry budget for a single run (§P2.7). When set, adapters construct a [`crate::retry_budget::RetryBudget`] from this value and decrement it on every retry; once exhausted, remaining statements fail fast with adapter-specific `RetryBudgetExhausted` errors instead of burning the warehouse's rate-limit quota.
+
+    `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
+    """
 
 
 class SchemaEvolutionConfig(BaseModel):
@@ -747,6 +753,7 @@ class AdapterConfig(BaseModel):
             "jitter": True,
             "max_backoff_ms": 30000,
             "max_retries": 3,
+            "max_retries_per_run": None,
         },
         validate_default=True,
     )

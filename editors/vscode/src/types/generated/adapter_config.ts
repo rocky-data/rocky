@@ -119,4 +119,10 @@ export interface RetryConfig {
    * Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
    */
   max_retries?: number;
+  /**
+   * Cross-statement retry budget for a single run (§P2.7). When set, adapters construct a [`crate::retry_budget::RetryBudget`] from this value and decrement it on every retry; once exhausted, remaining statements fail fast with adapter-specific `RetryBudgetExhausted` errors instead of burning the warehouse's rate-limit quota.
+   *
+   * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
+   */
+  max_retries_per_run?: number | null;
 }

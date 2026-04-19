@@ -67,6 +67,7 @@ fn test_connector_with_retries(server: &MockServer, max_retries: u32) -> Snowfla
             backoff_multiplier: 1.0,
             jitter: false,
             circuit_breaker_threshold: 0,
+            ..Default::default()
         },
     };
 
