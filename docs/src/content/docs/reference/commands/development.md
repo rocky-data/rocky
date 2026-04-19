@@ -88,7 +88,7 @@ rocky import-dbt [flags]
 
 ### Examples
 
-Import a dbt project:
+Import a dbt project. The output includes counts of what was imported, converted, and skipped, plus detail arrays for warnings and failures:
 
 ```bash
 rocky import-dbt --dbt-project ~/projects/acme-dbt
@@ -98,15 +98,33 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 {
   "version": "1.6.0",
   "command": "import-dbt",
-  "models_imported": 24,
-  "sources_imported": 6,
-  "warnings": [
-    { "model": "stg_payments", "message": "custom Jinja macro 'cents_to_dollars' not translated, left as comment" },
-    { "model": "fct_orders", "message": "incremental_strategy 'merge' converted to Rocky incremental with note" }
+  "import_method": "manifest",
+  "project_name": "acme_dbt",
+  "dbt_version": "1.9.2",
+  "imported": 24,
+  "failed": 0,
+  "warnings": 2,
+  "sources_found": 6,
+  "sources_mapped": 6,
+  "tests_found": 18,
+  "tests_converted": 16,
+  "tests_converted_custom": 0,
+  "tests_skipped": 2,
+  "macros_detected": 3,
+  "imported_models": ["stg_orders", "stg_customers", "fct_revenue", "…"],
+  "warning_details": [
+    {
+      "model": "stg_payments",
+      "category": "macro",
+      "message": "custom Jinja macro 'cents_to_dollars' left as comment",
+      "suggestion": "Inline the macro body or rewrite as a CTE"
+    }
   ],
-  "output_dir": "models/"
+  "failed_details": []
 }
 ```
+
+`import_method` is `"manifest"` when a compiled `target/manifest.json` is available (pre-resolved Jinja), or `"regex"` when Rocky parses the raw `.sql` files directly. Pass `--manifest <path>` or `--no-manifest` to force one mode.
 
 Import to a custom output directory:
 
@@ -114,18 +132,7 @@ Import to a custom output directory:
 rocky import-dbt --dbt-project ~/projects/acme-dbt --output src/models
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "import-dbt",
-  "models_imported": 24,
-  "sources_imported": 6,
-  "warnings": [],
-  "output_dir": "src/models/"
-}
-```
-
-Import and then compile to verify:
+Same shape. Import and then compile to verify in one step:
 
 ```bash
 rocky import-dbt --dbt-project ~/projects/acme-dbt && rocky compile
