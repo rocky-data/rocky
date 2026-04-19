@@ -289,11 +289,17 @@ impl DatabricksConnector {
                                 .with_error_class(classify_error(&err)),
                         );
                         rocky_observe::metrics::METRICS.inc_retries_attempted();
-                        // 401 typically means the OAuth token expired between
-                        // cache-mint and server-use. Drop the cache so the
-                        // next attempt triggers a fresh token exchange;
-                        // genuine bad credentials re-fail and exhaust retries.
-                        if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
+                        // 401/403 typically mean the OAuth token expired
+                        // between cache-mint and server-use. Databricks
+                        // returns 403 "Invalid Token" from some SQL
+                        // endpoints where 401 would be more idiomatic.
+                        // Drop the cache so the next attempt triggers a
+                        // fresh token exchange; genuine bad credentials
+                        // re-fail and exhaust retries.
+                        if matches!(
+                            &err,
+                            ConnectorError::ApiError { status: 401 | 403, .. }
+                        ) {
                             self.auth.invalidate_cache().await;
                         }
                         let backoff_ms = compute_backoff(retry, attempt);
@@ -463,10 +469,16 @@ fn check_terminal_state(response: StatementResponse) -> Result<StatementResponse
 /// - Statement execution timeouts (may succeed on retry with a warmed-up warehouse)
 fn is_transient(err: &ConnectorError) -> bool {
     match err {
-        // 401 is transient-on-first-retry — the connector drops the OAuth
-        // cache before retrying, so a server-expired token is replaced with
-        // a fresh exchange. Bad credentials re-fail on every attempt.
-        ConnectorError::ApiError { status, .. } => matches!(status, 401 | 429 | 502 | 503 | 504),
+        // 401 and 403 are transient-on-first-retry — the connector drops
+        // the OAuth cache before retrying, so a server-expired token is
+        // replaced with a fresh exchange. Bad credentials re-fail on
+        // every attempt. Databricks's SQL Statement Execution API
+        // returns 403 "Invalid Token" where 401 would be more idiomatic;
+        // both paths must flow through the token-refresh branch or
+        // long-running operations die at the 1-hour OAuth TTL boundary.
+        ConnectorError::ApiError { status, .. } => {
+            matches!(status, 401 | 403 | 429 | 502 | 503 | 504)
+        }
         ConnectorError::Http(e) => e.is_connect() || e.is_timeout(),
         ConnectorError::StatementFailed { message, .. } => {
             let msg = message.to_uppercase();
@@ -673,6 +685,21 @@ mod tests {
         let err = ConnectorError::ApiError {
             status: 401,
             body: "unauthorized".into(),
+        };
+        assert!(is_transient(&err));
+    }
+
+    #[test]
+    fn test_transient_http_403_invalid_token() {
+        // Databricks's SQL Statement Execution API returns 403 "Invalid
+        // Token" where 401 would be more idiomatic. Without this in the
+        // transient set, the connector never drops the expired OAuth
+        // token and every subsequent call fails for the rest of the run
+        // (seen on a dedup sweep that crossed the 1-hour OAuth TTL
+        // boundary mid-execution).
+        let err = ConnectorError::ApiError {
+            status: 403,
+            body: "Invalid Token".into(),
         };
         assert!(is_transient(&err));
     }
