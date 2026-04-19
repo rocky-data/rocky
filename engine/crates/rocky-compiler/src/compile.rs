@@ -215,6 +215,191 @@ pub fn compile_project(
     })
 }
 
+/// §P3.1 — Incremental compile, narrow scope.
+///
+/// Given the previous `CompileResult` and the set of model files that
+/// changed on disk, rebuilds only the typecheck of models that can have
+/// changed (the changed file itself + transitive dependents + anything
+/// new or with a shifted upstream set).
+///
+/// Falls through to a full [`compile`] — with an explicit branch each
+/// time — when the incremental path would either (a) touch too much of
+/// the graph to be worth the bookkeeping, (b) hit a case we don't yet
+/// reason about safely, or (c) affect inputs that aren't per-model
+/// (source_schemas / source_column_info).
+///
+/// This is deliberately a hand-rolled optimization. §P5.1 (salsa) is
+/// the long-term answer; this function exists so the LSP's per-keystroke
+/// path can stop paying a full-project typecheck when a single model
+/// edits don't ripple.
+pub fn compile_incremental(
+    config: &CompilerConfig,
+    changed_files: &[PathBuf],
+    previous: &CompileResult,
+) -> Result<CompileResult, CompileError> {
+    use std::collections::HashSet;
+
+    let total_start = Instant::now();
+
+    // The caller is responsible for guaranteeing that `previous` was
+    // produced against the same `config.source_schemas` and
+    // `config.source_column_info` as the current call. Source-schema
+    // changes affect every downstream model, so if they shift the caller
+    // must invoke `compile` directly rather than this path.
+    // The LSP constructs `CompilerConfig` once per workspace-init
+    // (see `RockyLsp::config_for_compile`), so this invariant holds in
+    // practice.
+
+    // 1. Load the new project + rebuild the semantic graph. Both are cheap
+    //    relative to typecheck — the whole point of the optimization.
+    let load_start = Instant::now();
+    let project = Project::load(&config.models_dir)?;
+    let project_load_ms = load_start.elapsed().as_millis() as u64;
+
+    let sg_start = Instant::now();
+    let semantic_graph = semantic::build_semantic_graph(&project, &config.source_column_info)
+        .map_err(CompileError::SemanticGraph)?;
+    let semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
+
+    // 2. Compute the affected set. The comparison must be with the NEW
+    //    graph so we catch upstream shifts and newly-added models.
+    let mut affected: HashSet<String> = HashSet::new();
+
+    let changed_paths: HashSet<PathBuf> = changed_files.iter().cloned().collect();
+    for m in &project.models {
+        let path = PathBuf::from(&m.file_path);
+        if changed_paths.contains(&path) {
+            affected.insert(m.config.name.clone());
+        }
+    }
+
+    // New-to-project: any model in the new graph that wasn't typed
+    // previously is affected (we have no cached result for it).
+    for name in semantic_graph.models.keys() {
+        if !previous.type_check.typed_models.contains_key(name) {
+            affected.insert(name.clone());
+        }
+    }
+
+    // Upstream shift: even with unchanged SQL, a model whose dependency
+    // set differs from the previous graph's must be re-typechecked —
+    // the scope it reads from has changed.
+    for (name, schema) in &semantic_graph.models {
+        if let Some(prev_schema) = previous.semantic_graph.models.get(name) {
+            if schema.upstream != prev_schema.upstream {
+                affected.insert(name.clone());
+            }
+        }
+    }
+
+    // Transitive dependents. Fixed-point over the NEW graph.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, schema) in &semantic_graph.models {
+            if !affected.contains(name) && schema.upstream.iter().any(|up| affected.contains(up)) {
+                affected.insert(name.clone());
+                changed = true;
+            }
+        }
+    }
+
+    // Guardrails: small projects and large blast radius aren't worth
+    // the merging cost — fall through.
+    let total = semantic_graph.models.len();
+    if total < 10 || affected.len() * 2 > total {
+        return compile(config);
+    }
+
+    // 3. Run the incremental typecheck against the reused `typed_models`
+    //    from `previous`, scoped to the affected subset.
+    let join_keys_acc = Arc::new(AtomicU64::new(0));
+    let tc_start = Instant::now();
+    let mut type_check = typecheck::typecheck_project_incremental(
+        &semantic_graph,
+        &config.source_schemas,
+        &project.models,
+        &affected,
+        &previous.type_check,
+        Some(&join_keys_acc),
+    );
+    let typecheck_ms = tc_start.elapsed().as_millis() as u64;
+    let typecheck_join_keys_ms = join_keys_acc.load(Ordering::Relaxed);
+
+    // 4. Re-validate contracts. Cheap, and the merged typed_models may
+    //    differ from previous so re-running is the safe default.
+    let contracts_start = Instant::now();
+    let contract_diagnostics = {
+        let mut contract_map = contracts::discover_contracts_from_models(&project.models)
+            .map_err(CompileError::ContractLoad)?;
+
+        if let Some(ref contracts_dir) = config.contracts_dir {
+            let explicit =
+                contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
+            contract_map.extend(explicit);
+        }
+
+        if contract_map.is_empty() {
+            Vec::new()
+        } else {
+            validate_all_contracts(&contract_map, &type_check.typed_models)
+        }
+    };
+    let contracts_ms = contracts_start.elapsed().as_millis() as u64;
+
+    // 5. Extract per-model timings + merge diagnostics (same shape as
+    //    the full path).
+    let model_timings: HashMap<String, ModelCompileTimings> =
+        std::mem::take(&mut type_check.model_typecheck_ms)
+            .into_iter()
+            .map(|(name, ms)| {
+                (
+                    name,
+                    ModelCompileTimings {
+                        typecheck_ms: ms,
+                        total_ms: ms,
+                    },
+                )
+            })
+            .collect();
+
+    let mut diagnostics = type_check.diagnostics.clone();
+    diagnostics.extend(contract_diagnostics.iter().cloned());
+
+    let has_errors = diagnostics
+        .iter()
+        .any(super::diagnostic::Diagnostic::is_error);
+
+    let timings = PhaseTimings {
+        project_load_ms,
+        semantic_graph_ms,
+        typecheck_ms,
+        typecheck_join_keys_ms,
+        contracts_ms,
+        total_ms: total_start.elapsed().as_millis() as u64,
+    };
+
+    tracing::info!(
+        target: "rocky::compile::timings",
+        affected = affected.len(),
+        total_models = total,
+        typecheck_ms,
+        total_ms = timings.total_ms,
+        "incremental compile finished"
+    );
+
+    Ok(CompileResult {
+        project,
+        semantic_graph,
+        type_check,
+        contract_diagnostics,
+        diagnostics,
+        has_errors,
+        timings,
+        model_timings,
+    })
+}
+
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,

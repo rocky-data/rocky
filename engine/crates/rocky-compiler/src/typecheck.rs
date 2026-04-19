@@ -226,6 +226,187 @@ pub fn typecheck_project_with_models(
     }
 }
 
+/// §P3.1 — Incremental typecheck. Reuses `previous.typed_models` entries for
+/// models that are **not** in `affected`, and re-typechecks only the models
+/// that are.
+///
+/// The caller is responsible for computing a correct `affected` set — any
+/// model whose typecheck inputs may have shifted (own SQL changed, upstream
+/// changed, config changed, new to the project). Members of `affected` that
+/// don't exist in `graph.models` are ignored.
+///
+/// The `reference_map` is always rebuilt in full (SQL scanning is cheap),
+/// and diagnostics / timings are stitched so the result is observationally
+/// identical to a full `typecheck_project_with_models` in shape.
+pub fn typecheck_project_incremental(
+    graph: &SemanticGraph,
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+    models: &[rocky_core::models::Model],
+    affected: &HashSet<String>,
+    previous: &TypeCheckResult,
+    join_keys_acc: Option<&Arc<AtomicU64>>,
+) -> TypeCheckResult {
+    let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut model_typecheck_ms: HashMap<String, u64> = HashMap::with_capacity(graph.models.len());
+
+    let mut model_names: HashSet<String> = HashSet::with_capacity(graph.models.len());
+    model_names.extend(graph.models.keys().cloned());
+
+    let model_by_name: HashMap<&str, &rocky_core::models::Model> =
+        models.iter().map(|m| (m.config.name.as_str(), m)).collect();
+
+    // Files that belong to affected models — any reference_map entry
+    // whose RefLocation.file is in this set came FROM an affected file and
+    // is therefore stale.
+    let affected_files: HashSet<PathBuf> = models
+        .iter()
+        .filter(|m| affected.contains(&m.config.name))
+        .map(|m| PathBuf::from(&m.file_path))
+        .collect();
+
+    // Seed reference_map from `previous`, dropping stale entries (anything
+    // recorded FROM an affected file — those refs were rebuilt below).
+    // Avoids the SQL-reparse cost of running `collect_references` over the
+    // non-affected models, which is the dominant overhead on wide DAGs.
+    let mut reference_map = ReferenceMap {
+        model_refs: previous
+            .reference_map
+            .model_refs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.iter()
+                        .filter(|loc| !affected_files.contains(&loc.file))
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .filter(|(_, v): &(String, Vec<RefLocation>)| !v.is_empty())
+            .collect(),
+        column_refs: previous
+            .reference_map
+            .column_refs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.iter()
+                        .filter(|loc| !affected_files.contains(&loc.file))
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .filter(|(_, v): &((String, String), Vec<RefLocation>)| !v.is_empty())
+            .collect(),
+        model_defs: HashMap::new(),
+    };
+
+    // Register fresh model definition locations for every model in the
+    // current graph (overwrites stale defs from removed models).
+    for m in models {
+        reference_map.model_defs.insert(
+            m.config.name.clone(),
+            RefLocation {
+                file: PathBuf::from(&m.file_path),
+                line: 1,
+                col: 0,
+                end_col: 0,
+            },
+        );
+    }
+
+    // Inject source schemas.
+    for (source_name, cols) in source_schemas {
+        typed_models.insert(source_name.clone(), cols.clone());
+    }
+
+    // Seed typed_models with non-affected entries from the previous result.
+    // Source schemas overlap is fine — we inserted them first, and re-inserting
+    // the same entry from previous.typed_models is idempotent.
+    for (name, cols) in &previous.typed_models {
+        if !affected.contains(name) && graph.models.contains_key(name) {
+            typed_models.insert(name.clone(), cols.clone());
+            // Carry over timing so model_typecheck_ms stays complete.
+            if let Some(&ms) = previous.model_typecheck_ms.get(name) {
+                model_typecheck_ms.insert(name.clone(), ms);
+            }
+        }
+    }
+
+    let layers = derive_execution_layers(graph);
+
+    let mut col_index: HashMap<String, HashMap<String, usize>> =
+        HashMap::with_capacity(typed_models.len());
+    for (name, cols) in typed_models.iter() {
+        let idx: HashMap<String, usize> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        col_index.insert(name.clone(), idx);
+    }
+
+    for layer in &layers {
+        let typed_snapshot = &typed_models;
+        let col_index_snapshot = &col_index;
+
+        let mut layer_outputs: Vec<ModelTypecheckOutput> = layer
+            .par_iter()
+            .with_min_len(32)
+            .filter_map(|model_name| {
+                if !affected.contains(model_name.as_str()) {
+                    return None;
+                }
+                let model_schema = graph.model_schema(model_name)?;
+                Some(compute_model_typecheck(
+                    model_name,
+                    model_schema,
+                    graph,
+                    typed_snapshot,
+                    col_index_snapshot,
+                    &model_by_name,
+                    &model_names,
+                    join_keys_acc,
+                ))
+            })
+            .collect();
+
+        layer_outputs.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+
+        for out in layer_outputs {
+            model_typecheck_ms.insert(out.model_name.clone(), out.typecheck_ms);
+            let idx: HashMap<String, usize> = out
+                .typed_cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.clone(), i))
+                .collect();
+            col_index.insert(out.model_name.clone(), idx);
+            typed_models.insert(out.model_name, out.typed_cols);
+            diagnostics.extend(out.diagnostics);
+            merge_reference_map(&mut reference_map, out.ref_map);
+        }
+    }
+
+    // Carry over non-affected models' diagnostics so the full diagnostic set
+    // reflects the whole project. The affected models produced fresh
+    // diagnostics above; here we stitch in the untouched remainder.
+    for d in &previous.diagnostics {
+        if !affected.contains(&d.model) && graph.models.contains_key(&d.model) {
+            diagnostics.push(d.clone());
+        }
+    }
+
+    TypeCheckResult {
+        typed_models,
+        diagnostics,
+        reference_map,
+        model_typecheck_ms,
+    }
+}
+
 /// Pure per-model output from a single typecheck pass.
 struct ModelTypecheckOutput {
     model_name: String,
