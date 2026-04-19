@@ -1,5 +1,5 @@
 {
-  "version": "1.9.0",
+  "version": "1.10.0",
   "command": "lineage",
   "model": "fct_revenue",
   "column": "total",

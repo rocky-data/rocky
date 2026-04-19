@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-04-20
+
+Closes the active arc of the perf-resilience roadmap. Thirteen release PRs over two days — P3.1 incremental compiler, P3.4 range-protocol half, P3.11 split `rocky-lsp` binary, full 15-event hook lifecycle wired into `rocky run`, cross-adapter shared `RetryBudget`, and a run of `Arc<str>` / `CiKey` alloc-reduction passes through the compiler hot path. Plus two adjacent Databricks fixes.
+
+### Added — split `rocky-lsp` binary (§P3.11)
+
+New `rocky-lsp` binary ships alongside the main `rocky` CLI from this release onwards. Purpose-built for IDE integration: links only `rocky-server` (compiler + LSP surface) + tokio — no adapter graph. Sizes measured on macOS ARM64 release:
+
+| Binary | Size | Contents |
+|---|---|---|
+| `rocky` | 47 MB | CLI + all adapters (Databricks, Snowflake, BigQuery, DuckDB, Fivetran, Airbyte, Iceberg) |
+| `rocky-lsp` | 6.1 MB | LSP only |
+
+The release workflow publishes `rocky-lsp-<target>.{tar.gz|zip}` archives alongside the existing `rocky-*` archives on every platform. The matching VS Code extension release (v1.5.0) prefers `rocky-lsp` when it's on PATH or alongside `rocky.server.path`, falling back to `rocky lsp` otherwise.
+
+### Added — 15-event hook lifecycle in `rocky run` (§P2.6)
+
+`HookRegistry::fire` is now wired into every lifecycle event `rocky run` emits. Hook subscribers — shell commands or webhooks declared in `rocky.toml` — can observe every phase without polling output JSON:
+
+- **Pipeline:** `pipeline_start`, `pipeline_complete`, `pipeline_error`, `wait_async_webhooks` drain before exit.
+- **Discovery / compile:** `discover_complete` (with `connector_count`), `compile_complete` (with `model_count`).
+- **Per-table:** `before_materialize`, `after_materialize` (with `duration_ms`, `row_count`), `materialize_error`.
+- **Per-model:** `before_model_run`, `after_model_run` (with `duration_ms`), `model_error`.
+- **Checks / state:** `before_checks`, `check_result` (per individual check), `after_checks` (roll-up), `drift_detected`, `anomaly_detected`, `state_synced`.
+
+Every error path after `pipeline_start` fires now emits a terminal `pipeline_error` or `pipeline_complete` — including previously-silent `?`-propagations through `execute_models`. Subscribers no longer need a timeout heuristic to detect orphaned runs.
+
+### Added — cross-adapter shared `RetryBudget` via `[retry]` config (§P2.7 extension)
+
+New optional top-level `[retry]` block:
+
+```toml
+[retry]
+max_retries_per_run = 50
+```
+
+When set, `AdapterRegistry` builds one shared `Arc<AtomicI64>` budget and wires it through every adapter (Databricks, Snowflake, Fivetran). Once exhausted, no adapter retries further — prevents one failing endpoint from burning the whole budget pool others could have used. Omit the block for per-adapter budgets (the existing behaviour from v1.9.0).
+
+### Added — `semanticTokens/range` on the LSP server (§P3.4)
+
+The LSP server now advertises `range: Some(true)` and implements `textDocument/semanticTokens/range`. Editors (vscode-languageclient) switch to range requests on scroll instead of always requesting full-document tokens. Response bytes shrink to viewport-only; server compute stays the same on a cache hit. Matches the roadmap's 10–20% per-keystroke estimate on large files.
+
+Cache shape changed from `Vec<SemanticToken>` (post-delta) to `Vec<(u32, u32, u32, u32)>` (pre-delta) so full + range paths share one cache.
+
+### Performance — incremental compiler reuses previous typecheck (§P3.1)
+
+The LSP's per-keystroke compile path is now genuinely incremental. New `rocky_compiler::compile::compile_incremental`:
+
+- Loads the new project + rebuilds the semantic graph (cheap).
+- Computes the affected set against the new graph — changed files, transitive dependents, new-to-project models, and models whose upstream set shifted.
+- Falls through to full `compile()` when the affected blast radius exceeds 50% of the graph, or projects under 10 models (bookkeeping isn't worth it).
+- Otherwise runs `typecheck_project_incremental`, which reuses `previous.typed_models` entries for non-affected models. `reference_map` is seeded from the previous result (dropping entries recorded FROM affected files) and merged with fresh refs — no SQL reparse of the non-affected remainder.
+
+On the `single_file_change/500_models_edit_one_mart` bench: ~24 ms → ~18 ms (~25% faster). Real LSP workloads with complex SQL should see a larger relative win.
+
+**Correctness fix bundled:** the old `compile_incremental` in `rocky-server/src/lsp.rs` wrote back `ReferenceMap::default()` on its "no model files changed" short-circuit, silently breaking Find References / Rename after any incremental compile. The new path preserves the reference map correctly.
+
+### Performance — `Arc`/`CiKey` across the compiler hot path (§P3.5–P3.8, §P4.2)
+
+- **P3.5** `Diagnostic::{code, message}` → `Arc<str>` (5-crate ripple; serde `rc` feature preserves JSON wire format).
+- **P3.6** DSL `Token` content variants → `Arc<str>` (logos callbacks wrap once via `Arc::from`; AST boundary preserved via `.to_string()`).
+- **P3.7** AST sub-expressions (`BinaryOp`, `UnaryOp`, `IsNull`, `InList`, `Match`) → `Arc<Expr>`. Cloning a DSL `Expr` is now a refcount bump per branch instead of a deep tree copy. `Arc` (not `Rc`) because `CompileResult` moves across `spawn_blocking`. Zero ripple outside rocky-lang — `Deref` preserves consumer surface.
+- **P3.8** `TypeScope` uses `CiKey<'static>` + nested `HashMap<CiKey, HashMap<CiKey, V>>` so lookups via `CiStr::new(name)` are alloc-free. ~1M lookup allocations removed per 100-model full compile.
+- **P4.2** `ir.rs` identifier-list fields (`unique_key`, `partition_by`, `ColumnSelection::Explicit`, `columns_to_drop`) → `Vec<Arc<str>>`. Coordinated `SqlDialect::merge_into` trait change across 5 dialect impls (databricks/snowflake/duckdb/bigquery) + 8 rocky-core mocks, all in one atomic commit so there's no per-call `.to_string()` conversion left behind. JSON wire format preserved.
+
+### Added — `PipelineEvent` retry emit sites + cross-dagster bindings
+
+`PipelineEvent` schema (added in v1.9.0 via P2.8) now has emit sites in every adapter's retry loop. Databricks + Snowflake + Fivetran emit `statement_retry` / `http_retry` events with `attempt`, `max_attempts`, and `error_class` fields; subscribers can distinguish "retry 3/5" from "final failure" without string-matching error messages. Pydantic + TypeScript bindings regenerated.
+
+### Added — batched watermark commits + other batch-3 wins
+
+Carried forward from the batch-3 roadmap push (PR #145):
+
+- **P1.6** batched watermark commits — `state_store` flushes watermarks in bulk per run instead of per-table; reduces redb transaction count by ~100× on wide pipelines.
+- **P1.9** `CiKey`/`CiStr` zero-alloc case-insensitive column lookups (`rocky-core/src/column_map.rs`) — replaces per-column `.to_lowercase()` allocs; drift / checks / contracts all lookup via `CiStr::new(name)`.
+- **P2.6** webhook global timeout + async tracking — webhooks run with a per-run watchdog; fire-and-forget handles drain before exit via `wait_async_webhooks()`.
+- **P2.9** env-var-aware TOML parse errors — surfaces `${VAR}` / `${VAR:-default}` substitution failures at parse time with the env-var name in the error message.
+- **P2.10** webhook method validated at config load — unknown HTTP verbs fail early with a sourced diagnostic instead of at fire time.
+- **P2.11** `fail_fast` gates watermark commits — a failing table in `fail_fast` mode no longer advances the watermark for tables still in-flight.
+- **P2.12** dagster JSON parse error UX — unparseable CLI output surfaces the offending byte offset + line instead of a generic `JSONDecodeError`.
+- **P2.13** BigQuery HTTP tuning — bounded connect/read timeouts + retries on transient errors.
+- **P3.2** LSP buffer-hash short-circuit — `didChange` skips recompile when the incoming buffer text hashes to the same value as the last compiled version. ~30% spurious compile cycles eliminated.
+- **P3.3** `spawn_blocking` the full compile — long parse+compile runs on the blocking pool so hover / completion / semantic-token handlers stay responsive.
+- **P3.9** parser error messages → `Cow<'static, str>` — no per-error `format!` when the message is static.
+- **P3.10** fast `rocky --version` / `--help` — cold start ~100 ms → ~10–20 ms. Version and help paths no longer load the adapter registry.
+- **P4.1** column_map exclude set hoisted — signature change: `exclude: &HashSet<String>` (callers keep a prepared set).
+- **P4.3** streaming `sql_fingerprint` — feeds statements into the hasher incrementally instead of `join(";\n")` then hash. Bit-identical output verified by a 6-case test.
+- **P4.4** single-file-change criterion bench — guards the P3.1 incremental-compile gains against regression.
+
 ### Fixed — Databricks OAuth 403 "Invalid Token" → token refresh
 
 `rocky-databricks/src/connector.rs::is_transient` previously classified only 401 as transient-and-refreshable. Databricks's SQL Statement Execution API returns **HTTP 403 "Invalid Token"** where 401 would be more idiomatic, which meant long-running operations that crossed the 1-hour OAuth M2M TTL boundary mid-execution died on the first post-expiry call with no retry and no token refresh.
