@@ -990,10 +990,8 @@ pub async fn run(
     // divided by concurrency; the final end-of-run upload (further below)
     // always flushes state, so the periodic loop only exists to bound
     // exposure for long runs. Runs shorter than ~1 minute skip it entirely.
-    let estimated_run_secs = (tables_to_process.len() as u64)
-        .saturating_mul(3)
-        .checked_div(concurrency.max(1) as u64)
-        .unwrap_or(0);
+    let estimated_run_secs =
+        (tables_to_process.len() as u64).saturating_mul(3) / (concurrency.max(1) as u64);
     let state_sync_handle = if estimated_run_secs < 60 {
         None
     } else {
@@ -1391,7 +1389,7 @@ pub async fn run(
             }
         }
 
-        if let Some(h) = state_sync_handle.as_ref() {
+        if let Some(h) = &state_sync_handle {
             h.abort();
         }
 

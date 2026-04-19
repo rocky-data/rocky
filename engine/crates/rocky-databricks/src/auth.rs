@@ -7,6 +7,12 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// Serve a cached OAuth token only if it still has at least this much
+/// time left. A request in flight when the token crosses the server-side
+/// expiry would otherwise 401; the connector retry loop re-exchanges on
+/// 401, but burning a retry on every refresh boundary is wasteful.
+const REFRESH_SLACK: Duration = Duration::from_secs(60);
+
 /// Errors from Databricks authentication (PAT or OAuth M2M).
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -50,6 +56,25 @@ pub struct Auth {
 pub(crate) struct CachedToken {
     access_token: RedactedString,
     expires_at: Instant,
+}
+
+impl CachedToken {
+    fn is_fresh(&self) -> bool {
+        self.expires_at > Instant::now() + REFRESH_SLACK
+    }
+}
+
+/// Fast-path cache read. Returns the cached token if one exists and is
+/// still within the refresh-slack window; otherwise returns `None` and
+/// the caller is expected to acquire the write lock and exchange for a
+/// new one.
+async fn read_fresh_token(cache: &RwLock<Option<CachedToken>>) -> Option<String> {
+    cache
+        .read()
+        .await
+        .as_ref()
+        .filter(|ct| ct.is_fresh())
+        .map(|ct| ct.access_token.expose().to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,24 +132,13 @@ impl Auth {
                 http_client,
                 cached_token,
             } => {
-                // Check cache (with read lock)
-                {
-                    let cache = cached_token.read().await;
-                    if let Some(ct) = cache.as_ref() {
-                        if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                            return Ok(ct.access_token.expose().to_string());
-                        }
-                    }
+                if let Some(token) = read_fresh_token(cached_token).await {
+                    return Ok(token);
                 }
 
-                // Refresh (with write lock)
                 let mut cache = cached_token.write().await;
-
-                // Double-check after acquiring write lock
-                if let Some(ct) = cache.as_ref() {
-                    if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                        return Ok(ct.access_token.expose().to_string());
-                    }
+                if let Some(ct) = cache.as_ref().filter(|ct| ct.is_fresh()) {
+                    return Ok(ct.access_token.expose().to_string());
                 }
 
                 let token_url = format!("https://{host}/oidc/v1/token");
@@ -142,11 +156,10 @@ impl Auth {
                     .json::<OAuthTokenResponse>()
                     .await?;
 
-                let new_token = CachedToken {
+                *cache = Some(CachedToken {
                     access_token: RedactedString::new(resp.access_token.clone()),
                     expires_at: Instant::now() + Duration::from_secs(resp.expires_in),
-                };
-                *cache = Some(new_token);
+                });
 
                 Ok(resp.access_token)
             }

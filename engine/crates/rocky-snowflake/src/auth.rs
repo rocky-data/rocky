@@ -16,6 +16,18 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// Snowflake's documented JWT lifetime cap is 60 minutes. Minting for
+/// 59 min lets a long-running pipeline cover almost the full hour while
+/// leaving headroom for the refresh-slack check below.
+const JWT_TTL_SECS: u64 = 59 * 60;
+
+/// Serve a cached token only if it still has at least this much time
+/// left. A request in flight when the token crosses the server-side
+/// expiry boundary would otherwise 401; the connector retry loop
+/// re-mints on 401, but burning a retry on every refresh boundary is
+/// wasteful.
+const REFRESH_SLACK: Duration = Duration::from_secs(60);
+
 /// Errors from Snowflake authentication.
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -83,6 +95,26 @@ enum AuthInner {
 struct CachedToken {
     token: RedactedString,
     expires_at: Instant,
+}
+
+impl CachedToken {
+    /// Returns true if the token is valid and not within `REFRESH_SLACK`
+    /// of server-side expiry.
+    fn is_fresh(&self) -> bool {
+        self.expires_at > Instant::now() + REFRESH_SLACK
+    }
+}
+
+/// Fast-path cache read. Returns the cached token if one exists and is
+/// still within the refresh-slack window; otherwise returns `None` and
+/// the caller is expected to acquire the write lock and mint a new one.
+async fn read_fresh_token(cache: &RwLock<Option<CachedToken>>) -> Option<String> {
+    cache
+        .read()
+        .await
+        .as_ref()
+        .filter(|ct| ct.is_fresh())
+        .map(|ct| ct.token.expose().to_string())
 }
 
 /// Snowflake login response (simplified).
@@ -158,26 +190,13 @@ impl Auth {
                 private_key_path,
                 cached_token,
             } => {
-                // Check cache (read lock). Keypair JWTs have a Snowflake-imposed
-                // maximum TTL of 60 minutes; we mint with 59 min and refresh
-                // 60 s before expiry to avoid serving an about-to-expire token.
-                {
-                    let cache = cached_token.read().await;
-                    if let Some(ct) = cache.as_ref() {
-                        if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                            return Ok(ct.token.expose().to_string());
-                        }
-                    }
+                if let Some(token) = read_fresh_token(cached_token).await {
+                    return Ok(token);
                 }
 
-                // Refresh (write lock)
                 let mut cache = cached_token.write().await;
-
-                // Double-check after acquiring write lock
-                if let Some(ct) = cache.as_ref() {
-                    if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                        return Ok(ct.token.expose().to_string());
-                    }
+                if let Some(ct) = cache.as_ref().filter(|ct| ct.is_fresh()) {
+                    return Ok(ct.token.expose().to_string());
                 }
 
                 use base64::Engine;
@@ -214,11 +233,6 @@ impl Auth {
                     .unwrap()
                     .as_secs();
 
-                // Snowflake's documented JWT lifetime cap is 60 min. Minting
-                // for 59 min lets a long-running pipeline cover the full hour
-                // minus the 60 s refresh slack.
-                const JWT_TTL_SECS: u64 = 59 * 60;
-
                 #[derive(serde::Serialize)]
                 struct Claims {
                     iss: String,
@@ -241,11 +255,10 @@ impl Auth {
                 let token = jsonwebtoken::encode(&header, &claims, &encoding_key)
                     .map_err(|e| AuthError::KeyPairInvalid(format!("JWT encode failed: {e}")))?;
 
-                let new_cached = CachedToken {
+                *cache = Some(CachedToken {
                     token: RedactedString::new(token.clone()),
                     expires_at: Instant::now() + Duration::from_secs(JWT_TTL_SECS),
-                };
-                *cache = Some(new_cached);
+                });
 
                 Ok(token)
             }
@@ -257,25 +270,13 @@ impl Auth {
                 http_client,
                 cached_token,
             } => {
-                // Check cache (read lock)
-                {
-                    let cache = cached_token.read().await;
-                    if let Some(ct) = cache.as_ref() {
-                        // Refresh 60s before expiry
-                        if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                            return Ok(ct.token.expose().to_string());
-                        }
-                    }
+                if let Some(token) = read_fresh_token(cached_token).await {
+                    return Ok(token);
                 }
 
-                // Refresh (write lock)
                 let mut cache = cached_token.write().await;
-
-                // Double-check after acquiring write lock
-                if let Some(ct) = cache.as_ref() {
-                    if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                        return Ok(ct.token.expose().to_string());
-                    }
+                if let Some(ct) = cache.as_ref().filter(|ct| ct.is_fresh()) {
+                    return Ok(ct.token.expose().to_string());
                 }
 
                 let url =
