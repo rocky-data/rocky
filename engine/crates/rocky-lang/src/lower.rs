@@ -3,6 +3,9 @@
 //! Compiles the DSL AST into standard SQL. The key semantic improvement:
 //! `!=` compiles to `IS DISTINCT FROM` (NULL-safe), not SQL's `!=`.
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use crate::ast::*;
 
 /// Lower a Rocky DSL file to a SQL string.
@@ -1746,13 +1749,13 @@ derive {
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("a".into())),
+                    left: Arc::new(Expr::BinaryOp {
+                        left: Arc::new(Expr::Column("a".into())),
                         op: BinOp::Or,
-                        right: Box::new(Expr::Column("b".into())),
+                        right: Arc::new(Expr::Column("b".into())),
                     }),
                     op: BinOp::And,
-                    right: Box::new(Expr::Column("c".into())),
+                    right: Arc::new(Expr::Column("c".into())),
                 }),
             ],
         };
@@ -1774,13 +1777,13 @@ derive {
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("a".into())),
+                    left: Arc::new(Expr::BinaryOp {
+                        left: Arc::new(Expr::Column("a".into())),
                         op: BinOp::And,
-                        right: Box::new(Expr::Column("b".into())),
+                        right: Arc::new(Expr::Column("b".into())),
                     }),
                     op: BinOp::Or,
-                    right: Box::new(Expr::Column("c".into())),
+                    right: Arc::new(Expr::Column("c".into())),
                 }),
             ],
         };
@@ -1803,10 +1806,10 @@ derive {
                 }),
                 PipelineStep::Where(Expr::UnaryOp {
                     op: UnaryOp::Not,
-                    expr: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("a".into())),
+                    expr: Arc::new(Expr::BinaryOp {
+                        left: Arc::new(Expr::Column("a".into())),
                         op: BinOp::And,
-                        right: Box::new(Expr::Column("b".into())),
+                        right: Arc::new(Expr::Column("b".into())),
                     }),
                 }),
             ],
@@ -1841,12 +1844,12 @@ derive {
                 PipelineStep::Derive(vec![(
                     "val".to_string(),
                     Expr::BinaryOp {
-                        left: Box::new(Expr::Column("a".into())),
+                        left: Arc::new(Expr::Column("a".into())),
                         op: BinOp::Sub,
-                        right: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::Column("b".into())),
+                        right: Arc::new(Expr::BinaryOp {
+                            left: Arc::new(Expr::Column("b".into())),
                             op: BinOp::Sub,
-                            right: Box::new(Expr::Column("c".into())),
+                            right: Arc::new(Expr::Column("c".into())),
                         }),
                     },
                 )]),
@@ -1872,12 +1875,12 @@ derive {
                 PipelineStep::Derive(vec![(
                     "val".to_string(),
                     Expr::BinaryOp {
-                        left: Box::new(Expr::Column("a".into())),
+                        left: Arc::new(Expr::Column("a".into())),
                         op: BinOp::Div,
-                        right: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::Column("b".into())),
+                        right: Arc::new(Expr::BinaryOp {
+                            left: Arc::new(Expr::Column("b".into())),
                             op: BinOp::Div,
-                            right: Box::new(Expr::Column("c".into())),
+                            right: Arc::new(Expr::Column("c".into())),
                         }),
                     },
                 )]),
@@ -1903,13 +1906,13 @@ derive {
                 PipelineStep::Derive(vec![(
                     "val".to_string(),
                     Expr::BinaryOp {
-                        left: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::Column("a".into())),
+                        left: Arc::new(Expr::BinaryOp {
+                            left: Arc::new(Expr::Column("a".into())),
                             op: BinOp::Add,
-                            right: Box::new(Expr::Column("b".into())),
+                            right: Arc::new(Expr::Column("b".into())),
                         }),
                         op: BinOp::Mul,
-                        right: Box::new(Expr::Column("c".into())),
+                        right: Arc::new(Expr::Column("c".into())),
                     },
                 )]),
             ],
@@ -1996,7 +1999,7 @@ where amount > 100"#,
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::InList {
-                    expr: Box::new(Expr::Column("status".into())),
+                    expr: Arc::new(Expr::Column("status".into())),
                     list: vec![
                         Expr::StringLit("active".into()),
                         Expr::StringLit("pending".into()),
@@ -2023,7 +2026,7 @@ where amount > 100"#,
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::InList {
-                    expr: Box::new(Expr::Column("status".into())),
+                    expr: Arc::new(Expr::Column("status".into())),
                     list: vec![
                         Expr::StringLit("cancelled".into()),
                         Expr::StringLit("refunded".into()),
@@ -2049,7 +2052,7 @@ where amount > 100"#,
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::InList {
-                    expr: Box::new(Expr::Column("priority".into())),
+                    expr: Arc::new(Expr::Column("priority".into())),
                     list: vec![
                         Expr::NumberLit("1".into()),
                         Expr::NumberLit("2".into()),
@@ -2343,10 +2346,10 @@ derive {
                     "val".to_string(),
                     Expr::UnaryOp {
                         op: UnaryOp::Neg,
-                        expr: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::Column("a".into())),
+                        expr: Arc::new(Expr::BinaryOp {
+                            left: Arc::new(Expr::Column("a".into())),
                             op: BinOp::Add,
-                            right: Box::new(Expr::Column("b".into())),
+                            right: Arc::new(Expr::Column("b".into())),
                         }),
                     },
                 )]),
@@ -2586,7 +2589,7 @@ derive {
                     alias: None,
                 }),
                 PipelineStep::Where(Expr::InList {
-                    expr: Box::new(Expr::Column("status".into())),
+                    expr: Arc::new(Expr::Column("status".into())),
                     list: vec![Expr::StringLit("active".into())],
                     negated: false,
                 }),

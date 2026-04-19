@@ -1,4 +1,14 @@
 //! DSL Abstract Syntax Tree types.
+//!
+//! §P3.7: sub-expression fields on `Expr` use `Arc<Expr>` instead of
+//! `Box<Expr>`. Cloning an `Expr` (common during lowering and
+//! typechecking of DSL pipelines) becomes a refcount bump on the
+//! sub-tree instead of a deep allocation. `Arc` (not `Rc`) because
+//! `CompileResult` — which transitively holds the AST — is now
+//! moved across a `tokio::task::spawn_blocking` boundary (§P3.3),
+//! and `Rc` isn't `Send`.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -126,29 +136,29 @@ pub enum Expr {
     Null,
     /// Binary operation.
     BinaryOp {
-        left: Box<Expr>,
+        left: Arc<Expr>,
         op: BinOp,
-        right: Box<Expr>,
+        right: Arc<Expr>,
     },
     /// Unary operation.
-    UnaryOp { op: UnaryOp, expr: Box<Expr> },
+    UnaryOp { op: UnaryOp, expr: Arc<Expr> },
     /// Function call.
     FunctionCall { name: String, args: Vec<Expr> },
     /// IS NULL / IS NOT NULL.
-    IsNull { expr: Box<Expr>, negated: bool },
+    IsNull { expr: Arc<Expr>, negated: bool },
     /// IN [list].
     ///
     /// TODO(plan-15): The parser does not yet support `in [...]` / `not in [...]`
     /// syntax. This node can only be constructed programmatically. Add parser
     /// support for `expr in [val1, val2]` and `expr not in [val1, val2]`.
     InList {
-        expr: Box<Expr>,
+        expr: Arc<Expr>,
         list: Vec<Expr>,
         negated: bool,
     },
     /// match expression (compiles to CASE WHEN).
     Match {
-        expr: Box<Expr>,
+        expr: Arc<Expr>,
         arms: Vec<MatchArm>,
     },
     /// Function call with window spec.
