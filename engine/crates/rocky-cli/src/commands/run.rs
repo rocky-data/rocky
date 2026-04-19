@@ -313,6 +313,8 @@ pub async fn run(
             &run_id,
             Some(target_model),
             &mut output,
+            None, // model-only run has no pipeline hooks
+            None,
         )
         .await?;
 
@@ -1988,6 +1990,8 @@ pub async fn run(
                 &run_id,
                 None, // no model filter in replication path
                 &mut output,
+                Some(&hook_registry),
+                Some(pipeline_name),
             )
             .await?;
         }
@@ -2215,6 +2219,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
 /// everything else (full_refresh / incremental / merge / materialized_view)
 /// uses the single-statement path via `generate_transformation_sql`.
 #[tracing::instrument(skip_all, name = "execute_models")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
     models_dir: &Path,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -2223,6 +2228,11 @@ pub(crate) async fn execute_models(
     run_id: &str,
     model_name_filter: Option<&str>,
     output: &mut RunOutput,
+    // §P2.6 hook plumbing — optional so `rocky run --model <X>`
+    // (which skips the full pipeline context) can pass `None` without
+    // the caller having to synthesise a fake pipeline name.
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -2256,6 +2266,20 @@ pub(crate) async fn execute_models(
         return Ok(());
     }
 
+    // §P2.6 emit: compile_complete — fires once after a successful
+    // compile pass, with the model count from the compiled project.
+    // Gated on both hook_registry + pipeline_name being supplied so
+    // `rocky run --model <X>` stays silent.
+    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+        let _ = reg
+            .fire(&HookContext::compile_complete(
+                run_id,
+                pipe,
+                compile_result.project.models.len(),
+            ))
+            .await;
+    }
+
     let dialect = warehouse.dialect();
     let mut models_executed = 0usize;
 
@@ -2282,6 +2306,16 @@ pub(crate) async fn execute_models(
                 continue;
             };
 
+            // §P2.6 per-model emit: before_model_run. Duration is
+            // reserved for after_model_run — here we just announce
+            // the model is about to execute.
+            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                let _ = reg
+                    .fire(&HookContext::before_model_run(run_id, pipe, model_name))
+                    .await;
+            }
+            let model_start = Instant::now();
+
             // Dispatch on the materialization strategy. time_interval models
             // take the per-partition path so the runtime can iterate
             // partitions, populate the window per partition, and record
@@ -2291,7 +2325,7 @@ pub(crate) async fn execute_models(
                 model.config.strategy,
                 rocky_core::models::StrategyConfig::TimeInterval { .. }
             ) {
-                execute_time_interval_model(
+                let time_interval_res = execute_time_interval_model(
                     model,
                     warehouse,
                     dialect,
@@ -2302,7 +2336,30 @@ pub(crate) async fn execute_models(
                     &exec_ctx,
                 )
                 .await
-                .with_context(|| format!("model '{model_name}' failed"))?;
+                .with_context(|| format!("model '{model_name}' failed"));
+                if let Err(ref e) = time_interval_res {
+                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        let _ = reg
+                            .fire(&HookContext::model_error(
+                                run_id,
+                                pipe,
+                                model_name,
+                                &format!("{e:#}"),
+                            ))
+                            .await;
+                    }
+                }
+                time_interval_res?;
+                if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                    let _ = reg
+                        .fire(&HookContext::after_model_run(
+                            run_id,
+                            pipe,
+                            model_name,
+                            model_start.elapsed().as_millis() as u64,
+                        ))
+                        .await;
+                }
                 models_executed += 1;
                 continue;
             }
@@ -2324,11 +2381,35 @@ pub(crate) async fn execute_models(
                 statements = exec_stmts.len(),
                 "executing model"
             );
+            let mut exec_error: Option<anyhow::Error> = None;
             for exec_sql in &exec_stmts {
-                warehouse
-                    .execute_statement(exec_sql)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("model '{model_name}' failed: {e}"))?;
+                if let Err(e) = warehouse.execute_statement(exec_sql).await {
+                    exec_error = Some(anyhow::anyhow!("model '{model_name}' failed: {e}"));
+                    break;
+                }
+            }
+            if let Some(e) = exec_error {
+                if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                    let _ = reg
+                        .fire(&HookContext::model_error(
+                            run_id,
+                            pipe,
+                            model_name,
+                            &format!("{e:#}"),
+                        ))
+                        .await;
+                }
+                return Err(e);
+            }
+            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                let _ = reg
+                    .fire(&HookContext::after_model_run(
+                        run_id,
+                        pipe,
+                        model_name,
+                        model_start.elapsed().as_millis() as u64,
+                    ))
+                    .await;
             }
             models_executed += 1;
         }
