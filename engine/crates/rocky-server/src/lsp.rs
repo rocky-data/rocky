@@ -322,6 +322,9 @@ const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
 
 // ── LSP backend ─────────────────────────────────────────────────────────────
 
+/// Content-hash-indexed cache of pre-computed semantic tokens (§P3.4).
+type SemanticTokensCache = Arc<RwLock<HashMap<String, (u64, Vec<SemanticToken>)>>>;
+
 /// Rocky LSP backend.
 pub struct RockyLsp {
     client: Client,
@@ -339,7 +342,7 @@ pub struct RockyLsp {
     /// encoded tokens). `semantic_tokens_full` skips the SQL parse
     /// pass when the cached hash matches the current model SQL —
     /// editors call this hook on every scroll on large files.
-    semantic_tokens_cache: Arc<RwLock<HashMap<String, (u64, Vec<SemanticToken>)>>>,
+    semantic_tokens_cache: SemanticTokensCache,
 }
 
 impl RockyLsp {
