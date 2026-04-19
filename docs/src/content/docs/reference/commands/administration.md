@@ -36,30 +36,34 @@ rocky history
 {
   "version": "1.6.0",
   "command": "history",
+  "count": 2,
   "runs": [
     {
       "run_id": "run_20260401_143022",
       "started_at": "2026-04-01T14:30:22Z",
       "duration_ms": 45200,
-      "filter": "client=acme",
-      "tables_copied": 20,
-      "tables_failed": 0,
-      "status": "success"
+      "status": "success",
+      "trigger": "cli",
+      "models_executed": 14,
+      "models": [
+        { "model_name": "stg_orders",  "duration_ms": 1200, "rows_affected": 150000, "status": "success" },
+        { "model_name": "fct_revenue", "duration_ms": 2300, "rows_affected":   8900, "status": "success" }
+      ]
     },
     {
       "run_id": "run_20260401_080015",
       "started_at": "2026-04-01T08:00:15Z",
       "duration_ms": 52100,
-      "filter": "client=acme",
-      "tables_copied": 19,
-      "tables_failed": 1,
-      "status": "partial"
+      "status": "partial",
+      "trigger": "cli",
+      "models_executed": 13,
+      "models": [ /* per-model records */ ]
     }
   ]
 }
 ```
 
-Show history for a specific model since a date:
+Show history for a specific model since a date. The `--model` variant returns a flat list of that model's executions:
 
 ```bash
 rocky history --model fct_revenue --since 2026-03-01
@@ -70,27 +74,27 @@ rocky history --model fct_revenue --since 2026-03-01
   "version": "1.6.0",
   "command": "history",
   "model": "fct_revenue",
+  "count": 2,
   "executions": [
     {
-      "run_id": "run_20260401_143022",
       "started_at": "2026-04-01T14:30:22Z",
       "duration_ms": 2300,
-      "strategy": "incremental",
+      "rows_affected": 8900,
       "status": "success",
-      "watermark": "2026-04-01T14:00:00Z"
+      "sql_hash": "a3f2b1c4..."
     },
     {
-      "run_id": "run_20260331_143005",
       "started_at": "2026-03-31T14:30:05Z",
       "duration_ms": 8900,
-      "strategy": "full_refresh",
+      "rows_affected": 150000,
       "status": "success",
-      "watermark": "2026-03-31T14:00:00Z",
-      "note": "drift detected, full refresh triggered"
+      "sql_hash": "b4e3c2d5..."
     }
   ]
 }
 ```
+
+`sql_hash` is stable across runs where the compiled SQL is identical — useful for detecting model body changes across runs.
 
 Show history with table output:
 
