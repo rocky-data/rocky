@@ -28,7 +28,7 @@
     "workspaceContains:**/*.rocky",
     "workspaceContains:rocky.toml"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "languages": [
       {
@@ -390,8 +390,10 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src/",
+    "bundle": "node esbuild.mjs",
+    "bundle:watch": "node esbuild.mjs --watch",
     "bundle:webview": "node scripts/bundle-webview.mjs",
-    "pretest": "npm run compile",
+    "pretest": "npm run compile && npm run bundle -- --dev",
     "test": "node ./out/test/runTest.js",
     "test:unit": "vitest run",
     "test:all": "npm run test:unit && npm test",
@@ -399,7 +401,7 @@
     "package:local": "vsce package -o rocky.vsix",
     "install:local": "npm run package:local && code --install-extension rocky.vsix --force",
     "uninstall:local": "code --uninstall-extension rocky-data.rocky",
-    "vscode:prepublish": "npm run bundle:webview && npm run compile"
+    "vscode:prepublish": "npm run compile && npm run bundle:webview && npm run bundle"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -411,6 +413,7 @@
     "@viz-js/viz": "^3.26.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.8.0",
+    "esbuild": "^0.25.0",
     "eslint": "^10.2.0",
     "glob": "^13.0.6",
     "json-schema-to-typescript": "^15.0.4",
