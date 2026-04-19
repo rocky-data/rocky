@@ -68,6 +68,8 @@ pub async fn run_transformation(
             &run_id,
             None, // no model filter in local execution path
             &mut output,
+            None, // run_local doesn't build a HookRegistry
+            None,
         )
         .await?;
     } else {
