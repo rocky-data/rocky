@@ -236,6 +236,14 @@ impl SnowflakeConnector {
                         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
+                        // 401 from Snowflake often means the cached keypair
+                        // JWT crossed the server-side expiry boundary between
+                        // mint and request. Drop the cache so the next
+                        // attempt mints a fresh JWT; a genuine bad-credential
+                        // 401 will simply re-fail and exhaust retries.
+                        if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
+                            self.auth.invalidate_cache().await;
+                        }
                         let backoff_ms = compute_backoff(retry, attempt);
                         warn!(
                             attempt = attempt + 1,
@@ -390,7 +398,10 @@ fn check_terminal(response: StatementResponse) -> Result<StatementResponse, Conn
 /// Classifies whether a connector error is transient and worth retrying.
 fn is_transient(err: &ConnectorError) -> bool {
     match err {
-        ConnectorError::ApiError { status, .. } => matches!(status, 429 | 502 | 503 | 504),
+        // 401 is transient-on-first-retry — the connector drops the auth
+        // cache before retrying, so a stale cached JWT replays as a fresh
+        // mint. Genuine bad credentials re-fail on every attempt.
+        ConnectorError::ApiError { status, .. } => matches!(status, 401 | 429 | 502 | 503 | 504),
         ConnectorError::Http(e) => e.is_connect() || e.is_timeout(),
         ConnectorError::StatementFailed { message, .. } => {
             let msg = message.to_uppercase();
@@ -500,6 +511,18 @@ mod tests {
             body: "bad request".into(),
         };
         assert!(!is_transient(&err));
+    }
+
+    #[test]
+    fn test_transient_http_401() {
+        // 401 is treated as transient so the retry loop can drop the auth
+        // cache and re-mint a fresh JWT. Bad credentials re-fail and exhaust
+        // retries quickly.
+        let err = ConnectorError::ApiError {
+            status: 401,
+            body: "token expired".into(),
+        };
+        assert!(is_transient(&err));
     }
 
     #[test]

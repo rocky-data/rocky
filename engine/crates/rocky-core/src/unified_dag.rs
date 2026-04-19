@@ -730,6 +730,7 @@ pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, Unif
 
     let mut in_degree: HashMap<&NodeId, usize> = HashMap::new();
     let mut dependents: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
+    let mut predecessors: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
 
     for node in &dag.nodes {
         in_degree.entry(&node.id).or_insert(0);
@@ -738,6 +739,7 @@ pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, Unif
     for edge in &dag.edges {
         *in_degree.entry(&edge.to).or_insert(0) += 1;
         dependents.entry(&edge.from).or_default().push(&edge.to);
+        predecessors.entry(&edge.to).or_default().push(&edge.from);
     }
 
     // Kahn's algorithm with layer tracking.
@@ -759,13 +761,16 @@ pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, Unif
 
         for id in &queue {
             // Determine the layer: max(layer of all predecessors) + 1, or 0.
-            let layer = dag
-                .edges
-                .iter()
-                .filter(|e| e.to == **id)
-                .filter_map(|e| node_layer.get(&e.from))
-                .max()
-                .map(|&max_dep| max_dep + 1)
+            let layer = predecessors
+                .get(id)
+                .map(|preds| {
+                    preds
+                        .iter()
+                        .filter_map(|pred_id| node_layer.get(pred_id))
+                        .max()
+                        .map(|&max_dep| max_dep + 1)
+                        .unwrap_or(0)
+                })
                 .unwrap_or(0);
 
             node_layer.insert(id, layer);

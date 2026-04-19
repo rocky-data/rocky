@@ -7,6 +7,12 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// Serve a cached OAuth token only if it still has at least this much
+/// time left. A request in flight when the token crosses the server-side
+/// expiry would otherwise 401; the connector retry loop re-exchanges on
+/// 401, but burning a retry on every refresh boundary is wasteful.
+const REFRESH_SLACK: Duration = Duration::from_secs(60);
+
 /// Errors from Databricks authentication (PAT or OAuth M2M).
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -50,6 +56,25 @@ pub struct Auth {
 pub(crate) struct CachedToken {
     access_token: RedactedString,
     expires_at: Instant,
+}
+
+impl CachedToken {
+    fn is_fresh(&self) -> bool {
+        self.expires_at > Instant::now() + REFRESH_SLACK
+    }
+}
+
+/// Fast-path cache read. Returns the cached token if one exists and is
+/// still within the refresh-slack window; otherwise returns `None` and
+/// the caller is expected to acquire the write lock and exchange for a
+/// new one.
+async fn read_fresh_token(cache: &RwLock<Option<CachedToken>>) -> Option<String> {
+    cache
+        .read()
+        .await
+        .as_ref()
+        .filter(|ct| ct.is_fresh())
+        .map(|ct| ct.access_token.expose().to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,24 +132,13 @@ impl Auth {
                 http_client,
                 cached_token,
             } => {
-                // Check cache (with read lock)
-                {
-                    let cache = cached_token.read().await;
-                    if let Some(ct) = cache.as_ref() {
-                        if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                            return Ok(ct.access_token.expose().to_string());
-                        }
-                    }
+                if let Some(token) = read_fresh_token(cached_token).await {
+                    return Ok(token);
                 }
 
-                // Refresh (with write lock)
                 let mut cache = cached_token.write().await;
-
-                // Double-check after acquiring write lock
-                if let Some(ct) = cache.as_ref() {
-                    if ct.expires_at > Instant::now() + Duration::from_secs(60) {
-                        return Ok(ct.access_token.expose().to_string());
-                    }
+                if let Some(ct) = cache.as_ref().filter(|ct| ct.is_fresh()) {
+                    return Ok(ct.access_token.expose().to_string());
                 }
 
                 let token_url = format!("https://{host}/oidc/v1/token");
@@ -142,20 +156,50 @@ impl Auth {
                     .json::<OAuthTokenResponse>()
                     .await?;
 
-                let new_token = CachedToken {
+                *cache = Some(CachedToken {
                     access_token: RedactedString::new(resp.access_token.clone()),
                     expires_at: Instant::now() + Duration::from_secs(resp.expires_in),
-                };
-                *cache = Some(new_token);
+                });
 
                 Ok(resp.access_token)
             }
         }
     }
 
+    /// Invalidates any cached OAuth token so the next `get_token` call
+    /// forces a fresh exchange. PAT auth has no cache and is a no-op.
+    ///
+    /// Called after a server 401 — long pipelines can otherwise keep
+    /// replaying a server-expired token from the local cache until the
+    /// TTL window closes.
+    pub async fn invalidate_cache(&self) {
+        if let AuthInner::OAuthM2M { cached_token, .. } = &self.inner {
+            let mut cache = cached_token.write().await;
+            *cache = None;
+        }
+    }
+
     #[cfg(test)]
     fn is_pat(&self) -> bool {
         matches!(self.inner, AuthInner::Pat { .. })
+    }
+
+    #[cfg(test)]
+    async fn has_cached_token(&self) -> bool {
+        match &self.inner {
+            AuthInner::Pat { .. } => false,
+            AuthInner::OAuthM2M { cached_token, .. } => cached_token.read().await.is_some(),
+        }
+    }
+
+    #[cfg(test)]
+    async fn prime_cache_with(&self, token: &str, ttl: Duration) {
+        if let AuthInner::OAuthM2M { cached_token, .. } = &self.inner {
+            *cached_token.write().await = Some(CachedToken {
+                access_token: RedactedString::new(token.to_string()),
+                expires_at: Instant::now() + ttl,
+            });
+        }
     }
 }
 
@@ -272,5 +316,35 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(!debug.contains("secret_token"));
         assert!(debug.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_clears_oauth_cache() {
+        let auth = Auth::from_config(AuthConfig {
+            host: "host.databricks.com".into(),
+            token: None,
+            client_id: Some("client_123".into()),
+            client_secret: Some("secret_456".into()),
+        })
+        .unwrap();
+        assert!(!auth.has_cached_token().await);
+        auth.prime_cache_with("oauth_token_abc", Duration::from_secs(3600))
+            .await;
+        assert!(auth.has_cached_token().await);
+        auth.invalidate_cache().await;
+        assert!(!auth.has_cached_token().await);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_noop_on_pat() {
+        let auth = Auth::from_config(AuthConfig {
+            host: "host.databricks.com".into(),
+            token: Some("dapi_fixed".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        auth.invalidate_cache().await; // should not panic
+        assert_eq!(auth.get_token().await.unwrap(), "dapi_fixed");
     }
 }
