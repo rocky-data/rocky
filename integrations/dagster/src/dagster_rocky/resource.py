@@ -26,9 +26,10 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 import dagster as dg
+from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -71,6 +72,59 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 # Checked lazily on first CLI invocation. If the binary is older, the resource
 # raises a ``dg.Failure`` with a clear message pointing at the install URL.
 MIN_ROCKY_VERSION = "1.0.0"
+
+# Number of bytes of stdout/stderr surfaced back to the operator when a Rocky
+# command returns malformed or schema-violating JSON. Enough to spot a stray
+# tracing line or truncated blob without dumping potentially MB of noise.
+_JSON_ERROR_PREVIEW_BYTES = 500
+
+_TModel = TypeVar("_TModel", bound=BaseModel)
+
+
+def _parse_rocky_json(output: str, model_cls: type[_TModel], *, command: str) -> _TModel:
+    """Parse Rocky CLI JSON output into a Pydantic model with operator-friendly errors.
+
+    Pydantic's ``model_validate_json`` raises ``ValidationError`` for both
+    malformed JSON and schema-drift; the default message is unreadable for
+    anyone debugging a Dagster run (a 2 000-character error with nested
+    pydantic paths). This wrapper catches those failures, attaches a preview
+    of the raw stdout, and re-raises as ``dg.Failure`` so the operator sees a
+    clear cause + a scannable excerpt of what Rocky actually wrote.
+
+    Roadmap §P2.12.
+    """
+    try:
+        return model_cls.model_validate_json(output)
+    except ValidationError as exc:
+        preview = (output or "")[:_JSON_ERROR_PREVIEW_BYTES]
+        raise dg.Failure(
+            description=(
+                f"rocky {command} output failed schema validation — "
+                "see metadata for the raw stdout preview and pydantic error"
+            ),
+            metadata={
+                "command": dg.MetadataValue.text(command),
+                "stdout_preview": dg.MetadataValue.text(preview),
+                "stdout_bytes": dg.MetadataValue.int(len(output or "")),
+                "validation_error": dg.MetadataValue.text(str(exc)),
+            },
+        ) from exc
+    except json.JSONDecodeError as exc:
+        # Defense in depth — pydantic wraps JSON errors in ValidationError in
+        # modern versions, but this catches any direct ``json.loads`` usage or
+        # future pydantic behaviour change.
+        preview = (output or "")[:_JSON_ERROR_PREVIEW_BYTES]
+        raise dg.Failure(
+            description=(
+                f"rocky {command} returned malformed JSON — see metadata for the stdout preview"
+            ),
+            metadata={
+                "command": dg.MetadataValue.text(command),
+                "stdout_preview": dg.MetadataValue.text(preview),
+                "stdout_bytes": dg.MetadataValue.int(len(output or "")),
+                "json_error": dg.MetadataValue.text(str(exc)),
+            },
+        ) from exc
 
 
 def _forward_stderr_to_context(
@@ -413,11 +467,15 @@ class RockyResource(dg.ConfigurableResource):
         args = ["discover"]
         if pipeline is not None:
             args.extend(["--pipeline", pipeline])
-        return DiscoverResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), DiscoverResult, command="discover")
 
     def plan(self, filter: str) -> PlanResult:
         """Run ``rocky plan --filter <key=value>`` and return the parsed result."""
-        return PlanResult.model_validate_json(self._run_rocky(["plan", "--filter", filter]))
+        return _parse_rocky_json(
+            self._run_rocky(["plan", "--filter", filter]),
+            PlanResult,
+            command="plan",
+        )
 
     def run(
         self,
@@ -482,7 +540,9 @@ class RockyResource(dg.ConfigurableResource):
             parallel=parallel,
             shadow_suffix=shadow_suffix,
         )
-        return RunResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(
+            self._run_rocky(args, allow_partial=True), RunResult, command="run"
+        )
 
     def run_streaming(
         self,
@@ -555,8 +615,10 @@ class RockyResource(dg.ConfigurableResource):
             parallel=parallel,
             shadow_suffix=shadow_suffix,
         )
-        return RunResult.model_validate_json(
-            self._run_rocky_streaming(args, context, allow_partial=True)
+        return _parse_rocky_json(
+            self._run_rocky_streaming(args, context, allow_partial=True),
+            RunResult,
+            command="run (streaming)",
         )
 
     def _build_run_args(
@@ -705,7 +767,7 @@ class RockyResource(dg.ConfigurableResource):
 
     def state(self) -> StateResult:
         """Run ``rocky state`` and return the parsed result."""
-        return StateResult.model_validate_json(self._run_rocky(["state"]))
+        return _parse_rocky_json(self._run_rocky(["state"]), StateResult, command="state")
 
     # ------------------------------------------------------------------ #
     # Compiler (HTTP when server_url is set, CLI otherwise)              #
@@ -720,14 +782,20 @@ class RockyResource(dg.ConfigurableResource):
             model_filter: Optional model name to filter diagnostics.
         """
         if self.server_url is not None:
-            return CompileResult.model_validate_json(self._http_get("/api/v1/compile"))
+            return _parse_rocky_json(
+                self._http_get("/api/v1/compile"), CompileResult, command="compile"
+            )
 
         args = ["compile", "--models", self.models_dir]
         if self.contracts_dir is not None:
             args.extend(["--contracts", self.contracts_dir])
         if model_filter is not None:
             args.extend(["--model", model_filter])
-        return CompileResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(
+            self._run_rocky(args, allow_partial=True),
+            CompileResult,
+            command="compile",
+        )
 
     def lineage(
         self,
@@ -745,17 +813,17 @@ class RockyResource(dg.ConfigurableResource):
         if self.server_url is not None:
             if column is not None:
                 output = self._http_get(f"/api/v1/models/{target}/lineage/{column}")
-                return ColumnLineageResult.model_validate_json(output)
+                return _parse_rocky_json(output, ColumnLineageResult, command="lineage")
             output = self._http_get(f"/api/v1/models/{target}/lineage")
-            return ModelLineageResult.model_validate_json(output)
+            return _parse_rocky_json(output, ModelLineageResult, command="lineage")
 
         args = ["lineage", "--models", self.models_dir, target]
         if column is not None:
             args.extend(["--column", column])
         output = self._run_rocky(args)
         if column is not None:
-            return ColumnLineageResult.model_validate_json(output)
-        return ModelLineageResult.model_validate_json(output)
+            return _parse_rocky_json(output, ColumnLineageResult, command="lineage")
+        return _parse_rocky_json(output, ModelLineageResult, command="lineage")
 
     # ------------------------------------------------------------------ #
     # DAG + per-model execution                                          #
@@ -778,7 +846,7 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--contracts", self.contracts_dir])
         if column_lineage:
             args.append("--column-lineage")
-        return DagResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), DagResult, command="dag")
 
     def run_model(
         self,
@@ -826,7 +894,9 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--lookback", str(lookback)])
         if parallel is not None:
             args.extend(["--parallel", str(parallel)])
-        return RunResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(
+            self._run_rocky(args, allow_partial=True), RunResult, command="run"
+        )
 
     # ------------------------------------------------------------------ #
     # Local testing (always CLI)                                         #
@@ -845,14 +915,16 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--contracts", self.contracts_dir])
         if model_filter is not None:
             args.extend(["--model", model_filter])
-        return TestResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(
+            self._run_rocky(args, allow_partial=True), TestResult, command="test"
+        )
 
     def ci(self) -> CiResult:
         """Run ``rocky ci`` (compile + test) and return the parsed result."""
         args = ["ci", "--models", self.models_dir]
         if self.contracts_dir is not None:
             args.extend(["--contracts", self.contracts_dir])
-        return CiResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(self._run_rocky(args, allow_partial=True), CiResult, command="ci")
 
     # ------------------------------------------------------------------ #
     # Observability (HTTP when server_url is set, CLI otherwise)         #
@@ -876,8 +948,8 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--since", since])
         output = self._run_rocky(args)
         if model is not None:
-            return ModelHistoryResult.model_validate_json(output)
-        return HistoryResult.model_validate_json(output)
+            return _parse_rocky_json(output, ModelHistoryResult, command="history")
+        return _parse_rocky_json(output, HistoryResult, command="history")
 
     def metrics(
         self,
@@ -898,8 +970,10 @@ class RockyResource(dg.ConfigurableResource):
             alerts: If ``True``, include quality alerts.
         """
         if self.server_url is not None:
-            return MetricsResult.model_validate_json(
-                self._http_get(f"/api/v1/models/{model}/metrics")
+            return _parse_rocky_json(
+                self._http_get(f"/api/v1/models/{model}/metrics"),
+                MetricsResult,
+                command="metrics",
             )
 
         args = ["metrics", model]
@@ -909,7 +983,7 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--column", column])
         if alerts:
             args.append("--alerts")
-        return MetricsResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), MetricsResult, command="metrics")
 
     def optimize(self, model: str | None = None) -> OptimizeResult:
         """Run ``rocky optimize`` and return the parsed result.
@@ -920,7 +994,7 @@ class RockyResource(dg.ConfigurableResource):
         args: list[str] = ["optimize"]
         if model is not None:
             args.extend(["--model", model])
-        return OptimizeResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), OptimizeResult, command="optimize")
 
     # ------------------------------------------------------------------ #
     # AI Level 3 commands                                                #
@@ -928,7 +1002,11 @@ class RockyResource(dg.ConfigurableResource):
 
     def ai(self, intent: str, format: str = "rocky") -> AiResult:
         """Generate a model from a natural-language intent."""
-        return AiResult.model_validate_json(self._run_rocky(["ai", intent, "--format", format]))
+        return _parse_rocky_json(
+            self._run_rocky(["ai", intent, "--format", format]),
+            AiResult,
+            command="ai",
+        )
 
     def ai_sync(
         self,
@@ -945,7 +1023,7 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--model", model])
         if with_intent:
             args.append("--with-intent")
-        return AiSyncResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), AiSyncResult, command="ai sync")
 
     def ai_explain(
         self,
@@ -962,7 +1040,7 @@ class RockyResource(dg.ConfigurableResource):
             args.append("--all")
         if save:
             args.append("--save")
-        return AiExplainResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), AiExplainResult, command="ai explain")
 
     def ai_test(
         self,
@@ -979,7 +1057,7 @@ class RockyResource(dg.ConfigurableResource):
             args.append("--all")
         if save:
             args.append("--save")
-        return AiTestResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), AiTestResult, command="ai test")
 
     # ------------------------------------------------------------------ #
     # Hook commands                                                      #
@@ -1010,7 +1088,11 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--rocky-project", rocky_project])
         if sample_size is not None:
             args.extend(["--sample-size", str(sample_size)])
-        return ValidateMigrationResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(
+            self._run_rocky(args),
+            ValidateMigrationResult,
+            command="validate",
+        )
 
     def test_adapter(
         self,
@@ -1023,7 +1105,7 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--adapter", adapter])
         if command is not None:
             args.extend(["--command", command])
-        return ConformanceResult.model_validate_json(self._run_rocky(args))
+        return _parse_rocky_json(self._run_rocky(args), ConformanceResult, command="conformance")
 
     # ------------------------------------------------------------------ #
     # Doctor and resume commands                                         #
@@ -1031,7 +1113,7 @@ class RockyResource(dg.ConfigurableResource):
 
     def doctor(self) -> DoctorResult:
         """Run ``rocky doctor`` and return the parsed health-check results."""
-        return DoctorResult.model_validate_json(self._run_rocky(["doctor"]))
+        return _parse_rocky_json(self._run_rocky(["doctor"]), DoctorResult, command="doctor")
 
     def resume_run(
         self,
@@ -1056,4 +1138,6 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--filter", filter])
         if governance_override:
             args.extend(["--governance-override", json.dumps(governance_override)])
-        return RunResult.model_validate_json(self._run_rocky(args, allow_partial=True))
+        return _parse_rocky_json(
+            self._run_rocky(args, allow_partial=True), RunResult, command="run"
+        )
