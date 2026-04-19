@@ -1,19 +1,27 @@
 //! Parse errors with source locations and miette rendering.
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 /// Errors during Rocky DSL parsing.
+///
+/// The `expected` and `found` fields use `Cow<'static, str>` so common
+/// static-literal cases (e.g. `"identifier"`, `"number"`,
+/// `"pipeline step"`) avoid a `String::from` allocation on the error
+/// path — matters for LSP hot paths where parse errors land per
+/// keystroke while the user is mid-typing (§P3.9).
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("unexpected token at offset {offset}: expected {expected}, found {found}")]
     UnexpectedToken {
-        expected: String,
-        found: String,
+        expected: Cow<'static, str>,
+        found: Cow<'static, str>,
         offset: usize,
     },
 
     #[error("unexpected end of file: expected {expected}")]
-    UnexpectedEof { expected: String },
+    UnexpectedEof { expected: Cow<'static, str> },
 
     #[error("invalid number: {value}")]
     InvalidNumber { value: String },

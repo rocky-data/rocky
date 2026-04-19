@@ -15,6 +15,34 @@ use tokio::sync::broadcast;
 use tracing::{debug, trace};
 
 // ---------------------------------------------------------------------------
+// ErrorClass
+// ---------------------------------------------------------------------------
+
+/// Classification of an error carried on a [`PipelineEvent`]. Lets
+/// subscribers (logging, metrics, Dagster integration) distinguish retryable
+/// flakiness from terminal failure without string-matching the free-form
+/// `error` field.
+///
+/// Adapters classify their own errors (each adapter has its own error enum)
+/// and stamp the event before emitting so consumers see a stable taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorClass {
+    /// Retryable network-level error (connection reset, 5xx, DNS flake).
+    Transient,
+    /// Non-retryable — invalid SQL, schema mismatch, bad arguments.
+    Permanent,
+    /// Deadline expiry (per-request or global cap).
+    Timeout,
+    /// Auth failure — 401, expired / rotated token, bad credentials.
+    Auth,
+    /// Config / input validation rejected by the server before execution.
+    Config,
+    /// 429 or adapter-specific rate-limit signal.
+    RateLimit,
+}
+
+// ---------------------------------------------------------------------------
 // PipelineEvent
 // ---------------------------------------------------------------------------
 
@@ -36,6 +64,19 @@ pub struct PipelineEvent {
     pub duration_ms: Option<u64>,
     /// Error message (for error events).
     pub error: Option<String>,
+    /// Current retry attempt number (1-based). Paired with `max_attempts`
+    /// on retry events so subscribers can distinguish "retry 2/5" from
+    /// "final failure". None on non-retry events.
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    /// Maximum attempts allowed by the adapter's retry policy. See `attempt`.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Structured classification of the error on this event — see
+    /// [`ErrorClass`]. None when no error, or when the emitter hasn't
+    /// classified the failure.
+    #[serde(default)]
+    pub error_class: Option<ErrorClass>,
     /// Arbitrary key-value metadata.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -50,6 +91,9 @@ impl PipelineEvent {
             target: None,
             duration_ms: None,
             error: None,
+            attempt: None,
+            max_attempts: None,
+            error_class: None,
             metadata: HashMap::new(),
         }
     }
@@ -79,6 +123,22 @@ impl PipelineEvent {
     #[must_use]
     pub fn with_error(mut self, error: impl Into<String>) -> Self {
         self.error = Some(error.into());
+        self
+    }
+
+    /// Set the current attempt / max-attempts pair. Emitted by adapter retry
+    /// loops so subscribers can tell "retry N of M" from "final failure".
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: u32, max_attempts: u32) -> Self {
+        self.attempt = Some(attempt);
+        self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Set the [`ErrorClass`] classification for this event.
+    #[must_use]
+    pub fn with_error_class(mut self, class: ErrorClass) -> Self {
+        self.error_class = Some(class);
         self
     }
 
@@ -257,5 +317,75 @@ mod tests {
 
         let received = rx.recv().await.expect("should receive on default bus");
         assert_eq!(received.event_type, "state_synced");
+    }
+
+    // -- P2.8: retry attempt + error class --
+
+    #[test]
+    fn test_with_attempt_sets_both_attempt_and_max() {
+        let event = PipelineEvent::new("materialize_retry").with_attempt(2, 5);
+        assert_eq!(event.attempt, Some(2));
+        assert_eq!(event.max_attempts, Some(5));
+    }
+
+    #[test]
+    fn test_with_error_class_sets_classification() {
+        let event = PipelineEvent::new("materialize_error")
+            .with_error("connection reset")
+            .with_error_class(ErrorClass::Transient);
+        assert_eq!(event.error_class, Some(ErrorClass::Transient));
+        assert_eq!(event.error.as_deref(), Some("connection reset"));
+    }
+
+    #[test]
+    fn test_error_class_serializes_snake_case() {
+        for (class, expected) in [
+            (ErrorClass::Transient, "\"transient\""),
+            (ErrorClass::Permanent, "\"permanent\""),
+            (ErrorClass::Timeout, "\"timeout\""),
+            (ErrorClass::Auth, "\"auth\""),
+            (ErrorClass::Config, "\"config\""),
+            (ErrorClass::RateLimit, "\"rate_limit\""),
+        ] {
+            let json = serde_json::to_string(&class).expect("serialize");
+            assert_eq!(json, expected, "classification {class:?}");
+            let round: ErrorClass = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round, class);
+        }
+    }
+
+    #[test]
+    fn test_new_fields_roundtrip_through_serde() {
+        let event = PipelineEvent::new("materialize_error")
+            .with_run_id("run-1")
+            .with_target("cat.sch.tbl")
+            .with_error("HTTP 429")
+            .with_attempt(3, 5)
+            .with_error_class(ErrorClass::RateLimit);
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: PipelineEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.attempt, Some(3));
+        assert_eq!(back.max_attempts, Some(5));
+        assert_eq!(back.error_class, Some(ErrorClass::RateLimit));
+    }
+
+    #[test]
+    fn test_missing_new_fields_deserialize_as_none() {
+        // Backward-compatibility: older event payloads that lack the P2.8
+        // fields should deserialize cleanly with None for each new slot.
+        let legacy_json = r#"{
+            "event_type": "pipeline_complete",
+            "timestamp": "2026-04-19T12:00:00Z",
+            "run_id": "run-legacy",
+            "target": null,
+            "duration_ms": 1234,
+            "error": null,
+            "metadata": {}
+        }"#;
+        let event: PipelineEvent =
+            serde_json::from_str(legacy_json).expect("legacy payload deserializes");
+        assert_eq!(event.attempt, None);
+        assert_eq!(event.max_attempts, None);
+        assert_eq!(event.error_class, None);
     }
 }

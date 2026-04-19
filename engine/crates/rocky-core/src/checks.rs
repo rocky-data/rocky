@@ -175,8 +175,11 @@ pub fn check_column_match(
     target_columns: &[ColumnInfo],
     exclude: &[String],
 ) -> CheckResult {
-    let source_names = column_map::build_column_name_set(source_columns, exclude);
-    let target_names = column_map::build_column_name_set(target_columns, exclude);
+    // §P4.1: build the lowercase exclude set once and reuse for both sides,
+    // instead of rebuilding it inside each `build_column_name_set` call.
+    let exclude_set = column_map::build_exclude_set(exclude);
+    let source_names = column_map::build_column_name_set(source_columns, &exclude_set);
+    let target_names = column_map::build_column_name_set(target_columns, &exclude_set);
 
     let missing: Vec<String> = source_names.difference(&target_names).cloned().collect();
     let extra: Vec<String> = target_names.difference(&source_names).cloned().collect();

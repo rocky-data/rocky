@@ -485,12 +485,74 @@ fn bench_startup(c: &mut Criterion) {
     });
 }
 
+/// §P4.4 — single-file-change incremental recompile bench. Locks in the
+/// gains expected from §P3.1 (finish incremental compiler) and §P3.2
+/// (didChange buffer-hash short-circuit). Runs a full compile once to
+/// seed `previous`, edits one mart model's SQL in place, then measures
+/// `compile_incremental` against that single changed file.
+///
+/// Expected envelope on a 500-model layered project:
+/// - full cold compile: hundreds of ms (see `sub_second_compile`)
+/// - `single_file_change`: single-digit ms (only the edited model +
+///   dependents re-typecheck)
+///
+/// If that ratio collapses, something in the incremental path regressed —
+/// criterion's default 120 % alert threshold fires on the perf-label CI.
+fn bench_single_file_change(c: &mut Criterion) {
+    use rocky_compiler::compile::compile;
+    use rocky_server::lsp::compile_incremental;
+
+    let mut group = c.benchmark_group("single_file_change");
+    group.sample_size(30);
+
+    let dir = TempDir::new().unwrap();
+    generate_layered_project(dir.path());
+
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        source_column_info: HashMap::new(),
+    };
+
+    // Seed the incremental cache with a full cold compile.
+    let previous = compile(&config).expect("seed compile must succeed");
+
+    // Pick a mart model (leaf of the DAG) — `fct_0500` is the first one
+    // `generate_layered_project` produces after 50+150+200 = 400 upstream
+    // models. Editing a leaf minimises downstream reflow so we're really
+    // measuring the incremental path's per-change overhead.
+    let models_dir = dir.path().join("models");
+    let target_sql = models_dir.join("fct_0500.sql");
+    let baseline =
+        fs::read_to_string(&target_sql).expect("layered project must contain fct_0500.sql");
+
+    group.bench_function("500_models_edit_one_mart", |b| {
+        let mut counter: u32 = 0;
+        b.iter(|| {
+            // Mutate the file each iteration so fs metadata genuinely changes
+            // (counter avoids a CPU cache / OS-level no-op on identical
+            // writes).
+            counter = counter.wrapping_add(1);
+            let mutated = format!("{baseline}\n-- bench-iter-{counter}\n");
+            fs::write(&target_sql, mutated).unwrap();
+            let changed = vec![target_sql.clone()];
+            compile_incremental(&changed, &previous, &config).unwrap();
+        });
+    });
+
+    // Restore the original file so subsequent benches see the seeded project.
+    fs::write(&target_sql, baseline).unwrap();
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_cold_compile,
     bench_dag_resolution,
     bench_sql_generation,
     bench_sub_second_compile,
+    bench_single_file_change,
     bench_startup,
 );
 criterion_main!(benches);

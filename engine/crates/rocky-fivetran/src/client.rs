@@ -21,6 +21,9 @@ pub enum FivetranError {
 
     #[error("rate limited — retry after backoff")]
     RateLimited,
+
+    #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
+    RetryBudgetExhausted { limit: u32 },
 }
 
 /// Async Fivetran REST client with Basic Auth and configurable retry.
@@ -30,6 +33,8 @@ pub struct FivetranClient {
     api_key: RedactedString,
     api_secret: RedactedString,
     retry: RetryConfig,
+    /// Shared retry budget across the run (§P2.7). Unbounded by default.
+    retry_budget: rocky_core::retry_budget::RetryBudget,
 }
 
 /// Standard Fivetran API envelope.
@@ -53,13 +58,24 @@ impl FivetranClient {
     }
 
     pub fn with_retry(api_key: String, api_secret: String, retry: RetryConfig) -> Self {
+        let retry_budget =
+            rocky_core::retry_budget::RetryBudget::from_config(retry.max_retries_per_run);
         FivetranClient {
             client: Client::new(),
             base_url: "https://api.fivetran.com".to_string(),
             api_key: RedactedString::new(api_key),
             api_secret: RedactedString::new(api_secret),
             retry,
+            retry_budget,
         }
+    }
+
+    /// Override the run-level [`RetryBudget`](rocky_core::retry_budget::RetryBudget).
+    /// Used by `rocky run` when multiple adapters should share one budget.
+    #[must_use]
+    pub fn with_retry_budget(mut self, budget: rocky_core::retry_budget::RetryBudget) -> Self {
+        self.retry_budget = budget;
+        self
     }
 
     /// Creates a client pointing at a custom base URL (for testing with wiremock).
@@ -74,6 +90,19 @@ impl FivetranClient {
                 max_retries: 0,
                 ..Default::default()
             },
+            retry_budget: rocky_core::retry_budget::RetryBudget::unbounded(),
+        }
+    }
+
+    /// Helper: try to consume one retry slot; if exhausted, return `Err(RetryBudgetExhausted)`.
+    /// Roadmap §P2.7.
+    fn check_retry_budget(&self) -> Result<(), FivetranError> {
+        if self.retry_budget.try_consume() {
+            Ok(())
+        } else {
+            let limit = self.retry_budget.total().unwrap_or(0);
+            warn!(budget_limit = limit, "retry budget exhausted for this run");
+            Err(FivetranError::RetryBudgetExhausted { limit })
         }
     }
 
@@ -96,6 +125,7 @@ impl FivetranClient {
                 Err(e)
                     if attempt < self.retry.max_retries && (e.is_connect() || e.is_timeout()) =>
                 {
+                    self.check_retry_budget()?;
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(attempt = attempt + 1, backoff_ms = backoff.as_millis() as u64, error = %e, "transient HTTP error, retrying");
                     tokio::time::sleep(backoff).await;
@@ -106,6 +136,7 @@ impl FivetranClient {
 
             if resp.status() == 429 {
                 if attempt < self.retry.max_retries {
+                    self.check_retry_budget()?;
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
                         attempt = attempt + 1,
@@ -119,6 +150,7 @@ impl FivetranClient {
             }
 
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
+                self.check_retry_budget()?;
                 let status = resp.status().as_u16();
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
@@ -211,6 +243,7 @@ impl FivetranClient {
                 Err(e)
                     if attempt < self.retry.max_retries && (e.is_connect() || e.is_timeout()) =>
                 {
+                    self.check_retry_budget()?;
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(attempt = attempt + 1, backoff_ms = backoff.as_millis() as u64, error = %e, "transient HTTP error, retrying page");
                     tokio::time::sleep(backoff).await;
@@ -221,6 +254,7 @@ impl FivetranClient {
 
             if resp.status() == 429 {
                 if attempt < self.retry.max_retries {
+                    self.check_retry_budget()?;
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
                         attempt = attempt + 1,
@@ -234,6 +268,7 @@ impl FivetranClient {
             }
 
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
+                self.check_retry_budget()?;
                 let status = resp.status().as_u16();
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(

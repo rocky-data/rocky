@@ -4,6 +4,7 @@ pub mod webhook;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use webhook::WebhookConfig;
+use webhook::{AsyncWebhookHandle, WebhookConfig};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -479,11 +480,26 @@ pub enum HookConfigOrList {
 // HookRegistry — runtime hook lookup + executor
 // ---------------------------------------------------------------------------
 
+/// Summary of async webhook outcomes, produced by
+/// [`HookRegistry::wait_async_webhooks`] at pipeline shutdown.
+#[derive(Debug, Default, Clone)]
+pub struct AsyncWebhookSummary {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// `(url, error message)` pairs for failed deliveries, in the order they
+    /// were spawned.
+    pub failures: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HookRegistry {
     hooks: HashMap<HookEvent, Vec<HookConfig>>,
     webhooks: HashMap<HookEvent, Vec<WebhookConfig>>,
     http: reqwest::Client,
+    /// Handles of async webhooks spawned via `fire` — drained by
+    /// `wait_async_webhooks` at pipeline end.
+    async_webhook_handles: Arc<Mutex<Vec<AsyncWebhookHandle>>>,
 }
 
 impl HookRegistry {
@@ -493,6 +509,7 @@ impl HookRegistry {
             hooks: HashMap::new(),
             webhooks: HashMap::new(),
             http: build_http_client(),
+            async_webhook_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -549,6 +566,22 @@ impl HookRegistry {
                 })
                 .collect();
 
+            // Validate HTTP methods at load time. An unparseable method used
+            // to silently fall through to POST at request time
+            // (`unwrap_or(Method::POST)`); surface it now with the bogus value
+            // + URL so the operator sees the misconfiguration instead of
+            // wondering why their PUT hook is firing as a POST.
+            for wh in &resolved {
+                if wh.method.parse::<reqwest::Method>().is_err() {
+                    warn!(
+                        webhook = %wh.url,
+                        method = %wh.method,
+                        event = %key,
+                        "invalid HTTP method in webhook config; will default to POST at runtime",
+                    );
+                }
+            }
+
             webhooks.entry(event).or_default().extend(resolved);
         }
 
@@ -556,6 +589,7 @@ impl HookRegistry {
             hooks,
             webhooks,
             http: build_http_client(),
+            async_webhook_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -655,8 +689,12 @@ impl HookRegistry {
             for webhook_config in wh {
                 let result = webhook::fire_webhook(webhook_config, ctx, &self.http).await;
                 match result {
-                    Ok(HookResult::Continue) => {}
-                    Ok(HookResult::Abort { reason }) => {
+                    Ok((HookResult::Continue, async_handle)) => {
+                        if let Some(handle) = async_handle {
+                            self.track_async_handle(handle);
+                        }
+                    }
+                    Ok((HookResult::Abort { reason }, _)) => {
                         return Ok(HookResult::Abort { reason });
                     }
                     Err(e) => match webhook_config.on_failure {
@@ -680,6 +718,64 @@ impl HookRegistry {
         }
 
         Ok(HookResult::Continue)
+    }
+
+    /// Records an async webhook handle for later joining. Silent no-op if the
+    /// mutex is poisoned — an earlier panic already broke the pipeline, and
+    /// losing summary fidelity on the way down is acceptable.
+    fn track_async_handle(&self, handle: AsyncWebhookHandle) {
+        match self.async_webhook_handles.lock() {
+            Ok(mut guard) => guard.push(handle),
+            Err(poisoned) => {
+                warn!("async webhook tracker mutex was poisoned; recovering");
+                poisoned.into_inner().push(handle);
+            }
+        }
+    }
+
+    /// Awaits every async webhook spawned via `fire` and returns a summary.
+    /// Callers (e.g. `rocky hooks test`, future `rocky run` integration)
+    /// should invoke this before returning so fire-and-forget deliveries
+    /// don't vanish without a trace.
+    ///
+    /// Subsequent calls return an empty summary — handles are drained.
+    pub async fn wait_async_webhooks(&self) -> AsyncWebhookSummary {
+        let handles: Vec<AsyncWebhookHandle> = match self.async_webhook_handles.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        let total = handles.len();
+        let mut summary = AsyncWebhookSummary {
+            total,
+            ..Default::default()
+        };
+        if total == 0 {
+            return summary;
+        }
+
+        for handle in handles {
+            let (url, outcome) = handle.join().await;
+            match outcome {
+                Ok(Ok(())) => summary.succeeded += 1,
+                Ok(Err(err)) => {
+                    summary.failed += 1;
+                    summary.failures.push((url, err.to_string()));
+                }
+                Err(join_err) => {
+                    summary.failed += 1;
+                    summary
+                        .failures
+                        .push((url, format!("task join error: {join_err}")));
+                }
+            }
+        }
+        info!(
+            total = summary.total,
+            succeeded = summary.succeeded,
+            failed = summary.failed,
+            "async webhook summary"
+        );
+        summary
     }
 }
 
@@ -1488,5 +1584,107 @@ url = "https://example.com/hook"
         assert_eq!(registry.hooks_for(&HookEvent::PipelineStart).len(), 1);
         assert_eq!(registry.webhooks_for(&HookEvent::PipelineStart).len(), 1);
         assert_eq!(registry.total_hook_count(), 2);
+    }
+
+    // -- Method validation at config load --
+
+    #[test]
+    fn test_invalid_method_does_not_prevent_load() {
+        // A webhook with an unparseable HTTP method used to silently default
+        // to POST at request time. After P2.10 the loader emits a warn! log
+        // but still registers the webhook (backward-compatible — invalid
+        // methods don't break existing configs).
+        let mut webhooks = HashMap::new();
+        webhooks.insert(
+            "on_pipeline_start".to_string(),
+            WebhookConfigOrList::Single(WebhookConfig {
+                url: "https://example.com/hook".to_string(),
+                method: "PØST".to_string(), // invalid token — reqwest rejects non-ASCII
+                headers: HashMap::new(),
+                body_template: None,
+                secret: None,
+                timeout_ms: 1000,
+                async_mode: false,
+                on_failure: FailureAction::Warn,
+                retry_count: 0,
+                retry_delay_ms: 100,
+                preset: None,
+            }),
+        );
+        let config = HooksConfig {
+            hooks: HashMap::new(),
+            webhooks,
+        };
+        let registry = HookRegistry::from_config(&config);
+        // Webhook is still registered — the load-time warning is visibility,
+        // not a hard failure (changing that would break hot-reload configs).
+        assert_eq!(registry.webhooks_for(&HookEvent::PipelineStart).len(), 1);
+    }
+
+    // -- Async webhook tracking --
+
+    #[tokio::test]
+    async fn test_wait_async_webhooks_empty_registry() {
+        let registry = HookRegistry::empty();
+        let summary = registry.wait_async_webhooks().await;
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wait_async_webhooks_tracks_spawned_delivery() {
+        // Fire an async webhook against an unroutable address so the spawned
+        // task completes quickly with a delivery error. We want to verify that
+        // (a) fire() returns without awaiting the HTTP roundtrip and (b)
+        // wait_async_webhooks surfaces the failure in the summary.
+        let mut webhooks = HashMap::new();
+        webhooks.insert(
+            "on_pipeline_start".to_string(),
+            WebhookConfigOrList::Single(WebhookConfig {
+                url: "https://127.0.0.1:1/nope".to_string(),
+                method: "POST".to_string(),
+                headers: HashMap::new(),
+                body_template: None,
+                secret: None,
+                // Short per-request timeout so the task ends well inside the
+                // test deadline; retries are off so we get exactly one attempt.
+                timeout_ms: 200,
+                async_mode: true,
+                on_failure: FailureAction::Warn,
+                retry_count: 0,
+                retry_delay_ms: 100,
+                preset: None,
+            }),
+        );
+        let config = HooksConfig {
+            hooks: HashMap::new(),
+            webhooks,
+        };
+        let registry = HookRegistry::from_config(&config);
+
+        let ctx = HookContext::pipeline_start("run-1", "test_pipeline");
+        let result = registry.fire(&ctx).await.unwrap();
+        assert_eq!(result, HookResult::Continue);
+
+        let summary = registry.wait_async_webhooks().await;
+        assert_eq!(summary.total, 1);
+        // Delivery to 127.0.0.1:1 fails; the summary should record that.
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures.len(), 1);
+        assert!(summary.failures[0].0.contains("127.0.0.1:1"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_async_webhooks_drains_handles() {
+        // After calling wait_async_webhooks once, a second call should report
+        // an empty summary (the tracker was drained).
+        let registry = HookRegistry::empty();
+        let first = registry.wait_async_webhooks().await;
+        assert_eq!(first.total, 0);
+        let second = registry.wait_async_webhooks().await;
+        assert_eq!(second.total, 0);
     }
 }

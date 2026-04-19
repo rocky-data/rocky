@@ -67,6 +67,7 @@ fn test_connector_with_retries(server: &MockServer, max_retries: u32) -> Snowfla
             backoff_multiplier: 1.0,
             jitter: false,
             circuit_breaker_threshold: 0,
+            ..Default::default()
         },
     };
 
@@ -222,6 +223,31 @@ async fn test_retry_on_429() {
     let result = connector.execute_sql("SELECT 1").await.unwrap();
 
     assert_eq!(result.statement_handle, "sf-retry");
+}
+
+/// §P2.7: retry budget exhaustion on Snowflake mirrors the Databricks path —
+/// a 429-spewing server with budget=2 + max_retries=5 should short-circuit
+/// with `RetryBudgetExhausted` instead of burning all 5 per-statement retries.
+#[tokio::test]
+async fn test_retry_budget_exhausted_short_circuits() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = test_connector_with_retries(&server, 5)
+        .with_retry_budget(rocky_core::retry_budget::RetryBudget::new(2));
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("429-spewing server should error");
+    match err {
+        ConnectorError::RetryBudgetExhausted { limit } => assert_eq!(limit, 2),
+        other => panic!("expected RetryBudgetExhausted, got: {other:?}"),
+    }
 }
 
 /// Retry on 503: mock returns 503 once, then 200 on retry.

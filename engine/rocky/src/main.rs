@@ -741,11 +741,30 @@ enum ListAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Synchronous entry point. Parses the CLI first so clap can handle
+/// `--version` / `--help` / `--completions` via its own short-circuit
+/// (it calls `process::exit(0)` before we ever reach here) without
+/// paying the tokio runtime construction cost. Only async commands
+/// get the full runtime + tracing + miette setup (§P3.10).
+///
+/// Before this, `#[tokio::main]` wrapped the whole entry and built the
+/// multi-thread runtime unconditionally — `rocky --version` used to take
+/// ~100 ms cold just spinning up worker threads and registering the
+/// global subscriber. Splitting it drops that to ~5 ms for the
+/// fast-exit flags, which matters for shell prompt integrations and
+/// editor-extension startup checks.
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let json = matches!(cli.output, OutputFormat::Json);
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(run_async(cli, json))
+}
+
+async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // Install miette's fancy handler for rich error rendering in text mode.
     // In JSON mode we skip it — errors are serialized as structured data.
     if !json {

@@ -72,10 +72,10 @@ pub fn validate_contract(
     let source_map = column_map::build_column_map(source_columns);
     let target_map = column_map::build_column_map(target_columns);
 
-    // Check required columns
+    // Check required columns (§P1.9: CiStr lookups avoid per-column alloc).
     for req in &contract.required_columns {
-        let name_lower = req.name.to_lowercase();
-        match source_map.get(&name_lower) {
+        let key = column_map::CiStr::new(&req.name);
+        match source_map.get(key) {
             None => {
                 violations.push(ContractViolation {
                     rule: "required_column".to_string(),
@@ -100,8 +100,8 @@ pub fn validate_contract(
 
     // Check protected columns (must exist in source if they existed in target)
     for protected in &contract.protected_columns {
-        let name_lower = protected.to_lowercase();
-        if target_map.contains_key(&name_lower) && !source_map.contains_key(&name_lower) {
+        let key = column_map::CiStr::new(protected);
+        if target_map.contains_key(key) && !source_map.contains_key(key) {
             violations.push(ContractViolation {
                 rule: "protected_column".to_string(),
                 column: protected.clone(),
@@ -113,9 +113,11 @@ pub fn validate_contract(
         }
     }
 
-    // Check type changes against allowed list
+    // Check type changes against allowed list (§P1.9: cross-map lookup via
+    // CiStr so the source map's key lifetime doesn't have to match the
+    // target map's).
     for (name, source_col) in &source_map {
-        if let Some(target_col) = target_map.get(name) {
+        if let Some(target_col) = target_map.get(column_map::CiStr::new(name.as_str())) {
             let src_type = source_col.data_type.to_lowercase();
             let tgt_type = target_col.data_type.to_lowercase();
 

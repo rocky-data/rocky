@@ -53,6 +53,7 @@ pub struct ModelCompileTimings {
 }
 
 /// Configuration for the compiler.
+#[derive(Clone)]
 pub struct CompilerConfig {
     /// Directory containing model files.
     pub models_dir: PathBuf,

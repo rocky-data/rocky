@@ -68,12 +68,12 @@ impl Parser {
                 Ok(())
             }
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: format!("{expected:?}"),
-                found: format!("{t:?}"),
+                expected: format!("{expected:?}").into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: format!("{expected:?}"),
+                expected: format!("{expected:?}").into(),
             }),
         }
     }
@@ -82,12 +82,12 @@ impl Parser {
         match self.advance() {
             Some(Token::Ident(s)) => Ok(s),
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: "identifier".to_string(),
-                found: format!("{t:?}"),
+                expected: "identifier".into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: "identifier".to_string(),
+                expected: "identifier".into(),
             }),
         }
     }
@@ -184,7 +184,7 @@ impl Parser {
 
         if steps.is_empty() {
             return Err(ParseError::UnexpectedEof {
-                expected: "pipeline steps for let binding".to_string(),
+                expected: "pipeline steps for let binding".into(),
             });
         }
 
@@ -259,12 +259,12 @@ impl Parser {
                 Ok(PipelineStep::Replicate)
             }
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: "pipeline step (from, where, group, derive, select, join, sort, take, distinct, replicate)".to_string(),
-                found: format!("{t:?}"),
+                expected: "pipeline step (from, where, group, derive, select, join, sort, take, distinct, replicate)".into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: "pipeline step".to_string(),
+                expected: "pipeline step".into(),
             }),
         }
     }
@@ -500,12 +500,12 @@ impl Parser {
                 Ok(PipelineStep::Take(value))
             }
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: "number".to_string(),
-                found: format!("{t:?}"),
+                expected: "number".into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: "number".to_string(),
+                expected: "number".into(),
             }),
         }
     }
@@ -615,12 +615,12 @@ impl Parser {
                 }
             }
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: "frame bound (unbounded, current, or number)".to_string(),
-                found: format!("{t:?}"),
+                expected: "frame bound (unbounded, current, or number)".into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: "frame bound".to_string(),
+                expected: "frame bound".into(),
             }),
         }
     }
@@ -906,12 +906,12 @@ impl Parser {
                 Ok(Expr::Column(name))
             }
             Some(t) => Err(ParseError::UnexpectedToken {
-                expected: "expression".to_string(),
-                found: format!("{t:?}"),
+                expected: "expression".into(),
+                found: format!("{t:?}").into(),
                 offset: self.current_offset(),
             }),
             None => Err(ParseError::UnexpectedEof {
-                expected: "expression".to_string(),
+                expected: "expression".into(),
             }),
         }
     }

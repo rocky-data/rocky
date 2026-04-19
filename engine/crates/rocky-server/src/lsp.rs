@@ -593,8 +593,20 @@ impl LanguageServer for RockyLsp {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri_string = params.text_document.uri.to_string();
         let changed_file = params.text_document.uri.to_file_path().ok();
+        // P3.2 buffer-hash short-circuit: if the incoming text is identical
+        // to what's already cached for this URI, skip the document update
+        // *and* the debounced recompile scheduling. Catches cursor-only
+        // edits and undo→redo sequences where the editor replays
+        // `didChange` with unchanged content.
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents.write().await.insert(uri_string, change.text);
+            let mut docs = self.documents.write().await;
+            let unchanged = docs
+                .get(&uri_string)
+                .is_some_and(|current| current == &change.text);
+            if unchanged {
+                return;
+            }
+            docs.insert(uri_string, change.text);
         }
 
         if !self.recompile_pending.swap(true, Ordering::SeqCst) {
@@ -617,14 +629,31 @@ impl LanguageServer for RockyLsp {
                     source_column_info: HashMap::new(),
                 };
 
-                // Try incremental compilation if we have a previous result
-                let new_result = {
+                // Try incremental compilation if we have a previous result.
+                //
+                // Full compile (§P3.3) is offloaded to the blocking pool via
+                // `spawn_blocking` so it can't starve hover / completion /
+                // semantic-token handlers on the async runtime's worker
+                // threads. The incremental path stays inline: it's already
+                // fast (<50 ms on 100-model projects), needs a live borrow
+                // of the previous result, and won't dominate the runtime.
+                let use_incremental =
+                    changed_file.is_some() && compile_result.read().await.is_some();
+                let new_result = if use_incremental {
                     let prev = compile_result.read().await;
-                    if let (Some(prev), Some(cf)) = (prev.as_ref(), &changed_file) {
-                        compile_incremental(std::slice::from_ref(cf), prev, &config).ok()
-                    } else {
-                        rocky_compiler::compile::compile(&config).ok()
-                    }
+                    let prev_ref = prev.as_ref().expect("checked use_incremental above");
+                    let cf = changed_file
+                        .as_ref()
+                        .expect("checked use_incremental above");
+                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config).ok()
+                } else {
+                    let config_for_blocking = config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        rocky_compiler::compile::compile(&config_for_blocking).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten()
                 };
 
                 if let Some(result) = new_result {

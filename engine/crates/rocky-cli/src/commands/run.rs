@@ -1333,17 +1333,28 @@ pub async fn run(
         output.interrupted = true;
 
         {
+            // §P1.6: commit every deferred watermark in a single redb
+            // transaction instead of one `begin_write → commit` cycle per
+            // entry. Same per-key data, 1 fsync instead of N.
             let state = shared_state.lock().await;
-            for wm in &deferred_watermarks {
-                if let Err(e) = state.set_watermark(
-                    &wm.state_key,
-                    &WatermarkState {
-                        last_value: wm.timestamp,
-                        updated_at: wm.timestamp,
-                    },
-                ) {
-                    tracing::warn!(error = %e, "failed to persist watermark for run ");
-                }
+            let materialized: Vec<WatermarkState> = deferred_watermarks
+                .iter()
+                .map(|wm| WatermarkState {
+                    last_value: wm.timestamp,
+                    updated_at: wm.timestamp,
+                })
+                .collect();
+            let entries: Vec<(&str, &WatermarkState)> = deferred_watermarks
+                .iter()
+                .zip(materialized.iter())
+                .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
+                .collect();
+            if let Err(e) = state.batch_set_watermarks(&entries) {
+                tracing::warn!(
+                    error = %e,
+                    count = entries.len(),
+                    "failed to persist watermarks for interrupted run",
+                );
             }
         }
 
@@ -1487,18 +1498,41 @@ pub async fn run(
     }
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
-    {
+    //
+    // Under `fail_fast = true` semantics, any table failure should prevent
+    // the surviving tables from advancing their watermarks — otherwise the
+    // next run resumes from a point that implies siblings succeeded. Under
+    // `fail_fast = false` (the default, partial-success semantics), commit
+    // whatever completed cleanly so forward progress isn't lost.
+    let skip_watermarks_due_to_failure = fail_fast && !table_errors.is_empty();
+    if skip_watermarks_due_to_failure {
+        tracing::warn!(
+            deferred = deferred_watermarks.len(),
+            failed_tables = table_errors.len(),
+            "fail_fast + partial failure: skipping {} pending watermark commits so the next run starts from the same baseline",
+            deferred_watermarks.len(),
+        );
+    } else {
+        // §P1.6: single redb transaction for every deferred watermark.
         let state = shared_state.lock().await;
-        for wm in &deferred_watermarks {
-            if let Err(e) = state.set_watermark(
-                &wm.state_key,
-                &WatermarkState {
-                    last_value: wm.timestamp,
-                    updated_at: wm.timestamp,
-                },
-            ) {
-                tracing::warn!(error = %e, "failed to persist watermark for run ");
-            }
+        let materialized: Vec<WatermarkState> = deferred_watermarks
+            .iter()
+            .map(|wm| WatermarkState {
+                last_value: wm.timestamp,
+                updated_at: wm.timestamp,
+            })
+            .collect();
+        let entries: Vec<(&str, &WatermarkState)> = deferred_watermarks
+            .iter()
+            .zip(materialized.iter())
+            .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
+            .collect();
+        if let Err(e) = state.batch_set_watermarks(&entries) {
+            tracing::warn!(
+                error = %e,
+                count = entries.len(),
+                "failed to persist watermarks for run",
+            );
         }
     }
 
