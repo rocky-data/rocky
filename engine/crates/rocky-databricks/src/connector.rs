@@ -245,6 +245,13 @@ impl DatabricksConnector {
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
                         rocky_observe::metrics::METRICS.inc_retries_attempted();
+                        // 401 typically means the OAuth token expired between
+                        // cache-mint and server-use. Drop the cache so the
+                        // next attempt triggers a fresh token exchange;
+                        // genuine bad credentials re-fail and exhaust retries.
+                        if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
+                            self.auth.invalidate_cache().await;
+                        }
                         let backoff_ms = compute_backoff(retry, attempt);
                         warn!(
                             attempt = attempt + 1,
@@ -412,7 +419,10 @@ fn check_terminal_state(response: StatementResponse) -> Result<StatementResponse
 /// - Statement execution timeouts (may succeed on retry with a warmed-up warehouse)
 fn is_transient(err: &ConnectorError) -> bool {
     match err {
-        ConnectorError::ApiError { status, .. } => matches!(status, 429 | 502 | 503 | 504),
+        // 401 is transient-on-first-retry — the connector drops the OAuth
+        // cache before retrying, so a server-expired token is replaced with
+        // a fresh exchange. Bad credentials re-fail on every attempt.
+        ConnectorError::ApiError { status, .. } => matches!(status, 401 | 429 | 502 | 503 | 504),
         ConnectorError::Http(e) => e.is_connect() || e.is_timeout(),
         ConnectorError::StatementFailed { message, .. } => {
             let msg = message.to_uppercase();
@@ -578,12 +588,15 @@ mod tests {
     }
 
     #[test]
-    fn test_not_transient_http_401() {
+    fn test_transient_http_401() {
+        // 401 is now treated as transient so the retry loop can drop the
+        // OAuth token cache and re-exchange. Bad credentials re-fail and
+        // exhaust retries quickly.
         let err = ConnectorError::ApiError {
             status: 401,
             body: "unauthorized".into(),
         };
-        assert!(!is_transient(&err));
+        assert!(is_transient(&err));
     }
 
     #[test]

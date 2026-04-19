@@ -153,9 +153,40 @@ impl Auth {
         }
     }
 
+    /// Invalidates any cached OAuth token so the next `get_token` call
+    /// forces a fresh exchange. PAT auth has no cache and is a no-op.
+    ///
+    /// Called after a server 401 — long pipelines can otherwise keep
+    /// replaying a server-expired token from the local cache until the
+    /// TTL window closes.
+    pub async fn invalidate_cache(&self) {
+        if let AuthInner::OAuthM2M { cached_token, .. } = &self.inner {
+            let mut cache = cached_token.write().await;
+            *cache = None;
+        }
+    }
+
     #[cfg(test)]
     fn is_pat(&self) -> bool {
         matches!(self.inner, AuthInner::Pat { .. })
+    }
+
+    #[cfg(test)]
+    async fn has_cached_token(&self) -> bool {
+        match &self.inner {
+            AuthInner::Pat { .. } => false,
+            AuthInner::OAuthM2M { cached_token, .. } => cached_token.read().await.is_some(),
+        }
+    }
+
+    #[cfg(test)]
+    async fn prime_cache_with(&self, token: &str, ttl: Duration) {
+        if let AuthInner::OAuthM2M { cached_token, .. } = &self.inner {
+            *cached_token.write().await = Some(CachedToken {
+                access_token: RedactedString::new(token.to_string()),
+                expires_at: Instant::now() + ttl,
+            });
+        }
     }
 }
 
@@ -272,5 +303,35 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(!debug.contains("secret_token"));
         assert!(debug.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_clears_oauth_cache() {
+        let auth = Auth::from_config(AuthConfig {
+            host: "host.databricks.com".into(),
+            token: None,
+            client_id: Some("client_123".into()),
+            client_secret: Some("secret_456".into()),
+        })
+        .unwrap();
+        assert!(!auth.has_cached_token().await);
+        auth.prime_cache_with("oauth_token_abc", Duration::from_secs(3600))
+            .await;
+        assert!(auth.has_cached_token().await);
+        auth.invalidate_cache().await;
+        assert!(!auth.has_cached_token().await);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_noop_on_pat() {
+        let auth = Auth::from_config(AuthConfig {
+            host: "host.databricks.com".into(),
+            token: Some("dapi_fixed".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        auth.invalidate_cache().await; // should not panic
+        assert_eq!(auth.get_token().await.unwrap(), "dapi_fixed");
     }
 }
