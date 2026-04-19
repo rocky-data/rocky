@@ -159,7 +159,12 @@ pub struct AsyncWebhookHandle {
 
 impl AsyncWebhookHandle {
     /// Awaits the background task, returning the URL alongside the result.
-    pub async fn join(self) -> (String, Result<Result<(), WebhookError>, tokio::task::JoinError>) {
+    pub async fn join(
+        self,
+    ) -> (
+        String,
+        Result<Result<(), WebhookError>, tokio::task::JoinError>,
+    ) {
         let result = self.handle.await;
         (self.url, result)
     }
@@ -212,7 +217,10 @@ pub async fn fire_webhook(
             }
         });
         debug!(webhook = %url_for_log, "async webhook spawned");
-        return Ok((HookResult::Continue, Some(AsyncWebhookHandle { url, handle })));
+        return Ok((
+            HookResult::Continue,
+            Some(AsyncWebhookHandle { url, handle }),
+        ));
     }
 
     // Synchronous: execute with retries, bounded by the global cap.

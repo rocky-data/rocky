@@ -1106,7 +1106,10 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
             format!("{}={:?}", sub.name, truncated)
         })
         .collect();
-    format!("\n  hint: config had these env var substitutions — check one is the culprit: {}", parts.join(", "))
+    format!(
+        "\n  hint: config had these env var substitutions — check one is the culprit: {}",
+        parts.join(", ")
+    )
 }
 
 // ===========================================================================
@@ -2406,10 +2409,9 @@ mod tests {
         // should still be recorded so the operator sees what was actually
         // substituted.
         unsafe { std::env::remove_var("ROCKY_TEST_UNSET_WITH_DEFAULT") };
-        let (text, report) = substitute_env_vars_with_report(
-            "timeout = ${ROCKY_TEST_UNSET_WITH_DEFAULT:-30}",
-        )
-        .unwrap();
+        let (text, report) =
+            substitute_env_vars_with_report("timeout = ${ROCKY_TEST_UNSET_WITH_DEFAULT:-30}")
+                .unwrap();
         assert_eq!(text, "timeout = 30");
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].name, "ROCKY_TEST_UNSET_WITH_DEFAULT");
@@ -2451,8 +2453,14 @@ max_retries = ${ROCKY_TEST_BAD_TIMEOUT}
             matches!(err, ConfigError::ParseTomlWithEnvContext { .. }),
             "expected ParseTomlWithEnvContext, got {err:?}",
         );
-        assert!(msg.contains("ROCKY_TEST_BAD_TIMEOUT"), "missing env var in error: {msg}");
-        assert!(msg.contains("env var substitutions"), "missing hint prefix in error: {msg}");
+        assert!(
+            msg.contains("ROCKY_TEST_BAD_TIMEOUT"),
+            "missing env var in error: {msg}"
+        );
+        assert!(
+            msg.contains("env var substitutions"),
+            "missing hint prefix in error: {msg}"
+        );
 
         unsafe { std::env::remove_var("ROCKY_TEST_BAD_TIMEOUT") };
     }
