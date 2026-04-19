@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "Diagnostic": {
-      "description": "A compiler diagnostic (error, warning, or informational message).",
+      "description": "A compiler diagnostic (error, warning, or informational message).\n\n`code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.",
       "properties": {
         "code": {
           "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
