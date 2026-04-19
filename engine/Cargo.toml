@@ -27,7 +27,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
-homepage = "https://rocky-data.github.io/rocky/"
+homepage = "https://rocky-data.dev/"
 repository = "https://github.com/rocky-data/rocky"
 
 [workspace.lints.clippy]

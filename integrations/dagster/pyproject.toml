@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://rocky-data.github.io/rocky/"
+Homepage = "https://rocky-data.dev/"
 Repository = "https://github.com/rocky-data/rocky"
-Documentation = "https://rocky-data.github.io/rocky/"
+Documentation = "https://rocky-data.dev/"
 "Bug Tracker" = "https://github.com/rocky-data/rocky/issues"
 
 [dependency-groups]
