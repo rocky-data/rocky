@@ -52,6 +52,6 @@
 
 ## Related
 
-- Rocky docs: [feature page](https://rocky-data.github.io/rocky/...)
+- Rocky docs: [feature page](https://rocky-data.dev/...)
 - Source: `rocky/crates/...`
 - Companion example (if any): [`rocky/examples/...`](https://github.com/rocky-data/rocky/tree/main/examples/...)
