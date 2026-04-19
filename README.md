@@ -11,7 +11,23 @@
 
 A SQL transformation engine built in Rust. Type-safe compilation, column-level lineage, AI-powered intent, and a language server — for data pipelines that don't break.
 
-This repository is a monorepo containing the Rocky engine and its first-party integrations.
+## Try it in 60 seconds
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
+```
+
+```bash
+rocky playground my-first-project
+cd my-first-project
+rocky compile && rocky test && rocky run
+```
+
+No credentials needed — the playground runs end-to-end on local DuckDB.
 
 ## Subprojects
 
@@ -23,20 +39,6 @@ This repository is a monorepo containing the Rocky engine and its first-party in
 | [`examples/playground/`](examples/playground/) | (config only) | TOML / SQL | Self-contained DuckDB sample pipeline used for smoke tests and benchmarks |
 
 Each subproject has its own README with detailed usage. The [`engine/README.md`](engine/README.md) is the canonical product reference for the Rocky CLI.
-
-## Quick install (Rocky CLI only)
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-```
-
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
-```
 
 ## Building from source
 
@@ -62,7 +64,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#releases) for the full release flow.
 
 ## Documentation
 
-Full documentation: **[rocky-data.github.io/rocky](https://rocky-data.github.io/rocky/)**
+Full documentation: **[rocky-data.dev](https://rocky-data.dev)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
 
 ## Contributing
 
