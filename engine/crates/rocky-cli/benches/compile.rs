@@ -518,14 +518,15 @@ fn bench_single_file_change(c: &mut Criterion) {
     // Seed the incremental cache with a full cold compile.
     let previous = compile(&config).expect("seed compile must succeed");
 
-    // Pick a mart model (leaf of the DAG) — `fct_0500` is the first one
-    // `generate_layered_project` produces after 50+150+200 = 400 upstream
-    // models. Editing a leaf minimises downstream reflow so we're really
-    // measuring the incremental path's per-change overhead.
+    // Pick a mart model (leaf of the DAG) — `fct_0400` is the first one
+    // `generate_layered_project` produces, since layers 0..2 contribute
+    // 50+150+200 = 400 upstream models before marts begin. Editing a leaf
+    // minimises downstream reflow so we're really measuring the
+    // incremental path's per-change overhead.
     let models_dir = dir.path().join("models");
-    let target_sql = models_dir.join("fct_0500.sql");
+    let target_sql = models_dir.join("fct_0400.sql");
     let baseline =
-        fs::read_to_string(&target_sql).expect("layered project must contain fct_0500.sql");
+        fs::read_to_string(&target_sql).expect("layered project must contain fct_0400.sql");
 
     group.bench_function("500_models_edit_one_mart", |b| {
         let mut counter: u32 = 0;
