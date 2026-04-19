@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Databricks OAuth 403 "Invalid Token" → token refresh
+
+`rocky-databricks/src/connector.rs::is_transient` previously classified only 401 as transient-and-refreshable. Databricks's SQL Statement Execution API returns **HTTP 403 "Invalid Token"** where 401 would be more idiomatic, which meant long-running operations that crossed the 1-hour OAuth M2M TTL boundary mid-execution died on the first post-expiry call with no retry and no token refresh.
+
+- `is_transient` now treats both 401 and 403 as transient.
+- The retry loop's `invalidate_cache` branch matches both 401 and 403, so the next attempt triggers a fresh `client_credentials` exchange.
+- Bad credentials still re-fail every attempt and exhaust the retry budget — no new attack surface.
+- Surfaced by a multi-hour `rocky compact --measure-dedup` sweep against a production Databricks workspace.
+
+### Fixed — `rocky compact --measure-dedup` on Databricks Unity Catalog
+
+The Layer 0 dedup-measurement command had three defects that made it unusable against Unity Catalog. All three land together since any real Databricks sweep hits each one in sequence:
+
+- **Unqualified `information_schema.tables` query.** Unity Catalog has no workspace-wide `information_schema`; every query must be `<catalog>.information_schema.tables`. `enumerate_tables` now accepts an explicit catalog list (derived from the managed-table set via the new `managed_catalog_set` helper) and fans out per-catalog with catalog-qualified queries. The unqualified form is kept as the `None` fall-through for DuckDB (single-DB scope). Catalogs that fail enumeration (missing, no `USE CATALOG` grant, etc.) are skipped with a warning rather than aborting the sweep.
+- **ANSI-only `table_type` filter.** `WHERE table_type IN ('BASE TABLE', 'TABLE')` excluded every Delta table on Databricks (which uses `MANAGED`, `EXTERNAL`, `STREAMING_TABLE`, `FOREIGN`). Flipped to `NOT IN ('VIEW', 'MATERIALIZED_VIEW', 'MATERIALIZED VIEW')` — broadly portable across warehouses.
+- **No tolerance for empty tables or single-table failures.** An empty table's `HASH` aggregate returns NULL, which aborted the entire sweep. Similarly, one `describe_table` or `hash_table` failure killed all prior + future work. Now all three degrade gracefully: NULL-checksum rows are skipped, per-table failures warn and continue, and the summary log reports skipped catalogs + skipped tables so results can be interpreted as partial coverage rather than silently incomplete.
+
+Known gap (not fixed here): `--all-tables` on Databricks still hits the unqualified `information_schema` query and errors out. The fix is to add `SHOW CATALOGS` discovery for the `None` catalog path, deferred as it needs adapter-level plumbing.
+
 ## [1.9.0] — 2026-04-19
 
 Perf-resilience batch 2. Four items off the roadmap's near-term bucket — two perf foundations, two 1.0 auth-resilience closeouts — plus a refactor pass consolidating the auth-cache pattern across adapters.

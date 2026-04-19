@@ -205,46 +205,77 @@ pub(crate) async fn compute_measure_dedup(
 
     // 5. Enumerate tables to measure, scoping to managed tables unless
     //    --all-tables was passed.
-    let all_warehouse_tables = enumerate_tables(adapter.as_ref()).await?;
-
-    let (tables, scope) = if all_tables {
-        (all_warehouse_tables, "all".to_string())
+    //
+    //    Order matters: resolve managed tables *first* so we can scope
+    //    the `information_schema.tables` query to the specific catalogs
+    //    Rocky manages. On Unity Catalog there is no workspace-wide
+    //    `information_schema` — every `FROM information_schema.tables`
+    //    needs a catalog prefix (`<cat>.information_schema.tables`).
+    //    Fanning out per catalog is the only form that works across
+    //    Databricks, Snowflake, and DuckDB.
+    let managed = if all_tables {
+        None
     } else {
-        let managed =
-            resolve_managed_tables(&rocky_cfg, pipeline_name, pipeline, &registry, config_path)
-                .await;
-        match managed {
-            Ok(Some(managed_set)) => {
-                let filtered: Vec<TableRef> = all_warehouse_tables
-                    .into_iter()
-                    .filter(|t| {
-                        t.validated_full_name()
-                            .map(|name| managed_set.contains(&name.to_lowercase()))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                tracing::info!(
-                    managed_tables = managed_set.len(),
-                    matched = filtered.len(),
-                    "scoped to Rocky-managed tables"
-                );
-                (filtered, "managed".to_string())
-            }
+        match resolve_managed_tables(&rocky_cfg, pipeline_name, pipeline, &registry, config_path)
+            .await
+        {
+            Ok(Some(managed_set)) => Some(managed_set),
             Ok(None) => {
                 tracing::warn!(
                     "could not resolve managed tables for this pipeline type; \
                      falling back to all warehouse tables"
                 );
-                (all_warehouse_tables, "all".to_string())
+                None
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "failed to resolve managed tables; falling back to all warehouse tables"
                 );
-                (all_warehouse_tables, "all".to_string())
+                None
             }
         }
+    };
+
+    let catalog_scope = managed.as_ref().map(managed_catalog_set);
+    let all_warehouse_tables =
+        enumerate_tables(adapter.as_ref(), catalog_scope.as_deref()).await?;
+
+    let (tables, scope) = match managed.as_ref() {
+        Some(managed_set) => {
+            let filtered: Vec<TableRef> = all_warehouse_tables
+                .iter()
+                .cloned()
+                .filter(|t| {
+                    t.validated_full_name()
+                        .map(|name| managed_set.contains(&name.to_lowercase()))
+                        .unwrap_or(false)
+                })
+                .collect();
+            tracing::info!(
+                managed_tables = managed_set.len(),
+                warehouse_tables = all_warehouse_tables.len(),
+                matched = filtered.len(),
+                "scoped to Rocky-managed tables"
+            );
+            if filtered.is_empty() && !managed_set.is_empty() && !all_warehouse_tables.is_empty()
+            {
+                let managed_sample: Vec<&String> = managed_set.iter().take(5).collect();
+                let warehouse_sample: Vec<String> = all_warehouse_tables
+                    .iter()
+                    .take(5)
+                    .filter_map(|t| t.validated_full_name().ok().map(|s| s.to_lowercase()))
+                    .collect();
+                tracing::warn!(
+                    ?managed_sample,
+                    ?warehouse_sample,
+                    "managed ∩ warehouse is empty — naming mismatch between \
+                     pipeline-resolved target names and warehouse table names"
+                );
+            }
+            (filtered, "managed".to_string())
+        }
+        None => (all_warehouse_tables, "all".to_string()),
     };
 
     let tables_scanned = tables.len();
@@ -265,6 +296,13 @@ pub(crate) async fn compute_measure_dedup(
     let mut semantic_per_table: Vec<(String, Vec<PartitionChecksum>)> =
         Vec::with_capacity(tables_scanned);
 
+    // Counters for the graceful-degradation summary emitted after the
+    // sweep. `describe_table` and `hash_table` failures on individual
+    // tables are treated as skippable — a measurement sweep over
+    // thousands of warehouse tables must not abort on one bad row.
+    let mut describe_failures: usize = 0;
+    let mut hash_failures: usize = 0;
+
     for table in &tables {
         let table_ref_str = table
             .validated_full_name()
@@ -275,10 +313,18 @@ pub(crate) async fn compute_measure_dedup(
         // (DuckDB's `hash()` is variadic but the `*` doesn't expand
         // inside function arguments) — by always passing explicit
         // column lists.
-        let column_info = adapter
-            .describe_table(table)
-            .await
-            .map_err(|e| anyhow!("failed to describe {table_ref_str}: {e}"))?;
+        let column_info = match adapter.describe_table(table).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_ref_str,
+                    error = %e,
+                    "describe_table failed — skipping"
+                );
+                describe_failures += 1;
+                continue;
+            }
+        };
 
         let all_columns: Vec<String> = column_info.iter().map(|c| c.name.clone()).collect();
         let semantic_columns: Vec<String> = column_info
@@ -299,7 +345,18 @@ pub(crate) async fn compute_measure_dedup(
             );
             Vec::new()
         } else {
-            hash_table(adapter.as_ref(), table, &all_columns).await?
+            match hash_table(adapter.as_ref(), table, &all_columns).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table_ref_str,
+                        error = %e,
+                        "raw hash failed — skipping table"
+                    );
+                    hash_failures += 1;
+                    continue;
+                }
+            }
         };
         raw_per_table.push((table_ref_str.clone(), raw));
 
@@ -311,9 +368,33 @@ pub(crate) async fn compute_measure_dedup(
             );
             Vec::new()
         } else {
-            hash_table(adapter.as_ref(), table, &semantic_columns).await?
+            match hash_table(adapter.as_ref(), table, &semantic_columns).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table_ref_str,
+                        error = %e,
+                        "semantic hash failed — skipping table"
+                    );
+                    hash_failures += 1;
+                    // Roll back the raw push we just made so the two
+                    // per_table vecs stay aligned for downstream stats.
+                    raw_per_table.pop();
+                    continue;
+                }
+            }
         };
         semantic_per_table.push((table_ref_str, semantic));
+    }
+
+    if describe_failures > 0 || hash_failures > 0 {
+        tracing::warn!(
+            describe_failures,
+            hash_failures,
+            total_matched = tables.len(),
+            hashed = semantic_per_table.len(),
+            "some tables were skipped during hashing; dedup numbers reflect only the hashed set"
+        );
     }
 
     // 7. Compute cross-table dedup stats for both passes.
@@ -511,28 +592,88 @@ fn resolve_transformation_managed_tables(
 /// Enumerate non-system tables visible to the warehouse adapter via
 /// `information_schema.tables`.
 ///
-/// Uses the **unqualified** form (no catalog prefix), which works on
-/// DuckDB (single-DB scope) and on Databricks/Snowflake when the
-/// session already has a default catalog/database bound — which is the
-/// case for every Rocky config that runs through `AdapterRegistry`.
+/// When `catalogs` is `Some(list)`, issues one catalog-prefixed query
+/// per catalog (`FROM <cat>.information_schema.tables`) and merges the
+/// results. This is required on Unity Catalog (Databricks) which has
+/// no workspace-wide `information_schema`, and also on Snowflake
+/// where the session's current database bounds the unqualified form.
+///
+/// When `catalogs` is `None`, issues a single unqualified query. This
+/// works on DuckDB (single-DB scope) and is the fall-through used when
+/// no managed-table resolution is available (e.g. `--all-tables`).
 ///
 /// System schemas (`information_schema`, `pg_catalog`, `system`) are
 /// filtered so the measurement doesn't include the warehouse's own
 /// metadata tables.
-async fn enumerate_tables(adapter: &dyn WarehouseAdapter) -> Result<Vec<TableRef>> {
+async fn enumerate_tables(
+    adapter: &dyn WarehouseAdapter,
+    catalogs: Option<&[String]>,
+) -> Result<Vec<TableRef>> {
     const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "system"];
 
-    let sql = "SELECT table_catalog, table_schema, table_name \
-               FROM information_schema.tables \
-               WHERE table_type IN ('BASE TABLE', 'TABLE')";
+    let mut tables: Vec<TableRef> = Vec::new();
+    match catalogs {
+        Some(catalog_list) => {
+            let mut skipped: Vec<(String, String)> = Vec::new();
+            for catalog in catalog_list {
+                rocky_sql::validation::validate_identifier(catalog).map_err(|e| {
+                    anyhow!("invalid catalog identifier {catalog:?} in managed set: {e}")
+                })?;
+                let sql = format!(
+                    "SELECT table_catalog, table_schema, table_name \
+                     FROM {catalog}.information_schema.tables \
+                     WHERE table_type NOT IN ('VIEW', 'MATERIALIZED_VIEW', 'MATERIALIZED VIEW')"
+                );
+                match adapter.execute_query(&sql).await {
+                    Ok(result) => {
+                        collect_table_rows(&result.rows, SYSTEM_SCHEMAS, &mut tables)?;
+                    }
+                    Err(e) => {
+                        // Catalog may not exist yet (auto-created on first
+                        // write) or the session may lack USE CATALOG. A
+                        // measurement tool should degrade gracefully and
+                        // surface the skipped catalogs in a single summary
+                        // rather than aborting.
+                        tracing::warn!(
+                            catalog = %catalog,
+                            error = %e,
+                            "skipping catalog — enumeration failed (catalog missing or not accessible)"
+                        );
+                        skipped.push((catalog.clone(), e.to_string()));
+                    }
+                }
+            }
+            if !skipped.is_empty() {
+                tracing::warn!(
+                    skipped_catalogs = skipped.len(),
+                    total_catalogs = catalog_list.len(),
+                    "some catalogs were skipped during enumeration; dedup numbers \
+                     below reflect only the catalogs that were readable"
+                );
+            }
+        }
+        None => {
+            let sql = "SELECT table_catalog, table_schema, table_name \
+                       FROM information_schema.tables \
+                       WHERE table_type NOT IN ('VIEW', 'MATERIALIZED_VIEW', 'MATERIALIZED VIEW')";
+            let result = adapter
+                .execute_query(sql)
+                .await
+                .map_err(|e| anyhow!("failed to enumerate tables via information_schema: {e}"))?;
+            collect_table_rows(&result.rows, SYSTEM_SCHEMAS, &mut tables)?;
+        }
+    }
+    Ok(tables)
+}
 
-    let result = adapter
-        .execute_query(sql)
-        .await
-        .map_err(|e| anyhow!("failed to enumerate tables via information_schema: {e}"))?;
-
-    let mut tables = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+/// Parse `SELECT table_catalog, table_schema, table_name` rows into
+/// [`TableRef`]s, dropping any that fall inside a system schema.
+fn collect_table_rows(
+    rows: &[Vec<serde_json::Value>],
+    system_schemas: &[&str],
+    tables: &mut Vec<TableRef>,
+) -> Result<()> {
+    for row in rows {
         let catalog = row
             .first()
             .and_then(|v| v.as_str())
@@ -543,7 +684,7 @@ async fn enumerate_tables(adapter: &dyn WarehouseAdapter) -> Result<Vec<TableRef
             .and_then(|v| v.as_str())
             .context("enumerate_tables: row missing table_schema column")?
             .to_string();
-        if SYSTEM_SCHEMAS
+        if system_schemas
             .iter()
             .any(|s| schema.eq_ignore_ascii_case(s))
         {
@@ -560,7 +701,28 @@ async fn enumerate_tables(adapter: &dyn WarehouseAdapter) -> Result<Vec<TableRef
             table: name,
         });
     }
-    Ok(tables)
+    Ok(())
+}
+
+/// Extract the distinct set of catalog identifiers from a managed-table
+/// set built by `resolve_managed_tables`.
+///
+/// The set is keyed on fully-qualified lowercase names (`catalog.schema.table`)
+/// assembled via `format!("{}.{}.{}", ...)` in the resolver, so splitting
+/// on the first `.` yields the catalog component. Names without a dot
+/// are skipped (defensive — the resolver always emits three components).
+fn managed_catalog_set(managed: &HashSet<String>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for full in managed {
+        if let Some((catalog, _rest)) = full.split_once('.') {
+            if seen.insert(catalog.to_string()) {
+                out.push(catalog.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Execute one whole-table checksum SQL against the warehouse and parse
@@ -601,8 +763,15 @@ fn parse_checksum_rows(result: &QueryResult) -> Result<Vec<PartitionChecksum>> {
             .and_then(|v| v.as_str())
             .unwrap_or("__whole_table__")
             .to_string();
+        // Empty tables: the HASH aggregate returns NULL (Databricks) or
+        // the query returns zero rows (DuckDB). Either way there's no
+        // content to dedupe — skip silently instead of failing the sweep.
+        let checksum_cell = row.get(1);
+        if checksum_cell.map(|v| v.is_null()).unwrap_or(true) {
+            continue;
+        }
         let checksum =
-            json_number_to_u64(row.get(1)).context("checksum column is missing or not a number")?;
+            json_number_to_u64(checksum_cell).context("checksum column is missing or not a number")?;
         let row_count = json_number_to_u64(row.get(2))
             .context("row_count column is missing or not a number")?;
         checksums.push(PartitionChecksum {
@@ -1060,6 +1229,28 @@ mod tests {
     fn test_generate_compact_sql_custom_size() {
         let stmts = generate_compact_sql("my_table", 512);
         assert!(stmts[0].1.contains("512MB"));
+    }
+
+    #[test]
+    fn managed_catalog_set_extracts_distinct_catalogs() {
+        let mut managed = HashSet::new();
+        managed.insert("acme.raw__shopify.orders".to_string());
+        managed.insert("acme.raw__shopify.events".to_string());
+        managed.insert("beta.raw__stripe.charges".to_string());
+        managed.insert("acme.raw__stripe.customers".to_string());
+
+        let catalogs = managed_catalog_set(&managed);
+        assert_eq!(catalogs, vec!["acme".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn managed_catalog_set_skips_names_without_catalog_prefix() {
+        let mut managed = HashSet::new();
+        managed.insert("acme.schema.table".to_string());
+        managed.insert("schema_only".to_string()); // defensive: no `.`
+
+        let catalogs = managed_catalog_set(&managed);
+        assert_eq!(catalogs, vec!["acme".to_string()]);
     }
 
     /// E2E test for `compute_measure_dedup` against an ephemeral DuckDB.
