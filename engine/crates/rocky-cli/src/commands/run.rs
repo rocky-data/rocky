@@ -1213,6 +1213,21 @@ pub async fn run(
                     output.drift.tables_checked += 1;
                 }
                 if let Some(drift_action) = tr.drift_detected {
+                    // §P2.6 per-table emit: drift_detected. The
+                    // column-level list isn't plumbed through
+                    // `TableResult` today (see `DriftActionOutput`: just
+                    // table + action + reason), so we emit with an
+                    // empty columns slice — subscribers get the
+                    // table/action surface; column names are a
+                    // follow-up that threads the full DriftResult.
+                    let _ = hook_registry
+                        .fire(&HookContext::drift_detected(
+                            &run_id,
+                            pipeline_name,
+                            &tr.target_full_name,
+                            &[],
+                        ))
+                        .await;
                     output.drift.tables_drifted += 1;
                     output.drift.actions_taken.push(drift_action);
                 }
@@ -1662,6 +1677,18 @@ pub async fn run(
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
 
+    // §P2.6 emit: before_checks. Table count is the number of tables
+    // participating in row-count / freshness batched checks (distinct
+    // from the per-table count from materialization — a table might
+    // skip one or both check types).
+    let _ = hook_registry
+        .fire(&HookContext::before_checks(
+            &run_id,
+            pipeline_name,
+            source_batch_refs.len().max(freshness_batch_refs.len()),
+        ))
+        .await;
+
     if row_count_enabled || freshness_enabled {
         info!(
             row_count_tables = source_batch_refs.len(),
@@ -1920,6 +1947,34 @@ pub async fn run(
             "batched checks complete"
         );
     }
+
+    // §P2.6 emit: after_checks — count total / passed / failed across
+    // every table's check bag. One event per run (batched), not per
+    // table, matching the "summary" semantics of the phase.
+    {
+        let mut total = 0usize;
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        for table_check in &output.check_results {
+            for check in &table_check.checks {
+                total += 1;
+                if check.passed {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+        let _ = hook_registry
+            .fire(&HookContext::after_checks(
+                &run_id,
+                pipeline_name,
+                total,
+                passed,
+                failed,
+            ))
+            .await;
+    }
     // --- Compiled model execution (--all or --models) ---
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
@@ -1947,6 +2002,14 @@ pub async fn run(
     if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
         warn!(error = %e, "state upload failed");
     }
+
+    // §P2.6 emit: state_synced — final upload is done (either
+    // successfully or the warn above tells the operator it failed;
+    // the hook still fires so downstream observers can tick the
+    // "sync attempted" lifecycle marker).
+    let _ = hook_registry
+        .fire(&HookContext::state_synced(&run_id, pipeline_name))
+        .await;
 
     output.execution.tables_processed = output.tables_copied + table_errors.len();
     output.execution.tables_failed = table_errors.len();
