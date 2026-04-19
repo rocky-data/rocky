@@ -1,5 +1,7 @@
 //! Token types for the Rocky DSL lexer.
 
+use std::sync::Arc;
+
 use logos::Logos;
 
 /// Tokens produced by the Rocky DSL lexer.
@@ -141,20 +143,21 @@ pub enum Token {
     #[token("\n")]
     Newline,
 
-    // Literals
-    #[regex(r#""[^"]*""#, |lex| lex.slice()[1..lex.slice().len()-1].to_string())]
-    #[regex(r#"'[^']*'"#, |lex| lex.slice()[1..lex.slice().len()-1].to_string())]
-    StringLit(String),
+    // Literals — §P3.6: payloads use Arc<str> so the parser clones
+    // tokens via refcount instead of allocating a fresh String per move.
+    #[regex(r#""[^"]*""#, |lex| Arc::<str>::from(&lex.slice()[1..lex.slice().len()-1]))]
+    #[regex(r#"'[^']*'"#, |lex| Arc::<str>::from(&lex.slice()[1..lex.slice().len()-1]))]
+    StringLit(std::sync::Arc<str>),
 
-    #[regex(r"[0-9][0-9_]*(\.[0-9][0-9_]*)?", |lex| lex.slice().replace('_', ""))]
-    NumberLit(String),
+    #[regex(r"[0-9][0-9_]*(\.[0-9][0-9_]*)?", |lex| Arc::<str>::from(lex.slice().replace('_', "").as_str()))]
+    NumberLit(std::sync::Arc<str>),
 
-    #[regex(r"@[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?)?", |lex| lex.slice()[1..].to_string())]
-    DateLit(String),
+    #[regex(r"@[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?)?", |lex| Arc::<str>::from(&lex.slice()[1..]))]
+    DateLit(std::sync::Arc<str>),
 
     // Identifiers
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string(), priority = 1)]
-    Ident(String),
+    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| Arc::<str>::from(lex.slice()), priority = 1)]
+    Ident(std::sync::Arc<str>),
 }
 
 impl std::fmt::Display for Token {
