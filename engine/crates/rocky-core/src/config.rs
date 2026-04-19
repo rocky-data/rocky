@@ -157,6 +157,16 @@ pub enum ConfigError {
     #[error("failed to parse TOML: {0}")]
     ParseToml(#[from] toml::de::Error),
 
+    /// TOML parse/deserialize error after env-var substitution, enriched with
+    /// the list of substituted env vars so the operator can narrow the cause
+    /// (e.g. a negative `timeout_secs` that came from `${TIMEOUT}`).
+    #[error("failed to parse TOML: {source}{env_var_hint}")]
+    ParseTomlWithEnvContext {
+        #[source]
+        source: toml::de::Error,
+        env_var_hint: String,
+    },
+
     #[error("environment variable '{name}' not set (referenced in config)")]
     MissingEnvVar {
         name: String,
@@ -975,16 +985,38 @@ pub struct CacheConfig {
 static ENV_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\{([^}]+)\}").expect("valid regex"));
 
+/// Record of a single environment variable substitution performed during
+/// config loading. Returned by [`substitute_env_vars_with_report`] so
+/// post-substitution diagnostics (§P2.9) can cite the env var that supplied
+/// a bogus value instead of leaving the operator to guess.
+#[derive(Debug, Clone)]
+pub struct EnvVarSubstitution {
+    /// Name of the env var as it appeared in `${NAME}` / `${NAME:-default}`.
+    pub name: String,
+    /// Value that was actually substituted (either `$NAME` or its default).
+    pub value: String,
+}
+
 /// Substitutes `${VAR_NAME}` and `${VAR_NAME:-default}` patterns with environment variable values.
 ///
 /// - `${VAR}` — required, errors if not set
 /// - `${VAR:-fallback}` — uses `fallback` if VAR is not set or empty
 pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
+    substitute_env_vars_with_report(input).map(|(text, _)| text)
+}
+
+/// Like [`substitute_env_vars`], but also returns a report of every
+/// substitution performed. Used by the config loader to attach env-var
+/// origin context to post-substitution parse errors (§P2.9).
+pub fn substitute_env_vars_with_report(
+    input: &str,
+) -> Result<(String, Vec<EnvVarSubstitution>), ConfigError> {
     let re = &*ENV_VAR_RE;
     let mut result = String::with_capacity(input.len());
     let mut last_end = 0;
     // Track the first missing env var and its byte span for diagnostics.
     let mut first_missing: Option<(String, std::ops::Range<usize>)> = None;
+    let mut substitutions: Vec<EnvVarSubstitution> = Vec::new();
 
     for cap in re.captures_iter(input) {
         let full_match = cap.get(0).expect("capture group 0 always exists");
@@ -1013,10 +1045,18 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| default_value.to_string());
             result.push_str(&value);
+            substitutions.push(EnvVarSubstitution {
+                name: var_name.to_string(),
+                value,
+            });
         } else {
             match std::env::var(expr) {
                 Ok(value) => {
                     result.push_str(&value);
+                    substitutions.push(EnvVarSubstitution {
+                        name: expr.to_string(),
+                        value,
+                    });
                 }
                 Err(_) => {
                     if first_missing.is_none() {
@@ -1040,7 +1080,33 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
 
     // Copy the tail of the input after the last match.
     result.push_str(&input[last_end..]);
-    Ok(result)
+    Ok((result, substitutions))
+}
+
+/// Formats a list of env-var substitutions into a one-line human-readable
+/// hint appended to post-substitution parse errors. Values are truncated to
+/// avoid dumping secrets / multi-KB strings into a log line; the operator
+/// just needs enough context to find the misbehaving env var.
+fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
+    if substitutions.is_empty() {
+        return String::new();
+    }
+    const MAX_VALUE_LEN: usize = 40;
+    // De-dup by name, keeping first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    let parts: Vec<String> = substitutions
+        .iter()
+        .filter(|sub| seen.insert(&sub.name))
+        .map(|sub| {
+            let truncated = if sub.value.len() > MAX_VALUE_LEN {
+                format!("{}…", &sub.value[..MAX_VALUE_LEN])
+            } else {
+                sub.value.clone()
+            };
+            format!("{}={:?}", sub.name, truncated)
+        })
+        .collect();
+    format!("\n  hint: config had these env var substitutions — check one is the culprit: {}", parts.join(", "))
 }
 
 // ===========================================================================
@@ -2127,11 +2193,22 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
             ConfigError::ReadFile(e)
         }
     })?;
-    let substituted = substitute_env_vars(&raw)?;
-    let mut value: toml::Value = toml::from_str(&substituted)?;
+    let (substituted, substitutions) = substitute_env_vars_with_report(&raw)?;
+    let env_var_hint = format_env_var_hint(&substitutions);
+    let to_parse_err = |source: toml::de::Error| -> ConfigError {
+        if env_var_hint.is_empty() {
+            ConfigError::ParseToml(source)
+        } else {
+            ConfigError::ParseTomlWithEnvContext {
+                source,
+                env_var_hint: env_var_hint.clone(),
+            }
+        }
+    };
+    let mut value: toml::Value = toml::from_str(&substituted).map_err(to_parse_err)?;
     apply_deprecations(&mut value);
     normalize_toml_shorthands(&mut value);
-    let config: RockyConfig = value.try_into()?;
+    let config: RockyConfig = value.try_into().map_err(to_parse_err)?;
     Ok(config)
 }
 
@@ -2296,6 +2373,88 @@ mod tests {
         unsafe { std::env::remove_var("ROCKY_EMPTY_DEFAULT") };
         let result = substitute_env_vars("${ROCKY_EMPTY_DEFAULT:-}").unwrap();
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_substitute_env_vars_with_report_records_substitutions() {
+        // P2.9: substitute_env_vars_with_report should return the list of
+        // substituted env vars alongside the final text so post-parse errors
+        // can cite the env var origin.
+        unsafe {
+            std::env::set_var("ROCKY_TEST_REPORT_A", "-10");
+            std::env::set_var("ROCKY_TEST_REPORT_B", "42");
+        }
+        let (text, report) = substitute_env_vars_with_report(
+            "timeout_secs = ${ROCKY_TEST_REPORT_A}\nretries = ${ROCKY_TEST_REPORT_B}",
+        )
+        .unwrap();
+        assert_eq!(text, "timeout_secs = -10\nretries = 42");
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].name, "ROCKY_TEST_REPORT_A");
+        assert_eq!(report[0].value, "-10");
+        assert_eq!(report[1].name, "ROCKY_TEST_REPORT_B");
+        assert_eq!(report[1].value, "42");
+        unsafe {
+            std::env::remove_var("ROCKY_TEST_REPORT_A");
+            std::env::remove_var("ROCKY_TEST_REPORT_B");
+        }
+    }
+
+    #[test]
+    fn test_substitute_report_includes_default_values() {
+        // When the env var is unset and a default kicks in, the default value
+        // should still be recorded so the operator sees what was actually
+        // substituted.
+        unsafe { std::env::remove_var("ROCKY_TEST_UNSET_WITH_DEFAULT") };
+        let (text, report) = substitute_env_vars_with_report(
+            "timeout = ${ROCKY_TEST_UNSET_WITH_DEFAULT:-30}",
+        )
+        .unwrap();
+        assert_eq!(text, "timeout = 30");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].name, "ROCKY_TEST_UNSET_WITH_DEFAULT");
+        assert_eq!(report[0].value, "30");
+    }
+
+    #[test]
+    fn test_parse_rocky_config_enriches_toml_error_with_env_vars() {
+        // End-to-end P2.9: a negative number supplied by an env var produces
+        // a TOML parse error; the enriched error should mention the env var
+        // names so the operator can find the culprit.
+        use std::io::Write;
+
+        // Build a minimal config that substitutes an env var into a field
+        // serde will reject as negative u64.
+        unsafe { std::env::set_var("ROCKY_TEST_BAD_TIMEOUT", "-10") };
+        let toml_source = r#"
+[state]
+path = "./state.db"
+
+[adapter.foo]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.p]
+type = "replication"
+source = { adapter = "foo", schema = "x" }
+target = { adapter = "foo", schema = "y" }
+conflict_action = "abort"
+max_retries = ${ROCKY_TEST_BAD_TIMEOUT}
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_source.as_bytes()).expect("write");
+        let err = parse_rocky_config(tmp.path()).expect_err("should reject negative max_retries");
+
+        let msg = err.to_string();
+        // The enriched variant should include the env var name in the hint.
+        assert!(
+            matches!(err, ConfigError::ParseTomlWithEnvContext { .. }),
+            "expected ParseTomlWithEnvContext, got {err:?}",
+        );
+        assert!(msg.contains("ROCKY_TEST_BAD_TIMEOUT"), "missing env var in error: {msg}");
+        assert!(msg.contains("env var substitutions"), "missing hint prefix in error: {msg}");
+
+        unsafe { std::env::remove_var("ROCKY_TEST_BAD_TIMEOUT") };
     }
 
     #[test]
