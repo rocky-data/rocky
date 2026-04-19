@@ -141,7 +141,7 @@ rocky metrics <model> [flags]
 
 ### Examples
 
-Show metrics for a model:
+Show metrics for a model. Output carries one snapshot per recent run with row count, freshness lag, and per-column null rates:
 
 ```bash
 rocky metrics fct_revenue
@@ -152,17 +152,24 @@ rocky metrics fct_revenue
   "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
-  "row_count": 148203,
-  "last_updated": "2026-04-01T14:30:22Z",
-  "columns": [
-    { "name": "customer_id", "null_rate": 0.0, "distinct_count": 12450 },
-    { "name": "revenue_month", "null_rate": 0.0, "distinct_count": 24 },
-    { "name": "net_revenue", "null_rate": 0.0, "min": 0.50, "max": 52340.00 }
+  "count": 1,
+  "snapshots": [
+    {
+      "run_id": "run_20260401_143022",
+      "timestamp": "2026-04-01T14:30:22Z",
+      "row_count": 148203,
+      "freshness_lag_seconds": 300,
+      "null_rates": {
+        "customer_id": 0.0,
+        "revenue_month": 0.0,
+        "net_revenue": 0.0
+      }
+    }
   ]
 }
 ```
 
-Show trends over recent runs:
+`--trend` keeps the same snapshot shape but returns multiple entries (one per recent run):
 
 ```bash
 rocky metrics fct_revenue --trend
@@ -173,15 +180,16 @@ rocky metrics fct_revenue --trend
   "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
-  "trend": [
-    { "run_id": "run_20260401_143022", "row_count": 148203, "duration_ms": 2300 },
-    { "run_id": "run_20260331_143005", "row_count": 145890, "duration_ms": 8900 },
-    { "run_id": "run_20260330_143010", "row_count": 143200, "duration_ms": 2100 }
+  "count": 3,
+  "snapshots": [
+    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "row_count": 148203, "null_rates": { /* … */ } },
+    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "row_count": 145890, "null_rates": { /* … */ } },
+    { "run_id": "run_20260330_143010", "timestamp": "2026-03-30T14:30:10Z", "row_count": 143200, "null_rates": { /* … */ } }
   ]
 }
 ```
 
-Show alerts for a specific column:
+`--alerts` adds a non-empty `alerts` array (omitted otherwise). `--column <name>` sets the top-level `column` field and populates `column_trend` with per-run null-rate points:
 
 ```bash
 rocky metrics fct_revenue --column net_revenue --alerts
@@ -193,13 +201,14 @@ rocky metrics fct_revenue --column net_revenue --alerts
   "command": "metrics",
   "model": "fct_revenue",
   "column": "net_revenue",
+  "count": 3,
+  "snapshots": [ /* … */ ],
+  "column_trend": [
+    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "null_rate": 0.023 },
+    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "null_rate": 0.0 }
+  ],
   "alerts": [
-    {
-      "type": "anomaly",
-      "message": "null rate increased from 0.0% to 2.3% in last run",
-      "severity": "warning",
-      "detected_at": "2026-04-01T14:30:22Z"
-    }
+    { "type": "anomaly", "severity": "warning", "run_id": "run_20260401_143022", "column": "net_revenue", "message": "null rate rose from 0.0% to 2.3% vs. 7-run baseline" }
   ]
 }
 ```
@@ -228,7 +237,7 @@ rocky optimize [flags]
 
 ### Examples
 
-Analyze all models:
+Analyze all models. Each recommendation includes the current and suggested strategy, a free-text reasoning, and an estimated monthly compute savings:
 
 ```bash
 rocky optimize
@@ -238,26 +247,28 @@ rocky optimize
 {
   "version": "1.6.0",
   "command": "optimize",
+  "total_models_analyzed": 3,
   "recommendations": [
     {
-      "model": "fct_revenue",
+      "model_name": "fct_revenue",
       "current_strategy": "incremental",
       "recommended_strategy": "incremental",
-      "reason": "Incremental is optimal. Average 2.3s per run, 1.2% of rows processed each run."
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "Incremental is optimal. Average 2.3s per run, 1.2% of rows processed each run."
     },
     {
-      "model": "dim_customers",
-      "current_strategy": "table",
+      "model_name": "dim_customers",
+      "current_strategy": "full_refresh",
       "recommended_strategy": "incremental",
-      "reason": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs. Switching to incremental would save ~17s per run.",
-      "estimated_savings_ms": 17000
+      "estimated_monthly_savings": 8.50,
+      "reasoning": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs — switching to incremental saves ~17s per run."
     },
     {
-      "model": "stg_events",
+      "model_name": "stg_events",
       "current_strategy": "incremental",
-      "recommended_strategy": "table",
-      "reason": "Drift detected in 4 of last 5 runs, triggering full refresh anyway. Switching to table materialization avoids drift detection overhead.",
-      "estimated_savings_ms": 500
+      "recommended_strategy": "full_refresh",
+      "estimated_monthly_savings": 0.25,
+      "reasoning": "Drift detected in 4 of last 5 runs, triggering full refresh anyway. Switching to full_refresh avoids drift detection overhead."
     }
   ]
 }
@@ -269,21 +280,7 @@ Analyze a single model:
 rocky optimize --model dim_customers
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "optimize",
-  "recommendations": [
-    {
-      "model": "dim_customers",
-      "current_strategy": "table",
-      "recommended_strategy": "incremental",
-      "reason": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs.",
-      "estimated_savings_ms": 17000
-    }
-  ]
-}
-```
+Same `recommendations` shape, single entry. When compile-time incrementality analysis offers additional opportunities, Rocky populates an `incrementality_note` pointing to `rocky compile --output json`.
 
 ### Related Commands
 
