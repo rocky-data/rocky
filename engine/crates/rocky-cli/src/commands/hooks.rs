@@ -105,6 +105,11 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
     info!(event = %event_name, "firing test hook");
     let result = registry.fire(&ctx).await.map_err(|e| anyhow::anyhow!(e))?;
 
+    // Drain any async webhooks so fire-and-forget deliveries complete before
+    // the command exits — otherwise the test would report success while the
+    // spawned task is silently dropped at runtime shutdown.
+    let async_summary = registry.wait_async_webhooks().await;
+
     if json {
         let status = match &result {
             HookResult::Continue => "continue",
@@ -121,6 +126,15 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
         match &result {
             HookResult::Continue => println!("All hooks passed."),
             HookResult::Abort { reason } => println!("Hook aborted: {reason}"),
+        }
+        if async_summary.total > 0 {
+            println!(
+                "Async webhooks: {}/{} succeeded ({} failed)",
+                async_summary.succeeded, async_summary.total, async_summary.failed,
+            );
+            for (url, err) in &async_summary.failures {
+                println!("  ! {url} — {err}");
+            }
         }
     }
 
