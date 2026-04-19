@@ -24,10 +24,26 @@ use rocky_core::checks::CheckResult;
 /// guaranteed — fingerprints should not be persisted across Rocky CLI
 /// upgrades. For run-to-run "did this change since last run?" comparisons
 /// inside a single deployment, it's a good fit.
+///
+/// Implementation note (§P4.3): statements are fed into the hasher
+/// incrementally instead of via `statements.join(";\n")` — the concatenated
+/// string used to allocate an O(total_chars) intermediate buffer per call.
+/// The byte sequence fed to the hasher is preserved (each statement's bytes
+/// followed by `;\n` between adjacent entries, with str's `0xff`
+/// end-marker) so the emitted fingerprint is bit-for-bit identical to the
+/// join-then-hash version — existing persisted `sql_hash` values in state
+/// stores stay comparable.
 pub fn sql_fingerprint(statements: &[String]) -> String {
-    let joined = statements.join(";\n");
     let mut hasher = DefaultHasher::new();
-    joined.hash(&mut hasher);
+    for (i, stmt) in statements.iter().enumerate() {
+        if i > 0 {
+            hasher.write(b";\n");
+        }
+        hasher.write(stmt.as_bytes());
+    }
+    // Match `str::hash`'s terminator byte so the stream matches
+    // `statements.join(";\n").hash(&mut hasher)` exactly.
+    hasher.write_u8(0xff);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1888,4 +1904,63 @@ pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(output)?;
     println!("{json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod sql_fingerprint_tests {
+    use super::sql_fingerprint;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    /// Reference implementation: the pre-§P4.3 `statements.join(";\n").hash(…)`
+    /// path. Used to prove the streaming version produces bit-identical output
+    /// (critical — `sql_hash` values are persisted in state and compared
+    /// across runs, so any drift would invalidate history).
+    fn reference_fingerprint(statements: &[String]) -> String {
+        let joined = statements.join(";\n");
+        let mut hasher = DefaultHasher::new();
+        joined.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    #[test]
+    fn fingerprint_matches_join_then_hash_for_empty_input() {
+        let stmts: Vec<String> = vec![];
+        assert_eq!(sql_fingerprint(&stmts), reference_fingerprint(&stmts));
+    }
+
+    #[test]
+    fn fingerprint_matches_join_then_hash_for_single_stmt() {
+        let stmts = vec!["SELECT 1".to_string()];
+        assert_eq!(sql_fingerprint(&stmts), reference_fingerprint(&stmts));
+    }
+
+    #[test]
+    fn fingerprint_matches_join_then_hash_for_multiple_stmts() {
+        let stmts = vec![
+            "CREATE TABLE t(x INT)".to_string(),
+            "INSERT INTO t VALUES(1)".to_string(),
+            "UPDATE t SET x = 2 WHERE x = 1".to_string(),
+            "DELETE FROM t".to_string(),
+        ];
+        assert_eq!(sql_fingerprint(&stmts), reference_fingerprint(&stmts));
+    }
+
+    #[test]
+    fn fingerprint_matches_for_empty_strings_in_slice() {
+        let stmts = vec!["".to_string(), "SELECT 1".to_string(), "".to_string()];
+        assert_eq!(sql_fingerprint(&stmts), reference_fingerprint(&stmts));
+    }
+
+    #[test]
+    fn fingerprint_order_sensitive() {
+        let a = vec!["SELECT 1".to_string(), "SELECT 2".to_string()];
+        let b = vec!["SELECT 2".to_string(), "SELECT 1".to_string()];
+        assert_ne!(sql_fingerprint(&a), sql_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_preserves_output_width() {
+        let stmts = vec!["SELECT 1".to_string()];
+        assert_eq!(sql_fingerprint(&stmts).len(), 16);
+    }
 }
