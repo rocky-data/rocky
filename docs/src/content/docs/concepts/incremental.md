@@ -13,12 +13,15 @@ Every model (replication or transformation) declares a materialization strategy:
 
 | Strategy | Behavior | Use case |
 |----------|----------|----------|
-| `FullRefresh` | `CREATE OR REPLACE TABLE ... AS SELECT ...` | Small tables, schema changes, initial loads |
-| `Incremental` | `INSERT INTO ... SELECT ... WHERE ts > watermark` | Append-only data with a reliable timestamp |
-| `Merge` | `MERGE INTO ... USING ... ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` | Mutable data with a unique key |
-| `MaterializedView` | `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...` | Warehouse-managed refresh (Databricks) |
-| `DynamicTable` | `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...'` | Auto-refresh with target lag (Snowflake) |
-| `TimeInterval` | Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` placeholders | Time-series data with partition-level reprocessing |
+| `full_refresh` | `CREATE OR REPLACE TABLE ... AS SELECT ...` | Small tables, schema changes, initial loads |
+| `incremental` | `INSERT INTO ... SELECT ... WHERE ts > watermark` | Append-only data with a reliable timestamp |
+| `merge` | `MERGE INTO ... USING ... ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` | Mutable data with a unique key |
+| `time_interval` | Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` placeholders | Time-series data with partition-level reprocessing |
+| `microbatch` | `time_interval` alias with hourly defaults | dbt-compatible partition processing |
+| `ephemeral` | No table; inlined as CTE in downstream models | Lightweight intermediate transformations |
+| `delete_insert` | `DELETE WHERE partition_key IN (...); INSERT ...` | Partition-replace when MERGE overhead isn't needed |
+
+See [Model Format](/reference/model-format/) for the full configuration of each strategy.
 
 ## Watermark-based incremental
 
@@ -178,15 +181,9 @@ Target: orders.amount (STRING)
 → Schema drift detected → DROP TABLE → Full refresh
 ```
 
-### Deleted watermark
+### Missing watermark
 
-Removing a table's watermark from the state store causes Rocky to treat it as a first run:
-
-```bash
-rocky state delete --table "warehouse.staging.orders"
-```
-
-The next run performs a full refresh for that table, establishing a new baseline watermark.
+If the state store doesn't contain a watermark for a table — either because the table is new, the state backend was wiped, or the table was renamed — Rocky treats the next run as a first run and performs a full refresh, establishing a new baseline watermark.
 
 ## State store
 
