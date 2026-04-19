@@ -16,7 +16,7 @@ sidebar:
 
 Source adapters: **Fivetran** (REST API discovery), **DuckDB** (information_schema), **Manual** (config-defined).
 
-## Materialization Strategies (10)
+## Materialization Strategies (7)
 
 | Strategy | Description |
 |---|---|
@@ -24,12 +24,11 @@ Source adapters: **Fivetran** (REST API discovery), **DuckDB** (information_sche
 | **incremental** | Append past a timestamp watermark |
 | **merge** | Upsert via MERGE INTO with unique key |
 | **time_interval** | Partition-keyed with per-partition state, lookback, parallel execution |
-| **snapshot** | SCD Type 2 with valid_from/valid_to and hard delete tracking |
-| **materialized_view** | Warehouse-managed materialized view (Databricks) |
-| **dynamic_table** | Snowflake dynamic table with lag-based refresh |
 | **ephemeral** | Inlined as CTE in downstream queries, no table created |
-| **microbatch** | Alias for time_interval with hourly defaults (dbt-compatible) |
 | **delete_insert** | Delete by partition key, then insert fresh data |
+| **microbatch** | Alias for time_interval with hourly defaults (dbt-compatible) |
+
+Separately, the top-level `format` key on a model selects warehouse-managed table shapes: **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, and **plain views**. SCD Type 2 **snapshots** are run through a dedicated `type = "snapshot"` pipeline (see [`rocky snapshot`](/reference/cli/#rocky-snapshot)).
 
 ### Time Interval Materialization
 

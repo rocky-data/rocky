@@ -59,16 +59,20 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type: `"full_refresh"`, `"incremental"`, `"merge"`, `"materialized_view"`, `"dynamic_table"`, or `"time_interval"`. |
-| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"`. |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`. |
+| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"` or `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
-| `target_lag` | string | | Target lag for dynamic tables (e.g., `"1 hour"`). Required when `type = "dynamic_table"`. Snowflake only. |
+| `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
 | `time_column` | string | | Partition column for time-interval processing. Required when `type = "time_interval"`. |
-| `granularity` | string | | Partition granularity: `"hour"`, `"day"`, `"month"`, or `"year"`. Required when `type = "time_interval"`. |
-| `lookback` | integer | | Number of past partitions to reprocess. Optional for `"time_interval"`. |
-| `batch_size` | integer | | Max partitions per batch. Optional for `"time_interval"`. |
+| `granularity` | string | `"hour"` (microbatch) | Partition granularity: `"hour"`, `"day"`, `"month"`, or `"year"`. Required when `type = "time_interval"`; optional default for `"microbatch"`. |
+| `lookback` | integer | `0` | Number of past partitions to reprocess. Optional for `"time_interval"`. |
+| `batch_size` | integer | `1` | Max partitions per batch. Optional for `"time_interval"`. |
 | `first_partition` | string | | Earliest partition key (e.g., `"2024-01-01"`). Optional for `"time_interval"`. |
+
+:::note[Lakehouse formats]
+Warehouse-managed materializations like **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, and **plain views** are selected via the top-level `format` key on the model TOML (e.g. `format = "materialized_view"`), not via `[strategy]`. `[strategy]` controls how Rocky writes the data; `format` controls the physical table shape.
+:::
 
 **`[target]`** -- Output table:
 
@@ -299,69 +303,70 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ---
 
-### Materialized View
+### Ephemeral
 
-Creates a materialized view managed by the warehouse. Databricks only.
+An ephemeral model is never materialized — Rocky inlines it as a CTE in every downstream consumer. Useful for lightweight intermediate transformations you don't want to persist.
 
-**Config** (`models/mv_daily_revenue.toml`):
+**Config** (`models/stg_recent_orders.toml`):
 
 ```toml
-name = "mv_daily_revenue"
-depends_on = ["fct_orders"]
+name = "stg_recent_orders"
+depends_on = []
 
 [strategy]
-type = "materialized_view"
+type = "ephemeral"
+
+[target]
+catalog = "analytics"
+schema = "staging"
+table = "stg_recent_orders"
+```
+
+No DDL runs for ephemeral models. The SQL body is injected as a `WITH stg_recent_orders AS (…)` CTE wherever the model is referenced.
+
+---
+
+### Delete + Insert
+
+Deletes matching rows by partition key, then inserts fresh data. A lower-overhead alternative to `merge` when the partition key identifies the rows being rewritten.
+
+**Config** (`models/fct_daily_activity.toml`):
+
+```toml
+name = "fct_daily_activity"
+depends_on = []
+
+[strategy]
+type = "delete_insert"
+partition_by = ["activity_date"]
 
 [target]
 catalog = "analytics"
 schema = "warehouse"
-table = "mv_daily_revenue"
-```
-
-Generated SQL:
-
-```sql
-CREATE OR REPLACE MATERIALIZED VIEW analytics.warehouse.mv_daily_revenue AS
-SELECT
-    order_date,
-    SUM(total_amount) AS daily_revenue
-FROM analytics.warehouse.fct_orders
-GROUP BY order_date
+table = "fct_daily_activity"
 ```
 
 ---
 
-### Dynamic Table
+### Microbatch
 
-Creates a Snowflake dynamic table with automatic refresh based on a target lag.
+An alias for `time_interval` with `hour`-granularity defaults. dbt-compatible naming for partition-based incremental processing.
 
-**Config** (`models/dt_customer_stats.toml`):
+**Config** (`models/fct_hourly_events.toml`):
 
 ```toml
-name = "dt_customer_stats"
-depends_on = ["stg_orders"]
+name = "fct_hourly_events"
+depends_on = []
 
 [strategy]
-type = "dynamic_table"
-target_lag = "1 hour"
+type = "microbatch"
+timestamp_column = "event_at"   # TIMESTAMP column on the model output
+# granularity = "hour"           # optional — defaults to hour
 
 [target]
 catalog = "analytics"
 schema = "warehouse"
-table = "dt_customer_stats"
-```
-
-Generated SQL:
-
-```sql
-CREATE OR REPLACE DYNAMIC TABLE analytics.warehouse.dt_customer_stats
-TARGET_LAG = '1 hour'
-WAREHOUSE = my_warehouse
-AS SELECT
-    customer_id,
-    COUNT(*) AS order_count
-FROM analytics.staging.stg_orders
-GROUP BY customer_id
+table = "fct_hourly_events"
 ```
 
 ---
