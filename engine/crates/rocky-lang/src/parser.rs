@@ -1,5 +1,7 @@
 //! Recursive descent parser for the Rocky DSL.
 
+use std::sync::Arc;
+
 use logos::Logos;
 
 use crate::ast::*;
@@ -646,7 +648,7 @@ impl Parser {
         self.expect(&Token::RBrace)?;
 
         Ok(Expr::Match {
-            expr: Box::new(expr),
+            expr: Arc::new(expr),
             arms,
         })
     }
@@ -703,9 +705,9 @@ impl Parser {
             self.advance();
             let right = self.parse_and_expr()?;
             left = Expr::BinaryOp {
-                left: Box::new(left),
+                left: Arc::new(left),
                 op: BinOp::Or,
-                right: Box::new(right),
+                right: Arc::new(right),
             };
         }
         Ok(left)
@@ -717,9 +719,9 @@ impl Parser {
             self.advance();
             let right = self.parse_comparison()?;
             left = Expr::BinaryOp {
-                left: Box::new(left),
+                left: Arc::new(left),
                 op: BinOp::And,
-                right: Box::new(right),
+                right: Arc::new(right),
             };
         }
         Ok(left)
@@ -739,7 +741,7 @@ impl Parser {
             };
             self.expect(&Token::Null)?;
             return Ok(Expr::IsNull {
-                expr: Box::new(left),
+                expr: Arc::new(left),
                 negated,
             });
         }
@@ -759,9 +761,9 @@ impl Parser {
             self.advance();
             let right = self.parse_additive()?;
             left = Expr::BinaryOp {
-                left: Box::new(left),
+                left: Arc::new(left),
                 op,
-                right: Box::new(right),
+                right: Arc::new(right),
             };
         }
 
@@ -779,9 +781,9 @@ impl Parser {
             self.advance();
             let right = self.parse_multiplicative()?;
             left = Expr::BinaryOp {
-                left: Box::new(left),
+                left: Arc::new(left),
                 op,
-                right: Box::new(right),
+                right: Arc::new(right),
             };
         }
         Ok(left)
@@ -799,9 +801,9 @@ impl Parser {
             self.advance();
             let right = self.parse_unary()?;
             left = Expr::BinaryOp {
-                left: Box::new(left),
+                left: Arc::new(left),
                 op,
-                right: Box::new(right),
+                right: Arc::new(right),
             };
         }
         Ok(left)
@@ -814,7 +816,7 @@ impl Parser {
                 let expr = self.parse_unary()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
-                    expr: Box::new(expr),
+                    expr: Arc::new(expr),
                 })
             }
             Some(Token::Minus) => {
@@ -822,7 +824,7 @@ impl Parser {
                 let expr = self.parse_unary()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
-                    expr: Box::new(expr),
+                    expr: Arc::new(expr),
                 })
             }
             _ => self.parse_primary(),
