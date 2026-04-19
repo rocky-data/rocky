@@ -566,6 +566,22 @@ impl HookRegistry {
                 })
                 .collect();
 
+            // Validate HTTP methods at load time. An unparseable method used
+            // to silently fall through to POST at request time
+            // (`unwrap_or(Method::POST)`); surface it now with the bogus value
+            // + URL so the operator sees the misconfiguration instead of
+            // wondering why their PUT hook is firing as a POST.
+            for wh in &resolved {
+                if wh.method.parse::<reqwest::Method>().is_err() {
+                    warn!(
+                        webhook = %wh.url,
+                        method = %wh.method,
+                        event = %key,
+                        "invalid HTTP method in webhook config; will default to POST at runtime",
+                    );
+                }
+            }
+
             webhooks.entry(event).or_default().extend(resolved);
         }
 
@@ -1568,6 +1584,41 @@ url = "https://example.com/hook"
         assert_eq!(registry.hooks_for(&HookEvent::PipelineStart).len(), 1);
         assert_eq!(registry.webhooks_for(&HookEvent::PipelineStart).len(), 1);
         assert_eq!(registry.total_hook_count(), 2);
+    }
+
+    // -- Method validation at config load --
+
+    #[test]
+    fn test_invalid_method_does_not_prevent_load() {
+        // A webhook with an unparseable HTTP method used to silently default
+        // to POST at request time. After P2.10 the loader emits a warn! log
+        // but still registers the webhook (backward-compatible — invalid
+        // methods don't break existing configs).
+        let mut webhooks = HashMap::new();
+        webhooks.insert(
+            "on_pipeline_start".to_string(),
+            WebhookConfigOrList::Single(WebhookConfig {
+                url: "https://example.com/hook".to_string(),
+                method: "PØST".to_string(), // invalid token — reqwest rejects non-ASCII
+                headers: HashMap::new(),
+                body_template: None,
+                secret: None,
+                timeout_ms: 1000,
+                async_mode: false,
+                on_failure: FailureAction::Warn,
+                retry_count: 0,
+                retry_delay_ms: 100,
+                preset: None,
+            }),
+        );
+        let config = HooksConfig {
+            hooks: HashMap::new(),
+            webhooks,
+        };
+        let registry = HookRegistry::from_config(&config);
+        // Webhook is still registered — the load-time warning is visibility,
+        // not a hard failure (changing that would break hot-reload configs).
+        assert_eq!(registry.webhooks_for(&HookEvent::PipelineStart).len(), 1);
     }
 
     // -- Async webhook tracking --
