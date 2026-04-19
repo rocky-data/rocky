@@ -831,6 +831,18 @@ pub async fn run(
         .fire(&HookContext::pipeline_start(&run_id, pipeline_name))
         .await;
 
+    // §P2.6 emit: discover_complete. Fired once, right after
+    // pipeline_start, with the source-discovery count captured above
+    // (discovery runs before run_id is established, so this is the
+    // earliest emit point with a stable run_id).
+    let _ = hook_registry
+        .fire(&HookContext::discover_complete(
+            &run_id,
+            pipeline_name,
+            connectors.len(),
+        ))
+        .await;
+
     let completed_keys: std::collections::HashSet<String> = if resume_latest {
         if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
             let keys: std::collections::HashSet<String> = prev
@@ -1898,6 +1910,17 @@ pub async fn run(
                             "row count anomaly detected"
                         );
                         rocky_observe::metrics::METRICS.inc_anomalies_detected();
+                        // §P2.6 emit: anomaly_detected. Fires before
+                        // pushing to output.anomalies so we can pass
+                        // references without cloning.
+                        let _ = hook_registry
+                            .fire(&HookContext::anomaly_detected(
+                                &run_id,
+                                pipeline_name,
+                                &anomaly.table,
+                                &anomaly.reason,
+                            ))
+                            .await;
                         output.anomalies.push(AnomalyOutput {
                             table: anomaly.table,
                             current_count: anomaly.current_count,
@@ -1935,6 +1958,19 @@ pub async fn run(
     // Assemble check results
     for (_table_key, pending) in pending_checks {
         if !pending.checks.is_empty() {
+            // §P2.6 emit: check_result. Fires per-check inside the
+            // assembled bag so subscribers see every pass/fail
+            // (after_checks is the summary roll-up).
+            for check in &pending.checks {
+                let _ = hook_registry
+                    .fire(&HookContext::check_result(
+                        &run_id,
+                        pipeline_name,
+                        &check.name,
+                        check.passed,
+                    ))
+                    .await;
+            }
             output.check_results.push(TableCheckOutput {
                 asset_key: pending.asset_key,
                 checks: pending.checks,
