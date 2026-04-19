@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-04-19
+
+### Changed — Tighter logo crop
+
+Cosmetic refresh of the bundled icons. The Rocky mark now uses a tighter SVG viewBox (`223.63 222.92 580.06 580.06`) that crops the empty margin around the glyph, so the icon reads larger in the marketplace tile, the activity bar, and the file-icon gutter. The activity bar icon (`rocky-activity-bar.svg`) stays monochrome so VS Code theme colors keep applying. No code changes.
+
 ## [1.4.0] — 2026-04-17
 
 ### Added — Regenerated TypeScript bindings for engine 1.8.0
