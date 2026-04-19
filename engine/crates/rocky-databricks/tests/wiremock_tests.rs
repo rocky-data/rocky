@@ -221,6 +221,64 @@ async fn test_retry_on_429() {
     assert_eq!(result.statement_id, "stmt-retry");
 }
 
+/// §P2.8 emit site: retry transitions publish a `statement_retry`
+/// PipelineEvent with structured attempt / error_class. Subscribes to the
+/// global event bus BEFORE the retry fires to avoid racing the broadcast.
+#[tokio::test]
+async fn test_retry_emits_pipeline_event() {
+    use rocky_observe::events::{ErrorClass, global_event_bus};
+
+    let server = MockServer::start().await;
+
+    // One 429 then a success — exactly one retry, one emitted event.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-event",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": { "schema": { "columns": [] }, "total_row_count": 0 },
+            "result": { "data_array": [] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut events = global_event_bus().subscribe();
+    let connector = test_connector_with_retries(&server, 2);
+    connector.execute_sql("SELECT 1").await.unwrap();
+
+    // Drain pending events and filter for the retry we just triggered.
+    // The bus is process-global — other wiremock tests running in parallel
+    // may publish their own statement_retry events with different
+    // max_attempts values. Match on the exact attempt/max_attempts pair
+    // we configured (1/2) so we don't accept a neighbour's event.
+    let mut retry_event = None;
+    for _ in 0..100 {
+        match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Ok(ev))
+                if ev.event_type == "statement_retry"
+                    && ev.attempt == Some(1)
+                    && ev.max_attempts == Some(2) =>
+            {
+                retry_event = Some(ev);
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    let ev = retry_event.expect("retry should publish a 1/2 statement_retry event");
+    assert_eq!(ev.error_class, Some(ErrorClass::RateLimit));
+    assert!(ev.error.as_deref().unwrap_or("").contains("429"));
+}
+
 /// §P2.7: retry budget caps total retries across the connector's lifetime.
 /// With max_retries=5 but budget=2, a 429-spewing server exhausts the budget
 /// on the second retry and short-circuits with `RetryBudgetExhausted`.

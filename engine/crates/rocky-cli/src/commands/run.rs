@@ -2090,8 +2090,8 @@ pub(crate) async fn execute_models(
             if d.is_error() {
                 warn!(
                     model = d.model.as_str(),
-                    code = d.code.as_str(),
-                    message = d.message.as_str(),
+                    code = &*d.code,
+                    message = &*d.message,
                     "compile error"
                 );
             }

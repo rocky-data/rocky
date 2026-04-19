@@ -50,7 +50,9 @@ pub fn run_tests(models_dir: &Path, contracts_dir: Option<&Path>) -> anyhow::Res
     if compile_result.has_errors {
         for d in &compile_result.diagnostics {
             if d.is_error() {
-                result.failures.push((d.model.clone(), d.message.clone()));
+                result
+                    .failures
+                    .push((d.model.clone(), d.message.to_string()));
             }
         }
         return Ok(result);

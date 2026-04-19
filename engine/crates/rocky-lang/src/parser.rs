@@ -80,7 +80,7 @@ impl Parser {
 
     fn expect_ident(&mut self) -> Result<String, ParseError> {
         match self.advance() {
-            Some(Token::Ident(s)) => Ok(s),
+            Some(Token::Ident(s)) => Ok(s.to_string()),
             Some(t) => Err(ParseError::UnexpectedToken {
                 expected: "identifier".into(),
                 found: format!("{t:?}").into(),
@@ -204,7 +204,7 @@ impl Parser {
         };
 
         // Combined forms: left_join, right_join, full_join, cross_join.
-        let combined = match s.as_str() {
+        let combined = match &*s {
             "left_join" => Some(JoinType::Left),
             "right_join" => Some(JoinType::Right),
             "full_join" => Some(JoinType::Full),
@@ -217,7 +217,7 @@ impl Parser {
         }
 
         // Two-word form: `left join`, `right join`, `full join`, `cross join`.
-        let modifier = match s.as_str() {
+        let modifier = match &*s {
             "left" => Some(JoinType::Left),
             "right" => Some(JoinType::Right),
             "full" => Some(JoinType::Full),
@@ -494,9 +494,9 @@ impl Parser {
         self.expect(&Token::Take)?;
         match self.advance() {
             Some(Token::NumberLit(n)) => {
-                let value: u64 = n
-                    .parse()
-                    .map_err(|_| ParseError::InvalidNumber { value: n })?;
+                let value: u64 = n.parse().map_err(|_| ParseError::InvalidNumber {
+                    value: n.to_string(),
+                })?;
                 Ok(PipelineStep::Take(value))
             }
             Some(t) => Err(ParseError::UnexpectedToken {
@@ -606,9 +606,9 @@ impl Parser {
             }
             Some(Token::NumberLit(_)) => {
                 if let Some(Token::NumberLit(n)) = self.advance() {
-                    let value: i64 = n
-                        .parse()
-                        .map_err(|_| ParseError::InvalidNumber { value: n })?;
+                    let value: i64 = n.parse().map_err(|_| ParseError::InvalidNumber {
+                        value: n.to_string(),
+                    })?;
                     Ok(FrameBound::Offset(value))
                 } else {
                     unreachable!()
@@ -833,21 +833,21 @@ impl Parser {
         match self.peek().cloned() {
             Some(Token::StringLit(_)) => {
                 if let Some(Token::StringLit(s)) = self.advance() {
-                    Ok(Expr::StringLit(s))
+                    Ok(Expr::StringLit(s.to_string()))
                 } else {
                     unreachable!()
                 }
             }
             Some(Token::NumberLit(_)) => {
                 if let Some(Token::NumberLit(n)) = self.advance() {
-                    Ok(Expr::NumberLit(n))
+                    Ok(Expr::NumberLit(n.to_string()))
                 } else {
                     unreachable!()
                 }
             }
             Some(Token::DateLit(_)) => {
                 if let Some(Token::DateLit(d)) = self.advance() {
-                    Ok(Expr::DateLit(d))
+                    Ok(Expr::DateLit(d.to_string()))
                 } else {
                     unreachable!()
                 }

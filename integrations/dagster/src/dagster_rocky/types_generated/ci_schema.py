@@ -42,6 +42,8 @@ class TestFailure(BaseModel):
 class Diagnostic(BaseModel):
     """
     A compiler diagnostic (error, warning, or informational message).
+
+    `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
     """
 
     code: str
