@@ -323,7 +323,12 @@ const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
 // ── LSP backend ─────────────────────────────────────────────────────────────
 
 /// Content-hash-indexed cache of pre-computed semantic tokens (§P3.4).
-type SemanticTokensCache = Arc<RwLock<HashMap<String, (u64, Vec<SemanticToken>)>>>;
+/// Pre-delta semantic tokens: `(line, col, len, type_idx)` tuples, in
+/// source order. Stored pre-delta so both `semantic_tokens_full` and
+/// `semantic_tokens_range` (§P3.4) can re-delta-encode their own slice —
+/// the full path over everything, the range path over just the tokens
+/// inside the requested viewport.
+type SemanticTokensCache = Arc<RwLock<HashMap<String, (u64, Vec<(u32, u32, u32, u32)>)>>>;
 
 /// Rocky LSP backend.
 pub struct RockyLsp {
@@ -522,6 +527,113 @@ impl RockyLsp {
             ),
         })
     }
+
+    /// Compute pre-delta semantic tokens for a model, using the cache
+    /// when the SQL hash is unchanged. Shared between
+    /// `semantic_tokens_full` and `semantic_tokens_range` (§P3.4) so
+    /// the range path benefits from the same caching.
+    async fn compute_or_load_semantic_tokens(
+        &self,
+        result: &CompileResult,
+        uri_str: &str,
+        model: &rocky_core::models::Model,
+    ) -> Vec<(u32, u32, u32, u32)> {
+        let sql_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            model.sql.hash(&mut h);
+            h.finish()
+        };
+        if let Some((cached_hash, cached_tokens)) =
+            self.semantic_tokens_cache.read().await.get(uri_str)
+        {
+            if *cached_hash == sql_hash {
+                return cached_tokens.clone();
+            }
+        }
+
+        let model_names: std::collections::HashSet<&str> = result
+            .project
+            .models
+            .iter()
+            .map(|m| m.config.name.as_str())
+            .collect();
+        let func_names: std::collections::HashSet<&str> =
+            SQL_FUNCTIONS.iter().map(|(name, _)| *name).collect();
+
+        let mut tokens: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let dialect = rocky_sql::dialect::DatabricksDialect;
+        if let Ok(stmts) = Parser::parse_sql(&dialect, &model.sql) {
+            for stmt in &stmts {
+                if let Statement::Query(query) = stmt {
+                    collect_semantic_tokens_from_query(
+                        query,
+                        &model_names,
+                        &func_names,
+                        &mut tokens,
+                    );
+                }
+            }
+        }
+        tokens.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        self.semantic_tokens_cache
+            .write()
+            .await
+            .insert(uri_str.to_string(), (sql_hash, tokens.clone()));
+        tokens
+    }
+}
+
+/// Filter pre-delta tokens to those falling within `range`. A token is
+/// included if its starting `(line, col)` lies within the range — we
+/// don't split tokens that straddle the boundary, which matches how
+/// most editors render partial viewports (the off-screen tail is
+/// invisible anyway).
+fn filter_tokens_to_range(
+    tokens: &[(u32, u32, u32, u32)],
+    range: &Range,
+) -> Vec<(u32, u32, u32, u32)> {
+    let start = &range.start;
+    let end = &range.end;
+    tokens
+        .iter()
+        .filter(|(line, col, _, _)| {
+            let after_start =
+                *line > start.line || (*line == start.line && *col >= start.character);
+            let before_end = *line < end.line || (*line == end.line && *col <= end.character);
+            after_start && before_end
+        })
+        .copied()
+        .collect()
+}
+
+/// Convert pre-delta `(line, col, len, type_idx)` tokens into the
+/// delta-encoded wire format required by the LSP protocol. The first
+/// token's deltas are taken relative to `(0, 0)`.
+fn delta_encode_semantic_tokens(tokens: &[(u32, u32, u32, u32)]) -> Vec<SemanticToken> {
+    let mut data = Vec::with_capacity(tokens.len());
+    let mut prev_line = 0u32;
+    let mut prev_col = 0u32;
+    for (line, col, len, type_idx) in tokens {
+        let delta_line = line - prev_line;
+        let delta_col = if delta_line == 0 {
+            col - prev_col
+        } else {
+            *col
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start: delta_col,
+            length: *len,
+            token_type: *type_idx,
+            token_modifiers_bitset: 0,
+        });
+        prev_line = *line;
+        prev_col = *col;
+    }
+    data
 }
 
 #[tower_lsp::async_trait]
@@ -570,7 +682,14 @@ impl LanguageServer for RockyLsp {
                                 token_modifiers: vec![],
                             },
                             full: Some(SemanticTokensFullOptions::Bool(true)),
-                            range: None,
+                            // §P3.4 — advertise range support so editors
+                            // (vscode-languageclient) send
+                            // `textDocument/semanticTokens/range` on scroll
+                            // instead of always requesting the full
+                            // document. Server-side compute cost stays the
+                            // same (cache hit) but response size drops to
+                            // what the editor actually needs to render.
+                            range: Some(true),
                             work_done_progress_options: WorkDoneProgressOptions::default(),
                         },
                     ),
@@ -1611,94 +1730,47 @@ impl LanguageServer for RockyLsp {
         };
 
         let uri = &params.text_document.uri;
-        let uri_str = uri.to_string();
-        let model = self.model_for_uri(result, uri);
-        let Some(model) = model else { return Ok(None) };
-
-        // §P3.4: editors call `semanticTokens/full` per scroll / focus
-        // change, and the SQL parse dominates the cost on large files.
-        // Cache by (URI, content hash); bail out early on a hit without
-        // re-parsing or re-walking the AST.
-        let sql_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            model.sql.hash(&mut h);
-            h.finish()
+        let Some(model) = self.model_for_uri(result, uri) else {
+            return Ok(None);
         };
-        {
-            let cache = self.semantic_tokens_cache.read().await;
-            if let Some((cached_hash, cached_data)) = cache.get(&uri_str) {
-                if *cached_hash == sql_hash {
-                    return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                        result_id: None,
-                        data: cached_data.clone(),
-                    })));
-                }
-            }
-        }
 
-        let model_names: std::collections::HashSet<&str> = result
-            .project
-            .models
-            .iter()
-            .map(|m| m.config.name.as_str())
-            .collect();
-
-        let func_names: std::collections::HashSet<&str> =
-            SQL_FUNCTIONS.iter().map(|(name, _)| *name).collect();
-
-        let mut tokens: Vec<(u32, u32, u32, u32)> = Vec::new(); // (line, col, len, type_idx)
-
-        // Tokenize via sqlparser to find function calls, identifiers, keywords
-        let dialect = rocky_sql::dialect::DatabricksDialect;
-        if let Ok(stmts) = Parser::parse_sql(&dialect, &model.sql) {
-            for stmt in &stmts {
-                if let Statement::Query(query) = stmt {
-                    collect_semantic_tokens_from_query(
-                        query,
-                        &model_names,
-                        &func_names,
-                        &mut tokens,
-                    );
-                }
-            }
-        }
-
-        // Sort by (line, col) and convert to delta encoding
-        tokens.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        let mut data = Vec::with_capacity(tokens.len() * 5);
-        let mut prev_line = 0u32;
-        let mut prev_col = 0u32;
-
-        for (line, col, len, type_idx) in &tokens {
-            let delta_line = line - prev_line;
-            let delta_col = if delta_line == 0 {
-                col - prev_col
-            } else {
-                *col
-            };
-            data.push(SemanticToken {
-                delta_line,
-                delta_start: delta_col,
-                length: *len,
-                token_type: *type_idx,
-                token_modifiers_bitset: 0,
-            });
-            prev_line = *line;
-            prev_col = *col;
-        }
-
-        // Store in cache for the next call on the same unchanged SQL.
-        self.semantic_tokens_cache
-            .write()
-            .await
-            .insert(uri_str, (sql_hash, data.clone()));
-
+        let tokens = self
+            .compute_or_load_semantic_tokens(result, uri.as_ref(), model)
+            .await;
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
-            data,
+            data: delta_encode_semantic_tokens(&tokens),
+        })))
+    }
+
+    /// §P3.4 — compute tokens only for the range the editor asked
+    /// about. The heavy work (SQL parse + AST walk) is shared with
+    /// `semantic_tokens_full` via the pre-delta cache, so this is
+    /// cheap on a cache hit and identical on a miss. The filtered
+    /// slice is then delta-encoded fresh — the first emitted delta
+    /// is offset from (0, 0), matching the protocol.
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        self.wait_for_init().await;
+        let lock = self.compile_result.read().await;
+        let Some(ref result) = *lock else {
+            return Ok(None);
+        };
+
+        let uri = &params.text_document.uri;
+        let Some(model) = self.model_for_uri(result, uri) else {
+            return Ok(None);
+        };
+
+        let all_tokens = self
+            .compute_or_load_semantic_tokens(result, uri.as_ref(), model)
+            .await;
+        let filtered = filter_tokens_to_range(&all_tokens, &params.range);
+        Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: delta_encode_semantic_tokens(&filtered),
         })))
     }
 
@@ -3014,5 +3086,39 @@ mod tests {
         assert_eq!(format_bytes(1_024), "1.0 KB");
         assert_eq!(format_bytes(1_048_576), "1.0 MB");
         assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+    }
+
+    #[test]
+    fn filter_tokens_to_range_keeps_only_inside_tokens() {
+        // 4 tokens: line 0 col 0, line 2 col 5, line 5 col 10, line 9 col 2.
+        let tokens = vec![(0, 0, 3, 0), (2, 5, 4, 1), (5, 10, 2, 0), (9, 2, 6, 1)];
+
+        // Range covering lines 2..=5 inclusive — the middle two tokens.
+        let range = Range::new(Position::new(2, 0), Position::new(5, 20));
+        let filtered = filter_tokens_to_range(&tokens, &range);
+        assert_eq!(filtered, vec![(2, 5, 4, 1), (5, 10, 2, 0)]);
+
+        // Range tighter than any token — empty.
+        let none = Range::new(Position::new(3, 0), Position::new(4, 0));
+        assert!(filter_tokens_to_range(&tokens, &none).is_empty());
+
+        // Range covering everything — identity.
+        let all = Range::new(Position::new(0, 0), Position::new(100, 100));
+        assert_eq!(filter_tokens_to_range(&tokens, &all), tokens);
+    }
+
+    #[test]
+    fn delta_encode_semantic_tokens_matches_protocol() {
+        // Two tokens on the same line: deltas (line=0, start=3→3 ; line=0, start=5→2).
+        // One token on a later line: (line=2, start=10) → deltas reset start to col.
+        let tokens = vec![(0, 3, 2, 0), (0, 5, 1, 1), (2, 10, 4, 0)];
+        let encoded = delta_encode_semantic_tokens(&tokens);
+        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded[0].delta_line, 0);
+        assert_eq!(encoded[0].delta_start, 3);
+        assert_eq!(encoded[1].delta_line, 0);
+        assert_eq!(encoded[1].delta_start, 2);
+        assert_eq!(encoded[2].delta_line, 2);
+        assert_eq!(encoded[2].delta_start, 10);
     }
 }
