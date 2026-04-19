@@ -1132,6 +1132,21 @@ pub async fn run(
         let pipeline_ref = shared_pipeline.clone();
         let task = task.clone();
 
+        // §P2.6 per-table emit: before_materialize fires on the main
+        // task just before we spawn — the registry is shared via Arc
+        // so we don't need to move it into the spawned future.
+        let table_ref = format!(
+            "{}.{}.{}",
+            task.target_catalog, task.target_schema, task.table_name
+        );
+        let _ = hook_registry
+            .fire(&HookContext::before_materialize(
+                &run_id,
+                pipeline_name,
+                &table_ref,
+            ))
+            .await;
+
         join_set.spawn(async move {
             let _permit = permit;
             let result = process_table(warehouse.as_ref(), &state, &pipeline_ref, &task).await;
@@ -1178,6 +1193,16 @@ pub async fn run(
                     t.on_success();
                     adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
                 }
+                // §P2.6 per-table emit: after_materialize on success.
+                let _ = hook_registry
+                    .fire(&HookContext::after_materialize(
+                        &run_id,
+                        pipeline_name,
+                        &tr.target_full_name,
+                        tr.materialization.duration_ms,
+                        tr.materialization.rows_copied,
+                    ))
+                    .await;
                 output.tables_copied += 1;
                 rocky_observe::metrics::METRICS.inc_tables_processed();
                 rocky_observe::metrics::METRICS
@@ -1275,6 +1300,16 @@ pub async fn run(
                             format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name)
                         })
                         .unwrap_or_default();
+
+                    // §P2.6 per-table emit: materialize_error.
+                    let _ = hook_registry
+                        .fire(&HookContext::materialize_error(
+                            &run_id,
+                            pipeline_name,
+                            &table_key,
+                            &msg,
+                        ))
+                        .await;
                     let state = shared_state.lock().await;
                     if let Err(e) = state.record_table_progress(
                         &shared_run_id,
