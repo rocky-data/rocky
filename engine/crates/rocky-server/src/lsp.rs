@@ -593,8 +593,20 @@ impl LanguageServer for RockyLsp {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri_string = params.text_document.uri.to_string();
         let changed_file = params.text_document.uri.to_file_path().ok();
+        // P3.2 buffer-hash short-circuit: if the incoming text is identical
+        // to what's already cached for this URI, skip the document update
+        // *and* the debounced recompile scheduling. Catches cursor-only
+        // edits and undo→redo sequences where the editor replays
+        // `didChange` with unchanged content.
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents.write().await.insert(uri_string, change.text);
+            let mut docs = self.documents.write().await;
+            let unchanged = docs
+                .get(&uri_string)
+                .is_some_and(|current| current == &change.text);
+            if unchanged {
+                return;
+            }
+            docs.insert(uri_string, change.text);
         }
 
         if !self.recompile_pending.swap(true, Ordering::SeqCst) {
