@@ -3556,6 +3556,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-lsp"
+version = "1.9.0"
+dependencies = [
+ "rocky-server",
+ "tokio",
+]
+
+[[package]]
 name = "rocky-observe"
 version = "1.9.0"
 dependencies = [
