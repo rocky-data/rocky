@@ -295,27 +295,25 @@ rocky ai-test fct_revenue
 {
   "version": "1.6.0",
   "command": "ai-test",
-  "tests": [
+  "results": [
     {
       "model": "fct_revenue",
-      "assertions": [
+      "saved": false,
+      "tests": [
         {
           "name": "net_revenue_is_not_negative",
-          "sql": "SELECT COUNT(*) FROM {{ ref('fct_revenue') }} WHERE net_revenue < 0",
-          "expected": 0,
-          "description": "Net revenue should never be negative after refunds"
+          "description": "Net revenue should never be negative after refunds",
+          "sql": "SELECT COUNT(*) FROM fct_revenue WHERE net_revenue < 0"
         },
         {
           "name": "customer_id_not_null",
-          "sql": "SELECT COUNT(*) FROM {{ ref('fct_revenue') }} WHERE customer_id IS NULL",
-          "expected": 0,
-          "description": "Every revenue row must have a customer"
+          "description": "Every revenue row must have a customer",
+          "sql": "SELECT COUNT(*) FROM fct_revenue WHERE customer_id IS NULL"
         },
         {
           "name": "no_duplicate_customer_months",
-          "sql": "SELECT COUNT(*) FROM (SELECT customer_id, revenue_month, COUNT(*) AS cnt FROM {{ ref('fct_revenue') }} GROUP BY 1, 2 HAVING cnt > 1)",
-          "expected": 0,
-          "description": "Each customer should have at most one row per month"
+          "description": "Each customer should have at most one row per month",
+          "sql": "SELECT COUNT(*) FROM (SELECT customer_id, revenue_month, COUNT(*) AS cnt FROM fct_revenue GROUP BY 1, 2 HAVING cnt > 1)"
         }
       ]
     }
@@ -323,7 +321,9 @@ rocky ai-test fct_revenue
 }
 ```
 
-Generate and save tests for all models:
+Each test is an assertion query — it passes when the query returns 0 rows. Rocky's test SQL references models by bare name (no Jinja), matching how the compiler resolves refs.
+
+Generate and save tests for all models (`saved: true` per model, full test bodies elided here):
 
 ```bash
 rocky ai-test --all --save
@@ -333,25 +333,15 @@ rocky ai-test --all --save
 {
   "version": "1.6.0",
   "command": "ai-test",
-  "tests": [
-    {
-      "model": "fct_revenue",
-      "assertions": 3,
-      "saved_to": "tests/fct_revenue_test.sql"
-    },
-    {
-      "model": "dim_customers",
-      "assertions": 2,
-      "saved_to": "tests/dim_customers_test.sql"
-    },
-    {
-      "model": "fct_orders",
-      "assertions": 4,
-      "saved_to": "tests/fct_orders_test.sql"
-    }
+  "results": [
+    { "model": "fct_revenue",   "saved": true, "tests": [ /* 3 assertions */ ] },
+    { "model": "dim_customers", "saved": true, "tests": [ /* 2 assertions */ ] },
+    { "model": "fct_orders",    "saved": true, "tests": [ /* 4 assertions */ ] }
   ]
 }
 ```
+
+With `--save`, each assertion is written out as a `.sql` file under `tests/` — one file per model — so `rocky test` picks them up.
 
 Generate tests from a custom models directory:
 
