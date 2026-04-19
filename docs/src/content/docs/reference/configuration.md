@@ -242,7 +242,7 @@ Each `[pipeline.NAME]` block defines a pipeline. The `name` is arbitrary — Roc
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `type` | string | Yes | | Pipeline type. Currently `"replication"`. |
+| `type` | string | No | `"replication"` | Pipeline type. One of `"replication"`, `"transformation"`, `"quality"`, `"snapshot"`, `"load"`. The remaining fields depend on the type — the fields below apply to `"replication"` (the default). |
 | `strategy` | string | No | `"incremental"` | Replication strategy: `"incremental"` or `"full_refresh"`. |
 | `timestamp_column` | string | No | `"_fivetran_synced"` | Watermark column for incremental strategy. |
 | `metadata_columns` | list | No | `[]` | Extra columns to add to copied data (see below). |

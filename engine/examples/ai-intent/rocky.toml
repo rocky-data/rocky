@@ -11,8 +11,8 @@
 #     --models engine/examples/ai-intent/models/
 #
 # AI features (require ANTHROPIC_API_KEY):
-#   rocky ai test --config engine/examples/ai-intent/rocky.toml \
-#     --models-dir engine/examples/ai-intent/models/
+#   rocky ai-test --config engine/examples/ai-intent/rocky.toml \
+#     --models engine/examples/ai-intent/models/
 
 [adapter.local]
 type = "duckdb"

@@ -89,13 +89,13 @@ The `rocky test` command compiles models and executes them locally using DuckDB,
 
 ```bash
 # Run all tests
-rocky test --models-dir models/
+rocky test --models models/
 
 # Run with contracts
-rocky test --models-dir models/ --contracts-dir contracts/
+rocky test --models models/ --contracts contracts/
 
 # JSON output for CI systems
-rocky test --models-dir models/ --output json
+rocky test --models models/ --output json
 ```
 
 ### Test output
@@ -140,7 +140,7 @@ Testing 12 models...
 The `rocky ci` command runs the full CI pipeline: compile + test. It is designed for CI/CD systems and returns a non-zero exit code on failure.
 
 ```bash
-rocky ci --models-dir models/ --contracts-dir contracts/
+rocky ci --models models/ --contracts contracts/
 ```
 
 ### Pipeline
@@ -188,7 +188,7 @@ Rocky CI Pipeline
 
 ## AI-generated tests
 
-Rocky can generate test assertions from a model's intent and schema using `rocky ai test`. See the [AI and Intent](/concepts/ai-intent) page for the full AI workflow.
+Rocky can generate test assertions from a model's intent and schema using `rocky ai-test`. See the [AI and Intent](/concepts/ai-intent) page for the full AI workflow.
 
 Each generated assertion is a SQL query that returns 0 rows when the assertion holds:
 
@@ -225,6 +225,6 @@ A typical development workflow combines contracts, testing, and CI:
 2. Write a contract defining the expected output schema
 3. Run `rocky test` locally to verify everything compiles and executes
 4. Commit and push -- CI runs `rocky ci` to catch regressions
-5. Optionally, run `rocky ai test --save` to generate additional assertions from intent
+5. Optionally, run `rocky ai-test --save` to generate additional assertions from intent
 
 Contracts serve as the stable interface between your model and its downstream consumers. If a model change would break a contract, the compiler catches it before anything reaches the warehouse.

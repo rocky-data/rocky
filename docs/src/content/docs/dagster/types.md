@@ -7,6 +7,10 @@ sidebar:
 
 All data returned by `RockyResource` methods is parsed into Pydantic v2 models. These models provide type safety, validation, and IDE autocompletion.
 
+:::tip[Source of truth]
+Most types are generated from the engine's JSON schemas via `just codegen` — see [JSON Output](/reference/json-output/) for the pipeline. The hand-written aliases in `dagster_rocky.types` (documented below) re-export the generated classes with Python-flavored names. If a field is missing from this page, consult the generated module (`dagster_rocky.types_generated`) as the canonical definition.
+:::
+
 ## Discover types
 
 ### `DiscoverResult`
@@ -18,6 +22,8 @@ Top-level result from `rocky discover`.
 | `version` | `str` | Output schema version |
 | `command` | `str` | Command that produced this output |
 | `sources` | `list[SourceInfo]` | Discovered sources |
+| `checks` | `ChecksConfig \| None` | Pipeline-level checks configuration |
+| `excluded_tables` | `list[ExcludedTable]` | Tables filtered because they don't exist in source |
 
 ### `SourceInfo`
 
@@ -28,7 +34,7 @@ A discovered source (e.g., a Fivetran connector).
 | `id` | `str` | Source identifier |
 | `components` | `dict[str, str \| list[str]]` | Parsed schema components (tenant, regions, connector, etc.) |
 | `source_type` | `str` | Source type (e.g., `"fivetran"`) |
-| `last_sync_at` | `str` | Timestamp of last sync |
+| `last_sync_at` | `datetime \| None` | Timestamp of last sync |
 | `tables` | `list[TableInfo]` | Tables in this source |
 
 ### `TableInfo`
@@ -39,10 +45,6 @@ A single table within a source.
 |---|---|---|
 | `name` | `str` | Table name |
 | `row_count` | `int \| None` | Row count, if available |
-
-### `ConnectorInfo`
-
-Alias for `SourceInfo`. Provided for backward compatibility.
 
 ---
 
@@ -59,12 +61,18 @@ Top-level result from `rocky run`.
 | `filter` | `str` | Filter that was applied |
 | `duration_ms` | `int` | Total execution time in milliseconds |
 | `tables_copied` | `int` | Number of tables copied |
+| `tables_failed` | `int` | Number of tables that failed |
 | `materializations` | `list[MaterializationInfo]` | Materialization details per table |
 | `check_results` | `list[TableCheckResult]` | Check results per table |
+| `errors` | `list[TableError]` | Per-table execution errors |
+| `excluded_tables` | `list[ExcludedTable]` | Tables skipped because missing from source |
+| `execution` | `ExecutionSummary \| None` | Concurrency and throughput summary |
+| `metrics` | `MetricsSnapshot \| None` | Engine-level execution metrics |
 | `permissions` | `PermissionInfo` | Permission reconciliation summary |
 | `drift` | `DriftInfo` | Schema drift detection summary |
-| `contracts` | `ContractResult` | Contract validation results |
+| `contracts` | `ContractResult \| None` | Contract validation results |
 | `anomalies` | `list[AnomalyResult]` | Anomaly detection results |
+| `partition_summaries` | `list[PartitionSummary]` | Per-model `time_interval` partition stats |
 
 ### `MaterializationInfo`
 
@@ -73,9 +81,10 @@ Details about a single table materialization.
 | Field | Type | Description |
 |---|---|---|
 | `asset_key` | `list[str]` | Asset key path |
-| `rows_copied` | `int` | Number of rows copied |
+| `rows_copied` | `int \| None` | Number of rows copied |
 | `duration_ms` | `int` | Time taken in milliseconds |
 | `metadata` | `MaterializationMetadata` | Additional metadata |
+| `partition` | `PartitionInfo \| None` | Partition window (populated only for `time_interval` models) |
 
 ### `MaterializationMetadata`
 
@@ -84,7 +93,84 @@ Metadata attached to a materialization.
 | Field | Type | Description |
 |---|---|---|
 | `strategy` | `str` | Materialization strategy (e.g., `"incremental"`, `"full_refresh"`) |
-| `watermark` | `str` | New high watermark value |
+| `watermark` | `datetime \| None` | New high watermark value |
+| `target_table_full_name` | `str \| None` | Fully-qualified `catalog.schema.table` identifier |
+| `sql_hash` | `str \| None` | 16-char fingerprint of executed SQL (populated for `time_interval`) |
+| `column_count` | `int \| None` | Number of columns in the typed schema (derived models only) |
+| `compile_time_ms` | `int \| None` | Compile time in milliseconds (derived models only) |
+
+### `PartitionInfo`
+
+Partition window information for a single `time_interval` materialization.
+
+| Field | Type | Description |
+|---|---|---|
+| `key` | `str` | Canonical partition key (e.g. `"2026-04-07"` for daily) |
+| `start` | `datetime` | Inclusive start of the `[start, end)` window |
+| `end` | `datetime` | Exclusive end of the window |
+| `batched_with` | `list[str]` | Additional partition keys merged into the batch (if `batch_size > 1`) |
+
+### `PartitionSummary`
+
+Per-model summary of `time_interval` partition execution.
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `str` | Model name |
+| `partitions_planned` | `int` | Partitions planned for this run |
+| `partitions_succeeded` | `int` | Partitions that succeeded |
+| `partitions_failed` | `int` | Partitions that failed |
+| `partitions_skipped` | `int` | Partitions already `Computed` and skipped |
+
+### `TableError`
+
+Per-table execution error.
+
+| Field | Type | Description |
+|---|---|---|
+| `asset_key` | `list[str]` | Asset key path |
+| `error` | `str` | Human-readable error message |
+
+### `ExcludedTable`
+
+A table the discovery adapter reported but which is missing from the source warehouse.
+
+| Field | Type | Description |
+|---|---|---|
+| `asset_key` | `list[str]` | Asset key path |
+| `source_schema` | `str` | Schema the table was reported under |
+| `table_name` | `str` | Raw table name |
+| `reason` | `str` | Free-form reason (currently always `"missing_from_source"`) |
+
+### `ExecutionSummary`
+
+Summary of execution parallelism and throughput.
+
+| Field | Type | Description |
+|---|---|---|
+| `concurrency` | `int` | Configured concurrency |
+| `tables_processed` | `int` | Total tables processed |
+| `tables_failed` | `int` | Total tables that failed |
+
+### `MetricsSnapshot`
+
+Engine execution metrics from `rocky-observe`.
+
+| Field | Type | Description |
+|---|---|---|
+| `tables_processed` | `int` | Total tables processed |
+| `tables_failed` | `int` | Total tables failed |
+| `error_rate_pct` | `float` | Failure percentage |
+| `statements_executed` | `int` | Total SQL statements executed |
+| `retries_attempted` | `int` | Retry attempts |
+| `retries_succeeded` | `int` | Successful retries |
+| `anomalies_detected` | `int` | Anomalies detected |
+| `table_duration_p50_ms` | `int` | Table duration 50th percentile |
+| `table_duration_p95_ms` | `int` | Table duration 95th percentile |
+| `table_duration_max_ms` | `int` | Table duration max |
+| `query_duration_p50_ms` | `int` | Query duration 50th percentile |
+| `query_duration_p95_ms` | `int` | Query duration 95th percentile |
+| `query_duration_max_ms` | `int` | Query duration max |
 
 ### `CheckResult`
 
@@ -104,7 +190,7 @@ A single check result.
 | `null_rate` | `float \| None` | Observed null rate (for null_rate checks) |
 | `threshold` | `float \| None` | Null rate threshold (for null_rate checks) |
 | `query` | `str \| None` | SQL query (for custom checks) |
-| `result_value` | `str \| None` | Query result (for custom checks) |
+| `result_value` | `int \| None` | Query result (for custom checks) |
 
 ### `TableCheckResult`
 
@@ -156,7 +242,6 @@ Result of anomaly detection for a table.
 | `current_count` | `int` | Current row count |
 | `baseline_avg` | `float` | Baseline average row count |
 | `deviation_pct` | `float` | Percentage deviation from baseline |
-| `is_anomaly` | `bool` | Whether this is considered an anomaly |
 | `reason` | `str` | Explanation of the anomaly determination |
 
 ### `ContractResult`

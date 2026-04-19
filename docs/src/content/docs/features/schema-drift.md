@@ -53,29 +53,16 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 - **New columns in source** -- these are picked up automatically by `SELECT *` and do not require special handling
 - **Columns removed from source** -- extra columns in the target table are ignored
 
-## Standalone Drift Check
-
-Use `rocky drift` to check for drift without executing any changes:
-
-```bash
-rocky drift --filter client=acme --output json
-```
-
 ## Output
 
-Drift actions are reported in the `drift` section of the run output:
+Drift detection runs inline during `rocky run`; the actions taken are reported in the `drift` section of the run JSON output:
 
 ```json
 {
   "drift": {
     "tables_checked": 45,
-    "tables_drifted": 2,
+    "tables_drifted": 1,
     "actions_taken": [
-      {
-        "table": "acme_warehouse.staging__us_west__shopify.orders",
-        "action": "alter_column",
-        "reason": "column 'amount' widened DECIMAL(10,2) -> DECIMAL(12,2)"
-      },
       {
         "table": "acme_warehouse.staging__us_west__shopify.events",
         "action": "drop_and_recreate",
@@ -86,8 +73,10 @@ Drift actions are reported in the `drift` section of the run output:
 }
 ```
 
-Drift detection runs automatically as part of `rocky run`. Use `rocky plan` to preview drift actions without executing them:
+Use `rocky plan` to preview the SQL Rocky would emit (including any drop statements) without executing:
 
 ```bash
 rocky plan --filter client=acme --output json
 ```
+
+Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky run` yet — safe-widening drift currently falls through without action.

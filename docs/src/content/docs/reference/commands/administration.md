@@ -36,30 +36,34 @@ rocky history
 {
   "version": "1.6.0",
   "command": "history",
+  "count": 2,
   "runs": [
     {
       "run_id": "run_20260401_143022",
       "started_at": "2026-04-01T14:30:22Z",
       "duration_ms": 45200,
-      "filter": "client=acme",
-      "tables_copied": 20,
-      "tables_failed": 0,
-      "status": "success"
+      "status": "success",
+      "trigger": "cli",
+      "models_executed": 14,
+      "models": [
+        { "model_name": "stg_orders",  "duration_ms": 1200, "rows_affected": 150000, "status": "success" },
+        { "model_name": "fct_revenue", "duration_ms": 2300, "rows_affected":   8900, "status": "success" }
+      ]
     },
     {
       "run_id": "run_20260401_080015",
       "started_at": "2026-04-01T08:00:15Z",
       "duration_ms": 52100,
-      "filter": "client=acme",
-      "tables_copied": 19,
-      "tables_failed": 1,
-      "status": "partial"
+      "status": "partial",
+      "trigger": "cli",
+      "models_executed": 13,
+      "models": [ /* per-model records */ ]
     }
   ]
 }
 ```
 
-Show history for a specific model since a date:
+Show history for a specific model since a date. The `--model` variant returns a flat list of that model's executions:
 
 ```bash
 rocky history --model fct_revenue --since 2026-03-01
@@ -70,27 +74,27 @@ rocky history --model fct_revenue --since 2026-03-01
   "version": "1.6.0",
   "command": "history",
   "model": "fct_revenue",
+  "count": 2,
   "executions": [
     {
-      "run_id": "run_20260401_143022",
       "started_at": "2026-04-01T14:30:22Z",
       "duration_ms": 2300,
-      "strategy": "incremental",
+      "rows_affected": 8900,
       "status": "success",
-      "watermark": "2026-04-01T14:00:00Z"
+      "sql_hash": "a3f2b1c4..."
     },
     {
-      "run_id": "run_20260331_143005",
       "started_at": "2026-03-31T14:30:05Z",
       "duration_ms": 8900,
-      "strategy": "full_refresh",
+      "rows_affected": 150000,
       "status": "success",
-      "watermark": "2026-03-31T14:00:00Z",
-      "note": "drift detected, full refresh triggered"
+      "sql_hash": "b4e3c2d5..."
     }
   ]
 }
 ```
+
+`sql_hash` is stable across runs where the compiled SQL is identical — useful for detecting model body changes across runs.
 
 Show history with table output:
 
@@ -137,7 +141,7 @@ rocky metrics <model> [flags]
 
 ### Examples
 
-Show metrics for a model:
+Show metrics for a model. Output carries one snapshot per recent run with row count, freshness lag, and per-column null rates:
 
 ```bash
 rocky metrics fct_revenue
@@ -148,17 +152,24 @@ rocky metrics fct_revenue
   "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
-  "row_count": 148203,
-  "last_updated": "2026-04-01T14:30:22Z",
-  "columns": [
-    { "name": "customer_id", "null_rate": 0.0, "distinct_count": 12450 },
-    { "name": "revenue_month", "null_rate": 0.0, "distinct_count": 24 },
-    { "name": "net_revenue", "null_rate": 0.0, "min": 0.50, "max": 52340.00 }
+  "count": 1,
+  "snapshots": [
+    {
+      "run_id": "run_20260401_143022",
+      "timestamp": "2026-04-01T14:30:22Z",
+      "row_count": 148203,
+      "freshness_lag_seconds": 300,
+      "null_rates": {
+        "customer_id": 0.0,
+        "revenue_month": 0.0,
+        "net_revenue": 0.0
+      }
+    }
   ]
 }
 ```
 
-Show trends over recent runs:
+`--trend` keeps the same snapshot shape but returns multiple entries (one per recent run):
 
 ```bash
 rocky metrics fct_revenue --trend
@@ -169,15 +180,16 @@ rocky metrics fct_revenue --trend
   "version": "1.6.0",
   "command": "metrics",
   "model": "fct_revenue",
-  "trend": [
-    { "run_id": "run_20260401_143022", "row_count": 148203, "duration_ms": 2300 },
-    { "run_id": "run_20260331_143005", "row_count": 145890, "duration_ms": 8900 },
-    { "run_id": "run_20260330_143010", "row_count": 143200, "duration_ms": 2100 }
+  "count": 3,
+  "snapshots": [
+    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "row_count": 148203, "null_rates": { /* … */ } },
+    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "row_count": 145890, "null_rates": { /* … */ } },
+    { "run_id": "run_20260330_143010", "timestamp": "2026-03-30T14:30:10Z", "row_count": 143200, "null_rates": { /* … */ } }
   ]
 }
 ```
 
-Show alerts for a specific column:
+`--alerts` adds a non-empty `alerts` array (omitted otherwise). `--column <name>` sets the top-level `column` field and populates `column_trend` with per-run null-rate points:
 
 ```bash
 rocky metrics fct_revenue --column net_revenue --alerts
@@ -189,13 +201,14 @@ rocky metrics fct_revenue --column net_revenue --alerts
   "command": "metrics",
   "model": "fct_revenue",
   "column": "net_revenue",
+  "count": 3,
+  "snapshots": [ /* … */ ],
+  "column_trend": [
+    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "null_rate": 0.023 },
+    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "null_rate": 0.0 }
+  ],
   "alerts": [
-    {
-      "type": "anomaly",
-      "message": "null rate increased from 0.0% to 2.3% in last run",
-      "severity": "warning",
-      "detected_at": "2026-04-01T14:30:22Z"
-    }
+    { "type": "anomaly", "severity": "warning", "run_id": "run_20260401_143022", "column": "net_revenue", "message": "null rate rose from 0.0% to 2.3% vs. 7-run baseline" }
   ]
 }
 ```
@@ -224,7 +237,7 @@ rocky optimize [flags]
 
 ### Examples
 
-Analyze all models:
+Analyze all models. Each recommendation includes the current and suggested strategy, a free-text reasoning, and an estimated monthly compute savings:
 
 ```bash
 rocky optimize
@@ -234,26 +247,28 @@ rocky optimize
 {
   "version": "1.6.0",
   "command": "optimize",
+  "total_models_analyzed": 3,
   "recommendations": [
     {
-      "model": "fct_revenue",
+      "model_name": "fct_revenue",
       "current_strategy": "incremental",
       "recommended_strategy": "incremental",
-      "reason": "Incremental is optimal. Average 2.3s per run, 1.2% of rows processed each run."
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "Incremental is optimal. Average 2.3s per run, 1.2% of rows processed each run."
     },
     {
-      "model": "dim_customers",
-      "current_strategy": "table",
+      "model_name": "dim_customers",
+      "current_strategy": "full_refresh",
       "recommended_strategy": "incremental",
-      "reason": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs. Switching to incremental would save ~17s per run.",
-      "estimated_savings_ms": 17000
+      "estimated_monthly_savings": 8.50,
+      "reasoning": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs — switching to incremental saves ~17s per run."
     },
     {
-      "model": "stg_events",
+      "model_name": "stg_events",
       "current_strategy": "incremental",
-      "recommended_strategy": "table",
-      "reason": "Drift detected in 4 of last 5 runs, triggering full refresh anyway. Switching to table materialization avoids drift detection overhead.",
-      "estimated_savings_ms": 500
+      "recommended_strategy": "full_refresh",
+      "estimated_monthly_savings": 0.25,
+      "reasoning": "Drift detected in 4 of last 5 runs, triggering full refresh anyway. Switching to full_refresh avoids drift detection overhead."
     }
   ]
 }
@@ -265,21 +280,7 @@ Analyze a single model:
 rocky optimize --model dim_customers
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "optimize",
-  "recommendations": [
-    {
-      "model": "dim_customers",
-      "current_strategy": "table",
-      "recommended_strategy": "incremental",
-      "reason": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs.",
-      "estimated_savings_ms": 17000
-    }
-  ]
-}
-```
+Same `recommendations` shape, single entry. When compile-time incrementality analysis offers additional opportunities, Rocky populates an `incrementality_note` pointing to `rocky compile --output json`.
 
 ### Related Commands
 
@@ -312,6 +313,8 @@ rocky compact <model> [flags]
 
 ### Examples
 
+`rocky compact` generates SQL — it doesn't execute. Pipe the output of `rocky -o table compact ... --dry-run` to your warehouse once you're happy with the plan, or drop `--dry-run` and let Rocky run the statements in sequence.
+
 Compact a table (dry run):
 
 ```bash
@@ -324,40 +327,21 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --dry-run
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
+  "target_size_mb": 0,
   "statements": [
-    { "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
-    { "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders" }
+    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
+    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
   ]
 }
 ```
 
-Compact with a target file size:
+With a target file size:
 
 ```bash
 rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256MB
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "compact",
-  "model": "acme_warehouse.staging__us_west__shopify.orders",
-  "dry_run": false,
-  "statements": [
-    { "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE file_size < '256MB'" },
-    { "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders" }
-  ],
-  "files_compacted": 142,
-  "size_before_mb": 890,
-  "size_after_mb": 620
-}
-```
-
-Execute compaction immediately:
-
-```bash
-rocky compact acme_warehouse.staging__eu_central__stripe.charges --target-size 512MB
-```
+The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`).
 
 ### Related Commands
 
@@ -383,7 +367,7 @@ rocky profile-storage <model>
 
 ### Examples
 
-Profile a table:
+Profile a table. Rocky emits a `profile_sql` query you can run against the warehouse to gather column cardinalities, plus a per-column `recommendations` list derived from the schema alone:
 
 ```bash
 rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
@@ -394,54 +378,27 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
   "version": "1.6.0",
   "command": "profile-storage",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
-  "total_size_mb": 890,
-  "file_count": 342,
-  "avg_file_size_mb": 2.6,
-  "columns": [
+  "profile_sql": "SELECT column_name, approx_count_distinct(...) FROM ... GROUP BY column_name",
+  "recommendations": [
     {
-      "name": "order_id",
-      "dtype": "BIGINT",
-      "null_rate": 0.0,
-      "cardinality": 1482030,
-      "recommendation": null
+      "column": "status",
+      "data_type": "STRING",
+      "estimated_cardinality": "low (< 100)",
+      "recommended_encoding": "dictionary",
+      "reasoning": "Low-cardinality string — dictionary encoding dramatically shrinks storage and speeds up filtering."
     },
     {
-      "name": "status",
-      "dtype": "STRING",
-      "null_rate": 0.0,
-      "cardinality": 5,
-      "recommendation": "Consider TINYINT encoding. Only 5 distinct values."
-    },
-    {
-      "name": "customer_notes",
-      "dtype": "STRING",
-      "null_rate": 0.72,
-      "cardinality": 98200,
-      "recommendation": "72% null rate. Consider splitting to a separate table."
+      "column": "customer_notes",
+      "data_type": "STRING",
+      "estimated_cardinality": "high",
+      "recommended_encoding": "lz4",
+      "reasoning": "High-cardinality free-text — LZ4 gives the best compression without hurting scan latency."
     }
-  ],
-  "partitioning": {
-    "current": "none",
-    "recommendation": "Partition by order_date (month) for time-range queries"
-  }
+  ]
 }
 ```
 
-Profile with table output:
-
-```bash
-rocky -o table profile-storage acme_warehouse.staging__us_west__shopify.orders
-```
-
-```
-column          | dtype   | null_rate | cardinality | recommendation
-----------------+---------+-----------+-------------+----------------------------------------------
-order_id        | BIGINT  | 0.0%      | 1,482,030   |
-status          | STRING  | 0.0%      | 5           | Consider TINYINT encoding
-customer_notes  | STRING  | 72.0%     | 98,200      | High null rate, consider separate table
-order_date      | DATE    | 0.0%     | 730          |
-total_amount    | DOUBLE  | 0.0%     | 145,200      |
-```
+`rocky profile-storage` is advisory — it does not run the profile SQL for you. Pipe `profile_sql` into `rocky shell` (or any SQL client) to collect the actual cardinality numbers.
 
 ### Related Commands
 
@@ -469,6 +426,8 @@ rocky archive [flags]
 
 ### Examples
 
+Like `compact`, `archive` is SQL-generating — it builds `DELETE ... WHERE partition_key < cutoff` (or `COPY TO` for cold-storage workflows) and either prints them (`--dry-run`) or executes them in order.
+
 Preview archival for data older than 90 days:
 
 ```bash
@@ -481,53 +440,27 @@ rocky archive --older-than 90d --dry-run
   "command": "archive",
   "dry_run": true,
   "older_than": "90d",
-  "cutoff_date": "2026-01-02",
-  "candidates": [
+  "older_than_days": 90,
+  "statements": [
     {
-      "model": "acme_warehouse.staging__us_west__shopify.orders",
-      "partitions_affected": 3,
-      "estimated_rows": 45000,
-      "estimated_size_mb": 120
+      "purpose": "archive:orders",
+      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'"
     },
     {
-      "model": "acme_warehouse.staging__us_west__shopify.events",
-      "partitions_affected": 12,
-      "estimated_rows": 2300000,
-      "estimated_size_mb": 890
+      "purpose": "archive:events",
+      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'"
     }
   ]
 }
 ```
 
-Archive a specific model's old data:
+Archive a specific model's old data (omitting `--dry-run` executes the statements):
 
 ```bash
 rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "archive",
-  "dry_run": false,
-  "older_than": "6m",
-  "cutoff_date": "2025-10-02",
-  "archived": [
-    {
-      "model": "acme_warehouse.staging__us_west__shopify.events",
-      "partitions_archived": 24,
-      "rows_archived": 8900000,
-      "size_freed_mb": 3200
-    }
-  ]
-}
-```
-
-Archive across all models with a 1-year threshold:
-
-```bash
-rocky archive --older-than 1y --dry-run
-```
+Same output shape — `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
 
 ### Related Commands
 

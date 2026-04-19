@@ -328,17 +328,26 @@ rocky run --filter client=acme
   "filter": "client=acme",
   "duration_ms": 45200,
   "tables_copied": 20,
+  "tables_failed": 0,
   "materializations": [
     {
       "asset_key": ["fivetran", "acme", "us_west", "shopify", "orders"],
       "rows_copied": null,
       "duration_ms": 2300,
-      "metadata": { "strategy": "incremental", "watermark": "2026-03-30T10:00:00Z" }
+      "metadata": {
+        "strategy": "incremental",
+        "watermark": "2026-03-30T10:00:00Z",
+        "target_table_full_name": "acme_warehouse.staging__us_west__shopify.orders"
+      }
     }
   ],
   "check_results": [],
-  "permissions": { "grants_added": 3, "grants_revoked": 0 },
-  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [] }
+  "errors": [],
+  "excluded_tables": [],
+  "permissions": { "grants_added": 3, "grants_revoked": 0, "catalogs_created": 0, "schemas_created": 1 },
+  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [] },
+  "anomalies": [],
+  "partition_summaries": []
 }
 ```
 

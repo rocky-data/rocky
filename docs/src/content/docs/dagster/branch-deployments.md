@@ -80,7 +80,8 @@ rejects most punctuation, so this keeps the suffix usable as part of a
 table name.
 
 The function returns `None` outside branch deployments so callers can
-unconditionally pass the result through to `rocky run` without guarding:
+unconditionally pass the result through to `rocky.run()` — the resource
+accepts `shadow_suffix: str | None`, and passing `None` is a no-op:
 
 ```python
 from dagster_rocky import RockyResource, branch_deploy_shadow_suffix
@@ -89,9 +90,7 @@ rocky = RockyResource(config_path="rocky.toml")
 suffix = branch_deploy_shadow_suffix()  # None in production, "_dagster_pr_42" in branch deploy
 
 # Pass through unconditionally — None means "no shadow"
-if suffix:
-    rocky.run(filter="tenant=acme")  # would shadow with the derived suffix
-    # (rocky.run shadow_suffix kwarg lands when shadow mode is wired through)
+rocky.run(filter="tenant=acme", shadow_suffix=suffix)
 ```
 
 ## Why detection only?
@@ -114,18 +113,17 @@ require any credentials.
 
 ## Future work
 
-Once `RockyResource` exposes a `shadow_mode` / `shadow_suffix`
-parameter, the detection helpers can be wired into the resource's
-default config so branch deployments automatically run in shadow mode
-without any user code:
+`RockyResource.run()` accepts a `shadow_suffix` kwarg today, so manual
+wiring works end-to-end. A resource-level `shadow_mode="branch_deploy"`
+default that auto-derives the suffix on every call is still aspirational:
 
 ```python
-# Future API (not yet shipped)
+# Future API (not yet shipped) — resource-level auto-shadow
 rocky = RockyResource(
     config_path="rocky.toml",
     shadow_mode="branch_deploy",  # auto-shadow when in branch deploy
 )
 ```
 
-For now, users wire the detection + suffix derivation into their own
-asset functions or RockyResource subclass.
+For now, wire the detection + suffix derivation into each call site (or a
+RockyResource subclass).

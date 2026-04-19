@@ -52,13 +52,17 @@ engine/
 │   ├── rocky-adapter-sdk/   # Adapter SDK + conformance tests
 │   ├── rocky-databricks/    # Databricks warehouse adapter
 │   ├── rocky-snowflake/     # Snowflake warehouse adapter
+│   ├── rocky-bigquery/      # BigQuery warehouse adapter (Beta)
 │   ├── rocky-fivetran/      # Fivetran source adapter
+│   ├── rocky-airbyte/       # Airbyte source adapter
+│   ├── rocky-iceberg/       # Apache Iceberg table format adapter
 │   ├── rocky-duckdb/        # DuckDB local execution adapter
 │   ├── rocky-engine/        # Local query engine (DataFusion + Arrow)
 │   ├── rocky-server/        # HTTP API + LSP server
 │   ├── rocky-cache/         # Three-tier caching
 │   ├── rocky-ai/            # AI intent layer
 │   ├── rocky-observe/       # Observability
+│   ├── rocky-wasm/          # WebAssembly exports for browser/edge
 │   └── rocky-cli/           # CLI framework + Dagster Pipes
 └── rocky/                   # Binary crate
 ```

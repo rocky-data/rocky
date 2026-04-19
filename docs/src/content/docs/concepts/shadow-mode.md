@@ -5,27 +5,25 @@ sidebar:
   order: 14
 ---
 
-## Overview
-
 Shadow mode writes pipeline output to shadow tables instead of (or alongside) production tables. This lets you validate changes — new logic, schema migrations, adapter upgrades — without affecting production data.
 
-## How It Works
+## How it works
 
 1. Rocky rewrites target table names by appending a suffix (default: `_rocky_shadow`) or routing to a dedicated schema
 2. The pipeline runs normally, writing to shadow targets
 3. A comparison engine checks row counts, schemas, and optionally sample data between shadow and production
 4. Results show pass/warn/fail with detailed diffs
 
-## Shadow Target Rewriting
+## Shadow target rewriting
 
-### Suffix Mode (default)
+### Suffix mode (default)
 
 ```
 production: analytics.marts.fct_revenue
 shadow:     analytics.marts.fct_revenue_rocky_shadow
 ```
 
-### Schema Override Mode
+### Schema override mode
 
 ```
 production: analytics.marts.fct_revenue
@@ -34,11 +32,11 @@ shadow:     analytics.rocky_shadow.fct_revenue
 
 Schema override keeps the table name clean and groups all shadow tables together.
 
-## Comparison Engine
+## Comparison engine
 
 The comparison evaluates three dimensions:
 
-### Row Count
+### Row count
 
 Compares the number of rows between shadow and production:
 
@@ -49,18 +47,18 @@ diff:       -2 rows (-0.001%)
 verdict:    PASS (within 0.01% threshold)
 ```
 
-### Schema Diff
+### Schema diff
 
 Compares column names, types, and order:
 
-| Diff Type | Description |
+| Diff type | Description |
 |-----------|-------------|
 | `ColumnAdded` | Column in shadow but not production |
 | `ColumnRemoved` | Column in production but not shadow |
 | `ColumnTypeDiff` | Same column, different type |
 | `ColumnOrderDiff` | Same columns, different order |
 
-### Sample Comparison
+### Sample comparison
 
 Hash-based comparison of sample rows to detect value differences even when row counts match.
 
@@ -82,7 +80,7 @@ Configure pass/warn/fail thresholds:
 | **Warn** | Minor differences detected (e.g., row count within warn threshold, column order change) |
 | **Fail** | Significant differences (e.g., row count beyond fail threshold, missing columns, type changes) |
 
-## Use Cases
+## Use cases
 
 - **Schema migrations**: Verify a column rename doesn't change output
 - **Logic changes**: Compare old vs new calculation results

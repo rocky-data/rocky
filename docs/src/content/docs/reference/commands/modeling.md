@@ -37,17 +37,16 @@ rocky compile
 {
   "version": "1.6.0",
   "command": "compile",
-  "models_compiled": 14,
-  "errors": [],
-  "warnings": [],
-  "dag": {
-    "nodes": 14,
-    "edges": 22
-  }
+  "models": 14,
+  "execution_layers": 4,
+  "has_errors": false,
+  "diagnostics": [],
+  "compile_timings": { "load_ms": 8, "resolve_ms": 2, "typecheck_ms": 42 },
+  "models_detail": [ /* one entry per model */ ]
 }
 ```
 
-Compile a single model with contracts:
+Compile a single model with contracts, showing a warning diagnostic:
 
 ```bash
 rocky compile --model fct_revenue --contracts contracts/
@@ -57,20 +56,24 @@ rocky compile --model fct_revenue --contracts contracts/
 {
   "version": "1.6.0",
   "command": "compile",
-  "models_compiled": 1,
-  "errors": [],
-  "warnings": [
+  "models": 1,
+  "execution_layers": 1,
+  "has_errors": false,
+  "diagnostics": [
     {
+      "severity": "warning",
+      "code": "W010",
       "model": "fct_revenue",
-      "message": "column 'discount_pct' not declared in contract"
+      "message": "column 'discount_pct' not declared in contract",
+      "span": null,
+      "suggestion": null
     }
   ],
-  "dag": {
-    "nodes": 1,
-    "edges": 3
-  }
+  "compile_timings": { "load_ms": 5, "resolve_ms": 1, "typecheck_ms": 12 }
 }
 ```
+
+Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E001`–`E026`, `W001`–`W011`, `V001`–`V020`), the owning model, and — when the compiler can locate it — a `span` and `suggestion`.
 
 Compile models from a non-default directory:
 
@@ -111,7 +114,7 @@ rocky lineage <target> [flags]
 
 ### Examples
 
-Show lineage for a model:
+Show lineage for a model. Returns the model's columns, its upstream and downstream models, and every column-level edge with the transform kind:
 
 ```bash
 rocky lineage fct_revenue
@@ -123,20 +126,44 @@ rocky lineage fct_revenue
   "command": "lineage",
   "model": "fct_revenue",
   "columns": [
+    { "name": "customer_id" },
+    { "name": "revenue_amount" }
+  ],
+  "upstream": ["stg_orders", "stg_refunds"],
+  "downstream": [],
+  "edges": [
     {
-      "name": "revenue_amount",
-      "sources": [
-        { "model": "stg_orders", "column": "total_amount" },
-        { "model": "stg_refunds", "column": "refund_amount" }
-      ]
+      "source": { "model": "stg_orders", "column": "customer_id" },
+      "target": { "model": "fct_revenue", "column": "customer_id" },
+      "transform": "direct"
     },
     {
-      "name": "customer_id",
-      "sources": [
-        { "model": "stg_orders", "column": "customer_id" }
-      ]
+      "source": { "model": "stg_orders", "column": "total_amount" },
+      "target": { "model": "fct_revenue", "column": "revenue_amount" },
+      "transform": "expression"
+    },
+    {
+      "source": { "model": "stg_refunds", "column": "refund_amount" },
+      "target": { "model": "fct_revenue", "column": "revenue_amount" },
+      "transform": "expression"
     }
   ]
+}
+```
+
+Tracing a single column returns a flat trace shape instead — use either `--column` or `model.column` syntax:
+
+```bash
+rocky lineage fct_revenue --column revenue_amount
+```
+
+```json
+{
+  "version": "1.6.0",
+  "command": "lineage",
+  "model": "fct_revenue",
+  "column": "revenue_amount",
+  "trace": [ /* LineageEdgeRecord entries, same shape as edges above */ ]
 }
 ```
 
@@ -195,21 +222,12 @@ rocky test
 {
   "version": "1.6.0",
   "command": "test",
-  "models_tested": 14,
+  "total": 14,
   "passed": 12,
   "failed": 2,
-  "results": [
-    { "model": "fct_revenue", "status": "pass", "assertions": 3, "duration_ms": 42 },
-    { "model": "dim_customers", "status": "pass", "assertions": 2, "duration_ms": 28 },
-    {
-      "model": "fct_orders",
-      "status": "fail",
-      "assertions": 4,
-      "failures": [
-        { "assertion": "not_null(order_id)", "message": "found 3 null values" }
-      ],
-      "duration_ms": 35
-    }
+  "failures": [
+    { "name": "fct_orders.not_null(order_id)", "error": "found 3 null values" },
+    { "name": "fct_orders.unique(order_id)",   "error": "found 1 duplicate" }
   ]
 }
 ```
@@ -224,14 +242,14 @@ rocky test --model fct_revenue --contracts contracts/
 {
   "version": "1.6.0",
   "command": "test",
-  "models_tested": 1,
+  "total": 1,
   "passed": 1,
   "failed": 0,
-  "results": [
-    { "model": "fct_revenue", "status": "pass", "assertions": 3, "duration_ms": 42 }
-  ]
+  "failures": []
 }
 ```
+
+`--declarative` adds a `declarative` block summarising `[[tests]]` declared in model sidecars; see [Testing and Contracts](/concepts/testing/) for that surface.
 
 ### Related Commands
 
@@ -268,21 +286,18 @@ rocky ci
 {
   "version": "1.6.0",
   "command": "ci",
-  "compile": {
-    "models_compiled": 14,
-    "errors": [],
-    "warnings": 1
-  },
-  "test": {
-    "models_tested": 14,
-    "passed": 14,
-    "failed": 0
-  },
-  "status": "pass"
+  "compile_ok": true,
+  "tests_ok": true,
+  "models_compiled": 14,
+  "tests_passed": 14,
+  "tests_failed": 0,
+  "exit_code": 0,
+  "diagnostics": [],
+  "failures": []
 }
 ```
 
-Run CI with contracts in a GitHub Actions workflow:
+Run CI with contracts in a GitHub Actions workflow. On a compile error, `tests_passed` / `tests_failed` are `0` because tests don't run — CI short-circuits and returns a non-zero `exit_code`:
 
 ```bash
 rocky ci --models src/models --contracts src/contracts
@@ -292,19 +307,23 @@ rocky ci --models src/models --contracts src/contracts
 {
   "version": "1.6.0",
   "command": "ci",
-  "compile": {
-    "models_compiled": 14,
-    "errors": [
-      { "model": "fct_revenue", "message": "unknown column 'total' in ref('stg_orders')" }
-    ],
-    "warnings": 0
-  },
-  "test": {
-    "models_tested": 0,
-    "passed": 0,
-    "failed": 0
-  },
-  "status": "fail"
+  "compile_ok": false,
+  "tests_ok": false,
+  "models_compiled": 13,
+  "tests_passed": 0,
+  "tests_failed": 0,
+  "exit_code": 1,
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "E001",
+      "model": "fct_revenue",
+      "message": "unknown column 'total' in model 'stg_orders'",
+      "span": null,
+      "suggestion": "did you mean 'total_amount'?"
+    }
+  ],
+  "failures": []
 }
 ```
 

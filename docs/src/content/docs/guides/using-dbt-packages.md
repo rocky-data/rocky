@@ -63,10 +63,17 @@ GROUP BY c.campaign_id, c.campaign_name, c.objective
 **models/facebook_campaign_performance.toml**
 
 ```toml
+name = "facebook_campaign_performance"
+
 [strategy]
 type = "full_refresh"
 
-# External sources -- tables managed by dbt, not by Rocky.
+[target]
+catalog = "analytics"
+schema = "marketing"
+table = "facebook_campaign_performance"
+
+# External sources — tables managed by dbt, not by Rocky.
 # Listed for lineage documentation; Rocky does not create or refresh them.
 [[sources]]
 catalog = "analytics"
@@ -82,11 +89,6 @@ table = "stg_facebook_ads__ad_history"
 catalog = "analytics"
 schema = "dbt_fivetran"
 table = "stg_facebook_ads__ad_report_daily"
-
-[target]
-catalog = "analytics"
-schema = "marketing"
-table = "facebook_campaign_performance"
 ```
 
 The `[[sources]]` entries are optional metadata for lineage documentation. Rocky resolves the actual table references from the SQL -- the `dbt_fivetran.stg_*` references are recognized as external and do not create DAG dependencies.
@@ -111,10 +113,11 @@ GROUP BY s.created_date, s.revenue_usd
 **models/combined_marketing_revenue.toml**
 
 ```toml
+name = "combined_marketing_revenue"
+depends_on = ["stripe_revenue_daily", "facebook_daily_trends"]
+
 [strategy]
 type = "full_refresh"
-
-depends_on = ["stripe_revenue_daily", "facebook_daily_trends"]
 
 [target]
 catalog = "analytics"

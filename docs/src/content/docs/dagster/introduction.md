@@ -5,15 +5,49 @@ sidebar:
   order: 1
 ---
 
-`dagster-rocky` is a Python package that bridges Rocky's Rust binary with Dagster orchestration. It lets you manage SQL transformations with Rocky while leveraging Dagster for scheduling, retries, alerting, and its asset-centric UI.
+`dagster-rocky` bridges Rocky's Rust binary with Dagster orchestration. You keep Rocky for the SQL transformation layer (DAG resolution, incremental logic, schema drift, permissions) and gain Dagster's scheduling, retries, alerts, and asset-centric UI.
+
+## Quick start
+
+Two ways to wire Rocky into Dagster. Start with the component — it auto-discovers your tables.
+
+**Option A — component** (`defs.yaml`):
+
+```yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  binary_path: rocky
+  config_path: config/rocky.toml
+  models_dir: models
+```
+
+**Option B — resource + asset**:
+
+```python
+import dagster as dg
+from dagster_rocky import RockyResource
+
+rocky = RockyResource(binary_path="rocky", config_path="config/rocky.toml")
+
+@dg.asset
+def acme_orders(rocky: RockyResource) -> dg.MaterializeResult:
+    result = rocky.run(filter="tenant=acme")
+    return dg.MaterializeResult(
+        metadata={"tables_copied": result.tables_copied, "duration_ms": result.duration_ms},
+    )
+
+defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
+```
 
 ## What it provides
 
-- **`RockyResource`** — A Dagster `ConfigurableResource` that wraps the Rocky CLI with 25+ methods covering discovery, execution, compilation, lineage, testing, AI-powered model generation, observability, and diagnostics. Three execution modes for `rocky run`: buffered (`run`), live-streaming (`run_streaming`), and full Dagster Pipes (`run_pipes`).
-- **`RockyDagsterTranslator`** — Controls how Rocky sources and tables map to Dagster asset keys, groups, tags, and metadata.
-- **`load_rocky_assets()`** — Calls `rocky discover` and returns a list of Dagster `AssetSpec` objects, one per enabled table.
-- **`emit_check_results()` / `emit_materializations()`** — Convert Rocky's check and materialization results into Dagster events that appear in the UI.
-- **`RockyComponent`** — A state-backed Dagster component that caches discovery output, avoiding API calls on every code location reload. With `dag_mode=True`, builds the full connected asset graph from `rocky dag`.
+| Symbol | Purpose |
+|---|---|
+| [`RockyResource`](/dagster/resource/) | `ConfigurableResource` wrapping the CLI; 25+ methods; three run modes (buffered, streaming, Pipes) |
+| [`RockyComponent`](/dagster/component/) | State-backed component that caches discovery; `dag_mode=True` builds connected asset graphs |
+| [`RockyDagsterTranslator`](/dagster/translator/) | Customize asset keys, groups, tags, and metadata per Rocky table |
+| [`load_rocky_assets()`](/dagster/assets/) | Returns one `AssetSpec` per enabled Rocky table |
+| `emit_check_results()` / `emit_materializations()` | Convert Rocky results into Dagster events |
 
 ## Architecture
 

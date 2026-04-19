@@ -349,15 +349,18 @@ All CI-related commands produce structured JSON for programmatic consumption.
   "command": "compile",
   "models": 12,
   "execution_layers": 4,
+  "has_errors": true,
   "diagnostics": [
     {
       "severity": "error",
+      "code": "E001",
       "model": "fct_revenue",
       "message": "unknown column 'nonexistent'",
-      "location": { "file": "models/fct_revenue.sql", "line": 5, "column": 9 }
+      "span": { "file": "models/fct_revenue.sql", "line": 5, "column": 9 },
+      "suggestion": "did you mean 'revenue'?"
     }
   ],
-  "has_errors": true
+  "compile_timings": { "load_ms": 5, "resolve_ms": 1, "typecheck_ms": 12 }
 }
 ```
 
@@ -371,7 +374,7 @@ All CI-related commands produce structured JSON for programmatic consumption.
   "passed": 11,
   "failed": 1,
   "failures": [
-    ["fct_revenue", "division by zero at line 8"]
+    { "name": "fct_revenue", "error": "division by zero at line 8" }
   ]
 }
 ```

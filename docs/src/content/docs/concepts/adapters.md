@@ -5,8 +5,6 @@ sidebar:
   order: 13
 ---
 
-## Overview
-
 Rocky's adapter system separates the transformation engine from warehouse-specific logic. Each adapter implements a set of traits from the `rocky-adapter-sdk` crate, declaring its capabilities through an `AdapterManifest`.
 
 ## Architecture
@@ -22,7 +20,7 @@ rocky-core (engine)
 
 The core engine calls trait methods without knowing which adapter is behind them. This means Rocky can support any SQL warehouse — Databricks, Snowflake, BigQuery, Redshift, DuckDB — through the same interface.
 
-## Adapter Traits
+## Adapter traits
 
 ### WarehouseAdapter
 
@@ -56,7 +54,7 @@ pub trait SqlDialect {
 }
 ```
 
-### Optional Traits
+### Optional traits
 
 | Trait | Capability | Methods |
 |-------|-----------|---------|
@@ -90,7 +88,7 @@ AdapterManifest {
 }
 ```
 
-## Building a Rust Adapter
+## Building a Rust adapter
 
 Scaffold a new adapter:
 
@@ -109,7 +107,7 @@ Implement the required traits, then run conformance tests:
 rocky test-adapter --adapter bigquery
 ```
 
-## Process Adapter Protocol
+## Process adapter protocol
 
 Adapters can be built in **any language** using the process adapter protocol — JSON-RPC 2.0 over stdio.
 
@@ -120,20 +118,20 @@ Rocky ──stdin──► Adapter Process
 Rocky ◄─stdout── Adapter Process
 ```
 
-### Protocol Flow
+### Protocol flow
 
 1. Rocky sends `initialize` with config → adapter responds with `AdapterManifest`
 2. Rocky sends method calls (`execute_statement`, `describe_table`, etc.)
 3. Adapter responds with results or errors
 4. Rocky sends `shutdown` when done
 
-### Example Request
+### Example request
 
 ```json
 {"jsonrpc": "2.0", "id": 1, "method": "execute_query", "params": {"sql": "SELECT 1"}}
 ```
 
-### Example Response
+### Example response
 
 ```json
 {"jsonrpc": "2.0", "id": 1, "result": {"columns": ["1"], "rows": [["1"]]}}
@@ -141,7 +139,7 @@ Rocky ◄─stdout── Adapter Process
 
 This enables adapters in Python, Go, Java, or any language that can read/write JSON.
 
-## Conformance Tests
+## Conformance tests
 
 The SDK includes 26 test specifications (19 core + 7 optional):
 

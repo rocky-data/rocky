@@ -123,7 +123,7 @@ fn init_databricks_fivetran(dir: &Path) -> Result<()> {
     std::fs::write(
         dir.join("rocky.toml"),
         r#"# Rocky pipeline configuration — Databricks + Fivetran
-# Docs: https://github.com/rocky-data/rocky
+# Docs: https://rocky-data.dev/
 #
 # This template uses a flat single-tenant schema pattern: source
 # schemas are named `src__<source>` (e.g. `src__orders`) and land in
@@ -135,8 +135,8 @@ fn init_databricks_fivetran(dir: &Path) -> Result<()> {
 # components = ["tenant", "regions...", "source"] in schema_pattern
 # and catalog_template = "{tenant}_warehouse" + schema_template =
 # "stage__{regions}__{source}" below. See
-# https://rocky-data.github.io/rocky/concepts/schema-patterns/ for
-# the full pattern reference.
+# https://rocky-data.dev/concepts/schema-patterns/ for the full
+# pattern reference.
 
 [adapter.databricks_prod]
 type = "databricks"
@@ -217,7 +217,7 @@ fn init_snowflake(dir: &Path) -> Result<()> {
     std::fs::write(
         dir.join("rocky.toml"),
         r#"# Rocky pipeline configuration — Snowflake
-# Docs: https://github.com/rocky-data/rocky
+# Docs: https://rocky-data.dev/
 
 [adapter.snowflake_prod]
 type = "snowflake"
