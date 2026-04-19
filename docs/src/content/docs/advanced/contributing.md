@@ -12,31 +12,15 @@ Rocky is a monorepo with four subprojects:
 ```
 rocky-data/
 ├── engine/                     # Rust CLI + engine (20-crate Cargo workspace)
-│   ├── Cargo.toml
-│   ├── crates/
-│   │   ├── rocky-core/         # Generic transformation engine
-│   │   ├── rocky-sql/          # SQL parsing + validation
-│   │   ├── rocky-lang/         # Rocky DSL parser (.rocky files)
-│   │   ├── rocky-compiler/     # Type checking + semantic analysis
-│   │   ├── rocky-adapter-sdk/  # Adapter SDK + conformance tests
-│   │   ├── rocky-databricks/   # Databricks adapter
-│   │   ├── rocky-snowflake/    # Snowflake adapter
-│   │   ├── rocky-fivetran/     # Fivetran source adapter
-│   │   ├── rocky-duckdb/       # DuckDB local execution
-│   │   ├── rocky-engine/       # Local query engine (DataFusion + Arrow)
-│   │   ├── rocky-server/       # HTTP API + LSP server
-│   │   ├── rocky-cache/        # Three-tier caching
-│   │   ├── rocky-ai/           # AI intent layer
-│   │   ├── rocky-observe/      # Observability
-│   │   └── rocky-cli/          # CLI framework + Dagster Pipes
-│   └── rocky/                  # Binary crate
 ├── integrations/dagster/       # dagster-rocky Python package
 ├── editors/vscode/             # VS Code extension (LSP client)
-├── examples/playground/        # POC catalog (28 POCs) + benchmarks
-├── docs/                       # This documentation site (Astro + Starlight)
+├── examples/playground/        # POC catalog + benchmarks
+├── docs/                       # Documentation site (Astro + Starlight)
 ├── justfile                    # Cross-project build orchestration
 └── CLAUDE.md                   # Monorepo conventions
 ```
+
+For the full crate-level breakdown of `engine/`, see [Architecture](/concepts/architecture/).
 
 ## Development Setup
 
@@ -193,8 +177,8 @@ Tag-namespaced — each artifact ships independently. All three are **CI-driven*
 | Rocky VSIX | `vscode-v*` | `vscode-release.yml` — VS Code Marketplace publish |
 
 ```bash
-git tag engine-v1.7.0
-git push origin engine-v1.7.0   # CI builds + publishes
+git tag engine-v<version>
+git push origin engine-v<version>   # CI builds + publishes
 ```
 
 The `scripts/release.sh` helper remains as a **local-build fallback** for hotfix scenarios; `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` wrap it.
