@@ -6,9 +6,9 @@ Demonstrates Rocky's AI features: intent-driven development, automatic test gene
 
 The `intent` field in a model's `.toml` sidecar describes what the model should accomplish in plain English. Rocky's AI layer uses this to:
 
-1. **Generate tests** -- `rocky ai test` reads the intent and produces SQL assertions that verify the model satisfies its business requirements
-2. **Explain models** -- `rocky ai explain` generates a human-readable description of what a model does
-3. **Sync models** -- `rocky ai sync` detects schema changes and proposes intent-guided updates
+1. **Generate tests** -- `rocky ai-test` reads the intent and produces SQL assertions that verify the model satisfies its business requirements
+2. **Explain models** -- `rocky ai-explain` generates a human-readable description of what a model does
+3. **Sync models** -- `rocky ai-sync` detects schema changes and proposes intent-guided updates
 4. **Generate models** -- `rocky ai "description"` creates a new model from natural language
 
 ## Project Structure
@@ -43,7 +43,7 @@ intent = "Daily revenue metrics grouped by date. One row per day. Only completed
 
 ```bash
 # Requires ANTHROPIC_API_KEY environment variable
-rocky ai test --models-dir models/
+rocky ai-test --models-dir models/
 ```
 
 Rocky sends the model source code, column schema, and intent to the LLM. The LLM returns SQL assertions -- queries that return 0 rows when the assertion holds.
@@ -51,7 +51,7 @@ Rocky sends the model source code, column schema, and intent to the LLM. The LLM
 ### 3. Explain existing models
 
 ```bash
-rocky ai explain --models-dir models/ --model stg_orders
+rocky ai-explain --models-dir models/ --model stg_orders
 ```
 
 ### 4. Generate a new model from natural language
@@ -64,7 +64,7 @@ rocky ai "Monthly active customers who placed at least one order"
 
 ```bash
 # Detect upstream schema changes and propose model updates
-rocky ai sync --models-dir models/ --with-intent
+rocky ai-sync --models-dir models/ --with-intent
 ```
 
 ## Test Format
