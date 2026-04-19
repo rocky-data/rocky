@@ -349,41 +349,18 @@ Aggregate health checks across config, state, adapters, and pipelines.
 
 ---
 
-### `rocky drift`
+### Drift (inline within `rocky run`)
 
-Detect schema drift between source and target tables without running the pipeline.
+There is no standalone `rocky drift` CLI command today — drift detection runs inline during `rocky run` and surfaces through the top-level `drift` field of the run JSON output (already shown under [`rocky run`](#rocky-run) above).
 
-```json
-{
-  "version": "1.6.0",
-  "command": "drift",
-  "drift": {
-    "tables_checked": 20,
-    "tables_drifted": 2,
-    "actions_taken": [
-      {
-        "table": "acme_warehouse.staging__us_west__shopify.orders",
-        "action": "alter_column",
-        "reason": "column 'amount' widened FLOAT -> DOUBLE (safe)"
-      },
-      {
-        "table": "acme_warehouse.staging__us_west__shopify.line_items",
-        "action": "drop_and_recreate",
-        "reason": "column 'status' changed STRING -> INT"
-      }
-    ]
-  }
-}
-```
-
-**Field reference:**
+**Field reference for `drift`:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `drift.tables_checked` | integer | Total tables inspected for schema drift. |
 | `drift.tables_drifted` | integer | Number of tables where drift was detected. |
 | `drift.actions_taken[].table` | string | Fully qualified table name. |
-| `drift.actions_taken[].action` | string | Action taken (`"alter_column"`, `"drop_and_recreate"`). |
+| `drift.actions_taken[].action` | string | Action taken. Currently emits `"drop_and_recreate"` (unsafe type mismatch) or `"add_column"` (column added to source). Safe widenings (`AlterColumnTypes` in `rocky-core`) don't yet surface an action string through the run path. |
 | `drift.actions_taken[].reason` | string | Human-readable explanation. |
 
 ---
