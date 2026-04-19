@@ -524,8 +524,8 @@ fn bench_single_file_change(c: &mut Criterion) {
     // measuring the incremental path's per-change overhead.
     let models_dir = dir.path().join("models");
     let target_sql = models_dir.join("fct_0500.sql");
-    let baseline = fs::read_to_string(&target_sql)
-        .expect("layered project must contain fct_0500.sql");
+    let baseline =
+        fs::read_to_string(&target_sql).expect("layered project must contain fct_0500.sql");
 
     group.bench_function("500_models_edit_one_mart", |b| {
         let mut counter: u32 = 0;
