@@ -171,7 +171,7 @@ filter = "region = 'US' AND status != 'cancelled'"
 
 Filter is user-supplied SQL — the caller is responsible for valid SQL in the target dialect. Rocky validates identifiers inside structured parameters (columns, values) but passes the filter expression through verbatim.
 
-### Row quarantine (DQX Phase 3)
+### Row quarantine
 
 Row-level assertions can quarantine failing rows instead of just reporting a count. Configure quarantine at the pipeline level:
 

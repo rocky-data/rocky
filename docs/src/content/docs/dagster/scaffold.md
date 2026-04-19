@@ -53,8 +53,9 @@ my_pipeline/
 ```
 
 The default `rocky.toml` uses the **DuckDB local-execution adapter** so the
-scaffold runs end-to-end without warehouse credentials. The freshness config
-is included to demonstrate the [T1.1 wiring](./freshness.md).
+scaffold runs end-to-end without warehouse credentials. A [freshness
+policy](./freshness.md) is preconfigured so you can see it flow through to
+Dagster assets immediately.
 
 ## Overwrite protection
 
