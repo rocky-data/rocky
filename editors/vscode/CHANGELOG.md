@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Bundle extension with esbuild
+
+The extension is now bundled with esbuild into a single `dist/extension.js` (~400 KB) instead of shipping `out/` plus the entire `node_modules/` tree. The VSIX drops from ~300 files to ~20, which clears the `vsce` packaging warning and speeds up activation. No runtime behavior changes — `vscode-languageclient` and its transitive deps are pulled into the bundle. Webview assets (viz.js) still ship as-is under `media/`.
+
 ## [1.4.1] — 2026-04-19
 
 ### Changed — Tighter logo crop
