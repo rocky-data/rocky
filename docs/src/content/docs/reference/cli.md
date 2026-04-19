@@ -241,17 +241,27 @@ Governance (tags, workspace bindings, permissions) is NOT a separate CLI command
   "filter": "tenant=acme",
   "duration_ms": 45200,
   "tables_copied": 20,
+  "tables_failed": 0,
   "materializations": [
     {
       "asset_key": ["fivetran", "acme", "us_west", "shopify", "orders"],
       "rows_copied": null,
       "duration_ms": 2300,
-      "metadata": { "strategy": "incremental", "watermark": "2026-03-30T10:00:00Z" }
+      "metadata": {
+        "strategy": "incremental",
+        "watermark": "2026-03-30T10:00:00Z",
+        "target_table_full_name": "acme_warehouse.staging__us_west__shopify.orders",
+        "sql_hash": null
+      }
     }
   ],
   "check_results": [],
-  "permissions": { "grants_added": 3, "grants_revoked": 0 },
-  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [] }
+  "errors": [],
+  "excluded_tables": [],
+  "permissions": { "grants_added": 3, "grants_revoked": 0, "catalogs_created": 0, "schemas_created": 1 },
+  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [] },
+  "anomalies": [],
+  "partition_summaries": []
 }
 ```
 
@@ -280,14 +290,16 @@ rocky doctor
 
 ```json
 {
-  "version": "1.6.0",
   "command": "doctor",
+  "overall": "warning",
   "checks": [
-    { "name": "config", "status": "ok", "message": "rocky.toml valid" },
-    { "name": "state", "status": "ok", "message": "state store readable" },
-    { "name": "adapters", "status": "warn", "message": "adapter.fivetran: API key not set" }
+    { "name": "config", "status": "healthy", "message": "rocky.toml valid", "duration_ms": 4 },
+    { "name": "state", "status": "healthy", "message": "state store readable", "duration_ms": 2 },
+    { "name": "adapters", "status": "warning", "message": "adapter.fivetran: API key not set", "duration_ms": 120 }
   ],
-  "overall": "warn"
+  "suggestions": [
+    "Set FIVETRAN_API_KEY to enable the Fivetran discovery adapter."
+  ]
 }
 ```
 
@@ -335,7 +347,7 @@ playground                replication      default              default         
       "target_adapter": "default",
       "source_adapter": "default",
       "depends_on": [],
-      "concurrency": 16
+      "concurrency": "16"
     }
   ]
 }
@@ -372,9 +384,19 @@ data_type = "DATE"
 {
   "version": "1.6.0",
   "command": "seed",
+  "seeds_dir": "seeds",
+  "tables_loaded": 1,
+  "tables_failed": 0,
   "tables": [
-    { "name": "dim_date", "rows_loaded": 365, "columns": 4 }
-  ]
+    {
+      "name": "dim_date",
+      "target": "warehouse.reference.dim_date",
+      "rows": 365,
+      "columns": 4,
+      "duration_ms": 42
+    }
+  ],
+  "duration_ms": 55
 }
 ```
 
@@ -403,16 +425,25 @@ rocky compare --filter <key=value> [flags]
 {
   "version": "1.6.0",
   "command": "compare",
-  "comparisons": [
+  "filter": "tenant=acme",
+  "tables_compared": 1,
+  "tables_passed": 1,
+  "tables_warned": 0,
+  "tables_failed": 0,
+  "results": [
     {
-      "table": "warehouse.staging.orders",
+      "production_table": "warehouse.staging.orders",
       "shadow_table": "warehouse.staging.orders_rocky_shadow",
       "row_count_match": true,
+      "production_count": 15000,
+      "shadow_count": 15000,
+      "row_count_diff_pct": 0.0,
       "schema_match": true,
-      "production_rows": 15000,
-      "shadow_rows": 15000
+      "schema_diffs": [],
+      "verdict": "pass"
     }
-  ]
+  ],
+  "overall_verdict": "pass"
 }
 ```
 

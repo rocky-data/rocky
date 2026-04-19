@@ -166,7 +166,7 @@ Published VS Code extension with TextMate grammar + semantic tokens.
 - **dagster-rocky** package with `RockyResource` and `RockyComponent`
 - **Auto-discovery**: Rocky discover → Dagster asset definitions
 - **Dagster Pipes protocol**: Hand-rolled emitter (no external dependency) — reports materializations, check results, drift observations, anomaly alerts
-- **28 typed JSON output schemas** with auto-generated Pydantic v2 models and TypeScript interfaces via `rocky export-schemas`
+- **38 typed JSON output schemas** with auto-generated Pydantic v2 models and TypeScript interfaces via `rocky export-schemas`
 - **Freshness policies** auto-attached from `[checks.freshness]` config
 - **Column lineage** attached to derived model asset metadata
 
