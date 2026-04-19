@@ -71,7 +71,7 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 | `first_partition` | string | | Earliest partition key (e.g., `"2024-01-01"`). Optional for `"time_interval"`. |
 
 :::note[Lakehouse formats]
-Warehouse-managed materializations like **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, and **plain views** are selected via the top-level `format` key on the model TOML (e.g. `format = "materialized_view"`), not via `[strategy]`. `[strategy]` controls how Rocky writes the data; `format` controls the physical table shape.
+Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views** — are modeled as a separate `format` axis on the `LakehouseFormat` enum. `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
 :::
 
 **`[target]`** -- Output table:
