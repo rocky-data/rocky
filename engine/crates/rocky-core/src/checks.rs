@@ -294,7 +294,7 @@ mod tests {
             &self,
             _target: &str,
             _source_sql: &str,
-            _keys: &[String],
+            _keys: &[std::sync::Arc<str>],
             _update_cols: &ColumnSelection,
         ) -> AdapterResult<String> {
             unimplemented!()

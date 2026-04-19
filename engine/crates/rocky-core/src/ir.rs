@@ -1,3 +1,10 @@
+//! §P4.2: identifier-list fields on IR structs — `unique_key`,
+//! `partition_by`, `ColumnSelection::Explicit`, `columns_to_drop` — use
+//! `Vec<Arc<str>>` so cloning a plan / drift result is refcount-cheap.
+//! JSON wire format is preserved by serde's `rc` feature.
+
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use rocky_sql::validation::{self, ValidationError};
 use serde::{Deserialize, Serialize};
@@ -50,7 +57,7 @@ pub struct SnapshotPlan {
     pub source: SourceRef,
     pub target: TargetRef,
     /// Columns that uniquely identify a row.
-    pub unique_key: Vec<String>,
+    pub unique_key: Vec<Arc<str>>,
     /// Column used to detect changes.
     pub updated_at: String,
     /// When true, invalidate rows deleted from source.
@@ -71,7 +78,7 @@ pub enum MaterializationStrategy {
     },
     /// Upsert based on unique key columns.
     Merge {
-        unique_key: Vec<String>,
+        unique_key: Vec<Arc<str>>,
         update_columns: ColumnSelection,
     },
     /// Databricks Materialized View — warehouse manages refresh.
@@ -103,7 +110,7 @@ pub enum MaterializationStrategy {
     /// MERGE overhead is unnecessary.
     DeleteInsert {
         /// Column(s) used to identify the partition to delete before inserting.
-        partition_by: Vec<String>,
+        partition_by: Vec<Arc<str>>,
     },
     /// Alias for `TimeInterval` with sensible defaults. Processes data
     /// in micro-batches based on a timestamp column. dbt-compatible naming.
@@ -180,7 +187,7 @@ pub enum ColumnSelection {
     /// `SELECT *`
     All,
     /// `SELECT col1, col2, ...`
-    Explicit(Vec<String>),
+    Explicit(Vec<Arc<str>>),
 }
 
 /// Extra columns to add during replication (e.g., `CAST(NULL AS STRING) AS _loaded_by`).
@@ -260,7 +267,7 @@ pub struct DriftResult {
     pub grace_period_columns: Vec<GracePeriodColumn>,
     /// Columns whose grace period has expired and should be dropped from the target.
     #[serde(default)]
-    pub columns_to_drop: Vec<String>,
+    pub columns_to_drop: Vec<Arc<str>>,
 }
 
 /// A single column that has drifted between source and target.

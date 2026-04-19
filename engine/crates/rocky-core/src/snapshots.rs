@@ -109,7 +109,11 @@ impl SnapshotConfig {
         SnapshotPlan {
             source: self.source.clone(),
             target: self.target.clone(),
-            unique_key: self.unique_key.clone(),
+            unique_key: self
+                .unique_key
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str()))
+                .collect(),
             updated_at,
             invalidate_hard_deletes: self.invalidate_hard_deletes,
             governance: GovernanceConfig {
@@ -365,9 +369,16 @@ fn format_target(config: &SnapshotConfig, dialect: &dyn SqlDialect) -> Result<St
 }
 
 /// Build a `left.k1 = right.k1 AND left.k2 = right.k2` join condition.
-fn build_join_condition(keys: &[String], left: &str, right: &str) -> String {
+///
+/// Generic over the key slice element so both `Vec<String>`
+/// (SnapshotConfig) and `Vec<Arc<str>>` (IR) call sites can share it
+/// without per-call conversion (§P4.2).
+fn build_join_condition<S: AsRef<str>>(keys: &[S], left: &str, right: &str) -> String {
     keys.iter()
-        .map(|k| format!("{left}.{k} = {right}.{k}"))
+        .map(|k| {
+            let k = k.as_ref();
+            format!("{left}.{k} = {right}.{k}")
+        })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -410,7 +421,7 @@ mod tests {
             &self,
             target: &str,
             source_sql: &str,
-            keys: &[String],
+            keys: &[std::sync::Arc<str>],
             update_cols: &ColumnSelection,
         ) -> AdapterResult<String> {
             if keys.is_empty() {

@@ -459,9 +459,16 @@ impl Model {
                 unique_key,
                 update_columns,
             } => MaterializationStrategy::Merge {
-                unique_key: unique_key.clone(),
+                unique_key: unique_key
+                    .iter()
+                    .map(|s| std::sync::Arc::from(s.as_str()))
+                    .collect(),
                 update_columns: match update_columns {
-                    Some(cols) => crate::ir::ColumnSelection::Explicit(cols.clone()),
+                    Some(cols) => crate::ir::ColumnSelection::Explicit(
+                        cols.iter()
+                            .map(|s| std::sync::Arc::from(s.as_str()))
+                            .collect(),
+                    ),
                     None => crate::ir::ColumnSelection::All,
                 },
             },
@@ -479,7 +486,10 @@ impl Model {
             StrategyConfig::Ephemeral => MaterializationStrategy::Ephemeral,
             StrategyConfig::DeleteInsert { partition_by } => {
                 MaterializationStrategy::DeleteInsert {
-                    partition_by: partition_by.clone(),
+                    partition_by: partition_by
+                        .iter()
+                        .map(|s| std::sync::Arc::from(s.as_str()))
+                        .collect(),
                 }
             }
             StrategyConfig::Microbatch {

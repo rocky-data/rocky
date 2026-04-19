@@ -29,7 +29,7 @@ impl SqlDialect for BigQueryDialect {
         &self,
         target: &str,
         source_sql: &str,
-        keys: &[String],
+        keys: &[std::sync::Arc<str>],
         update_cols: &ColumnSelection,
     ) -> AdapterResult<String> {
         if keys.is_empty() {
