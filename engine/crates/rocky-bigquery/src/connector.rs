@@ -87,8 +87,26 @@ impl BigQueryAdapter {
         Self {
             client: reqwest::Client::builder()
                 .tcp_nodelay(true)
+                // Keep connections alive on the wire so GCP load balancers
+                // don't silently sever idle sockets mid-query. Matches the
+                // cadence reqwest uses internally for HTTP/2 ping frames.
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 .pool_max_idle_per_host(32)
                 .pool_idle_timeout(std::time::Duration::from_secs(300))
+                // Separate HTTP request timeout from the BigQuery query
+                // timeout (which is encoded in the request body as
+                // `timeout_ms`). Post-P2.3 we poll `jobs.getQueryResults` for
+                // anything longer; 120 s bounds individual HTTP roundtrips.
+                // Matches the Databricks adapter.
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                // GCP endpoints (bigquery.googleapis.com, oauth2.googleapis.com)
+                // support HTTP/2 natively; skipping the Upgrade dance shaves
+                // one RTT off the first request. Safe only because this
+                // adapter never hits HTTP/1-only endpoints (metadata server,
+                // corporate proxies, etc. — see auth.rs which only talks to
+                // oauth2.googleapis.com).
+                .http2_prior_knowledge()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             auth,
