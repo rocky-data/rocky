@@ -20,6 +20,7 @@ members = [
     "crates/rocky-cli",
     "crates/rocky-wasm",
     "rocky",
+    "rocky-lsp",
 ]
 resolver = "3"
 

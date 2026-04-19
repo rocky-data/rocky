@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   LanguageClient,
@@ -63,11 +65,27 @@ export function startLspClient(context: vscode.ExtensionContext): void {
 async function launchClient(): Promise<void> {
   const cfg = getConfig();
 
-  const serverOptions: ServerOptions = {
-    command: cfg.serverPath,
-    args: ["lsp", ...cfg.extraArgs],
-    transport: TransportKind.stdio,
-  };
+  // §P3.11 — prefer the standalone `rocky-lsp` binary when it's
+  // installed next to `rocky`. It's ~6 MB instead of ~47 MB and skips
+  // loading the whole adapter graph, so fork+exec is faster.
+  // Resolution rules:
+  //   • if the user set an explicit `rocky.server.path` to a full path,
+  //     look for `rocky-lsp` in the same directory and use it if present.
+  //   • if serverPath is just "rocky" (the default), leave PATH-based
+  //     resolution to the OS by using the literal "rocky-lsp" command.
+  //     The OS returns ENOENT if absent; we fall back to `rocky lsp`.
+  const lspBin = resolveLspBinary(cfg.serverPath);
+  const serverOptions: ServerOptions = lspBin
+    ? {
+        command: lspBin,
+        args: cfg.extraArgs,
+        transport: TransportKind.stdio,
+      }
+    : {
+        command: cfg.serverPath,
+        args: ["lsp", ...cfg.extraArgs],
+        transport: TransportKind.stdio,
+      };
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
@@ -99,6 +117,61 @@ async function launchClient(): Promise<void> {
     statusBarItem.backgroundColor = undefined;
   } catch (err) {
     handleStartupFailure(err as Error);
+  }
+}
+
+/**
+ * Resolve the standalone `rocky-lsp` binary when the user hasn't forced a
+ * specific path. Returns `undefined` if we can't confirm its presence —
+ * the caller falls back to `rocky lsp` in that case.
+ *
+ * Only returns a path we've verified exists on disk, so startup never
+ * falls into a "command not found" failure purely because of this
+ * optimisation. Users without rocky-lsp installed see no behaviour
+ * change.
+ */
+function resolveLspBinary(serverPath: string): string | undefined {
+  const candidateNames =
+    process.platform === "win32"
+      ? ["rocky-lsp.exe", "rocky-lsp"]
+      : ["rocky-lsp"];
+
+  // Case 1: user set an explicit path like `/opt/rocky/bin/rocky` —
+  // look for a sibling `rocky-lsp` in the same directory.
+  if (serverPath !== "rocky" && serverPath.includes(path.sep)) {
+    const dir = path.dirname(serverPath);
+    for (const name of candidateNames) {
+      const full = path.join(dir, name);
+      if (isExecutableFile(full)) {
+        return full;
+      }
+    }
+    return undefined;
+  }
+
+  // Case 2: default "rocky" (or a bare name) — walk PATH and return
+  // the first rocky-lsp we find. Keeps startup synchronous and avoids
+  // the "spawn ENOENT" trap that would hit users without the split
+  // binary installed.
+  const pathEnv = process.env.PATH ?? "";
+  const pathSep = process.platform === "win32" ? ";" : ":";
+  for (const dir of pathEnv.split(pathSep)) {
+    if (!dir) continue;
+    for (const name of candidateNames) {
+      const full = path.join(dir, name);
+      if (isExecutableFile(full)) {
+        return full;
+      }
+    }
+  }
+  return undefined;
+}
+
+function isExecutableFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
   }
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "rocky-lsp"
+version = "1.9.0"
+description = "Rocky Language Server Protocol binary (minimal, adapter-free)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# §P3.11 — this is a purpose-built binary for IDE / editor integration.
+# It links only `rocky-server` (compiler + LSP surface) and the tokio
+# runtime, deliberately avoiding the adapter graph pulled in by the
+# main `rocky` CLI. Result: a ~5–8 MB binary instead of ~35–50 MB, so
+# VS Code's language-server client spawns faster and on-disk footprint
+# stays small. The main `rocky lsp` subcommand is kept as a fallback —
+# editors can prefer `rocky-lsp` when present.
+
+[dependencies]
+rocky-server = { path = "../crates/rocky-server" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
