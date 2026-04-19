@@ -23,6 +23,7 @@ use crate::diagnostic::{
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
+use rocky_core::column_map::{CiKey, CiStr};
 use rocky_core::dag::{self, DagNode};
 
 /// A reference location: which file and where in the source.
@@ -62,11 +63,19 @@ pub struct TypeCheckResult {
 }
 
 /// Scope for resolving column types during expression inference.
+///
+/// §P3.8: keys are `CiKey` (case-insensitive, owned; see
+/// `rocky_core::column_map`) so `lookup` / `lookup_qualified` can `.get()`
+/// via `CiStr::new(name)` without allocating a lowercased `String` per
+/// call. `qualified` is nested `HashMap<CiKey, HashMap<CiKey, V>>` so the
+/// table + column keys look up independently (a flat `(String, String)`
+/// key would need `format!("{table}.{col}")` at the lookup site and
+/// re-introduce the allocation).
 struct TypeScope {
     /// column_name → (type, nullable) for all columns in scope.
-    columns: HashMap<String, (RockyType, bool)>,
-    /// alias.column_name → (type, nullable) for qualified references.
-    qualified: HashMap<(String, String), (RockyType, bool)>,
+    columns: HashMap<CiKey<'static>, (RockyType, bool)>,
+    /// table → { column → (type, nullable) } for qualified references.
+    qualified: HashMap<CiKey<'static>, HashMap<CiKey<'static>, (RockyType, bool)>>,
 }
 
 impl TypeScope {
@@ -79,15 +88,15 @@ impl TypeScope {
 
     fn lookup(&self, name: &str) -> (RockyType, bool) {
         self.columns
-            .get(name)
+            .get(CiStr::new(name))
             .cloned()
             .unwrap_or((RockyType::Unknown, true))
     }
 
     fn lookup_qualified(&self, table: &str, col: &str) -> (RockyType, bool) {
         self.qualified
-            .get(&(table.to_lowercase(), col.to_string()))
-            .cloned()
+            .get(CiStr::new(table))
+            .and_then(|m| m.get(CiStr::new(col)).cloned())
             .unwrap_or_else(|| self.lookup(col))
     }
 }
@@ -259,9 +268,10 @@ fn compute_model_typecheck(
     for upstream_name in &model_schema.upstream {
         if let Some(upstream_cols) = typed_models.get(upstream_name) {
             for col in upstream_cols {
-                scope
-                    .columns
-                    .insert(col.name.clone(), (col.data_type.clone(), col.nullable));
+                scope.columns.insert(
+                    CiKey::owned(col.name.clone()),
+                    (col.data_type.clone(), col.nullable),
+                );
             }
         }
     }
@@ -274,7 +284,7 @@ fn compute_model_typecheck(
                 .map(|&i| &source_cols[i]);
             if let Some(col) = col {
                 scope.columns.insert(
-                    edge.source.column.to_string(),
+                    CiKey::owned(edge.source.column.to_string()),
                     (col.data_type.clone(), col.nullable),
                 );
             }
@@ -1396,13 +1406,18 @@ pub fn infer_select_types(
                 Ok(cte_cols) => {
                     // Register CTE columns in scope
                     for col in &cte_cols {
-                        type_scope
-                            .columns
-                            .insert(col.name.clone(), (col.data_type.clone(), col.nullable));
-                        type_scope.qualified.insert(
-                            (cte_name.to_lowercase(), col.name.clone()),
+                        type_scope.columns.insert(
+                            CiKey::owned(col.name.clone()),
                             (col.data_type.clone(), col.nullable),
                         );
+                        type_scope
+                            .qualified
+                            .entry(CiKey::owned(cte_name.clone()))
+                            .or_default()
+                            .insert(
+                                CiKey::owned(col.name.clone()),
+                                (col.data_type.clone(), col.nullable),
+                            );
                     }
                     cte_scope.insert(cte_name, cte_cols);
                 }
@@ -1416,14 +1431,19 @@ pub fn infer_select_types(
 
     for (table_name, cols) in scope {
         for col in cols {
-            type_scope
-                .columns
-                .insert(col.name.clone(), (col.data_type.clone(), col.nullable));
-            let short_name = table_name.split('.').next_back().unwrap_or(table_name);
-            type_scope.qualified.insert(
-                (short_name.to_lowercase(), col.name.clone()),
+            type_scope.columns.insert(
+                CiKey::owned(col.name.clone()),
                 (col.data_type.clone(), col.nullable),
             );
+            let short_name = table_name.split('.').next_back().unwrap_or(table_name);
+            type_scope
+                .qualified
+                .entry(CiKey::owned(short_name.to_string()))
+                .or_default()
+                .insert(
+                    CiKey::owned(col.name.clone()),
+                    (col.data_type.clone(), col.nullable),
+                );
         }
     }
 
@@ -1432,24 +1452,32 @@ pub fn infer_select_types(
         if let ast::TableFactor::Table { name, alias, .. } = &from_item.relation {
             let table_name = name.to_string();
             if let Some(alias) = alias {
-                let alias_str = alias.name.value.to_lowercase();
+                let alias_str = alias.name.value.clone();
                 // Map alias.column to the same types as the table
                 if let Some(cols) = scope.get(&table_name) {
                     for col in cols {
-                        type_scope.qualified.insert(
-                            (alias_str.clone(), col.name.clone()),
-                            (col.data_type.clone(), col.nullable),
-                        );
+                        type_scope
+                            .qualified
+                            .entry(CiKey::owned(alias_str.clone()))
+                            .or_default()
+                            .insert(
+                                CiKey::owned(col.name.clone()),
+                                (col.data_type.clone(), col.nullable),
+                            );
                     }
                 }
                 // Also try short name
                 let short = table_name.split('.').next_back().unwrap_or(&table_name);
                 if let Some(cols) = scope.get(short) {
                     for col in cols {
-                        type_scope.qualified.insert(
-                            (alias_str.clone(), col.name.clone()),
-                            (col.data_type.clone(), col.nullable),
-                        );
+                        type_scope
+                            .qualified
+                            .entry(CiKey::owned(alias_str.clone()))
+                            .or_default()
+                            .insert(
+                                CiKey::owned(col.name.clone()),
+                                (col.data_type.clone(), col.nullable),
+                            );
                     }
                 }
             }
@@ -1970,10 +1998,10 @@ mod tests {
         let mut scope = TypeScope::new();
         scope
             .columns
-            .insert("x".to_string(), (RockyType::Int64, false));
+            .insert(CiKey::owned("x".to_string()), (RockyType::Int64, false));
         scope
             .columns
-            .insert("y".to_string(), (RockyType::Int64, false));
+            .insert(CiKey::owned("y".to_string()), (RockyType::Int64, false));
         let expr = parse_expr("x + y");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
     }
@@ -1990,9 +2018,10 @@ mod tests {
     #[test]
     fn test_infer_expr_sum() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("amount".to_string(), (RockyType::Int64, false));
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (RockyType::Int64, false),
+        );
         let expr = parse_expr("SUM(amount)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Int64);
@@ -2018,9 +2047,10 @@ mod tests {
     #[test]
     fn test_infer_expr_case_when() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("status".to_string(), (RockyType::String, false));
+        scope.columns.insert(
+            CiKey::owned("status".to_string()),
+            (RockyType::String, false),
+        );
         let expr = parse_expr("CASE WHEN status = 'a' THEN 1 ELSE 0 END");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
     }
@@ -2030,7 +2060,7 @@ mod tests {
         let mut scope = TypeScope::new();
         scope
             .columns
-            .insert("a".to_string(), (RockyType::Int64, true));
+            .insert(CiKey::owned("a".to_string()), (RockyType::Int64, true));
         let expr = parse_expr("COALESCE(a, 0)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Int64);
@@ -2186,9 +2216,10 @@ mod tests {
     #[test]
     fn test_infer_window_lag() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("amount".to_string(), (RockyType::Float64, false));
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (RockyType::Float64, false),
+        );
         let expr = parse_expr("LAG(amount, 1) OVER (ORDER BY order_date)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Float64);
@@ -2198,9 +2229,10 @@ mod tests {
     #[test]
     fn test_infer_window_lead() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("status".to_string(), (RockyType::String, false));
+        scope.columns.insert(
+            CiKey::owned("status".to_string()),
+            (RockyType::String, false),
+        );
         let expr = parse_expr("LEAD(status) OVER (ORDER BY id)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::String);
@@ -2210,9 +2242,10 @@ mod tests {
     #[test]
     fn test_infer_window_first_value() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("amount".to_string(), (RockyType::Int64, false));
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (RockyType::Int64, false),
+        );
         let expr = parse_expr("FIRST_VALUE(amount) OVER (PARTITION BY customer_id ORDER BY ts)");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
     }
@@ -2220,9 +2253,10 @@ mod tests {
     #[test]
     fn test_infer_window_sum_over() {
         let mut scope = TypeScope::new();
-        scope
-            .columns
-            .insert("amount".to_string(), (RockyType::Int64, false));
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (RockyType::Int64, false),
+        );
         let expr = parse_expr("SUM(amount) OVER (PARTITION BY customer_id)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Int64);
@@ -2257,7 +2291,7 @@ mod tests {
         let mut scope = TypeScope::new();
         scope
             .columns
-            .insert("name".to_string(), (RockyType::String, false));
+            .insert(CiKey::owned("name".to_string()), (RockyType::String, false));
         let expr = parse_expr("NTH_VALUE(name, 2) OVER (ORDER BY id)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::String);
@@ -2308,7 +2342,7 @@ mod tests {
         let mut scope = TypeScope::new();
         scope
             .columns
-            .insert("x".to_string(), (RockyType::Int64, false));
+            .insert(CiKey::owned("x".to_string()), (RockyType::Int64, false));
         let expr = parse_expr("NULLIF(x, 0)");
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Int64);
