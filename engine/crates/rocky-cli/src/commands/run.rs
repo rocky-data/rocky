@@ -2017,19 +2017,41 @@ pub async fn run(
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
         if mdir.exists() {
-            let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
-            execute_models(
-                mdir,
-                warehouse.as_ref(),
-                state_store.as_ref(),
-                partition_opts,
-                &run_id,
-                None, // no model filter in replication path
-                &mut output,
-                Some(&hook_registry),
-                Some(pipeline_name),
-            )
-            .await?;
+            // §P2.6 follow-up — execute_models + warehouse adapter
+            // construction were the remaining `?`-propagation sites
+            // where a pipeline error could surface without firing
+            // `pipeline_error`. Other early-return sites — Ctrl-C at
+            // line 1520 and partial-failure bail! below — already
+            // fire. Wrap both calls so subscribers see
+            // `pipeline_error` before the error reaches the caller.
+            let exec_result: Result<()> = async {
+                let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
+                execute_models(
+                    mdir,
+                    warehouse.as_ref(),
+                    state_store.as_ref(),
+                    partition_opts,
+                    &run_id,
+                    None, // no model filter in replication path
+                    &mut output,
+                    Some(&hook_registry),
+                    Some(pipeline_name),
+                )
+                .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = exec_result {
+                let _ = hook_registry
+                    .fire(&HookContext::pipeline_error(
+                        &run_id,
+                        pipeline_name,
+                        &format!("{e:#}"),
+                    ))
+                    .await;
+                let _ = hook_registry.wait_async_webhooks().await;
+                return Err(e);
+            }
         }
     }
 
