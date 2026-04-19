@@ -848,7 +848,7 @@ id = "INTEGER"
             &self,
             _target: &str,
             _source_sql: &str,
-            _keys: &[String],
+            _keys: &[std::sync::Arc<str>],
             _update_cols: &crate::ir::ColumnSelection,
         ) -> crate::traits::AdapterResult<String> {
             Ok(String::new())

@@ -202,11 +202,16 @@ pub trait SqlDialect: Send + Sync {
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
     /// MERGE INTO (upsert by key).
+    ///
+    /// Keys are `&[Arc<str>]` so the ir-level `Vec<Arc<str>>` on
+    /// `MaterializationStrategy::Merge::unique_key` threads through without
+    /// per-call allocation (§P4.2). Dialect implementations dereference
+    /// (`&**key`) to get a `&str` for validation / formatting.
     fn merge_into(
         &self,
         target: &str,
         source_sql: &str,
-        keys: &[String],
+        keys: &[std::sync::Arc<str>],
         update_cols: &ColumnSelection,
     ) -> AdapterResult<String>;
 

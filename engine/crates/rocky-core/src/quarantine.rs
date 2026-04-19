@@ -519,7 +519,7 @@ mod unit_tests {
             &self,
             _: &str,
             _: &str,
-            _: &[String],
+            _: &[std::sync::Arc<str>],
             _: &ColumnSelection,
         ) -> AdapterResult<String> {
             unimplemented!()

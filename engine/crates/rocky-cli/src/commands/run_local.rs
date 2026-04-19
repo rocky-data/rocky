@@ -620,7 +620,11 @@ pub async fn run_snapshot(
             schema: pipeline.target.schema.clone(),
             table: pipeline.target.table.clone(),
         },
-        unique_key: pipeline.unique_key.clone(),
+        unique_key: pipeline
+            .unique_key
+            .iter()
+            .map(|s| std::sync::Arc::from(s.as_str()))
+            .collect(),
         updated_at: pipeline.updated_at.clone(),
         invalidate_hard_deletes: pipeline.invalidate_hard_deletes,
         governance: rocky_core::ir::GovernanceConfig {
