@@ -1,6 +1,6 @@
 ---
 title: SQL Generation
-description: All SQL statements Rocky generates for Databricks
+description: The full SQL surface Rocky emits across warehouses
 sidebar:
   order: 5
 ---
