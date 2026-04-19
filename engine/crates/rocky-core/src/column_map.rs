@@ -168,11 +168,11 @@ mod tests {
         let cols = vec![col("CustomerID"), col("created_at"), col("Status")];
         let map = build_column_map(&cols);
         // Lookups with any casing resolve to the same entry.
-        assert!(map.get(CiStr::new("customerid")).is_some());
-        assert!(map.get(CiStr::new("CUSTOMERID")).is_some());
-        assert!(map.get(CiStr::new("created_at")).is_some());
-        assert!(map.get(CiStr::new("CREATED_AT")).is_some());
-        assert!(map.get(CiStr::new("missing")).is_none());
+        assert!(map.contains_key(CiStr::new("customerid")));
+        assert!(map.contains_key(CiStr::new("CUSTOMERID")));
+        assert!(map.contains_key(CiStr::new("created_at")));
+        assert!(map.contains_key(CiStr::new("CREATED_AT")));
+        assert!(!map.contains_key(CiStr::new("missing")));
     }
 
     #[test]
