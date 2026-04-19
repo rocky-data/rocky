@@ -25,13 +25,15 @@ models/
 
 ### Inline format (legacy)
 
-A single SQL file with TOML frontmatter:
+A single SQL file with TOML frontmatter. Supported for backward compatibility; the sidecar format is preferred because embedded TOML breaks SQL editor tooling.
 
 ```sql
 ---toml
 name = "fct_orders"
-depends_on = ["stg_orders", "dim_customers"]
-strategy = "full_refresh"
+depends_on = ["stg_orders"]
+
+[strategy]
+type = "full_refresh"
 
 [target]
 catalog = "acme_warehouse"
@@ -39,46 +41,34 @@ schema = "analytics"
 table = "fct_orders"
 ---
 
-SELECT
-    o.order_id,
-    o.customer_id,
-    c.customer_name,
-    o.total_amount,
-    o.order_date
-FROM acme_warehouse.staging__us_west__shopify.orders o
-JOIN acme_warehouse.analytics.dim_customers c
-    ON o.customer_id = c.customer_id
+SELECT ...
 ```
 
-This format works but is not recommended because embedded TOML breaks SQL editor tooling.
+## Configuration
 
-## Model configuration
-
-The TOML configuration (whether sidecar or inline) supports these fields:
+Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 
 | Field | Required | Description |
 |---|---|---|
 | `name` | Yes | Model identifier, used in `depends_on` references |
-| `depends_on` | No | List of upstream model names (determines execution order) |
-| `strategy` | No | Materialization strategy: `full_refresh` (default), `incremental`, or `merge` |
-| `target` | Yes | Output table: `{ catalog, schema, table }` |
-| `sources` | No | Input tables (for documentation and validation) |
+| `depends_on` | No | List of upstream model names (execution order) |
+| `[strategy]` | No | Materialization config (see below) — defaults to `full_refresh` |
+| `[target]` | Yes | Output table: `{ catalog, schema, table }` |
+| `[[sources]]` | No | Input tables (for documentation and lineage) |
 
-### Strategy-specific fields
-
-For `incremental`:
+### `[strategy]`
 
 ```toml
-strategy = "incremental"
+# Incremental
+[strategy]
+type = "incremental"
 timestamp_column = "updated_at"
-```
 
-For `merge`:
-
-```toml
-strategy = "merge"
+# Merge
+[strategy]
+type = "merge"
 unique_key = ["customer_id"]
-update_columns = ["customer_name", "email", "updated_at"]  # optional, defaults to all
+update_columns = ["name", "email", "updated_at"]  # optional, defaults to all non-key columns
 ```
 
 ## Example: sidecar model
@@ -88,7 +78,9 @@ update_columns = ["customer_name", "email", "updated_at"]  # optional, defaults 
 ```toml
 name = "fct_orders"
 depends_on = ["stg_orders", "dim_customers"]
-strategy = "full_refresh"
+
+[strategy]
+type = "full_refresh"
 
 [target]
 catalog = "acme_warehouse"
@@ -118,7 +110,9 @@ WHERE o.order_date >= '2024-01-01'
 ```toml
 name = "dim_customers"
 depends_on = ["stg_customers"]
-strategy = "merge"
+
+[strategy]
+type = "merge"
 unique_key = ["customer_id"]
 
 [target]
