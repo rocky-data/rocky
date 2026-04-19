@@ -2619,70 +2619,16 @@ fn find_last_nonblank_before(lines: &[&str], before_idx: usize) -> usize {
 // ── Incremental compilation (Phase 3H) ──────────────────────────────────────
 
 /// Incremental compilation: recompile only changed models + dependents.
+///
+/// §P3.1 — delegates to `rocky_compiler::compile::compile_incremental`,
+/// which reuses `previous.type_check.typed_models` for non-affected
+/// models instead of re-typechecking the whole project.
 pub fn compile_incremental(
     changed_files: &[std::path::PathBuf],
     previous: &CompileResult,
     config: &CompilerConfig,
 ) -> std::result::Result<CompileResult, rocky_compiler::compile::CompileError> {
-    // Identify which models changed
-    let changed_models: Vec<&str> = previous
-        .project
-        .models
-        .iter()
-        .filter(|m| {
-            let path = std::path::Path::new(&m.file_path);
-            changed_files.iter().any(|cf| cf == path)
-        })
-        .map(|m| m.config.name.as_str())
-        .collect();
-
-    if changed_models.is_empty() {
-        // No model files changed — return previous result as-is
-        return Ok(CompileResult {
-            project: rocky_compiler::project::Project::load(&config.models_dir)?,
-            semantic_graph: previous.semantic_graph.clone(),
-            type_check: rocky_compiler::typecheck::TypeCheckResult {
-                typed_models: previous.type_check.typed_models.clone(),
-                diagnostics: previous.type_check.diagnostics.clone(),
-                reference_map: rocky_compiler::typecheck::ReferenceMap::default(),
-                model_typecheck_ms: previous.type_check.model_typecheck_ms.clone(),
-            },
-            contract_diagnostics: previous.contract_diagnostics.clone(),
-            diagnostics: previous.diagnostics.clone(),
-            has_errors: previous.has_errors,
-            timings: previous.timings.clone(),
-            model_timings: previous.model_timings.clone(),
-        });
-    }
-
-    // Find transitive dependents
-    let mut affected: std::collections::HashSet<String> = changed_models
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (model_name, schema) in &previous.semantic_graph.models {
-            if !affected.contains(model_name)
-                && schema.upstream.iter().any(|up| affected.contains(up))
-            {
-                affected.insert(model_name.clone());
-                changed = true;
-            }
-        }
-    }
-
-    // If most models are affected, just do a full recompile
-    let total = previous.project.models.len();
-    if affected.len() > total / 2 || total < 10 {
-        return rocky_compiler::compile::compile(config);
-    }
-
-    // Otherwise, still do full compile (incremental merging is complex)
-    // but this framework allows future optimization
-    rocky_compiler::compile::compile(config)
+    rocky_compiler::compile::compile_incremental(config, changed_files, previous)
 }
 
 // ── Server entry point ──────────────────────────────────────────────────────
