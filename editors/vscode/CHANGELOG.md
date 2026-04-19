@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Prefer the standalone `rocky-lsp` binary when available
+
+The LSP client now probes PATH (or the directory of an explicit `rocky.server.path`) for a `rocky-lsp` binary and uses it directly when present, falling back to `rocky lsp` otherwise. `rocky-lsp` is a purpose-built ~6 MB binary that skips the full adapter graph, so language-server spawn is faster and the on-disk footprint for IDE-only installs drops. Users without the split binary installed see no behaviour change — resolution is transparent.
+
 ## [1.4.2] — 2026-04-19
 
 ### Changed — Bundle extension with esbuild
