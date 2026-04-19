@@ -141,12 +141,14 @@ assert pdef is not None  # it's a DailyPartitionsDefinition
     key=dg.AssetKey(["fct_daily_orders"]),
     partitions_def=pdef,
 )
-def fct_daily_orders_asset(context: dg.AssetExecutionContext):
+def fct_daily_orders_asset(
+    context: dg.AssetExecutionContext,
+    rocky: RockyResource,
+):
     rocky_key = dagster_to_rocky_partition_key("day", context.partition_key)
-    rocky.run(
+    result = rocky.run(
         filter="layer=marts",
-        # rocky.run doesn't yet expose a `partition_key` kwarg —
-        # the wiring is a follow-up. For now, the helper builds the
-        # CLI args you can pass through a custom subprocess wrapper.
+        partition=rocky_key,   # threads through to `rocky run --partition <key>`
     )
+    return result.tables_copied
 ```
