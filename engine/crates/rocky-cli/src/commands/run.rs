@@ -983,18 +983,37 @@ pub async fn run(
     let shared_pipeline = Arc::new(pipeline.clone());
     let mut join_set: JoinSet<(usize, Result<TableResult, anyhow::Error>)> = JoinSet::new();
 
-    // Background state sync — flush watermarks to remote storage every 30s
-    let state_sync_handle = {
+    // Background state sync — flush watermarks to remote storage.
+    //
+    // Cadence scales with estimated run duration so small runs don't spam
+    // the object store. Duration is a coarse estimate of ~3s per table
+    // divided by concurrency; the final end-of-run upload (further below)
+    // always flushes state, so the periodic loop only exists to bound
+    // exposure for long runs. Runs shorter than ~1 minute skip it entirely.
+    let estimated_run_secs = (tables_to_process.len() as u64)
+        .saturating_mul(3)
+        .checked_div(concurrency.max(1) as u64)
+        .unwrap_or(0);
+    let state_sync_handle = if estimated_run_secs < 60 {
+        None
+    } else {
+        // Target one upload per quarter of the estimated run, capped at 30s.
+        let cadence_secs = std::cmp::min(30, estimated_run_secs / 4).max(10);
+        let cadence = Duration::from_secs(cadence_secs);
         let state_cfg = rocky_cfg.state.clone();
         let state_p = state_path.to_path_buf();
-        tokio::spawn(async move {
+        info!(
+            estimated_run_secs,
+            cadence_secs, "adaptive state-sync cadence configured"
+        );
+        Some(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(cadence).await;
                 if let Err(e) = rocky_core::state_sync::upload_state(&state_cfg, &state_p).await {
                     warn!(error = %e, "periodic state sync failed");
                 }
             }
-        })
+        }))
     };
 
     // Track the semaphore's effective capacity so we can adjust it when the
@@ -1372,7 +1391,9 @@ pub async fn run(
             }
         }
 
-        state_sync_handle.abort();
+        if let Some(h) = state_sync_handle.as_ref() {
+            h.abort();
+        }
 
         output.duration_ms = start.elapsed().as_millis() as u64;
         if output_json {
@@ -1453,7 +1474,9 @@ pub async fn run(
     }
 
     // Stop background state sync and reclaim resources for post-run phase
-    state_sync_handle.abort();
+    if let Some(h) = state_sync_handle.as_ref() {
+        h.abort();
+    }
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
     {
