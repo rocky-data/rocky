@@ -238,19 +238,18 @@ pub(crate) async fn compute_measure_dedup(
     };
 
     let catalog_scope = managed.as_ref().map(managed_catalog_set);
-    let all_warehouse_tables =
-        enumerate_tables(adapter.as_ref(), catalog_scope.as_deref()).await?;
+    let all_warehouse_tables = enumerate_tables(adapter.as_ref(), catalog_scope.as_deref()).await?;
 
     let (tables, scope) = match managed.as_ref() {
         Some(managed_set) => {
             let filtered: Vec<TableRef> = all_warehouse_tables
                 .iter()
-                .cloned()
                 .filter(|t| {
                     t.validated_full_name()
                         .map(|name| managed_set.contains(&name.to_lowercase()))
                         .unwrap_or(false)
                 })
+                .cloned()
                 .collect();
             tracing::info!(
                 managed_tables = managed_set.len(),
@@ -258,8 +257,7 @@ pub(crate) async fn compute_measure_dedup(
                 matched = filtered.len(),
                 "scoped to Rocky-managed tables"
             );
-            if filtered.is_empty() && !managed_set.is_empty() && !all_warehouse_tables.is_empty()
-            {
+            if filtered.is_empty() && !managed_set.is_empty() && !all_warehouse_tables.is_empty() {
                 let managed_sample: Vec<&String> = managed_set.iter().take(5).collect();
                 let warehouse_sample: Vec<String> = all_warehouse_tables
                     .iter()
@@ -767,11 +765,14 @@ fn parse_checksum_rows(result: &QueryResult) -> Result<Vec<PartitionChecksum>> {
         // the query returns zero rows (DuckDB). Either way there's no
         // content to dedupe — skip silently instead of failing the sweep.
         let checksum_cell = row.get(1);
-        if checksum_cell.map(|v| v.is_null()).unwrap_or(true) {
+        if checksum_cell
+            .map(serde_json::Value::is_null)
+            .unwrap_or(true)
+        {
             continue;
         }
-        let checksum =
-            json_number_to_u64(checksum_cell).context("checksum column is missing or not a number")?;
+        let checksum = json_number_to_u64(checksum_cell)
+            .context("checksum column is missing or not a number")?;
         let row_count = json_number_to_u64(row.get(2))
             .context("row_count column is missing or not a number")?;
         checksums.push(PartitionChecksum {

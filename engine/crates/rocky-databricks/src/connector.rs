@@ -298,7 +298,10 @@ impl DatabricksConnector {
                         // re-fail and exhaust retries.
                         if matches!(
                             &err,
-                            ConnectorError::ApiError { status: 401 | 403, .. }
+                            ConnectorError::ApiError {
+                                status: 401 | 403,
+                                ..
+                            }
                         ) {
                             self.auth.invalidate_cache().await;
                         }
