@@ -75,6 +75,7 @@ enum AuthInner {
         account: String,
         username: String,
         private_key_path: String,
+        cached_token: Arc<RwLock<Option<CachedToken>>>,
     },
 }
 
@@ -124,6 +125,7 @@ impl Auth {
                             account: config.account,
                             username: username.clone(),
                             private_key_path: key_path,
+                            cached_token: Arc::new(RwLock::new(None)),
                         },
                     });
                 }
@@ -154,7 +156,30 @@ impl Auth {
                 account,
                 username,
                 private_key_path,
+                cached_token,
             } => {
+                // Check cache (read lock). Keypair JWTs have a Snowflake-imposed
+                // maximum TTL of 60 minutes; we mint with 59 min and refresh
+                // 60 s before expiry to avoid serving an about-to-expire token.
+                {
+                    let cache = cached_token.read().await;
+                    if let Some(ct) = cache.as_ref() {
+                        if ct.expires_at > Instant::now() + Duration::from_secs(60) {
+                            return Ok(ct.token.expose().to_string());
+                        }
+                    }
+                }
+
+                // Refresh (write lock)
+                let mut cache = cached_token.write().await;
+
+                // Double-check after acquiring write lock
+                if let Some(ct) = cache.as_ref() {
+                    if ct.expires_at > Instant::now() + Duration::from_secs(60) {
+                        return Ok(ct.token.expose().to_string());
+                    }
+                }
+
                 use base64::Engine;
                 use base64::engine::general_purpose::STANDARD as BASE64;
                 use rsa::RsaPrivateKey;
@@ -189,6 +214,11 @@ impl Auth {
                     .unwrap()
                     .as_secs();
 
+                // Snowflake's documented JWT lifetime cap is 60 min. Minting
+                // for 59 min lets a long-running pipeline cover the full hour
+                // minus the 60 s refresh slack.
+                const JWT_TTL_SECS: u64 = 59 * 60;
+
                 #[derive(serde::Serialize)]
                 struct Claims {
                     iss: String,
@@ -201,7 +231,7 @@ impl Auth {
                     iss: issuer,
                     sub: format!("{account_upper}.{user_upper}"),
                     iat: now,
-                    exp: now + 60,
+                    exp: now + JWT_TTL_SECS,
                 };
 
                 let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(pem_str.as_bytes())
@@ -210,6 +240,12 @@ impl Auth {
                 let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
                 let token = jsonwebtoken::encode(&header, &claims, &encoding_key)
                     .map_err(|e| AuthError::KeyPairInvalid(format!("JWT encode failed: {e}")))?;
+
+                let new_cached = CachedToken {
+                    token: RedactedString::new(token.clone()),
+                    expires_at: Instant::now() + Duration::from_secs(JWT_TTL_SECS),
+                };
+                *cache = Some(new_cached);
 
                 Ok(token)
             }
@@ -295,6 +331,22 @@ impl Auth {
         }
     }
 
+    /// Invalidates any cached session/JWT token so the next `get_token`
+    /// call forces a fresh mint. Called when the server returns 401 —
+    /// a long-running pipeline may otherwise keep replaying an expired
+    /// token from the cache.
+    pub async fn invalidate_cache(&self) {
+        match &self.inner {
+            AuthInner::OAuth { .. } => {
+                // OAuth here is caller-supplied and not refreshable by us.
+            }
+            AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
+                let mut cache = cached_token.write().await;
+                *cache = None;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn is_oauth(&self) -> bool {
         matches!(self.inner, AuthInner::OAuth { .. })
@@ -308,6 +360,30 @@ impl Auth {
     #[cfg(test)]
     fn is_key_pair(&self) -> bool {
         matches!(self.inner, AuthInner::KeyPair { .. })
+    }
+
+    #[cfg(test)]
+    async fn has_cached_token(&self) -> bool {
+        match &self.inner {
+            AuthInner::OAuth { .. } => false,
+            AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
+                cached_token.read().await.is_some()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn prime_cache_with(&self, token: &str, ttl: Duration) {
+        let new_cached = CachedToken {
+            token: RedactedString::new(token.to_string()),
+            expires_at: Instant::now() + ttl,
+        };
+        match &self.inner {
+            AuthInner::OAuth { .. } => {}
+            AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
+                *cached_token.write().await = Some(new_cached);
+            }
+        }
     }
 }
 
@@ -440,6 +516,56 @@ mod tests {
         })
         .unwrap();
         assert_eq!(auth.get_token().await.unwrap(), "my_oauth_token");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_clears_keypair_cache() {
+        let auth = Auth::from_config(AuthConfig {
+            account: "xy12345".into(),
+            username: Some("user".into()),
+            password: None,
+            oauth_token: None,
+            private_key_path: Some("/path/to/key.pem".into()),
+        })
+        .unwrap();
+        assert!(!auth.has_cached_token().await);
+        auth.prime_cache_with("jwt_token_abc", Duration::from_secs(3540))
+            .await;
+        assert!(auth.has_cached_token().await);
+        auth.invalidate_cache().await;
+        assert!(!auth.has_cached_token().await);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_clears_password_cache() {
+        let auth = Auth::from_config(AuthConfig {
+            account: "xy12345".into(),
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            oauth_token: None,
+            private_key_path: None,
+        })
+        .unwrap();
+        assert!(!auth.has_cached_token().await);
+        auth.prime_cache_with("session_token_xyz", Duration::from_secs(3600))
+            .await;
+        assert!(auth.has_cached_token().await);
+        auth.invalidate_cache().await;
+        assert!(!auth.has_cached_token().await);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_noop_on_oauth() {
+        let auth = Auth::from_config(AuthConfig {
+            account: "xy12345".into(),
+            username: None,
+            password: None,
+            oauth_token: Some("pre_supplied_token".into()),
+            private_key_path: None,
+        })
+        .unwrap();
+        auth.invalidate_cache().await; // should not panic
+        assert_eq!(auth.get_token().await.unwrap(), "pre_supplied_token");
     }
 
     #[tokio::test]
