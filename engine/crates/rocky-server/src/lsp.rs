@@ -335,6 +335,11 @@ pub struct RockyLsp {
     init_done: Arc<AtomicBool>,
     /// Notifies request handlers blocked on the initial compile.
     init_notify: Arc<Notify>,
+    /// §P3.4 semantic-token cache: maps URI → (SQL-content hash,
+    /// encoded tokens). `semantic_tokens_full` skips the SQL parse
+    /// pass when the cached hash matches the current model SQL —
+    /// editors call this hook on every scroll on large files.
+    semantic_tokens_cache: Arc<RwLock<HashMap<String, (u64, Vec<SemanticToken>)>>>,
 }
 
 impl RockyLsp {
@@ -606,8 +611,14 @@ impl LanguageServer for RockyLsp {
             if unchanged {
                 return;
             }
-            docs.insert(uri_string, change.text);
+            docs.insert(uri_string.clone(), change.text);
         }
+
+        // §P3.4: drop the stale semantic-token cache entry for this URI
+        // so the next `semanticTokens/full` request rebuilds from the
+        // updated SQL. (The content-hash gate would catch stale entries
+        // anyway, but evicting now keeps the cache tight.)
+        self.semantic_tokens_cache.write().await.remove(&uri_string);
 
         if !self.recompile_pending.swap(true, Ordering::SeqCst) {
             let client = self.client.clone();
@@ -1597,8 +1608,32 @@ impl LanguageServer for RockyLsp {
         };
 
         let uri = &params.text_document.uri;
+        let uri_str = uri.to_string();
         let model = self.model_for_uri(result, uri);
         let Some(model) = model else { return Ok(None) };
+
+        // §P3.4: editors call `semanticTokens/full` per scroll / focus
+        // change, and the SQL parse dominates the cost on large files.
+        // Cache by (URI, content hash); bail out early on a hit without
+        // re-parsing or re-walking the AST.
+        let sql_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            model.sql.hash(&mut h);
+            h.finish()
+        };
+        {
+            let cache = self.semantic_tokens_cache.read().await;
+            if let Some((cached_hash, cached_data)) = cache.get(&uri_str) {
+                if *cached_hash == sql_hash {
+                    return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                        result_id: None,
+                        data: cached_data.clone(),
+                    })));
+                }
+            }
+        }
 
         let model_names: std::collections::HashSet<&str> = result
             .project
@@ -1651,6 +1686,12 @@ impl LanguageServer for RockyLsp {
             prev_line = *line;
             prev_col = *col;
         }
+
+        // Store in cache for the next call on the same unchanged SQL.
+        self.semantic_tokens_cache
+            .write()
+            .await
+            .insert(uri_str, (sql_hash, data.clone()));
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
@@ -2656,6 +2697,7 @@ pub async fn run_lsp() {
         recompile_pending: Arc::new(AtomicBool::new(false)),
         init_done: Arc::new(AtomicBool::new(false)),
         init_notify: Arc::new(Notify::new()),
+        semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
