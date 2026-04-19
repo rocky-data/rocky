@@ -7,9 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed — Prefer the standalone `rocky-lsp` binary when available
+## [1.5.0] — 2026-04-20
 
-The LSP client now probes PATH (or the directory of an explicit `rocky.server.path`) for a `rocky-lsp` binary and uses it directly when present, falling back to `rocky lsp` otherwise. `rocky-lsp` is a purpose-built ~6 MB binary that skips the full adapter graph, so language-server spawn is faster and the on-disk footprint for IDE-only installs drops. Users without the split binary installed see no behaviour change — resolution is transparent.
+### Added — Prefer the standalone `rocky-lsp` binary when available
+
+The LSP client now probes PATH (or the directory of an explicit `rocky.server.path`) for a `rocky-lsp` binary and uses it directly when present, falling back to `rocky lsp` otherwise. `rocky-lsp` is a purpose-built ~6 MB binary (vs. ~47 MB for the full `rocky` CLI) that skips the full adapter graph, so language-server spawn is faster and the on-disk footprint for IDE-only installs drops.
+
+**Resolution rules:**
+
+- If `rocky.server.path` is an absolute/relative path containing a separator (e.g. `/opt/rocky/bin/rocky`), the client looks for a sibling `rocky-lsp(.exe)` in the same directory.
+- If `rocky.server.path` is just `"rocky"` (the default), the client walks `$PATH` and returns the first `rocky-lsp` it finds.
+- If nothing is found, the client falls back to the existing `rocky lsp` invocation unchanged.
+
+Users without the split binary installed see no behaviour change — resolution is transparent.
+
+`rocky-lsp` ships alongside `rocky` from engine-v1.10.0 onwards. Install it via `engine/install.sh` (which will be taught about the new archive in a follow-up) or by downloading the `rocky-lsp-<target>.tar.gz` archive from the GitHub Release. Until then, building locally (`cargo build --release --bin rocky-lsp` from the engine workspace) produces the binary.
+
+### Added — Regenerated TypeScript bindings for engine 1.10.0
+
+Engine 1.10.0 closes the perf-resilience roadmap's active arc. The regenerated interfaces in `src/types/generated/` surface additive schema changes from that push:
+
+- **`PipelineEvent.attempt` / `error_class`** on the retry-event shapes emitted by Databricks / Snowflake / Fivetran adapter retry loops.
+- **Hook context schemas** for the 15 lifecycle events wired into `rocky run`.
+- **Top-level `[retry]` config** for cross-adapter shared `RetryBudget`.
+- Additive `CompileOutput` timing fields from the incremental compiler path.
+
+No source-code changes in the extension aside from the LSP-client integration above — existing commands continue to work unchanged.
 
 ## [1.4.2] — 2026-04-19
 
