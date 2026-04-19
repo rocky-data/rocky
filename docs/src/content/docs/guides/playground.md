@@ -58,7 +58,6 @@ path = "playground.duckdb"
 [pipeline.playground]
 type = "replication"
 strategy = "full_refresh"
-timestamp_column = "_updated_at"
 
 [pipeline.playground.source]
 adapter = "local"
