@@ -22,7 +22,10 @@ pub fn detect_drift(
     let mut drifted_columns = Vec::new();
 
     for source_col in source_columns {
-        if let Some(target_col) = target_map.get(&source_col.name.to_lowercase()) {
+        // §P1.9: look up via CiStr borrow — no allocation per column.
+        if let Some(target_col) =
+            target_map.get(column_map::CiStr::new(&source_col.name))
+        {
             if source_col.data_type.to_lowercase() != target_col.data_type.to_lowercase() {
                 drifted_columns.push(DriftedColumn {
                     name: source_col.name.clone(),
