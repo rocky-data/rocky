@@ -5,17 +5,15 @@ sidebar:
   order: 12
 ---
 
-## Overview
-
 Rocky fires lifecycle events at key points during pipeline execution. You can attach shell scripts or HTTP webhooks to any event for notifications, gating, auditing, or custom integrations.
 
-## Lifecycle Events
+## Lifecycle events
 
 Events are organized into five phases:
 
-### Pipeline Phase
+### Pipeline phase
 
-| Event | When | Use Case |
+| Event | When | Use case |
 |-------|------|----------|
 | `pipeline_start` | Pipeline begins | Slack notification, deploy freeze gate |
 | `discover_complete` | Source discovery finishes | Log connector/table counts |
@@ -23,37 +21,37 @@ Events are organized into five phases:
 | `pipeline_complete` | Pipeline succeeds | Success notification, metrics push |
 | `pipeline_error` | Pipeline fails | PagerDuty alert, incident creation |
 
-### Table Phase
+### Table phase
 
-| Event | When | Use Case |
+| Event | When | Use case |
 |-------|------|----------|
 | `before_materialize` | Before table copy | Audit logging |
 | `after_materialize` | After table copy | Publish to data catalog |
 | `materialize_error` | Table copy fails | Per-table alerting |
 
-### Model Phase
+### Model phase
 
-| Event | When | Use Case |
+| Event | When | Use case |
 |-------|------|----------|
 | `before_model_run` | Before compiled model runs | Feature flag checks |
 | `after_model_run` | After compiled model runs | Lineage metadata push |
 | `model_error` | Model execution fails | Debug notification |
 
-### Quality Phase
+### Quality phase
 
-| Event | When | Use Case |
+| Event | When | Use case |
 |-------|------|----------|
 | `check_result` | Quality check completes | Threshold alerting |
 | `drift_detected` | Schema drift found | Schema change notification |
 | `anomaly_detected` | Row count anomaly | Data quality alert |
 
-### State Phase
+### State phase
 
-| Event | When | Use Case |
+| Event | When | Use case |
 |-------|------|----------|
 | `state_synced` | State store synced | Backup confirmation |
 
-## Shell Hooks
+## Shell hooks
 
 Shell hooks execute a command and pipe the event context as JSON to stdin:
 
@@ -79,7 +77,7 @@ The script receives JSON like:
 }
 ```
 
-### Failure Handling
+### Failure handling
 
 | Mode | Behavior |
 |------|----------|
@@ -100,9 +98,9 @@ preset = "slack"
 secret = "${WEBHOOK_SECRET}"
 ```
 
-### Built-in Presets
+### Built-in presets
 
-| Preset | Service | Body Format |
+| Preset | Service | Body format |
 |--------|---------|-------------|
 | `slack` | Slack Incoming Webhook | Slack Block Kit JSON |
 | `pagerduty` | PagerDuty Events API v2 | PD event payload |
@@ -111,7 +109,7 @@ secret = "${WEBHOOK_SECRET}"
 
 Presets provide default body templates and headers. Override any field in your config.
 
-### HMAC Signing
+### HMAC signing
 
 When `secret` is set, Rocky signs the request body with HMAC-SHA256:
 
@@ -121,7 +119,7 @@ X-Rocky-Signature: sha256=<hex-encoded digest>
 
 The receiving service can verify the signature to ensure the request came from Rocky.
 
-### Body Templates
+### Body templates
 
 Custom body templates use Mustache-style syntax:
 
@@ -135,7 +133,7 @@ body_template = """
 
 Supported: `{{field}}`, `{{metadata.key}}`, `{{#if field}}...{{/if}}`.
 
-## Testing Hooks
+## Testing hooks
 
 Validate your hook configuration without running a real pipeline:
 
