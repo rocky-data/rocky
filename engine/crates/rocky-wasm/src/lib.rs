@@ -151,10 +151,10 @@ pub fn get_parse_errors(source: &str) -> String {
                     expected,
                     found,
                     offset,
-                } => (*offset, expected.clone(), found.clone()),
+                } => (*offset, expected.to_string(), found.to_string()),
                 rocky_lang::ParseError::UnexpectedEof { expected } => (
                     source.len().saturating_sub(1),
-                    expected.clone(),
+                    expected.to_string(),
                     "EOF".to_string(),
                 ),
                 rocky_lang::ParseError::InvalidNumber { value } => {
@@ -210,10 +210,10 @@ pub fn compile_rocky_model(source: &str) -> String {
                     expected,
                     found,
                     offset,
-                } => (*offset, expected.clone(), found.clone()),
+                } => (*offset, expected.to_string(), found.to_string()),
                 rocky_lang::ParseError::UnexpectedEof { expected } => (
                     source.len().saturating_sub(1),
-                    expected.clone(),
+                    expected.to_string(),
                     "EOF".to_string(),
                 ),
                 rocky_lang::ParseError::InvalidNumber { value } => {
