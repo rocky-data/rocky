@@ -707,6 +707,7 @@ mod tests {
             hooks: Default::default(),
             cost: Default::default(),
             schema_evolution: Default::default(),
+            retry: None,
         };
 
         let models = vec![
@@ -775,6 +776,7 @@ mod tests {
             hooks: Default::default(),
             cost: Default::default(),
             schema_evolution: Default::default(),
+            retry: None,
         };
 
         let models = vec![Model {
@@ -839,6 +841,7 @@ mod tests {
             hooks: Default::default(),
             cost: Default::default(),
             schema_evolution: Default::default(),
+            retry: None,
         };
 
         let index = build_doc_index(&[], &config, None);

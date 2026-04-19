@@ -457,6 +457,20 @@ class RetryConfig(BaseModel):
     """
 
 
+class RunRetryConfig(BaseModel):
+    """
+    Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_retries_per_run: conint(ge=0) | None = None
+    """
+    Total number of retries allowed across every adapter for this run. `None` means no cross-adapter cap (each adapter's own `retry.max_retries_per_run` still applies in isolation).
+    """
+
+
 class SchemaEvolutionConfig(BaseModel):
     """
     Schema evolution configuration.
@@ -2036,6 +2050,14 @@ class RockyConfig(BaseModel):
     ) = Field({}, validate_default=True)
     """
     Named pipeline configurations (keyed by pipeline name).
+    """
+    retry: RunRetryConfig | None = None
+    """
+    Run-level retry budget shared across every adapter for this run.
+
+    When set, `rocky run` builds a single [`crate::retry_budget::RetryBudget`] from [`RunRetryConfig::max_retries_per_run`] and passes it to every connector via `with_retry_budget(...)`. One bad table that burns through retries on adapter A then has less budget available for adapter B's retries — the protection §P2.7 added within a single adapter now extends across the whole run.
+
+    Unset (the default) preserves per-adapter semantics: each adapter still honours its own `retry.max_retries_per_run` independently. That's the backward-compatible path and stays the right choice when adapters have wildly different rate limits.
     """
     schema_evolution: SchemaEvolutionConfig | None = Field(
         {"grace_period_days": 7}, validate_default=True

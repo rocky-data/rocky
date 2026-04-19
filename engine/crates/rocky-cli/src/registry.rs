@@ -70,6 +70,18 @@ impl AdapterRegistry {
         let mut bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>> = HashMap::new();
         let mut adapter_configs = HashMap::new();
 
+        // Cross-adapter run-level retry budget (follow-up to §P2.7). When
+        // the top-level `[retry]` section is set, every adapter in this
+        // registry receives the *same* budget instance — retries across
+        // adapters share the quota, so a runaway statement on Databricks
+        // can't later starve Snowflake. When unset, each adapter stays on
+        // its own per-adapter `retry.max_retries_per_run` (unchanged).
+        let shared_retry_budget = config
+            .retry
+            .as_ref()
+            .and_then(|r| r.max_retries_per_run)
+            .map(rocky_core::retry_budget::RetryBudget::new);
+
         for (name, adapter_cfg) in &config.adapters {
             adapter_configs.insert(name.clone(), adapter_cfg.clone());
 
@@ -106,31 +118,36 @@ impl AdapterRegistry {
                         retry: adapter_cfg.retry.clone(),
                     };
 
-                    let connector = Arc::new(DatabricksConnector::new(connector_config, auth));
-                    let adapter =
-                        Arc::new(DatabricksWarehouseAdapter::new(DatabricksConnector::new(
-                            ConnectorConfig {
-                                host: host.to_string(),
-                                warehouse_id: ConnectorConfig::warehouse_id_from_http_path(
-                                    http_path,
-                                )
-                                .context("failed to extract warehouse_id from http_path")?,
-                                timeout: Duration::from_secs(
-                                    adapter_cfg.timeout_secs.unwrap_or(120),
-                                ),
-                                retry: adapter_cfg.retry.clone(),
-                            },
-                            Auth::from_config(AuthConfig {
-                                host: host.to_string(),
-                                token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
-                                client_id: adapter_cfg.client_id.clone(),
-                                client_secret: adapter_cfg
-                                    .client_secret
-                                    .as_ref()
-                                    .map(|s| s.expose().to_string()),
-                            })
-                            .context("failed to resolve Databricks auth from adapter config")?,
-                        )));
+                    let mut connector = DatabricksConnector::new(connector_config, auth);
+                    if let Some(ref budget) = shared_retry_budget {
+                        connector = connector.with_retry_budget(budget.clone());
+                    }
+                    let connector = Arc::new(connector);
+                    let mut warehouse_conn = DatabricksConnector::new(
+                        ConnectorConfig {
+                            host: host.to_string(),
+                            warehouse_id: ConnectorConfig::warehouse_id_from_http_path(http_path)
+                                .context(
+                                "failed to extract warehouse_id from http_path",
+                            )?,
+                            timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
+                            retry: adapter_cfg.retry.clone(),
+                        },
+                        Auth::from_config(AuthConfig {
+                            host: host.to_string(),
+                            token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
+                            client_id: adapter_cfg.client_id.clone(),
+                            client_secret: adapter_cfg
+                                .client_secret
+                                .as_ref()
+                                .map(|s| s.expose().to_string()),
+                        })
+                        .context("failed to resolve Databricks auth from adapter config")?,
+                    );
+                    if let Some(ref budget) = shared_retry_budget {
+                        warehouse_conn = warehouse_conn.with_retry_budget(budget.clone());
+                    }
+                    let adapter = Arc::new(DatabricksWarehouseAdapter::new(warehouse_conn));
 
                     connectors.insert(name.clone(), connector);
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
@@ -178,11 +195,14 @@ impl AdapterRegistry {
                         "adapters.{name}: destination_id required for fivetran"
                     ))?;
 
-                    let client = FivetranClient::with_retry(
+                    let mut client = FivetranClient::with_retry(
                         api_key.to_string(),
                         api_secret.to_string(),
                         adapter_cfg.retry.clone(),
                     );
+                    if let Some(ref budget) = shared_retry_budget {
+                        client = client.with_retry_budget(budget.clone());
+                    }
 
                     let adapter = Arc::new(FivetranDiscoveryAdapter::new(
                         client,
@@ -263,13 +283,19 @@ impl AdapterRegistry {
                     // path. Keeping it separate means the batch describe
                     // query won't contend with in-flight `execute_statement`
                     // calls on the warehouse adapter's connector.
-                    let sf_connector_for_batch = Arc::new(SnowflakeConnector::new(
-                        sf_connector_config.clone(),
-                        sf_auth.clone(),
-                    ));
-                    snowflake_connectors.insert(name.clone(), sf_connector_for_batch);
+                    let mut sf_connector_for_batch =
+                        SnowflakeConnector::new(sf_connector_config.clone(), sf_auth.clone());
+                    if let Some(ref budget) = shared_retry_budget {
+                        sf_connector_for_batch =
+                            sf_connector_for_batch.with_retry_budget(budget.clone());
+                    }
+                    snowflake_connectors.insert(name.clone(), Arc::new(sf_connector_for_batch));
 
-                    let warehouse_connector = SnowflakeConnector::new(sf_connector_config, sf_auth);
+                    let mut warehouse_connector =
+                        SnowflakeConnector::new(sf_connector_config, sf_auth);
+                    if let Some(ref budget) = shared_retry_budget {
+                        warehouse_connector = warehouse_connector.with_retry_budget(budget.clone());
+                    }
                     let adapter = SnowflakeWarehouseAdapter::new(warehouse_connector);
                     warehouse.insert(name.clone(), Arc::new(adapter));
                 }

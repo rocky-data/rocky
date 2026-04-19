@@ -303,6 +303,7 @@ mod tests {
             hooks: Default::default(),
             cost: Default::default(),
             schema_evolution: Default::default(),
+            retry: None,
         }
     }
 
