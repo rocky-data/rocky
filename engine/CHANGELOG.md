@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-04-19
+
+Perf-resilience batch 2. Four items off the roadmap's near-term bucket — two perf foundations, two 1.0 auth-resilience closeouts — plus a refactor pass consolidating the auth-cache pattern across adapters.
+
+### Added — predecessor map in DAG execution phases
+
+`execution_phases` in `rocky-core/src/unified_dag.rs` now builds a `HashMap<NodeId, Vec<NodeId>>` of predecessors once in the same edge-walk as the existing `dependents` map, replacing the per-node `dag.edges.iter().filter(...)` inner loop. Sub-ms on today's graphs; guardrails quadratic blow-up on projects with 500+ models.
+
+### Changed — adaptive state-sync cadence
+
+`rocky run` no longer flushes watermarks to remote object storage on a fixed 30-second cadence. Cadence now scales with an estimated run duration (`tables * 3s / concurrency`):
+
+- Runs estimated under 60 s skip the periodic upload entirely — the end-of-run upload handles state persistence. Short runs interrupted with Ctrl-C no longer emit an intermediate PUT.
+- Longer runs target one upload per quarter of the estimated duration, floored at 10 s and capped at 30 s.
+
+Eliminates ~9 redundant object-store PUTs per 5-minute run without sacrificing durability for long pipelines.
+
+### Fixed — Snowflake keypair JWT caching + 401 recovery
+
+The keypair-auth path in `rocky-snowflake/src/auth.rs` previously minted a fresh 60-second-TTL JWT on **every** `get_token` call and classified all 401 responses as permanent errors. Long-running pipelines that crossed any server-side expiry boundary silently failed.
+
+- The keypair branch now caches the minted JWT with a 59-minute TTL (Snowflake's documented maximum) and refreshes 60 s before expiry, mirroring the existing password-path cache.
+- New `Auth::invalidate_cache()` drops the cached token. The connector retry loop calls it on 401 so the next attempt re-mints a fresh JWT; `is_transient(401)` now returns `true` to make the retry path reachable. Bad credentials still re-fail every attempt and exhaust the configured retry budget — no new attack surface.
+
+### Fixed — Databricks OAuth 401 → token refresh + retry
+
+`rocky-databricks/src/connector.rs::is_transient` classified every 401 as permanent, so OAuth M2M pipelines running past the hourly token TTL silently failed the first time Databricks rejected the cached token.
+
+- New `Auth::invalidate_cache()` drops the cached OAuth token (PAT is a no-op).
+- The retry loop calls it before retrying a 401 so the next attempt triggers a fresh `client_credentials` exchange; `is_transient(401)` now returns `true`.
+
+### Refactored — shared auth-cache scaffolding
+
+Post-review cleanup that landed in the same PR:
+
+- `JWT_TTL_SECS` and `REFRESH_SLACK` promoted to module-scope constants in both auth crates, replacing six magic `Duration::from_secs(60)` literals with documented names.
+- `CachedToken::is_fresh()` predicate + module-level `read_fresh_token(&RwLock<Option<CachedToken>>)` helper collapse three near-identical double-checked-locking cache-check blocks (Snowflake Password, Snowflake KeyPair, Databricks OAuth) into three lines each.
+- `run.rs` tightened: dead `checked_div(max(1)).unwrap_or(0)` replaced with plain division; `state_sync_handle.as_ref()` becomes `&state_sync_handle`.
+
+No behavior change from the refactor.
+
+### Test coverage caveat
+
+`Auth::invalidate_cache()` is covered in isolation for every auth variant (keypair, password, OAuth M2M, PAT, pre-supplied OAuth). The wire-up that `submit_and_wait` actually calls `invalidate_cache` on a live 401 response is **not** covered end-to-end — that needs a `wiremock`/`mockito` harness and is tracked as a follow-up. The behavior is still indirectly exercised: the 401 transience classification is unit-tested on both connectors.
+
 ## [1.8.1] — 2026-04-18
 
 Patch release. One bug fix addressing an indefinite hang on remote state sync.
