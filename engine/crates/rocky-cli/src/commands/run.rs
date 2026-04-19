@@ -1333,17 +1333,28 @@ pub async fn run(
         output.interrupted = true;
 
         {
+            // §P1.6: commit every deferred watermark in a single redb
+            // transaction instead of one `begin_write → commit` cycle per
+            // entry. Same per-key data, 1 fsync instead of N.
             let state = shared_state.lock().await;
-            for wm in &deferred_watermarks {
-                if let Err(e) = state.set_watermark(
-                    &wm.state_key,
-                    &WatermarkState {
-                        last_value: wm.timestamp,
-                        updated_at: wm.timestamp,
-                    },
-                ) {
-                    tracing::warn!(error = %e, "failed to persist watermark for run ");
-                }
+            let materialized: Vec<WatermarkState> = deferred_watermarks
+                .iter()
+                .map(|wm| WatermarkState {
+                    last_value: wm.timestamp,
+                    updated_at: wm.timestamp,
+                })
+                .collect();
+            let entries: Vec<(&str, &WatermarkState)> = deferred_watermarks
+                .iter()
+                .zip(materialized.iter())
+                .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
+                .collect();
+            if let Err(e) = state.batch_set_watermarks(&entries) {
+                tracing::warn!(
+                    error = %e,
+                    count = entries.len(),
+                    "failed to persist watermarks for interrupted run",
+                );
             }
         }
 
@@ -1502,17 +1513,26 @@ pub async fn run(
             deferred_watermarks.len(),
         );
     } else {
+        // §P1.6: single redb transaction for every deferred watermark.
         let state = shared_state.lock().await;
-        for wm in &deferred_watermarks {
-            if let Err(e) = state.set_watermark(
-                &wm.state_key,
-                &WatermarkState {
-                    last_value: wm.timestamp,
-                    updated_at: wm.timestamp,
-                },
-            ) {
-                tracing::warn!(error = %e, "failed to persist watermark for run ");
-            }
+        let materialized: Vec<WatermarkState> = deferred_watermarks
+            .iter()
+            .map(|wm| WatermarkState {
+                last_value: wm.timestamp,
+                updated_at: wm.timestamp,
+            })
+            .collect();
+        let entries: Vec<(&str, &WatermarkState)> = deferred_watermarks
+            .iter()
+            .zip(materialized.iter())
+            .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
+            .collect();
+        if let Err(e) = state.batch_set_watermarks(&entries) {
+            tracing::warn!(
+                error = %e,
+                count = entries.len(),
+                "failed to persist watermarks for run",
+            );
         }
     }
 

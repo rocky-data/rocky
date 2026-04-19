@@ -258,6 +258,35 @@ impl StateStore {
         Ok(())
     }
 
+    /// Sets multiple watermarks in a single write transaction.
+    ///
+    /// Use this at end-of-run when promoting deferred watermarks: one
+    /// `begin_write` / `commit` cycle covers every entry instead of one per
+    /// watermark. On a 100-partition pipeline this saves hundreds of
+    /// milliseconds of fsync overhead (redb commits flush to disk).
+    ///
+    /// Returns the number of watermarks written. If any entry fails to
+    /// serialize or insert, the whole transaction is rolled back — partial
+    /// watermark commits are not observable to subsequent reads (§P1.6).
+    pub fn batch_set_watermarks(
+        &self,
+        entries: &[(&str, &WatermarkState)],
+    ) -> Result<usize, StateError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WATERMARKS)?;
+            for (key, watermark) in entries {
+                let bytes = serde_json::to_vec(*watermark)?;
+                table.insert(*key, bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(entries.len())
+    }
+
     /// Deletes the watermark for a table (triggers full refresh on next run).
     pub fn delete_watermark(&self, table_key: &str) -> Result<bool, StateError> {
         let txn = self.db.begin_write()?;
@@ -1125,6 +1154,69 @@ mod tests {
         store.set_watermark("cat.sch.tbl", &watermark).unwrap();
         let retrieved = store.get_watermark("cat.sch.tbl").unwrap().unwrap();
         assert_eq!(retrieved.last_value, watermark.last_value);
+    }
+
+    #[test]
+    fn test_batch_set_watermarks_writes_all_entries() {
+        // §P1.6 batch_set_watermarks should commit every entry in a single
+        // transaction so `get_watermark` observes the same result after one
+        // call as N sequential `set_watermark` calls.
+        let (store, _dir) = temp_store();
+        let t = Utc::now();
+        let wm1 = WatermarkState {
+            last_value: t,
+            updated_at: t,
+        };
+        let wm2 = WatermarkState {
+            last_value: t,
+            updated_at: t,
+        };
+        let wm3 = WatermarkState {
+            last_value: t,
+            updated_at: t,
+        };
+        let entries = [
+            ("cat.sch.a", &wm1),
+            ("cat.sch.b", &wm2),
+            ("cat.sch.c", &wm3),
+        ];
+        let count = store.batch_set_watermarks(&entries).unwrap();
+        assert_eq!(count, 3);
+
+        assert!(store.get_watermark("cat.sch.a").unwrap().is_some());
+        assert!(store.get_watermark("cat.sch.b").unwrap().is_some());
+        assert!(store.get_watermark("cat.sch.c").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_batch_set_watermarks_empty_slice_is_noop() {
+        let (store, _dir) = temp_store();
+        let count = store.batch_set_watermarks(&[]).unwrap();
+        assert_eq!(count, 0);
+        assert!(store.get_watermark("never-set").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_batch_set_watermarks_overwrites_existing() {
+        let (store, _dir) = temp_store();
+        let t1 = Utc::now();
+        let wm1 = WatermarkState {
+            last_value: t1,
+            updated_at: t1,
+        };
+        store.set_watermark("cat.sch.tbl", &wm1).unwrap();
+
+        // Fresher timestamp goes in via the batch path.
+        let t2 = Utc::now();
+        let wm2 = WatermarkState {
+            last_value: t2,
+            updated_at: t2,
+        };
+        let entries = [("cat.sch.tbl", &wm2)];
+        store.batch_set_watermarks(&entries).unwrap();
+
+        let retrieved = store.get_watermark("cat.sch.tbl").unwrap().unwrap();
+        assert_eq!(retrieved.last_value, wm2.last_value);
     }
 
     #[test]
