@@ -629,14 +629,33 @@ impl LanguageServer for RockyLsp {
                     source_column_info: HashMap::new(),
                 };
 
-                // Try incremental compilation if we have a previous result
-                let new_result = {
+                // Try incremental compilation if we have a previous result.
+                //
+                // Full compile (§P3.3) is offloaded to the blocking pool via
+                // `spawn_blocking` so it can't starve hover / completion /
+                // semantic-token handlers on the async runtime's worker
+                // threads. The incremental path stays inline: it's already
+                // fast (<50 ms on 100-model projects), needs a live borrow
+                // of the previous result, and won't dominate the runtime.
+                let use_incremental = changed_file.is_some()
+                    && compile_result.read().await.is_some();
+                let new_result = if use_incremental {
                     let prev = compile_result.read().await;
-                    if let (Some(prev), Some(cf)) = (prev.as_ref(), &changed_file) {
-                        compile_incremental(std::slice::from_ref(cf), prev, &config).ok()
-                    } else {
-                        rocky_compiler::compile::compile(&config).ok()
-                    }
+                    let prev_ref = prev
+                        .as_ref()
+                        .expect("checked use_incremental above");
+                    let cf = changed_file
+                        .as_ref()
+                        .expect("checked use_incremental above");
+                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config).ok()
+                } else {
+                    let config_for_blocking = config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        rocky_compiler::compile::compile(&config_for_blocking).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten()
                 };
 
                 if let Some(result) = new_result {
