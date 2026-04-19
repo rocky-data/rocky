@@ -14,6 +14,7 @@ use rocky_adapter_sdk::throttle::AdaptiveThrottle;
 use rocky_core::checks;
 use rocky_core::config::{GovernanceOverride, ReplicationPipelineConfig};
 use rocky_core::drift;
+use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
@@ -330,6 +331,25 @@ pub async fn run(
         pipeline_type = pipeline_config.pipeline_type_str(),
         "resolved pipeline"
     );
+
+    // Hook lifecycle wiring (follow-up to §P2.6). Builds the registry
+    // once from the loaded config and drives the four lifecycle events
+    // we can emit without restructuring the 1700-line run body:
+    //
+    //   pipeline_start  — right after run_id is established (below)
+    //   pipeline_complete — just before the happy-path Ok(())
+    //   pipeline_error  — at the two explicit error returns (Ctrl-C
+    //                      Interrupted, partial-failure anyhow::bail!)
+    //   wait_async_webhooks — before returning, so fire-and-forget
+    //                      webhooks don't vanish
+    //
+    // Per-table events (before_materialize, after_materialize,
+    // materialize_error) require threading the registry through the
+    // parallel dispatch loop and are a separate PR.
+    //
+    // Errors propagating via `?` skip the lifecycle emit — also a
+    // known limitation that a top-level wrapper could close.
+    let hook_registry = std::sync::Arc::new(HookRegistry::from_config(&rocky_cfg.hooks));
 
     // Dispatch by pipeline type. Non-replication types have their own
     // execution paths and don't fall through to the replication logic below.
@@ -801,6 +821,13 @@ pub async fn run(
     }
     // --- Checkpoint / resume: filter already-completed tables ---
     let run_id = format!("run-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+
+    // §P2.6 emit: pipeline_start. Failures here are logged by the
+    // registry itself; we swallow the Result because hook failures
+    // shouldn't block the pipeline.
+    let _ = hook_registry
+        .fire(&HookContext::pipeline_start(&run_id, pipeline_name))
+        .await;
 
     let completed_keys: std::collections::HashSet<String> = if resume_latest {
         if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
@@ -1426,6 +1453,19 @@ pub async fn run(
             );
         }
 
+        // §P2.6 emit: pipeline_error + drain async webhooks on Ctrl-C
+        // interrupt. Spawned `async` webhooks are flushed before we exit
+        // so the operator sees their summary rather than losing them
+        // silently at runtime shutdown.
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(
+                &run_id,
+                pipeline_name,
+                "interrupted by signal",
+            ))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+
         return Err(anyhow::Error::new(Interrupted));
     }
 
@@ -1937,10 +1977,28 @@ pub async fn run(
         for e in &table_errors {
             warn!(error = e.error.as_str(), "table error");
         }
+        // §P2.6 emit: pipeline_error + drain on partial failure.
+        let msg = format!("{count} table(s) failed during parallel execution");
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
         );
     }
+
+    // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
+    // webhooks before returning.
+    let _ = hook_registry
+        .fire(&HookContext::pipeline_complete(
+            &run_id,
+            pipeline_name,
+            output.duration_ms,
+            output.tables_copied,
+        ))
+        .await;
+    let _ = hook_registry.wait_async_webhooks().await;
 
     Ok(())
 }
