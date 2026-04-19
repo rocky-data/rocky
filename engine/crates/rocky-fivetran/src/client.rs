@@ -172,11 +172,7 @@ impl FivetranClient {
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
-                self.emit_retry_event(
-                    attempt,
-                    &format!("HTTP {status}"),
-                    ErrorClass::Transient,
-                );
+                self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
                     attempt = attempt + 1,
@@ -302,11 +298,7 @@ impl FivetranClient {
             if resp.status().is_server_error() && attempt < self.retry.max_retries {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
-                self.emit_retry_event(
-                    attempt,
-                    &format!("HTTP {status}"),
-                    ErrorClass::Transient,
-                );
+                self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
                     attempt = attempt + 1,

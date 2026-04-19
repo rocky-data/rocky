@@ -255,12 +255,18 @@ async fn test_retry_emits_pipeline_event() {
     connector.execute_sql("SELECT 1").await.unwrap();
 
     // Drain pending events and filter for the retry we just triggered.
-    // The bus is process-global so other tests may publish too — filter
-    // on event_type to stay precise.
+    // The bus is process-global — other wiremock tests running in parallel
+    // may publish their own statement_retry events with different
+    // max_attempts values. Match on the exact attempt/max_attempts pair
+    // we configured (1/2) so we don't accept a neighbour's event.
     let mut retry_event = None;
-    for _ in 0..50 {
+    for _ in 0..100 {
         match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
-            Ok(Ok(ev)) if ev.event_type == "statement_retry" => {
+            Ok(Ok(ev))
+                if ev.event_type == "statement_retry"
+                    && ev.attempt == Some(1)
+                    && ev.max_attempts == Some(2) =>
+            {
                 retry_event = Some(ev);
                 break;
             }
@@ -268,9 +274,7 @@ async fn test_retry_emits_pipeline_event() {
             _ => break,
         }
     }
-    let ev = retry_event.expect("retry should publish statement_retry event");
-    assert_eq!(ev.attempt, Some(1));
-    assert_eq!(ev.max_attempts, Some(2));
+    let ev = retry_event.expect("retry should publish a 1/2 statement_retry event");
     assert_eq!(ev.error_class, Some(ErrorClass::RateLimit));
     assert!(ev.error.as_deref().unwrap_or("").contains("429"));
 }

@@ -495,9 +495,9 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
     match err {
         ConnectorError::ApiError { status: 401, .. } => ErrorClass::Auth,
         ConnectorError::ApiError { status: 429, .. } => ErrorClass::RateLimit,
-        ConnectorError::ApiError { status, .. } if matches!(status, 502 | 503 | 504) => {
-            ErrorClass::Transient
-        }
+        ConnectorError::ApiError {
+            status: 502..=504, ..
+        } => ErrorClass::Transient,
         ConnectorError::ApiError { status: 400, .. } => ErrorClass::Config,
         ConnectorError::ApiError { .. } => ErrorClass::Permanent,
         ConnectorError::Http(e) if e.is_timeout() => ErrorClass::Timeout,

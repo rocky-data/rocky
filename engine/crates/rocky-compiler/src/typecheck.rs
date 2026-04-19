@@ -1771,7 +1771,7 @@ mod tests {
         let star_diags: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| d.model == "b" && (d.code == "I001" || d.code == "W002"))
+            .filter(|d| d.model == "b" && (&*d.code == "I001" || &*d.code == "W002"))
             .collect();
         assert!(!star_diags.is_empty());
     }
@@ -1855,7 +1855,7 @@ mod tests {
         let type_errors: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| d.code == "E001")
+            .filter(|d| &*d.code == "E001")
             .collect();
         assert!(
             !type_errors.is_empty(),
@@ -1907,7 +1907,7 @@ mod tests {
         let warnings: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| d.code == "W001")
+            .filter(|d| &*d.code == "W001")
             .collect();
         assert!(
             !warnings.is_empty(),
@@ -2415,7 +2415,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         let cols = vec![typed_col("other_col", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E020"));
+        assert!(diags.iter().any(|d| &*d.code == "E020"));
     }
 
     #[test]
@@ -2423,7 +2423,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         let cols = vec![typed_col("order_date", RockyType::String, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E021"));
+        assert!(diags.iter().any(|d| &*d.code == "E021"));
     }
 
     #[test]
@@ -2436,7 +2436,7 @@ mod tests {
         // E022 (nullable), AND E025 (hour grain on non-TIMESTAMP).
         let cols = vec![typed_col("order_date", RockyType::Unknown, true)];
         let diags = check_time_interval_strategy(&model, &cols);
-        let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
+        let codes: Vec<&str> = diags.iter().map(|d| &*d.code).collect();
         assert!(
             !codes.contains(&"E021"),
             "E021 should be skipped when type is Unknown, got: {codes:?}"
@@ -2456,7 +2456,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         let cols = vec![typed_col("order_date", RockyType::Date, true)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E022"));
+        assert!(diags.iter().any(|d| &*d.code == "E022"));
     }
 
     #[test]
@@ -2464,7 +2464,7 @@ mod tests {
         let model = make_time_interval_model("m", "order date", TimeGrain::Day, None);
         let cols = vec![typed_col("order date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E023"));
+        assert!(diags.iter().any(|d| &*d.code == "E023"));
     }
 
     #[test]
@@ -2473,7 +2473,7 @@ mod tests {
         model.sql = "SELECT order_date FROM upstream".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E024"));
+        assert!(diags.iter().any(|d| &*d.code == "E024"));
     }
 
     #[test]
@@ -2482,7 +2482,7 @@ mod tests {
         model.sql = "SELECT order_date FROM upstream WHERE order_date >= @start_date".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        let w003: Vec<_> = diags.iter().filter(|d| d.code == "W003").collect();
+        let w003: Vec<_> = diags.iter().filter(|d| &*d.code == "W003").collect();
         assert_eq!(w003.len(), 1, "expected one W003, got: {diags:?}");
     }
 
@@ -2492,7 +2492,7 @@ mod tests {
         model.sql = "SELECT order_date FROM upstream WHERE order_date < @end_date".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "W003"));
+        assert!(diags.iter().any(|d| &*d.code == "W003"));
     }
 
     #[test]
@@ -2500,7 +2500,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Hour, None);
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E025"));
+        assert!(diags.iter().any(|d| &*d.code == "E025"));
     }
 
     #[test]
@@ -2509,7 +2509,7 @@ mod tests {
         let cols = vec![typed_col("event_at", RockyType::Timestamp, false)];
         let diags = check_time_interval_strategy(&model, &cols);
         assert!(
-            !diags.iter().any(|d| d.code == "E025"),
+            !diags.iter().any(|d| &*d.code == "E025"),
             "TIMESTAMP column should accept hour granularity"
         );
     }
@@ -2519,7 +2519,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Day, Some("2024-13-01"));
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E026"));
+        assert!(diags.iter().any(|d| &*d.code == "E026"));
     }
 
     #[test]
@@ -2529,7 +2529,7 @@ mod tests {
         let model = make_time_interval_model("m", "year_col", TimeGrain::Year, Some("2024-01-01"));
         let cols = vec![typed_col("year_col", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| d.code == "E026"));
+        assert!(diags.iter().any(|d| &*d.code == "E026"));
     }
 
     #[test]
@@ -2537,7 +2537,7 @@ mod tests {
         let model = make_time_interval_model("m", "order_date", TimeGrain::Day, Some("2024-01-01"));
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(!diags.iter().any(|d| d.code == "E026"));
+        assert!(!diags.iter().any(|d| &*d.code == "E026"));
     }
 
     #[test]
@@ -2550,6 +2550,6 @@ mod tests {
         let diags = check_time_interval_strategy(&model, &cols);
         // Should fire E024 (neither placeholder present, since @start_date_extra
         // doesn't count) — not W003.
-        assert!(diags.iter().any(|d| d.code == "E024"));
+        assert!(diags.iter().any(|d| &*d.code == "E024"));
     }
 }

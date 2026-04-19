@@ -3,6 +3,13 @@
 //! Used by both the type checker and contract validator to report issues.
 //! Diagnostics can be converted to miette `Report`s for rich terminal
 //! rendering with source spans, underlines, and help text.
+//!
+//! §P3.5: `code` and `message` are `Arc<str>` so cloning a `Diagnostic`
+//! (hot-path in the LSP publish loop) is a refcount bump instead of a
+//! `String` allocation. The JSON wire format is unchanged because serde's
+//! `rc` feature makes `Arc<str>` (de)serialize transparently as a string.
+
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -80,14 +87,19 @@ pub struct SourceSpan {
 }
 
 /// A compiler diagnostic (error, warning, or informational message).
+///
+/// `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic`
+/// in the LSP publish loop becomes a refcount bump. Construction still
+/// accepts any `Into<String>` / `&str` via the helper constructors below;
+/// the arc wrap happens once at construction time.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Diagnostic {
     /// Severity level.
     pub severity: Severity,
     /// Diagnostic code (e.g., "E001", "W001").
-    pub code: String,
+    pub code: Arc<str>,
     /// Human-readable message.
-    pub message: String,
+    pub message: Arc<str>,
     /// Source location (if available).
     pub span: Option<SourceSpan>,
     /// Which model this diagnostic relates to.
@@ -101,8 +113,8 @@ impl Diagnostic {
     pub fn error(code: &str, model: &str, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Error,
-            code: code.to_string(),
-            message: message.into(),
+            code: Arc::from(code),
+            message: Arc::from(message.into()),
             span: None,
             model: model.to_string(),
             suggestion: None,
@@ -113,8 +125,8 @@ impl Diagnostic {
     pub fn warning(code: &str, model: &str, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Warning,
-            code: code.to_string(),
-            message: message.into(),
+            code: Arc::from(code),
+            message: Arc::from(message.into()),
             span: None,
             model: model.to_string(),
             suggestion: None,
@@ -125,8 +137,8 @@ impl Diagnostic {
     pub fn info(code: &str, model: &str, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Info,
-            code: code.to_string(),
-            message: message.into(),
+            code: Arc::from(code),
+            message: Arc::from(message.into()),
             span: None,
             model: model.to_string(),
             suggestion: None,
@@ -172,7 +184,7 @@ impl Diagnostic {
                     src: miette::NamedSource::new(&span.file, src.to_string()),
                     span: Some(miette::SourceSpan::new(offset.into(), 1)),
                     help: self.suggestion.clone(),
-                    code: self.code.clone(),
+                    code: self.code.to_string(),
                     severity: self.severity,
                 };
                 return miette::Report::new(diag);
@@ -191,7 +203,7 @@ impl Diagnostic {
             ),
             span: None,
             help: self.suggestion.clone(),
-            code: self.code.clone(),
+            code: self.code.to_string(),
             severity: self.severity,
         };
         miette::Report::new(diag)

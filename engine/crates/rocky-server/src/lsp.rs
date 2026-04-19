@@ -403,9 +403,9 @@ impl RockyLsp {
             diags_by_file.entry(file).or_default().push(Diagnostic {
                 range,
                 severity: Some(severity),
-                code: Some(NumberOrString::String(d.code.clone())),
+                code: Some(NumberOrString::String(d.code.to_string())),
                 source: Some("rocky".to_string()),
-                message: d.message.clone(),
+                message: d.message.to_string(),
                 ..Default::default()
             });
         }
@@ -692,9 +692,9 @@ impl LanguageServer for RockyLsp {
                         diags_by_file.entry(file).or_default().push(Diagnostic {
                             range,
                             severity: Some(severity),
-                            code: Some(NumberOrString::String(d.code.clone())),
+                            code: Some(NumberOrString::String(d.code.to_string())),
                             source: Some("rocky".to_string()),
-                            message: d.message.clone(),
+                            message: d.message.to_string(),
                             ..Default::default()
                         });
                     }
@@ -2093,7 +2093,7 @@ fn find_compiler_diagnostic<'a>(
     result
         .diagnostics
         .iter()
-        .find(|d| d.code == code && d.message == lsp_diag.message)
+        .find(|d| &*d.code == code && &*d.message == lsp_diag.message.as_str())
 }
 
 /// Collect semantic tokens from a parsed query.

@@ -273,7 +273,7 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| d.code == "E010"));
+        assert!(diags.iter().any(|d| &*d.code == "E010"));
     }
 
     #[test]
@@ -291,7 +291,7 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| d.code == "E011"));
+        assert!(diags.iter().any(|d| &*d.code == "E011"));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| d.code == "E012"));
+        assert!(diags.iter().any(|d| &*d.code == "E012"));
     }
 
     #[test]
@@ -325,7 +325,7 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| d.code == "E013"));
+        assert!(diags.iter().any(|d| &*d.code == "E013"));
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
 
         let diags = validate_contract("test_model", &schema, &contract);
         // Unknown type should not produce an error (we can't check)
-        assert!(diags.iter().all(|d| d.code != "E011"));
+        assert!(diags.iter().all(|d| &*d.code != "E011"));
     }
 
     #[test]
