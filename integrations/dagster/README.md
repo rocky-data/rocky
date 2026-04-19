@@ -77,7 +77,7 @@ def acme_orders(rocky: RockyResource) -> dg.MaterializeResult:
 
 ## Documentation
 
-* **[Dagster Integration docs](https://rocky-data.github.io/rocky/dagster/introduction/)** — resource, component, translator, schedules, sensors, pipes, and more
+* **[Dagster Integration docs](https://rocky-data.dev/dagster/introduction/)** — resource, component, translator, schedules, sensors, pipes, and more
 * **[DEVELOPMENT.md](./DEVELOPMENT.md)** — local setup, architecture, testing
 * **[CHANGELOG.md](./CHANGELOG.md)** — release notes
 

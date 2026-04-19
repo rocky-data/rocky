@@ -39,10 +39,12 @@ The playground is self-contained: sample models, contracts, and a DuckDB backend
 
 ```bash
 rocky init           # Scaffold a new project
+rocky validate       # Check config without API calls
 rocky compile        # Type-check all models
 rocky test           # Run assertions locally (DuckDB)
 rocky plan           # Preview generated SQL (dry-run)
 rocky run            # Execute the pipeline
+rocky state          # Inspect stored watermarks
 rocky ai "<intent>"  # Generate a model from natural language
 rocky lineage        # Trace column-level lineage
 rocky doctor         # Aggregate health checks
@@ -50,7 +52,7 @@ rocky serve          # HTTP API + live watch
 rocky lsp            # Language Server Protocol for IDEs
 ```
 
-Full reference: [CLI commands](https://rocky-data.github.io/rocky/reference/cli/).
+Full reference: [CLI commands](https://rocky-data.dev/reference/cli/).
 
 ## Adapters
 
@@ -63,7 +65,7 @@ Full reference: [CLI commands](https://rocky-data.github.io/rocky/reference/cli/
 | Warehouse | BigQuery | Beta | SQL execution via BigQuery connector |
 | Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
 
-Build a custom adapter in Rust or any language: [Adapter SDK](https://rocky-data.github.io/rocky/concepts/adapters/).
+Build a custom adapter in Rust or any language: [Adapter SDK](https://rocky-data.dev/concepts/adapters/).
 
 ## Installation
 
@@ -89,7 +91,7 @@ cargo build --release
 
 ## Documentation
 
-**[rocky-data.github.io/rocky](https://rocky-data.github.io/rocky/)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
+**[rocky-data.dev](https://rocky-data.dev)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
 
 ## License
 
