@@ -39,6 +39,9 @@ pub enum ConnectorError {
 
     #[error("circuit breaker tripped after {consecutive_failures} consecutive transient failures")]
     CircuitBreakerOpen { consecutive_failures: u32 },
+
+    #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
+    RetryBudgetExhausted { limit: u32 },
 }
 
 /// Configuration for the Snowflake connector.
@@ -136,6 +139,9 @@ pub struct SnowflakeConnector {
     client: Client,
     /// Consecutive transient failures (shared across clones for circuit breaker).
     consecutive_failures: Arc<AtomicU32>,
+    /// Shared retry budget across the run (§P2.7). Unbounded by default —
+    /// set via `config.retry.max_retries_per_run`.
+    retry_budget: rocky_core::retry_budget::RetryBudget,
     /// Override for the base URL (used by tests to point at wiremock).
     #[cfg(any(test, feature = "test-support"))]
     base_url_override: Option<String>,
@@ -144,6 +150,8 @@ pub struct SnowflakeConnector {
 impl SnowflakeConnector {
     /// Creates a new connector with the given configuration and auth provider.
     pub fn new(config: ConnectorConfig, auth: Auth) -> Self {
+        let retry_budget =
+            rocky_core::retry_budget::RetryBudget::from_config(config.retry.max_retries_per_run);
         SnowflakeConnector {
             config,
             auth,
@@ -154,9 +162,18 @@ impl SnowflakeConnector {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
+            retry_budget,
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }
+    }
+
+    /// Override the run-level [`RetryBudget`](rocky_core::retry_budget::RetryBudget).
+    /// Used by `rocky run` when multiple adapters should share one budget.
+    #[must_use]
+    pub fn with_retry_budget(mut self, budget: rocky_core::retry_budget::RetryBudget) -> Self {
+        self.retry_budget = budget;
+        self
     }
 
     /// Creates a connector that points at a custom base URL (for testing with wiremock).
@@ -236,6 +253,20 @@ impl SnowflakeConnector {
                         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
+                        // Run-level retry budget (§P2.7). Short-circuit if
+                        // exhausted so one bad statement can't drain the
+                        // adapter's rate-limit quota for the rest of the run.
+                        if !self.retry_budget.try_consume() {
+                            let limit = self.retry_budget.total().unwrap_or(0);
+                            warn!(
+                                attempt = attempt + 1,
+                                max_retries = retry.max_retries,
+                                budget_limit = limit,
+                                error = %err,
+                                "retry budget exhausted for this run; aborting further retries",
+                            );
+                            return Err(ConnectorError::RetryBudgetExhausted { limit });
+                        }
                         // 401 from Snowflake often means the cached keypair
                         // JWT crossed the server-side expiry boundary between
                         // mint and request. Drop the cache so the next
@@ -411,7 +442,9 @@ fn is_transient(err: &ConnectorError) -> bool {
                 || msg.contains("TIMEOUT")
         }
         ConnectorError::Timeout { .. } => true,
-        ConnectorError::Auth(_) | ConnectorError::CircuitBreakerOpen { .. } => false,
+        ConnectorError::Auth(_)
+        | ConnectorError::CircuitBreakerOpen { .. }
+        | ConnectorError::RetryBudgetExhausted { .. } => false,
     }
 }
 
