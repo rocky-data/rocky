@@ -296,13 +296,14 @@ Generate `OPTIMIZE` and `VACUUM` SQL for storage compaction on Delta tables. Com
 
 ```bash
 rocky compact <model> [flags]
+rocky compact --measure-dedup [flags]   # experimental, project-wide scope
 ```
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `model` | `string` | **(required)** | Target table in `catalog.schema.table` format. |
+| `model` | `string` | **(required unless `--measure-dedup`)** | Target table in `catalog.schema.table` format. |
 
 ### Flags
 
@@ -310,6 +311,10 @@ rocky compact <model> [flags]
 |------|------|---------|-------------|
 | `--target-size <SIZE>` | `string` | | Target file size (e.g., `256MB`, `512MB`, `1GB`). |
 | `--dry-run` | `bool` | `false` | Show SQL without executing. |
+| `--measure-dedup` | `bool` | `false` | Experimental. Measure the cross-table dedup ratio across all Rocky-managed tables in the project (Layer 0 storage experiment). Project-wide; does not take a model argument. |
+| `--exclude-columns <COLS>` | `string` | Rocky-owned metadata cols | Comma-separated columns to exclude from the "semantic" dedup hash. Defaults to `_loaded_by,_loaded_at,_fivetran_synced,_synced_at`. Requires `--measure-dedup`. |
+| `--calibrate-bytes` | `bool` | `false` | Run byte-level calibration on a sampled subset of tables. Produces a sharper but more expensive second estimate alongside the cheap partition-level one. Requires `--measure-dedup`. |
+| `--all-tables` | `bool` | `false` | Scan all warehouse tables instead of only Rocky-managed ones. Requires `--measure-dedup`. |
 
 ### Examples
 
@@ -342,6 +347,26 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256M
 ```
 
 The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`).
+
+#### Layer 0 dedup measurement (experimental)
+
+`--measure-dedup` runs a project-wide analysis that hashes each row on its semantic columns and reports the fraction of duplicate content across Rocky-managed tables. It is a research tool for Rocky's Layer 0 storage work — the output is a measurement, not a plan, and no SQL is issued against the target tables.
+
+```bash
+# Cheap partition-level estimate across all Rocky-managed tables
+rocky compact --measure-dedup
+
+# Add a byte-level calibration pass on a sampled subset
+rocky compact --measure-dedup --calibrate-bytes
+
+# Include every warehouse table, not just Rocky-managed ones
+rocky compact --measure-dedup --all-tables
+
+# Customize which metadata columns are excluded from the dedup hash
+rocky compact --measure-dedup --exclude-columns "_loaded_at,_loaded_by,_synced_at"
+```
+
+The command emits a distinct `compact-dedup` JSON shape with per-table contributions and a project-wide summary. Use `--output json` in CI to track the ratio over time.
 
 ### Related Commands
 

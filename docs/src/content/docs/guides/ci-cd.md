@@ -33,6 +33,27 @@ Exit codes:
 
 The command detects both compile-time issues (type mismatches, missing dependencies, contract violations) and runtime issues (SQL syntax errors, division by zero, invalid casts).
 
+### Structural diff against a base ref
+
+For PR review, [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) is a companion to `rocky ci`. It compares model files between a base git ref and `HEAD`, compiles both sides, and reports added / modified / removed columns per model. The output is both JSON (for pipelines) and Markdown (for PR comments):
+
+```bash
+rocky ci-diff                    # defaults to main
+rocky ci-diff release/2026-04 --models src/models
+```
+
+In GitHub Actions, post the pre-rendered Markdown block to the PR directly:
+
+```yaml
+- name: Post diff to PR
+  run: |
+    rocky ci-diff --output json | jq -r .markdown | \
+      gh pr comment "$PR_NUMBER" --body-file -
+  env:
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
 ## 2. GitHub Actions
 
 ### Basic setup
