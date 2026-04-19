@@ -8,7 +8,7 @@ No Jinja. No manifest. No parse step.
 
 Rocky replaces dbt's core responsibilities — DAG resolution, incremental logic, SQL generation, schema management — with a compiled, type-safe approach. Models are type-checked before execution, schema changes are detected automatically, and an AI intent layer keeps models synchronized when upstream schemas evolve. Rocky ships as a single binary with no runtime dependencies.
 
-## Quick Start
+## Quick start
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
@@ -19,101 +19,51 @@ rocky test          # Run assertions locally with DuckDB
 rocky run           # Execute the pipeline
 ```
 
-The playground creates a self-contained project with sample models, contracts, and a DuckDB backend — no credentials needed.
+The playground is self-contained: sample models, contracts, and a DuckDB backend. No credentials needed.
 
 ## Features
 
 | Category | Capabilities |
 |----------|-------------|
 | **Compiler** | Type checking, column-level lineage, data contracts, DAG resolution, diagnostics with suggestions |
-| **DSL** | Pipeline-oriented syntax (`.rocky` files), NULL-safe operators, window functions, CTEs, pattern matching |
-| **AI** | Intent metadata, `ai-sync` (schema change propagation), `ai-explain`, `ai-test` (assertion generation) |
-| **IDE** | VS Code extension, LSP with completion, hover, go-to-definition, find references, rename, code actions, inlay hints, semantic tokens, signature help |
-| **Execution** | DuckDB (local/testing), Databricks (production), Snowflake (beta) adapters |
-| **Quality** | Row count, column match, freshness, null rate, anomaly detection, custom SQL, declarative assertions (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`), per-check severity and filter, row quarantine (split / tag / drop) |
+| **DSL** | Pipeline-oriented `.rocky` syntax — optional, models stay plain SQL by default |
+| **AI** | Intent metadata, schema-sync, intent extraction, test generation |
+| **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |
+| **Quality** | Pipeline-level checks + 13 declarative assertions with severity, filters, and row quarantine |
+| **Execution** | DuckDB (local), Databricks (prod), Snowflake + BigQuery (beta) |
 | **Optimization** | Cost-based materialization, storage profiling, compaction, partition archival |
-| **Integration** | Dagster ([dagster-rocky](https://github.com/rocky-data/rocky/tree/main/integrations/dagster)), dbt import, CI pipeline |
 | **Governance** | Unity Catalog tags, workspace isolation, declarative RBAC with GRANT/REVOKE diffing |
+| **Integration** | Dagster ([dagster-rocky](../integrations/dagster/)), dbt import, CI pipeline |
 
-## CLI Commands
+## CLI at a glance
 
-### Core Pipeline
+```bash
+rocky init           # Scaffold a new project
+rocky compile        # Type-check all models
+rocky test           # Run assertions locally (DuckDB)
+rocky plan           # Preview generated SQL (dry-run)
+rocky run            # Execute the pipeline
+rocky ai "<intent>"  # Generate a model from natural language
+rocky lineage        # Trace column-level lineage
+rocky doctor         # Aggregate health checks
+rocky serve          # HTTP API + live watch
+rocky lsp            # Language Server Protocol for IDEs
+```
 
-| Command | Description |
-|---------|-------------|
-| `rocky init [path]` | Scaffold a new project |
-| `rocky validate` | Validate config and models without API calls |
-| `rocky discover` | List connectors and tables from the source |
-| `rocky plan --filter key=value` | Preview SQL (dry-run) |
-| `rocky run --filter key=value` | Execute the full pipeline |
-| `rocky state` | Show stored watermarks |
-
-### Modeling
-
-| Command | Description |
-|---------|-------------|
-| `rocky compile` | Type-check models, validate contracts |
-| `rocky lineage <model>` | Trace column-level lineage |
-| `rocky test` | Run local tests via DuckDB |
-| `rocky ci` | Combined compile + test for CI pipelines |
-
-### AI
-
-| Command | Description |
-|---------|-------------|
-| `rocky ai "<intent>"` | Generate a model from natural language |
-| `rocky ai-explain <model>` | Generate intent description from code |
-| `rocky ai-sync` | Propose intent-guided updates for schema changes |
-| `rocky ai-test <model>` | Generate test assertions from intent |
-
-### Development
-
-| Command | Description |
-|---------|-------------|
-| `rocky playground [path]` | Create a sample DuckDB project |
-| `rocky import-dbt --dbt-project <path>` | Convert a dbt project to Rocky |
-| `rocky serve` | HTTP API server with watch mode |
-| `rocky lsp` | Language Server Protocol for IDE integration |
-| `rocky init-adapter <name>` | Scaffold a new warehouse adapter crate |
-| `rocky hooks list` | List configured lifecycle hooks |
-| `rocky hooks test <event>` | Fire a test hook event |
-| `rocky test-adapter` | Run adapter conformance suite |
-| `rocky validate-migration` | Validate dbt → Rocky migration output |
-
-### Administration
-
-| Command | Description |
-|---------|-------------|
-| `rocky doctor` | Aggregate health checks (config, state, adapters, pipelines) |
-| `rocky history` | Run history with trend analysis |
-| `rocky metrics <model>` | Quality metrics with alerts |
-| `rocky optimize` | Materialization cost recommendations |
-| `rocky drift` | Schema drift detection |
-| `rocky compare` | Shadow vs production comparison |
-| `rocky compact` | Generate OPTIMIZE/VACUUM SQL |
-| `rocky profile-storage` | Column encoding recommendations |
-| `rocky archive` | Partition archival |
+Full reference: [CLI commands](https://rocky-data.github.io/rocky/reference/cli/).
 
 ## Adapters
 
-| Role | Adapter | Status | Description |
-|------|---------|--------|-------------|
+| Role | Adapter | Status | Notes |
+|------|---------|--------|-------|
 | Source | Fivetran | Production | REST API discovery of connectors and tables |
-| Source | Manual | Production | Schema/table lists defined in `rocky.toml` |
-| Warehouse | Databricks | Production | SQL Statement API, Unity Catalog governance |
+| Source | Manual | Production | Schema/table lists inline in `rocky.toml` |
+| Warehouse | Databricks | Production | SQL Statement API + Unity Catalog governance |
 | Warehouse | Snowflake | Beta | SQL execution via Snowflake connector |
 | Warehouse | BigQuery | Beta | SQL execution via BigQuery connector |
-| Warehouse | DuckDB | Local/Testing | Embedded execution for development and CI |
+| Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
 
-## VS Code Extension
-
-The [Rocky VS Code extension](https://github.com/rocky-data/rocky/tree/main/editors/vscode) provides full language support:
-
-- Syntax highlighting for `.rocky` and SQL model files
-- Diagnostics, hover, completion, go-to-definition
-- Find references, rename, code actions, inlay hints
-- Model lineage visualization
-- AI model generation from the editor
+Build a custom adapter in Rust or any language: [Adapter SDK](https://rocky-data.github.io/rocky/concepts/adapters/).
 
 ## Installation
 
@@ -139,7 +89,7 @@ cargo build --release
 
 ## Documentation
 
-Full documentation: **[rocky-data.github.io/rocky](https://rocky-data.github.io/rocky/)**
+**[rocky-data.github.io/rocky](https://rocky-data.github.io/rocky/)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
 
 ## License
 
