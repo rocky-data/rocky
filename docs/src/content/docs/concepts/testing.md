@@ -89,13 +89,13 @@ The `rocky test` command compiles models and executes them locally using DuckDB,
 
 ```bash
 # Run all tests
-rocky test --models-dir models/
+rocky test --models models/
 
 # Run with contracts
-rocky test --models-dir models/ --contracts-dir contracts/
+rocky test --models models/ --contracts contracts/
 
 # JSON output for CI systems
-rocky test --models-dir models/ --output json
+rocky test --models models/ --output json
 ```
 
 ### Test output
@@ -140,7 +140,7 @@ Testing 12 models...
 The `rocky ci` command runs the full CI pipeline: compile + test. It is designed for CI/CD systems and returns a non-zero exit code on failure.
 
 ```bash
-rocky ci --models-dir models/ --contracts-dir contracts/
+rocky ci --models models/ --contracts contracts/
 ```
 
 ### Pipeline

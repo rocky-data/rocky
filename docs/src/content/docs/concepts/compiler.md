@@ -174,10 +174,10 @@ This data powers IDE features like Find References and Rename Symbol when Rocky 
 
 ```bash
 # Compile all models
-rocky compile --models-dir models/
+rocky compile --models models/
 
 # Compile with contracts
-rocky compile --models-dir models/ --contracts-dir contracts/
+rocky compile --models models/ --contracts contracts/
 ```
 
 ### Programmatic
