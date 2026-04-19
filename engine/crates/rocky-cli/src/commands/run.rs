@@ -1487,7 +1487,21 @@ pub async fn run(
     }
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
-    {
+    //
+    // Under `fail_fast = true` semantics, any table failure should prevent
+    // the surviving tables from advancing their watermarks — otherwise the
+    // next run resumes from a point that implies siblings succeeded. Under
+    // `fail_fast = false` (the default, partial-success semantics), commit
+    // whatever completed cleanly so forward progress isn't lost.
+    let skip_watermarks_due_to_failure = fail_fast && !table_errors.is_empty();
+    if skip_watermarks_due_to_failure {
+        tracing::warn!(
+            deferred = deferred_watermarks.len(),
+            failed_tables = table_errors.len(),
+            "fail_fast + partial failure: skipping {} pending watermark commits so the next run starts from the same baseline",
+            deferred_watermarks.len(),
+        );
+    } else {
         let state = shared_state.lock().await;
         for wm in &deferred_watermarks {
             if let Err(e) = state.set_watermark(
