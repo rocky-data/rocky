@@ -31,7 +31,7 @@ rocky ai <intent> [flags]
 
 ### Examples
 
-Generate a revenue model:
+Generate a revenue model (Rocky DSL, the default):
 
 ```bash
 rocky ai "monthly revenue by customer, joining orders and refunds"
@@ -41,22 +41,21 @@ rocky ai "monthly revenue by customer, joining orders and refunds"
 {
   "version": "1.6.0",
   "command": "ai",
-  "model": {
-    "name": "fct_monthly_revenue_by_customer",
-    "sql": "SELECT\n  o.customer_id,\n  DATE_TRUNC('month', o.order_date) AS revenue_month,\n  SUM(o.total_amount) - COALESCE(SUM(r.refund_amount), 0) AS net_revenue\nFROM {{ ref('stg_orders') }} o\nLEFT JOIN {{ ref('stg_refunds') }} r\n  ON o.order_id = r.order_id\nGROUP BY 1, 2",
-    "config": {
-      "materialized": "table",
-      "description": "Monthly net revenue per customer after refunds"
-    }
-  }
+  "intent": "monthly revenue by customer, joining orders and refunds",
+  "format": "rocky",
+  "name": "fct_monthly_revenue_by_customer",
+  "source": "from stg_orders\njoin stg_refunds on order_id {\n    keep stg_refunds.refund_amount\n}\nderive {\n    revenue_month: date_trunc('month', order_date),\n    net_revenue: total_amount - coalesce(refund_amount, 0)\n}\ngroup customer_id, revenue_month {\n    customer_id,\n    revenue_month,\n    net_revenue: sum(net_revenue)\n}",
+  "attempts": 1
 }
 ```
 
-Generate raw SQL only:
+Generate raw SQL instead:
 
 ```bash
 rocky ai "top 10 customers by lifetime value" --format sql
 ```
+
+The `source` field then contains standard SQL using bare model references (resolved by the compiler against project models):
 
 ```sql
 SELECT
@@ -65,17 +64,13 @@ SELECT
   COUNT(DISTINCT order_id) AS total_orders,
   MIN(order_date) AS first_order,
   MAX(order_date) AS last_order
-FROM {{ ref('stg_orders') }}
+FROM stg_orders
 GROUP BY customer_id
 ORDER BY lifetime_value DESC
 LIMIT 10
 ```
 
-Generate a full Rocky model:
-
-```bash
-rocky ai "daily active users from events table" --format rocky
-```
+Rocky generates plain SQL — no Jinja, no templating. `stg_orders` is resolved by the compiler to the project model of that name.
 
 ### Related Commands
 
