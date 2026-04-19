@@ -109,27 +109,18 @@ rocky ai-sync
 {
   "version": "1.6.0",
   "command": "ai-sync",
-  "applied": false,
   "proposals": [
     {
       "model": "fct_revenue",
-      "changes_detected": [
-        { "type": "column_added", "source": "stg_orders", "column": "discount_pct", "dtype": "DOUBLE" }
-      ],
-      "proposal": "Add discount_pct to revenue calculation: net_revenue = total_amount * (1 - discount_pct) - refund_amount",
-      "intent": "Monthly net revenue per customer after refunds"
-    },
-    {
-      "model": "dim_customers",
-      "changes_detected": [
-        { "type": "column_renamed", "source": "stg_customers", "from": "email", "to": "email_address" }
-      ],
-      "proposal": "Update column reference from 'email' to 'email_address'",
-      "intent": "Customer dimension with contact details"
+      "intent": "Monthly net revenue per customer after refunds",
+      "diff": "--- a/models/fct_revenue.sql\n+++ b/models/fct_revenue.sql\n@@ -3,5 +3,6 @@\n     o.customer_id,\n     DATE_TRUNC('month', o.order_date) AS revenue_month,\n-    SUM(o.total_amount) - COALESCE(SUM(r.refund_amount), 0) AS net_revenue\n+    SUM(o.total_amount * (1 - o.discount_pct)) - COALESCE(SUM(r.refund_amount), 0) AS net_revenue",
+      "proposed_source": "SELECT\n  o.customer_id,\n  DATE_TRUNC('month', o.order_date) AS revenue_month,\n  SUM(o.total_amount * (1 - o.discount_pct)) - COALESCE(SUM(r.refund_amount), 0) AS net_revenue\nFROM stg_orders o\nLEFT JOIN stg_refunds r ON o.order_id = r.order_id\nGROUP BY 1, 2"
     }
   ]
 }
 ```
+
+Each proposal carries a unified `diff` (ready to show in a review UI) plus the full `proposed_source` (ready to write if you apply). The sync command is dry-run by default.
 
 Sync a specific model and apply changes:
 
@@ -137,23 +128,7 @@ Sync a specific model and apply changes:
 rocky ai-sync --model fct_revenue --apply
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "ai-sync",
-  "applied": true,
-  "proposals": [
-    {
-      "model": "fct_revenue",
-      "changes_detected": [
-        { "type": "column_added", "source": "stg_orders", "column": "discount_pct", "dtype": "DOUBLE" }
-      ],
-      "proposal": "Add discount_pct to revenue calculation",
-      "files_modified": ["models/fct_revenue.sql", "models/fct_revenue.toml"]
-    }
-  ]
-}
-```
+Same output shape — `--apply` writes `proposed_source` to disk after the proposal passes the compile-verify loop.
 
 Only check models that have intent metadata:
 
@@ -207,11 +182,7 @@ rocky ai-explain fct_revenue
     {
       "model": "fct_revenue",
       "intent": "Calculates monthly net revenue per customer by joining orders with refunds. Groups by customer and month, computing total order amounts minus refund amounts.",
-      "columns": [
-        { "name": "customer_id", "description": "Unique customer identifier from orders" },
-        { "name": "revenue_month", "description": "Month truncated from order date" },
-        { "name": "net_revenue", "description": "Sum of order amounts minus refunds" }
-      ]
+      "saved": false
     }
   ]
 }
@@ -228,21 +199,9 @@ rocky ai-explain --all --save
   "version": "1.6.0",
   "command": "ai-explain",
   "explanations": [
-    {
-      "model": "fct_revenue",
-      "intent": "Calculates monthly net revenue per customer by joining orders with refunds.",
-      "saved": true
-    },
-    {
-      "model": "dim_customers",
-      "intent": "Customer dimension combining profile data with computed lifetime metrics.",
-      "saved": true
-    },
-    {
-      "model": "fct_orders",
-      "intent": "Order fact table enriched with customer and product dimensions.",
-      "saved": true
-    }
+    { "model": "fct_revenue",   "intent": "Calculates monthly net revenue per customer by joining orders with refunds.", "saved": true },
+    { "model": "dim_customers", "intent": "Customer dimension combining profile data with computed lifetime metrics.",  "saved": true },
+    { "model": "fct_orders",    "intent": "Order fact table enriched with customer and product dimensions.",             "saved": true }
   ]
 }
 ```
