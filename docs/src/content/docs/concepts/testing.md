@@ -188,7 +188,7 @@ Rocky CI Pipeline
 
 ## AI-generated tests
 
-Rocky can generate test assertions from a model's intent and schema using `rocky ai test`. See the [AI and Intent](/concepts/ai-intent) page for the full AI workflow.
+Rocky can generate test assertions from a model's intent and schema using `rocky ai-test`. See the [AI and Intent](/concepts/ai-intent) page for the full AI workflow.
 
 Each generated assertion is a SQL query that returns 0 rows when the assertion holds:
 
@@ -225,6 +225,6 @@ A typical development workflow combines contracts, testing, and CI:
 2. Write a contract defining the expected output schema
 3. Run `rocky test` locally to verify everything compiles and executes
 4. Commit and push -- CI runs `rocky ci` to catch regressions
-5. Optionally, run `rocky ai test --save` to generate additional assertions from intent
+5. Optionally, run `rocky ai-test --save` to generate additional assertions from intent
 
 Contracts serve as the stable interface between your model and its downstream consumers. If a model change would break a contract, the compiler catches it before anything reaches the warehouse.

@@ -77,36 +77,36 @@ rocky ai "Top 10 customers by lifetime revenue" --output json
 
 The output includes the generated source code, the suggested model name, the format used, and the number of compilation attempts required.
 
-### rocky ai explain
+### rocky ai-explain
 
 Reads existing models and generates intent descriptions from the code. This is the bootstrap command for adopting intent-driven development on an existing project:
 
 ```bash
 # Explain a specific model
-rocky ai explain --models-dir models/ --model orders_summary
+rocky ai-explain --models-dir models/ --model orders_summary
 
 # Explain all models that don't have intent yet
-rocky ai explain --models-dir models/ --all
+rocky ai-explain --models-dir models/ --all
 
 # Save the generated intent to each model's TOML config
-rocky ai explain --models-dir models/ --all --save
+rocky ai-explain --models-dir models/ --all --save
 ```
 
-When `--save` is used, Rocky writes the generated intent string into the model's TOML sidecar file. After saving, `rocky ai sync` can use this intent for future maintenance.
+When `--save` is used, Rocky writes the generated intent string into the model's TOML sidecar file. After saving, `rocky ai-sync` can use this intent for future maintenance.
 
-### rocky ai sync
+### rocky ai-sync
 
 Detects schema changes between compilations and proposes intent-guided updates to affected models:
 
 ```bash
 # Show proposed changes
-rocky ai sync --models-dir models/
+rocky ai-sync --models-dir models/
 
 # Apply the proposed changes
-rocky ai sync --models-dir models/ --apply
+rocky ai-sync --models-dir models/ --apply
 
 # Sync a specific model
-rocky ai sync --models-dir models/ --model orders_summary
+rocky ai-sync --models-dir models/ --model orders_summary
 ```
 
 The sync process:
@@ -119,19 +119,19 @@ The sync process:
 
 Schema changes that sync detects include columns added, columns removed, columns renamed, and column type changes.
 
-### rocky ai test
+### rocky ai-test
 
 Generates test assertions from a model's intent and schema:
 
 ```bash
 # Generate tests for a specific model
-rocky ai test --models-dir models/ --model orders_summary
+rocky ai-test --models-dir models/ --model orders_summary
 
 # Generate tests for all models
-rocky ai test --models-dir models/ --all
+rocky ai-test --models-dir models/ --all
 
 # Save generated tests to the tests/ directory
-rocky ai test --models-dir models/ --all --save
+rocky ai-test --models-dir models/ --all --save
 ```
 
 The LLM analyzes the model's intent, column schema (with types and nullability), and target table to produce SQL assertions. Each assertion is a query that returns 0 rows when the assertion holds. See the [Testing and Contracts](/concepts/testing) page for the test format.
@@ -169,9 +169,9 @@ The LLM provider, model, and max attempts are configured internally. Rocky uses 
 
 For existing projects without intent metadata:
 
-1. Run `rocky ai explain --all --save` to generate initial intent for all models
+1. Run `rocky ai-explain --all --save` to generate initial intent for all models
 2. Review and refine the generated intents (they are natural language, so edit freely)
-3. Run `rocky ai test --all --save` to generate baseline test assertions
-4. From this point, `rocky ai sync` can maintain models as upstream schemas evolve
+3. Run `rocky ai-test --all --save` to generate baseline test assertions
+4. From this point, `rocky ai-sync` can maintain models as upstream schemas evolve
 
 Intent is optional. Models without intent still compile, test, and run normally. Intent enables the AI maintenance features but is never required.
