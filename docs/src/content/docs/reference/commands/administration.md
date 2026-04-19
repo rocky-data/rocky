@@ -313,6 +313,8 @@ rocky compact <model> [flags]
 
 ### Examples
 
+`rocky compact` generates SQL — it doesn't execute. Pipe the output of `rocky -o table compact ... --dry-run` to your warehouse once you're happy with the plan, or drop `--dry-run` and let Rocky run the statements in sequence.
+
 Compact a table (dry run):
 
 ```bash
@@ -325,40 +327,21 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --dry-run
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
+  "target_size_mb": 0,
   "statements": [
-    { "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
-    { "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders" }
+    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
+    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
   ]
 }
 ```
 
-Compact with a target file size:
+With a target file size:
 
 ```bash
 rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256MB
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "compact",
-  "model": "acme_warehouse.staging__us_west__shopify.orders",
-  "dry_run": false,
-  "statements": [
-    { "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE file_size < '256MB'" },
-    { "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders" }
-  ],
-  "files_compacted": 142,
-  "size_before_mb": 890,
-  "size_after_mb": 620
-}
-```
-
-Execute compaction immediately:
-
-```bash
-rocky compact acme_warehouse.staging__eu_central__stripe.charges --target-size 512MB
-```
+The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`).
 
 ### Related Commands
 
@@ -384,7 +367,7 @@ rocky profile-storage <model>
 
 ### Examples
 
-Profile a table:
+Profile a table. Rocky emits a `profile_sql` query you can run against the warehouse to gather column cardinalities, plus a per-column `recommendations` list derived from the schema alone:
 
 ```bash
 rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
@@ -395,54 +378,27 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
   "version": "1.6.0",
   "command": "profile-storage",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
-  "total_size_mb": 890,
-  "file_count": 342,
-  "avg_file_size_mb": 2.6,
-  "columns": [
+  "profile_sql": "SELECT column_name, approx_count_distinct(...) FROM ... GROUP BY column_name",
+  "recommendations": [
     {
-      "name": "order_id",
-      "dtype": "BIGINT",
-      "null_rate": 0.0,
-      "cardinality": 1482030,
-      "recommendation": null
+      "column": "status",
+      "data_type": "STRING",
+      "estimated_cardinality": "low (< 100)",
+      "recommended_encoding": "dictionary",
+      "reasoning": "Low-cardinality string — dictionary encoding dramatically shrinks storage and speeds up filtering."
     },
     {
-      "name": "status",
-      "dtype": "STRING",
-      "null_rate": 0.0,
-      "cardinality": 5,
-      "recommendation": "Consider TINYINT encoding. Only 5 distinct values."
-    },
-    {
-      "name": "customer_notes",
-      "dtype": "STRING",
-      "null_rate": 0.72,
-      "cardinality": 98200,
-      "recommendation": "72% null rate. Consider splitting to a separate table."
+      "column": "customer_notes",
+      "data_type": "STRING",
+      "estimated_cardinality": "high",
+      "recommended_encoding": "lz4",
+      "reasoning": "High-cardinality free-text — LZ4 gives the best compression without hurting scan latency."
     }
-  ],
-  "partitioning": {
-    "current": "none",
-    "recommendation": "Partition by order_date (month) for time-range queries"
-  }
+  ]
 }
 ```
 
-Profile with table output:
-
-```bash
-rocky -o table profile-storage acme_warehouse.staging__us_west__shopify.orders
-```
-
-```
-column          | dtype   | null_rate | cardinality | recommendation
-----------------+---------+-----------+-------------+----------------------------------------------
-order_id        | BIGINT  | 0.0%      | 1,482,030   |
-status          | STRING  | 0.0%      | 5           | Consider TINYINT encoding
-customer_notes  | STRING  | 72.0%     | 98,200      | High null rate, consider separate table
-order_date      | DATE    | 0.0%     | 730          |
-total_amount    | DOUBLE  | 0.0%     | 145,200      |
-```
+`rocky profile-storage` is advisory — it does not run the profile SQL for you. Pipe `profile_sql` into `rocky shell` (or any SQL client) to collect the actual cardinality numbers.
 
 ### Related Commands
 
@@ -470,6 +426,8 @@ rocky archive [flags]
 
 ### Examples
 
+Like `compact`, `archive` is SQL-generating — it builds `DELETE ... WHERE partition_key < cutoff` (or `COPY TO` for cold-storage workflows) and either prints them (`--dry-run`) or executes them in order.
+
 Preview archival for data older than 90 days:
 
 ```bash
@@ -482,53 +440,27 @@ rocky archive --older-than 90d --dry-run
   "command": "archive",
   "dry_run": true,
   "older_than": "90d",
-  "cutoff_date": "2026-01-02",
-  "candidates": [
+  "older_than_days": 90,
+  "statements": [
     {
-      "model": "acme_warehouse.staging__us_west__shopify.orders",
-      "partitions_affected": 3,
-      "estimated_rows": 45000,
-      "estimated_size_mb": 120
+      "purpose": "archive:orders",
+      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'"
     },
     {
-      "model": "acme_warehouse.staging__us_west__shopify.events",
-      "partitions_affected": 12,
-      "estimated_rows": 2300000,
-      "estimated_size_mb": 890
+      "purpose": "archive:events",
+      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'"
     }
   ]
 }
 ```
 
-Archive a specific model's old data:
+Archive a specific model's old data (omitting `--dry-run` executes the statements):
 
 ```bash
 rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "archive",
-  "dry_run": false,
-  "older_than": "6m",
-  "cutoff_date": "2025-10-02",
-  "archived": [
-    {
-      "model": "acme_warehouse.staging__us_west__shopify.events",
-      "partitions_archived": 24,
-      "rows_archived": 8900000,
-      "size_freed_mb": 3200
-    }
-  ]
-}
-```
-
-Archive across all models with a 1-year threshold:
-
-```bash
-rocky archive --older-than 1y --dry-run
-```
+Same output shape — `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
 
 ### Related Commands
 
