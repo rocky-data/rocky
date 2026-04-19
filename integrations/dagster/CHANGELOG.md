@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-04-20
+
+### Added — Regenerated Pydantic bindings for engine 1.10.0
+
+Engine 1.10.0 closes the perf-resilience roadmap's active arc. The regenerated bindings in `types_generated/` surface the additive schema changes from that push:
+
+- **`PipelineEvent` retry fields** — every adapter retry loop now emits events with `attempt`, `max_attempts`, and `error_class` fields so Dagster subscribers can distinguish "retry 3/5" from "final failure" without string-matching error messages.
+- **Hook context schemas** — 15 lifecycle events (`pipeline_start`, `discover_complete`, `compile_complete`, `before_model_run` / `after_model_run` / `model_error`, `before_materialize` / `after_materialize` / `materialize_error`, `before_checks` / `check_result` / `after_checks`, `drift_detected`, `anomaly_detected`, `state_synced`, `pipeline_complete`, `pipeline_error`) wired into `rocky run`. Schemas are exported for subscribers that want to type hook-context JSON.
+- **Top-level `[retry]` config** — cross-adapter shared `RetryBudget`. Pydantic parser picks up the new config key; unset = per-adapter budgets (prior behaviour).
+- **Additive `CompileOutput` timing fields** from §P3.1's incremental path.
+
+No source code changes in `dagster_rocky` itself — `RockyResource` + `RockyComponent` + the Pipes path all continue to work unchanged against engine 1.10.0. Regenerated models in `types_generated/` pick up the new fields automatically.
+
+Fixture refresh via `just regen-fixtures` against the 1.10.0 binary — committed as part of the engine-v1.10.0 release PR (not re-committed here).
+
+### Upgrading
+
+Pin `rocky >= 1.10.0` in orchestrator environments when upgrading to `dagster-rocky 1.6.0`. Old Rocky binaries (< 1.10.0) that don't emit the new fields may surface Pydantic validation errors on `PipelineEvent` — the retry-event fields are non-optional in the regenerated schema because the engine always serialises them when the adapter is on a retry path.
+
 ## [1.5.0] — 2026-04-17
 
 ### Added — `RunOutput.interrupted` and regenerated Pydantic bindings for engine 1.8.0
