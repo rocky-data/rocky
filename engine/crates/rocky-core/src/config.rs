@@ -1168,6 +1168,36 @@ pub struct RockyConfig {
     /// Schema evolution configuration (grace-period column drops).
     #[serde(default)]
     pub schema_evolution: SchemaEvolutionConfig,
+
+    /// Run-level retry budget shared across every adapter for this run.
+    ///
+    /// When set, `rocky run` builds a single
+    /// [`crate::retry_budget::RetryBudget`] from
+    /// [`RunRetryConfig::max_retries_per_run`] and passes it to every
+    /// connector via `with_retry_budget(...)`. One bad table that burns
+    /// through retries on adapter A then has less budget available for
+    /// adapter B's retries — the protection §P2.7 added within a single
+    /// adapter now extends across the whole run.
+    ///
+    /// Unset (the default) preserves per-adapter semantics: each adapter
+    /// still honours its own `retry.max_retries_per_run` independently.
+    /// That's the backward-compatible path and stays the right choice
+    /// when adapters have wildly different rate limits.
+    #[serde(default)]
+    pub retry: Option<RunRetryConfig>,
+}
+
+/// Top-level retry configuration applied across every adapter for this
+/// run. See [`RockyConfig::retry`] for the cross-adapter semantics this
+/// unlocks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunRetryConfig {
+    /// Total number of retries allowed across every adapter for this run.
+    /// `None` means no cross-adapter cap (each adapter's own
+    /// `retry.max_retries_per_run` still applies in isolation).
+    #[serde(default)]
+    pub max_retries_per_run: Option<u32>,
 }
 
 /// Schema-only helper that mirrors the deserializer's acceptance of both

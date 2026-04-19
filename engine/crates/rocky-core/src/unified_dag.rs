@@ -923,6 +923,7 @@ mod tests {
                 min_history_runs: 5,
             },
             schema_evolution: Default::default(),
+            retry: None,
         }
     }
 
