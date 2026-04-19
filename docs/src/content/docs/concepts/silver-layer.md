@@ -5,11 +5,13 @@ sidebar:
   order: 3
 ---
 
-The silver layer is where you write custom SQL transformations — the equivalent of dbt models. Each model is a SQL query paired with TOML configuration that declares its dependencies, materialization strategy, and target table.
+The silver layer is where you write custom SQL transformations — the equivalent of dbt models. Each model is a SQL query paired with TOML configuration that declares dependencies, materialization strategy, and target table.
+
+:::tip[SQL stays first-class]
+Rocky models are plain SQL files. No Jinja, no `{{ ref() }}` macros, no templating. Dependencies and materialization live in a sidecar TOML file — your `.sql` is what the warehouse sees.
+:::
 
 ## Model formats
-
-Rocky supports two formats for defining models. The sidecar format is recommended.
 
 ### Sidecar format (recommended)
 
@@ -17,11 +19,9 @@ Each model is two files with the same base name:
 
 ```
 models/
-├── fct_orders.sql    # Pure SQL
+├── fct_orders.sql    # Pure SQL — opens cleanly in any SQL editor
 └── fct_orders.toml   # Configuration
 ```
-
-The SQL file is plain SQL with full editor support (syntax highlighting, linting, autocompletion). No special syntax or template tags.
 
 ### Inline format (legacy)
 
@@ -159,32 +159,36 @@ WHEN NOT MATCHED THEN INSERT *
 
 ## Materialization strategies
 
+| Strategy | When to use | Adapters |
+|---|---|---|
+| [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | All |
+| [`incremental`](#incremental) | Large append-mostly tables, timestamped events | All |
+| [`merge`](#merge) | SCDs, upserts by key | All |
+| [`time_interval`](/features/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | All |
+| `materialized_view` | Warehouse-managed view refresh | Databricks |
+| `dynamic_table` | Target-lag managed tables | Snowflake |
+
 ### full_refresh (default)
 
 Rebuilds the entire table on every run:
 
 ```sql
-CREATE OR REPLACE TABLE target AS
-SELECT ...
+CREATE OR REPLACE TABLE target AS SELECT ...
 ```
-
-Use for small tables, complex transformations, or when you need guaranteed consistency.
 
 ### incremental
 
-Appends new rows based on a timestamp column:
+Appends new rows past the stored watermark:
 
 ```sql
-INSERT INTO target
-SELECT ...
-WHERE updated_at > :watermark
+INSERT INTO target SELECT ... WHERE updated_at > :watermark
 ```
 
-The watermark is tracked in Rocky's embedded state store and updated after each successful run. Use for large append-only or append-mostly tables.
+Watermarks live in Rocky's embedded state store ([state management](/concepts/state-management/)) and advance after each successful run.
 
 ### merge
 
-Upserts based on a unique key:
+Upserts by unique key:
 
 ```sql
 MERGE INTO target USING (...) AS source
@@ -192,16 +196,6 @@ ON target.key = source.key
 WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 ```
-
-Use for slowly changing dimensions or any table where rows are updated in place.
-
-## Loading models
-
-Rocky loads models from a directory using `load_models_from_dir()`. It auto-detects the format:
-
-1. For each `.sql` file, check if a matching `.toml` file exists (sidecar format)
-2. If no sidecar, check for `---toml ... ---` frontmatter (inline format)
-3. If neither, skip the file
 
 ## Validation
 

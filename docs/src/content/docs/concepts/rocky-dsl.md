@@ -5,13 +5,15 @@ sidebar:
   order: 8
 ---
 
-Rocky includes a domain-specific language (implemented in the `rocky-lang` crate) that provides a pipeline-oriented alternative to SQL for writing transformation models. Rocky DSL files (`.rocky`) are parsed into an AST and lowered to standard SQL before execution.
+Rocky's DSL is a pipeline-oriented alternative to SQL for transformation models. `.rocky` files lower to standard SQL before execution — the warehouse only sees SQL.
+
+:::note[The DSL is optional]
+Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely — a DSL model can depend on a SQL model and vice versa.
+:::
 
 ## Why a DSL
 
-SQL is powerful but its syntax works against readability for common data transformation patterns. A `SELECT` with multiple CTEs, window functions, and `CASE` expressions quickly becomes hard to follow. Rocky's DSL addresses this with a top-to-bottom pipeline syntax where each step transforms the data flowing through it.
-
-Rocky DSL is optional. You can write models in plain SQL and they work the same way. The DSL is for teams that want more readable, composable transformations.
+A `SELECT` with multiple CTEs, window functions, and nested `CASE` expressions gets hard to follow. The DSL offers a top-to-bottom pipeline: each step transforms the rows flowing through, and the final shape is obvious from scanning the file.
 
 ## Pipeline syntax
 
@@ -251,12 +253,11 @@ where status == "completed"
 
 ## How lowering works
 
-The `rocky-lang` crate processes DSL files in two phases:
+DSL files go through two phases before the compiler sees them:
 
-1. **Parse** -- A recursive descent parser (using the `logos` lexer) produces a typed AST. Each pipeline step becomes an enum variant (`From`, `Where`, `Group`, `Derive`, `Select`, `Join`, `Sort`, `Take`, `Distinct`, `Replicate`).
+1. **Parse** — tokens → typed AST (one variant per pipeline step).
+2. **Lower** — AST → single SQL string, walked step by step with an accumulating clause context (`FROM`, joins, `WHERE`, `SELECT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`).
 
-2. **Lower** -- The AST is walked step by step, accumulating SQL clauses. The lowering context tracks the current `FROM`, joins, `WHERE` clauses, `SELECT` columns, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT`. After all steps are processed, the context emits a single SQL string.
+The lowered SQL then flows into the compiler for type checking and dependency resolution — exactly as if you'd written it by hand. There's no runtime indirection; `.rocky` and `.sql` reach the warehouse identically.
 
-The lowered SQL is then handed to the compiler for type checking and dependency resolution, exactly as if it had been written by hand.
-
-For the full language specification, see `docs/rocky-lang-spec.md` in the repository.
+For the full language grammar, see the [Rocky language spec](https://github.com/rocky-data/rocky/blob/main/docs/rocky-lang-spec.md).
