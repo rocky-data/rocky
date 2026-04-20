@@ -84,10 +84,7 @@ pub fn run_replay(
 
     if let Some(name) = model_filter {
         if models.is_empty() {
-            anyhow::bail!(
-                "run '{}' did not execute model '{name}'",
-                record.run_id
-            );
+            anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
         }
     }
 

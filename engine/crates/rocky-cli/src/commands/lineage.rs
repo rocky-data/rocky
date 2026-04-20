@@ -67,7 +67,9 @@ pub fn run_lineage(
     if output_json {
         if let Some(col) = col_name {
             let trace_edges = if downstream {
-                result.semantic_graph.trace_column_downstream(model_name, col)
+                result
+                    .semantic_graph
+                    .trace_column_downstream(model_name, col)
             } else {
                 result.semantic_graph.trace_column(model_name, col)
             };
@@ -116,7 +118,9 @@ pub fn run_lineage(
         // Add edges
         let edges: Vec<_> = if let Some(col) = col_name {
             if downstream {
-                result.semantic_graph.trace_column_downstream(model_name, col)
+                result
+                    .semantic_graph
+                    .trace_column_downstream(model_name, col)
             } else {
                 result.semantic_graph.trace_column(model_name, col)
             }
@@ -153,7 +157,9 @@ pub fn run_lineage(
         if let Some(col) = col_name {
             if downstream {
                 println!("Column consumers: {model_name}.{col}");
-                let trace = result.semantic_graph.trace_column_downstream(model_name, col);
+                let trace = result
+                    .semantic_graph
+                    .trace_column_downstream(model_name, col);
                 for (i, edge) in trace.iter().enumerate() {
                     let indent = "  ".repeat(i + 1);
                     println!(

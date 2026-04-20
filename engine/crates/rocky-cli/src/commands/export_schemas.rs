@@ -17,13 +17,14 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, BranchDeleteOutput,
-    BranchListOutput, BranchOutput, CiDiffOutput, CiOutput, ColumnLineageOutput, CompactDedupOutput,
-    CompactOutput, CompareOutput, CompileOutput, DagOutput, DagRunOutput, DiscoverOutput,
-    DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
-    LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
-    ProfileStorageOutput, ReplayOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
-    TestOutput, ValidateMigrationOutput, ValidateOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput,
+    BranchDeleteOutput, BranchListOutput, BranchOutput, CiDiffOutput, CiOutput,
+    ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
+    DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput,
+    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput,
+    ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput, ReplayOutput, RunOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, ValidateMigrationOutput,
+    ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.

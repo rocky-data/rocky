@@ -33,9 +33,7 @@ fn validate_branch_name(name: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
-        anyhow::bail!(
-            "invalid branch name '{name}': only [A-Za-z0-9_.-] characters are allowed"
-        );
+        anyhow::bail!("invalid branch name '{name}': only [A-Za-z0-9_.-] characters are allowed");
     }
     Ok(())
 }

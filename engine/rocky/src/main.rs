@@ -1247,14 +1247,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         },
         Command::Branch { action } => match action {
-            BranchAction::Create { name, description } => {
-                rocky_cli::commands::run_branch_create(
-                    &cli.state_path,
-                    &name,
-                    description.as_deref(),
-                    json,
-                )
-            }
+            BranchAction::Create { name, description } => rocky_cli::commands::run_branch_create(
+                &cli.state_path,
+                &name,
+                description.as_deref(),
+                json,
+            ),
             BranchAction::Delete { name } => {
                 rocky_cli::commands::run_branch_delete(&cli.state_path, &name, json)
             }
