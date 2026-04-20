@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-04-20
+
+### Fixed
+
+Bumps `engines.vscode` to `^1.116.0` to match `@types/vscode` (dependabot PR #182 bumped the types without the engines field). The `vscode-v1.6.0` build failed in `vsce package` with `@types/vscode ^1.116.0 greater than engines.vscode ^1.105.0`; this patch release unblocks the Marketplace publish path. No feature changes vs. v1.6.0 — same regenerated bindings + project schema.
+
+The `vscode-v1.6.0` GitHub Release exists but has no VSIX attached and Marketplace was not published; users should consume v1.6.1 as the first shippable release of the trust-system arc bundle.
+
 ## [1.6.0] — 2026-04-20
 
 Tracks engine 1.11.0. Regenerated TypeScript bindings + `rocky-project.schema.json` for the trust-system arcs (Arcs 1–7 first waves + Arc 6 wave 2 + Arc 7 wave 2 wave-1).
