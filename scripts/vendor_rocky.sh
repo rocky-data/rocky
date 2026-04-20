@@ -145,8 +145,16 @@ if [[ -z "$VERSION" ]]; then
         echo "Error: --release without an explicit version requires gh CLI to look up the latest engine release" >&2
         exit 1
     fi
+    # `gh release list` orders by published_at DESC, but a hotfix on an
+    # older minor (e.g. 1.9.1 after 1.10.0) would then win over the true
+    # latest. Version-sort the engine-prefixed stable tags and take the
+    # highest. The stable-only regex excludes pre-releases, which `sort -V`
+    # would otherwise rank above the corresponding stable tag.
     VERSION=$(gh release list --repo "$REPO" --limit 30 \
-        | awk -v p="$TAG_PREFIX" '$0 ~ p {print $1; exit}' \
+        | grep -E "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+\b" \
+        | awk '{print $1}' \
+        | sort -V -r \
+        | head -1 \
         | sed "s/^${TAG_PREFIX}//")
     if [[ -z "$VERSION" ]]; then
         echo "Error: no engine releases found in $REPO" >&2
