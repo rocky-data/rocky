@@ -45,6 +45,10 @@
     "command": {
       "type": "string"
     },
+    "direction": {
+      "description": "Direction of the trace walk: `\"upstream\"` (producers) or `\"downstream\"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.",
+      "type": "string"
+    },
     "model": {
       "type": "string"
     },
@@ -61,6 +65,7 @@
   "required": [
     "column",
     "command",
+    "direction",
     "model",
     "trace",
     "version"

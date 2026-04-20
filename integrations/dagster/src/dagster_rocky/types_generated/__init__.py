@@ -165,6 +165,14 @@ from .validate_migration_schema import ModelValidationOutput, ValidateMigrationO
 # Test-adapter
 from .test_adapter_schema import TestAdapterOutput, TestAdapterTestResult
 
+# Branch (schema-prefix virtual branches)
+from .branch_schema import BranchEntry, BranchOutput
+from .branch_list_schema import BranchListOutput
+from .branch_delete_schema import BranchDeleteOutput
+
+# Replay (inspection-only run record)
+from .replay_schema import ReplayModelOutput, ReplayOutput
+
 __all__ = [
     # ai
     "AiGenerateOutput",
@@ -273,4 +281,12 @@ __all__ = [
     # test-adapter
     "TestAdapterOutput",
     "TestAdapterTestResult",
+    # branch
+    "BranchOutput",
+    "BranchEntry",
+    "BranchListOutput",
+    "BranchDeleteOutput",
+    # replay
+    "ReplayOutput",
+    "ReplayModelOutput",
 ]

@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ReplayModelOutput": {
+      "description": "A single model execution inside a replayed run.",
+      "properties": {
+        "bytes_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_written": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "finished_at": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sql_hash": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "finished_at",
+        "model_name",
+        "sql_hash",
+        "started_at",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky replay <run_id|latest>`.\n\nInspection-only surface over the state store's [`RunRecord`]: shows every model that ran, with the SQL hash, row counts, bytes, and timings captured at the time. Re-execution (with pinned inputs + content-addressed writes) is deferred to a follow-up when the Arc-1 storage path arrives.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "config_hash": {
+      "type": "string"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/ReplayModelOutput"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "trigger": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "config_hash",
+    "finished_at",
+    "models",
+    "run_id",
+    "started_at",
+    "status",
+    "trigger",
+    "version"
+  ],
+  "title": "ReplayOutput",
+  "type": "object"
+}

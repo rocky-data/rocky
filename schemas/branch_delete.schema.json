@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky branch delete`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "removed": {
+      "description": "Whether a record was actually removed (false if the branch didn't exist).",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "name",
+    "removed",
+    "version"
+  ],
+  "title": "BranchDeleteOutput",
+  "type": "object"
+}

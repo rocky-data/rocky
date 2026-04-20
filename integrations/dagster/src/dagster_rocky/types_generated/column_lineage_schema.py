@@ -27,6 +27,10 @@ class ColumnLineageOutput(BaseModel):
 
     column: str
     command: str
+    direction: str
+    """
+    Direction of the trace walk: `"upstream"` (producers) or `"downstream"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.
+    """
     model: str
     trace: list[LineageEdgeRecord]
     version: str
