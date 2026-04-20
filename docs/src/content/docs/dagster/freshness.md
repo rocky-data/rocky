@@ -5,7 +5,7 @@ sidebar:
   order: 9
 ---
 
-`dagster-rocky` 0.4 maps Rocky's freshness configuration onto Dagster's
+`dagster-rocky` maps Rocky's freshness configuration onto Dagster's
 [`FreshnessPolicy`](https://docs.dagster.io/api/dagster/assets#dagster.FreshnessPolicy)
 so the Dagster UI surfaces stale-data badges and the declarative-automation
 freshness conditions trigger correctly.

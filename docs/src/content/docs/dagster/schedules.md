@@ -7,7 +7,7 @@ sidebar:
 
 Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition)
 is fully sufficient for scheduled Rocky runs without any Rocky-specific glue.
-`dagster-rocky` 0.4 ships `build_rocky_schedule()` as a thin convenience that
+`dagster-rocky` ships `build_rocky_schedule()` as a thin convenience that
 bakes in sensible defaults and accepts the same `target=` shape as
 `rocky_source_sensor()` for symmetry.
 

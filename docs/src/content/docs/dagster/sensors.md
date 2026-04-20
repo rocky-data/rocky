@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-`dagster-rocky` 0.4 ships `rocky_source_sensor()` — a factory that builds a
+`dagster-rocky` ships `rocky_source_sensor()` — a factory that builds a
 Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition)
 that polls `rocky discover` and emits a `RunRequest` for any source whose
 upstream connector has produced new data since the previous tick.

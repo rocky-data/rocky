@@ -5,7 +5,7 @@ sidebar:
   order: 17
 ---
 
-`dagster-rocky` 0.4 surfaces Rocky's compile-time contract validation as
+`dagster-rocky` surfaces Rocky's compile-time contract validation as
 native Dagster [`AssetCheckSpec`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckSpec)
 and [`AssetCheckResult`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckResult)
 events. Each model with a `.contract.toml` file gets one or more contract

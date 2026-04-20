@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/instal
 **Pin a specific version:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- 1.0.0
+curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- <version>
 ```
 
 ## Windows

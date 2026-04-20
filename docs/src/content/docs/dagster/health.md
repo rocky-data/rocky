@@ -5,7 +5,7 @@ sidebar:
   order: 15
 ---
 
-`dagster-rocky` 0.4 ships `rocky_healthcheck()` — a wrapper around
+`dagster-rocky` ships `rocky_healthcheck()` — a wrapper around
 `rocky doctor` suitable for Dagster+ code-location startup probes, custom
 asset checks, and custom ops.
 
