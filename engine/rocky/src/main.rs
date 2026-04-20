@@ -355,6 +355,11 @@ enum Command {
         /// Output format: "rocky" or "sql"
         #[arg(long)]
         format: Option<String>,
+        /// Models directory (compiled to ground the prompt in real schemas).
+        /// If the directory doesn't exist or fails to compile, generation
+        /// proceeds without schema context.
+        #[arg(long, default_value = "models")]
+        models: String,
     },
 
     /// Detect schema changes and propose intent-guided model updates
@@ -1091,9 +1096,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             downstream,
             json,
         ),
-        Command::Ai { intent, format } => {
-            rocky_cli::commands::run_ai(&intent, format.as_deref(), json).await
-        }
+        Command::Ai {
+            intent,
+            format,
+            models,
+        } => rocky_cli::commands::run_ai(&intent, format.as_deref(), &models, json).await,
         Command::AiSync {
             apply,
             model,

@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 
 use rocky_ai::client::{AiConfig, LlmClient};
 use rocky_ai::generate;
-use rocky_compiler::compile::{CompilerConfig, compile};
+use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
+use rocky_compiler::types::TypedColumn;
 
 use crate::output::{
     AiExplainOutput, AiExplanation, AiGenerateOutput, AiSyncOutput, AiSyncProposal,
@@ -33,7 +34,7 @@ fn make_client() -> Result<LlmClient> {
 }
 
 /// Compile the project from a models directory.
-fn compile_project(models_dir: &str) -> Result<rocky_compiler::compile::CompileResult> {
+fn compile_project(models_dir: &str) -> Result<CompileResult> {
     let config = CompilerConfig {
         models_dir: PathBuf::from(models_dir),
         contracts_dir: None,
@@ -43,17 +44,86 @@ fn compile_project(models_dir: &str) -> Result<rocky_compiler::compile::CompileR
     compile(&config).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Typed schemas bucketed by origin for prompt rendering.
+type SchemaBuckets = (
+    Vec<(String, Vec<TypedColumn>)>,
+    Vec<(String, Vec<TypedColumn>)>,
+);
+
+/// Split `CompileResult.type_check.typed_models` into (existing-models,
+/// source-tables) for the AI prompt. Source tables are distinguished by the
+/// dotted schema.table naming convention used in Rocky sources; anything
+/// else is treated as an existing model. This is best-effort classification
+/// — the prompt tolerates either bucket without losing correctness.
+fn build_schema_context(result: &CompileResult) -> SchemaBuckets {
+    let mut model_schemas = Vec::new();
+    let mut source_tables = Vec::new();
+
+    for (name, cols) in &result.type_check.typed_models {
+        if name.contains('.') {
+            source_tables.push((name.clone(), cols.clone()));
+        } else {
+            model_schemas.push((name.clone(), cols.clone()));
+        }
+    }
+
+    (model_schemas, source_tables)
+}
+
 /// Execute `rocky ai "intent"` — generate a model from natural language.
-pub async fn run_ai(intent: &str, format: Option<&str>, output_json: bool) -> Result<()> {
+///
+/// Grounds the LLM prompt in the project's typed schemas (existing models
+/// and, once warehouse discovery is plumbed through, source tables) so
+/// generated code references real columns with correct types. The generated
+/// model is then typechecked inside the full project graph rather than in
+/// isolation — upstream typed schemas propagate into its output type, which
+/// matters for downstream models and contract validation. Rocky's
+/// typechecker is lenient on unresolved columns today, so schema grounding
+/// in the prompt is the primary mechanism preventing hallucinated columns.
+pub async fn run_ai(
+    intent: &str,
+    format: Option<&str>,
+    models_dir: &str,
+    output_json: bool,
+) -> Result<()> {
     let client = make_client()?;
     let fmt = format.unwrap_or("rocky");
 
-    let model_names = Vec::new();
-    let source_tables = Vec::new();
+    // Best-effort compile of the project to ground the prompt.
+    // If it fails (missing dir, parse errors, etc.) we degrade to unschema'd
+    // generation rather than refusing.
+    let compile_result = compile_project(models_dir).ok();
 
-    let result = generate::generate_model(intent, &model_names, &source_tables, fmt, &client, 3)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (model_schemas, source_tables) = match &compile_result {
+        Some(r) => build_schema_context(r),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    // Empty maps act as stand-ins for source_schemas / source_column_info
+    // until the CLI threads real warehouse discovery into `rocky ai`
+    // (deferred to a later wave). Project-aware validation still catches
+    // hallucinated references to existing *models* via the project graph.
+    let empty_source_schemas = std::collections::HashMap::new();
+    let empty_source_column_info = std::collections::HashMap::new();
+    let validation_context = compile_result
+        .as_ref()
+        .map(|r| generate::ValidationContext {
+            project_models: &r.project.models,
+            source_schemas: &empty_source_schemas,
+            source_column_info: &empty_source_column_info,
+        });
+
+    let result = generate::generate_model(
+        intent,
+        &model_schemas,
+        &source_tables,
+        fmt,
+        &client,
+        3,
+        validation_context.as_ref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if output_json {
         let output = AiGenerateOutput {
