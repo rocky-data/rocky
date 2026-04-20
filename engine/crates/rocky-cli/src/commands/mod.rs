@@ -43,6 +43,7 @@ mod state;
 #[cfg(feature = "duckdb")]
 mod test;
 mod test_adapter;
+mod trace;
 mod validate;
 mod validate_migration;
 mod watch;
@@ -94,6 +95,7 @@ pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]
 pub use test::run_test;
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
+pub use trace::run_trace;
 pub use validate::validate;
 pub use validate_migration::run_validate_migration;
 pub use watch::run_watch;

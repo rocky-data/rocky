@@ -2372,3 +2372,48 @@ pub struct ReplayModelOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
 }
+
+/// JSON output for `rocky trace <run_id|latest>`.
+///
+/// Sibling to [`ReplayOutput`] but with offset-relative timings so
+/// downstream consumers (Dagster asset Gantt, custom dashboards) can
+/// render the run as a timeline without re-deriving the run start.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TraceOutput {
+    pub version: String,
+    pub command: String,
+    pub run_id: String,
+    pub status: String,
+    pub trigger: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub run_duration_ms: u64,
+    /// Number of concurrent lanes the scheduler used during this run.
+    /// `1` for fully sequential pipelines, `>1` when the DAG had
+    /// independent models that the executor materialized in parallel.
+    pub lane_count: usize,
+    pub models: Vec<TraceModelEntry>,
+}
+
+/// One model execution entry inside [`TraceOutput`]. `start_offset_ms`
+/// is the wall-clock offset from the run start; `lane` identifies the
+/// concurrency lane for Gantt rendering (entries on the same lane
+/// never overlap in time).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct TraceModelEntry {
+    pub model_name: String,
+    pub status: String,
+    pub start_offset_ms: i64,
+    pub duration_ms: u64,
+    pub sql_hash: String,
+    /// Greedy first-fit concurrency lane. Populated by the renderer;
+    /// deserializing clients don't need to supply it.
+    #[serde(default)]
+    pub lane: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+}

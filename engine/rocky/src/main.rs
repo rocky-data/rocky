@@ -660,6 +660,19 @@ enum Command {
         model: Option<String>,
     },
 
+    /// Render a completed run as a timeline.
+    ///
+    /// Sibling to `rocky replay` but tuned for "I can see everything
+    /// that happened" — per-model offsets, duration bars, concurrency
+    /// lanes. Reads from the state store's `RunRecord`.
+    Trace {
+        /// Run id or the literal `latest`
+        target: String,
+        /// Filter to a single model within the run
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -1285,6 +1298,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         },
         Command::Replay { target, model } => {
             rocky_cli::commands::run_replay(&cli.state_path, &target, model.as_deref(), json)
+        }
+        Command::Trace { target, model } => {
+            rocky_cli::commands::run_trace(&cli.state_path, &target, model.as_deref(), json)
         }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
