@@ -144,6 +144,7 @@
           ],
           "default": {
             "backoff_multiplier": 2.0,
+            "circuit_breaker_recovery_timeout_secs": null,
             "circuit_breaker_threshold": 5,
             "initial_backoff_ms": 1000,
             "jitter": true,
@@ -1842,6 +1843,16 @@
           "description": "Backoff multiplier applied after each retry (e.g. 2.0 = double each time).",
           "format": "double",
           "type": "number"
+        },
+        "circuit_breaker_recovery_timeout_secs": {
+          "default": null,
+          "description": "Seconds the breaker will stay `Open` before a single trial request is allowed through (half-open state). On trial success the breaker closes and resumes normal traffic; on trial failure it re-opens immediately. `None` preserves the pre-Arc-3 \"manual-reset-only\" behaviour — a tripped breaker stays tripped for the rest of the run.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "circuit_breaker_threshold": {
           "default": 5,

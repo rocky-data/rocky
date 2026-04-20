@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod catalog;
 pub mod checks;
 pub mod ci_diff;
+pub mod circuit_breaker;
 pub mod column_map;
 pub mod compare;
 pub mod config;

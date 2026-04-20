@@ -8,10 +8,10 @@
 //! Supports retry with exponential backoff for transient failures.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use reqwest::Client;
+use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
 use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
 use serde::{Deserialize, Serialize};
@@ -138,8 +138,10 @@ pub struct SnowflakeConnector {
     config: ConnectorConfig,
     auth: Auth,
     client: Client,
-    /// Consecutive transient failures (shared across clones for circuit breaker).
-    consecutive_failures: Arc<AtomicU32>,
+    /// Shared circuit breaker (clones share state via `Arc`). See
+    /// `rocky_core::circuit_breaker::CircuitBreaker` for the timed
+    /// half-open recovery semantics.
+    circuit_breaker: Arc<CircuitBreaker>,
     /// Shared retry budget across the run (§P2.7). Unbounded by default —
     /// set via `config.retry.max_retries_per_run`.
     retry_budget: rocky_core::retry_budget::RetryBudget,
@@ -153,6 +155,7 @@ impl SnowflakeConnector {
     pub fn new(config: ConnectorConfig, auth: Auth) -> Self {
         let retry_budget =
             rocky_core::retry_budget::RetryBudget::from_config(config.retry.max_retries_per_run);
+        let circuit_breaker = Arc::new(config.retry.build_circuit_breaker());
         SnowflakeConnector {
             config,
             auth,
@@ -162,7 +165,7 @@ impl SnowflakeConnector {
                 .pool_idle_timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            circuit_breaker,
             retry_budget,
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
@@ -232,26 +235,39 @@ impl SnowflakeConnector {
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
         let retry = &self.config.retry;
 
-        // Circuit breaker: fail fast if too many consecutive transient failures
-        let cb_threshold = retry.circuit_breaker_threshold;
-        if cb_threshold > 0 {
-            let failures = self.consecutive_failures.load(Ordering::Relaxed);
-            if failures >= cb_threshold {
-                return Err(ConnectorError::CircuitBreakerOpen {
-                    consecutive_failures: failures,
-                });
-            }
+        // Circuit breaker: fail fast if Open. When timed half-open
+        // recovery is configured, `check()` transitions Open → HalfOpen
+        // after `circuit_breaker_recovery_timeout_secs` and lets one
+        // trial request through — success below closes the breaker,
+        // failure re-opens.
+        if let Err(e) = self.circuit_breaker.check() {
+            return Err(ConnectorError::CircuitBreakerOpen {
+                consecutive_failures: e.consecutive_failures,
+            });
         }
 
         for attempt in 0..=retry.max_retries {
             match self.submit_and_wait_once(sql).await {
                 Ok(resp) => {
-                    self.consecutive_failures.store(0, Ordering::Relaxed);
+                    if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
+                        global_event_bus().emit(
+                            PipelineEvent::new("circuit_breaker_recovered")
+                                .with_target("snowflake"),
+                        );
+                    }
                     return Ok(resp);
                 }
                 Err(err) => {
-                    if is_transient(&err) {
-                        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                    if is_transient(&err)
+                        && self.circuit_breaker.record_failure(&err.to_string())
+                            == TransitionOutcome::Tripped
+                    {
+                        global_event_bus().emit(
+                            PipelineEvent::new("circuit_breaker_tripped")
+                                .with_target("snowflake")
+                                .with_error(err.to_string())
+                                .with_error_class(classify_error(&err)),
+                        );
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
                         // Run-level retry budget (§P2.7). Short-circuit if
