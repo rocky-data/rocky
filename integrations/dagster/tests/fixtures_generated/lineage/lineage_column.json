@@ -3,6 +3,7 @@
   "command": "lineage",
   "model": "fct_revenue",
   "column": "total",
+  "direction": "upstream",
   "trace": [
     {
       "source": {

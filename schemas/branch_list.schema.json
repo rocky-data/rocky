@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BranchEntry": {
+      "description": "A single branch record in JSON output.",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "created_by": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "schema_prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "name",
+        "schema_prefix"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky branch list`.",
+  "properties": {
+    "branches": {
+      "items": {
+        "$ref": "#/definitions/BranchEntry"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "total": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "branches",
+    "command",
+    "total",
+    "version"
+  ],
+  "title": "BranchListOutput",
+  "type": "object"
+}

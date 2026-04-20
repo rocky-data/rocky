@@ -175,6 +175,11 @@ enum Command {
         /// Override schema for shadow tables (mutually exclusive with --shadow-suffix)
         #[arg(long)]
         shadow_schema: Option<String>,
+        /// Execute the run against a named branch created with `rocky branch
+        /// create`. Internally equivalent to `--shadow --shadow-schema
+        /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"])]
+        branch: Option<String>,
 
         // ----- time_interval partition selection (Phase 3) -----
         /// Run a single partition by canonical key (e.g. 2026-04-07 for daily,
@@ -333,6 +338,14 @@ enum Command {
         /// Output format: "dot" for Graphviz
         #[arg(long)]
         format: Option<String>,
+        /// Trace downstream (consumers) instead of upstream (sources).
+        /// Mutually exclusive with --upstream; default is upstream.
+        #[arg(long, conflicts_with = "upstream")]
+        downstream: bool,
+        /// Trace upstream (sources). Default when neither is set; use this
+        /// flag for explicitness in scripted callers.
+        #[arg(long)]
+        upstream: bool,
     },
 
     /// Generate a model from natural language intent using AI
@@ -620,6 +633,33 @@ enum Command {
         action: HooksAction,
     },
 
+    /// Manage named virtual branches (schema-prefix branches).
+    ///
+    /// A branch is the persistent, named analogue of `--shadow` mode: it
+    /// records a `schema_prefix` in the state store and, when `rocky run
+    /// --branch <name>` is invoked, every model target has the prefix
+    /// applied. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake
+    /// zero-copy `CLONE`) are a follow-up.
+    Branch {
+        #[command(subcommand)]
+        action: BranchAction,
+    },
+
+    /// Inspect a recorded run from the state store.
+    ///
+    /// Shows every model that ran with SQL hash, row counts, bytes, and
+    /// timings captured at the time. Useful for "what exactly ran at
+    /// 03:15 UTC?" and as the reproducibility artefact for the
+    /// Trust-system Arc 1 claim. Re-execution with pinned inputs is a
+    /// follow-up once the content-addressed write path arrives.
+    Replay {
+        /// Run id or the literal `latest`
+        target: String,
+        /// Filter to a single model within the run
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -706,6 +746,30 @@ enum HooksAction {
     Test {
         /// Event name (e.g., on_pipeline_start, on_materialize_error)
         event: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchAction {
+    /// Create a new branch
+    Create {
+        /// Branch name (e.g., `fix-price`, `feature_new_join`)
+        name: String,
+        /// Optional description, surfaced in `rocky branch list`
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a branch entry. Does not drop warehouse tables.
+    Delete {
+        /// Branch name
+        name: String,
+    },
+    /// List all branches
+    List,
+    /// Show details for a single branch
+    Show {
+        /// Branch name
+        name: String,
     },
 }
 
@@ -807,6 +871,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             shadow,
             shadow_suffix,
             shadow_schema,
+            branch,
             partition,
             from,
             to,
@@ -833,8 +898,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 None => None,
             };
 
-            // Build shadow config if shadow mode is enabled
-            let shadow_config = if shadow {
+            // Resolve --branch to the same machinery as --shadow. clap
+            // guarantees branch can't coexist with `shadow` / `shadow_schema`.
+            let shadow_config = if let Some(name) = &branch {
+                let store = rocky_core::state::StateStore::open_read_only(&cli.state_path)
+                    .with_context(|| {
+                        format!("failed to open state store at {}", cli.state_path.display())
+                    })?;
+                let record = store.get_branch(name)?.with_context(|| {
+                    format!(
+                        "branch '{name}' not found — create it with `rocky branch create {name}`"
+                    )
+                })?;
+                Some(rocky_core::shadow::ShadowConfig {
+                    suffix: shadow_suffix,
+                    schema_override: Some(record.schema_prefix),
+                    cleanup_after: false,
+                })
+            } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
                     schema_override: shadow_schema,
@@ -987,11 +1068,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             column,
             format,
+            downstream,
+            upstream: _,
         } => rocky_cli::commands::run_lineage(
             &models,
             &target,
             column.as_deref(),
             format.as_deref(),
+            downstream,
             json,
         ),
         Command::Ai { intent, format } => {
@@ -1184,6 +1268,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 rocky_cli::commands::run_hooks_test(&cli.config, &event, json).await
             }
         },
+        Command::Branch { action } => match action {
+            BranchAction::Create { name, description } => rocky_cli::commands::run_branch_create(
+                &cli.state_path,
+                &name,
+                description.as_deref(),
+                json,
+            ),
+            BranchAction::Delete { name } => {
+                rocky_cli::commands::run_branch_delete(&cli.state_path, &name, json)
+            }
+            BranchAction::List => rocky_cli::commands::run_branch_list(&cli.state_path, json),
+            BranchAction::Show { name } => {
+                rocky_cli::commands::run_branch_show(&cli.state_path, &name, json)
+            }
+        },
+        Command::Replay { target, model } => {
+            rocky_cli::commands::run_replay(&cli.state_path, &target, model.as_deref(), json)
+        }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
             ListAction::Adapters => rocky_cli::commands::list_adapters(&cli.config, json),

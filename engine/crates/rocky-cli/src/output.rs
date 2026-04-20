@@ -987,6 +987,10 @@ pub struct ColumnLineageOutput {
     pub command: String,
     pub model: String,
     pub column: String,
+    /// Direction of the trace walk: `"upstream"` (producers) or `"downstream"`
+    /// (consumers). Defaults to upstream when `--column` is set without
+    /// direction flags, matching pre-Arc-1 behaviour.
+    pub direction: String,
     pub trace: Vec<LineageEdgeRecord>,
 }
 
@@ -1963,4 +1967,78 @@ mod sql_fingerprint_tests {
         let stmts = vec!["SELECT 1".to_string()];
         assert_eq!(sql_fingerprint(&stmts).len(), 16);
     }
+}
+
+/// JSON output for `rocky branch create` and `rocky branch show`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchOutput {
+    pub version: String,
+    pub command: String,
+    pub branch: BranchEntry,
+}
+
+/// JSON output for `rocky branch list`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchListOutput {
+    pub version: String,
+    pub command: String,
+    pub branches: Vec<BranchEntry>,
+    pub total: usize,
+}
+
+/// A single branch record in JSON output.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchEntry {
+    pub name: String,
+    pub schema_prefix: String,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// JSON output for `rocky branch delete`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchDeleteOutput {
+    pub version: String,
+    pub command: String,
+    pub name: String,
+    /// Whether a record was actually removed (false if the branch didn't exist).
+    pub removed: bool,
+}
+
+/// JSON output for `rocky replay <run_id|latest>`.
+///
+/// Inspection-only surface over the state store's [`RunRecord`]: shows every
+/// model that ran, with the SQL hash, row counts, bytes, and timings
+/// captured at the time. Re-execution (with pinned inputs + content-addressed
+/// writes) is deferred to a follow-up when the Arc-1 storage path arrives.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReplayOutput {
+    pub version: String,
+    pub command: String,
+    pub run_id: String,
+    pub status: String,
+    pub trigger: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub config_hash: String,
+    pub models: Vec<ReplayModelOutput>,
+}
+
+/// A single model execution inside a replayed run.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReplayModelOutput {
+    pub model_name: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration_ms: u64,
+    pub sql_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
 }

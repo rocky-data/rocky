@@ -153,3 +153,11 @@ export type {
   TestAdapterOutput,
   TestAdapterTestResult,
 } from "./test_adapter";
+
+// Branch (schema-prefix virtual branches)
+export type { BranchOutput, BranchEntry } from "./branch";
+export type { BranchListOutput } from "./branch_list";
+export type { BranchDeleteOutput } from "./branch_delete";
+
+// Replay (inspection-only run record)
+export type { ReplayOutput, ReplayModelOutput } from "./replay";

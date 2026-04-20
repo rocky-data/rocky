@@ -2,6 +2,7 @@ mod ai;
 mod archive;
 #[cfg(feature = "duckdb")]
 pub mod bench;
+mod branch;
 #[cfg(feature = "duckdb")]
 mod ci;
 mod ci_diff;
@@ -30,6 +31,7 @@ mod optimize;
 mod plan;
 mod playground;
 mod profile_storage;
+mod replay;
 mod run;
 mod run_dag_exec;
 mod run_local;
@@ -49,6 +51,7 @@ pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
 pub use archive::run_archive;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
+pub use branch::{run_branch_create, run_branch_delete, run_branch_list, run_branch_show};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::run_ci_diff;
@@ -78,6 +81,7 @@ pub use optimize::run_optimize;
 pub use plan::plan;
 pub use playground::{run_playground, run_playground_with_template};
 pub use profile_storage::run_profile_storage;
+pub use replay::run_replay;
 pub use run::{Interrupted, PartitionRunOptions, run};
 pub use run_dag_exec::run_with_dag;
 pub use seed::run_seed;

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Trust-system Arc 1 (first wave)
+
+- `rocky lineage --column <col> --downstream` walks the column-level graph forward (existing `--column` continues to walk upstream). A new `edges_by_source_model` index backs the transitive walker so the cost scales with fan-out rather than total edges. `ColumnLineageOutput` gains a `direction` field so consumers can distinguish the two shapes.
+- `rocky branch create|delete|list|show` — named virtual branches persisted in the state store's new `BRANCHES` table. A branch records a `schema_prefix` (default `branch__<name>`); `BranchOutput`, `BranchListOutput`, and `BranchDeleteOutput` are registered with the codegen cascade.
+- `rocky run --branch <name>` applies a previously-created branch by routing through existing shadow-mode machinery (internally `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`.
+- `rocky replay <run_id|latest>` surfaces the state store's `RunRecord` — per-model SQL hash, row counts, bytes, and timings as captured at execution time. Optional `--model` filter. Inspection-only; re-execution with pinned inputs is a follow-up once the content-addressed write path arrives.
+
+### Deferred
+
+- Warehouse-native clone (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) — schema-prefix branches work uniformly across every adapter today; native clone is a follow-up when branch-on-disk-state guarantees are needed.
+- `rocky replay` re-execution — waits on the content-addressed write path from the Arc 1 storage spike.
+
 ## [1.10.0] — 2026-04-20
 
 Closes the active arc of the perf-resilience roadmap. Thirteen release PRs over two days — P3.1 incremental compiler, P3.4 range-protocol half, P3.11 split `rocky-lsp` binary, full 15-event hook lifecycle wired into `rocky run`, cross-adapter shared `RetryBudget`, and a run of `Arc<str>` / `CiKey` alloc-reduction passes through the compiler hot path. Plus two adjacent Databricks fixes.
