@@ -196,6 +196,8 @@ Returns a complete summary of the pipeline execution.
 | `metrics` | object or null | Counters and percentile histograms for the run. |
 | `anomalies` | array | Row count anomalies detected by historical baseline comparison. |
 | `partition_summaries` | array | Per-model partition execution summaries (present for `time_interval` models). |
+| `cost_summary` | object or absent | Per-run cost rollup: `total_usd` (float or null), `by_adapter` (map of adapter → USD). Present when at least one adapter reports cost data. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
+| `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
 
 **`materializations[]`:**
 
@@ -210,6 +212,7 @@ Returns a complete summary of the pipeline execution.
 | `metadata.sql_hash` | string or absent | 16-char hex hash of the generated SQL. |
 | `metadata.column_count` | integer or absent | Number of columns in the materialized table. |
 | `metadata.compile_time_ms` | integer or absent | Compile time in milliseconds for derived models. |
+| `metadata.cost_usd` | float or absent | Estimated cost for this materialization in USD. Rolls up into `cost_summary.total_usd` at the run level. |
 | `partition` | object or absent | Partition window info for `time_interval` materializations. |
 
 **`check_results[]`:**
@@ -514,14 +517,15 @@ Show model-level lineage with columns, upstream/downstream models, and column-le
 
 ### `rocky lineage <model> --column <col>`
 
-Trace a single column back through its upstream lineage chain.
+Trace a single column through its lineage chain. Default direction is **upstream** (sources). Pass `--downstream` to walk consumers instead.
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.11.0",
   "command": "lineage",
   "model": "fct_revenue",
   "column": "net_revenue",
+  "direction": "upstream",
   "trace": [
     {
       "source": { "model": "stg_orders", "column": "total_amount" },
@@ -543,6 +547,7 @@ Trace a single column back through its upstream lineage chain.
 |-------|------|-------------|
 | `model` | string | The model containing the traced column. |
 | `column` | string | The column being traced. |
+| `direction` | string | `"upstream"` (default) or `"downstream"`. Set by the `--downstream` flag. |
 | `trace[].source` | object | Source column (`model` + `column`). |
 | `trace[].target` | object | Target column (`model` + `column`). |
 | `trace[].transform` | string | Transform kind: `"direct"`, `"cast"`, `"expression"`, etc. |
@@ -696,6 +701,131 @@ Show execution history for a specific model.
 | `executions[].status` | string | Execution status. |
 | `executions[].sql_hash` | string | Hash of the SQL that was executed. |
 | `count` | integer | Total number of executions returned. |
+
+---
+
+### `rocky replay <run_id|latest>`
+
+Per-model dump of a recorded run — SQL hash, row counts, bytes, and timings captured at execution time.
+
+```json
+{
+  "version": "1.11.0",
+  "command": "replay",
+  "run_id": "run_20260420_143022",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2026-04-20T14:30:22Z",
+  "finished_at": "2026-04-20T14:31:07Z",
+  "config_hash": "cfg_a3f2b1c4",
+  "models": [
+    {
+      "model_name": "fct_revenue",
+      "status": "success",
+      "started_at": "2026-04-20T14:30:24Z",
+      "finished_at": "2026-04-20T14:31:07Z",
+      "duration_ms": 43000,
+      "sql_hash": "hash_b4e3c2d5",
+      "rows_affected": 8900,
+      "bytes_scanned": 20971520,
+      "bytes_written": 4194304
+    }
+  ]
+}
+```
+
+**Field reference:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | Run identifier from the state store. |
+| `status` | string | `"success"`, `"partial_failure"`, or `"failure"`. |
+| `trigger` | string | What triggered the run: `"manual"`, `"sensor"`, `"schedule"`, `"ci"`. |
+| `config_hash` | string | Hash of the `rocky.toml` effective at run time. |
+| `models[].sql_hash` | string | Stable across runs where the compiled SQL is identical. |
+| `models[].bytes_scanned` / `bytes_written` | integer or null | Per-model byte counts, when the adapter reports them. |
+
+---
+
+### `rocky trace <run_id|latest>`
+
+Same run, laid out as a Gantt timeline — per-model start offsets + concurrency-lane assignments.
+
+```json
+{
+  "version": "1.11.0",
+  "command": "trace",
+  "run_id": "run_20260420_143022",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2026-04-20T14:30:22Z",
+  "finished_at": "2026-04-20T14:31:07Z",
+  "run_duration_ms": 45000,
+  "lane_count": 2,
+  "models": [
+    {
+      "model_name": "stg_orders",
+      "status": "success",
+      "start_offset_ms": 0,
+      "duration_ms": 1200,
+      "sql_hash": "hash_a3f2b1c4",
+      "lane": 0,
+      "rows_affected": 150000,
+      "bytes_scanned": 41943040,
+      "bytes_written": 20971520
+    }
+  ]
+}
+```
+
+**Field reference:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_duration_ms` | integer | Wall time from `started_at` to `finished_at`. |
+| `lane_count` | integer | Observed maximum concurrency (greedy first-fit over start offsets). |
+| `models[].start_offset_ms` | integer | Milliseconds between the run start and this model's start. |
+| `models[].lane` | integer | Concurrency lane index; models sharing a lane do not overlap in time. |
+
+---
+
+### `rocky branch create` / `branch show` / `branch list` / `branch delete`
+
+Branches use three distinct output shapes — see [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) for command-level usage.
+
+```json
+{
+  "version": "1.11.0",
+  "command": "branch create",
+  "branch": {
+    "name": "fix-price",
+    "schema_prefix": "branch__fix-price",
+    "created_by": "hugo",
+    "created_at": "2026-04-20T14:22:11+00:00",
+    "description": "testing reprice migration"
+  }
+}
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "branch list",
+  "total": 2,
+  "branches": [ { "name": "fix-price", "schema_prefix": "branch__fix-price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" } ]
+}
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "branch delete",
+  "name": "fix-price",
+  "removed": true
+}
+```
+
+`removed` is `false` when the branch didn't exist. Deletion does not drop warehouse tables — that's a separate cleanup step.
 
 ---
 

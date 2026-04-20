@@ -53,6 +53,21 @@ Events are organized into five phases:
 |-------|------|----------|
 | `state_synced` | State store synced | Backup confirmation |
 
+### Budget phase
+
+| Event | When | Use case |
+|-------|------|----------|
+| `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend; gate downstream runs on `on_breach = "error"` |
+
+### Adapter resilience phase
+
+| Event | When | Use case |
+|-------|------|----------|
+| `circuit_breaker_tripped` | Adapter circuit breaker moves `Closed → Open` after consecutive transient failures | Mute retries; notify oncall that a warehouse endpoint is unhealthy |
+| `circuit_breaker_recovered` | Half-open trial request succeeds and the breaker closes | Clear the alert; record recovery latency |
+
+Circuit-breaker behaviour is configured per-adapter via [`[adapter.NAME.retry]`](/reference/configuration/#adapternameretry) — `circuit_breaker_threshold` sets the failure count that trips it, and `circuit_breaker_recovery_timeout_secs` enables timed auto-recovery through the half-open state.
+
 ## Shell hooks
 
 Shell hooks execute a command and pipe the event context as JSON to stdin:

@@ -492,3 +492,183 @@ Same output shape — `model` is set when `--model` filters the run. `older_than
 - [`rocky compact`](#rocky-compact) -- compact remaining data after archival
 - [`rocky profile-storage`](#rocky-profile-storage) -- analyze storage to identify archival candidates
 - [`rocky history`](#rocky-history) -- review when data was last accessed
+
+---
+
+## `rocky replay`
+
+Inspect a recorded run from the state store. Surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time — the concrete artefact behind the reproducibility claim. Inspection-only today; re-execution with pinned inputs is an Arc 1 follow-up.
+
+```bash
+rocky replay <target> [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `target` | `string` | **(required)** | A specific `run_id`, or the literal `latest` for the most recent run. |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <NAME>` | `string` | | Filter to a single model within the run. Errors if the model wasn't executed. |
+
+### Examples
+
+Replay the most recent run:
+
+```bash
+rocky replay latest
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "replay",
+  "run_id": "run_20260420_143022",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2026-04-20T14:30:22Z",
+  "finished_at": "2026-04-20T14:31:07Z",
+  "config_hash": "cfg_a3f2b1c4",
+  "models": [
+    {
+      "model_name": "stg_orders",
+      "status": "success",
+      "started_at": "2026-04-20T14:30:22Z",
+      "finished_at": "2026-04-20T14:30:23Z",
+      "duration_ms": 1200,
+      "sql_hash": "hash_a3f2b1c4",
+      "rows_affected": 150000,
+      "bytes_scanned": 41943040,
+      "bytes_written": 20971520
+    },
+    {
+      "model_name": "fct_revenue",
+      "status": "success",
+      "started_at": "2026-04-20T14:30:24Z",
+      "finished_at": "2026-04-20T14:31:07Z",
+      "duration_ms": 43000,
+      "sql_hash": "hash_b4e3c2d5",
+      "rows_affected": 8900,
+      "bytes_scanned": 20971520,
+      "bytes_written": 4194304
+    }
+  ]
+}
+```
+
+Filter to a single model within a specific run:
+
+```bash
+rocky replay run_20260420_143022 --model fct_revenue
+```
+
+`sql_hash` is stable across runs where the compiled SQL is identical, so diffing two replays is a fast way to detect whether a re-run would execute the same statements.
+
+### Related Commands
+
+- [`rocky trace`](#rocky-trace) -- same data rendered as a Gantt timeline
+- [`rocky history`](#rocky-history) -- list past runs
+- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- record a new run
+
+---
+
+## `rocky trace`
+
+Render a completed run as a Gantt-style timeline. Sibling to `rocky replay` — reads the same `RunRecord`, but lays out models by start offset and assigns them to concurrency lanes so overlapping models show up on separate rows.
+
+```bash
+rocky trace <target> [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `target` | `string` | **(required)** | A specific `run_id`, or the literal `latest`. |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <NAME>` | `string` | | Filter to a single model within the run. |
+
+### Examples
+
+Trace the most recent run:
+
+```bash
+rocky trace latest
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "trace",
+  "run_id": "run_20260420_143022",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2026-04-20T14:30:22Z",
+  "finished_at": "2026-04-20T14:31:07Z",
+  "run_duration_ms": 45000,
+  "lane_count": 2,
+  "models": [
+    {
+      "model_name": "stg_orders",
+      "status": "success",
+      "start_offset_ms": 0,
+      "duration_ms": 1200,
+      "sql_hash": "hash_a3f2b1c4",
+      "lane": 0,
+      "rows_affected": 150000,
+      "bytes_scanned": 41943040,
+      "bytes_written": 20971520
+    },
+    {
+      "model_name": "stg_customers",
+      "status": "success",
+      "start_offset_ms": 100,
+      "duration_ms": 900,
+      "sql_hash": "hash_x9y8z7w6",
+      "lane": 1,
+      "rows_affected": 8000,
+      "bytes_scanned": 2097152,
+      "bytes_written": 1048576
+    },
+    {
+      "model_name": "fct_revenue",
+      "status": "success",
+      "start_offset_ms": 2000,
+      "duration_ms": 43000,
+      "sql_hash": "hash_b4e3c2d5",
+      "lane": 0,
+      "rows_affected": 8900,
+      "bytes_scanned": 20971520,
+      "bytes_written": 4194304
+    }
+  ]
+}
+```
+
+Lane assignment is greedy first-fit over sorted start offsets, so `lane_count` is the observed maximum concurrency. The table-mode output prints a bar chart:
+
+```
+$ rocky -o table trace latest
+run: run_20260420_143022
+status: success   trigger: manual   duration: 45.00s
+parallelism: 2 lanes
+
+  model                         timeline                                    duration  status
+  stg_orders                    [###.....................................]     1.20s  success
+  stg_customers                 [##......................................]     0.90s  success
+  fct_revenue                   [....####################################]    43.00s  success
+```
+
+### Related Commands
+
+- [`rocky replay`](#rocky-replay) -- flat per-model dump of the same run
+- [`rocky history`](#rocky-history) -- list recent runs
+- [`rocky metrics`](#rocky-metrics) -- quality metrics captured during runs

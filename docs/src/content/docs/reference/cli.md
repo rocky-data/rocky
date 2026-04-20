@@ -7,12 +7,12 @@ sidebar:
 
 Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
 
-- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `run`, `state`
+- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `run`, `state`, `branch`
 - **Modeling**: `compile`, `lineage`, `test`, `ci`, `ci-diff`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `hooks`, `validate-migration`, `test-adapter`
-- **Administration**: `history`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`
+- **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`
 - **Diagnostics**: `doctor`, `compare`
 
 See the dedicated command reference pages for detailed documentation of each category.
@@ -208,6 +208,7 @@ rocky run --filter <key=value> [flags]
 | `--shadow` | | Run in shadow mode: write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | | Suffix appended to table names in shadow mode (default `_rocky_shadow`). |
 | `--shadow-schema <NAME>` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
+| `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Mutually exclusive with `--shadow` / `--shadow-schema`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
 
 **Pipeline stages (in order):**
 

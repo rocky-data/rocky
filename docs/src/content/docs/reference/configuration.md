@@ -226,13 +226,18 @@ Retry policy for transient errors (HTTP 429/503, rate limits, timeouts). Uses ex
 | `backoff_multiplier` | float | `2.0` | Multiplier applied after each retry. |
 | `jitter` | bool | `true` | Add random jitter to prevent thundering herd. |
 | `circuit_breaker_threshold` | integer | `5` | Trip after this many consecutive failures. Set to 0 to disable. |
+| `circuit_breaker_recovery_timeout_secs` | integer | `null` | When set, the breaker auto-recovers after this many seconds: it enters half-open, admits a single trial request, and either closes on success or re-opens on failure. When unset, a tripped breaker stays tripped for the rest of the run (manual-reset behaviour). |
+| `max_retries_per_run` | integer | `null` | Per-adapter cross-statement retry budget for a single run. Use the top-level [`[retry]`](#retry) block when you want one shared budget across every adapter instead. |
 
 ```toml
 [adapter.prod.retry]
 max_retries = 5
 initial_backoff_ms = 500
 max_backoff_ms = 60000
+circuit_breaker_recovery_timeout_secs = 30
 ```
+
+When the breaker trips, Rocky emits a `circuit_breaker_tripped` pipeline event; on auto-recovery it emits `circuit_breaker_recovered`. Hook subscribers can observe both without polling the adapter. See [Hooks](/concepts/hooks/).
 
 ---
 
@@ -594,6 +599,67 @@ Cost assumptions used by `rocky optimize` when recommending materialization stra
 storage_cost_per_gb_month = 0.023
 compute_cost_per_dbu = 0.40
 warehouse_size = "Medium"
+```
+
+---
+
+## `[budget]`
+
+Declarative run-level cost and duration limits. When a run exceeds a configured limit, Rocky emits a `budget_breach` pipeline event and fires the `HookEvent::BudgetBreach` hook. With `on_breach = "error"` the run also exits non-zero. Unknown fields are rejected.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_usd` | float | | Maximum allowed run cost in USD. Cost is computed from per-materialization `cost_usd` values on `RunOutput.cost_summary`. `None` on runs where no adapter produced cost data (e.g. a BigQuery job with no bytes billed). |
+| `max_duration_ms` | integer | | Maximum allowed run wall time in milliseconds. |
+| `on_breach` | string | `"warn"` | Either `"warn"` (fire the event, keep the run successful) or `"error"` (also fail the run). |
+
+```toml
+[budget]
+max_usd = 25.0
+max_duration_ms = 900000   # 15 minutes
+on_breach = "error"
+```
+
+The limits are evaluated once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
+
+---
+
+## `[portability]`
+
+Project-wide configuration for Rocky's dialect-portability lint (**P001**). When `target_dialect` is set, every `rocky compile` (and LSP-driven in-editor check) runs the lint against that target. The CLI flag `rocky compile --target-dialect <DIALECT>` overrides this block when both are present. Unknown fields are rejected.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_dialect` | string | | `"databricks"`, `"snowflake"`, `"bigquery"`, or `"duckdb"`. When unset, no lint runs (wave-1 "flag opt-in" behavior). |
+| `allow` | list of string | `[]` | Project-wide allow-list of construct labels (case-insensitive). Useful when a project standardizes on a non-portable extension like `QUALIFY`. Prefer per-model `-- rocky-allow: …` pragmas for targeted exemptions. |
+
+```toml
+[portability]
+target_dialect = "bigquery"
+allow = ["QUALIFY"]
+```
+
+Precedence for the effective target dialect:
+
+1. `rocky compile --target-dialect <DIALECT>` flag (wins if set).
+2. `[portability] target_dialect`.
+3. Unset — no lint.
+
+See [Linters](/features/linters/) for the full list of covered constructs and the per-model pragma syntax.
+
+---
+
+## `[retry]`
+
+Optional top-level cross-adapter retry budget. When set, `AdapterRegistry` builds one shared `Arc<AtomicI64>` budget and wires it through every adapter for this run — once exhausted, no adapter retries further. Prevents one failing endpoint from burning the whole budget pool that other adapters could have used.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_retries_per_run` | integer | | Total retries allowed across every adapter for this run. Omit the block to keep per-adapter budgets (each `[adapter.NAME.retry]` remains in isolation). |
+
+```toml
+[retry]
+max_retries_per_run = 50
 ```
 
 ---
