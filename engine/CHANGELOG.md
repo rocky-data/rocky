@@ -7,17 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — Trust-system Arc 1 (first wave)
+## [1.11.0] — 2026-04-20
+
+Closes the **first wave of every trust-system arc** (Arcs 1–7) plus two
+wave-2 follow-ups landed the same day. Nine feature PRs since v1.10.0,
+organized by the seven arcs of the trust-system direction.
+
+### Added — Trust-system Arc 1 (first wave) · #170
 
 - `rocky lineage --column <col> --downstream` walks the column-level graph forward (existing `--column` continues to walk upstream). A new `edges_by_source_model` index backs the transitive walker so the cost scales with fan-out rather than total edges. `ColumnLineageOutput` gains a `direction` field so consumers can distinguish the two shapes.
 - `rocky branch create|delete|list|show` — named virtual branches persisted in the state store's new `BRANCHES` table. A branch records a `schema_prefix` (default `branch__<name>`); `BranchOutput`, `BranchListOutput`, and `BranchDeleteOutput` are registered with the codegen cascade.
 - `rocky run --branch <name>` applies a previously-created branch by routing through existing shadow-mode machinery (internally `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`.
-- `rocky replay <run_id|latest>` surfaces the state store's `RunRecord` — per-model SQL hash, row counts, bytes, and timings as captured at execution time. Optional `--model` filter. Inspection-only; re-execution with pinned inputs is a follow-up once the content-addressed write path arrives.
+- `rocky replay <run_id|latest>` surfaces the state store's `RunRecord` — per-model SQL hash, row counts, bytes, and timings as captured at execution time. Optional `--model` filter. Inspection-only.
 
-### Deferred
+### Added — Trust-system Arc 2 (first wave) · #171
 
-- Warehouse-native clone (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) — schema-prefix branches work uniformly across every adapter today; native clone is a follow-up when branch-on-disk-state guarantees are needed.
-- `rocky replay` re-execution — waits on the content-addressed write path from the Arc 1 storage spike.
+- `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
+- `[budget]` block in `rocky.toml` declares run-level cost / row / byte limits with `on_breach = "warn" | "error"` semantics.
+- `budget_breach` PipelineEvent + `HookEvent::BudgetBreach` fire when limits trip; non-zero exit code on `on_breach = "error"`.
+
+### Added — Trust-system Arc 3 (first wave) · #172
+
+- Three-state `CircuitBreaker` (Closed / Open / HalfOpen) with timed auto-recovery — Databricks + Snowflake adapters consolidated onto a single shared implementation in `rocky_core::poison`.
+- New `circuit_breaker_tripped` / `_recovered` PipelineEvents emitted via `TransitionOutcome` so observers see state transitions in real time.
+
+### Added — Trust-system Arc 4 (first wave) · #173
+
+- `rocky trace <run_id|latest>` renders a Gantt timeline of a run with lane assignment to fit parallel materializations on the terminal.
+- Feature-gated `otel` cascade wires `rocky_observe::otel::OtelExporter` via an `OtelGuard` RAII handle so `rocky run` exports OTLP metrics when built with `--features otel`.
+
+### Added — Trust-system Arc 5 (first wave) · #174
+
+- Schema-grounded prompt builder for `rocky ai`: AI requests now ship the project's typed model schema as context so first-attempt accuracy improves without an extra round-trip.
+- `rocky_ai::generate::ValidationContext` hook lets the AI generator typecheck against the live project before returning SQL.
+- `rocky ai --models <a,b,c>` flag scopes prompt context to a subset of models.
+
+### Added — Trust-system Arc 6 (first wave) · #184
+
+- `rocky compile --target-dialect <dbx|sf|bq|duckdb>` rejects SQL constructs that don't run on the chosen warehouse, emitting error-severity **P001** diagnostics. AST-based (sqlparser visitor) catalog mirrors what `rocky_sql::transpile` already knows about: NVL / IFNULL / DATEADD / DATE_ADD / TO_VARCHAR / LEN / CHARINDEX / ARRAY_SIZE / DATE_FORMAT / QUALIFY / ILIKE / FLATTEN.
+
+### Added — Trust-system Arc 7 (first wave) · #185
+
+- Always-on, warning-severity **P002** blast-radius lint for `SELECT *`. Fires when a model uses `SELECT *` AND a downstream model references specific columns of its output (leaf `SELECT *` is intentionally not flagged). Diagnostic names the affected downstream consumers + the columns they reference (capped at 3 per consumer for legibility), with an actionable suggestion to switch to an explicit column list. Wired in `rocky-compiler::compile_project` + `compile_incremental` so both CLI and LSP surfaces see it.
+
+### Added — Trust-system Arc 6 (wave 2) · #186
+
+- `[portability]` block in `rocky.toml` (top-level `target_dialect` + `allow` list) replaces the wave-1 flag-only UX with project-level configuration.
+- Per-model SQL pragma `-- rocky-allow: NVL, QUALIFY` (case-insensitive, comma-separated) for targeted exemptions.
+- New generic `rocky-sql/src/pragma.rs` module so a future `[lints]` block driving P002 toggles reuses the same parser.
+- `Dialect` enum gains `Serialize / Deserialize / JsonSchema` (lowercase variants) so `target_dialect = "bigquery"` round-trips cleanly through TOML.
+- Precedence: CLI flag > `[portability] target_dialect` config > unset.
+
+### Added — Trust-system Arc 7 (wave 2 wave-1) · #187
+
+- Opt-in `rocky compile --with-seed` flag runs the project's `data/seed.sql` against an in-memory DuckDB and uses `information_schema` as the source-of-truth for `source_schemas`. Leaf `.sql` models pick up real types instead of `Unknown`. Reuses the existing sync `DuckDbConnector` + one `information_schema.columns` round-trip; feature-gated behind `duckdb`.
+- Trust outcome verified on the playground default POC: `raw_orders.incrementality_hint` confidence jumps from `medium` (1 signal: name pattern) to `high` (2 signals — including "column type is temporal (Date), suitable as a watermark," impossible without typed source).
+
+### Fixed · #169
+
+- `engine/install.sh` and `engine/install.ps1` now resolve "latest" by semver instead of lexicographic order across the `engine-v*` tag namespace.
+
+### Deferred (carry forward from this release)
+
+- Arc 1 wave 2: warehouse-native clone (Delta `SHALLOW CLONE`, Snowflake zero-copy); `rocky replay` re-execution; `rocky branch compare`; Exp 4 live spike.
+- Arc 2 wave 2: per-model budgets; adapter-reported `bytes_scanned` plumbing for BigQuery cost; PR cost-projection GitHub Action; `rocky cost` historical command.
+- Arc 3 wave 2: event→hook bridge so adapter-emitted events fire configured hooks; transactional checkpoint atomicity audit.
+- Arc 4 wave 2: OTel *span* coverage on `HookEvent::Before/AfterMaterialize` sites; freshness SLO enforcement; Dagster UI timeline hook.
+- Arc 5 wave 2: auto-fix suggestions on failed runs; contract-aware generation; typechecker tightening so the validator becomes a hard gate.
+- Arc 6 wave 3: lint on expanded SQL when `--expand-macros` is set; sharper source spans (per-construct byte offsets).
+- Arc 7 wave 2 wave-2: cached `DESCRIBE TABLE` from `rocky discover`/`run` flowing into compile (real-warehouse audience); needs design pass for new persistent cache + invalidation.
 
 ## [1.10.0] — 2026-04-20
 
