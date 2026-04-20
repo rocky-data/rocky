@@ -135,6 +135,7 @@ Observability infrastructure.
 - **metrics.rs** — In-process metrics collection: counters (tables processed/failed, statements executed, retries, anomalies) and duration histograms (p50/p95/max for tables and queries). Thread-safe via atomics, serialized to JSON in run output.
 - **tracing.rs** — Structured JSON logging via the `tracing` crate
 - **events.rs** — Event broadcasting over Valkey Pub/Sub for real-time monitoring
+- **otel.rs** — Feature-gated OpenTelemetry exporter. When the engine is built with `--features otel`, `rocky run` exports in-process metrics as OTLP via an `OtelGuard` RAII handle. Send metrics to any OTLP-compatible collector (Honeycomb, Datadog, Grafana Tempo, Prometheus via the OTel collector) without bespoke integration code.
 
 ### rocky-lang
 

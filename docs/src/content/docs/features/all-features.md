@@ -52,6 +52,16 @@ Partition-keyed materialization with:
 - **SELECT * expansion** with deduplication
 - **Parallel type checking** via rayon across DAG execution layers
 - **Data contracts** with required columns, protected columns (prevent removal), allowed type changes (widening whitelist), and nullability constraints
+- **Seeded type inference**: `rocky compile --with-seed` runs `data/seed.sql` through an in-memory DuckDB so leaf `.sql` models pick up real source types instead of `Unknown`
+
+## Linters
+
+- **P001 dialect portability** — opt-in lint rejecting SQL that won't run on the chosen target (`databricks` / `snowflake` / `bigquery` / `duckdb`). Catches `NVL`, `DATEADD`, `QUALIFY`, `ILIKE`, `FLATTEN`, and friends.
+- **P002 blast-radius `SELECT *`** — always-on warning when a model uses `SELECT *` AND a downstream model references specific columns of its output. Leaf-model `SELECT *` is intentionally not flagged.
+- **Project-wide allow list** (`[portability] allow = [...]`) for blanket exemptions.
+- **Per-model `-- rocky-allow: CONSTRUCT, OTHER` pragma** for targeted opt-outs.
+
+Full reference: [Linters](/features/linters/).
 
 ## Column-Level Lineage
 
@@ -128,10 +138,10 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 ## CLI Commands (38+)
 
 ### Core Pipeline
-`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state`
+`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch`
 
 ### Modeling & Compilation
-`compile` · `lineage` · `test` · `ci` · `export-schemas`
+`compile` · `lineage` · `test` · `ci` · `ci-diff` · `export-schemas`
 
 ### AI
 `ai` (generate) · `ai-sync` · `ai-explain` · `ai-test`
@@ -140,7 +150,17 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 `playground` · `serve` · `lsp` · `init-adapter` · `test-adapter` · `import-dbt` · `validate-migration`
 
 ### Administration
-`doctor` · `history` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `bench` · `hooks list` · `hooks test`
+`doctor` · `history` · `replay` · `trace` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `bench` · `hooks list` · `hooks test`
+
+## Observability
+
+- **15-event hook lifecycle** — pipeline / discover / compile / per-model / per-table / checks / drift / anomaly / state-sync events fire through the hook registry. See [Hooks](/concepts/hooks/).
+- **`rocky trace <run_id|latest>`** — Gantt-style timeline of a completed run with concurrency lanes, rendered from the state-store `RunRecord`.
+- **`rocky replay <run_id|latest>`** — flat per-model dump of SQL hashes, row counts, bytes, and timings captured at execution time.
+- **Timed half-open circuit breaker** — three-state (`Closed` / `Open` / `HalfOpen`) breaker shared across Databricks + Snowflake adapters. Fires `circuit_breaker_tripped` / `circuit_breaker_recovered` events.
+- **OTLP metrics export** (feature-gated via `--features otel`) — `rocky run` exports in-process counters and histograms to any OTLP-compatible collector.
+- **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` with `on_breach = "warn" | "error"`; fires `budget_breach` events. See [`[budget]`](/reference/configuration/#budget).
+- **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
 
 ## IDE / Language Server (11 capabilities)
 

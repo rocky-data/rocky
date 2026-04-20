@@ -101,7 +101,21 @@ rocky ai "monthly revenue by category" -o json
 }
 ```
 
-## 3. The Compile-Verify Loop
+## 3. Schema-Grounded Prompts
+
+Before sending your intent to the LLM, `rocky ai` compiles the project and injects the resulting typed schemas into the prompt. The LLM sees the real column names, types, and model graph — so generated code references columns that actually exist, with the types they actually have.
+
+```bash
+rocky ai "monthly revenue by category" --models models
+```
+
+`--models <PATH>` points at the directory to compile for grounding (default `models`). If the directory doesn't exist or fails to compile, `rocky ai` degrades gracefully to unschema'd generation rather than failing outright — the compile-verify loop (next section) still guards the output.
+
+A second mechanism runs after generation: `rocky ai`'s `ValidationContext` typechecks the candidate SQL against the live project graph. If the LLM references a model or column that doesn't exist, the diagnostic flows back into the compile-verify loop as retry feedback instead of reaching your files.
+
+Rocky's typechecker is lenient on unresolved columns today, so schema grounding in the prompt is the primary mechanism preventing hallucinated columns; project-aware validation catches hallucinated *model* references in the project graph.
+
+## 4. The Compile-Verify Loop
 
 This is Rocky's key safety mechanism for AI-generated code. Every generated model is compiled before it is shown to you:
 
@@ -137,7 +151,7 @@ If all attempts fail, Rocky reports the best attempt and the remaining errors. N
 
 LLMs occasionally generate plausible-looking SQL that is semantically wrong -- a column name that does not exist, a JOIN on mismatched types, or an aggregation without a GROUP BY. The compile-verify loop catches these errors before you see the output.
 
-## 4. Add Intent to Existing Models
+## 5. Add Intent to Existing Models
 
 Intent is a natural language description stored in the model's TOML config. It serves two purposes:
 1. **Documentation**: Explains what the model does in business terms
@@ -207,7 +221,7 @@ stg_orders: Stage raw Shopify orders selecting order_id, customer, date, amount.
 
 Review and refine the descriptions before saving. The AI-generated intent is a starting point -- you know your business domain better than the LLM.
 
-## 5. Schema Change Sync
+## 6. Schema Change Sync
 
 When upstream schemas change (columns renamed, types changed, new columns added), `rocky ai-sync` proposes updates to downstream models based on their stored intent.
 
@@ -283,7 +297,7 @@ Suppose an upstream model `stg_orders` renames `unit_price` to `unit_price_local
 3. Review the diff and apply with `--apply`
 4. `rocky compile` passes again
 
-## 6. Generate Test Assertions
+## 7. Generate Test Assertions
 
 `rocky ai-test` generates test assertions based on each model's SQL logic and intent:
 
@@ -341,7 +355,7 @@ Testing 12 models...
   Result: 12 passed, 0 failed
 ```
 
-## 7. Intent in the IDE
+## 8. Intent in the IDE
 
 When using the [VS Code extension](/guides/ide-setup/), models with intent get enhanced IDE features:
 
@@ -349,7 +363,7 @@ When using the [VS Code extension](/guides/ide-setup/), models with intent get e
 - **Document Symbols**: Intent appears as the first child of the model in the Outline panel
 - **Diagnostics**: The compiler warns when intent mentions columns that do not exist in the model's output schema
 
-## 8. Best Practices for Intent Descriptions
+## 9. Best Practices for Intent Descriptions
 
 Good intent descriptions make `ai-sync` and `ai-test` significantly more effective. Here are guidelines:
 
@@ -412,7 +426,7 @@ intent = "Revenue model."
 
 This is too vague for `ai-sync` to make intelligent update proposals or for `ai-test` to generate meaningful assertions.
 
-## 9. AI Commands Reference
+## 10. AI Commands Reference
 
 | Command | Description |
 |---|---|

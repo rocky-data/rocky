@@ -304,6 +304,7 @@ rocky run --filter <key=value> [flags]
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
+| `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`. |
 
 ### Pipeline Stages
 
@@ -376,10 +377,18 @@ rocky run --filter client=acme --shadow
 rocky compare --filter client=acme
 ```
 
+Or run against a named branch — the persistent, named analogue of `--shadow`:
+
+```bash
+rocky branch create fix-price --description "testing reprice migration"
+rocky run --filter client=acme --branch fix-price
+```
+
 ### Related Commands
 
 - [`rocky plan`](#rocky-plan) -- preview SQL before execution
 - [`rocky state`](#rocky-state) -- inspect watermarks after a run
+- [`rocky branch`](#rocky-branch) -- manage named branches
 - [`rocky history`](/reference/commands/administration/#rocky-history) -- view past runs
 
 ---
@@ -441,3 +450,66 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 - [`rocky run`](#rocky-run) -- update watermarks by executing the pipeline
 - [`rocky history`](/reference/commands/administration/#rocky-history) -- view run history
+
+---
+
+## `rocky branch`
+
+Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky run --branch <name>` is invoked, every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
+
+```bash
+rocky branch create <name> [--description <text>]
+rocky branch delete <name>
+rocky branch list
+rocky branch show <name>
+```
+
+Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
+
+### Examples
+
+Create, list, run against, and delete a branch:
+
+```bash
+rocky branch create fix-price --description "testing reprice migration"
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "branch create",
+  "branch": {
+    "name": "fix-price",
+    "schema_prefix": "branch__fix-price",
+    "created_by": "hugo",
+    "created_at": "2026-04-20T14:22:11+00:00",
+    "description": "testing reprice migration"
+  }
+}
+```
+
+```bash
+rocky branch list
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "branch list",
+  "total": 2,
+  "branches": [
+    { "name": "fix-price", "schema_prefix": "branch__fix-price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" },
+    { "name": "ingest-v2", "schema_prefix": "branch__ingest-v2", "created_by": "ci",   "created_at": "2026-04-18T09:05:00+00:00", "description": null }
+  ]
+}
+```
+
+```bash
+rocky run --filter client=acme --branch fix-price
+rocky branch delete fix-price
+```
+
+### Related Commands
+
+- [`rocky run`](#rocky-run) -- execute a pipeline against a branch via `--run --branch`
+- [`rocky compare`](/reference/cli/#rocky-compare) -- diff branch output against production

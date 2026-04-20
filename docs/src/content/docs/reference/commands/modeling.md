@@ -24,6 +24,9 @@ rocky compile [flags]
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--model <NAME>` | `string` | | Filter compilation to a single model by name. |
+| `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
+| `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/features/linters/). |
+| `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
 
 ### Examples
 
@@ -35,7 +38,7 @@ rocky compile
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.11.0",
   "command": "compile",
   "models": 14,
   "execution_layers": 4,
@@ -81,6 +84,40 @@ Compile models from a non-default directory:
 rocky compile --models src/transformations/
 ```
 
+Reject SQL that won't run on BigQuery (P001 dialect-portability lint):
+
+```bash
+rocky compile --target-dialect bq
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "compile",
+  "has_errors": true,
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "P001",
+      "model": "fct_revenue",
+      "message": "NVL is not portable to BigQuery (supported by: Snowflake, Databricks)",
+      "span": { "file": "models/fct_revenue.sql", "line": 1, "col": 1 },
+      "suggestion": "use COALESCE"
+    }
+  ]
+}
+```
+
+Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs — see [Portability linting](/features/linters/#p001--dialect-portability).
+
+Compile with seeded source schemas so leaf `.sql` models pick up real types:
+
+```bash
+rocky compile --with-seed
+```
+
+`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so downstream incrementality and type-inference get concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+
 ### Related Commands
 
 - [`rocky lineage`](#rocky-lineage) -- trace column-level dependencies
@@ -111,6 +148,8 @@ rocky lineage <target> [flags]
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 | `--column <NAME>` | `string` | | Specific column to trace (alternative to `model.column` syntax). |
 | `--format <FORMAT>` | `string` | | Output format. Use `dot` for Graphviz DOT output. |
+| `--downstream` | `bool` | `false` | Walk the column-level graph forward (consumers) instead of backward (sources). Mutually exclusive with `--upstream`. |
+| `--upstream` | `bool` | `true` | Walk the column-level graph backward (sources). Default; the flag exists for explicitness in scripted callers. |
 
 ### Examples
 
@@ -186,6 +225,36 @@ Use the dot syntax shorthand:
 ```bash
 rocky lineage fct_revenue.revenue_amount --format dot | dot -Tpng -o lineage.png
 ```
+
+Walk downstream to see every consumer of a column — the answer to "what breaks if I change this?":
+
+```bash
+rocky lineage stg_orders.customer_id --downstream
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "lineage",
+  "model": "stg_orders",
+  "column": "customer_id",
+  "direction": "downstream",
+  "trace": [
+    {
+      "source": { "model": "stg_orders", "column": "customer_id" },
+      "target": { "model": "fct_revenue", "column": "customer_id" },
+      "transform": "direct"
+    },
+    {
+      "source": { "model": "fct_revenue", "column": "customer_id" },
+      "target": { "model": "mart_ltv",    "column": "customer_id" },
+      "transform": "direct"
+    }
+  ]
+}
+```
+
+Upstream output has `"direction": "upstream"` (the default shape, unchanged). The transitive walker is backed by an `edges_by_source_model` index so cost scales with fan-out rather than total edges.
 
 ### Related Commands
 
