@@ -1,0 +1,2 @@
+from raw_orders
+where status != "cancelled"
