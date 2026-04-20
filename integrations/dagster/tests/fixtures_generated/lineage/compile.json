@@ -15,6 +15,18 @@
       },
       "model": "stg_orders",
       "suggestion": null
+    },
+    {
+      "severity": "Warning",
+      "code": "P002",
+      "message": "SELECT * may silently propagate upstream schema changes to 1 downstream consumer: `fct_revenue` (customer_id, amount)",
+      "span": {
+        "file": "models/stg_orders.rocky",
+        "line": 1,
+        "col": 1
+      },
+      "model": "stg_orders",
+      "suggestion": "replace SELECT * with an explicit column list to make schema dependencies visible"
     }
   ],
   "has_errors": false,
