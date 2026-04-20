@@ -92,6 +92,41 @@ class BindingType(StrEnum):
     READ_ONLY = "READ_ONLY"
 
 
+class BudgetBreachAction(StrEnum):
+    """
+    What to do when a [`BudgetConfig`] limit is exceeded by an actual run.
+
+    `Warn` always fires the `budget_breach` event; `Error` additionally causes `rocky run` to exit with a non-zero status so orchestrators can gate downstream work on the breach.
+    """
+
+    warn = "warn"
+    error = "error"
+
+
+class BudgetConfig(BaseModel):
+    """
+    Declarative run-level budget for cost, duration, and (future) data volume. All limits are optional; when unset the dimension is not enforced.
+
+    A breach is detected at end of run by comparing [`BudgetConfig`] against the observed [`crate::cost::compute_observed_cost_usd`] total and the run wall clock. Per-model budgets are deferred to a later wave — the first iteration enforces run-level totals only.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_duration_ms: conint(ge=0) | None = None
+    """
+    Maximum allowed run wall-clock duration in milliseconds.
+    """
+    max_usd: float | None = None
+    """
+    Maximum allowed run cost in USD. When set and exceeded, emits `budget_breach` on the event bus; when paired with `on_breach = "error"`, also fails the run.
+    """
+    on_breach: BudgetBreachAction | None = "warn"
+    """
+    What to do when a limit is breached. Defaults to `warn` — fire the event, keep the run successful. Set to `error` to fail the run.
+    """
+
+
 class CompositeKind1(StrEnum):
     """
     `(col1, col2, ...)` is unique across all rows.
@@ -2015,6 +2050,13 @@ class RockyConfig(BaseModel):
     )
     """
     Named adapter configurations (keyed by adapter name).
+    """
+    budget: BudgetConfig | None = Field(
+        {"max_duration_ms": None, "max_usd": None, "on_breach": "warn"},
+        validate_default=True,
+    )
+    """
+    Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
     """
     cost: CostSection | None = Field(
         {

@@ -19,7 +19,8 @@
         "strategy": "incremental",
         "watermark": "2000-01-01T00:00:00Z",
         "target_table_full_name": "poc.staging__events.events"
-      }
+      },
+      "cost_usd": 0.0
     }
   ],
   "check_results": [],
@@ -57,5 +58,21 @@
     "tables_drifted": 0,
     "actions_taken": []
   },
-  "interrupted": false
+  "interrupted": false,
+  "cost_summary": {
+    "total_cost_usd": 0.0,
+    "total_duration_ms": 0,
+    "per_model": [
+      {
+        "asset_key": [
+          "duckdb",
+          "events",
+          "events"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      }
+    ],
+    "adapter_type": "duckdb"
+  }
 }

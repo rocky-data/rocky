@@ -100,6 +100,22 @@ impl WarehouseType {
             Self::DuckDb => WarehouseCostModel::duckdb(),
         }
     }
+
+    /// Parse a Rocky adapter `type` string into a [`WarehouseType`].
+    ///
+    /// Returns `None` for adapters that don't represent a billed warehouse
+    /// (e.g. `fivetran`, `airbyte` — source adapters that move data but
+    /// don't charge compute to us).
+    #[must_use]
+    pub fn from_adapter_type(s: &str) -> Option<Self> {
+        match s {
+            "databricks" => Some(Self::Databricks),
+            "snowflake" => Some(Self::Snowflake),
+            "bigquery" => Some(Self::BigQuery),
+            "duckdb" => Some(Self::DuckDb),
+            _ => None,
+        }
+    }
 }
 
 /// Per-operation pricing constants for a warehouse.
@@ -516,6 +532,77 @@ pub fn aggregate_project_cost(estimates: &HashMap<String, CostEstimate>) -> Cost
 }
 
 // ---------------------------------------------------------------------------
+// Observed cost (post-execution, per-adapter)
+// ---------------------------------------------------------------------------
+
+/// BigQuery on-demand pricing in USD per TB scanned. Hard-coded default
+/// (`$6.25/TB`) — matches the public price list; we expose this as a
+/// constant rather than a config knob until someone asks for per-region
+/// overrides.
+pub const BIGQUERY_USD_PER_TB_SCANNED: f64 = 6.25;
+
+/// DBU throughput per hour for a named warehouse size.
+///
+/// Numbers mirror Databricks SQL Warehouse sizing. Snowflake users can
+/// treat these as credits/hr with their own `cost_per_dbu` interpretation:
+/// the scaling curve differs (Snowflake doubles exactly, Databricks
+/// doesn't) but the order of magnitude holds for a wave-1 approximation.
+/// Unknown sizes fall back to `Medium` rather than failing — the trust
+/// outcome degrades gracefully to "directional cost estimate" instead of
+/// "no cost at all".
+#[must_use]
+pub fn warehouse_size_to_dbu_per_hour(size: &str) -> f64 {
+    match size.to_ascii_lowercase().as_str() {
+        "2x-small" | "2xsmall" => 4.0,
+        "x-small" | "xsmall" => 6.0,
+        "small" => 12.0,
+        "medium" => 24.0,
+        "large" => 40.0,
+        "x-large" | "xlarge" => 80.0,
+        "2x-large" | "2xlarge" => 144.0,
+        "3x-large" | "3xlarge" => 272.0,
+        "4x-large" | "4xlarge" => 528.0,
+        _ => 24.0,
+    }
+}
+
+/// Observed dollar cost of a single completed execution, computed from
+/// the measurements the adapter returned.
+///
+/// Unlike [`CostEstimate`] (which powers `rocky estimate` / `rocky
+/// optimize` before execution), this is a post-hoc number intended for
+/// `rocky run` cost attribution: given actual `duration_ms` and
+/// `bytes_scanned`, pick the right billing formula per warehouse.
+///
+/// - **Databricks / Snowflake**: duration-based. `cost = duration_hours *
+///   dbu_per_hour * cost_per_dbu`. DBU/credit throughput comes from
+///   [`warehouse_size_to_dbu_per_hour`]; the per-DBU rate comes from
+///   `[cost].compute_cost_per_dbu` in `rocky.toml`.
+/// - **BigQuery**: bytes-based. `cost = bytes_scanned / 1e12 *
+///   BIGQUERY_USD_PER_TB_SCANNED`. Returns `None` when `bytes_scanned`
+///   wasn't reported.
+/// - **DuckDB**: always `0.0` (local execution).
+#[must_use]
+pub fn compute_observed_cost_usd(
+    warehouse_type: WarehouseType,
+    bytes_scanned: Option<u64>,
+    duration_ms: u64,
+    dbu_per_hour: f64,
+    cost_per_dbu: f64,
+) -> Option<f64> {
+    match warehouse_type {
+        WarehouseType::Databricks | WarehouseType::Snowflake => {
+            let hours = duration_ms as f64 / 3_600_000.0;
+            Some(hours * dbu_per_hour * cost_per_dbu)
+        }
+        WarehouseType::BigQuery => {
+            bytes_scanned.map(|b| (b as f64 / 1.0e12) * BIGQUERY_USD_PER_TB_SCANNED)
+        }
+        WarehouseType::DuckDb => Some(0.0),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -800,6 +887,122 @@ mod tests {
         assert_eq!(json, "\"medium\"");
         let json = serde_json::to_string(&Confidence::Low).unwrap();
         assert_eq!(json, "\"low\"");
+    }
+
+    // -- Observed cost --------------------------------------------------------
+
+    #[test]
+    fn from_adapter_type_known_warehouses() {
+        assert_eq!(
+            WarehouseType::from_adapter_type("databricks"),
+            Some(WarehouseType::Databricks)
+        );
+        assert_eq!(
+            WarehouseType::from_adapter_type("snowflake"),
+            Some(WarehouseType::Snowflake)
+        );
+        assert_eq!(
+            WarehouseType::from_adapter_type("bigquery"),
+            Some(WarehouseType::BigQuery)
+        );
+        assert_eq!(
+            WarehouseType::from_adapter_type("duckdb"),
+            Some(WarehouseType::DuckDb)
+        );
+    }
+
+    #[test]
+    fn from_adapter_type_ignores_sources() {
+        // Source adapters don't represent a billed warehouse.
+        assert_eq!(WarehouseType::from_adapter_type("fivetran"), None);
+        assert_eq!(WarehouseType::from_adapter_type("airbyte"), None);
+        assert_eq!(WarehouseType::from_adapter_type(""), None);
+    }
+
+    #[test]
+    fn warehouse_size_mapping_is_monotone() {
+        let small = warehouse_size_to_dbu_per_hour("small");
+        let medium = warehouse_size_to_dbu_per_hour("medium");
+        let large = warehouse_size_to_dbu_per_hour("large");
+        assert!(small < medium);
+        assert!(medium < large);
+    }
+
+    #[test]
+    fn warehouse_size_is_case_insensitive_and_alias_tolerant() {
+        assert_eq!(warehouse_size_to_dbu_per_hour("Medium"), 24.0);
+        assert_eq!(warehouse_size_to_dbu_per_hour("MEDIUM"), 24.0);
+        assert_eq!(warehouse_size_to_dbu_per_hour("x-small"), 6.0);
+        assert_eq!(warehouse_size_to_dbu_per_hour("xsmall"), 6.0);
+    }
+
+    #[test]
+    fn warehouse_size_unknown_falls_back_to_medium() {
+        assert_eq!(warehouse_size_to_dbu_per_hour("nonsense"), 24.0);
+        assert_eq!(warehouse_size_to_dbu_per_hour(""), 24.0);
+    }
+
+    #[test]
+    fn observed_cost_duckdb_is_free() {
+        let cost =
+            compute_observed_cost_usd(WarehouseType::DuckDb, Some(1_000_000), 5_000, 24.0, 0.40);
+        assert_eq!(cost, Some(0.0));
+    }
+
+    #[test]
+    fn observed_cost_databricks_uses_duration() {
+        // 1 hour on a Medium (24 DBU/hr) at $0.40/DBU = $9.60.
+        let cost =
+            compute_observed_cost_usd(WarehouseType::Databricks, None, 3_600_000, 24.0, 0.40)
+                .unwrap();
+        assert!((cost - 9.60).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn observed_cost_databricks_ignores_bytes() {
+        // Whether bytes_scanned is set or not, Databricks cost depends only
+        // on duration.
+        let with_bytes = compute_observed_cost_usd(
+            WarehouseType::Databricks,
+            Some(10_000_000),
+            1_800_000, // 30 min
+            24.0,
+            0.40,
+        );
+        let without_bytes =
+            compute_observed_cost_usd(WarehouseType::Databricks, None, 1_800_000, 24.0, 0.40);
+        assert_eq!(with_bytes, without_bytes);
+    }
+
+    #[test]
+    fn observed_cost_bigquery_uses_bytes() {
+        // 1 TB scanned at $6.25/TB = $6.25.
+        let cost = compute_observed_cost_usd(
+            WarehouseType::BigQuery,
+            Some(1_000_000_000_000),
+            60_000,
+            24.0,
+            0.40,
+        )
+        .unwrap();
+        assert!((cost - 6.25).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn observed_cost_bigquery_none_without_bytes() {
+        let cost = compute_observed_cost_usd(WarehouseType::BigQuery, None, 60_000, 24.0, 0.40);
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn observed_cost_snowflake_scales_linearly_with_duration() {
+        let thirty_min =
+            compute_observed_cost_usd(WarehouseType::Snowflake, None, 1_800_000, 4.0, 2.00)
+                .unwrap();
+        let one_hour =
+            compute_observed_cost_usd(WarehouseType::Snowflake, None, 3_600_000, 4.0, 2.00)
+                .unwrap();
+        assert!((one_hour - 2.0 * thirty_min).abs() < 1.0e-9);
     }
 
     // -- DAG propagation -------------------------------------------------------

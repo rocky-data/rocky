@@ -922,6 +922,7 @@ mod tests {
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
             },
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         }

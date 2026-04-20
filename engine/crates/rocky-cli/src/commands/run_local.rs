@@ -671,6 +671,7 @@ pub async fn run_snapshot(
                 compile_time_ms: None,
             },
             partition: None,
+            cost_usd: None,
         });
     } else {
         output.tables_failed = 1;

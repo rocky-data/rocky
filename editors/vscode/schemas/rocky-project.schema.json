@@ -335,6 +335,49 @@
       ],
       "type": "string"
     },
+    "BudgetBreachAction": {
+      "description": "What to do when a [`BudgetConfig`] limit is exceeded by an actual run.\n\n`Warn` always fires the `budget_breach` event; `Error` additionally causes `rocky run` to exit with a non-zero status so orchestrators can gate downstream work on the breach.",
+      "enum": [
+        "warn",
+        "error"
+      ],
+      "type": "string"
+    },
+    "BudgetConfig": {
+      "additionalProperties": false,
+      "description": "Declarative run-level budget for cost, duration, and (future) data volume. All limits are optional; when unset the dimension is not enforced.\n\nA breach is detected at end of run by comparing [`BudgetConfig`] against the observed [`crate::cost::compute_observed_cost_usd`] total and the run wall clock. Per-model budgets are deferred to a later wave — the first iteration enforces run-level totals only.",
+      "properties": {
+        "max_duration_ms": {
+          "default": null,
+          "description": "Maximum allowed run wall-clock duration in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_usd": {
+          "default": null,
+          "description": "Maximum allowed run cost in USD. When set and exceeded, emits `budget_breach` on the event bus; when paired with `on_breach = \"error\"`, also fails the run.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "on_breach": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BudgetBreachAction"
+            }
+          ],
+          "default": "warn",
+          "description": "What to do when a limit is breached. Defaults to `warn` — fire the event, keep the run successful. Set to `error` to fail the run."
+        }
+      },
+      "type": "object"
+    },
     "ChecksConfig": {
       "additionalProperties": false,
       "description": "Data quality checks configuration (row count, column match, freshness, null rate, custom).",
@@ -2422,6 +2465,19 @@
       ],
       "default": {},
       "description": "Named adapter configurations (keyed by adapter name)."
+    },
+    "budget": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetConfig"
+        }
+      ],
+      "default": {
+        "max_duration_ms": null,
+        "max_usd": null,
+        "on_breach": "warn"
+      },
+      "description": "Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action."
     },
     "cost": {
       "allOf": [

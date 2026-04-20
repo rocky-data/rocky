@@ -20,6 +20,21 @@ class AnomalyOutput(BaseModel):
     table: str
 
 
+class BudgetBreachOutput(BaseModel):
+    """
+    One budget breach surfaced on [`RunOutput::budget_breaches`].
+
+    Kept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.
+    """
+
+    actual: float
+    limit: float
+    limit_type: str
+    """
+    Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+    """
+
+
 class DriftActionOutput(BaseModel):
     action: str
     reason: str
@@ -118,6 +133,22 @@ class MetricsSnapshot(BaseModel):
     tables_processed: conint(ge=0)
 
 
+class ModelCostEntry(BaseModel):
+    """
+    Per-model cost attribution entry inside [`RunCostSummary`].
+    """
+
+    asset_key: list[str]
+    """
+    Asset key path for the model this entry covers.
+    """
+    cost_usd: float | None = None
+    """
+    Observed cost for this materialization. `None` when the adapter type isn't billed or the formula couldn't be computed.
+    """
+    duration_ms: conint(ge=0)
+
+
 class PartitionInfo(BaseModel):
     """
     Partition window information for a single `time_interval` materialization.
@@ -193,6 +224,31 @@ class QuarantineOutput(BaseModel):
     valid_table: str
     """
     Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
+    """
+
+
+class RunCostSummary(BaseModel):
+    """
+    Aggregate cost attribution for a `rocky run` invocation.
+
+    The run finalizer walks every [`MaterializationOutput`] in [`RunOutput::materializations`], computes a per-model dollar cost using [`rocky_core::cost::compute_observed_cost_usd`], and stuffs the totals here. Consumers (Dagster, custom dashboards) can then read either the per-model breakdown or the run total without re-deriving the cost model themselves.
+    """
+
+    adapter_type: str
+    """
+    Adapter type the cost formula was parameterised against, for audit. Values mirror `AdapterConfig.type`: "databricks", "snowflake", "bigquery", "duckdb".
+    """
+    per_model: list[ModelCostEntry]
+    """
+    Per-model cost attribution, ordered as in [`RunOutput::materializations`].
+    """
+    total_cost_usd: float | None = None
+    """
+    Sum of every per-model `cost_usd` that produced a number. `None` when no materialization produced a cost.
+    """
+    total_duration_ms: conint(ge=0)
+    """
+    Wall-clock time summed across every materialization. Separate from [`RunOutput::duration_ms`] (which includes setup / governance overhead) so budget enforcement can target model-compute time specifically.
     """
 
 
@@ -327,6 +383,10 @@ class CheckResult6(BaseModel):
 
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
+    cost_usd: float | None = None
+    """
+    Observed dollar cost of this materialization, computed post-hoc from the adapter-appropriate formula (duration × DBU rate for Databricks/Snowflake, bytes × $/TB for BigQuery, zero for DuckDB). `None` when the warehouse type isn't billed or the adapter didn't report the inputs the formula needs. Populated by the run finalizer via `rocky_core::cost::compute_observed_cost_usd`.
+    """
     duration_ms: conint(ge=0)
     metadata: MaterializationMetadata
     partition: PartitionInfo | None = None
@@ -354,8 +414,16 @@ class RunOutput(BaseModel):
     """
 
     anomalies: list[AnomalyOutput]
+    budget_breaches: list[BudgetBreachOutput] | None = None
+    """
+    Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
+    """
     check_results: list[TableCheckOutput]
     command: str
+    cost_summary: RunCostSummary | None = None
+    """
+    Aggregate cost attribution across every materialization in this run (per-model entries + run totals). `None` for DuckDB-only pipelines or when no materializations produced a cost number.
+    """
     drift: DriftSummary
     duration_ms: conint(ge=0)
     errors: list[TableErrorOutput]

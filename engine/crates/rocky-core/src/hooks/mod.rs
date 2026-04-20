@@ -76,6 +76,9 @@ pub enum HookEvent {
     DriftDetected,
     AnomalyDetected,
     StateSynced,
+
+    // Budget lifecycle (Arc 2)
+    BudgetBreach,
 }
 
 impl HookEvent {
@@ -99,6 +102,7 @@ impl HookEvent {
             Self::DriftDetected => "on_drift_detected",
             Self::AnomalyDetected => "on_anomaly_detected",
             Self::StateSynced => "on_state_synced",
+            Self::BudgetBreach => "on_budget_breach",
         }
     }
 
@@ -122,6 +126,7 @@ impl HookEvent {
             "on_drift_detected" => Some(Self::DriftDetected),
             "on_anomaly_detected" => Some(Self::AnomalyDetected),
             "on_state_synced" => Some(Self::StateSynced),
+            "on_budget_breach" => Some(Self::BudgetBreach),
             _ => None,
         }
     }
@@ -146,6 +151,7 @@ impl HookEvent {
             Self::DriftDetected,
             Self::AnomalyDetected,
             Self::StateSynced,
+            Self::BudgetBreach,
         ]
     }
 }
@@ -409,6 +415,39 @@ impl HookContext {
 
     pub fn state_synced(run_id: &str, pipeline: &str) -> Self {
         Self::new(HookEvent::StateSynced, run_id, pipeline)
+    }
+
+    // -- Budget lifecycle builders (Arc 2) --
+
+    /// Build a [`HookContext`] for a run-level budget breach.
+    ///
+    /// `limit_type` is the stable tag string (e.g. `"max_usd"`,
+    /// `"max_duration_ms"`) that
+    /// [`crate::config::BudgetLimitType::as_str`] emits. `limit` is the
+    /// configured cap; `actual` is what the run observed. Both ride on
+    /// `metadata` so the existing shell-hook template engine can
+    /// interpolate them (`{{metadata.limit}}`, `{{metadata.actual}}`).
+    pub fn budget_breach(
+        run_id: &str,
+        pipeline: &str,
+        limit_type: &str,
+        limit: f64,
+        actual: f64,
+    ) -> Self {
+        let mut ctx = Self::new(HookEvent::BudgetBreach, run_id, pipeline);
+        ctx.metadata.insert(
+            "limit_type".to_string(),
+            serde_json::Value::String(limit_type.to_string()),
+        );
+        if let Some(limit_val) = serde_json::Number::from_f64(limit) {
+            ctx.metadata
+                .insert("limit".to_string(), serde_json::Value::Number(limit_val));
+        }
+        if let Some(actual_val) = serde_json::Number::from_f64(actual) {
+            ctx.metadata
+                .insert("actual".to_string(), serde_json::Value::Number(actual_val));
+        }
+        ctx
     }
 
     /// Creates a synthetic test context for `rocky hooks test`.

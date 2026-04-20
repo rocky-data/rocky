@@ -302,6 +302,7 @@ mod tests {
             pipelines: Default::default(),
             hooks: Default::default(),
             cost: Default::default(),
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         }
