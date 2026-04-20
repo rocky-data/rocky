@@ -162,6 +162,72 @@ pub struct RunOutput {
     /// Always serialised (even when `false`) so consumers don't have to
     /// treat its absence specially.
     pub interrupted: bool,
+    /// Aggregate cost attribution across every materialization in this
+    /// run (per-model entries + run totals). `None` for DuckDB-only
+    /// pipelines or when no materializations produced a cost number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_summary: Option<RunCostSummary>,
+    /// Budget breaches detected at end of run. Empty when no
+    /// `[budget]` block is configured or all configured limits were
+    /// respected. Each breach is also emitted as a `budget_breach`
+    /// [`rocky_observe::events::PipelineEvent`] and fires the
+    /// `on_budget_breach` hook so subscribers see them live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_breaches: Vec<BudgetBreachOutput>,
+}
+
+/// Per-model cost attribution entry inside [`RunCostSummary`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModelCostEntry {
+    /// Asset key path for the model this entry covers.
+    pub asset_key: Vec<String>,
+    pub duration_ms: u64,
+    /// Observed cost for this materialization. `None` when the adapter
+    /// type isn't billed or the formula couldn't be computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Aggregate cost attribution for a `rocky run` invocation.
+///
+/// The run finalizer walks every [`MaterializationOutput`] in
+/// [`RunOutput::materializations`], computes a per-model dollar cost
+/// using [`rocky_core::cost::compute_observed_cost_usd`], and stuffs the
+/// totals here. Consumers (Dagster, custom dashboards) can then read
+/// either the per-model breakdown or the run total without re-deriving
+/// the cost model themselves.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RunCostSummary {
+    /// Sum of every per-model `cost_usd` that produced a number.
+    /// `None` when no materialization produced a cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// Wall-clock time summed across every materialization. Separate
+    /// from [`RunOutput::duration_ms`] (which includes setup /
+    /// governance overhead) so budget enforcement can target
+    /// model-compute time specifically.
+    pub total_duration_ms: u64,
+    /// Per-model cost attribution, ordered as in
+    /// [`RunOutput::materializations`].
+    pub per_model: Vec<ModelCostEntry>,
+    /// Adapter type the cost formula was parameterised against, for
+    /// audit. Values mirror `AdapterConfig.type`: "databricks",
+    /// "snowflake", "bigquery", "duckdb".
+    pub adapter_type: String,
+}
+
+/// One budget breach surfaced on [`RunOutput::budget_breaches`].
+///
+/// Kept as a CLI-side struct (rather than re-using
+/// [`rocky_core::config::BudgetBreach`]) so the JSON schema lives
+/// alongside the other `rocky run` output types. The fields mirror
+/// `BudgetBreach` one-to-one.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BudgetBreachOutput {
+    /// Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+    pub limit_type: String,
+    pub limit: f64,
+    pub actual: f64,
 }
 
 fn is_zero(v: &usize) -> bool {
@@ -236,6 +302,15 @@ pub struct MaterializationOutput {
     /// strategies (full_refresh, incremental, merge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition: Option<PartitionInfo>,
+    /// Observed dollar cost of this materialization, computed post-hoc
+    /// from the adapter-appropriate formula (duration × DBU rate for
+    /// Databricks/Snowflake, bytes × $/TB for BigQuery, zero for
+    /// DuckDB). `None` when the warehouse type isn't billed or the
+    /// adapter didn't report the inputs the formula needs. Populated by
+    /// the run finalizer via
+    /// `rocky_core::cost::compute_observed_cost_usd`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1734,6 +1809,148 @@ impl RunOutput {
             },
             partition_summaries: vec![],
             interrupted: false,
+            cost_summary: None,
+            budget_breaches: vec![],
+        }
+    }
+
+    /// Walk every [`MaterializationOutput`] already pushed onto this
+    /// run, populate per-model `cost_usd` via the adapter-specific
+    /// formula, and aggregate the totals into [`RunCostSummary`].
+    ///
+    /// Always safe to call — no-op for unbilled adapters (fivetran,
+    /// airbyte), zero-cost for DuckDB, etc. Split from
+    /// [`RunOutput::check_and_record_budget`] so the interrupt path
+    /// can surface per-model cost without firing budget breach events
+    /// on partial work.
+    pub fn populate_cost_summary(
+        &mut self,
+        adapter_type: &str,
+        cost_cfg: &rocky_core::config::CostSection,
+    ) {
+        let Some(wh) = rocky_core::cost::WarehouseType::from_adapter_type(adapter_type) else {
+            return;
+        };
+
+        let dbu_per_hour =
+            rocky_core::cost::warehouse_size_to_dbu_per_hour(&cost_cfg.warehouse_size);
+        let cost_per_dbu = cost_cfg.compute_cost_per_dbu;
+
+        let mut per_model = Vec::with_capacity(self.materializations.len());
+        let mut any_cost_computed = false;
+        let mut total_cost = 0.0;
+        let mut total_duration_ms: u64 = 0;
+
+        for mat in &mut self.materializations {
+            // `bytes_scanned` is not yet plumbed into `MaterializationOutput`
+            // from the adapter layer — a later wave will wire
+            // Databricks's `result.manifest.total_byte_count` /
+            // Snowflake's `statistics.queryLoad` / BigQuery's
+            // `totalBytesProcessed` through. Until then BigQuery cost
+            // stays `None`; Databricks/Snowflake/DuckDB compute from
+            // `duration_ms` alone.
+            let cost = rocky_core::cost::compute_observed_cost_usd(
+                wh,
+                None,
+                mat.duration_ms,
+                dbu_per_hour,
+                cost_per_dbu,
+            );
+            mat.cost_usd = cost;
+            if let Some(c) = cost {
+                any_cost_computed = true;
+                total_cost += c;
+            }
+            total_duration_ms = total_duration_ms.saturating_add(mat.duration_ms);
+            per_model.push(ModelCostEntry {
+                asset_key: mat.asset_key.clone(),
+                duration_ms: mat.duration_ms,
+                cost_usd: cost,
+            });
+        }
+
+        let total_cost_usd = if any_cost_computed {
+            Some(total_cost)
+        } else {
+            None
+        };
+
+        self.cost_summary = Some(RunCostSummary {
+            total_cost_usd,
+            total_duration_ms,
+            per_model,
+            adapter_type: adapter_type.to_string(),
+        });
+    }
+
+    /// Run the [`rocky_core::config::BudgetConfig`] check against the
+    /// already-populated [`RunCostSummary`] and [`Self::duration_ms`].
+    ///
+    /// For each breached dimension, emits a `budget_breach`
+    /// [`rocky_observe::events::PipelineEvent`] on the global event bus
+    /// (so hook subscribers and Dagster see breaches live) and records
+    /// the breach on [`Self::budget_breaches`] (so JSON consumers can
+    /// read it synchronously).
+    ///
+    /// Returns `Err` when `budget_cfg.on_breach = "error"` and any
+    /// configured limit was exceeded. In every other case — including
+    /// `on_breach = "warn"` with a breach — returns `Ok(())` so the
+    /// event fires but the run still succeeds.
+    ///
+    /// No-op when [`rocky_core::config::BudgetConfig::is_unset`].
+    pub fn check_and_record_budget(
+        &mut self,
+        budget_cfg: &rocky_core::config::BudgetConfig,
+        run_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if budget_cfg.is_unset() {
+            return Ok(());
+        }
+
+        let observed_cost = self.cost_summary.as_ref().and_then(|s| s.total_cost_usd);
+        let breaches = budget_cfg.check_breaches(observed_cost, self.duration_ms);
+        if breaches.is_empty() {
+            return Ok(());
+        }
+
+        let bus = rocky_observe::events::global_event_bus();
+        for b in &breaches {
+            let mut evt = rocky_observe::events::PipelineEvent::new("budget_breach")
+                .with_metadata("limit_type", serde_json::json!(b.limit_type.as_str()))
+                .with_metadata("limit", serde_json::json!(b.limit))
+                .with_metadata("actual", serde_json::json!(b.actual));
+            if let Some(rid) = run_id {
+                evt = evt.with_run_id(rid);
+            }
+            bus.emit(evt);
+        }
+
+        self.budget_breaches = breaches
+            .iter()
+            .map(|b| BudgetBreachOutput {
+                limit_type: b.limit_type.as_str().to_string(),
+                limit: b.limit,
+                actual: b.actual,
+            })
+            .collect();
+
+        match budget_cfg.on_breach {
+            rocky_core::config::BudgetBreachAction::Warn => Ok(()),
+            rocky_core::config::BudgetBreachAction::Error => {
+                let joined = breaches
+                    .iter()
+                    .map(|b| {
+                        format!(
+                            "{}: actual {} > limit {}",
+                            b.limit_type.as_str(),
+                            b.actual,
+                            b.limit
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Err(anyhow::anyhow!("budget exceeded — {joined}"))
+            }
         }
     }
 }
@@ -1908,6 +2125,119 @@ pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(output)?;
     println!("{json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod cost_finalize_tests {
+    use super::*;
+    use rocky_core::config::{BudgetBreachAction, BudgetConfig, CostSection};
+
+    fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
+        MaterializationOutput {
+            asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            rows_copied: None,
+            duration_ms,
+            metadata: MaterializationMetadata {
+                strategy: "full_refresh".to_string(),
+                watermark: None,
+                target_table_full_name: None,
+                sql_hash: None,
+                column_count: None,
+                compile_time_ms: None,
+            },
+            partition: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn populate_cost_summary_no_op_on_unbilled_adapter() {
+        let mut out = RunOutput::new(String::new(), 1000, 1);
+        out.materializations.push(mat(&["a", "b", "c"], 1000));
+        out.populate_cost_summary("fivetran", &CostSection::default());
+        assert!(out.cost_summary.is_none(), "unbilled adapters skip cost");
+        assert!(out.materializations[0].cost_usd.is_none());
+    }
+
+    #[test]
+    fn populate_cost_summary_duckdb_is_zero() {
+        let mut out = RunOutput::new(String::new(), 1000, 1);
+        out.materializations.push(mat(&["a", "b"], 2000));
+        out.populate_cost_summary("duckdb", &CostSection::default());
+        let summary = out.cost_summary.as_ref().unwrap();
+        assert_eq!(summary.adapter_type, "duckdb");
+        assert_eq!(summary.total_duration_ms, 2000);
+        assert_eq!(summary.total_cost_usd, Some(0.0));
+        assert_eq!(summary.per_model.len(), 1);
+        assert_eq!(summary.per_model[0].cost_usd, Some(0.0));
+        assert_eq!(out.materializations[0].cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn populate_cost_summary_databricks_uses_duration() {
+        let mut out = RunOutput::new(String::new(), 3_600_000, 1);
+        out.materializations.push(mat(&["orders"], 1_800_000));
+        out.materializations.push(mat(&["customers"], 1_800_000));
+        let cost_cfg = CostSection {
+            storage_cost_per_gb_month: 0.023,
+            compute_cost_per_dbu: 0.40,
+            warehouse_size: "Medium".to_string(),
+            min_history_runs: 5,
+        };
+        out.populate_cost_summary("databricks", &cost_cfg);
+
+        let summary = out.cost_summary.as_ref().unwrap();
+        // 1 hr total on Medium (24 DBU/hr) at $0.40/DBU = $9.60.
+        let total = summary.total_cost_usd.unwrap();
+        assert!((total - 9.60).abs() < 1.0e-6, "total cost = {total}");
+        assert_eq!(summary.per_model.len(), 2);
+    }
+
+    #[test]
+    fn check_and_record_budget_noop_when_unset() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        let budget = BudgetConfig::default();
+        assert!(out.check_and_record_budget(&budget, None).is_ok());
+        assert!(out.budget_breaches.is_empty());
+    }
+
+    #[test]
+    fn check_and_record_budget_warn_flags_but_succeeds() {
+        let mut out = RunOutput::new(String::new(), 7_200_000, 1);
+        out.materializations.push(mat(&["huge"], 7_200_000));
+        out.populate_cost_summary(
+            "databricks",
+            &CostSection {
+                storage_cost_per_gb_month: 0.023,
+                compute_cost_per_dbu: 0.40,
+                warehouse_size: "Medium".to_string(),
+                min_history_runs: 5,
+            },
+        );
+        let budget = BudgetConfig {
+            max_usd: Some(5.0),
+            max_duration_ms: Some(60_000),
+            on_breach: BudgetBreachAction::Warn,
+        };
+        assert!(out.check_and_record_budget(&budget, Some("run-1")).is_ok());
+        assert_eq!(out.budget_breaches.len(), 2);
+    }
+
+    #[test]
+    fn check_and_record_budget_error_returns_err() {
+        let mut out = RunOutput::new(String::new(), 120_000, 1);
+        out.materializations.push(mat(&["over"], 120_000));
+        out.populate_cost_summary("duckdb", &CostSection::default());
+        let budget = BudgetConfig {
+            max_usd: None,
+            max_duration_ms: Some(60_000),
+            on_breach: BudgetBreachAction::Error,
+        };
+        let result = out.check_and_record_budget(&budget, None);
+        assert!(result.is_err(), "error mode must return Err on breach");
+        assert_eq!(out.budget_breaches.len(), 1);
+        assert_eq!(out.budget_breaches[0].limit_type, "max_duration_ms");
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,12 @@ export type RedactedString = string;
  */
 export type AdapterKind = "data" | "discovery";
 /**
+ * What to do when a [`BudgetConfig`] limit is exceeded by an actual run.
+ *
+ * `Warn` always fires the `budget_breach` event; `Error` additionally causes `rocky run` to exit with a non-zero status so orchestrators can gate downstream work on the breach.
+ */
+export type BudgetBreachAction = "warn" | "error";
+/**
  * Supports both single-webhook and multi-webhook syntax per event.
  *
  * Single: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`
@@ -274,6 +280,10 @@ export interface RockyConfig {
    */
   adapter?: AdaptersFieldSchema;
   /**
+   * Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
+   */
+  budget?: BudgetConfig;
+  /**
    * Cost estimation configuration.
    */
   cost?: CostSection;
@@ -412,6 +422,25 @@ export interface RetryConfig {
    * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * Declarative run-level budget for cost, duration, and (future) data volume. All limits are optional; when unset the dimension is not enforced.
+ *
+ * A breach is detected at end of run by comparing [`BudgetConfig`] against the observed [`crate::cost::compute_observed_cost_usd`] total and the run wall clock. Per-model budgets are deferred to a later wave — the first iteration enforces run-level totals only.
+ */
+export interface BudgetConfig {
+  /**
+   * Maximum allowed run wall-clock duration in milliseconds.
+   */
+  max_duration_ms?: number | null;
+  /**
+   * Maximum allowed run cost in USD. When set and exceeded, emits `budget_breach` on the event bus; when paired with `on_breach = "error"`, also fails the run.
+   */
+  max_usd?: number | null;
+  /**
+   * What to do when a limit is breached. Defaults to `warn` — fire the event, keep the run successful. Set to `error` to fail the run.
+   */
+  on_breach?: BudgetBreachAction & string;
 }
 /**
  * Cost estimation configuration.

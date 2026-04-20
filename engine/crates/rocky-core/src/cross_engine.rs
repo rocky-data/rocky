@@ -570,6 +570,7 @@ mod tests {
             pipelines: pipeline_map,
             hooks: Default::default(),
             cost: Default::default(),
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         }

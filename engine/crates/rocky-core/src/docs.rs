@@ -706,6 +706,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         };
@@ -775,6 +776,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         };
@@ -840,6 +842,7 @@ mod tests {
             pipelines: IndexMap::new(),
             hooks: Default::default(),
             cost: Default::default(),
+            budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
         };

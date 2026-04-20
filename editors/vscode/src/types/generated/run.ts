@@ -70,8 +70,16 @@ export type TestSeverity = "error" | "warning";
  */
 export interface RunOutput {
   anomalies: AnomalyOutput[];
+  /**
+   * Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
+   */
+  budget_breaches?: BudgetBreachOutput[];
   check_results: TableCheckOutput[];
   command: string;
+  /**
+   * Aggregate cost attribution across every materialization in this run (per-model entries + run totals). `None` for DuckDB-only pipelines or when no materializations produced a cost number.
+   */
+  cost_summary?: RunCostSummary | null;
   drift: DriftSummary;
   duration_ms: number;
   errors: TableErrorOutput[];
@@ -122,9 +130,62 @@ export interface AnomalyOutput {
   table: string;
   [k: string]: unknown;
 }
+/**
+ * One budget breach surfaced on [`RunOutput::budget_breaches`].
+ *
+ * Kept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.
+ */
+export interface BudgetBreachOutput {
+  actual: number;
+  limit: number;
+  /**
+   * Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+   */
+  limit_type: string;
+  [k: string]: unknown;
+}
 export interface TableCheckOutput {
   asset_key: string[];
   checks: CheckResult[];
+  [k: string]: unknown;
+}
+/**
+ * Aggregate cost attribution for a `rocky run` invocation.
+ *
+ * The run finalizer walks every [`MaterializationOutput`] in [`RunOutput::materializations`], computes a per-model dollar cost using [`rocky_core::cost::compute_observed_cost_usd`], and stuffs the totals here. Consumers (Dagster, custom dashboards) can then read either the per-model breakdown or the run total without re-deriving the cost model themselves.
+ */
+export interface RunCostSummary {
+  /**
+   * Adapter type the cost formula was parameterised against, for audit. Values mirror `AdapterConfig.type`: "databricks", "snowflake", "bigquery", "duckdb".
+   */
+  adapter_type: string;
+  /**
+   * Per-model cost attribution, ordered as in [`RunOutput::materializations`].
+   */
+  per_model: ModelCostEntry[];
+  /**
+   * Sum of every per-model `cost_usd` that produced a number. `None` when no materialization produced a cost.
+   */
+  total_cost_usd?: number | null;
+  /**
+   * Wall-clock time summed across every materialization. Separate from [`RunOutput::duration_ms`] (which includes setup / governance overhead) so budget enforcement can target model-compute time specifically.
+   */
+  total_duration_ms: number;
+  [k: string]: unknown;
+}
+/**
+ * Per-model cost attribution entry inside [`RunCostSummary`].
+ */
+export interface ModelCostEntry {
+  /**
+   * Asset key path for the model this entry covers.
+   */
+  asset_key: string[];
+  /**
+   * Observed cost for this materialization. `None` when the adapter type isn't billed or the formula couldn't be computed.
+   */
+  cost_usd?: number | null;
+  duration_ms: number;
   [k: string]: unknown;
 }
 export interface DriftSummary {
@@ -192,6 +253,10 @@ export interface ExecutionSummary {
 }
 export interface MaterializationOutput {
   asset_key: string[];
+  /**
+   * Observed dollar cost of this materialization, computed post-hoc from the adapter-appropriate formula (duration × DBU rate for Databricks/Snowflake, bytes × $/TB for BigQuery, zero for DuckDB). `None` when the warehouse type isn't billed or the adapter didn't report the inputs the formula needs. Populated by the run finalizer via `rocky_core::cost::compute_observed_cost_usd`.
+   */
+  cost_usd?: number | null;
   duration_ms: number;
   metadata: MaterializationMetadata;
   /**

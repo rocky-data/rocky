@@ -319,9 +319,19 @@ pub async fn run(
         .await?;
 
         output.duration_ms = start.elapsed().as_millis() as u64;
+
+        let adapter_type = rocky_cfg
+            .adapters
+            .get(&target_adapter_name)
+            .map(|a| a.adapter_type.clone())
+            .unwrap_or_default();
+        output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+        let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
         if output_json {
             print_json(&output)?;
         }
+        budget_result?;
         return Ok(());
     }
 
@@ -1506,6 +1516,17 @@ pub async fn run(
         }
 
         output.duration_ms = start.elapsed().as_millis() as u64;
+
+        // Populate cost summary on the interrupted output so orchestrators
+        // can see what the partial run cost. Skip the budget check — we
+        // don't want to fire `budget_breach` on partial work.
+        let adapter_type = rocky_cfg
+            .adapters
+            .get(&pipeline.target.adapter)
+            .map(|a| a.adapter_type.clone())
+            .unwrap_or_default();
+        output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+
         if output_json {
             print_json(&output)?;
         } else {
@@ -2089,6 +2110,32 @@ pub async fn run(
         })
         .collect();
 
+    // Populate per-model / per-run cost attribution and run the
+    // configured `[budget]` check. Populate always; propagate the
+    // budget error (if any) after the output has been printed so
+    // orchestrators still see the final JSON.
+    let adapter_type = rocky_cfg
+        .adapters
+        .get(&pipeline.target.adapter)
+        .map(|a| a.adapter_type.clone())
+        .unwrap_or_default();
+    output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+    let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+    // Fire the `on_budget_breach` hook for each recorded breach so
+    // shell hooks / webhooks configured via `[hook.on_budget_breach]`
+    // see the breach alongside the bus event.
+    for breach in &output.budget_breaches {
+        let _ = hook_registry
+            .fire(&HookContext::budget_breach(
+                &run_id,
+                pipeline_name,
+                &breach.limit_type,
+                breach.limit,
+                breach.actual,
+            ))
+            .await;
+    }
+
     // Dagster Pipes message emission. We emit at the END of the run
     // (not per-event during) so the streaming is batch-at-the-end
     // rather than truly live — that's a simplification of the full
@@ -2159,6 +2206,11 @@ pub async fn run(
         ))
         .await;
     let _ = hook_registry.wait_async_webhooks().await;
+
+    // Propagate budget breach error (if any) after the hooks have
+    // drained, so subscribers see the breach event before the CLI
+    // exits non-zero.
+    budget_result?;
 
     Ok(())
 }
@@ -2854,6 +2906,7 @@ async fn run_one_partition(
                 end: partition_plan.window.end,
                 batched_with: partition_plan.batch_with.clone(),
             }),
+            cost_usd: None,
         }),
     }
 }
@@ -3122,6 +3175,7 @@ async fn process_table(
             },
             // Replication tables are never time_interval; no partition info.
             partition: None,
+            cost_usd: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -3706,6 +3760,8 @@ mod tests {
             },
             partition_summaries: vec![],
             interrupted: false,
+            cost_summary: None,
+            budget_breaches: vec![],
         };
 
         emit_pipes_events(&emitter, &output);

@@ -19,7 +19,8 @@
         "strategy": "full_refresh",
         "watermark": "2000-01-01T00:00:00Z",
         "target_table_full_name": "poc.staging__orders.orders"
-      }
+      },
+      "cost_usd": 0.0
     },
     {
       "asset_key": [
@@ -40,7 +41,8 @@
         "key": "2026-04-04",
         "start": "2026-04-04T00:00:00Z",
         "end": "2026-04-05T00:00:00Z"
-      }
+      },
+      "cost_usd": 0.0
     },
     {
       "asset_key": [
@@ -61,7 +63,8 @@
         "key": "2026-04-05",
         "start": "2026-04-05T00:00:00Z",
         "end": "2026-04-06T00:00:00Z"
-      }
+      },
+      "cost_usd": 0.0
     },
     {
       "asset_key": [
@@ -82,7 +85,8 @@
         "key": "2026-04-06",
         "start": "2026-04-06T00:00:00Z",
         "end": "2026-04-07T00:00:00Z"
-      }
+      },
+      "cost_usd": 0.0
     },
     {
       "asset_key": [
@@ -103,7 +107,8 @@
         "key": "2026-04-07",
         "start": "2026-04-07T00:00:00Z",
         "end": "2026-04-08T00:00:00Z"
-      }
+      },
+      "cost_usd": 0.0
     },
     {
       "asset_key": [
@@ -124,7 +129,8 @@
         "key": "2026-04-08",
         "start": "2026-04-08T00:00:00Z",
         "end": "2026-04-09T00:00:00Z"
-      }
+      },
+      "cost_usd": 0.0
     }
   ],
   "check_results": [],
@@ -170,5 +176,66 @@
       "partitions_failed": 0
     }
   ],
-  "interrupted": false
+  "interrupted": false,
+  "cost_summary": {
+    "total_cost_usd": 0.0,
+    "total_duration_ms": 0,
+    "per_model": [
+      {
+        "asset_key": [
+          "duckdb",
+          "orders",
+          "orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      },
+      {
+        "asset_key": [
+          "",
+          "marts",
+          "fct_daily_orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      },
+      {
+        "asset_key": [
+          "",
+          "marts",
+          "fct_daily_orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      },
+      {
+        "asset_key": [
+          "",
+          "marts",
+          "fct_daily_orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      },
+      {
+        "asset_key": [
+          "",
+          "marts",
+          "fct_daily_orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      },
+      {
+        "asset_key": [
+          "",
+          "marts",
+          "fct_daily_orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      }
+    ],
+    "adapter_type": "duckdb"
+  }
 }

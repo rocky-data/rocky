@@ -987,6 +987,126 @@ impl Default for CostSection {
     }
 }
 
+/// What to do when a [`BudgetConfig`] limit is exceeded by an actual run.
+///
+/// `Warn` always fires the `budget_breach` event; `Error` additionally
+/// causes `rocky run` to exit with a non-zero status so orchestrators
+/// can gate downstream work on the breach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetBreachAction {
+    #[default]
+    Warn,
+    Error,
+}
+
+/// Declarative run-level budget for cost, duration, and (future) data
+/// volume. All limits are optional; when unset the dimension is not
+/// enforced.
+///
+/// A breach is detected at end of run by comparing [`BudgetConfig`]
+/// against the observed [`crate::cost::compute_observed_cost_usd`] total
+/// and the run wall clock. Per-model budgets are deferred to a later
+/// wave — the first iteration enforces run-level totals only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// Maximum allowed run cost in USD. When set and exceeded, emits
+    /// `budget_breach` on the event bus; when paired with
+    /// `on_breach = "error"`, also fails the run.
+    #[serde(default)]
+    pub max_usd: Option<f64>,
+
+    /// Maximum allowed run wall-clock duration in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+
+    /// What to do when a limit is breached. Defaults to `warn` — fire the
+    /// event, keep the run successful. Set to `error` to fail the run.
+    #[serde(default)]
+    pub on_breach: BudgetBreachAction,
+}
+
+impl BudgetConfig {
+    /// True when no limit is configured — skip budget checking entirely.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.max_usd.is_none() && self.max_duration_ms.is_none()
+    }
+
+    /// Compare observed totals against each configured limit.
+    ///
+    /// Returns one [`BudgetBreach`] per breached dimension; an empty
+    /// vector when within budget or when no limits are configured.
+    /// `observed_cost_usd` is `None` when the adapters didn't produce
+    /// enough data to compute a cost (e.g. BigQuery with no bytes
+    /// reported); in that case the cost dimension is skipped rather
+    /// than treated as zero.
+    #[must_use]
+    pub fn check_breaches(
+        &self,
+        observed_cost_usd: Option<f64>,
+        observed_duration_ms: u64,
+    ) -> Vec<BudgetBreach> {
+        let mut breaches = Vec::new();
+
+        if let (Some(limit), Some(actual)) = (self.max_usd, observed_cost_usd)
+            && actual > limit
+        {
+            breaches.push(BudgetBreach {
+                limit_type: BudgetLimitType::MaxUsd,
+                limit,
+                actual,
+            });
+        }
+
+        if let Some(limit) = self.max_duration_ms
+            && observed_duration_ms > limit
+        {
+            breaches.push(BudgetBreach {
+                limit_type: BudgetLimitType::MaxDurationMs,
+                limit: limit as f64,
+                actual: observed_duration_ms as f64,
+            });
+        }
+
+        breaches
+    }
+}
+
+/// Which budget limit was breached. Surfaced on [`BudgetBreach`] so
+/// subscribers can filter on a stable tag rather than string-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimitType {
+    MaxUsd,
+    MaxDurationMs,
+}
+
+impl BudgetLimitType {
+    /// String tag used in `budget_breach` [`crate::hooks`] / event
+    /// payload `limit_type` fields.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BudgetLimitType::MaxUsd => "max_usd",
+            BudgetLimitType::MaxDurationMs => "max_duration_ms",
+        }
+    }
+}
+
+/// One breached budget dimension from [`BudgetConfig::check_breaches`].
+///
+/// `limit` and `actual` are stored as `f64` so a single struct carries
+/// both the USD dimension (naturally `f64`) and the duration dimension
+/// (originally `u64` milliseconds, widened without loss up to 2^53).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BudgetBreach {
+    pub limit_type: BudgetLimitType,
+    pub limit: f64,
+    pub actual: f64,
+}
+
 /// Valkey/Redis cache configuration for distributed caching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
@@ -1164,6 +1284,11 @@ pub struct RockyConfig {
     /// Cost estimation configuration.
     #[serde(default)]
     pub cost: CostSection,
+
+    /// Declarative run-level budget. See [`BudgetConfig`] for the
+    /// semantics of each limit and the breach action.
+    #[serde(default)]
+    pub budget: BudgetConfig,
 
     /// Schema evolution configuration (grace-period column drops).
     #[serde(default)]
@@ -4734,5 +4859,96 @@ concurrency = "turbo"
         let fixed = ConcurrencyMode::Fixed(16);
         let json = serde_json::to_string(&fixed).unwrap();
         assert_eq!(json, "16");
+    }
+
+    // -- Budget ------------------------------------------------------------
+
+    #[test]
+    fn budget_defaults_are_unset() {
+        let cfg = BudgetConfig::default();
+        assert!(cfg.is_unset());
+        assert_eq!(cfg.on_breach, BudgetBreachAction::Warn);
+    }
+
+    #[test]
+    fn budget_parses_from_toml() {
+        let toml_str = r#"
+max_usd = 25.0
+max_duration_ms = 900000
+on_breach = "error"
+"#;
+        let cfg: BudgetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.max_usd, Some(25.0));
+        assert_eq!(cfg.max_duration_ms, Some(900_000));
+        assert_eq!(cfg.on_breach, BudgetBreachAction::Error);
+    }
+
+    #[test]
+    fn budget_rejects_unknown_fields() {
+        let toml_str = r#"
+max_usd = 10.0
+max_rows = 1000000
+"#;
+        let result: Result<BudgetConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn budget_check_breaches_empty_when_under_limits() {
+        let cfg = BudgetConfig {
+            max_usd: Some(10.0),
+            max_duration_ms: Some(60_000),
+            on_breach: BudgetBreachAction::Warn,
+        };
+        assert!(cfg.check_breaches(Some(9.0), 30_000).is_empty());
+    }
+
+    #[test]
+    fn budget_check_breaches_flags_usd_over() {
+        let cfg = BudgetConfig {
+            max_usd: Some(10.0),
+            max_duration_ms: None,
+            on_breach: BudgetBreachAction::Error,
+        };
+        let breaches = cfg.check_breaches(Some(15.0), 0);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, BudgetLimitType::MaxUsd);
+        assert_eq!(breaches[0].limit, 10.0);
+        assert_eq!(breaches[0].actual, 15.0);
+    }
+
+    #[test]
+    fn budget_check_breaches_flags_duration_over() {
+        let cfg = BudgetConfig {
+            max_usd: None,
+            max_duration_ms: Some(60_000),
+            on_breach: BudgetBreachAction::Warn,
+        };
+        let breaches = cfg.check_breaches(None, 120_000);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, BudgetLimitType::MaxDurationMs);
+    }
+
+    #[test]
+    fn budget_check_breaches_skips_usd_when_unknown() {
+        // When the adapters didn't produce enough data to compute cost,
+        // the USD dimension is skipped rather than treated as zero.
+        let cfg = BudgetConfig {
+            max_usd: Some(10.0),
+            max_duration_ms: None,
+            on_breach: BudgetBreachAction::Warn,
+        };
+        assert!(cfg.check_breaches(None, 0).is_empty());
+    }
+
+    #[test]
+    fn budget_check_breaches_handles_both_limits() {
+        let cfg = BudgetConfig {
+            max_usd: Some(5.0),
+            max_duration_ms: Some(60_000),
+            on_breach: BudgetBreachAction::Warn,
+        };
+        let breaches = cfg.check_breaches(Some(12.0), 90_000);
+        assert_eq!(breaches.len(), 2);
     }
 }
