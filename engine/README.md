@@ -1,12 +1,33 @@
 # Rocky
 
-A SQL transformation engine built in Rust. Type-safe compilation, column-level lineage, AI-powered intent, and a language server — for data pipelines that don't break.
+The **trust system for your data**. A Rust-based control plane for warehouse-side data pipelines: branches, replay, provable reproducibility, column-level lineage, compile-time safety, per-model cost attribution.
+
+Keep Databricks or Snowflake. Bring Rocky for the DAG.
+
+**Rocky is not a warehouse.** Storage and compute stay with your warehouse; Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
 
 No Jinja. No manifest. No parse step.
 
-## Why Rocky
+## Scope on the ELT spectrum
 
-Rocky replaces dbt's core responsibilities — DAG resolution, incremental logic, SQL generation, schema management — with a compiled, type-safe approach. Models are type-checked before execution, schema changes are detected automatically, and an AI intent layer keeps models synchronized when upstream schemas evolve. Rocky ships as a single binary with no runtime dependencies.
+| Stage | Rocky | Notes |
+|---|---|---|
+| Extract (SaaS sources) | — | Use Fivetran, Airbyte, Stitch, or warehouse-native CDC |
+| Extract (files) | ✅ | `rocky load` — CSV / Parquet / JSONL from a directory |
+| Load (bronze replication) | ✅ | Config-driven replication pipelines |
+| Transform | ✅ | Compiled SQL models |
+| Quality | ✅ | Inline assertions during `rocky run` |
+| Orchestration | Partial | First-class Dagster integration; `rocky serve` standalone |
+
+## The seven trust dimensions
+
+1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Git-grade workflow on a warehouse.
+2. **Cost attribution + budgets** — per-model cost on every run; `[budget]` block in `rocky.toml`; `budget_breach` hook event.
+3. **Resume + circuit breakers** — three-state `CircuitBreaker`, checkpointed run state, deploy safety.
+4. **Observability** — `rocky trace` Gantt output, OpenTelemetry OTLP export (feature-gated).
+5. **Schema-grounded AI** — every AI feature gated through the compiler; generated SQL type-checks before it lands.
+6. **Polyglot correctness** — dialect-divergence lint across Databricks / Snowflake / BigQuery / DuckDB.
+7. **SQL as first-class with types** — type inference over raw `.sql`, `SELECT *` blast-radius lint, DAG-aware refactoring.
 
 ## Quick start
 
@@ -26,6 +47,10 @@ The playground is self-contained: sample models, contracts, and a DuckDB backend
 | Category | Capabilities |
 |----------|-------------|
 | **Compiler** | Type checking, column-level lineage, data contracts, DAG resolution, diagnostics with suggestions |
+| **Branches** | `rocky branch create`/`delete`/`list`/`show`, `rocky run --branch`, `rocky replay <run_id>` |
+| **Cost** | Per-model cost attribution on every run, `[budget]` blocks, `budget_breach` hook event |
+| **Observability** | `rocky trace` Gantt output, OpenTelemetry OTLP export, structured JSON events |
+| **Portability** | Dialect-divergence lint across Databricks / Snowflake / BigQuery / DuckDB |
 | **DSL** | Pipeline-oriented `.rocky` syntax — optional, models stay plain SQL by default |
 | **AI** | Intent metadata, schema-sync, intent extraction, test generation |
 | **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |

@@ -9,7 +9,7 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A SQL transformation engine built in Rust. Type-safe compilation, column-level lineage, AI-powered intent, and a language server — for data pipelines that don't break.
+The **trust system for your data**. A Rust-based control plane for warehouse pipelines: branches, replay, column-level lineage, compile-time safety, per-model cost attribution. Keep Databricks or Snowflake. Bring Rocky for the DAG.
 
 ## Try it in 60 seconds
 
