@@ -5,9 +5,10 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use rocky_compiler::compile::{self, CompilerConfig};
+use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::incrementality;
+use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
 use rocky_sql::portability::{self, PortabilityIssue};
@@ -17,6 +18,7 @@ use rocky_sql::transpile::Dialect;
 use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
 /// Execute `rocky compile`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_compile(
     config_path: Option<&Path>,
     models_dir: &Path,
@@ -25,11 +27,24 @@ pub fn run_compile(
     output_json: bool,
     do_expand_macros: bool,
     target_dialect: Option<Dialect>,
+    with_seed: bool,
 ) -> Result<()> {
+    // Wave-1 of Arc 7 wave 2: when `--with-seed` is set, run the project's
+    // `data/seed.sql` against an in-memory DuckDB and use the resulting
+    // information_schema as the source-of-truth for `source_schemas`. This
+    // turns leaf .sql models from `RockyType::Unknown` into concrete types
+    // for any project that ships a runnable seed (the entire playground).
+    // Opt-in keeps the wave-1 fast-pure compile path intact.
+    let source_schemas = if with_seed {
+        load_source_schemas_from_seed(models_dir)?
+    } else {
+        HashMap::new()
+    };
+
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
-        source_schemas: HashMap::new(),
+        source_schemas,
         source_column_info: HashMap::new(),
     };
 
@@ -289,6 +304,92 @@ fn build_p001_diagnostic(
         .with_suggestion(issue.suggestion.clone())
 }
 
+/// Wave-1 of Arc 7 wave 2: load source schemas from a project's
+/// `data/seed.sql` by running it against an in-memory DuckDB.
+///
+/// Resolution: walks up from `models_dir` looking for `data/seed.sql`. The
+/// playground convention is `<project>/models/` + `<project>/data/seed.sql`,
+/// so the parent of `models_dir` is the standard place to look.
+///
+/// On any failure (missing file, seed-execution error, information_schema
+/// query error) returns an `anyhow` error with the full chain — surfaces
+/// to the user via the standard CLI error path. Silent fall-through would
+/// be worse here than a hard fail because the user explicitly opted in
+/// via `--with-seed`.
+///
+/// Result keys are `"<schema>.<table>"` — the same shape the SQL lineage
+/// extractor produces from a model's `FROM <schema>.<table>` clause, so
+/// the typecheck `typed_models` injection in
+/// `rocky-compiler/src/typecheck.rs:152` lands the type info on the path
+/// the producing-edge lookup walks.
+#[cfg(feature = "duckdb")]
+fn load_source_schemas_from_seed(models_dir: &Path) -> Result<HashMap<String, Vec<TypedColumn>>> {
+    use anyhow::Context;
+    use rocky_duckdb::DuckDbConnector;
+
+    let project_root = models_dir.parent().unwrap_or(Path::new("."));
+    let seed_path = project_root.join("data").join("seed.sql");
+    if !seed_path.is_file() {
+        anyhow::bail!(
+            "--with-seed requested but no seed file found at {}",
+            seed_path.display()
+        );
+    }
+
+    let seed_sql = std::fs::read_to_string(&seed_path)
+        .with_context(|| format!("failed to read seed file: {}", seed_path.display()))?;
+
+    // In-memory DuckDB; dropped at end of fn so no temp files leak.
+    let conn = DuckDbConnector::in_memory()
+        .map_err(|e| anyhow::anyhow!("failed to open in-memory DuckDB for --with-seed: {e}"))?;
+    conn.execute_statement(&seed_sql)
+        .map_err(|e| anyhow::anyhow!("seed execution failed for {}: {e}", seed_path.display()))?;
+
+    // One round-trip pulls every (schema, table, column, type, nullable)
+    // tuple. Filtering out DuckDB's internal schemas keeps the resulting
+    // map scoped to user-created tables.
+    let info_sql = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
+                    FROM information_schema.columns \
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
+                    ORDER BY table_schema, table_name, ordinal_position";
+    let result = conn
+        .execute_sql(info_sql)
+        .map_err(|e| anyhow::anyhow!("information_schema query failed: {e}"))?;
+
+    let mut by_table: HashMap<String, Vec<TypedColumn>> = HashMap::new();
+    for row in &result.rows {
+        let schema = row[0].as_str().unwrap_or_default();
+        let table = row[1].as_str().unwrap_or_default();
+        let column = row[2].as_str().unwrap_or_default();
+        let data_type = row[3].as_str().unwrap_or_default();
+        let nullable = row[4]
+            .as_str()
+            .map(|s| s.eq_ignore_ascii_case("yes") || s == "true" || s == "1")
+            .unwrap_or(true);
+
+        if schema.is_empty() || table.is_empty() || column.is_empty() {
+            continue;
+        }
+
+        let key = format!("{schema}.{table}");
+        by_table.entry(key).or_default().push(TypedColumn {
+            name: column.to_string(),
+            data_type: default_type_mapper(data_type),
+            nullable,
+        });
+    }
+
+    Ok(by_table)
+}
+
+/// Stub used when the binary is built without the `duckdb` feature. The
+/// flag exists in the clap definition unconditionally so feature-stripped
+/// builds give a clear error rather than a silent no-op.
+#[cfg(not(feature = "duckdb"))]
+fn load_source_schemas_from_seed(_models_dir: &Path) -> Result<HashMap<String, Vec<TypedColumn>>> {
+    anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +476,7 @@ schema_template = "s"
             true,
             false,
             Some(Dialect::BigQuery),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -391,7 +493,7 @@ schema_template = "s"
         write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
 
         // No target_dialect → no P001, compile succeeds.
-        run_compile(None, &models_dir, None, None, true, false, None)
+        run_compile(None, &models_dir, None, None, true, false, None, false)
             .expect("compile should succeed without lint");
     }
 
@@ -411,6 +513,7 @@ schema_template = "s"
             true,
             false,
             Some(Dialect::Snowflake),
+            false,
         )
         .expect("snowflake target should accept NVL");
     }
@@ -425,8 +528,17 @@ schema_template = "s"
         write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
         let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
 
-        let err =
-            run_compile(Some(&config), &models_dir, None, None, true, false, None).unwrap_err();
+        let err = run_compile(
+            Some(&config),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("compilation failed"),
             "config target_dialect should fire P001: {err}",
@@ -454,6 +566,7 @@ schema_template = "s"
             true,
             false,
             Some(Dialect::BigQuery),
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"));
@@ -471,8 +584,17 @@ schema_template = "s"
         );
 
         // Project-wide allow-list of NVL → no P001 → compile succeeds.
-        run_compile(Some(&config), &models_dir, None, None, true, false, None)
-            .expect("allow-listed NVL should not trip the lint");
+        run_compile(
+            Some(&config),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .expect("allow-listed NVL should not trip the lint");
     }
 
     #[test]
@@ -488,8 +610,17 @@ schema_template = "s"
         let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
 
         // Pragma exempts this model, so the lint should not fire.
-        run_compile(Some(&config), &models_dir, None, None, true, false, None)
-            .expect("pragma-exempted model should not trip the lint");
+        run_compile(
+            Some(&config),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .expect("pragma-exempted model should not trip the lint");
     }
 
     #[test]
@@ -506,8 +637,17 @@ schema_template = "s"
         write_model(&models_dir, "m2", "SELECT NVL(d, e) AS f FROM t");
         let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
 
-        let err =
-            run_compile(Some(&config), &models_dir, None, None, true, false, None).unwrap_err();
+        let err = run_compile(
+            Some(&config),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("compilation failed"),
             "m2 should still trip the lint: {err}",
@@ -532,7 +672,110 @@ schema_template = "s"
             true,
             false,
             None,
+            false,
         )
         .expect("missing config should fall through, not error");
+    }
+
+    // ---- Wave-1 of Arc 7 wave 2: --with-seed source-schema loading ----
+
+    #[cfg(feature = "duckdb")]
+    fn write_seed(project_dir: &Path, sql: &str) {
+        let data_dir = project_dir.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("seed.sql"), sql).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn with_seed_populates_source_schemas_for_leaf_model() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(
+            &models_dir,
+            "leaf",
+            "SELECT order_id, customer_id, amount FROM raw__orders.orders",
+        );
+        write_seed(
+            dir.path(),
+            "CREATE SCHEMA IF NOT EXISTS raw__orders;\n\
+             CREATE TABLE raw__orders.orders (\n\
+                order_id BIGINT,\n\
+                customer_id BIGINT,\n\
+                amount DECIMAL(10, 2)\n\
+             );\n",
+        );
+
+        // Compile with --with-seed: should succeed AND the leaf model's
+        // typed columns should pick up real types instead of Unknown.
+        // (We assert the bail-free path here; the typed-output assertion
+        // lives in compile_with_seed_resolves_unknown_types_to_concrete.)
+        run_compile(None, &models_dir, None, None, true, false, None, true)
+            .expect("with-seed compile should succeed");
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn with_seed_bails_when_seed_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "leaf", "SELECT 1 AS x");
+        // Note: no data/seed.sql written.
+
+        let err = run_compile(None, &models_dir, None, None, true, false, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--with-seed"), "msg: {msg}");
+        assert!(msg.contains("seed.sql"), "msg: {msg}");
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn with_seed_bails_when_seed_sql_invalid() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "leaf", "SELECT 1 AS x");
+        write_seed(dir.path(), "DEFINITELY NOT VALID SQL;");
+
+        let err = run_compile(None, &models_dir, None, None, true, false, None, true).unwrap_err();
+        assert!(
+            err.to_string().contains("seed execution failed"),
+            "msg: {err}",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn with_seed_resolves_unknown_types_to_concrete() {
+        // Build a project with a leaf model and inspect the typed output
+        // by going through the rocky-compiler API directly with the
+        // source_schemas the seed loader would produce.
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "leaf", "SELECT id, name FROM raw__users.users");
+        write_seed(
+            dir.path(),
+            "CREATE SCHEMA IF NOT EXISTS raw__users;\n\
+             CREATE TABLE raw__users.users (id BIGINT, name VARCHAR);\n",
+        );
+
+        let source_schemas = load_source_schemas_from_seed(&models_dir).unwrap();
+        let cols = source_schemas
+            .get("raw__users.users")
+            .expect("seed loader should produce raw__users.users entry");
+        assert_eq!(cols.len(), 2);
+        let by_name: HashMap<&str, &TypedColumn> =
+            cols.iter().map(|c| (c.name.as_str(), c)).collect();
+        assert!(matches!(
+            by_name["id"].data_type,
+            rocky_compiler::types::RockyType::Int64,
+        ));
+        assert!(matches!(
+            by_name["name"].data_type,
+            rocky_compiler::types::RockyType::String,
+        ));
     }
 }

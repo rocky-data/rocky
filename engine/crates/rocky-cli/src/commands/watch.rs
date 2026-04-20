@@ -108,6 +108,7 @@ fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_
         output_json,
         false,
         None,
+        false,
     ) {
         Ok(()) => {
             if !output_json {
