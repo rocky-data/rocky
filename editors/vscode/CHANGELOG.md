@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Trust-system Arc 1 types
+
+TypeScript interfaces for the four new engine schemas:
+
+- `BranchOutput` / `BranchEntry`, `BranchListOutput`, `BranchDeleteOutput`
+- `ReplayOutput` / `ReplayModelOutput`
+
+`ColumnLineageOutput` gains a `direction` field (`"upstream"` / `"downstream"`) — additive, no consumer changes required.
+
 ## [1.5.0] — 2026-04-20
 
 ### Added — Prefer the standalone `rocky-lsp` binary when available

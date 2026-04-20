@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Trust-system Arc 1 bindings
+
+Pydantic models for the four new engine schemas:
+
+- `BranchOutput` / `BranchEntry` (from `rocky branch create|show`)
+- `BranchListOutput` (from `rocky branch list`)
+- `BranchDeleteOutput` (from `rocky branch delete`)
+- `ReplayOutput` / `ReplayModelOutput` (from `rocky replay <run_id|latest>`)
+
+`ColumnLineageOutput` picks up a new `direction` field (`"upstream"` / `"downstream"`) — additive, no parsing changes for existing consumers.
+
 ## [1.6.0] — 2026-04-20
 
 ### Added — Regenerated Pydantic bindings for engine 1.10.0

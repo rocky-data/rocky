@@ -175,6 +175,11 @@ enum Command {
         /// Override schema for shadow tables (mutually exclusive with --shadow-suffix)
         #[arg(long)]
         shadow_schema: Option<String>,
+        /// Execute the run against a named branch created with `rocky branch
+        /// create`. Internally equivalent to `--shadow --shadow-schema
+        /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"])]
+        branch: Option<String>,
 
         // ----- time_interval partition selection (Phase 3) -----
         /// Run a single partition by canonical key (e.g. 2026-04-07 for daily,
@@ -866,6 +871,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             shadow,
             shadow_suffix,
             shadow_schema,
+            branch,
             partition,
             from,
             to,
@@ -892,8 +898,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 None => None,
             };
 
-            // Build shadow config if shadow mode is enabled
-            let shadow_config = if shadow {
+            // Resolve --branch to the same machinery as --shadow. clap
+            // guarantees branch can't coexist with `shadow` / `shadow_schema`.
+            let shadow_config = if let Some(name) = &branch {
+                let store = rocky_core::state::StateStore::open_read_only(&cli.state_path)
+                    .with_context(|| {
+                        format!("failed to open state store at {}", cli.state_path.display())
+                    })?;
+                let record = store.get_branch(name)?.with_context(|| {
+                    format!(
+                        "branch '{name}' not found — create it with `rocky branch create {name}`"
+                    )
+                })?;
+                Some(rocky_core::shadow::ShadowConfig {
+                    suffix: shadow_suffix,
+                    schema_override: Some(record.schema_prefix),
+                    cleanup_after: false,
+                })
+            } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
                     schema_override: shadow_schema,
