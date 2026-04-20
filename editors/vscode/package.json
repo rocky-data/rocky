@@ -418,7 +418,7 @@
     "glob": "^13.0.6",
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
-    "typescript": "^6.0.2",
+    "typescript": "^6.0.3",
     "typescript-eslint": "^8.58.2",
     "vitest": "^4.1.4"
   },
