@@ -178,6 +178,19 @@ class CostSection(BaseModel):
     """
 
 
+class Dialect(StrEnum):
+    """
+    Target dialect for transpilation.
+
+    Serializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.
+    """
+
+    databricks = "databricks"
+    snowflake = "snowflake"
+    bigquery = "bigquery"
+    duckdb = "duckdb"
+
+
 class DiscoveryConfig(BaseModel):
     """
     Discovery configuration within a pipeline source.
@@ -362,6 +375,26 @@ class Type17(StrEnum):
 
 class Type18(StrEnum):
     load = "load"
+
+
+class PortabilityConfig(BaseModel):
+    """
+    Project-wide dialect portability configuration.
+
+    Lives at the top level because a Rocky project targets one warehouse; per-pipeline overrides aren't supported yet (no demand signal). The `allow` list applies to every model — a per-model override is the `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed by [`rocky_sql::pragma`].
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    allow: list[str] | None = []
+    """
+    Project-wide allow-list of construct labels (case-insensitive, matched against `PortabilityIssue::construct`). Useful for blanket exemptions like `allow = ["QUALIFY"]` when a project standardizes on a specific extension. For per-model exemptions prefer the `-- rocky-allow: <construct>` pragma over expanding this list.
+    """
+    target_dialect: Dialect | None = None
+    """
+    Target dialect for the portability lint. When unset, no lint runs (matches the wave-1 "flag opt-in" behavior). The CLI flag overrides this if both are present.
+    """
 
 
 class Type19(StrEnum):
@@ -2097,6 +2130,12 @@ class RockyConfig(BaseModel):
     ) = Field({}, validate_default=True)
     """
     Named pipeline configurations (keyed by pipeline name).
+    """
+    portability: PortabilityConfig | None = Field(
+        {"allow": [], "target_dialect": None}, validate_default=True
+    )
+    """
+    Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
     """
     retry: RunRetryConfig | None = None
     """

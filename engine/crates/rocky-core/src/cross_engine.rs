@@ -573,6 +573,7 @@ mod tests {
             budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
+            portability: Default::default(),
         }
     }
 

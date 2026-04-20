@@ -556,6 +556,16 @@
       ],
       "type": "object"
     },
+    "Dialect": {
+      "description": "Target dialect for transpilation.\n\nSerializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.",
+      "enum": [
+        "databricks",
+        "snowflake",
+        "bigquery",
+        "duckdb"
+      ],
+      "type": "string"
+    },
     "DiscoveryConfig": {
       "additionalProperties": false,
       "description": "Discovery configuration within a pipeline source.",
@@ -1281,6 +1291,33 @@
         }
       ],
       "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
+    },
+    "PortabilityConfig": {
+      "additionalProperties": false,
+      "description": "Project-wide dialect portability configuration.\n\nLives at the top level because a Rocky project targets one warehouse; per-pipeline overrides aren't supported yet (no demand signal). The `allow` list applies to every model — a per-model override is the `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed by [`rocky_sql::pragma`].",
+      "properties": {
+        "allow": {
+          "default": [],
+          "description": "Project-wide allow-list of construct labels (case-insensitive, matched against `PortabilityIssue::construct`). Useful for blanket exemptions like `allow = [\"QUALIFY\"]` when a project standardizes on a specific extension. For per-model exemptions prefer the `-- rocky-allow: <construct>` pragma over expanding this list.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target_dialect": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Dialect"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Target dialect for the portability lint. When unset, no lint runs (matches the wave-1 \"flag opt-in\" behavior). The CLI flag overrides this if both are present."
+        }
+      },
+      "type": "object"
     },
     "QualityAssertion": {
       "description": "A single row-level assertion attached to a quality pipeline, scoped to one table in the pipeline's `tables` list.\n\n```toml [[pipeline.nightly_dq.checks.assertions]] name     = \"orders_customer_id_not_null\"  # optional table    = \"orders\" type     = \"not_null\" column   = \"customer_id\" severity = \"error\" ```\n\nThe `type`-specific fields (and `column`, `severity`) are flattened from `TestDecl` — the same surface used by declarative model tests.",
@@ -2523,6 +2560,18 @@
       ],
       "default": {},
       "description": "Named pipeline configurations (keyed by pipeline name)."
+    },
+    "portability": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PortabilityConfig"
+        }
+      ],
+      "default": {
+        "allow": [],
+        "target_dialect": null
+      },
+      "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
     },
     "retry": {
       "anyOf": [

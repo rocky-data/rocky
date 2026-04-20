@@ -263,6 +263,12 @@ export type BindingType = "READ_WRITE" | "READ_ONLY";
  */
 export type LoadFileFormat = "csv" | "parquet" | "json_lines";
 /**
+ * Target dialect for transpilation.
+ *
+ * Serializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.
+ */
+export type Dialect = "databricks" | "snowflake" | "bigquery" | "duckdb";
+/**
  * State storage backend variants.
  */
 export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
@@ -295,6 +301,10 @@ export interface RockyConfig {
    * Named pipeline configurations (keyed by pipeline name).
    */
   pipeline?: PipelinesFieldSchema;
+  /**
+   * Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
+   */
+  portability?: PortabilityConfig;
   /**
    * Run-level retry budget shared across every adapter for this run.
    *
@@ -1091,6 +1101,21 @@ export interface LoadTargetConfig {
    * Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).
    */
   table?: string | null;
+}
+/**
+ * Project-wide dialect portability configuration.
+ *
+ * Lives at the top level because a Rocky project targets one warehouse; per-pipeline overrides aren't supported yet (no demand signal). The `allow` list applies to every model — a per-model override is the `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed by [`rocky_sql::pragma`].
+ */
+export interface PortabilityConfig {
+  /**
+   * Project-wide allow-list of construct labels (case-insensitive, matched against `PortabilityIssue::construct`). Useful for blanket exemptions like `allow = ["QUALIFY"]` when a project standardizes on a specific extension. For per-model exemptions prefer the `-- rocky-allow: <construct>` pragma over expanding this list.
+   */
+  allow?: string[];
+  /**
+   * Target dialect for the portability lint. When unset, no lint runs (matches the wave-1 "flag opt-in" behavior). The CLI flag overrides this if both are present.
+   */
+  target_dialect?: Dialect | null;
 }
 /**
  * Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.

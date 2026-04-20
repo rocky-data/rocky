@@ -15,7 +15,24 @@
 //! be written natively.
 
 /// Target dialect for transpilation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so
+/// the long-form names can sit in `rocky.toml` under the `[portability]`
+/// block without translation. The CLI's short-form flag values
+/// (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the
+/// `TargetDialect` clap enum and convert to this type at the boundary.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Dialect {
     Databricks,
     Snowflake,

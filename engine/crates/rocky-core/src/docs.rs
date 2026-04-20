@@ -709,6 +709,7 @@ mod tests {
             budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
+            portability: Default::default(),
         };
 
         let models = vec![
@@ -779,6 +780,7 @@ mod tests {
             budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
+            portability: Default::default(),
         };
 
         let models = vec![Model {
@@ -845,6 +847,7 @@ mod tests {
             budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
+            portability: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);
