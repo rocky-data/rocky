@@ -61,6 +61,38 @@ pub struct TypedColumn {
     pub nullable: bool,
 }
 
+impl std::fmt::Display for RockyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RockyType::Boolean => f.write_str("BOOL"),
+            RockyType::Int32 => f.write_str("INT32"),
+            RockyType::Int64 => f.write_str("INT64"),
+            RockyType::Float32 => f.write_str("FLOAT32"),
+            RockyType::Float64 => f.write_str("FLOAT64"),
+            RockyType::Decimal { precision, scale } => write!(f, "DECIMAL({precision},{scale})"),
+            RockyType::String => f.write_str("STRING"),
+            RockyType::Date => f.write_str("DATE"),
+            RockyType::Timestamp => f.write_str("TIMESTAMP"),
+            RockyType::TimestampNtz => f.write_str("TIMESTAMP_NTZ"),
+            RockyType::Binary => f.write_str("BINARY"),
+            RockyType::Array(inner) => write!(f, "ARRAY<{inner}>"),
+            RockyType::Map(k, v) => write!(f, "MAP<{k},{v}>"),
+            RockyType::Struct(fields) => {
+                f.write_str("STRUCT<")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{}:{}", field.name, field.data_type)?;
+                }
+                f.write_str(">")
+            }
+            RockyType::Variant => f.write_str("VARIANT"),
+            RockyType::Unknown => f.write_str("?"),
+        }
+    }
+}
+
 impl RockyType {
     /// Returns true if this type is numeric (can participate in arithmetic).
     pub fn is_numeric(&self) -> bool {
@@ -274,6 +306,44 @@ mod tests {
         );
         assert!(!RockyType::String.is_numeric());
         assert!(!RockyType::Boolean.is_numeric());
+    }
+
+    #[test]
+    fn test_display_compact() {
+        assert_eq!(RockyType::Int64.to_string(), "INT64");
+        assert_eq!(
+            RockyType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+            .to_string(),
+            "DECIMAL(10,2)"
+        );
+        assert_eq!(
+            RockyType::Array(Box::new(RockyType::String)).to_string(),
+            "ARRAY<STRING>"
+        );
+        assert_eq!(
+            RockyType::Map(Box::new(RockyType::String), Box::new(RockyType::Int64)).to_string(),
+            "MAP<STRING,INT64>"
+        );
+        assert_eq!(
+            RockyType::Struct(vec![
+                StructField {
+                    name: "id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                },
+                StructField {
+                    name: "name".to_string(),
+                    data_type: RockyType::String,
+                    nullable: true,
+                },
+            ])
+            .to_string(),
+            "STRUCT<id:INT64,name:STRING>"
+        );
+        assert_eq!(RockyType::Unknown.to_string(), "?");
     }
 
     #[test]
