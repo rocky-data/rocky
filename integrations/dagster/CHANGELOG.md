@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-04-20
+
+Tracks engine 1.11.0. Regenerated Pydantic bindings for the trust-system arcs (Arcs 1–7 first waves + Arc 6 wave 2 + Arc 7 wave 2 wave-1).
+
 ### Added — Trust-system Arc 1 bindings
 
 Pydantic models for the four new engine schemas:
@@ -17,6 +21,35 @@ Pydantic models for the four new engine schemas:
 - `ReplayOutput` / `ReplayModelOutput` (from `rocky replay <run_id|latest>`)
 
 `ColumnLineageOutput` picks up a new `direction` field (`"upstream"` / `"downstream"`) — additive, no parsing changes for existing consumers.
+
+### Added — Trust-system Arc 2 bindings
+
+- `RunOutput.cost_summary` and per-materialization `cost_usd` flow through the regenerated `RunOutput` model.
+- `BudgetConfig` (from `rocky.toml [budget]`) and the `budget_breach` PipelineEvent shape are now typed.
+
+### Added — Trust-system Arc 3 bindings
+
+- `circuit_breaker_tripped` / `_recovered` PipelineEvent variants in the regenerated event union.
+
+### Added — Trust-system Arc 4 bindings
+
+- `TraceOutput` / `TraceLane` / `TraceMaterialization` typed shape for `rocky trace <run_id|latest>` JSON consumers.
+
+### Added — Trust-system Arc 5 bindings
+
+- `AiGenerateOutput.models` field for scoped AI prompt context.
+
+### Added — Trust-system Arc 6 wave 2 bindings
+
+- `PortabilityConfig` (from `[portability]` block) added to the `RockyProject` schema. Lowercase `Dialect` enum (`databricks` / `snowflake` / `bigquery` / `duckdb`) round-trips through the `target_dialect` field.
+
+### Added — Trust-system Arc 7 wave 2 wave-1 bindings
+
+- No new schemas; `--with-seed` is a CLI-only flag that doesn't change any output struct shape. Bindings unchanged for this PR.
+
+### Note
+
+Arc 6 wave 1 (P001) and Arc 7 wave 1 (P002) emit diagnostics that flow through the existing `Diagnostic` shape — no new Pydantic models needed. Codes `P001` (error) and `P002` (warning) appear in the `code` field as plain strings.
 
 ## [1.6.0] — 2026-04-20
 
