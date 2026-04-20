@@ -19,7 +19,7 @@
     {
       "severity": "Warning",
       "code": "P002",
-      "message": "SELECT * may silently propagate upstream schema changes to 1 downstream consumer: `fct_revenue` (customer_id, amount)",
+      "message": "SELECT * silently propagates upstream schema changes to 1 downstream consumer: `fct_revenue` (customer_id, amount)",
       "span": {
         "file": "models/stg_orders.rocky",
         "line": 1,

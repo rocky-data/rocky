@@ -80,7 +80,9 @@ impl Visitor for PortabilityVisitor {
                     construct: "ILIKE".to_string(),
                     supported_by: vec![Dialect::Snowflake, Dialect::DuckDB, Dialect::Databricks],
                     target: self.target,
-                    suggestion: "use LOWER(lhs) LIKE LOWER(pattern) for portable case-insensitive matching".to_string(),
+                    suggestion:
+                        "use LOWER(lhs) LIKE LOWER(pattern) for portable case-insensitive matching"
+                            .to_string(),
                 });
             }
             _ => {}
