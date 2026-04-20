@@ -1,6 +1,6 @@
 # Rocky — Agent Instructions
 
-Rocky is a Rust SQL transformation engine. It replaces dbt's core responsibilities (SQL generation, incremental logic, schema management) with a config-driven approach.
+Rocky is a Rust-based control plane for warehouse-side data pipelines — the trust system for your data. It owns the DAG: compile-time types, branches + replay, column-level lineage, drift handling, incremental logic, and cost attribution. Storage and compute stay with the warehouse (Databricks, Snowflake, BigQuery, DuckDB).
 
 ## Key Concepts
 

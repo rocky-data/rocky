@@ -1,8 +1,16 @@
 # Rocky
 
-> A compiled SQL transformation engine written in Rust. Replaces dbt's DAG resolution, incremental logic, SQL generation, and schema management with a type-safe, config-driven approach. No Jinja. No manifest. No parse step.
+> The trust system for your data. A Rust-based control plane for warehouse-side data pipelines: branches, replay, provable reproducibility, column-level lineage, compile-time safety, per-model cost attribution. Keep Databricks or Snowflake. Bring Rocky for the DAG.
 
-Rocky follows the ELT pattern: it operates on data already in the warehouse, landed by ingestion tools like Fivetran or Airbyte. Rocky owns the T (warehouse-side transformation and replication).
+Rocky is not a warehouse. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, DuckDB); Rocky owns the graph — dependencies, compile-time types, drift, incremental logic, lineage, cost. No Jinja, no manifest, no parse step.
+
+Scope on the ELT spectrum:
+- Extract (SaaS sources) — not Rocky; use Fivetran, Airbyte, Stitch, or warehouse-native CDC
+- Extract (files) — `rocky load` handles CSV / Parquet / JSONL from a directory
+- Load (bronze replication) — config-driven pipelines via Fivetran metadata / DuckDB information_schema / manual declaration
+- Transform — compiled SQL models
+- Quality — inline assertions during `rocky run`
+- Orchestration — first-class Dagster integration; `rocky serve` for standalone teams
 
 ## Architecture at a glance
 
