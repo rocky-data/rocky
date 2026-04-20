@@ -66,6 +66,15 @@ pub const I001: &str = "I001";
 /// Model compiled with SELECT *.
 pub const I002: &str = "I002";
 
+// Lints — portability + blast-radius
+/// Construct is not portable to the configured target dialect.
+/// Error severity, opt-in via `--target-dialect`. Emitted by the CLI.
+pub const P001: &str = "P001";
+/// `SELECT *` model has downstream consumers that reference specific
+/// columns of its output — a schema change in the star's source would
+/// silently propagate. Warning severity, always-on.
+pub const P002: &str = "P002";
+
 /// Severity level of a diagnostic.
 ///
 /// Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay

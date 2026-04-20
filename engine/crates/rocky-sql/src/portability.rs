@@ -75,15 +75,15 @@ impl Visitor for PortabilityVisitor {
                     self.issues.push(issue);
                 }
             }
-            Expr::ILike { .. } => {
-                if !supports_ilike(self.target) {
-                    self.issues.push(PortabilityIssue {
-                        construct: "ILIKE".to_string(),
-                        supported_by: vec![Dialect::Snowflake, Dialect::DuckDB, Dialect::Databricks],
-                        target: self.target,
-                        suggestion: "use LOWER(lhs) LIKE LOWER(pattern) for portable case-insensitive matching".to_string(),
-                    });
-                }
+            Expr::ILike { .. } if !supports_ilike(self.target) => {
+                self.issues.push(PortabilityIssue {
+                    construct: "ILIKE".to_string(),
+                    supported_by: vec![Dialect::Snowflake, Dialect::DuckDB, Dialect::Databricks],
+                    target: self.target,
+                    suggestion:
+                        "use LOWER(lhs) LIKE LOWER(pattern) for portable case-insensitive matching"
+                            .to_string(),
+                });
             }
             _ => {}
         }

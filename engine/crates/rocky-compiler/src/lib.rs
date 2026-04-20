@@ -8,6 +8,7 @@
 //! 5. **Compilation** — top-level `compile()` entry point
 
 pub mod arena;
+pub mod blast_radius;
 pub mod cache;
 pub mod compile;
 pub mod contracts;
