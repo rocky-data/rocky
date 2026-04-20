@@ -397,6 +397,10 @@ export interface RetryConfig {
    */
   backoff_multiplier?: number;
   /**
+   * Seconds the breaker will stay `Open` before a single trial request is allowed through (half-open state). On trial success the breaker closes and resumes normal traffic; on trial failure it re-opens immediately. `None` preserves the pre-Arc-3 "manual-reset-only" behaviour — a tripped breaker stays tripped for the rest of the run.
+   */
+  circuit_breaker_recovery_timeout_secs?: number | null;
+  /**
    * Circuit breaker: trip after this many consecutive transient failures across statements. Once tripped, all subsequent statements fail immediately without attempting execution. Default: 5. Set to 0 to disable.
    */
   circuit_breaker_threshold?: number;

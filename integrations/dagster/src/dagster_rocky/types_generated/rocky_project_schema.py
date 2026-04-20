@@ -464,6 +464,10 @@ class RetryConfig(BaseModel):
     """
     Backoff multiplier applied after each retry (e.g. 2.0 = double each time).
     """
+    circuit_breaker_recovery_timeout_secs: conint(ge=0) | None = None
+    """
+    Seconds the breaker will stay `Open` before a single trial request is allowed through (half-open state). On trial success the breaker closes and resumes normal traffic; on trial failure it re-opens immediately. `None` preserves the pre-Arc-3 "manual-reset-only" behaviour — a tripped breaker stays tripped for the rest of the run.
+    """
     circuit_breaker_threshold: conint(ge=0) | None = 5
     """
     Circuit breaker: trip after this many consecutive transient failures across statements. Once tripped, all subsequent statements fail immediately without attempting execution. Default: 5. Set to 0 to disable.
@@ -797,6 +801,7 @@ class AdapterConfig(BaseModel):
     retry: RetryConfig | None = Field(
         {
             "backoff_multiplier": 2.0,
+            "circuit_breaker_recovery_timeout_secs": None,
             "circuit_breaker_threshold": 5,
             "initial_backoff_ms": 1000,
             "jitter": True,

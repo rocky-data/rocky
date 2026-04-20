@@ -465,6 +465,14 @@ pub struct RetryConfig {
     /// Default: 5. Set to 0 to disable.
     #[serde(default = "default_circuit_breaker_threshold")]
     pub circuit_breaker_threshold: u32,
+    /// Seconds the breaker will stay `Open` before a single trial
+    /// request is allowed through (half-open state). On trial success
+    /// the breaker closes and resumes normal traffic; on trial failure
+    /// it re-opens immediately. `None` preserves the pre-Arc-3
+    /// "manual-reset-only" behaviour — a tripped breaker stays tripped
+    /// for the rest of the run.
+    #[serde(default)]
+    pub circuit_breaker_recovery_timeout_secs: Option<u64>,
     /// Cross-statement retry budget for a single run (§P2.7). When set,
     /// adapters construct a [`crate::retry_budget::RetryBudget`] from this
     /// value and decrement it on every retry; once exhausted, remaining
@@ -478,6 +486,23 @@ pub struct RetryConfig {
     pub max_retries_per_run: Option<u32>,
 }
 
+impl RetryConfig {
+    /// Build a [`crate::circuit_breaker::CircuitBreaker`] shaped by
+    /// this retry config. When `circuit_breaker_recovery_timeout_secs`
+    /// is set, the breaker is created with timed half-open recovery;
+    /// otherwise it is manual-reset only.
+    #[must_use]
+    pub fn build_circuit_breaker(&self) -> crate::circuit_breaker::CircuitBreaker {
+        match self.circuit_breaker_recovery_timeout_secs {
+            Some(secs) => crate::circuit_breaker::CircuitBreaker::with_recovery_timeout(
+                self.circuit_breaker_threshold,
+                std::time::Duration::from_secs(secs),
+            ),
+            None => crate::circuit_breaker::CircuitBreaker::new(self.circuit_breaker_threshold),
+        }
+    }
+}
+
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
@@ -487,6 +512,7 @@ impl Default for RetryConfig {
             backoff_multiplier: default_backoff_multiplier(),
             jitter: default_jitter(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            circuit_breaker_recovery_timeout_secs: None,
             max_retries_per_run: None,
         }
     }
