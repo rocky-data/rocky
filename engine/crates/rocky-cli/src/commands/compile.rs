@@ -6,9 +6,11 @@ use std::path::Path;
 use anyhow::Result;
 
 use rocky_compiler::compile::{self, CompilerConfig};
-use rocky_compiler::diagnostic::{self, Severity};
+use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::incrementality;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
+use rocky_sql::portability::{self, PortabilityIssue};
+use rocky_sql::transpile::Dialect;
 
 use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
@@ -19,6 +21,7 @@ pub fn run_compile(
     model_filter: Option<&str>,
     output_json: bool,
     do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
 ) -> Result<()> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -27,7 +30,27 @@ pub fn run_compile(
         source_column_info: HashMap::new(),
     };
 
-    let result = compile::compile(&config)?;
+    let mut result = compile::compile(&config)?;
+
+    // Portability lint. Opt-in via `--target-dialect`. Emits error-severity
+    // P001 diagnostics for constructs that don't run on the chosen target;
+    // the catalog mirrors what `rocky_sql::transpile` already knows about.
+    if let Some(dialect) = target_dialect {
+        let mut portability_errors = false;
+        for model in &result.project.models {
+            for issue in portability::detect_portability_issues(&model.sql, dialect) {
+                result.diagnostics.push(build_p001_diagnostic(
+                    &model.config.name,
+                    &model.file_path,
+                    &issue,
+                ));
+                portability_errors = true;
+            }
+        }
+        if portability_errors {
+            result.has_errors = true;
+        }
+    }
 
     // Load macros and expand model SQL when --expand-macros is set.
     let expanded_sql = if do_expand_macros {
@@ -209,4 +232,125 @@ pub fn run_compile(
     }
 
     Ok(())
+}
+
+/// Build an error-severity P001 diagnostic from a portability issue.
+///
+/// `file_path` is threaded into `SourceSpan` so the diagnostic shows up
+/// against the model file. We don't yet track per-construct byte offsets,
+/// so the span defaults to line 1 — wave 2 can sharpen this.
+fn build_p001_diagnostic(
+    model_name: &str,
+    file_path: &str,
+    issue: &PortabilityIssue,
+) -> Diagnostic {
+    let supported = issue
+        .supported_by
+        .iter()
+        .map(Dialect::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "{} is not portable to {} (supported by: {})",
+        issue.construct, issue.target, supported,
+    );
+    Diagnostic::error("P001", model_name, message)
+        .with_span(diagnostic::SourceSpan {
+            file: file_path.to_string(),
+            line: 1,
+            col: 1,
+        })
+        .with_suggestion(issue.suggestion.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_model(dir: &Path, name: &str, sql: &str) {
+        let sql_path = dir.join(format!("{name}.sql"));
+        let toml_path = dir.join(format!("{name}.toml"));
+        fs::write(&sql_path, sql).unwrap();
+        fs::write(
+            &toml_path,
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn build_p001_has_error_severity_and_code() {
+        let issue = PortabilityIssue {
+            construct: "NVL".to_string(),
+            supported_by: vec![Dialect::Snowflake, Dialect::Databricks],
+            target: Dialect::BigQuery,
+            suggestion: "use COALESCE".to_string(),
+        };
+        let diag = build_p001_diagnostic("m", "m.sql", &issue);
+        assert_eq!(&*diag.code, "P001");
+        assert_eq!(diag.severity, Severity::Error);
+        assert_eq!(diag.model, "m");
+        assert!(diag.message.contains("NVL"));
+        assert!(diag.message.contains("BigQuery"));
+        assert_eq!(diag.suggestion.as_deref(), Some("use COALESCE"));
+    }
+
+    #[test]
+    fn compile_with_bigquery_target_flags_nvl_as_p001() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+
+        // With target_dialect = BigQuery, NVL should trigger P001 and the
+        // compile should bail with the generic "compilation failed" error.
+        let err = run_compile(
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            Some(Dialect::BigQuery),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("compilation failed"),
+            "expected bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_without_target_dialect_does_not_run_lint() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+
+        // No target_dialect → no P001, compile succeeds.
+        run_compile(&models_dir, None, None, true, false, None)
+            .expect("compile should succeed without lint");
+    }
+
+    #[test]
+    fn compile_with_snowflake_target_accepts_nvl() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+
+        // NVL is native to Snowflake, so the lint should produce no issues.
+        run_compile(
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            Some(Dialect::Snowflake),
+        )
+        .expect("snowflake target should accept NVL");
+    }
 }

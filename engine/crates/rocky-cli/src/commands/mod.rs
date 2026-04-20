@@ -83,6 +83,9 @@ pub use plan::plan;
 pub use playground::{run_playground, run_playground_with_template};
 pub use profile_storage::run_profile_storage;
 pub use replay::run_replay;
+// Re-exported so the `rocky` bin can build a clap ValueEnum for
+// `--target-dialect` without taking a direct dep on rocky-sql.
+pub use rocky_sql::transpile::Dialect;
 pub use run::{Interrupted, PartitionRunOptions, run};
 pub use run_dag_exec::run_with_dag;
 pub use seed::run_seed;
