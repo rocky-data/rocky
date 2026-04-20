@@ -1968,3 +1968,41 @@ mod sql_fingerprint_tests {
         assert_eq!(sql_fingerprint(&stmts).len(), 16);
     }
 }
+
+/// JSON output for `rocky branch create` and `rocky branch show`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchOutput {
+    pub version: String,
+    pub command: String,
+    pub branch: BranchEntry,
+}
+
+/// JSON output for `rocky branch list`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchListOutput {
+    pub version: String,
+    pub command: String,
+    pub branches: Vec<BranchEntry>,
+    pub total: usize,
+}
+
+/// A single branch record in JSON output.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchEntry {
+    pub name: String,
+    pub schema_prefix: String,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// JSON output for `rocky branch delete`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchDeleteOutput {
+    pub version: String,
+    pub command: String,
+    pub name: String,
+    /// Whether a record was actually removed (false if the branch didn't exist).
+    pub removed: bool,
+}

@@ -17,12 +17,13 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, CiDiffOutput,
-    CiOutput, ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
-    DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput,
-    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput,
-    ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput, RunOutput, SeedOutput,
-    StateOutput, TestAdapterOutput, TestOutput, ValidateMigrationOutput, ValidateOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput, BranchDeleteOutput,
+    BranchListOutput, BranchOutput, CiDiffOutput, CiOutput, ColumnLineageOutput, CompactDedupOutput,
+    CompactOutput, CompareOutput, CompileOutput, DagOutput, DagRunOutput, DiscoverOutput,
+    DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
+    LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
+    ProfileStorageOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
+    ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -79,6 +80,9 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<LoadOutput>("load"),
         entry::<DagOutput>("dag"),
         entry::<DagRunOutput>("dag_run"),
+        entry::<BranchOutput>("branch"),
+        entry::<BranchListOutput>("branch_list"),
+        entry::<BranchDeleteOutput>("branch_delete"),
         // Config types feeding the VS Code project schema. Not CLI command
         // outputs, but exported through the same pipeline so the IDE-facing
         // `editors/vscode/schemas/rocky-project.schema.json` is generated

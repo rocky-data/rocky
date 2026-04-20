@@ -35,6 +35,15 @@ const GRACE_PERIODS: TableDefinition<&str, &[u8]> = TableDefinition::new("grace_
 /// Used for incremental loads: files already recorded with a matching hash
 /// can be skipped.
 const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_files");
+/// Named virtual branches (schema-prefix branches).
+///
+/// Key: branch name. Value: serialized [`BranchRecord`]. A branch records the
+/// `schema_prefix` applied to every model target when `rocky run --branch <name>`
+/// is invoked; it's the persistent, named analogue of the ephemeral `--shadow`
+/// mode. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake
+/// zero-copy `CLONE`) are a follow-up — the schema-prefix approach ships first
+/// because it works uniformly across every adapter.
+const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -219,6 +228,7 @@ impl StateStore {
             let _table = txn.open_table(PARTITIONS)?;
             let _table = txn.open_table(GRACE_PERIODS)?;
             let _table = txn.open_table(LOADED_FILES)?;
+            let _table = txn.open_table(BRANCHES)?;
         }
         txn.commit()?;
 
@@ -1014,6 +1024,83 @@ impl StateStore {
         txn.commit()?;
         Ok(removed)
     }
+
+    // -----------------------------------------------------------------------
+    // Branches (schema-prefix virtual branches)
+    // -----------------------------------------------------------------------
+
+    /// Record (create or overwrite) a branch.
+    pub fn put_branch(&self, branch: &BranchRecord) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(branch)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(BRANCHES)?;
+            table.insert(branch.name.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a branch by name.
+    pub fn get_branch(&self, name: &str) -> Result<Option<BranchRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BRANCHES)?;
+        match table.get(name)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all branches (sorted by name).
+    pub fn list_branches(&self) -> Result<Vec<BranchRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BRANCHES)?;
+        let mut branches = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            branches.push(serde_json::from_slice(value.value())?);
+        }
+        branches.sort_by(|a: &BranchRecord, b| a.name.cmp(&b.name));
+        Ok(branches)
+    }
+
+    /// Delete a branch. Returns true if a record was removed.
+    pub fn delete_branch(&self, name: &str) -> Result<bool, StateError> {
+        let txn = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = txn.open_table(BRANCHES)?;
+            removed = table.remove(name)?.is_some();
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+}
+
+/// A named virtual branch.
+///
+/// Persisted in the state store. When `rocky run --branch <name>` is invoked,
+/// the pipeline executes against tables whose schema has been suffixed with
+/// `schema_prefix`, i.e. a named, persistent form of the existing `--shadow`
+/// mode. Warehouse-native clones (Delta `SHALLOW CLONE` / Snowflake
+/// zero-copy `CLONE`) are a follow-up — schema-prefix branches work uniformly
+/// across every adapter without dialect-specific SQL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BranchRecord {
+    /// Branch name (CLI-facing identifier).
+    pub name: String,
+    /// Token appended to every target schema when the branch is active.
+    ///
+    /// Example: branch name `fix-price` → `schema_prefix = "branch__fix-price"`
+    /// → a model targeting `prod.sales` materializes to `prod.sales__branch__fix-price`
+    /// when run with `--branch fix-price`.
+    pub schema_prefix: String,
+    /// Creator of the branch (user name resolved from `$USER` at create time).
+    pub created_by: String,
+    /// Creation timestamp (UTC).
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Optional free-form description.
+    pub description: Option<String>,
 }
 
 /// Builds the key for the LOADED_FILES table.
@@ -2023,5 +2110,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Branches
+    // -----------------------------------------------------------------------
+
+    fn make_branch(name: &str, description: Option<&str>) -> BranchRecord {
+        BranchRecord {
+            name: name.to_string(),
+            schema_prefix: format!("branch__{name}"),
+            created_by: "hugo".to_string(),
+            created_at: Utc::now(),
+            description: description.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn test_branch_put_get() {
+        let (store, _dir) = temp_store();
+        let branch = make_branch("fix-price", Some("trial a new price join"));
+        store.put_branch(&branch).unwrap();
+
+        let fetched = store.get_branch("fix-price").unwrap().unwrap();
+        assert_eq!(fetched.name, "fix-price");
+        assert_eq!(fetched.schema_prefix, "branch__fix-price");
+        assert_eq!(
+            fetched.description.as_deref(),
+            Some("trial a new price join")
+        );
+    }
+
+    #[test]
+    fn test_branch_get_missing() {
+        let (store, _dir) = temp_store();
+        assert!(store.get_branch("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_branch_list_sorted() {
+        let (store, _dir) = temp_store();
+        store.put_branch(&make_branch("charlie", None)).unwrap();
+        store.put_branch(&make_branch("alice", None)).unwrap();
+        store.put_branch(&make_branch("bob", None)).unwrap();
+
+        let branches = store.list_branches().unwrap();
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["alice", "bob", "charlie"]);
+    }
+
+    #[test]
+    fn test_branch_delete() {
+        let (store, _dir) = temp_store();
+        store.put_branch(&make_branch("transient", None)).unwrap();
+        assert!(store.delete_branch("transient").unwrap());
+        assert!(!store.delete_branch("transient").unwrap()); // idempotent
+        assert!(store.get_branch("transient").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_branch_put_overwrites() {
+        let (store, _dir) = temp_store();
+        store.put_branch(&make_branch("x", Some("v1"))).unwrap();
+        store.put_branch(&make_branch("x", Some("v2"))).unwrap();
+
+        let fetched = store.get_branch("x").unwrap().unwrap();
+        assert_eq!(fetched.description.as_deref(), Some("v2"));
     }
 }

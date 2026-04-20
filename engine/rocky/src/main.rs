@@ -628,6 +628,18 @@ enum Command {
         action: HooksAction,
     },
 
+    /// Manage named virtual branches (schema-prefix branches).
+    ///
+    /// A branch is the persistent, named analogue of `--shadow` mode: it
+    /// records a `schema_prefix` in the state store and, when `rocky run
+    /// --branch <name>` is invoked, every model target has the prefix
+    /// applied. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake
+    /// zero-copy `CLONE`) are a follow-up.
+    Branch {
+        #[command(subcommand)]
+        action: BranchAction,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -714,6 +726,30 @@ enum HooksAction {
     Test {
         /// Event name (e.g., on_pipeline_start, on_materialize_error)
         event: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchAction {
+    /// Create a new branch
+    Create {
+        /// Branch name (e.g., `fix-price`, `feature_new_join`)
+        name: String,
+        /// Optional description, surfaced in `rocky branch list`
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a branch entry. Does not drop warehouse tables.
+    Delete {
+        /// Branch name
+        name: String,
+    },
+    /// List all branches
+    List,
+    /// Show details for a single branch
+    Show {
+        /// Branch name
+        name: String,
     },
 }
 
@@ -1193,6 +1229,23 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             HooksAction::List => rocky_cli::commands::run_hooks_list(&cli.config, json),
             HooksAction::Test { event } => {
                 rocky_cli::commands::run_hooks_test(&cli.config, &event, json).await
+            }
+        },
+        Command::Branch { action } => match action {
+            BranchAction::Create { name, description } => {
+                rocky_cli::commands::run_branch_create(
+                    &cli.state_path,
+                    &name,
+                    description.as_deref(),
+                    json,
+                )
+            }
+            BranchAction::Delete { name } => {
+                rocky_cli::commands::run_branch_delete(&cli.state_path, &name, json)
+            }
+            BranchAction::List => rocky_cli::commands::run_branch_list(&cli.state_path, json),
+            BranchAction::Show { name } => {
+                rocky_cli::commands::run_branch_show(&cli.state_path, &name, json)
             }
         },
         Command::List { action } => match action {
