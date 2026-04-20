@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-04-20
+
+Tracks engine 1.11.0. Regenerated TypeScript bindings + `rocky-project.schema.json` for the trust-system arcs (Arcs 1–7 first waves + Arc 6 wave 2 + Arc 7 wave 2 wave-1).
+
 ### Added — Trust-system Arc 1 types
 
 TypeScript interfaces for the four new engine schemas:
@@ -15,6 +19,36 @@ TypeScript interfaces for the four new engine schemas:
 - `ReplayOutput` / `ReplayModelOutput`
 
 `ColumnLineageOutput` gains a `direction` field (`"upstream"` / `"downstream"`) — additive, no consumer changes required.
+
+### Added — Trust-system Arc 2 types
+
+- `RunOutput.cost_summary`, per-materialization `cost_usd` on `MaterializationMetadata`.
+- `BudgetConfig` (from `rocky.toml [budget]`) and `budget_breach` PipelineEvent shape typed.
+
+### Added — Trust-system Arc 3 types
+
+- `circuit_breaker_tripped` / `_recovered` PipelineEvent variants in the regenerated event union.
+
+### Added — Trust-system Arc 4 types
+
+- `TraceOutput` / `TraceLane` / `TraceMaterialization` for `rocky trace <run_id|latest>` JSON consumers.
+
+### Added — Trust-system Arc 5 types
+
+- `AiGenerateOutput.models` field for scoped AI prompt context.
+
+### Added — Trust-system Arc 6 wave 2 types + project schema
+
+- `PortabilityConfig` block added to `rocky-project.schema.json` (jsonValidation surface for `rocky.toml`). Lowercase `Dialect` enum (`databricks` / `snowflake` / `bigquery` / `duckdb`) round-trips through the `target_dialect` field.
+- IDE autocomplete + validation now covers `[portability]` and the `allow = [...]` list.
+
+### Added — Trust-system Arc 7 wave 2 wave-1
+
+- No new TypeScript types; `--with-seed` is a CLI-only flag with no output schema impact.
+
+### Note
+
+Arc 6 wave 1 (P001) and Arc 7 wave 1 (P002) lint diagnostics flow through the existing `Diagnostic` interface — codes appear as plain strings in the `code` field.
 
 ## [1.5.0] — 2026-04-20
 
