@@ -640,6 +640,21 @@ enum Command {
         action: BranchAction,
     },
 
+    /// Inspect a recorded run from the state store.
+    ///
+    /// Shows every model that ran with SQL hash, row counts, bytes, and
+    /// timings captured at the time. Useful for "what exactly ran at
+    /// 03:15 UTC?" and as the reproducibility artefact for the
+    /// Trust-system Arc 1 claim. Re-execution with pinned inputs is a
+    /// follow-up once the content-addressed write path arrives.
+    Replay {
+        /// Run id or the literal `latest`
+        target: String,
+        /// Filter to a single model within the run
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -1248,6 +1263,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 rocky_cli::commands::run_branch_show(&cli.state_path, &name, json)
             }
         },
+        Command::Replay { target, model } => {
+            rocky_cli::commands::run_replay(&cli.state_path, &target, model.as_deref(), json)
+        }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
             ListAction::Adapters => rocky_cli::commands::list_adapters(&cli.config, json),
