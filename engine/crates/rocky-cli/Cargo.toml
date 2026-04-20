@@ -54,6 +54,10 @@ harness = false
 [features]
 default = ["duckdb"]
 duckdb = ["dep:rocky-duckdb", "rocky-engine/duckdb"]
+# Enable OTLP metrics export at end of `rocky run`. Off by default;
+# when enabled, the CLI auto-initialises `OtelExporter` when the
+# OTEL_EXPORTER_OTLP_ENDPOINT env var is set.
+otel = ["rocky-observe/otel"]
 
 [lints]
 workspace = true

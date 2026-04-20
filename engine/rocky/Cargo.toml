@@ -9,6 +9,8 @@ rust-version.workspace = true
 [features]
 default = ["duckdb"]
 duckdb = ["rocky-cli/duckdb"]
+# Forward the OTLP metrics exporter flag to rocky-cli.
+otel = ["rocky-cli/otel", "rocky-observe/otel"]
 
 [dependencies]
 rocky-cli = { path = "../crates/rocky-cli", default-features = false }

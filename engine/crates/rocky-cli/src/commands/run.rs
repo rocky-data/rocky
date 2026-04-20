@@ -243,6 +243,14 @@ pub async fn run(
 ) -> Result<()> {
     let start = Instant::now();
 
+    // OTLP metrics exporter (feature-gated). Auto-initialises when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
+    // env alone — no CLI flag needed. Drop flushes the final snapshot
+    // and shuts the periodic reader down, so this guard covers every
+    // exit path (happy, interrupted, error) without threading an
+    // explicit cleanup call.
+    let _otel_guard = crate::otel_guard::OtelGuard::init_if_enabled();
+
     // Detect Dagster Pipes mode. When the parent process is a Dagster
     // job that launched us via PipesSubprocessClient, both
     // DAGSTER_PIPES_CONTEXT and DAGSTER_PIPES_MESSAGES are set; we

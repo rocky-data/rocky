@@ -23,7 +23,7 @@ use crate::output::{
     DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput,
     HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput,
     ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput, ReplayOutput, RunOutput,
-    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, ValidateMigrationOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
     ValidateOutput,
 };
 
@@ -85,6 +85,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<BranchListOutput>("branch_list"),
         entry::<BranchDeleteOutput>("branch_delete"),
         entry::<ReplayOutput>("replay"),
+        entry::<TraceOutput>("trace"),
         // Config types feeding the VS Code project schema. Not CLI command
         // outputs, but exported through the same pipeline so the IDE-facing
         // `editors/vscode/schemas/rocky-project.schema.json` is generated
