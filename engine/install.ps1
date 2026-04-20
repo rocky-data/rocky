@@ -43,9 +43,15 @@ $ResolvedVersion = if ($env:ROCKY_VERSION) {
 if (-not $ResolvedVersion) {
     try {
         # Filter by tag prefix — /releases/latest may return a non-engine tag
-        # in the monorepo (dagster-v*, vscode-v*, etc.)
+        # in the monorepo (dagster-v*, vscode-v*, etc.). GitHub's /releases
+        # endpoint does not sort strictly by published_at across tag prefixes,
+        # and lexical sort places v1.10.0 before v1.9.0 — cast the stripped
+        # version to [version] and sort descending so 1.10.0 wins.
         $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=30" -ErrorAction Stop
-        $ResolvedVersion = ($Releases | Where-Object { $_.tag_name -like "$TagPrefix*" } | Select-Object -First 1).tag_name
+        $ResolvedVersion = ($Releases
+            | Where-Object { $_.tag_name -match "^$TagPrefix\d+\.\d+\.\d+$" }
+            | Sort-Object -Property @{Expression = { [version]($_.tag_name -replace "^$TagPrefix", "") }} -Descending
+            | Select-Object -First 1).tag_name
         if (-not $ResolvedVersion) {
             Write-Error "Failed to find an engine release (tag prefix '$TagPrefix'). Set ROCKY_VERSION manually."
             exit 1

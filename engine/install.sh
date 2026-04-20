@@ -99,6 +99,11 @@ ARCHIVE="rocky-${TARGET}.tar.gz"
 # The monorepo releases multiple artifacts (engine-v*, dagster-v*, vscode-v*),
 # so /releases/latest can return a non-engine tag. Filter by TAG_PREFIX instead.
 #
+# GitHub's /releases endpoint does NOT sort strictly by published_at in a
+# monorepo with multiple tag prefixes, and lexical sort would put v1.10.0
+# before v1.9.0 — so we version-sort (sort -V) the engine-prefixed tags
+# and take the highest.
+#
 # Capture the full API response before piping through grep — piping directly
 # from curl/wget into grep causes set -o pipefail to abort the script when
 # grep exits 1 (no match found on old/pre-release tags).
@@ -106,9 +111,10 @@ if [[ -z "${ROCKY_VERSION:-}" ]]; then
     API_RESPONSE="$(download_file "https://api.github.com/repos/${REPO}/releases?per_page=30")"
     ROCKY_VERSION="$(echo "${API_RESPONSE}" \
         | grep '"tag_name"' \
-        | grep "\"${TAG_PREFIX}" \
-        | head -1 \
         | sed 's/.*"tag_name": "//;s/".*//' \
+        | grep -E "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" \
+        | sort -V -r \
+        | head -1 \
         || true)"
     if [[ -z "${ROCKY_VERSION}" ]]; then
         echo "Error: Failed to determine latest engine version (tag prefix '${TAG_PREFIX}'). Set ROCKY_VERSION manually." >&2
