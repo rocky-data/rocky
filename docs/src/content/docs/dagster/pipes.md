@@ -5,7 +5,7 @@ sidebar:
   order: 20
 ---
 
-`dagster-rocky` 0.4 ships **`RockyResource.run_streaming()`** — a
+`dagster-rocky` ships **`RockyResource.run_streaming()`** — a
 Pipes-style alternative to `RockyResource.run()` that spawns the binary
 via `subprocess.Popen`, forwards rocky's stderr (where the engine's
 Rust `tracing` layer writes `info!()` / `warn!()` macros) to

@@ -5,7 +5,7 @@ sidebar:
   order: 12
 ---
 
-`dagster-rocky` 0.4 elevates Rocky's runtime observability signals from log
+`dagster-rocky` elevates Rocky's runtime observability signals from log
 warnings to first-class Dagster primitives:
 
 - **Schema drift** → `dg.AssetObservation` events on the asset timeline

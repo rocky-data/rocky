@@ -7,7 +7,7 @@ sidebar:
 
 Rocky's `time_interval` materialization strategy declares a model is
 partitioned by a time column with a fixed granularity (`hour`, `day`, `month`,
-or `year`). `dagster-rocky` 0.4 ships `partitions.py` — a translation layer
+or `year`). `dagster-rocky` ships `partitions.py` — a translation layer
 that converts these strategies into Dagster's
 [`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
 variants.

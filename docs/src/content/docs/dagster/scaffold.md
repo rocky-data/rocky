@@ -5,7 +5,7 @@ sidebar:
   order: 16
 ---
 
-`dagster-rocky` 0.4 ships two ways to bootstrap a new project:
+`dagster-rocky` ships two ways to bootstrap a new project:
 
 1. **`dg scaffold defs dagster_rocky.RockyComponent <name>`** — uses Dagster's
    built-in scaffolder via the registered entry point. Writes a bare

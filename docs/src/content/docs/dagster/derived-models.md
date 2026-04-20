@@ -5,7 +5,7 @@ sidebar:
   order: 18
 ---
 
-`dagster-rocky` 0.4 historically only surfaced source-replication tables
+`dagster-rocky` historically only surfaced source-replication tables
 (one `AssetSpec` per discovered Fivetran/connector table). Derived models
 — the `*.sql` / `*.rocky` files Rocky compiles from your `models/`
 directory — were invisible to the asset graph. The

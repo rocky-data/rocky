@@ -7,7 +7,7 @@ sidebar:
 
 Dagster 1.12+ uses
 [`AutomationCondition`](https://docs.dagster.io/api/dagster/declarative-automation#dagster.AutomationCondition)
-for asset-centric declarative automation. `dagster-rocky` 0.4 ships two
+for asset-centric declarative automation. `dagster-rocky` ships two
 helpers that name the canonical Rocky-side mappings so you don't have to dig
 through Dagster docs.
 

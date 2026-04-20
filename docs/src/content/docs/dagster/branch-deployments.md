@@ -12,7 +12,7 @@ Rocky-side response is to **shadow-run** every materialization against a
 sandboxed schema instead of production tables, so PR diffs are visible
 side-by-side without touching production data.
 
-`dagster-rocky` 0.4 ships three small primitives to make this trivial:
+`dagster-rocky` ships three small primitives to make this trivial:
 
 - **`is_branch_deployment()`** — boolean check for the standard Dagster+
   env vars.
