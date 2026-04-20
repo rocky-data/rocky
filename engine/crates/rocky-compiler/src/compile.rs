@@ -13,6 +13,7 @@ use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::blast_radius;
 use crate::contracts::{self, CompilerContract};
 use crate::diagnostic::{Diagnostic, W011};
 use crate::project::{Project, ProjectError};
@@ -195,9 +196,21 @@ pub fn compile_project(
             })
             .collect();
 
-    // 6. Merge all diagnostics.
+    // 6. Blast-radius lint (P002): warn on `SELECT *` in models that have
+    //    downstream consumers referencing specific columns. Always-on,
+    //    warning severity — non-blocking but visible in both CLI and LSP.
+    let file_paths: HashMap<String, String> = project
+        .models
+        .iter()
+        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        .collect();
+    let blast_radius_diagnostics =
+        blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
+
+    // 7. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
+    diagnostics.extend(blast_radius_diagnostics);
 
     let has_errors = diagnostics
         .iter()
@@ -363,8 +376,20 @@ pub fn compile_incremental(
             })
             .collect();
 
+    // Blast-radius lint (P002), mirroring the full-path wiring. The graph
+    // already reflects the new state, so the lint sees post-edit consumer
+    // edges — exactly what the LSP needs to surface live.
+    let file_paths: HashMap<String, String> = project
+        .models
+        .iter()
+        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        .collect();
+    let blast_radius_diagnostics =
+        blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
+
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
+    diagnostics.extend(blast_radius_diagnostics);
 
     let has_errors = diagnostics
         .iter()
