@@ -1336,6 +1336,38 @@ pub struct RockyConfig {
     /// when adapters have wildly different rate limits.
     #[serde(default)]
     pub retry: Option<RunRetryConfig>,
+
+    /// Dialect-portability lint configuration. Consumed by `rocky compile`
+    /// to drive P001 (and, when wired, future) diagnostics. The CLI's
+    /// `--target-dialect` flag, when set, takes precedence over
+    /// [`PortabilityConfig::target_dialect`].
+    #[serde(default)]
+    pub portability: PortabilityConfig,
+}
+
+/// Project-wide dialect portability configuration.
+///
+/// Lives at the top level because a Rocky project targets one warehouse;
+/// per-pipeline overrides aren't supported yet (no demand signal). The
+/// `allow` list applies to every model — a per-model override is the
+/// `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed
+/// by [`rocky_sql::pragma`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PortabilityConfig {
+    /// Target dialect for the portability lint. When unset, no lint runs
+    /// (matches the wave-1 "flag opt-in" behavior). The CLI flag overrides
+    /// this if both are present.
+    #[serde(default)]
+    pub target_dialect: Option<rocky_sql::transpile::Dialect>,
+
+    /// Project-wide allow-list of construct labels (case-insensitive,
+    /// matched against `PortabilityIssue::construct`). Useful for blanket
+    /// exemptions like `allow = ["QUALIFY"]` when a project standardizes on
+    /// a specific extension. For per-model exemptions prefer the
+    /// `-- rocky-allow: <construct>` pragma over expanding this list.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// Top-level retry configuration applied across every adapter for this

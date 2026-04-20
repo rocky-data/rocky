@@ -1089,6 +1089,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             expand_macros,
             target_dialect,
         } => rocky_cli::commands::run_compile(
+            Some(cli.config.as_path()),
             &models,
             contracts.as_deref(),
             model.as_deref(),

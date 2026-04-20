@@ -8,14 +8,17 @@ use anyhow::Result;
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::incrementality;
+use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
 use rocky_sql::portability::{self, PortabilityIssue};
+use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
 
 use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
 /// Execute `rocky compile`.
 pub fn run_compile(
+    config_path: Option<&Path>,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
@@ -32,13 +35,36 @@ pub fn run_compile(
 
     let mut result = compile::compile(&config)?;
 
-    // Portability lint. Opt-in via `--target-dialect`. Emits error-severity
-    // P001 diagnostics for constructs that don't run on the chosen target;
-    // the catalog mirrors what `rocky_sql::transpile` already knows about.
-    if let Some(dialect) = target_dialect {
+    // Portability lint. Effective target_dialect = CLI flag > [portability]
+    // config > unset. Project-wide allow list and per-model `-- rocky-allow:`
+    // pragmas suppress matching constructs before they become diagnostics.
+    let portability_cfg = match config_path {
+        Some(path) => rocky_config::load_rocky_config(path)
+            .ok()
+            .map(|c| c.portability),
+        None => None,
+    };
+    let effective_dialect =
+        target_dialect.or_else(|| portability_cfg.as_ref().and_then(|p| p.target_dialect));
+    let project_allow: std::collections::HashSet<String> = portability_cfg
+        .as_ref()
+        .map(|p| {
+            p.allow
+                .iter()
+                .map(|c| c.trim().to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(dialect) = effective_dialect {
         let mut portability_errors = false;
         for model in &result.project.models {
+            let model_pragmas = pragma::parse_pragmas(&model.sql);
             for issue in portability::detect_portability_issues(&model.sql, dialect) {
+                let upper = issue.construct.to_ascii_uppercase();
+                if project_allow.contains(&upper) || model_pragmas.allows(&upper) {
+                    continue;
+                }
                 result.diagnostics.push(build_p001_diagnostic(
                     &model.config.name,
                     &model.file_path,
@@ -282,6 +308,39 @@ mod tests {
         .unwrap();
     }
 
+    /// Write a minimal `rocky.toml` next to a models dir, with optional
+    /// `[portability]` section content. Returns the path so tests can pass
+    /// it as the new `config_path` argument. Uses the shape committed in
+    /// `examples/playground/pocs/00-foundations/00-playground-default/rocky.toml`.
+    fn write_rocky_toml(dir: &Path, portability_block: &str) -> std::path::PathBuf {
+        let path = dir.join("rocky.toml");
+        let body = format!(
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "c"
+schema_template = "s"
+
+{portability_block}
+"#
+        );
+        fs::write(&path, body).unwrap();
+        path
+    }
+
     #[test]
     fn build_p001_has_error_severity_and_code() {
         let issue = PortabilityIssue {
@@ -309,6 +368,7 @@ mod tests {
         // With target_dialect = BigQuery, NVL should trigger P001 and the
         // compile should bail with the generic "compilation failed" error.
         let err = run_compile(
+            None,
             &models_dir,
             None,
             None,
@@ -331,7 +391,7 @@ mod tests {
         write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
 
         // No target_dialect → no P001, compile succeeds.
-        run_compile(&models_dir, None, None, true, false, None)
+        run_compile(None, &models_dir, None, None, true, false, None)
             .expect("compile should succeed without lint");
     }
 
@@ -344,6 +404,7 @@ mod tests {
 
         // NVL is native to Snowflake, so the lint should produce no issues.
         run_compile(
+            None,
             &models_dir,
             None,
             None,
@@ -352,5 +413,126 @@ mod tests {
             Some(Dialect::Snowflake),
         )
         .expect("snowflake target should accept NVL");
+    }
+
+    // ---- Wave 2: [portability] block + pragma ----
+
+    #[test]
+    fn config_target_dialect_drives_lint_when_no_flag() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+        let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
+
+        let err =
+            run_compile(Some(&config), &models_dir, None, None, true, false, None).unwrap_err();
+        assert!(
+            err.to_string().contains("compilation failed"),
+            "config target_dialect should fire P001: {err}",
+        );
+    }
+
+    #[test]
+    fn flag_overrides_config_target_dialect() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+        // Config says snowflake (NVL native), flag overrides to bigquery
+        // (NVL not portable). The flag must win and the lint must fire.
+        let config = write_rocky_toml(
+            dir.path(),
+            "[portability]\ntarget_dialect = \"snowflake\"\n",
+        );
+
+        let err = run_compile(
+            Some(&config),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            Some(Dialect::BigQuery),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("compilation failed"));
+    }
+
+    #[test]
+    fn config_allow_list_suppresses_p001() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+        let config = write_rocky_toml(
+            dir.path(),
+            "[portability]\ntarget_dialect = \"bigquery\"\nallow = [\"NVL\"]\n",
+        );
+
+        // Project-wide allow-list of NVL → no P001 → compile succeeds.
+        run_compile(Some(&config), &models_dir, None, None, true, false, None)
+            .expect("allow-listed NVL should not trip the lint");
+    }
+
+    #[test]
+    fn per_model_pragma_suppresses_p001() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(
+            &models_dir,
+            "m1",
+            "-- rocky-allow: NVL\nSELECT NVL(a, b) AS c FROM t",
+        );
+        let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
+
+        // Pragma exempts this model, so the lint should not fire.
+        run_compile(Some(&config), &models_dir, None, None, true, false, None)
+            .expect("pragma-exempted model should not trip the lint");
+    }
+
+    #[test]
+    fn pragma_is_per_model_not_project_wide() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // m1 has the pragma; m2 does not. m2 should still trip the lint.
+        write_model(
+            &models_dir,
+            "m1",
+            "-- rocky-allow: NVL\nSELECT NVL(a, b) AS c FROM t",
+        );
+        write_model(&models_dir, "m2", "SELECT NVL(d, e) AS f FROM t");
+        let config = write_rocky_toml(dir.path(), "[portability]\ntarget_dialect = \"bigquery\"\n");
+
+        let err =
+            run_compile(Some(&config), &models_dir, None, None, true, false, None).unwrap_err();
+        assert!(
+            err.to_string().contains("compilation failed"),
+            "m2 should still trip the lint: {err}",
+        );
+    }
+
+    #[test]
+    fn missing_config_file_falls_through_to_flag_only() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
+        let nonexistent = dir.path().join("nope.toml");
+
+        // Config file doesn't exist → portability config silently None →
+        // flag-only behavior remains. With no flag, no lint fires.
+        run_compile(
+            Some(&nonexistent),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+        )
+        .expect("missing config should fall through, not error");
     }
 }

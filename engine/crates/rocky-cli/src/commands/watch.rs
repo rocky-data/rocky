@@ -100,7 +100,15 @@ pub async fn run_watch(
 /// Run compile and print the result. Errors are printed, not propagated,
 /// so the watch loop continues after a failed compilation.
 fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_json: bool) {
-    match run_compile(models_dir, contracts_dir, None, output_json, false, None) {
+    match run_compile(
+        None,
+        models_dir,
+        contracts_dir,
+        None,
+        output_json,
+        false,
+        None,
+    ) {
         Ok(()) => {
             if !output_json {
                 println!("[watch] compilation succeeded");
