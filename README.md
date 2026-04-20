@@ -11,6 +11,10 @@
 
 The **trust system for your data**. A Rust-based control plane for warehouse pipelines: branches, replay, column-level lineage, compile-time safety, per-model cost attribution. Keep Databricks or Snowflake. Bring Rocky for the DAG.
 
+<p align="center">
+  <img src="docs/public/demo-quickstart.gif" alt="Rocky quickstart — create a project, compile, and run 3 models in under 15s" width="900" />
+</p>
+
 ## Try it in 60 seconds
 
 ```bash
