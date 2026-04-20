@@ -81,6 +81,28 @@ enum OutputFormat {
     Table,
 }
 
+/// CLI alias for `rocky compile --target-dialect`. Short names
+/// (`dbx`, `sf`, `bq`, `duckdb`) are the user-facing spelling; they map
+/// 1:1 to `rocky_cli::commands::Dialect`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TargetDialect {
+    Dbx,
+    Sf,
+    Bq,
+    Duckdb,
+}
+
+impl From<TargetDialect> for rocky_cli::commands::Dialect {
+    fn from(value: TargetDialect) -> Self {
+        match value {
+            TargetDialect::Dbx => Self::Databricks,
+            TargetDialect::Sf => Self::Snowflake,
+            TargetDialect::Bq => Self::BigQuery,
+            TargetDialect::Duckdb => Self::DuckDB,
+        }
+    }
+}
+
 /// Command groups (Plan 22 design)
 ///
 /// These commands will be reorganized into nested subcommand trees in a
@@ -307,6 +329,10 @@ enum Command {
         /// Show expanded SQL after macro substitution
         #[arg(long)]
         expand_macros: bool,
+        /// Reject non-portable SQL constructs for the given warehouse
+        /// target. Emits error-severity P001 diagnostics (Arc 6).
+        #[arg(long, value_enum)]
+        target_dialect: Option<TargetDialect>,
     },
 
     /// Show the full unified DAG (all pipeline stages and dependencies)
@@ -1061,12 +1087,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             contracts,
             model,
             expand_macros,
+            target_dialect,
         } => rocky_cli::commands::run_compile(
             &models,
             contracts.as_deref(),
             model.as_deref(),
             json,
             expand_macros,
+            target_dialect.map(Into::into),
         ),
         Command::Dag {
             models,
