@@ -987,6 +987,10 @@ pub struct ColumnLineageOutput {
     pub command: String,
     pub model: String,
     pub column: String,
+    /// Direction of the trace walk: `"upstream"` (producers) or `"downstream"`
+    /// (consumers). Defaults to upstream when `--column` is set without
+    /// direction flags, matching pre-Arc-1 behaviour.
+    pub direction: String,
     pub trace: Vec<LineageEdgeRecord>,
 }
 

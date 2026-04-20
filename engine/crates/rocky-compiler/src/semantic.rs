@@ -78,6 +78,11 @@ pub struct SemanticGraph {
     /// `(target.model, target.column)` → index into `edges`. Built from `edges`; not serialized.
     #[serde(skip, default)]
     edge_by_target_column: HashMap<(String, String), usize>,
+    /// `source.model` → indices into `edges`. Built from `edges`; not serialized.
+    /// Symmetric counterpart to `edges_by_target_model` used by the downstream
+    /// walk in [`SemanticGraph::trace_column_downstream`].
+    #[serde(skip, default)]
+    edges_by_source_model: HashMap<String, Vec<usize>>,
 }
 
 impl SemanticGraph {
@@ -88,6 +93,7 @@ impl SemanticGraph {
             edges,
             edges_by_target_model: HashMap::new(),
             edge_by_target_column: HashMap::new(),
+            edges_by_source_model: HashMap::new(),
         };
         graph.rebuild_indices();
         graph
@@ -98,12 +104,19 @@ impl SemanticGraph {
     /// Call this after any mutation to `edges` or after loading from a
     /// deserialized form (the index maps are `#[serde(skip)]`).
     pub fn rebuild_indices(&mut self) {
-        let mut by_model: HashMap<String, Vec<usize>> = HashMap::with_capacity(self.models.len());
+        let mut by_target_model: HashMap<String, Vec<usize>> =
+            HashMap::with_capacity(self.models.len());
+        let mut by_source_model: HashMap<String, Vec<usize>> =
+            HashMap::with_capacity(self.models.len());
         let mut by_column: HashMap<(String, String), usize> =
             HashMap::with_capacity(self.edges.len());
         for (idx, edge) in self.edges.iter().enumerate() {
-            by_model
+            by_target_model
                 .entry(edge.target.model.to_string())
+                .or_default()
+                .push(idx);
+            by_source_model
+                .entry(edge.source.model.to_string())
                 .or_default()
                 .push(idx);
             // First-writer-wins: matches the semantics of the prior `iter().find(...)`
@@ -117,7 +130,8 @@ impl SemanticGraph {
                 ))
                 .or_insert(idx);
         }
-        self.edges_by_target_model = by_model;
+        self.edges_by_target_model = by_target_model;
+        self.edges_by_source_model = by_source_model;
         self.edge_by_target_column = by_column;
     }
 
@@ -170,16 +184,50 @@ impl SemanticGraph {
         result
     }
 
-    /// Find downstream consumers of a column: edges where `source` matches `(model, column)`.
-    ///
-    /// Returns edges whose `source.model == model` and `source.column == column`,
-    /// i.e. models that read this column as input. O(E) scan — acceptable for
-    /// hover latency; add an `edges_by_source_column` index if profiling shows need.
-    pub fn column_consumers(&self, model: &str, column: &str) -> Vec<&LineageEdge> {
-        self.edges
+    /// Iterate edges whose `source.model` equals `model`. O(fan-out) lookup.
+    pub fn edges_sourced_from<'a>(&'a self, model: &str) -> impl Iterator<Item = &'a LineageEdge> {
+        self.edges_by_source_model
+            .get(model)
+            .map(std::vec::Vec::as_slice)
+            .unwrap_or(&[])
             .iter()
-            .filter(|e| &*e.source.model == model && &*e.source.column == column)
+            .map(move |&idx| &self.edges[idx])
+    }
+
+    /// Find direct downstream consumers of a column: edges where `source` matches
+    /// `(model, column)`. Uses the `edges_by_source_model` index — O(fan-out).
+    pub fn column_consumers(&self, model: &str, column: &str) -> Vec<&LineageEdge> {
+        self.edges_sourced_from(model)
+            .filter(|e| &*e.source.column == column)
             .collect()
+    }
+
+    /// Trace a column forward through every downstream consumer, transitively.
+    ///
+    /// Mirror of [`Self::trace_column`] walking the graph in the opposite
+    /// direction. Returns every edge reachable by following `source → target`
+    /// steps starting from `(model, column)`. Cycles are cut by a visited-set.
+    pub fn trace_column_downstream(&self, model: &str, column: &str) -> Vec<&LineageEdge> {
+        let mut result = Vec::new();
+        let mut stack = vec![QualifiedColumn {
+            model: Arc::from(model),
+            column: Arc::from(column),
+        }];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for edge in self.edges_sourced_from(&current.model) {
+                if edge.source.column == current.column {
+                    result.push(edge);
+                    stack.push(edge.target.clone()); // cheap: atomic ref-count inc
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -561,6 +609,57 @@ mod tests {
         // c.id has no consumers (leaf model)
         let leaf_consumers = graph.column_consumers("c", "id");
         assert!(leaf_consumers.is_empty());
+    }
+
+    #[test]
+    fn test_trace_column_downstream() {
+        let models = vec![
+            make_model("a", "SELECT id, name FROM source.raw.users"),
+            make_model("b", "SELECT id, name FROM a"),
+            make_model("c", "SELECT id, name FROM b"),
+            make_model("d", "SELECT id FROM c"),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        // a.id flows through b, c, d transitively
+        let downstream = graph.trace_column_downstream("a", "id");
+        let target_models: std::collections::HashSet<&str> =
+            downstream.iter().map(|e| &*e.target.model).collect();
+        assert!(target_models.contains("b"));
+        assert!(target_models.contains("c"));
+        assert!(target_models.contains("d"));
+
+        // a.name flows through b and c but not d (d only selects id)
+        let name_downstream = graph.trace_column_downstream("a", "name");
+        let name_targets: std::collections::HashSet<&str> =
+            name_downstream.iter().map(|e| &*e.target.model).collect();
+        assert!(name_targets.contains("b"));
+        assert!(name_targets.contains("c"));
+        assert!(!name_targets.contains("d"));
+    }
+
+    #[test]
+    fn test_trace_column_downstream_cycle_safe() {
+        // Non-cyclic graph; verifies the visited set doesn't produce duplicate edges
+        // when multiple paths converge on the same downstream node.
+        let models = vec![
+            make_model("a", "SELECT id FROM source.raw.data"),
+            make_model("b", "SELECT id FROM a"),
+            make_model("c", "SELECT id FROM a"),
+            make_model("d", "SELECT b.id FROM b JOIN c ON b.id = c.id"),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        // a.id reaches b, c, d — d through two paths but visited once
+        let downstream = graph.trace_column_downstream("a", "id");
+        let target_models: Vec<&str> = downstream.iter().map(|e| &*e.target.model).collect();
+        assert!(target_models.contains(&"b"));
+        assert!(target_models.contains(&"c"));
+        assert!(target_models.contains(&"d"));
     }
 
     #[test]

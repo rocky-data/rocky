@@ -333,6 +333,14 @@ enum Command {
         /// Output format: "dot" for Graphviz
         #[arg(long)]
         format: Option<String>,
+        /// Trace downstream (consumers) instead of upstream (sources).
+        /// Mutually exclusive with --upstream; default is upstream.
+        #[arg(long, conflicts_with = "upstream")]
+        downstream: bool,
+        /// Trace upstream (sources). Default when neither is set; use this
+        /// flag for explicitness in scripted callers.
+        #[arg(long)]
+        upstream: bool,
     },
 
     /// Generate a model from natural language intent using AI
@@ -987,11 +995,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             column,
             format,
+            downstream,
+            upstream: _,
         } => rocky_cli::commands::run_lineage(
             &models,
             &target,
             column.as_deref(),
             format.as_deref(),
+            downstream,
             json,
         ),
         Command::Ai { intent, format } => {

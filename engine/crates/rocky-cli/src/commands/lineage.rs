@@ -35,6 +35,7 @@ pub fn run_lineage(
     target: &str,
     column: Option<&str>,
     format: Option<&str>,
+    downstream: bool,
     output_json: bool,
 ) -> Result<()> {
     let config = CompilerConfig {
@@ -61,19 +62,23 @@ pub fn run_lineage(
         .model_schema(model_name)
         .context(format!("model '{model_name}' not found"))?;
 
+    let direction = if downstream { "downstream" } else { "upstream" };
+
     if output_json {
         if let Some(col) = col_name {
-            let trace: Vec<LineageEdgeRecord> = result
-                .semantic_graph
-                .trace_column(model_name, col)
-                .iter()
-                .map(|e| to_edge_record(e))
-                .collect();
+            let trace_edges = if downstream {
+                result.semantic_graph.trace_column_downstream(model_name, col)
+            } else {
+                result.semantic_graph.trace_column(model_name, col)
+            };
+            let trace: Vec<LineageEdgeRecord> =
+                trace_edges.iter().map(|e| to_edge_record(e)).collect();
             let output = ColumnLineageOutput {
                 version: VERSION.to_string(),
                 command: "lineage".to_string(),
                 model: model_name.to_string(),
                 column: col.to_string(),
+                direction: direction.to_string(),
                 trace,
             };
             print_json(&output)?;
@@ -110,7 +115,18 @@ pub fn run_lineage(
 
         // Add edges
         let edges: Vec<_> = if let Some(col) = col_name {
-            result.semantic_graph.trace_column(model_name, col)
+            if downstream {
+                result.semantic_graph.trace_column_downstream(model_name, col)
+            } else {
+                result.semantic_graph.trace_column(model_name, col)
+            }
+        } else if downstream {
+            result
+                .semantic_graph
+                .edges
+                .iter()
+                .filter(|e| &*e.source.model == model_name)
+                .collect()
         } else {
             result
                 .semantic_graph
@@ -135,14 +151,26 @@ pub fn run_lineage(
         println!();
 
         if let Some(col) = col_name {
-            println!("Column trace: {model_name}.{col}");
-            let trace = result.semantic_graph.trace_column(model_name, col);
-            for (i, edge) in trace.iter().enumerate() {
-                let indent = "  ".repeat(i + 1);
-                println!(
-                    "{indent}<- {}.{} ({})",
-                    edge.source.model, edge.source.column, edge.transform
-                );
+            if downstream {
+                println!("Column consumers: {model_name}.{col}");
+                let trace = result.semantic_graph.trace_column_downstream(model_name, col);
+                for (i, edge) in trace.iter().enumerate() {
+                    let indent = "  ".repeat(i + 1);
+                    println!(
+                        "{indent}-> {}.{} ({})",
+                        edge.target.model, edge.target.column, edge.transform
+                    );
+                }
+            } else {
+                println!("Column trace: {model_name}.{col}");
+                let trace = result.semantic_graph.trace_column(model_name, col);
+                for (i, edge) in trace.iter().enumerate() {
+                    let indent = "  ".repeat(i + 1);
+                    println!(
+                        "{indent}<- {}.{} ({})",
+                        edge.source.model, edge.source.column, edge.transform
+                    );
+                }
             }
         } else {
             println!("Columns:");
