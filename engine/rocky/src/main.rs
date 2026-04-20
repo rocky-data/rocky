@@ -333,6 +333,12 @@ enum Command {
         /// target. Emits error-severity P001 diagnostics (Arc 6).
         #[arg(long, value_enum)]
         target_dialect: Option<TargetDialect>,
+        /// Run `data/seed.sql` against an in-memory DuckDB before compiling
+        /// and use its `information_schema` as the source-of-truth for
+        /// raw source schemas. Turns leaf .sql models from `Unknown`
+        /// columns into concrete types (Arc 7 wave 2).
+        #[arg(long)]
+        with_seed: bool,
     },
 
     /// Show the full unified DAG (all pipeline stages and dependencies)
@@ -1088,6 +1094,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             model,
             expand_macros,
             target_dialect,
+            with_seed,
         } => rocky_cli::commands::run_compile(
             Some(cli.config.as_path()),
             &models,
@@ -1096,6 +1103,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             json,
             expand_macros,
             target_dialect.map(Into::into),
+            with_seed,
         ),
         Command::Dag {
             models,
