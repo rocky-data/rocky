@@ -13,7 +13,11 @@ async function main() {
     // the response then fails JSON.parse, killing the test run with
     // "Failed to parse response ... as JSON". Pinning a version skips the
     // lookup entirely. Override with VSCODE_TEST_VERSION when needed.
-    const version = process.env.VSCODE_TEST_VERSION ?? "1.105.0";
+    //
+    // Keep this in sync with `engines.vscode` in package.json — a test host
+    // older than `engines.vscode` fails to activate the extension silently,
+    // which shows up as "0 commands registered" in the suite.
+    const version = process.env.VSCODE_TEST_VERSION ?? "1.116.0";
 
     await runTests({
       version,
