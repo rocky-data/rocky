@@ -6,7 +6,7 @@ path = "poc.duckdb"
 
 # Project-wide portability settings. Per-model overrides via `-- rocky-allow` pragma.
 [portability]
-target_dialect = "bq"
+target_dialect = "bigquery"
 allow = ["QUALIFY"]  # QUALIFY is BigQuery-supported, so allow it project-wide
 
 [pipeline.poc]
