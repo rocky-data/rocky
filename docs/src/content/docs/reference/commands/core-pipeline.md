@@ -462,6 +462,7 @@ rocky branch create <name> [--description <text>]
 rocky branch delete <name>
 rocky branch list
 rocky branch show <name>
+rocky branch compare <name> [--filter <key=value>]
 ```
 
 Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
@@ -509,7 +510,15 @@ rocky run --filter client=acme --branch fix-price
 rocky branch delete fix-price
 ```
 
+Diff a branch's materialized tables against production (row counts + schemas):
+
+```bash
+rocky branch compare fix-price
+```
+
+Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override` — the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag.
+
 ### Related Commands
 
 - [`rocky run`](#rocky-run) -- execute a pipeline against a branch via `--run --branch`
-- [`rocky compare`](/reference/cli/#rocky-compare) -- diff branch output against production
+- [`rocky compare`](/reference/cli/#rocky-compare) -- diff an ad-hoc shadow against production (the generic form `rocky branch compare` specialises)
