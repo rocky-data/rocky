@@ -382,11 +382,13 @@ def test_parse_history(history_json: str):
     assert run.run_id == "run-001"
     assert run.status == "Success"
     assert run.trigger == "Manual"
-    assert len(run.models_executed) == 1
-    assert run.models_executed[0].model_name == "orders"
-    assert run.models_executed[0].duration_ms == 1500
-    assert run.models_executed[0].rows_affected == 15000
-    assert run.models_executed[0].bytes_scanned == 52428800
+    # ``models_executed`` is a count on the CLI-output shape; the per-model
+    # detail list lives on ``models``.
+    assert run.models_executed == 1
+    assert len(run.models) == 1
+    assert run.models[0].model_name == "orders"
+    assert run.models[0].duration_ms == 1500
+    assert run.models[0].rows_affected == 15000
 
 
 def test_parse_metrics(metrics_json: str):

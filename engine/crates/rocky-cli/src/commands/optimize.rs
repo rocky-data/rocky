@@ -108,6 +108,9 @@ pub fn run_optimize(
                 recommended_strategy: r.recommended_strategy.clone(),
                 estimated_monthly_savings: r.estimated_monthly_savings,
                 reasoning: r.reasoning.clone(),
+                compute_cost_per_run: r.compute_cost_per_run,
+                storage_cost_per_month: r.storage_cost_per_month,
+                downstream_references: r.downstream_references as u64,
             })
             .collect();
         let output = OptimizeOutput::new(typed_recs);

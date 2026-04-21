@@ -418,6 +418,10 @@ CI: dict[str, Any] = {
 # history — one completed run with bytes_scanned/written
 # ---------------------------------------------------------------------------
 
+# Shape mirrors `rocky history --json` CLI output (``RunHistoryRecord``),
+# not the state-store ``RunRecord``. Fields trimmed to the projection the
+# CLI actually emits (no ``finished_at`` / ``config_hash`` / per-model
+# byte columns — those live in the state store, not the CLI surface).
 HISTORY: dict[str, Any] = {
     "version": "0.3.0",
     "command": "history",
@@ -425,23 +429,18 @@ HISTORY: dict[str, Any] = {
         {
             "run_id": "run-001",
             "started_at": "2026-04-01T10:00:00Z",
-            "finished_at": "2026-04-01T10:05:00Z",
             "status": "Success",
-            "models_executed": [
+            "trigger": "Manual",
+            "models_executed": 1,
+            "duration_ms": 300000,
+            "models": [
                 {
                     "model_name": "orders",
-                    "started_at": "2026-04-01T10:00:30Z",
-                    "finished_at": "2026-04-01T10:02:00Z",
                     "duration_ms": 1500,
                     "rows_affected": 15000,
                     "status": "success",
-                    "sql_hash": "abc12345",
-                    "bytes_scanned": 52428800,
-                    "bytes_written": 10485760,
                 },
             ],
-            "trigger": "Manual",
-            "config_hash": "cfg-hash-001",
         },
     ],
     "count": 1,

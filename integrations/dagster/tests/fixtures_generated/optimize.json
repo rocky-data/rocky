@@ -1,7 +1,18 @@
 {
   "version": "1.11.0",
   "command": "optimize",
-  "recommendations": [],
-  "total_models_analyzed": 0,
-  "message": "no run history available"
+  "recommendations": [
+    {
+      "model_name": "orders",
+      "current_strategy": "table",
+      "recommended_strategy": "table",
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "insufficient history: 2 runs (need 5)",
+      "compute_cost_per_run": 0.0,
+      "storage_cost_per_month": 0.0023,
+      "downstream_references": 0
+    }
+  ],
+  "total_models_analyzed": 1,
+  "incrementality_note": "Run `rocky compile --output json` for inferred incrementality hints on full_refresh models"
 }

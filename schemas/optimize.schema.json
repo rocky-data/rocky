@@ -4,8 +4,19 @@
     "OptimizeRecommendation": {
       "description": "One materialization-strategy recommendation. Mirrors `rocky_core::optimize::MaterializationCost` but lives in the CLI crate so we don't have to derive JsonSchema across the workspace.",
       "properties": {
+        "compute_cost_per_run": {
+          "description": "Projected per-run compute cost (USD). Populated from `rocky_core::optimize::MaterializationCost::compute_cost_per_run` so Dagster's `checks.py` can surface it as metadata without re-deriving from config.",
+          "format": "double",
+          "type": "number"
+        },
         "current_strategy": {
           "type": "string"
+        },
+        "downstream_references": {
+          "description": "How many downstream models depend on this one. Drives whether the recommendation favours table materialisation (many consumers) vs a view.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "estimated_monthly_savings": {
           "format": "double",
@@ -19,14 +30,22 @@
         },
         "recommended_strategy": {
           "type": "string"
+        },
+        "storage_cost_per_month": {
+          "description": "Projected monthly storage cost (USD).",
+          "format": "double",
+          "type": "number"
         }
       },
       "required": [
+        "compute_cost_per_run",
         "current_strategy",
+        "downstream_references",
         "estimated_monthly_savings",
         "model_name",
         "reasoning",
-        "recommended_strategy"
+        "recommended_strategy",
+        "storage_cost_per_month"
       ],
       "type": "object"
     }

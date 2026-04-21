@@ -47,6 +47,26 @@ pub fn sql_fingerprint(statements: &[String]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Stable 16-char hex fingerprint of a `rocky.toml` file's raw bytes.
+///
+/// Stored on [`rocky_core::state::RunRecord::config_hash`] so consumers can
+/// detect "did the config change between these two runs?" without diffing
+/// full TOML bodies. Uses the same [`DefaultHasher`] (SipHash) as
+/// [`sql_fingerprint`] — intra-release-stable, not cross-release-stable.
+///
+/// Returns `"unknown"` on read failure — record persistence should never
+/// fail because the config file became unreadable between load and finalize.
+pub fn config_fingerprint(config_path: &std::path::Path) -> String {
+    match std::fs::read(config_path) {
+        Ok(bytes) => {
+            let mut hasher = DefaultHasher::new();
+            hasher.write(&bytes);
+            format!("{:016x}", hasher.finish())
+        }
+        Err(_) => "unknown".to_string(),
+    }
+}
+
 /// JSON output for `rocky discover`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DiscoverOutput {
@@ -775,6 +795,17 @@ pub struct OptimizeRecommendation {
     pub recommended_strategy: String,
     pub estimated_monthly_savings: f64,
     pub reasoning: String,
+    /// Projected per-run compute cost (USD). Populated from
+    /// `rocky_core::optimize::MaterializationCost::compute_cost_per_run`
+    /// so Dagster's `checks.py` can surface it as metadata without
+    /// re-deriving from config.
+    pub compute_cost_per_run: f64,
+    /// Projected monthly storage cost (USD).
+    pub storage_cost_per_month: f64,
+    /// How many downstream models depend on this one. Drives whether
+    /// the recommendation favours table materialisation (many
+    /// consumers) vs a view.
+    pub downstream_references: u64,
 }
 
 impl OptimizeOutput {
@@ -1953,6 +1984,99 @@ impl RunOutput {
             }
         }
     }
+
+    /// Build a [`rocky_core::state::RunRecord`] from the finalised output,
+    /// ready for [`rocky_core::state::StateStore::record_run`].
+    ///
+    /// Each [`MaterializationOutput`] becomes a success-status
+    /// [`rocky_core::state::ModelExecution`]; each
+    /// [`TableErrorOutput`] becomes a failure-status entry. Per-model
+    /// timestamps are lossy: `finished_at` is set to the run's
+    /// `finished_at` (every model) and `started_at` is computed as
+    /// `finished_at - duration_ms`. Actual per-model wall-clock windows
+    /// require execution-loop instrumentation and land in a later wave —
+    /// this mirrors how `populate_cost_summary` leaves `bytes_scanned`
+    /// as `None` until the adapter layer plumbs real values.
+    ///
+    /// `model_name` is derived from the last element of
+    /// [`MaterializationOutput::asset_key`] to match how `rocky cost` /
+    /// `rocky history` reference models.
+    pub fn to_run_record(
+        &self,
+        run_id: &str,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+        config_hash: String,
+        trigger: rocky_core::state::RunTrigger,
+        status: rocky_core::state::RunStatus,
+    ) -> rocky_core::state::RunRecord {
+        let mut models = Vec::with_capacity(self.materializations.len() + self.errors.len());
+
+        for mat in &self.materializations {
+            let duration_ms = mat.duration_ms;
+            let model_start = finished_at
+                - chrono::Duration::milliseconds(duration_ms.min(i64::MAX as u64) as i64);
+            let model_name = mat
+                .asset_key
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            models.push(rocky_core::state::ModelExecution {
+                model_name,
+                started_at: model_start,
+                finished_at,
+                duration_ms,
+                rows_affected: mat.rows_copied,
+                status: "success".to_string(),
+                sql_hash: mat.metadata.sql_hash.clone().unwrap_or_default(),
+                bytes_scanned: None,
+                bytes_written: None,
+            });
+        }
+
+        for err in &self.errors {
+            let model_name = err
+                .asset_key
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            models.push(rocky_core::state::ModelExecution {
+                model_name,
+                started_at,
+                finished_at,
+                duration_ms: 0,
+                rows_affected: None,
+                status: "failed".to_string(),
+                sql_hash: String::new(),
+                bytes_scanned: None,
+                bytes_written: None,
+            });
+        }
+
+        rocky_core::state::RunRecord {
+            run_id: run_id.to_string(),
+            started_at,
+            finished_at,
+            status,
+            models_executed: models,
+            trigger,
+            config_hash,
+        }
+    }
+
+    /// Derive the [`rocky_core::state::RunStatus`] from the output's
+    /// end-state counters. Interrupt (`self.interrupted`) with no
+    /// materializations → `Failure`; with at least one → `PartialFailure`.
+    /// Same rule for failed-table counts. Clean completion → `Success`.
+    pub fn derive_run_status(&self) -> rocky_core::state::RunStatus {
+        let has_progress = self.tables_copied > 0;
+        let has_problem = self.interrupted || self.tables_failed > 0;
+        match (has_progress, has_problem) {
+            (_, false) => rocky_core::state::RunStatus::Success,
+            (true, true) => rocky_core::state::RunStatus::PartialFailure,
+            (false, true) => rocky_core::state::RunStatus::Failure,
+        }
+    }
 }
 
 impl PlanOutput {
@@ -2237,6 +2361,171 @@ mod cost_finalize_tests {
         assert!(result.is_err(), "error mode must return Err on breach");
         assert_eq!(out.budget_breaches.len(), 1);
         assert_eq!(out.budget_breaches[0].limit_type, "max_duration_ms");
+    }
+}
+
+#[cfg(test)]
+mod run_record_tests {
+    use super::*;
+    use rocky_core::state::{RunStatus, RunTrigger};
+
+    fn mat(asset_key: &[&str], duration_ms: u64, sql_hash: Option<&str>) -> MaterializationOutput {
+        MaterializationOutput {
+            asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            rows_copied: Some(42),
+            duration_ms,
+            metadata: MaterializationMetadata {
+                strategy: "full_refresh".to_string(),
+                watermark: None,
+                target_table_full_name: None,
+                sql_hash: sql_hash.map(str::to_string),
+                column_count: None,
+                compile_time_ms: None,
+            },
+            partition: None,
+            cost_usd: None,
+        }
+    }
+
+    fn fixed_start() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-04-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn to_run_record_maps_materializations_to_success_entries() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.tables_copied = 2;
+        out.materializations
+            .push(mat(&["s", "orders"], 1_500, Some("abc123")));
+        out.materializations
+            .push(mat(&["s", "customers"], 800, None));
+
+        let started = fixed_start();
+        let finished = started + chrono::Duration::seconds(5);
+        let record = out.to_run_record(
+            "run-test-1",
+            started,
+            finished,
+            "cfghash".to_string(),
+            RunTrigger::Manual,
+            RunStatus::Success,
+        );
+
+        assert_eq!(record.run_id, "run-test-1");
+        assert_eq!(record.config_hash, "cfghash");
+        assert_eq!(record.models_executed.len(), 2);
+
+        let orders = &record.models_executed[0];
+        assert_eq!(orders.model_name, "orders");
+        assert_eq!(orders.status, "success");
+        assert_eq!(orders.duration_ms, 1_500);
+        assert_eq!(orders.rows_affected, Some(42));
+        assert_eq!(orders.sql_hash, "abc123");
+        assert_eq!(orders.finished_at, finished);
+        assert_eq!(
+            orders.started_at,
+            finished - chrono::Duration::milliseconds(1_500)
+        );
+
+        let customers = &record.models_executed[1];
+        assert_eq!(customers.model_name, "customers");
+        assert_eq!(customers.sql_hash, "", "sql_hash none → empty string");
+    }
+
+    #[test]
+    fn to_run_record_maps_errors_to_failed_entries() {
+        let mut out = RunOutput::new(String::new(), 2_000, 1);
+        out.tables_copied = 1;
+        out.tables_failed = 1;
+        out.materializations
+            .push(mat(&["s", "orders"], 1_000, Some("ok")));
+        out.errors.push(TableErrorOutput {
+            asset_key: vec!["s".to_string(), "broken".to_string()],
+            error: "connection refused".to_string(),
+        });
+
+        let started = fixed_start();
+        let finished = started + chrono::Duration::seconds(2);
+        let record = out.to_run_record(
+            "run-test-2",
+            started,
+            finished,
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+        );
+
+        assert_eq!(record.models_executed.len(), 2);
+        let failed = record
+            .models_executed
+            .iter()
+            .find(|m| m.status == "failed")
+            .expect("failed entry present");
+        assert_eq!(failed.model_name, "broken");
+        assert_eq!(failed.duration_ms, 0);
+        assert!(matches!(record.status, RunStatus::PartialFailure));
+    }
+
+    #[test]
+    fn derive_run_status_clean_success() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 3;
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+    }
+
+    #[test]
+    fn derive_run_status_interrupted_with_progress_is_partial() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.interrupted = true;
+        assert!(matches!(out.derive_run_status(), RunStatus::PartialFailure));
+    }
+
+    #[test]
+    fn derive_run_status_interrupted_no_progress_is_failure() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.interrupted = true;
+        assert!(matches!(out.derive_run_status(), RunStatus::Failure));
+    }
+
+    #[test]
+    fn derive_run_status_failed_tables_no_progress_is_failure() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_failed = 2;
+        assert!(matches!(out.derive_run_status(), RunStatus::Failure));
+    }
+
+    #[test]
+    fn config_fingerprint_stable_for_same_bytes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"[adapter]\ntype = \"duckdb\"\n").unwrap();
+        let h1 = config_fingerprint(tmp.path());
+        let h2 = config_fingerprint(tmp.path());
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 16, "16 hex chars");
+        assert_ne!(h1, "unknown");
+    }
+
+    #[test]
+    fn config_fingerprint_differs_when_bytes_differ() {
+        let tmp1 = tempfile::NamedTempFile::new().unwrap();
+        let tmp2 = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp1.path(), b"one").unwrap();
+        std::fs::write(tmp2.path(), b"two").unwrap();
+        assert_ne!(
+            config_fingerprint(tmp1.path()),
+            config_fingerprint(tmp2.path())
+        );
+    }
+
+    #[test]
+    fn config_fingerprint_missing_file_returns_unknown() {
+        assert_eq!(
+            config_fingerprint(std::path::Path::new("/does/not/exist.toml")),
+            "unknown"
+        );
     }
 }
 

@@ -546,23 +546,12 @@ class RunRecord(BaseModel):
     config_hash: str
 
 
-class HistoryResult(BaseModel):
-    """Output of ``rocky history --json`` (all runs)."""
-
-    version: str
-    command: str
-    runs: list[RunRecord]
-    count: int
-
-
-class ModelHistoryResult(BaseModel):
-    """Output of ``rocky history --model <name> --json`` (single model)."""
-
-    version: str
-    command: str
-    model: str
-    executions: list[ModelExecution]
-    count: int
+# ``HistoryResult`` + ``ModelHistoryResult`` soft-swapped to the generated
+# CLI-output-shaped classes below (see "generated types bridge" section).
+# The hand-written classes above referenced the state-store ``RunRecord``
+# shape (with ``finished_at``, ``config_hash``, ``models_executed`` as a
+# list) — that shape doesn't match what ``rocky history --json`` actually
+# emits. Aliases live at module scope below the re-export block.
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +889,15 @@ from .types_generated import (  # noqa: E402, F401
 DagResult = DagOutput
 DagNode = DagNodeOutput
 DagEdge = DagEdgeOutput
+
+# Soft-swap aliases — the hand-written ``HistoryResult`` /
+# ``ModelHistoryResult`` / ``OptimizeResult`` above diverged from what the
+# Rust CLI emits (they mirrored state-store shapes instead). Empty arrays
+# masked the drift until `rocky run` started persisting run records. The
+# generated types are the source of truth; keep the Result names as
+# exports so external consumers don't break.
+HistoryResult = HistoryOutput
+ModelHistoryResult = ModelHistoryOutput
 
 # ---------------------------------------------------------------------------
 # Union type and parser

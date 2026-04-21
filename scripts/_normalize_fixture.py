@@ -27,7 +27,28 @@ WALL_CLOCK_FIELDS: frozenset[str] = frozenset(
         "watermark",
     }
 )
+
+# String fields derived from wall-clock time (e.g. rocky's
+# ``run-YYYYMMDD-HHMMSS-NNN`` ids). Replaced with a sentinel so the
+# corpus is byte-stable across regens.
+WALL_CLOCK_ID_FIELDS: frozenset[str] = frozenset({"run_id"})
+
+# Numeric fields whose value is a deterministic function of a
+# wall-clock-derived number (e.g. ``compute_cost_per_run =
+# avg_duration_seconds * compute_cost_per_second``). Even though the
+# raw duration gets zeroed elsewhere, ``rocky optimize`` does the math
+# before emitting, so the product is captured as-is and wiggles across
+# machines. Treat these identically to timing inputs: zero them so the
+# corpus stays byte-stable.
+DERIVED_FROM_WALL_CLOCK_FIELDS: frozenset[str] = frozenset(
+    {
+        "compute_cost_per_run",
+        "estimated_monthly_savings",
+    }
+)
+
 SENTINEL_TS = "2000-01-01T00:00:00Z"
+SENTINEL_RUN_ID = "run-SENTINEL"
 
 
 def normalize(node: object) -> None:
@@ -37,8 +58,14 @@ def normalize(node: object) -> None:
                 k.endswith(s) for s in TIMING_SUFFIXES
             ):
                 node[k] = 0
+            elif isinstance(v, (int, float)) and k in DERIVED_FROM_WALL_CLOCK_FIELDS:
+                # Preserve float-vs-int typing so the JSON renders
+                # `0.0` rather than `0` for originally-float fields.
+                node[k] = 0.0 if isinstance(v, float) else 0
             elif isinstance(v, str) and k in WALL_CLOCK_FIELDS:
                 node[k] = SENTINEL_TS
+            elif isinstance(v, str) and k in WALL_CLOCK_ID_FIELDS:
+                node[k] = SENTINEL_RUN_ID
             else:
                 normalize(v)
     elif isinstance(node, list):

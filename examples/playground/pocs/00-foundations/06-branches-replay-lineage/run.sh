@@ -28,8 +28,10 @@ echo "==> 5. Run replication against the branch (writes poc.branch__fix_revenue.
 rocky -c rocky.toml -o json run --filter source=orders --branch fix_revenue \
     > expected/run_branch.json
 
-echo "==> 6. Replay inspection — shape of the read path (no records yet; write path is Arc 1 wave 2)"
-rocky replay latest > expected/replay_latest.json 2>&1 || true
+echo "==> 6. Replay — inspect the last recorded run (SQL hashes, per-model status, cost)"
+rocky replay latest > expected/replay_latest.json
+rocky history > expected/history.json
+rocky cost latest > expected/cost_latest.json
 
 echo "==> 7. Column-level lineage — downstream blast radius of raw_orders.amount"
 rocky lineage raw_orders --models models --column amount --downstream \

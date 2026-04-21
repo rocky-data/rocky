@@ -11,11 +11,23 @@ class OptimizeRecommendation(BaseModel):
     One materialization-strategy recommendation. Mirrors `rocky_core::optimize::MaterializationCost` but lives in the CLI crate so we don't have to derive JsonSchema across the workspace.
     """
 
+    compute_cost_per_run: float
+    """
+    Projected per-run compute cost (USD). Populated from `rocky_core::optimize::MaterializationCost::compute_cost_per_run` so Dagster's `checks.py` can surface it as metadata without re-deriving from config.
+    """
     current_strategy: str
+    downstream_references: conint(ge=0)
+    """
+    How many downstream models depend on this one. Drives whether the recommendation favours table materialisation (many consumers) vs a view.
+    """
     estimated_monthly_savings: float
     model_name: str
     reasoning: str
     recommended_strategy: str
+    storage_cost_per_month: float
+    """
+    Projected monthly storage cost (USD).
+    """
 
 
 class OptimizeOutput(BaseModel):
