@@ -574,19 +574,6 @@ def test_run_streaming_timeout_kills_proc_and_raises():
 # ---------------------------------------------------------------------------
 
 
-_HANG_WITH_STDERR_CHATTER_SCRIPT = """#!/bin/sh
-# Mimics the 2026-04-19 production behaviour: stream stderr at ~20Hz
-# while never exiting. Under the two-readers race on proc.stderr, the
-# old communicate(timeout=) path intermittently failed to fire, leaving
-# the subprocess hanging for hours.
-echo '{"started": true}' >&2
-while true; do
-    echo 'still uploading state...' >&2
-    sleep 0.05
-done
-"""
-
-
 def _write_hang_fake(tmp_path: Path) -> Path:
     """Write the hanging-with-stderr-chatter fake rocky binary to ``tmp_path``.
 
@@ -689,7 +676,10 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
             for _ in stderr:
                 pass
         except (OSError, ValueError):
-            pass
+            # Drain-only helper: pipe close / decode errors are the
+            # same termination signals the real forwarder swallows.
+            # Exit quietly; the watchdog still owns timeout enforcement.
+            return
 
     monkeypatch.setattr(
         "dagster_rocky.resource._forward_stderr_to_context",
