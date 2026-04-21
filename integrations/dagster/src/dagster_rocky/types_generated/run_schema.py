@@ -394,6 +394,10 @@ class MaterializationOutput(BaseModel):
     Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge).
     """
     rows_copied: conint(ge=0) | None = None
+    started_at: AwareDatetime
+    """
+    Wall-clock timestamp captured at the moment the engine began executing this model. Used by `RunOutput::to_run_record` to build accurate per-model windows on the persisted `ModelExecution` — replaces the prior lossy reconstruction (`finished_at - duration`) that mis-ordered parallel runs. `finished_at` is derived as `started_at + duration_ms`; keeping one source of truth avoids drift between the two.
+    """
 
 
 class TableCheckOutput(BaseModel):

@@ -15,6 +15,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "full_refresh",
         "watermark": "2000-01-01T00:00:00Z",
@@ -30,6 +31,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
@@ -52,6 +54,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
@@ -74,6 +77,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
@@ -96,6 +100,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
@@ -118,6 +123,7 @@
       ],
       "rows_copied": null,
       "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
       "metadata": {
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",

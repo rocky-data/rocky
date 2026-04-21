@@ -316,6 +316,14 @@ pub struct MaterializationOutput {
     pub asset_key: Vec<String>,
     pub rows_copied: Option<u64>,
     pub duration_ms: u64,
+    /// Wall-clock timestamp captured at the moment the engine began
+    /// executing this model. Used by `RunOutput::to_run_record` to
+    /// build accurate per-model windows on the persisted
+    /// `ModelExecution` — replaces the prior lossy reconstruction
+    /// (`finished_at - duration`) that mis-ordered parallel runs.
+    /// `finished_at` is derived as `started_at + duration_ms`; keeping
+    /// one source of truth avoids drift between the two.
+    pub started_at: DateTime<Utc>,
     pub metadata: MaterializationMetadata,
     /// Partition window this materialization targeted, present only when
     /// the model's strategy is `time_interval`. `None` for unpartitioned
@@ -1991,12 +1999,10 @@ impl RunOutput {
     /// Each [`MaterializationOutput`] becomes a success-status
     /// [`rocky_core::state::ModelExecution`]; each
     /// [`TableErrorOutput`] becomes a failure-status entry. Per-model
-    /// timestamps are lossy: `finished_at` is set to the run's
-    /// `finished_at` (every model) and `started_at` is computed as
-    /// `finished_at - duration_ms`. Actual per-model wall-clock windows
-    /// require execution-loop instrumentation and land in a later wave —
-    /// this mirrors how `populate_cost_summary` leaves `bytes_scanned`
-    /// as `None` until the adapter layer plumbs real values.
+    /// windows use `MaterializationOutput::started_at` (stamped at
+    /// execution time) and derive `finished_at` as
+    /// `started_at + duration_ms` — parallel runs preserve their real
+    /// ordering on the stored `RunRecord`.
     ///
     /// `model_name` is derived from the last element of
     /// [`MaterializationOutput::asset_key`] to match how `rocky cost` /
@@ -2014,8 +2020,9 @@ impl RunOutput {
 
         for mat in &self.materializations {
             let duration_ms = mat.duration_ms;
-            let model_start = finished_at
-                - chrono::Duration::milliseconds(duration_ms.min(i64::MAX as u64) as i64);
+            let model_started = mat.started_at;
+            let model_finished = model_started
+                + chrono::Duration::milliseconds(duration_ms.min(i64::MAX as u64) as i64);
             let model_name = mat
                 .asset_key
                 .last()
@@ -2023,8 +2030,8 @@ impl RunOutput {
                 .unwrap_or_else(|| "<unknown>".to_string());
             models.push(rocky_core::state::ModelExecution {
                 model_name,
-                started_at: model_start,
-                finished_at,
+                started_at: model_started,
+                finished_at: model_finished,
                 duration_ms,
                 rows_affected: mat.rows_copied,
                 status: "success".to_string(),
@@ -2261,6 +2268,7 @@ mod cost_finalize_tests {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             rows_copied: None,
             duration_ms,
+            started_at: Utc::now(),
             metadata: MaterializationMetadata {
                 strategy: "full_refresh".to_string(),
                 watermark: None,
@@ -2369,11 +2377,17 @@ mod run_record_tests {
     use super::*;
     use rocky_core::state::{RunStatus, RunTrigger};
 
-    fn mat(asset_key: &[&str], duration_ms: u64, sql_hash: Option<&str>) -> MaterializationOutput {
+    fn mat(
+        asset_key: &[&str],
+        duration_ms: u64,
+        sql_hash: Option<&str>,
+        started_at: DateTime<Utc>,
+    ) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             rows_copied: Some(42),
             duration_ms,
+            started_at,
             metadata: MaterializationMetadata {
                 strategy: "full_refresh".to_string(),
                 watermark: None,
@@ -2394,20 +2408,26 @@ mod run_record_tests {
     }
 
     #[test]
-    fn to_run_record_maps_materializations_to_success_entries() {
+    fn to_run_record_uses_per_model_started_at() {
         let mut out = RunOutput::new(String::new(), 5_000, 1);
         out.tables_copied = 2;
+        let run_started = fixed_start();
+        // Simulate parallel execution: orders starts at +0s (runs
+        // 1.5s), customers starts at +0.5s (runs 0.8s). Under the old
+        // lossy reconstruction both would share the same finished_at
+        // and have started_at rebuilt from the wrong end.
+        let orders_start = run_started;
+        let customers_start = run_started + chrono::Duration::milliseconds(500);
         out.materializations
-            .push(mat(&["s", "orders"], 1_500, Some("abc123")));
+            .push(mat(&["s", "orders"], 1_500, Some("abc123"), orders_start));
         out.materializations
-            .push(mat(&["s", "customers"], 800, None));
+            .push(mat(&["s", "customers"], 800, None, customers_start));
 
-        let started = fixed_start();
-        let finished = started + chrono::Duration::seconds(5);
+        let run_finished = run_started + chrono::Duration::seconds(5);
         let record = out.to_run_record(
             "run-test-1",
-            started,
-            finished,
+            run_started,
+            run_finished,
             "cfghash".to_string(),
             RunTrigger::Manual,
             RunStatus::Success,
@@ -2423,15 +2443,23 @@ mod run_record_tests {
         assert_eq!(orders.duration_ms, 1_500);
         assert_eq!(orders.rows_affected, Some(42));
         assert_eq!(orders.sql_hash, "abc123");
-        assert_eq!(orders.finished_at, finished);
+        // Each model's started_at mirrors the MaterializationOutput's;
+        // finished_at is derived as started_at + duration (preserves
+        // parallel overlap rather than collapsing to run.finished_at).
+        assert_eq!(orders.started_at, orders_start);
         assert_eq!(
-            orders.started_at,
-            finished - chrono::Duration::milliseconds(1_500)
+            orders.finished_at,
+            orders_start + chrono::Duration::milliseconds(1_500)
         );
 
         let customers = &record.models_executed[1];
         assert_eq!(customers.model_name, "customers");
         assert_eq!(customers.sql_hash, "", "sql_hash none → empty string");
+        assert_eq!(customers.started_at, customers_start);
+        assert_eq!(
+            customers.finished_at,
+            customers_start + chrono::Duration::milliseconds(800)
+        );
     }
 
     #[test]
@@ -2439,8 +2467,9 @@ mod run_record_tests {
         let mut out = RunOutput::new(String::new(), 2_000, 1);
         out.tables_copied = 1;
         out.tables_failed = 1;
+        let run_started = fixed_start();
         out.materializations
-            .push(mat(&["s", "orders"], 1_000, Some("ok")));
+            .push(mat(&["s", "orders"], 1_000, Some("ok"), run_started));
         out.errors.push(TableErrorOutput {
             asset_key: vec!["s".to_string(), "broken".to_string()],
             error: "connection refused".to_string(),

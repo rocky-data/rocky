@@ -264,6 +264,10 @@ export interface MaterializationOutput {
    */
   partition?: PartitionInfo | null;
   rows_copied?: number | null;
+  /**
+   * Wall-clock timestamp captured at the moment the engine began executing this model. Used by `RunOutput::to_run_record` to build accurate per-model windows on the persisted `ModelExecution` — replaces the prior lossy reconstruction (`finished_at - duration`) that mis-ordered parallel runs. `finished_at` is derived as `started_at + duration_ms`; keeping one source of truth avoids drift between the two.
+   */
+  started_at: string;
   [k: string]: unknown;
 }
 export interface MaterializationMetadata {
