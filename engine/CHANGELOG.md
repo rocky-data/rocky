@@ -7,18 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-04-21
+
+Arc 1 wave 2 shipped + a short cleanup wave around it. Eight PRs since v1.11.0. `record_run` wiring finally makes the run-history query surfaces (`rocky history` / `replay` / `trace` / `cost`) return real data end-to-end, plus two new commands (`rocky cost`, `rocky branch compare`) and a SIGPIPE fix.
+
 ### Added
 
 - **`rocky cost <run_id|latest>`** (#202) — historical cost rollup over stored runs. Recomputes per-model cost via `rocky_core::cost::compute_observed_cost_usd` from `ModelExecution.duration_ms` / `bytes_scanned`. New `CostOutput` + `PerModelCostHistorical` through the codegen cascade. BigQuery cost now computes from stored bytes even when the live `rocky run` path still emits `None`. Arc 2 wave 2 first PR.
 - **`rocky branch compare <name>`** (#200) — diff a named branch's targets against main. Delegates to the existing `compare::compare` entry point with the branch's `schema_prefix` routed through `ShadowConfig.schema_override` — same mechanism `rocky run --branch` uses for writes, so compare hits exactly the tables the branch produced. Zero JSON-schema drift.
-- **`rocky run` now persists `RunRecord` to the state store** (#203) — `StateStore::record_run` wired at every exit path (happy / interrupted / model-only) after `populate_cost_summary`. `rocky history`, `rocky replay`, `rocky trace`, and `rocky cost` now return real data instead of reading from an empty store. Per-model timestamps are lossily captured as `finished_at = run.finished_at`, `started_at = finished_at - duration`; actual per-model wall-clock windows require execution-loop instrumentation and land in a later wave. Arc 1 wave 2.
+- **`rocky run` now persists `RunRecord` to the state store** (#203) — `StateStore::record_run` wired at every exit path (happy / interrupted / model-only) after `populate_cost_summary`. `rocky history`, `rocky replay`, `rocky trace`, and `rocky cost` now return real data instead of reading from an empty store. Arc 1 wave 2.
+- **Real per-model `started_at` on `MaterializationOutput`** (#206) — every materialization now carries a `DateTime<Utc>` stamped at the moment the engine begins executing it. `RunOutput::to_run_record` uses it directly (deriving per-model `finished_at` as `started_at + duration_ms`), so parallel runs preserve their real ordering on the persisted `RunRecord` instead of the finish-relative collapse PR #203 had to leave behind.
 - **`OptimizeRecommendation`** (#203) gained `compute_cost_per_run`, `storage_cost_per_month`, `downstream_references` — projected through from `rocky_core::optimize::MaterializationCost` so Dagster `checks.py` can surface the values as asset metadata without re-deriving.
+- **Configurable `state.transfer_timeout_seconds`** — wall-clock budget for each state download/upload operation, defaulting to 300 s. Replaces the hard-coded constant in `rocky_core::state_sync`. Raise for very large state files or slow networks; lower to fail faster in CI. Surfaces in `rocky.toml` under `[state]`.
+- **`state.upload` / `state.download` tracing spans** around every state transfer, carrying `backend`, `bucket`, and `size_bytes` fields. Events emitted inside the transfer — including the new timeout warning — inherit those fields automatically, so hung transfers are diagnosable from stderr logs alone (which dagster-rocky streams into the Dagster run viewer).
+- **Structured `tracing::warn!` on transfer-timeout elapse** with a `duration_ms` field and message `"state transfer exceeded timeout budget"`. Operators now see a single, searchable event instead of a silent `StateSyncError::Timeout`.
+- **`rocky_core::object_store` now honours `AWS_ALLOW_HTTP` / `AZURE_ALLOW_HTTP` / `GOOGLE_STORAGE_ALLOW_HTTP`** in `default_client_options()`. These are standard `object_store`-crate env vars; the flag is always off in production. Integration tests (see `tests/state_sync_timeout_test.rs`) use it to front-end the SDK with a plain-HTTP wiremock without bypassing the real credential chain.
 
 ### Fixed
 
 - **SIGPIPE now handled gracefully** (#199) — `rocky <cmd> | head` / `| jq | head` no longer SIGABRTs. Rust's default was to ignore `SIGPIPE` at the kernel level and panic from `println!` on the resulting EPIPE; restored the POSIX default in `main()` before `Cli::parse()` so `--help` / `--version` are also covered. `#[cfg(not(unix))]` stub preserves Windows builds.
 - **`target_dialect = "bq"` rejected by the project schema** (#201) — `examples/playground/pocs/06-developer-experience/08-portability-lint/rocky.toml` had the CLI-flag short form where only the long form (`bigquery`) is valid in `[portability]`. Updated the POC; `every_committed_poc_matches_project_schema` is green again.
 - **`HistoryResult` Pydantic drift** (#203) — hand-written class mirrored the state-store `RunRecord` shape (`finished_at`, `config_hash`, `models_executed` as a list) rather than what `rocky history --json` actually emits. Completed the Phase 2 soft-swap that history had been missing: `HistoryResult = HistoryOutput`, `ModelHistoryResult = ModelHistoryOutput`. Invisible until runs stopped being empty.
+- **Valkey state transfers now honour the transfer-timeout budget.** The sync `redis::Client::get_connection()` and `redis::cmd(...).query()` calls in `upload_to_valkey` / `download_from_valkey` ran on the tokio runtime thread, so a dead Valkey peer could stall the run forever — no outer `tokio::time::timeout` could rescue a blocking socket read. Both paths now run under `tokio::task::spawn_blocking` inside `with_transfer_timeout`, closing the same class of hang the object-store paths were already protected against.
 
 ### Internal
 

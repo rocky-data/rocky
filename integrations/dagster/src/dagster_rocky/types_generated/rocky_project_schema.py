@@ -668,6 +668,10 @@ class StateConfig(BaseModel):
     """
     S3 key prefix (default: "rocky/state/")
     """
+    transfer_timeout_seconds: conint(ge=0) | None = 300
+    """
+    Wall-clock budget (seconds) for each state transfer operation (download or upload). Catches stuck SDK retry loops, DNS, TLS, and hung endpoints that the per-request HTTP timeout does not see. Defaults to 300s; raise for large state or slow networks.
+    """
     valkey_prefix: str | None = None
     """
     Valkey key prefix (default: "rocky:state:")
@@ -2158,6 +2162,7 @@ class RockyConfig(BaseModel):
             "gcs_prefix": None,
             "s3_bucket": None,
             "s3_prefix": None,
+            "transfer_timeout_seconds": 300,
             "valkey_prefix": None,
             "valkey_url": None,
         },

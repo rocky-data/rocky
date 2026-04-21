@@ -36,9 +36,21 @@ const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn default_client_options() -> ClientOptions {
-    ClientOptions::new()
+    let mut opts = ClientOptions::new()
         .with_timeout(CLIENT_REQUEST_TIMEOUT)
-        .with_connect_timeout(CLIENT_CONNECT_TIMEOUT)
+        .with_connect_timeout(CLIENT_CONNECT_TIMEOUT);
+    // Respect the standard `object_store` env vars for allowing plain HTTP.
+    // Production never sets these; integration tests (which front-end the S3
+    // SDK with a local HTTP mock server) do.
+    let allow_http = std::env::var("AWS_ALLOW_HTTP")
+        .or_else(|_| std::env::var("GOOGLE_STORAGE_ALLOW_HTTP"))
+        .or_else(|_| std::env::var("AZURE_ALLOW_HTTP"))
+        .ok()
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if allow_http {
+        opts = opts.with_allow_http(true);
+    }
+    opts
 }
 
 /// Errors returned by [`ObjectStoreProvider`] operations.
