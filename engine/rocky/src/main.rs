@@ -821,6 +821,19 @@ enum BranchAction {
         /// Branch name
         name: String,
     },
+    /// Diff a branch's table set against production targets.
+    ///
+    /// Reuses the `rocky compare` machinery — looks up the branch's
+    /// `schema_prefix` in the state store and compares the branch
+    /// schema (e.g. `branch__myfeature`) against the pipeline's
+    /// production target schemas.
+    Compare {
+        /// Branch name
+        name: String,
+        /// Filter sources by component value (e.g., --filter client=acme)
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1338,6 +1351,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             BranchAction::List => rocky_cli::commands::run_branch_list(&cli.state_path, json),
             BranchAction::Show { name } => {
                 rocky_cli::commands::run_branch_show(&cli.state_path, &name, json)
+            }
+            BranchAction::Compare { name, filter } => {
+                rocky_cli::commands::run_branch_compare(
+                    &cli.state_path,
+                    &cli.config,
+                    &name,
+                    filter.as_deref(),
+                    json,
+                )
+                .await
             }
         },
         Command::Replay { target, model } => {

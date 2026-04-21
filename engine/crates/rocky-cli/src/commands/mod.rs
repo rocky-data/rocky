@@ -52,7 +52,9 @@ pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
 pub use archive::run_archive;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
-pub use branch::{run_branch_create, run_branch_delete, run_branch_list, run_branch_show};
+pub use branch::{
+    run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_show,
+};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::run_ci_diff;
