@@ -418,7 +418,7 @@ impl std::fmt::Display for StateBackend {
 /// When both S3 and Valkey are configured (`backend = "tiered"`):
 /// - Download: Valkey first (fast), S3 fallback (durable)
 /// - Upload: write to both Valkey + S3
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
     /// Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
@@ -436,6 +436,31 @@ pub struct StateConfig {
     pub valkey_url: Option<String>,
     /// Valkey key prefix (default: "rocky:state:")
     pub valkey_prefix: Option<String>,
+    /// Wall-clock budget (seconds) for each state transfer operation
+    /// (download or upload). Catches stuck SDK retry loops, DNS, TLS, and
+    /// hung endpoints that the per-request HTTP timeout does not see.
+    /// Defaults to 300s; raise for large state or slow networks.
+    #[serde(default = "default_state_transfer_timeout_secs")]
+    pub transfer_timeout_seconds: u64,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            backend: StateBackend::default(),
+            s3_bucket: None,
+            s3_prefix: None,
+            gcs_bucket: None,
+            gcs_prefix: None,
+            valkey_url: None,
+            valkey_prefix: None,
+            transfer_timeout_seconds: default_state_transfer_timeout_secs(),
+        }
+    }
+}
+
+fn default_state_transfer_timeout_secs() -> u64 {
+    300
 }
 
 /// Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).

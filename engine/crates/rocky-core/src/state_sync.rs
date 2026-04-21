@@ -11,16 +11,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::config::{StateBackend, StateConfig};
 use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
-
-/// Hard upper bound on any single remote state transfer. Belt-and-suspenders
-/// complement to the per-request timeout configured on the cloud client in
-/// [`crate::object_store`]: the client timeout handles stuck TCP; this outer
-/// bound catches unforeseen await paths (SDK retry loops, DNS, TLS).
-const STATE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
 pub enum StateSyncError {
@@ -73,6 +67,11 @@ fn cloud_provider(
     Ok(ObjectStoreProvider::from_uri(&uri)?)
 }
 
+/// Resolve the per-transfer wall-clock budget from `StateConfig`.
+fn transfer_timeout(config: &StateConfig) -> Duration {
+    Duration::from_secs(config.transfer_timeout_seconds)
+}
+
 /// Downloads state from remote storage to a local file before a run.
 pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     match config.backend {
@@ -85,16 +84,18 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
                 StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
             })?;
             let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
-            download_from_object_store("s3", bucket, prefix, local_path).await
+            download_from_object_store("s3", bucket, prefix, local_path, transfer_timeout(config))
+                .await
         }
         StateBackend::Gcs => {
             let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
             })?;
             let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
-            download_from_object_store("gs", bucket, prefix, local_path).await
+            download_from_object_store("gs", bucket, prefix, local_path, transfer_timeout(config))
+                .await
         }
-        StateBackend::Valkey => download_from_valkey(config, local_path),
+        StateBackend::Valkey => download_from_valkey(config, local_path).await,
         StateBackend::Tiered => {
             // Try Valkey first (fast), fall back to S3 (durable)
             info!("State backend: tiered (Valkey → S3 fallback)");
@@ -138,16 +139,16 @@ pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(),
                 StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
             })?;
             let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
-            upload_to_object_store("s3", bucket, prefix, local_path).await
+            upload_to_object_store("s3", bucket, prefix, local_path, transfer_timeout(config)).await
         }
         StateBackend::Gcs => {
             let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
             })?;
             let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
-            upload_to_object_store("gs", bucket, prefix, local_path).await
+            upload_to_object_store("gs", bucket, prefix, local_path, transfer_timeout(config)).await
         }
-        StateBackend::Valkey => upload_to_valkey(config, local_path),
+        StateBackend::Valkey => upload_to_valkey(config, local_path).await,
         StateBackend::Tiered => {
             // Write to both Valkey (fast) and S3 (durable)
             info!("State backend: tiered (uploading to Valkey + S3)");
@@ -180,34 +181,44 @@ async fn download_from_object_store(
     bucket: &str,
     prefix: &str,
     local_path: &Path,
+    timeout: Duration,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
-    info!(
-        uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
-        local = %local_path.display(),
-        "downloading state from object store"
+    let span = info_span!(
+        "state.download",
+        backend = %provider.scheme(),
+        bucket = %provider.bucket(),
     );
+    async {
+        info!(
+            uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
+            local = %local_path.display(),
+            "downloading state from object store"
+        );
 
-    with_transfer_timeout(async {
-        match provider.exists(STATE_FILE).await {
-            Ok(true) => {
-                provider.download_file(STATE_FILE, local_path).await?;
-                info!(
-                    size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
-                    "state restored from object store"
-                );
-                Ok(())
+        with_transfer_timeout(timeout, async {
+            match provider.exists(STATE_FILE).await {
+                Ok(true) => {
+                    provider.download_file(STATE_FILE, local_path).await?;
+                    info!(
+                        size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        "state restored from object store"
+                    );
+                    Ok(())
+                }
+                Ok(false) => {
+                    info!("No existing state in object store — starting fresh");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
+                    Ok(())
+                }
             }
-            Ok(false) => {
-                info!("No existing state in object store — starting fresh");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
-                Ok(())
-            }
-        }
-    })
+        })
+        .await
+    }
+    .instrument(span)
     .await
 }
 
@@ -217,99 +228,177 @@ async fn upload_to_object_store(
     bucket: &str,
     prefix: &str,
     local_path: &Path,
+    timeout: Duration,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
-    info!(
-        uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
-        "uploading state to object store"
+    let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let span = info_span!(
+        "state.upload",
+        backend = %provider.scheme(),
+        bucket = %provider.bucket(),
+        size_bytes,
     );
-    with_transfer_timeout(async {
-        provider.upload_file(local_path, STATE_FILE).await?;
-        Ok::<(), StateSyncError>(())
-    })
-    .await?;
-    Ok(())
+    async {
+        info!(
+            uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
+            "uploading state to object store"
+        );
+        with_transfer_timeout(timeout, async {
+            provider.upload_file(local_path, STATE_FILE).await?;
+            Ok::<(), StateSyncError>(())
+        })
+        .await?;
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
 
-/// Wrap a state-transfer future with [`STATE_TRANSFER_TIMEOUT`]. On elapse
+/// Wrap a state-transfer future with the configured timeout budget. On elapse
 /// the returned error is `StateSyncError::Timeout` — distinct from the
 /// per-request timeout the client raises, so callers can tell the two apart.
-async fn with_transfer_timeout<F, T>(fut: F) -> Result<T, StateSyncError>
+///
+/// Emits a structured `tracing::warn!` on elapse so operators can diagnose
+/// hung transfers from log output alone. Span fields (`backend`, `bucket`,
+/// `size_bytes`) propagate via the enclosing `state.{upload,download}` span.
+async fn with_transfer_timeout<F, T>(timeout: Duration, fut: F) -> Result<T, StateSyncError>
 where
     F: std::future::Future<Output = Result<T, StateSyncError>>,
 {
-    match tokio::time::timeout(STATE_TRANSFER_TIMEOUT, fut).await {
+    match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
-        Err(_) => Err(StateSyncError::Timeout(STATE_TRANSFER_TIMEOUT)),
+        Err(_) => {
+            warn!(
+                duration_ms = timeout.as_millis() as u64,
+                "state transfer exceeded timeout budget"
+            );
+            Err(StateSyncError::Timeout(timeout))
+        }
     }
 }
 
 /// Download state from Valkey/Redis.
-fn download_from_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+///
+/// The `redis` crate's sync client blocks the current thread — a dead Valkey
+/// peer would otherwise stall the tokio runtime indefinitely and no outer
+/// `tokio::time::timeout` could rescue it. We offload the blocking work to a
+/// dedicated thread via `spawn_blocking` and gate it with the same
+/// `transfer_timeout_seconds` budget the object-store paths use.
+async fn download_from_valkey(
+    config: &StateConfig,
+    local_path: &Path,
+) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
         .as_deref()
-        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?;
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
+        .to_string();
     let prefix = config
         .valkey_prefix
         .as_deref()
-        .unwrap_or(DEFAULT_VALKEY_PREFIX);
+        .unwrap_or(DEFAULT_VALKEY_PREFIX)
+        .to_string();
     let key = format!("{prefix}{STATE_FILE}");
+    let local_path_owned = local_path.to_path_buf();
+    let timeout = transfer_timeout(config);
 
-    info!(key = key, "downloading state from Valkey");
+    let span = info_span!("state.download", backend = "valkey");
+    async move {
+        info!(key = %key, "downloading state from Valkey");
+        with_transfer_timeout(timeout, async move {
+            let key_for_task = key.clone();
+            let local_for_task = local_path_owned.clone();
+            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
+                let client =
+                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let mut conn = client
+                    .get_connection()
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-    let client = redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-    let mut conn = client
-        .get_connection()
-        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let data: Option<Vec<u8>> = redis::cmd("GET")
+                    .arg(&key_for_task)
+                    .query(&mut conn)
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-    let data: Option<Vec<u8>> = redis::cmd("GET")
-        .arg(&key)
-        .query(&mut conn)
-        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-
-    match data {
-        Some(bytes) => {
-            std::fs::write(local_path, bytes)?;
-            info!(
-                size = local_path.metadata()?.len(),
-                "state restored from Valkey"
-            );
-        }
-        None => {
-            info!("No existing state in Valkey — starting fresh");
-        }
+                match data {
+                    Some(bytes) => {
+                        std::fs::write(&local_for_task, bytes)?;
+                        let size = std::fs::metadata(&local_for_task)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        info!(size, "state restored from Valkey");
+                    }
+                    None => {
+                        info!("No existing state in Valkey — starting fresh");
+                    }
+                }
+                Ok(())
+            })
+            .await;
+            match join {
+                Ok(inner) => inner,
+                Err(e) => Err(StateSyncError::Valkey(format!(
+                    "valkey worker task failed: {e}"
+                ))),
+            }
+        })
+        .await
     }
-    Ok(())
+    .instrument(span)
+    .await
 }
 
 /// Upload state to Valkey/Redis.
-fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+///
+/// Mirrors [`download_from_valkey`]: offloads the blocking redis SET via
+/// `spawn_blocking` and wraps the handle with `with_transfer_timeout` so a
+/// hung Valkey peer cannot stall the run past the configured budget.
+async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
         .as_deref()
-        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?;
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
+        .to_string();
     let prefix = config
         .valkey_prefix
         .as_deref()
-        .unwrap_or(DEFAULT_VALKEY_PREFIX);
+        .unwrap_or(DEFAULT_VALKEY_PREFIX)
+        .to_string();
     let key = format!("{prefix}{STATE_FILE}");
-
     let data = std::fs::read(local_path)?;
-    info!(key = key, size = data.len(), "uploading state to Valkey");
+    let size_bytes = data.len() as u64;
+    let timeout = transfer_timeout(config);
 
-    let client = redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-    let mut conn = client
-        .get_connection()
-        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+    let span = info_span!("state.upload", backend = "valkey", size_bytes);
+    async move {
+        info!(key = %key, size = size_bytes, "uploading state to Valkey");
+        with_transfer_timeout(timeout, async move {
+            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
+                let client =
+                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let mut conn = client
+                    .get_connection()
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-    redis::cmd("SET")
-        .arg(&key)
-        .arg(data)
-        .query::<()>(&mut conn)
-        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-
-    Ok(())
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg(data)
+                    .query::<()>(&mut conn)
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                Ok(())
+            })
+            .await;
+            match join {
+                Ok(inner) => inner,
+                Err(e) => Err(StateSyncError::Valkey(format!(
+                    "valkey worker task failed: {e}"
+                ))),
+            }
+        })
+        .await
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
@@ -372,5 +461,11 @@ mod tests {
     #[test]
     fn test_state_backend_display_includes_gcs() {
         assert_eq!(StateBackend::Gcs.to_string(), "gcs");
+    }
+
+    #[test]
+    fn test_default_state_transfer_timeout() {
+        let config = StateConfig::default();
+        assert_eq!(config.transfer_timeout_seconds, 300);
     }
 }

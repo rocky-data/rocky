@@ -33,3 +33,6 @@ concurrency = 4
 
 [state]
 backend = "local"
+# Wall-clock budget (seconds) for each state transfer (download or upload).
+# Optional; defaults to 300s. Raise for large state files or slow networks.
+transfer_timeout_seconds = 300
