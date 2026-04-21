@@ -2876,6 +2876,7 @@ async fn run_one_partition(
     use rocky_core::incremental::{PartitionRecord, PartitionStatus};
     let key = partition_plan.partition_key.clone();
     let partition_start = std::time::Instant::now();
+    let partition_started_at = chrono::Utc::now();
 
     // Mark InProgress before executing so a crashed runner leaves a
     // diagnostic breadcrumb in the state store.
@@ -2979,6 +2980,7 @@ async fn run_one_partition(
             asset_key: asset_key.to_vec(),
             rows_copied: None,
             duration_ms: record.duration_ms,
+            started_at: partition_started_at,
             metadata: MaterializationMetadata {
                 strategy: "time_interval".to_string(),
                 watermark: None,
@@ -3012,6 +3014,7 @@ async fn process_table(
     task: &TableTask,
 ) -> Result<TableResult> {
     let table_start = Instant::now();
+    let table_started_at = Utc::now();
     let dialect = warehouse.dialect();
 
     let source_table = TableRef {
@@ -3252,6 +3255,7 @@ async fn process_table(
             asset_key: asset_key.clone(),
             rows_copied: None,
             duration_ms: table_duration,
+            started_at: table_started_at,
             metadata: MaterializationMetadata {
                 strategy: strategy_name.to_string(),
                 watermark: Some(now),

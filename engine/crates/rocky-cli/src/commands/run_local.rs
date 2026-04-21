@@ -599,6 +599,7 @@ pub async fn run_snapshot(
     output_json: bool,
 ) -> Result<()> {
     let start = Instant::now();
+    let started_at = chrono::Utc::now();
 
     let pipes = crate::pipes::PipesEmitter::detect();
     if let Some(p) = &pipes {
@@ -662,6 +663,7 @@ pub async fn run_snapshot(
             ],
             rows_copied: None,
             duration_ms: start.elapsed().as_millis() as u64,
+            started_at,
             metadata: MaterializationMetadata {
                 strategy: "snapshot_scd2".to_string(),
                 watermark: None,
