@@ -204,7 +204,51 @@ pub async fn doctor(
         }
     }
 
-    // 6. Auth — construct adapters and ping each warehouse
+    // 6. State backend RW probe — actually write/read/delete a test
+    //    object against the configured backend. Complements `state_sync`
+    //    (which only inspects the backend type) by surfacing permission
+    //    and reachability problems that would otherwise only manifest at
+    //    end-of-run upload time.
+    if should_run("state_rw", check_filter) {
+        let start = Instant::now();
+        if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
+            let backend = &cfg.state.backend;
+            if *backend == rocky_core::config::StateBackend::Local {
+                checks.push(HealthCheck {
+                    name: "state_rw".into(),
+                    status: HealthStatus::Healthy,
+                    message: "Local backend — no remote probe needed".into(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            } else {
+                match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
+                    Ok(()) => {
+                        checks.push(HealthCheck {
+                            name: "state_rw".into(),
+                            status: HealthStatus::Healthy,
+                            message: format!("State backend RW probe succeeded ({backend})"),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        });
+                    }
+                    Err(e) => {
+                        checks.push(HealthCheck {
+                            name: "state_rw".into(),
+                            status: HealthStatus::Critical,
+                            message: format!("State backend RW probe failed: {e}"),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        });
+                        suggestions.push(format!(
+                            "state_rw: verify the '{backend}' backend has read+write access \
+                             to the configured bucket / prefix (tried put/get/delete of a \
+                             short-lived marker object)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Auth — construct adapters and ping each warehouse
     if should_run("auth", check_filter) {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
