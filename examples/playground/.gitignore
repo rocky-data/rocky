@@ -8,6 +8,8 @@
 pocs/**/expected/*.json
 pocs/**/expected/*.dot
 pocs/**/expected/*.txt
+pocs/**/expected/*.jsonl
+pocs/**/expected/*.log
 !pocs/**/expected/.gitkeep
 
 # Python (benchmarks, dbt-migration POC)
