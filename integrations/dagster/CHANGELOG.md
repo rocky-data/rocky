@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-04-21
+
+Tracks engine 1.12.0 (Arc 1 wave 2 + cleanup cascade).
+
+### Added
+
+- **`CostOutput` + `PerModelCostHistorical` Pydantic bindings** (#202) — generated from the new `rocky cost <run_id|latest>` engine schema. Reachable today via `dagster_rocky.types_generated.cost_schema.CostOutput`; `RockyResource.cost(...)` + `parse_rocky_output` dispatch + fixture are a small follow-up (explicitly deferred in #202).
+- **`OptimizeRecommendation.compute_cost_per_run` / `storage_cost_per_month` / `downstream_references`** (#203) — regenerated Pydantic bindings now expose the three fields `checks.py:54-59` reads on each recommendation. Previously hand-written drift caused `AttributeError` once `rocky optimize` started producing non-empty recommendations.
+- **`MaterializationOutput.started_at: datetime`** (#206) — real per-model wall-clock timestamp captured at execution time, propagated through the regenerated `run_schema.py`. Makes parallel-run ordering honest on the persisted `RunRecord` consumers read via `RockyResource.history()` / `.replay()` / `.cost()`.
+
+### Changed
+
+- **`HistoryResult` soft-swapped to `HistoryOutput`** (#203). Completes the Phase 2 generated-types migration that had been silent because `rocky history` always returned empty. `HistoryResult` / `ModelHistoryResult` are now aliases of the generated CLI-shape classes; hand-written `RunRecord`-shape versions had `finished_at`, `config_hash`, and `models_executed` as a list — none of which the CLI actually emits. `tests/scenarios.py::HISTORY` + the parse assertion were retrofitted to the CLI shape. No external API break: same class names, same import paths.
+
+### Internal
+
+- **`scripts/_normalize_fixture.py`** (#203) gained `WALL_CLOCK_ID_FIELDS = {"run_id"}` and `DERIVED_FROM_WALL_CLOCK_FIELDS = {"compute_cost_per_run", "estimated_monthly_savings"}` so the test-fixture corpus stays byte-stable across regens now that `run_id` and wall-clock-derived cost numbers appear in non-empty arrays.
+
 ## [1.7.0] — 2026-04-20
 
 Tracks engine 1.11.0. Regenerated Pydantic bindings for the trust-system arcs (Arcs 1–7 first waves + Arc 6 wave 2 + Arc 7 wave 2 wave-1).
