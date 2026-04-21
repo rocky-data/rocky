@@ -855,6 +855,34 @@ enum ListAction {
     },
 }
 
+/// Restore the kernel-default SIGPIPE disposition so that piping the CLI
+/// into `head`, `less`, `jq | head`, etc. terminates the process cleanly
+/// (exit 141) instead of aborting on an `EPIPE` panic from `println!`.
+///
+/// Rust's standard library installs `SIG_IGN` for SIGPIPE at startup, which
+/// makes every subsequent `write(2)` return `EPIPE`; `println!` / `writeln!`
+/// then panic, and a panic in the main thread with `panic = "abort"`
+/// surfaces as SIGABRT (exit 134). Restoring `SIG_DFL` gives us the POSIX
+/// convention instead.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: `signal(2)` is async-signal-safe, and we call it as the very
+    // first statement of `main()` — before `Cli::parse()`, before the tokio
+    // runtime is built, and therefore before any threads exist. Restoring
+    // `SIG_DFL` only changes process-wide disposition to the kernel default;
+    // the worst case if the invariant (single-threaded, pre-runtime) were
+    // violated would be a transient race on the signal table, not UB.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {
+    // Windows has no SIGPIPE; `WriteFile` on a closed pipe returns an error
+    // that Rust surfaces as `ErrorKind::BrokenPipe` without aborting.
+}
+
 /// Synchronous entry point. Parses the CLI first so clap can handle
 /// `--version` / `--help` / `--completions` via its own short-circuit
 /// (it calls `process::exit(0)` before we ever reach here) without
@@ -868,6 +896,10 @@ enum ListAction {
 /// fast-exit flags, which matters for shell prompt integrations and
 /// editor-extension startup checks.
 fn main() -> Result<()> {
+    // Must run before `Cli::parse()`: clap emits `--help` / `--version`
+    // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
+    reset_sigpipe();
+
     let cli = Cli::parse();
     let json = matches!(cli.output, OutputFormat::Json);
 

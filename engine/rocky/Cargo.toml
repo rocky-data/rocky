@@ -23,5 +23,11 @@ clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+# Used only to restore the kernel-default SIGPIPE handler on startup so the
+# CLI exits cleanly when its stdout is piped into `head`, `less`, `jq | head`,
+# etc. Scoped to Unix targets; Windows has no SIGPIPE.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
