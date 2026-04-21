@@ -710,6 +710,22 @@ enum Command {
         model: Option<String>,
     },
 
+    /// Roll up per-model cost attribution for a recorded run.
+    ///
+    /// Trust-system Arc 2 wave 2. Reads a `RunRecord` from the state
+    /// store and re-derives per-model cost via
+    /// `compute_observed_cost_usd` — the same formula `rocky run` uses
+    /// for the live summary. Adapter type is resolved from `rocky.toml`;
+    /// when the config can't be loaded the command still emits
+    /// durations and byte counts, with `cost_usd` set to `null`.
+    Cost {
+        /// Run id or the literal `latest`
+        target: String,
+        /// Filter to a single model within the run
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -1346,6 +1362,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Trace { target, model } => {
             rocky_cli::commands::run_trace(&cli.state_path, &target, model.as_deref(), json)
         }
+        Command::Cost { target, model } => rocky_cli::commands::run_cost(
+            &cli.state_path,
+            &cli.config,
+            &target,
+            model.as_deref(),
+            json,
+        ),
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
             ListAction::Adapters => rocky_cli::commands::list_adapters(&cli.config, json),

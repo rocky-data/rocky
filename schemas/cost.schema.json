@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PerModelCostHistorical": {
+      "description": "A single model's cost attribution inside [`CostOutput`].\n\nDistinct from [`ModelCostEntry`] (which lives on [`RunCostSummary`]) because the historical surface carries the richer fields the state store actually persists: model name (not asset-key vector), row/byte counts, and the recorded per-model status.",
+      "properties": {
+        "bytes_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes_written": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "description": "Observed cost for this execution. `None` when the adapter isn't a billed warehouse, the config couldn't be loaded, or the formula inputs were unavailable (e.g. BigQuery without `bytes_scanned`).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "model_name",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky cost <run_id|latest>`.\n\nTrust-system Arc 2 wave 2: historical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the \"what did my last run cost?\" question answerable from the recorded run alone, without re-materialising tables.\n\n# Adapter type resolution\n\nThe `RunRecord` only carries `config_hash`, not the adapter type. The command loads `rocky.toml` to resolve the billed-warehouse type. When the config can't be loaded (working-dir mismatch, missing file, parse error), the output degrades gracefully: `adapter_type` stays `None` and `cost_usd` is `None` on every model, but durations and byte counts are still populated from the stored record.\n\n# BigQuery note\n\nBecause [`rocky_core::state::ModelExecution::bytes_scanned`] is persisted, this command can return a real cost figure for BigQuery runs even though the live `rocky run` path currently reports `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a follow-up wave).",
+  "properties": {
+    "adapter_type": {
+      "description": "Adapter type the cost formula was parameterised against, for audit. Mirrors `AdapterConfig.type`. `None` when the config couldn't be loaded or the adapter isn't a billed warehouse.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "per_model": {
+      "items": {
+        "$ref": "#/definitions/PerModelCostHistorical"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "total_bytes_scanned": {
+      "description": "Sum of per-model `bytes_scanned`. `None` when no model reported bytes scanned.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "total_bytes_written": {
+      "description": "Sum of per-model `bytes_written`. `None` when no model reported bytes written.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "total_cost_usd": {
+      "description": "Sum of every per-model `cost_usd` that produced a number. `None` when no model produced a cost.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "total_duration_ms": {
+      "description": "Wall-clock time summed across every model execution.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "trigger": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "duration_ms",
+    "finished_at",
+    "per_model",
+    "run_id",
+    "started_at",
+    "status",
+    "total_duration_ms",
+    "trigger",
+    "version"
+  ],
+  "title": "CostOutput",
+  "type": "object"
+}

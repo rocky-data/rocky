@@ -20,11 +20,11 @@ use crate::output::{
     AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput,
     BranchDeleteOutput, BranchListOutput, BranchOutput, CiDiffOutput, CiOutput,
     ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
-    DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput,
-    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput, MetricsOutput,
-    ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput, ReplayOutput, RunOutput,
-    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
-    ValidateOutput,
+    CostOutput, DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput,
+    HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput,
+    MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput,
+    ReplayOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput,
+    ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -86,6 +86,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<BranchDeleteOutput>("branch_delete"),
         entry::<ReplayOutput>("replay"),
         entry::<TraceOutput>("trace"),
+        entry::<CostOutput>("cost"),
         // Config types feeding the VS Code project schema. Not CLI command
         // outputs, but exported through the same pipeline so the IDE-facing
         // `editors/vscode/schemas/rocky-project.schema.json` is generated
