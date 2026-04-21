@@ -27,7 +27,14 @@ WALL_CLOCK_FIELDS: frozenset[str] = frozenset(
         "watermark",
     }
 )
+
+# String fields derived from wall-clock time (e.g. rocky's
+# ``run-YYYYMMDD-HHMMSS-NNN`` ids). Replaced with a sentinel so the
+# corpus is byte-stable across regens.
+WALL_CLOCK_ID_FIELDS: frozenset[str] = frozenset({"run_id"})
+
 SENTINEL_TS = "2000-01-01T00:00:00Z"
+SENTINEL_RUN_ID = "run-SENTINEL"
 
 
 def normalize(node: object) -> None:
@@ -39,6 +46,8 @@ def normalize(node: object) -> None:
                 node[k] = 0
             elif isinstance(v, str) and k in WALL_CLOCK_FIELDS:
                 node[k] = SENTINEL_TS
+            elif isinstance(v, str) and k in WALL_CLOCK_ID_FIELDS:
+                node[k] = SENTINEL_RUN_ID
             else:
                 normalize(v)
     elif isinstance(node, list):

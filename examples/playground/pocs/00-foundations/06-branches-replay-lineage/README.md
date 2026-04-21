@@ -19,11 +19,11 @@ on a single 3-model DuckDB pipeline:
    persistent analogue of `--shadow`. Warehouse-native zero-copy clones
    (Delta `SHALLOW CLONE`, Snowflake `CLONE`) slot into the same API.
 3. **Replay** — `rocky replay latest` reads `RunRecord`s back from the
-   state store: every model, SQL hash, row count, bytes, timings. The
-   reproducibility artefact for *"what exactly ran?"*. Today the
-   command is **inspection-only** (Arc 1 wave 1) — the run-record
-   *write* path arrives in Arc 1 wave 2 alongside the content-addressed
-   storage primitive.
+   state store: every model, SQL hash, row count, timings, per-model
+   status. The reproducibility artefact for *"what exactly ran?"*.
+   `rocky history` lists recent runs; `rocky cost latest` rolls up
+   per-run cost from the same record. Content-addressed re-execution is
+   the next primitive on the Arc 1 roadmap.
 4. **Column-level blast radius** — `rocky lineage raw_orders --column
    amount --downstream` traces every consumer of `amount`, so you can
    see before you ship a schema change exactly which downstream columns

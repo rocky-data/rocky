@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, info_span, warn};
@@ -223,6 +223,44 @@ impl<'a> ExecutionContext<'a> {
     }
 }
 
+/// Persist a [`rocky_core::state::RunRecord`] to the state store at run
+/// finalize. Called at every exit path (happy, interrupted, model-only)
+/// after [`RunOutput::populate_cost_summary`] so the recorded
+/// `ModelExecution` entries carry cost-populated values.
+///
+/// Failures are logged and swallowed — the user's run has already
+/// succeeded (or not) by the time we reach here; a state-store write
+/// failure must not flip the exit code. Matches the resilience posture
+/// of state_sync aborts elsewhere in this file.
+fn persist_run_record(
+    state_store: Option<&StateStore>,
+    output: &RunOutput,
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    config_hash: &str,
+) {
+    let Some(store) = state_store else {
+        return;
+    };
+    let finished_at = Utc::now();
+    let status = output.derive_run_status();
+    let record = output.to_run_record(
+        run_id,
+        started_at,
+        finished_at,
+        config_hash.to_string(),
+        rocky_core::state::RunTrigger::Manual,
+        status,
+    );
+    if let Err(e) = store.record_run(&record) {
+        warn!(
+            error = %e,
+            run_id = run_id,
+            "failed to record run to state store — history/replay/cost/trace will not surface this run"
+        );
+    }
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run")]
@@ -242,6 +280,7 @@ pub async fn run(
     model_name_filter: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
+    let started_at = Utc::now();
 
     // OTLP metrics exporter (feature-gated). Auto-initialises when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
@@ -266,6 +305,7 @@ pub async fn run(
         "failed to load config from {}",
         config_path.display()
     ))?;
+    let config_hash = crate::output::config_fingerprint(config_path);
 
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
@@ -335,6 +375,17 @@ pub async fn run(
             .unwrap_or_default();
         output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
         let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+        // Persist the model-only RunRecord. `rocky replay <run_id>` + cost
+        // queries work against per-asset materializations the same way as
+        // full-pipeline runs.
+        persist_run_record(
+            state_store.as_ref(),
+            &output,
+            &run_id,
+            started_at,
+            &config_hash,
+        );
 
         if output_json {
             print_json(&output)?;
@@ -1535,6 +1586,21 @@ pub async fn run(
             .unwrap_or_default();
         output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
 
+        // Persist interrupted RunRecord so `rocky history` shows it as
+        // PartialFailure / Failure and `rocky replay` can inspect what
+        // got done before the SIGINT. `output.interrupted` was set
+        // above so `derive_run_status` picks the right variant.
+        {
+            let state = shared_state.lock().await;
+            persist_run_record(
+                Some(&state),
+                &output,
+                &shared_run_id,
+                started_at,
+                &config_hash,
+            );
+        }
+
         if output_json {
             print_json(&output)?;
         } else {
@@ -2129,6 +2195,19 @@ pub async fn run(
         .unwrap_or_default();
     output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
     let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+    // Persist the RunRecord so `rocky history`, `rocky replay`,
+    // `rocky trace`, and `rocky cost` have real data to read.
+    // Record-store failures never fail the command — the user's run
+    // succeeded, bookkeeping can't be allowed to flip the exit code.
+    persist_run_record(
+        state_store.as_ref(),
+        &output,
+        &run_id,
+        started_at,
+        &config_hash,
+    );
+
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
     // see the breach alongside the bus event.
