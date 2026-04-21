@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-04-21
+
+Arc 1 wave 2 shipped + a short cleanup wave around it. Eight PRs since v1.11.0. `record_run` wiring finally makes the run-history query surfaces (`rocky history` / `replay` / `trace` / `cost`) return real data end-to-end, plus two new commands (`rocky cost`, `rocky branch compare`) and a SIGPIPE fix.
+
 ### Added
 
 - **`rocky cost <run_id|latest>`** (#202) — historical cost rollup over stored runs. Recomputes per-model cost via `rocky_core::cost::compute_observed_cost_usd` from `ModelExecution.duration_ms` / `bytes_scanned`. New `CostOutput` + `PerModelCostHistorical` through the codegen cascade. BigQuery cost now computes from stored bytes even when the live `rocky run` path still emits `None`. Arc 2 wave 2 first PR.
 - **`rocky branch compare <name>`** (#200) — diff a named branch's targets against main. Delegates to the existing `compare::compare` entry point with the branch's `schema_prefix` routed through `ShadowConfig.schema_override` — same mechanism `rocky run --branch` uses for writes, so compare hits exactly the tables the branch produced. Zero JSON-schema drift.
-- **`rocky run` now persists `RunRecord` to the state store** (#203) — `StateStore::record_run` wired at every exit path (happy / interrupted / model-only) after `populate_cost_summary`. `rocky history`, `rocky replay`, `rocky trace`, and `rocky cost` now return real data instead of reading from an empty store. Per-model timestamps are lossily captured as `finished_at = run.finished_at`, `started_at = finished_at - duration`; actual per-model wall-clock windows require execution-loop instrumentation and land in a later wave. Arc 1 wave 2.
+- **`rocky run` now persists `RunRecord` to the state store** (#203) — `StateStore::record_run` wired at every exit path (happy / interrupted / model-only) after `populate_cost_summary`. `rocky history`, `rocky replay`, `rocky trace`, and `rocky cost` now return real data instead of reading from an empty store. Arc 1 wave 2.
+- **Real per-model `started_at` on `MaterializationOutput`** (#206) — every materialization now carries a `DateTime<Utc>` stamped at the moment the engine begins executing it. `RunOutput::to_run_record` uses it directly (deriving per-model `finished_at` as `started_at + duration_ms`), so parallel runs preserve their real ordering on the persisted `RunRecord` instead of the finish-relative collapse PR #203 had to leave behind.
 - **`OptimizeRecommendation`** (#203) gained `compute_cost_per_run`, `storage_cost_per_month`, `downstream_references` — projected through from `rocky_core::optimize::MaterializationCost` so Dagster `checks.py` can surface the values as asset metadata without re-deriving.
 
 ### Fixed
