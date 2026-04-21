@@ -8,7 +8,7 @@
       "recommended_strategy": "table",
       "estimated_monthly_savings": 0.0,
       "reasoning": "insufficient history: 1 runs (need 5)",
-      "compute_cost_per_run": 2e-06,
+      "compute_cost_per_run": 0.0,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 0
     }
