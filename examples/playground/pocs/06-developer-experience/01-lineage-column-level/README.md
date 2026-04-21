@@ -1,5 +1,7 @@
 # 01-lineage-column-level — Column-level lineage as JSON + DOT
 
+![rocky lineage --column traces fct_revenue.total back through stg_orders.amount to seeds.orders.amount](../../../../../docs/public/demo-column-lineage.gif)
+
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s

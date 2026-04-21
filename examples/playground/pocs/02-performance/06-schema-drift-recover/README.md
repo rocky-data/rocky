@@ -1,5 +1,7 @@
 # 06-schema-drift-recover — Drift detection on incremental runs
 
+![Two rocky run invocations sandwiching an ALTER TABLE — the second run reports "Drift: 1/1 tables drifted"](../../../../../docs/public/demo-drift-recover.gif)
+
 > **Category:** 02-performance
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s

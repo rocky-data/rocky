@@ -12,6 +12,10 @@ Rocky ships two complementary quality surfaces, both executed inline against the
 
 Both surfaces share the same JSON output shape (`check_results[]`) and the same severity / quarantine plumbing, so orchestrators don't need to distinguish between them.
 
+Compile-time contract diagnostics run even earlier — before any check executes — so a model that violates its contract never reaches the warehouse:
+
+![rocky compile surfaces E010 and E013 contract diagnostic codes on a broken model](/demo-data-contracts.gif)
+
 ## Pipeline-level checks
 
 Enable and configure checks per pipeline in `rocky.toml`:
