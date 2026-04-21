@@ -2228,6 +2228,13 @@
             "null"
           ]
         },
+        "transfer_timeout_seconds": {
+          "default": 300,
+          "description": "Wall-clock budget (seconds) for each state transfer operation (download or upload). Catches stuck SDK retry loops, DNS, TLS, and hung endpoints that the per-request HTTP timeout does not see. Defaults to 300s; raise for large state or slow networks.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "valkey_prefix": {
           "description": "Valkey key prefix (default: \"rocky:state:\")",
           "type": [
@@ -2608,6 +2615,7 @@
         "gcs_prefix": null,
         "s3_bucket": null,
         "s3_prefix": null,
+        "transfer_timeout_seconds": 300,
         "valkey_prefix": null,
         "valkey_url": null
       },
