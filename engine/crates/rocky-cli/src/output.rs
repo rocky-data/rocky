@@ -2417,3 +2417,87 @@ pub struct TraceModelEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
 }
+
+/// JSON output for `rocky cost <run_id|latest>`.
+///
+/// Trust-system Arc 2 wave 2: historical per-run cost attribution read
+/// from the embedded state store's [`rocky_core::state::RunRecord`].
+/// Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`]
+/// — the same formula [`RunOutput::populate_cost_summary`] applies at
+/// the end of a live run. The per-model and per-run totals make the
+/// "what did my last run cost?" question answerable from the recorded
+/// run alone, without re-materialising tables.
+///
+/// # Adapter type resolution
+///
+/// The `RunRecord` only carries `config_hash`, not the adapter type.
+/// The command loads `rocky.toml` to resolve the billed-warehouse type.
+/// When the config can't be loaded (working-dir mismatch, missing file,
+/// parse error), the output degrades gracefully: `adapter_type` stays
+/// `None` and `cost_usd` is `None` on every model, but durations and
+/// byte counts are still populated from the stored record.
+///
+/// # BigQuery note
+///
+/// Because [`rocky_core::state::ModelExecution::bytes_scanned`] is
+/// persisted, this command can return a real cost figure for BigQuery
+/// runs even though the live `rocky run` path currently reports
+/// `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a
+/// follow-up wave).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CostOutput {
+    pub version: String,
+    pub command: String,
+    pub run_id: String,
+    pub status: String,
+    pub trigger: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration_ms: u64,
+    /// Adapter type the cost formula was parameterised against, for
+    /// audit. Mirrors `AdapterConfig.type`. `None` when the config
+    /// couldn't be loaded or the adapter isn't a billed warehouse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_type: Option<String>,
+    /// Sum of every per-model `cost_usd` that produced a number.
+    /// `None` when no model produced a cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// Wall-clock time summed across every model execution.
+    pub total_duration_ms: u64,
+    /// Sum of per-model `bytes_scanned`. `None` when no model reported
+    /// bytes scanned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes_scanned: Option<u64>,
+    /// Sum of per-model `bytes_written`. `None` when no model reported
+    /// bytes written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes_written: Option<u64>,
+    pub per_model: Vec<PerModelCostHistorical>,
+}
+
+/// A single model's cost attribution inside [`CostOutput`].
+///
+/// Distinct from [`ModelCostEntry`] (which lives on
+/// [`RunCostSummary`]) because the historical surface carries the
+/// richer fields the state store actually persists: model name (not
+/// asset-key vector), row/byte counts, and the recorded per-model
+/// status.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PerModelCostHistorical {
+    pub model_name: String,
+    pub status: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    /// Observed cost for this execution. `None` when the adapter
+    /// isn't a billed warehouse, the config couldn't be loaded, or
+    /// the formula inputs were unavailable (e.g. BigQuery without
+    /// `bytes_scanned`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
