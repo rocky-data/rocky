@@ -1,0 +1,29 @@
+# Arc 3 — circuit breaker + retry policy (surface + config reference)
+#
+# The three-state CircuitBreaker is wired into the Databricks and Snowflake
+# adapters (`engine/crates/rocky-{databricks,snowflake}/src/connector.rs`). The
+# DuckDB adapter is in-process and has no transient-error surface, so this POC
+# focuses on validating the config shape. To exercise the breaker end-to-end,
+# point `[adapter]` at a real warehouse and induce a transient fault (bad auth
+# token, rate-limit, network partition).
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# Retry policy and circuit breaker live under `[adapter.retry]`.
+# All keys have sensible defaults (max_retries = 3, threshold = 5,
+# recovery_timeout = manual). This POC makes them explicit for clarity.
+[adapter.retry]
+max_retries = 3
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+backoff_multiplier = 2.0
+jitter = true
+circuit_breaker_threshold = 5
+circuit_breaker_recovery_timeout_secs = 60
+
+[pipeline.poc]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "staging__{source}" }

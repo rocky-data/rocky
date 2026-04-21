@@ -1,0 +1,15 @@
+# Arc 6 — portability lint (P001)
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# Project-wide portability settings. Per-model overrides via `-- rocky-allow` pragma.
+[portability]
+target_dialect = "bq"
+allow = ["QUALIFY"]  # QUALIFY is BigQuery-supported, so allow it project-wide
+
+[pipeline.poc]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "staging__{source}" }

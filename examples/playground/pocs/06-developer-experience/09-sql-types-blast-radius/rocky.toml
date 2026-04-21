@@ -1,0 +1,10 @@
+# Arc 7 — SQL as first-class: typecheck + blast-radius lint
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "staging__{source}" }

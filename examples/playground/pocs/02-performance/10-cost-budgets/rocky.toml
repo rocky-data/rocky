@@ -1,0 +1,30 @@
+# Arc 2 — per-run cost summary + [budget] breach
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# Tiny budget so the tiny DuckDB run breaches it. `on_breach = "warn"`
+# emits the `budget_breach` event but does not fail the run (switch to
+# `"error"` to gate CI on this).
+[budget]
+max_duration_ms = 1
+on_breach = "warn"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true

@@ -1,0 +1,10 @@
+# Arc 5 — schema-grounded AI (compile-verify retry loop)
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "staging__{source}" }

@@ -36,13 +36,13 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**34 of 46 POCs run with no external credentials.** See each POC's README for prerequisites.
+**40 of 53 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (6 POCs · DuckDB)
+### 00 — Foundations (7 POCs · DuckDB)
 
-DSL syntax, materialization basics, and the playground baseline.
+DSL syntax, materialization basics, playground baseline, and the trust-arc 1 storage primitives.
 
 | POC | Feature |
 |---|---|
@@ -52,6 +52,7 @@ DSL syntax, materialization basics, and the playground baseline.
 | [03-date-literals-and-match](pocs/00-foundations/03-date-literals-and-match) | `@2025-01-01` date literals and `match { ... }` pattern matching |
 | [04-window-functions](pocs/00-foundations/04-window-functions) | DSL window syntax with partition + sort + frame |
 | [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Generic adapter exercise — building custom adapters via the process protocol |
+| [06-branches-replay-lineage](pocs/00-foundations/06-branches-replay-lineage) | **Trust arc 1** — `rocky branch create/list/show`, `rocky run --branch`, `rocky replay`, `rocky lineage --downstream` |
 
 ### 01 — Quality (6 POCs · DuckDB)
 
@@ -66,9 +67,9 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 
-### 02 — Performance (9 POCs · DuckDB)
+### 02 — Performance (10 POCs · DuckDB)
 
-Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency.
+Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets.
 
 | POC | Feature |
 |---|---|
@@ -81,10 +82,11 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [07-ephemeral-cte](pocs/02-performance/07-ephemeral-cte) | `strategy = "ephemeral"` — model inlined as CTE, never persisted as a table |
 | [08-delete-insert-partitioned](pocs/02-performance/08-delete-insert-partitioned) | `strategy = "delete_insert"` with `partition_by` — atomic partition replacement without MERGE |
 | [09-adaptive-concurrency](pocs/02-performance/09-adaptive-concurrency) | AIMD throttling — dynamic parallelism with `concurrency`, `error_rate_abort_pct`, `table_retries` |
+| [10-cost-budgets](pocs/02-performance/10-cost-budgets) | **Trust arc 2** — per-run `cost_summary` + `[budget]` block + `budget_breach` record |
 
-### 03 — AI (4 POCs · `ANTHROPIC_API_KEY` required)
+### 03 — AI (5 POCs · `ANTHROPIC_API_KEY` required)
 
-AI-powered model generation, intent extraction, schema sync, test generation.
+AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation.
 
 | POC | Feature |
 |---|---|
@@ -92,6 +94,7 @@ AI-powered model generation, intent extraction, schema sync, test generation.
 | [02-ai-explain-bootstrap](pocs/03-ai/02-ai-explain-bootstrap) | `rocky ai-explain --all --save` reverse-engineers intent fields onto existing models |
 | [03-ai-sync-schema-evolution](pocs/03-ai/03-ai-sync-schema-evolution) | `rocky ai-sync` proposes downstream updates after upstream schema changes |
 | [04-ai-test-generation](pocs/03-ai/04-ai-test-generation) | `rocky ai-test --all --save` generates SQL assertions from intent + schema |
+| [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 
 ### 04 — Governance (4 POCs · Databricks required)
 
@@ -104,9 +107,9 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging.
 | [03-workspace-isolation](pocs/04-governance/03-workspace-isolation) | `[governance.isolation]` with workspace bindings + ISOLATED catalog mode |
 | [04-tagging-lifecycle](pocs/04-governance/04-tagging-lifecycle) | `[governance.tags]` propagated via `ALTER ... SET TAGS` |
 
-### 05 — Orchestration (6 POCs · DuckDB / docker)
+### 05 — Orchestration (8 POCs · DuckDB / docker)
 
-Hooks, webhooks, remote state, checkpoint/resume, Valkey cache.
+Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker.
 
 | POC | Feature |
 |---|---|
@@ -116,10 +119,12 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache.
 | [04-checkpoint-resume](pocs/05-orchestration/04-checkpoint-resume) | `rocky run --resume-latest` after a deliberate mid-pipeline failure |
 | [05-webhook-presets-multi](pocs/05-orchestration/05-webhook-presets-multi) | All 5 webhook presets (Slack, Teams, PagerDuty, Datadog, generic) on different lifecycle events |
 | [06-valkey-distributed-cache](pocs/05-orchestration/06-valkey-distributed-cache) | Three-tier caching (memory → Valkey → source) + tiered state backend via docker-compose |
+| [07-dagster-dag-mode](pocs/05-orchestration/07-dagster-dag-mode) | `rocky run --dag` unified cross-pipeline DAG with Dagster orchestration |
+| [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 
-### 06 — Developer Experience (6 POCs · DuckDB)
+### 06 — Developer Experience (9 POCs · DuckDB)
 
-Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows.
+Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types.
 
 | POC | Feature |
 |---|---|
@@ -129,6 +134,9 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows.
 | [04-shadow-mode-compare](pocs/06-developer-experience/04-shadow-mode-compare) | `rocky compare` shadow targets with row count + schema diffs |
 | [05-doctor-and-ci](pocs/06-developer-experience/05-doctor-and-ci) | `rocky doctor` + `rocky ci --output json` + a GitHub Actions example |
 | [06-hybrid-dbt-packages](pocs/06-developer-experience/06-hybrid-dbt-packages) | Rocky consuming dbt package tables (Fivetran facebook_ads, stripe) as external sources — no conversion needed |
+| [07-run-trace-gantt](pocs/06-developer-experience/07-run-trace-gantt) | **Trust arc 4** — `rocky trace latest` Gantt view + feature-gated OTLP exporter |
+| [08-portability-lint](pocs/06-developer-experience/08-portability-lint) | **Trust arc 6** — `rocky compile --target-dialect bq`, `[portability]`, `-- rocky-allow` pragma |
+| [09-sql-types-blast-radius](pocs/06-developer-experience/09-sql-types-blast-radius) | **Trust arc 7** — `rocky compile --with-seed` type grounding + blast-radius `SELECT *` lint |
 
 ### 07 — Adapters (5 POCs · mixed)
 
