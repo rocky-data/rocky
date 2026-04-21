@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.3] — 2026-04-21
+
+### Fixed
+
+- **`rocky-project.schema.json` + `StateConfig` TS interface** — restore `transfer_timeout_seconds` validation field that was missing from `vscode-v1.6.2` (#210). Root cause: `just codegen-vscode` fails silently when `editors/vscode/node_modules` is absent, so the release build regenerated the engine schemas but left the vscode mirror stale. `vscode-v1.6.2` ships a working extension; this patch just reintroduces IDE validation for the one missing field.
+
 ## [1.6.2] — 2026-04-21
 
 Tracks engine 1.12.0 (Arc 1 wave 2 + cleanup cascade). Regenerated TypeScript bindings + `rocky-project.schema.json`; no feature changes to the extension itself.
