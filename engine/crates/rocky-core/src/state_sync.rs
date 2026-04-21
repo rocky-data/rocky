@@ -203,16 +203,17 @@ async fn download_from_object_store(
                     provider.download_file(STATE_FILE, local_path).await?;
                     info!(
                         size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        outcome = "ok",
                         "state restored from object store"
                     );
                     Ok(())
                 }
                 Ok(false) => {
-                    info!("No existing state in object store — starting fresh");
+                    info!(outcome = "absent", "No existing state in object store — starting fresh");
                     Ok(())
                 }
                 Err(e) => {
-                    warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
+                    warn!(error = %e, outcome = "error_then_fresh", "state existence check failed (non-fatal, starting fresh)");
                     Ok(())
                 }
             }
@@ -249,6 +250,7 @@ async fn upload_to_object_store(
             Ok::<(), StateSyncError>(())
         })
         .await?;
+        info!(bytes = size_bytes, outcome = "ok", "state upload complete");
         Ok(())
     }
     .instrument(span)
@@ -271,6 +273,7 @@ where
         Err(_) => {
             warn!(
                 duration_ms = timeout.as_millis() as u64,
+                outcome = "timeout",
                 "state transfer exceeded timeout budget"
             );
             Err(StateSyncError::Timeout(timeout))
@@ -327,10 +330,10 @@ async fn download_from_valkey(
                         let size = std::fs::metadata(&local_for_task)
                             .map(|m| m.len())
                             .unwrap_or(0);
-                        info!(size, "state restored from Valkey");
+                        info!(size, outcome = "ok", "state restored from Valkey");
                     }
                     None => {
-                        info!("No existing state in Valkey — starting fresh");
+                        info!(outcome = "absent", "No existing state in Valkey — starting fresh");
                     }
                 }
                 Ok(())
@@ -396,7 +399,9 @@ async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(),
                 ))),
             }
         })
-        .await
+        .await?;
+        info!(bytes = size_bytes, outcome = "ok", "state upload complete");
+        Ok(())
     }
     .instrument(span)
     .await
