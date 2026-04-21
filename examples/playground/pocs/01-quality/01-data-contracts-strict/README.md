@@ -1,5 +1,7 @@
 # 01-data-contracts-strict — Every contract rule + a deliberately broken sibling
 
+![rocky compile surfaces E010 and E013 contract diagnostic codes on broken_metrics while good_metrics passes](../../../../../docs/public/demo-data-contracts.gif)
+
 > **Category:** 01-quality
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s

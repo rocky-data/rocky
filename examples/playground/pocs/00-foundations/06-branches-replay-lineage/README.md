@@ -1,5 +1,7 @@
 # 06-branches-replay-lineage — Trust arc 1: branches, replay, column lineage
 
+![Create a branch, run replication on it, then trace column lineage downstream](../../../../../docs/public/demo-branches-replay.gif)
+
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s

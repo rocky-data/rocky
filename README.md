@@ -33,6 +33,60 @@ rocky compile && rocky test && rocky run
 
 No credentials needed — the playground runs end-to-end on local DuckDB.
 
+## See it in action
+
+Each demo below is a self-contained POC in [`examples/playground/pocs/`](examples/playground/) — `cd` in, run `./run.sh`, reproduce locally.
+
+### Detects schema drift the moment it happens
+
+A source column type changes upstream. On the next run, Rocky diffs source vs. target, drops the target, and recreates it. No silent data corruption, no dbt-style quiet divergence.
+
+<p align="center">
+  <img src="docs/public/demo-drift-recover.gif" alt="rocky run detects source type change and recreates the target" width="900" />
+</p>
+
+[POC — `02-performance/06-schema-drift-recover`](examples/playground/pocs/02-performance/06-schema-drift-recover/)
+
+### Enforces data contracts at compile time
+
+Missing required columns, protected columns being removed, or unsafe type changes surface as diagnostic codes (`E010`, `E013`) before a single row is written.
+
+<p align="center">
+  <img src="docs/public/demo-data-contracts.gif" alt="rocky compile flags E010 and E013 contract violations on broken_metrics" width="900" />
+</p>
+
+[POC — `01-quality/01-data-contracts-strict`](examples/playground/pocs/01-quality/01-data-contracts-strict/)
+
+### Named branches for risk-free experiments
+
+Create a branch, run against it in an isolated schema, inspect, then drop or promote. Column-level lineage shows the downstream blast radius before you ship.
+
+<p align="center">
+  <img src="docs/public/demo-branches-replay.gif" alt="rocky branch create, run on branch, and trace column lineage downstream" width="900" />
+</p>
+
+[POC — `00-foundations/06-branches-replay-lineage`](examples/playground/pocs/00-foundations/06-branches-replay-lineage/)
+
+### Column-level lineage, not table-level
+
+Trace a single column from a downstream fact back through its aggregations, all the way to the seed. Blast-radius analysis without reading every model.
+
+<p align="center">
+  <img src="docs/public/demo-column-lineage.gif" alt="rocky lineage --column traces fct_revenue.total back to seeds.orders.amount" width="900" />
+</p>
+
+[POC — `06-developer-experience/01-lineage-column-level`](examples/playground/pocs/06-developer-experience/01-lineage-column-level/)
+
+### AI model generation with a compile-validate loop
+
+Describe what you want in plain English. Rocky generates a Rocky DSL model, compiles it, and retries on parse failure — the `Attempts: 2` line shows the loop catching a first-pass error invisibly.
+
+<p align="center">
+  <img src="docs/public/demo-ai-model-generation.gif" alt="rocky ai generates a .rocky model from natural language intent, Attempts: 2" width="900" />
+</p>
+
+[POC — `03-ai/01-model-generation`](examples/playground/pocs/03-ai/01-model-generation/)
+
 ## Subprojects
 
 | Path | Artifact | Language | Description |

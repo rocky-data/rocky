@@ -7,6 +7,8 @@ sidebar:
 
 Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data), while unsafe changes trigger a full refresh.
 
+![Two rocky run invocations sandwiching an ALTER TABLE — the second run reports "Drift: 1/1 tables drifted"](/demo-drift-recover.gif)
+
 ## What It Detects
 
 Schema drift in Rocky means **column type mismatches** between source and target tables. For example, a column that was `STRING` in the source but is `INT` in the target, or an `INT` that widened to `BIGINT`.

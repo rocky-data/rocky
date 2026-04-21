@@ -19,6 +19,8 @@ Given a natural language intent, Rocky generates a model (in Rocky DSL or SQL):
 rocky ai "Calculate monthly revenue per customer from orders, joined with customer names"
 ```
 
+![rocky ai generates a .rocky model from a natural language intent; Attempts: 2 shows the compile-validate retry loop](/demo-ai-model-generation.gif)
+
 The LLM receives context about available models, source tables, and the target format. It produces source code that Rocky immediately attempts to compile. If compilation fails, the diagnostics are fed back to the LLM for correction, up to a configurable number of attempts (default: 3).
 
 This compile-verify loop is the key safety mechanism. The LLM might generate syntactically valid but semantically wrong SQL. The compiler catches type mismatches, missing columns, and contract violations before the code is ever shown to the user as a success.

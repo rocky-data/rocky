@@ -1,5 +1,7 @@
 # 01-model-generation — `rocky ai "intent..."` with compile-verify retry loop
 
+![rocky ai generates a .rocky model from natural language intent; Attempts: 2 shows the compile-validate retry loop](../../../../../docs/public/demo-ai-model-generation.gif)
+
 > **Category:** 03-ai
 > **Credentials:** `ANTHROPIC_API_KEY` required
 > **Runtime:** depends on Anthropic API latency
