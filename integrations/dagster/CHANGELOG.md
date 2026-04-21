@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-04-21
+
+Tracks engine 1.12.0 (Arc 1 wave 2 + cleanup cascade).
+
+### Fixed
+
+- **`RockyResource.run_streaming` two-readers race on `proc.stderr` (#208)** — the previous implementation spawned a daemon stderr forwarder thread that read `proc.stderr` via `TextIOWrapper` iteration **while** the main thread called `proc.communicate(timeout=…)`, which reads the same pipe FD via raw `os.read`. This violated CPython's documented `subprocess` contract ("the process must have been started with the stream set to `PIPE` and the stream must not be read from otherwise") and under production stderr traffic the `TimeoutExpired` path intermittently failed to fire. Observed twice in production (2026-04-18 and 2026-04-19) where the subprocess ran for hours against a 30-minute configured timeout, triggering a 58-run Dagster queue backlog on the second incident. The race is now eliminated by making the stderr forwarder and a new stdout accumulator the **sole readers** of their pipes, and enforcing the wall-clock timeout externally via a watchdog thread that kills the process group (see Added). Audit of `run_pipes` against upstream `dagster.PipesSubprocessClient` confirmed no analogous bug (upstream inherits stdio by default — no PIPE FDs, no reader threads — and calls `process.wait()` without a timeout); pipes does have a separate gap (no wall-clock timeout at all, only SIGINT on Dagster cancel) that is out of scope for this release.
+
+### Added
+
+- **Watchdog-based subprocess timeout enforcement in `run_streaming` (#208)** — `_run_rocky_streaming` now uses a `threading.Event`-driven watchdog daemon thread that calls `os.killpg(os.getpgid(proc.pid), signal.SIGKILL)` (POSIX) or `proc.kill()` (Windows) when `timeout_seconds` elapses. The main thread calls `proc.wait()` with no timeout; enforcement is pipe-FD-independent so traffic patterns on stderr no longer affect timeout semantics. `Popen` is launched with `start_new_session=True` on POSIX so rocky gets its own process group and any child processes (adapter subprocesses, hook scripts) are reaped alongside the parent. Watchdog-fire is detected via `proc.returncode == -signal.SIGKILL` and surfaces a `dg.Failure` with `description` matching `"timed out after Ns (watchdog-killed)"` and `stderr_tail` / `duration_ms` / `pid` metadata — distinguishable from a native non-zero exit.
+- **Separate single-reader threads for stdout and stderr in `run_streaming` (#208)** — the dedicated stdout accumulator (`_accumulate_stdout`) and the existing stderr forwarder (`_forward_stderr_to_context`) each own their pipe end-to-end, restoring conformance with CPython's subprocess contract. Live stderr streaming to `context.log.info` is preserved (the feature that motivated `run_streaming` in the first place).
+- **Structured start/end subprocess logging in `run_streaming` (#208)** — one `INFO` line on `Popen` success (`pid`, `timeout_s`, `cmd`) and one on process exit with `pid`, `returncode`, `duration_ms`, `outcome` (`"success"` / `"failure"` / `"partial-success"` / `"timeout-killed"`). Emitted via the module logger `dagster_rocky.resource._log`. Closes the observability gap that made post-mortems on the 2026-04-18 / 2026-04-19 hangs harder than they needed to be.
+- **`CostOutput` + `PerModelCostHistorical` Pydantic bindings** (#202) — generated from the new `rocky cost <run_id|latest>` engine schema. Reachable today via `dagster_rocky.types_generated.cost_schema.CostOutput`; `RockyResource.cost(...)` + `parse_rocky_output` dispatch + fixture are a small follow-up (explicitly deferred in #202).
+- **`OptimizeRecommendation.compute_cost_per_run` / `storage_cost_per_month` / `downstream_references`** (#203) — regenerated Pydantic bindings now expose the three fields `checks.py:54-59` reads on each recommendation. Previously hand-written drift caused `AttributeError` once `rocky optimize` started producing non-empty recommendations.
+- **`MaterializationOutput.started_at: datetime`** (#206) — real per-model wall-clock timestamp captured at execution time, propagated through the regenerated `run_schema.py`. Makes parallel-run ordering honest on the persisted `RunRecord` consumers read via `RockyResource.history()` / `.replay()` / `.cost()`.
+
+### Changed
+
+- **`HistoryResult` soft-swapped to `HistoryOutput`** (#203). Completes the Phase 2 generated-types migration that had been silent because `rocky history` always returned empty. `HistoryResult` / `ModelHistoryResult` are now aliases of the generated CLI-shape classes; hand-written `RunRecord`-shape versions had `finished_at`, `config_hash`, and `models_executed` as a list — none of which the CLI actually emits. `tests/scenarios.py::HISTORY` + the parse assertion were retrofitted to the CLI shape. No external API break: same class names, same import paths.
+
+### Internal
+
+- **`scripts/_normalize_fixture.py`** (#203) gained `WALL_CLOCK_ID_FIELDS = {"run_id"}` and `DERIVED_FROM_WALL_CLOCK_FIELDS = {"compute_cost_per_run", "estimated_monthly_savings"}` so the test-fixture corpus stays byte-stable across regens now that `run_id` and wall-clock-derived cost numbers appear in non-empty arrays.
+
 ## [1.7.0] — 2026-04-20
 
 Tracks engine 1.11.0. Regenerated Pydantic bindings for the trust-system arcs (Arcs 1–7 first waves + Arc 6 wave 2 + Arc 7 wave 2 wave-1).
