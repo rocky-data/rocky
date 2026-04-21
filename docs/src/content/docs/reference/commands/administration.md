@@ -670,5 +670,106 @@ parallelism: 2 lanes
 ### Related Commands
 
 - [`rocky replay`](#rocky-replay) -- flat per-model dump of the same run
+- [`rocky cost`](#rocky-cost) -- per-model cost rollup for the same run
 - [`rocky history`](#rocky-history) -- list recent runs
 - [`rocky metrics`](#rocky-metrics) -- quality metrics captured during runs
+
+---
+
+## `rocky cost`
+
+Historical cost rollup for a completed run. Reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace), then recomputes per-model cost via the adapter-appropriate formula (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). Sibling commands — replay shows what ran, trace shows when, `cost` shows what it cost.
+
+```bash
+rocky cost <target> [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `target` | `string` | **(required)** | A specific `run_id`, or the literal `latest` for the most recent run. |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <NAME>` | `string` | | Filter to a single model within the run. |
+| `--output <FORMAT>` | `json|table` | `json` | Output format. Table form is a compact per-model breakdown. |
+
+### Examples
+
+Roll up cost for the most recent run:
+
+```bash
+rocky cost latest
+```
+
+```json
+{
+  "version": "1.11.0",
+  "command": "cost",
+  "run_id": "run-20260421-142430-017",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2026-04-21T14:24:29.881087+00:00",
+  "finished_at": "2026-04-21T14:24:30.031036+00:00",
+  "duration_ms": 149,
+  "adapter_type": "databricks",
+  "total_cost_usd": 0.101,
+  "total_duration_ms": 910000,
+  "total_bytes_scanned": 104857600,
+  "total_bytes_written": 20971520,
+  "per_model": [
+    {
+      "model_name": "stg_orders",
+      "status": "success",
+      "duration_ms": 310000,
+      "rows_affected": 150000,
+      "bytes_scanned": 41943040,
+      "bytes_written": 10485760,
+      "cost_usd": 0.034
+    },
+    {
+      "model_name": "fct_revenue",
+      "status": "success",
+      "duration_ms": 600000,
+      "rows_affected": 8900,
+      "bytes_scanned": 62914560,
+      "bytes_written": 10485760,
+      "cost_usd": 0.067
+    }
+  ]
+}
+```
+
+Human-readable table form:
+
+```bash
+rocky cost latest --output table
+```
+
+```
+run: run-20260421-142430-017
+status: success   adapter: databricks   total: $0.101
+
+  model            duration       rows   bytes_scanned  cost
+  stg_orders        5m 10s    150,000           40 MB  $0.034
+  fct_revenue      10m  0s      8,900           60 MB  $0.067
+```
+
+### Adapter coverage
+
+- **Databricks / Snowflake** — cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
+- **BigQuery** — computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky run` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
+- **DuckDB / local** — `$0.00` by definition (no billed compute).
+- **Discovery adapters (Fivetran, Airbyte, etc.)** — skipped; cost is `None`.
+
+Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command still emits duration + bytes totals but leaves `cost_usd` as `null`.
+
+### Related Commands
+
+- [`rocky replay`](#rocky-replay) -- same `RunRecord`, shown as a per-model execution dump
+- [`rocky trace`](#rocky-trace) -- same `RunRecord`, shown as a Gantt-style timeline
+- [`rocky history`](#rocky-history) -- list recent runs to find a `run_id`
+- [`[budget]`](/reference/configuration/#budget) -- run-level budget that fires `budget_breach` events during the run itself

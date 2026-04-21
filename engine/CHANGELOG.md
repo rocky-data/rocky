@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky cost <run_id|latest>`** (#202) — historical cost rollup over stored runs. Recomputes per-model cost via `rocky_core::cost::compute_observed_cost_usd` from `ModelExecution.duration_ms` / `bytes_scanned`. New `CostOutput` + `PerModelCostHistorical` through the codegen cascade. BigQuery cost now computes from stored bytes even when the live `rocky run` path still emits `None`. Arc 2 wave 2 first PR.
+- **`rocky branch compare <name>`** (#200) — diff a named branch's targets against main. Delegates to the existing `compare::compare` entry point with the branch's `schema_prefix` routed through `ShadowConfig.schema_override` — same mechanism `rocky run --branch` uses for writes, so compare hits exactly the tables the branch produced. Zero JSON-schema drift.
+- **`rocky run` now persists `RunRecord` to the state store** (#203) — `StateStore::record_run` wired at every exit path (happy / interrupted / model-only) after `populate_cost_summary`. `rocky history`, `rocky replay`, `rocky trace`, and `rocky cost` now return real data instead of reading from an empty store. Per-model timestamps are lossily captured as `finished_at = run.finished_at`, `started_at = finished_at - duration`; actual per-model wall-clock windows require execution-loop instrumentation and land in a later wave. Arc 1 wave 2.
+- **`OptimizeRecommendation`** (#203) gained `compute_cost_per_run`, `storage_cost_per_month`, `downstream_references` — projected through from `rocky_core::optimize::MaterializationCost` so Dagster `checks.py` can surface the values as asset metadata without re-deriving.
+
+### Fixed
+
+- **SIGPIPE now handled gracefully** (#199) — `rocky <cmd> | head` / `| jq | head` no longer SIGABRTs. Rust's default was to ignore `SIGPIPE` at the kernel level and panic from `println!` on the resulting EPIPE; restored the POSIX default in `main()` before `Cli::parse()` so `--help` / `--version` are also covered. `#[cfg(not(unix))]` stub preserves Windows builds.
+- **`target_dialect = "bq"` rejected by the project schema** (#201) — `examples/playground/pocs/06-developer-experience/08-portability-lint/rocky.toml` had the CLI-flag short form where only the long form (`bigquery`) is valid in `[portability]`. Updated the POC; `every_committed_poc_matches_project_schema` is green again.
+- **`HistoryResult` Pydantic drift** (#203) — hand-written class mirrored the state-store `RunRecord` shape (`finished_at`, `config_hash`, `models_executed` as a list) rather than what `rocky history --json` actually emits. Completed the Phase 2 soft-swap that history had been missing: `HistoryResult = HistoryOutput`, `ModelHistoryResult = ModelHistoryOutput`. Invisible until runs stopped being empty.
+
+### Internal
+
+- **`scripts/_normalize_fixture.py`** (#203) gained `WALL_CLOCK_ID_FIELDS = {"run_id"}` and `DERIVED_FROM_WALL_CLOCK_FIELDS = {"compute_cost_per_run", "estimated_monthly_savings"}` so dagster test fixtures stay byte-stable across regens now that `run_id` and wall-clock-derived cost numbers appear in non-empty arrays.
+
 ## [1.11.0] — 2026-04-20
 
 Closes the **first wave of every trust-system arc** (Arcs 1–7) plus two

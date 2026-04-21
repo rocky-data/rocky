@@ -150,7 +150,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 `playground` · `serve` · `lsp` · `init-adapter` · `test-adapter` · `import-dbt` · `validate-migration`
 
 ### Administration
-`doctor` · `history` · `replay` · `trace` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `bench` · `hooks list` · `hooks test`
+`doctor` · `history` · `replay` · `trace` · `cost` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `bench` · `hooks list` · `hooks test`
 
 ## Observability
 
@@ -161,6 +161,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 - **OTLP metrics export** (feature-gated via `--features otel`) — `rocky run` exports in-process counters and histograms to any OTLP-compatible collector.
 - **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` with `on_breach = "warn" | "error"`; fires `budget_breach` events. See [`[budget]`](/reference/configuration/#budget).
 - **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
+- **`rocky cost <run_id|latest>`** — historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
 
 ## IDE / Language Server (11 capabilities)
 
