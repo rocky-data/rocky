@@ -3272,6 +3272,7 @@ version = "1.11.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "miette",
  "rocky-cli",
  "rocky-core",
