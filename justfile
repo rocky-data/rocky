@@ -63,7 +63,20 @@ vendor-dagster:
 # --- Phase 2 schema codegen ---
 
 # Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript + VS Code project schema
+#
+# Use `just codegen` when editing Rust *Output structs or adding new CLI
+# commands. For release cuts — and any change that bumps version strings
+# or output shapes that show up in dagster fixtures — use `just codegen-all`
+# instead, which also runs `regen-fixtures`. Release CI fails
+# (codegen-drift.yml) if either side is stale.
 codegen: codegen-rust codegen-dagster codegen-vscode codegen-vscode-project-schema
+
+# Bundle `codegen` + `regen-fixtures` for release cuts and any change that
+# alters the shape of command output (e.g. new fields on MaterializationOutput,
+# a version bump). Fixture regen takes 1-2 min vs. codegen's ~30s — so
+# `codegen` stays as the fast dev loop and `codegen-all` is the "about to
+# land a release PR" loop.
+codegen-all: codegen regen-fixtures
 
 # Export JSON schemas from the engine's typed CLI output structs.
 #
@@ -110,11 +123,23 @@ codegen-dagster:
 # Regenerate TypeScript interfaces in editors/vscode from schemas/
 # (writes to editors/vscode/src/types/generated/)
 #
-# Self-healing: like the dagster recipe, this nukes the generated dir
-# and restores the curated index.ts barrel from git after json2ts runs.
+# Self-healing:
+#   1. Auto-runs `npm install` if editors/vscode/node_modules is missing.
+#      Without this guard the recipe used to fail silently on fresh
+#      worktrees and release PR merges — codegen-rust + codegen-dagster
+#      had already written their outputs by the time json2ts failed, so
+#      a partial codegen would leak into main and trigger
+#      codegen-drift.yml on the next PR. The install is ~15s on a warm
+#      npm cache, skipped entirely when deps are present.
+#   2. Like the dagster recipe, nukes the generated dir and restores the
+#      curated index.ts barrel from git after json2ts runs.
 codegen-vscode:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ ! -d editors/vscode/node_modules ]; then
+        echo "==> installing editors/vscode/ deps (required for json2ts codegen)"
+        (cd editors/vscode && npm install --silent)
+    fi
     rm -rf editors/vscode/src/types/generated
     mkdir -p editors/vscode/src/types/generated
     for schema in schemas/*.schema.json; do
