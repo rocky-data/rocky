@@ -21,12 +21,15 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar
 
 import dagster as dg
 from pydantic import BaseModel, ValidationError
@@ -144,6 +147,14 @@ def _forward_stderr_to_context(
        stderr (see ``engine/crates/rocky-observe/src/tracing_setup.rs``)
        so this captures every ``info!()`` / ``warn!()`` macro emission.
 
+    This function is the **sole reader** of ``proc.stderr``. Running it
+    alongside a ``proc.communicate(timeout=…)`` call (which also reads
+    the pipe via raw ``os.read``) violates CPython's documented
+    subprocess contract and was the root cause of the 2026-04-18 /
+    2026-04-19 production hangs — the timeout intermittently failed to
+    fire under stderr traffic. See :meth:`RockyResource._run_rocky_streaming`
+    for the single-reader + watchdog pattern that replaces that race.
+
     On unexpected read errors the reader thread logs the error at WARN
     via the module logger and exits cleanly so it doesn't take down the
     parent. We still lose live streaming for the rest of the run, but
@@ -167,6 +178,58 @@ def _forward_stderr_to_context(
         # stderr handle. ValueError covers "I/O operation on closed file"
         # from CPython. Anything else escapes so we notice the real bug.
         _log.warning("rocky stderr reader terminated: %s", exc)
+
+
+def _accumulate_stdout(stdout: IO[str] | None, sink: list[str]) -> None:
+    """Reader-thread body that accumulates rocky stdout lines into ``sink``.
+
+    Counterpart to :func:`_forward_stderr_to_context` for the stdout
+    pipe. Runs as the **sole reader** of ``proc.stdout`` so the parent
+    thread never touches the pipe FD — eliminating the two-readers
+    race that caused the 2026-04-18 / 2026-04-19 production hangs.
+
+    Reads line-by-line (inheriting the parent's ``bufsize=1``
+    line-buffering) and appends every line, **including blank ones**,
+    so the final concatenation reconstructs rocky's exact JSON output
+    byte-for-byte ready for ``_parse_rocky_json``.
+
+    On unexpected read errors the reader thread logs at WARN and exits
+    cleanly; the parent will see whatever was buffered so far and will
+    surface a JSON parse failure if the payload is truncated.
+    """
+    if stdout is None:
+        return
+    try:
+        for line in stdout:
+            sink.append(line)
+    except (OSError, ValueError) as exc:
+        _log.warning("rocky stdout accumulator terminated: %s", exc)
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """Terminate ``proc`` and any children via its POSIX process group.
+
+    Called from the watchdog thread when the wall-clock timeout
+    elapses. On POSIX, uses ``os.killpg(os.getpgid(pid), SIGKILL)`` so
+    child processes rocky spawned also die — requires that the Popen
+    was launched with ``start_new_session=True``. On Windows
+    (``os.name == "nt"``) falls back to ``proc.kill()`` which is the
+    best we can do without a process group.
+
+    ``ProcessLookupError`` and ``OSError`` are swallowed silently: the
+    subprocess may have exited between ``proc.wait()`` returning and
+    the kill call, which is benign. Any other exception surfaces to
+    the thread's default handler so we notice real bugs.
+    """
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        # Process already reaped, pgid lookup raced with exit, or the
+        # kernel simply refused — nothing useful we can do from here.
+        pass
 
 
 class RockyResource(dg.ConfigurableResource):
@@ -338,10 +401,9 @@ class RockyResource(dg.ConfigurableResource):
         This is the Pipes-style alternative to :meth:`_run_rocky`. Instead
         of buffering everything via ``subprocess.run``, it spawns the
         binary via ``subprocess.Popen`` with separated stdout/stderr,
-        starts a reader thread on stderr that forwards each line to
-        ``context.log.info`` for live progress visibility, and captures
-        stdout in memory for the final JSON parse after the subprocess
-        exits.
+        starts dedicated reader threads on each pipe, and relies on an
+        external watchdog thread (not ``communicate(timeout=)``) to
+        enforce the wall-clock timeout.
 
         Rocky's tracing logs go to stderr (see
         ``engine/crates/rocky-observe/src/tracing_setup.rs``) and the
@@ -349,6 +411,25 @@ class RockyResource(dg.ConfigurableResource):
         separation is clean: users see human-readable progress lines
         in the Dagster run viewer in real time, and the integration
         gets the typed result back at the end.
+
+        Concurrency model (fixes the 2026-04-18 / 2026-04-19 prod hangs)::
+
+            Popen(..., start_new_session=True)   # rocky gets its own pgid
+              ├── stderr forwarder thread         # SOLE reader of proc.stderr
+              ├── stdout accumulator thread       # SOLE reader of proc.stdout
+              ├── watchdog thread                 # os.killpg on timeout
+              └── main thread: proc.wait()        # blocks until external kill
+
+        The previous implementation combined the stderr forwarder with
+        ``proc.communicate(timeout=…)``, which also reads the stderr
+        pipe via raw ``os.read``. Two concurrent readers on the same
+        pipe FD violates CPython's documented ``subprocess`` contract
+        ("the process must have been started with the stream set to
+        ``PIPE`` and the stream must not be read from otherwise") —
+        under stderr traffic the ``TimeoutExpired`` path intermittently
+        failed to fire and the subprocess hung for hours. The watchdog
+        pattern kills the process externally via
+        ``os.killpg(SIGKILL)``, so enforcement is pipe-FD-independent.
 
         For full Dagster Pipes integration with structured per-model
         materialization and check events, use
@@ -379,13 +460,26 @@ class RockyResource(dg.ConfigurableResource):
         """
         self._verify_engine_version()
         cmd = self._build_cmd(args)
+        # POSIX-only process group isolation. Lets os.killpg reach any
+        # child processes rocky spawns (adapter subprocesses, hook
+        # scripts, …) when the watchdog fires. Windows has no direct
+        # equivalent; ``proc.kill()`` fallback in ``_kill_process_group``
+        # handles the single-process case, which is all rocky does on
+        # Windows today.
+        popen_kwargs: dict[str, object] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "bufsize": 1,  # line-buffered so the readers see lines as they're written
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+
+        t0 = time.monotonic()
         try:
             proc = subprocess.Popen(  # noqa: S603 - cmd is fully constructed from typed args
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # line-buffered so the reader thread sees lines as they're written
+                **popen_kwargs,
             )
         except FileNotFoundError:
             raise dg.Failure(
@@ -395,33 +489,108 @@ class RockyResource(dg.ConfigurableResource):
                 ),
             ) from None
 
-        # Start a daemon thread to forward stderr lines to context.log in
-        # real time. Daemon=True so it doesn't block process exit on a
-        # crash.
+        _log.info(
+            "rocky subprocess started: pid=%s timeout_s=%s cmd=%s",
+            proc.pid,
+            self.timeout_seconds,
+            " ".join(cmd),
+        )
+
+        # Sole-reader threads for the two pipes. Must be started before
+        # proc.wait() so they drain concurrently with the subprocess
+        # writing to its pipe buffers (otherwise a large write blocks
+        # rocky and we deadlock).
         stderr_lines: list[str] = []
-        reader = threading.Thread(
+        stdout_chunks: list[str] = []
+        stderr_reader = threading.Thread(
             target=_forward_stderr_to_context,
             args=(proc.stderr, context, stderr_lines),
             daemon=True,
             name="rocky-stderr-forwarder",
         )
-        reader.start()
+        stdout_reader = threading.Thread(
+            target=_accumulate_stdout,
+            args=(proc.stdout, stdout_chunks),
+            daemon=True,
+            name="rocky-stdout-accumulator",
+        )
+        stderr_reader.start()
+        stdout_reader.start()
+
+        # Watchdog: if ``fired`` is not set within ``timeout_seconds``,
+        # hard-kill the process group. Uses an Event so the main
+        # thread can dismiss the watchdog after a clean exit without
+        # racing on a shared flag.
+        fired = threading.Event()
+
+        def _watchdog() -> None:
+            if not fired.wait(self.timeout_seconds):
+                _kill_process_group(proc)
+                fired.set()
+
+        watchdog = threading.Thread(
+            target=_watchdog,
+            daemon=True,
+            name="rocky-watchdog",
+        )
+        watchdog.start()
 
         try:
-            stdout, _ = proc.communicate(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            # No timeout on wait(): enforcement comes from the watchdog
+            # killing the process externally. This is the critical
+            # change — `communicate(timeout=)` was racing with the
+            # stderr reader on the same pipe FD and failing to fire.
             proc.wait()
-            reader.join(timeout=1.0)
-            raise dg.Failure(
-                description=f"Rocky command timed out after {self.timeout_seconds}s",
-                metadata={"stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:]))},
-            ) from None
+        finally:
+            # Order matters: dismiss the watchdog first (so it stops
+            # waiting on the timeout), then drain the reader threads.
+            # ``proc.wait()`` has already closed the pipes on the
+            # subprocess side, so the readers will hit EOF and exit.
+            fired.set()
+            watchdog.join(timeout=1.0)
+            stderr_reader.join(timeout=2.0)
+            stdout_reader.join(timeout=2.0)
 
-        # Wait briefly for the stderr reader to drain remaining lines
-        # before checking exit status. The communicate() call already
-        # closed the stderr pipe so the reader will exit shortly.
-        reader.join(timeout=2.0)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        stdout = "".join(stdout_chunks)
+
+        # On POSIX, a subprocess killed by SIGKILL has returncode == -SIGKILL.
+        # On Windows, proc.kill() leaves returncode == 1 (no way to
+        # distinguish from a native failure), but the watchdog firing
+        # on Windows is still reliable because fired.wait() + proc.kill()
+        # behave identically. We treat the POSIX signal marker as the
+        # canonical timeout signal.
+        killed_by_watchdog = os.name != "nt" and proc.returncode == -signal.SIGKILL
+
+        outcome: str
+        if killed_by_watchdog:
+            outcome = "timeout-killed"
+        elif proc.returncode == 0:
+            outcome = "success"
+        elif allow_partial and stdout.lstrip().startswith("{"):
+            outcome = "partial-success"
+        else:
+            outcome = "failure"
+
+        _log.info(
+            "rocky subprocess ended: pid=%s returncode=%s duration_ms=%d outcome=%s",
+            proc.pid,
+            proc.returncode,
+            duration_ms,
+            outcome,
+        )
+
+        if killed_by_watchdog:
+            raise dg.Failure(
+                description=(
+                    f"Rocky command timed out after {self.timeout_seconds}s (watchdog-killed)"
+                ),
+                metadata={
+                    "stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:])),
+                    "duration_ms": dg.MetadataValue.int(duration_ms),
+                    "pid": dg.MetadataValue.int(proc.pid),
+                },
+            )
 
         if proc.returncode == 0:
             return stdout
@@ -432,7 +601,10 @@ class RockyResource(dg.ConfigurableResource):
 
         raise dg.Failure(
             description=f"Rocky command failed (exit {proc.returncode})",
-            metadata={"stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:]))},
+            metadata={
+                "stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:])),
+                "duration_ms": dg.MetadataValue.int(duration_ms),
+            },
         )
 
     def _http_get(self, path: str) -> str:

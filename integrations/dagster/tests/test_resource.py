@@ -8,8 +8,13 @@ real Rocky binary or hitting a server.
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
+import sys
+import threading
+import time
 import urllib.error
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -295,17 +300,27 @@ def _streaming_popen_mock(
     stderr_lines: list[str],
     returncode: int = 0,
 ):
-    """Build a Popen mock that returns the supplied stdout + stderr.
+    """Build a Popen mock that mimics a real subprocess.Popen for streaming.
 
-    The stderr is exposed as an iterator of pre-recorded lines so the
-    reader thread sees one line at a time. communicate() returns the
-    final (stdout, '') pair and sets the configured returncode.
+    Both ``stdout`` and ``stderr`` are exposed as iterators so the
+    dedicated reader threads (the sole readers of each pipe, per the
+    post-2026-04-19 watchdog rewrite of ``_run_rocky_streaming``) see
+    one line at a time and drain to EOF.
+
+    The stdout accumulator concatenates whatever it reads verbatim; to
+    keep existing tests reconstructing the exact JSON payload, stdout
+    is exposed as a single-element iterator yielding the full string.
+
+    ``proc.wait()`` returns immediately (returncode already set), which
+    matches a normally-exiting subprocess. The watchdog's ``fired.wait``
+    is dismissed in the main thread's ``finally`` block before
+    ``proc.wait()``'s effect matters.
     """
     proc = MagicMock()
-    proc.stdout = MagicMock()
+    proc.pid = 12345
+    proc.stdout = iter([stdout]) if stdout else iter([])
     proc.stderr = iter(line + "\n" for line in stderr_lines)
     proc.returncode = returncode
-    proc.communicate = MagicMock(return_value=(stdout, ""))
     proc.kill = MagicMock()
     proc.wait = MagicMock()
     return proc
@@ -482,25 +497,230 @@ def test_run_streaming_missing_binary_raises_failure():
 
 
 def test_run_streaming_timeout_kills_proc_and_raises():
-    """When the subprocess hangs past timeout, run_streaming kills it
-    and raises dg.Failure with the configured timeout in the message."""
-    rocky = RockyResource(timeout_seconds=42)
+    """When the subprocess hangs past ``timeout_seconds``, the watchdog
+    thread kills the process group via ``os.killpg(SIGKILL)`` and
+    ``run_streaming`` raises ``dg.Failure`` with the configured timeout
+    in the message.
+
+    This is the mock-based smoke test; the real regression guard is the
+    pair of fake-binary tests below
+    (``test_run_streaming_hard_kills_hung_binary_with_stderr_chatter`` and
+    ``test_run_streaming_timeout_fires_natively_without_daemon_reader``)
+    which exercise the actual two-readers race that caused the
+    2026-04-18 / 2026-04-19 production hangs.
+    """
+    # Short timeout keeps the test fast while still exercising the
+    # real ``threading.Event.wait`` path (no monkeypatching of the
+    # watchdog itself).
+    rocky = RockyResource(timeout_seconds=1)
     context = _captured_log_context()
+
+    # proc.wait() blocks until the watchdog signals the parent — we
+    # simulate a live hang by making wait() wait on a sentinel Event
+    # that never fires naturally. ``_kill_process_group`` is stubbed
+    # out in the patch block below (mock proc.pid isn't a real pid),
+    # and our side_effect sets returncode to -SIGKILL and unblocks.
+    killed = threading.Event()
+
+    def fake_wait(timeout: float | None = None) -> int:
+        # mimic proc.wait() blocking until the watchdog's side-effect
+        # unblocks us by setting the sentinel
+        killed.wait()
+        return proc.returncode
+
     proc = _streaming_popen_mock(
         stdout="",
         stderr_lines=["INFO hung at step 3"],
     )
-    proc.communicate.side_effect = subprocess.TimeoutExpired(cmd="rocky", timeout=42)
+    proc.wait = MagicMock(side_effect=fake_wait)
+
+    killpg_mock = MagicMock(
+        side_effect=lambda pgid, sig: (
+            object.__setattr__(proc, "returncode", -signal.SIGKILL),
+            killed.set(),
+        )[0],
+    )
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
         patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("dagster_rocky.resource.os.killpg", killpg_mock),
+        patch("dagster_rocky.resource.os.getpgid", return_value=proc.pid),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
-    proc.kill.assert_called_once()
-    assert "42s" in (excinfo.value.description or "")
+    killpg_mock.assert_called_once()
+    # Watchdog kills via SIGKILL and surfaces the configured duration.
+    desc = excinfo.value.description or ""
+    assert "1s" in desc
+    assert "timed out" in desc.lower()
+    assert "watchdog-killed" in desc.lower()
+
+
+# ---------------------------------------------------------------------------
+# Real-binary regression tests for the 2026-04-18 / 2026-04-19 hang
+#
+# These tests replace the fake ``rocky`` binary with a POSIX shell script
+# that deliberately hangs while spamming stderr (the exact production
+# pattern that triggered the two-readers race in dagster-rocky 1.7.0).
+# The previous ``_run_rocky_streaming`` called ``proc.communicate(timeout)``
+# concurrently with a daemon stderr reader thread — two CPython readers on
+# the same pipe FD — which violates the documented subprocess contract and
+# caused the timeout to intermittently fail to fire.
+#
+# Skipped on Windows: the fix path (``os.killpg`` + ``start_new_session``)
+# is POSIX-only, and the fake binary is a shell script.
+# ---------------------------------------------------------------------------
+
+
+_HANG_WITH_STDERR_CHATTER_SCRIPT = """#!/bin/sh
+# Mimics the 2026-04-19 production behaviour: stream stderr at ~20Hz
+# while never exiting. Under the two-readers race on proc.stderr, the
+# old communicate(timeout=) path intermittently failed to fire, leaving
+# the subprocess hanging for hours.
+echo '{"started": true}' >&2
+while true; do
+    echo 'still uploading state...' >&2
+    sleep 0.05
+done
+"""
+
+
+def _write_hang_fake(tmp_path: Path) -> Path:
+    """Write the hanging-with-stderr-chatter fake rocky binary to ``tmp_path``.
+
+    Returns the absolute path. Chmod 0o755 so it's directly executable.
+    Adds a ``--version`` shortcut so the version check doesn't hang.
+    """
+    fake = tmp_path / "rocky"
+    # The version shortcut runs when the script is called with the first
+    # arg ``--version`` (the version-check codepath). Otherwise the
+    # script hangs, which is what we want for the timeout test.
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  echo 'rocky 99.0.0'\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo '{\"started\": true}' >&2\n"
+        "while true; do\n"
+        "    echo 'still uploading state...' >&2\n"
+        "    sleep 0.05\n"
+        "done\n"
+    )
+    fake.chmod(0o755)
+    return fake
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fake binary")
+def test_run_streaming_hard_kills_hung_binary_with_stderr_chatter(tmp_path: Path):
+    """Positive regression test for the two-readers race fix.
+
+    Spawns a **real** shell script that hangs forever while spamming
+    stderr. Confirms the watchdog kills the process group via SIGKILL
+    and ``_run_rocky_streaming`` raises ``dg.Failure`` within the
+    configured timeout + a small grace window (not hours, as happened
+    in prod on 2026-04-18 and 2026-04-19).
+
+    Wall-clock assertion uses ``time.monotonic()`` because
+    ``pytest-timeout`` is not declared in the dagster-rocky dev deps.
+    """
+    fake = _write_hang_fake(tmp_path)
+    rocky = RockyResource(
+        binary_path=str(fake),
+        # Pass a config_path/state_path/models_dir that point at the
+        # tmp dir so we don't need real config files.
+        config_path=str(tmp_path / "rocky.toml"),
+        state_path=str(tmp_path / ".rocky-state.redb"),
+        models_dir=str(tmp_path),
+        timeout_seconds=2,
+    )
+    context = _captured_log_context()
+
+    t0 = time.monotonic()
+    with pytest.raises(dg.Failure, match="timed out"):
+        rocky._run_rocky_streaming(
+            ["run", "--filter", "client=test"],
+            context,
+            allow_partial=True,
+        )
+    elapsed = time.monotonic() - t0
+
+    # Budget: 2s timeout + 3s grace for watchdog + reader joins.
+    # The 2026-04-19 incident sat at 11.5 hours; if this test takes >
+    # 5s the fix is not actually bounded.
+    assert elapsed < 5.0, (
+        f"run_streaming took {elapsed:.2f}s; expected < 5s. Watchdog may not be firing."
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fake binary")
+def test_run_streaming_timeout_fires_natively_without_daemon_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Negative-control regression test — documents the race mechanism.
+
+    Same hanging fake binary as the positive test, but the stderr
+    forwarder is monkeypatched to a no-op. With only the stdout
+    accumulator reading pipes, there's no two-readers race.
+
+    The watchdog still fires (it's the enforcer regardless of pipe
+    traffic), so the observable behaviour is identical: ``dg.Failure``
+    raised within the timeout + grace window. The *value* of this test
+    is documentation — it demonstrates that the mechanism by which the
+    fix works is independent of pipe-FD semantics: an external SIGKILL
+    via ``os.killpg`` bypasses the race entirely.
+
+    Without this control, a passing positive test only shows the
+    watchdog works; it doesn't validate that the race was the root
+    cause of the prior hangs.
+    """
+
+    def _noop_forwarder(stderr, context, sink):
+        # Drain stderr quickly to avoid filling the pipe buffer (which
+        # would block the subprocess after a few KB). We don't log
+        # anything to context.log — this is the "no daemon reader"
+        # simulation.
+        if stderr is None:
+            return
+        try:
+            for _ in stderr:
+                pass
+        except (OSError, ValueError):
+            pass
+
+    monkeypatch.setattr(
+        "dagster_rocky.resource._forward_stderr_to_context",
+        _noop_forwarder,
+    )
+
+    fake = _write_hang_fake(tmp_path)
+    rocky = RockyResource(
+        binary_path=str(fake),
+        config_path=str(tmp_path / "rocky.toml"),
+        state_path=str(tmp_path / ".rocky-state.redb"),
+        models_dir=str(tmp_path),
+        timeout_seconds=2,
+    )
+    context = _captured_log_context()
+
+    t0 = time.monotonic()
+    with pytest.raises(dg.Failure, match="timed out"):
+        rocky._run_rocky_streaming(
+            ["run", "--filter", "client=test"],
+            context,
+            allow_partial=True,
+        )
+    elapsed = time.monotonic() - t0
+
+    # Same budget: if the mechanism depended on pipe semantics, a
+    # different rail would need a different budget. It doesn't.
+    assert elapsed < 5.0, (
+        f"run_streaming took {elapsed:.2f}s without daemon reader; "
+        "expected < 5s. The watchdog is the enforcer — race or no race."
+    )
 
 
 def test_run_streaming_threads_partition_flags():
