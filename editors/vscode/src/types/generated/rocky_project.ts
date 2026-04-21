@@ -1166,6 +1166,10 @@ export interface StateConfig {
    */
   s3_prefix?: string | null;
   /**
+   * Wall-clock budget (seconds) for each state transfer operation (download or upload). Catches stuck SDK retry loops, DNS, TLS, and hung endpoints that the per-request HTTP timeout does not see. Defaults to 300s; raise for large state or slow networks.
+   */
+  transfer_timeout_seconds?: number;
+  /**
    * Valkey key prefix (default: "rocky:state:")
    */
   valkey_prefix?: string | null;
