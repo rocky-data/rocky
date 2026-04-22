@@ -93,5 +93,11 @@ class DiscoverOutput(BaseModel):
     """
     Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.
     """
+    schemas_cached: conint(ge=0) | None = None
+    """
+    Number of schema-cache entries written by this invocation.
+
+    Populated by `rocky discover --with-schemas` — the explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache (design doc §4.2 route B at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md`). Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
+    """
     sources: list[SourceOutput]
     version: str

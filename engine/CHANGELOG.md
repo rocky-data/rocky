@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky discover --with-schemas`** — explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache (design doc §4.2 route B). When set, walks each unique `(catalog, schema)` pair reachable via the source's `BatchCheckAdapter`, issues one `batch_describe_schema` round-trip, and persists every returned table as a `SchemaCacheEntry` in `state.redb::schema_cache`. Intended for CI warm-up so downstream `rocky compile` / `rocky lsp` invocations typecheck leaf models against real warehouse types. Per-schema describe failures and per-entry write failures are logged at `warn` and skipped — one bad source does not abort the warm-up. Missing `source.catalog` or an adapter without a `BatchCheckAdapter` (DuckDB today) warns once and skips writes. Passing `--with-schemas` when `[cache.schemas] enabled = false` errors with a clear message instead of silently no-op'ing. New `schemas_cached: usize` field on `DiscoverOutput` (skipped from JSON when zero, so existing fixtures stay byte-stable).
+
 ## [1.13.0] — 2026-04-22
 
 Reliability hardening for the state backend. Closes the last mutation path in `rocky-core` without retry / circuit-breaker parity with the adapter layer, and turns `rocky doctor` into a real smoke test of state-backend connectivity instead of a credentials-only check. Two PRs since v1.12.0.

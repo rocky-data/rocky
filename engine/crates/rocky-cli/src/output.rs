@@ -86,6 +86,17 @@ pub struct DiscoverOutput {
     /// parser. Empty when nothing was filtered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_tables: Vec<ExcludedTableOutput>,
+    /// Number of schema-cache entries written by this invocation.
+    ///
+    /// Populated by `rocky discover --with-schemas` — the explicit
+    /// warm-up path for the Arc 7 wave 2 wave-2 schema cache (design
+    /// doc §4.2 route B at
+    /// `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md`).
+    /// Zero — and omitted from the wire format — when `--with-schemas`
+    /// isn't set, so fixtures captured without the flag stay
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schemas_cached: usize,
 }
 
 /// Pipeline-level checks configuration projected into the discover output.
@@ -1820,6 +1831,7 @@ impl DiscoverOutput {
             sources,
             checks: None,
             excluded_tables: vec![],
+            schemas_cached: 0,
         }
     }
 
@@ -1834,6 +1846,18 @@ impl DiscoverOutput {
     #[must_use]
     pub fn with_excluded_tables(mut self, excluded: Vec<ExcludedTableOutput>) -> Self {
         self.excluded_tables = excluded;
+        self
+    }
+
+    /// Record the number of schema-cache entries written by
+    /// `rocky discover --with-schemas` and return self.
+    ///
+    /// Zero is the canonical "flag absent" value and is skipped from the
+    /// wire format (see the `#[serde(skip_serializing_if = "is_zero")]`
+    /// attribute on the field).
+    #[must_use]
+    pub fn with_schemas_cached(mut self, schemas_cached: usize) -> Self {
+        self.schemas_cached = schemas_cached;
         self
     }
 }
