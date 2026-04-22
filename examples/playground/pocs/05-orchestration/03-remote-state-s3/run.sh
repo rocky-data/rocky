@@ -36,6 +36,16 @@ export AWS_REGION="us-east-1"
 rocky validate
 echo
 
+# --- state_rw probe: confirm the MinIO bucket is writable before any pipeline
+#     work (fails fast at cold start on IAM / reachability issues instead of
+#     at end-of-run upload). Local backend = no-op; tiered probes both legs.
+if $HAVE_DOCKER; then
+    echo "=== rocky doctor --check state_rw (live round-trip probe vs MinIO) ==="
+    rocky -c rocky.toml -o json doctor --check state_rw > expected/doctor_state_rw.json 2>&1 || true
+    head -20 expected/doctor_state_rw.json
+    echo
+fi
+
 # --- Run 1: initial load ---
 echo "=== Run 1 (initial — full load of 100 rows) ==="
 rocky -c rocky.toml -o json run --filter source=orders > expected/run1.json 2>&1 || true

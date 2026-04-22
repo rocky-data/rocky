@@ -75,5 +75,10 @@ event bus — `circuit_breaker_tripped` (Closed/HalfOpen → Open) and
   `engine/crates/rocky-core/src/config.rs` (`RetryConfig`)
 - Adapters wired: `rocky-databricks/src/connector.rs`,
   `rocky-snowflake/src/connector.rs`
+- **State backend wired (v1.13.0+):** `[state.retry]` shares the exact
+  shape and semantics of `[adapter.NAME.retry]` — same `RetryConfig`,
+  same breaker, same events. See [`03-remote-state-s3/`](../03-remote-state-s3/)
+  for a live MinIO demo that includes the retry block and a
+  `rocky doctor --check state_rw` cold-start probe.
 - Sibling POC: [`04-checkpoint-resume/`](../04-checkpoint-resume/)
   covers the other half of Arc 3 — state-store-backed resume.

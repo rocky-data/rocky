@@ -270,7 +270,7 @@ Governance (tags, workspace bindings, permissions) is NOT a separate CLI command
 
 ### `rocky doctor`
 
-Runs aggregate health checks on your Rocky project: config validation, state store health, adapter connectivity, pipeline consistency, and state sync status.
+Runs aggregate health checks on your Rocky project: config validation, state store health, adapter connectivity, pipeline consistency, state backend configuration, live state read/write, and auth.
 
 ```bash
 rocky doctor
@@ -278,14 +278,15 @@ rocky doctor
 
 **Checks performed:**
 
-| Check | Description |
-|-------|-------------|
-| Config | Parses `rocky.toml`, validates adapters and pipelines |
-| State | Verifies the state store is readable and not corrupted |
-| Adapters | Tests connectivity to configured adapters |
-| Pipelines | Validates schema patterns, templates, and governance config |
-| State Sync | Checks remote state backends (S3, Valkey) if configured |
-| Auth | Pings each warehouse and discovery adapter to verify credentials and connectivity |
+| Check | Name | Description |
+|-------|------|-------------|
+| Config | `config` | Parses `rocky.toml`, validates adapters and pipelines |
+| State | `state` | Verifies the local state store is readable and not corrupted |
+| Adapters | `adapters` | Tests connectivity to configured adapters |
+| Pipelines | `pipelines` | Validates schema patterns, templates, and governance config |
+| State Sync | `state_sync` | Inspects the configured remote state backend (type only) |
+| State RW | `state_rw` | Round-trips a marker object against the configured backend (put → get → delete). Surfaces IAM and reachability problems at cold start instead of end-of-run upload. No-op for `local`; tiered probes both legs. |
+| Auth | `auth`, `auth/<adapter>` | Pings each warehouse and discovery adapter to verify credentials and connectivity |
 
 **JSON output:**
 
@@ -308,6 +309,7 @@ Run a specific check:
 
 ```bash
 rocky doctor --check auth
+rocky doctor --check state_rw   # live round-trip probe against the remote state backend
 ```
 
 ---

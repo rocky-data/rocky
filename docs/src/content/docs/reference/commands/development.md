@@ -404,15 +404,18 @@ Running conformance tests for duckdb...
 
 ## `rocky doctor`
 
-Health checks for your Rocky project: config validation, state store integrity, adapter connectivity, pipeline consistency, state sync, and auth verification.
+Health checks for your Rocky project: config validation, local state store integrity, adapter connectivity, pipeline consistency, state backend configuration, live state read/write, and auth verification.
 
 ```bash
-rocky doctor                   # Run all checks
-rocky doctor --check config    # Run only the config check
-rocky doctor --check auth      # Verify credentials + connectivity for all adapters
+rocky doctor                     # Run all checks
+rocky doctor --check config      # Run only the config check
+rocky doctor --check auth        # Verify credentials + connectivity for all adapters
+rocky doctor --check state_rw    # Round-trip a marker object against the state backend
 ```
 
 The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an adapter-specific cheaper query) and each discovery adapter. Reports per-adapter pass/fail with latency.
+
+The `state_rw` check (v1.13.0+) runs a put → get → delete probe against the configured state backend so IAM and reachability problems surface at cold start rather than at end-of-run upload. Local backend is a no-op; tiered probes both legs.
 
 See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
 
