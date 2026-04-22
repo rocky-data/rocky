@@ -519,8 +519,8 @@ async fn probe_valkey(config: &StateConfig) -> Result<(), StateSyncError> {
     async move {
         with_transfer_timeout(timeout, async move {
             let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
-                let client = redis::Client::open(url)
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let client =
+                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
                 let mut conn = client
                     .get_connection()
                     .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
