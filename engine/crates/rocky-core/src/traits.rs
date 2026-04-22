@@ -102,17 +102,36 @@ pub struct ExplainResult {
 /// warehouse.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ExecutionStats {
-    /// Bytes read by the warehouse to produce the result. For BigQuery
-    /// on-demand this is `totalBytesBilled` (what the user is actually
-    /// charged for — the 10 MB minimum floor is already applied),
-    /// intentionally stored in this field because
-    /// [`crate::cost::compute_observed_cost_usd`] multiplies it by the
-    /// per-TB rate to compute the billed cost.
+    /// Adapter-reported bytes figure used for cost accounting. This is
+    /// the *billing-relevant* number per adapter, not literal scan
+    /// volume — so anyone comparing this to a warehouse console should
+    /// know which column lines up.
+    ///
+    /// - **BigQuery:** `totalBytesBilled` (with the 10 MB per-query
+    ///   minimum floor already applied) — matches the BigQuery
+    ///   console's "Bytes billed" field, **not** "Bytes processed".
+    ///   Stored in this field because
+    ///   [`crate::cost::compute_observed_cost_usd`] multiplies it by
+    ///   the per-TB rate to compute the billed cost.
+    /// - **Databricks:** when populated, the byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design
+    ///   (QUERY_HISTORY round-trip cost; Snowflake cost is
+    ///   duration × DBU, not bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
     pub bytes_scanned: Option<u64>,
-    /// Bytes written to the destination. Only populated by adapters
-    /// that report it natively (none today — Databricks and Snowflake
-    /// return bytes-written in statement results but aren't wired yet;
-    /// BigQuery doesn't expose a bytes-written figure for query jobs).
+    /// Adapter-reported bytes-written figure. Only populated by
+    /// adapters that report it natively:
+    ///
+    /// - **BigQuery:** `None` — query jobs don't surface a
+    ///   bytes-written figure.
+    /// - **Databricks / Snowflake:** `None` today; statement results
+    ///   expose a bytes-written figure but it's not wired yet.
+    /// - **DuckDB:** `None`.
+    ///
+    /// Reserved so a future wave can populate it without a schema
+    /// break.
     pub bytes_written: Option<u64>,
     /// Rows affected by the statement (inserts + updates + deletes).
     /// Not populated yet — reserved so a follow-up wave can thread

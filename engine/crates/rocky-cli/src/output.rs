@@ -339,20 +339,32 @@ pub struct MaterializationOutput {
     /// `rocky_core::cost::compute_observed_cost_usd`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
-    /// Bytes the warehouse reported reading to produce the result, summed
-    /// across all statements executed for this materialization. For
-    /// BigQuery on-demand this is `statistics.query.totalBytesBilled`
-    /// (with the 10 MB minimum already applied) — fed straight into
-    /// [`rocky_core::cost::compute_observed_cost_usd`] to produce
-    /// `cost_usd`. `None` when the adapter does not report bytes (today:
-    /// Databricks / Snowflake / DuckDB).
+    /// Adapter-reported bytes figure used for cost accounting, summed
+    /// across all statements executed for this materialization. This
+    /// is the *billing-relevant* number per adapter, not literal scan
+    /// volume — so anyone comparing this to a warehouse console should
+    /// know which column lines up.
+    ///
+    /// - **BigQuery:** `statistics.query.totalBytesBilled` (with the
+    ///   10 MB per-query minimum already applied) — matches the
+    ///   BigQuery console's "Bytes billed" field, **not** "Bytes
+    ///   processed". Fed straight into
+    ///   [`rocky_core::cost::compute_observed_cost_usd`] to produce
+    ///   `cost_usd`.
+    /// - **Databricks:** when populated, byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design (QUERY_HISTORY
+    ///   round-trip cost; Snowflake cost is duration × DBU, not
+    ///   bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_scanned: Option<u64>,
-    /// Bytes the warehouse reported writing to the destination, summed
-    /// across all statements. Currently `None` on every adapter — BigQuery
-    /// doesn't expose a natural bytes-written figure for query jobs, and
-    /// the Databricks / Snowflake paths haven't wired it yet. Field
-    /// reserved so future waves can populate it without a schema break.
+    /// Adapter-reported bytes-written figure, summed across all
+    /// statements. Currently `None` on every adapter — BigQuery doesn't
+    /// expose a bytes-written figure for query jobs, and the Databricks
+    /// / Snowflake paths haven't wired it yet. Reserved so future waves
+    /// can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
 }
@@ -2742,8 +2754,26 @@ pub struct ReplayModelOutput {
     pub sql_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_affected: Option<u64>,
+    /// Adapter-reported bytes figure used for cost accounting. This is
+    /// the *billing-relevant* number per adapter, not literal scan
+    /// volume:
+    ///
+    /// - **BigQuery:** `totalBytesBilled` — includes the 10 MB
+    ///   per-query minimum floor; matches the BigQuery console's
+    ///   "Bytes billed" field, **not** "Bytes processed".
+    /// - **Databricks:** when populated, byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design (QUERY_HISTORY
+    ///   round-trip cost; Snowflake cost is duration × DBU, not
+    ///   bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_scanned: Option<u64>,
+    /// Adapter-reported bytes-written figure. Currently `None` on
+    /// every adapter — BigQuery doesn't expose a bytes-written figure
+    /// for query jobs, and the Databricks / Snowflake paths haven't
+    /// wired it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
 }
@@ -2787,8 +2817,26 @@ pub struct TraceModelEntry {
     pub lane: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_affected: Option<u64>,
+    /// Adapter-reported bytes figure used for cost accounting. This is
+    /// the *billing-relevant* number per adapter, not literal scan
+    /// volume:
+    ///
+    /// - **BigQuery:** `totalBytesBilled` — includes the 10 MB
+    ///   per-query minimum floor; matches the BigQuery console's
+    ///   "Bytes billed" field, **not** "Bytes processed".
+    /// - **Databricks:** when populated, byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design (QUERY_HISTORY
+    ///   round-trip cost; Snowflake cost is duration × DBU, not
+    ///   bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_scanned: Option<u64>,
+    /// Adapter-reported bytes-written figure. Currently `None` on
+    /// every adapter — BigQuery doesn't expose a bytes-written figure
+    /// for query jobs, and the Databricks / Snowflake paths haven't
+    /// wired it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
 }
@@ -2865,8 +2913,26 @@ pub struct PerModelCostHistorical {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_affected: Option<u64>,
+    /// Adapter-reported bytes figure used for cost accounting. This is
+    /// the *billing-relevant* number per adapter, not literal scan
+    /// volume:
+    ///
+    /// - **BigQuery:** `totalBytesBilled` — includes the 10 MB
+    ///   per-query minimum floor; matches the BigQuery console's
+    ///   "Bytes billed" field, **not** "Bytes processed".
+    /// - **Databricks:** when populated, byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design (QUERY_HISTORY
+    ///   round-trip cost; Snowflake cost is duration × DBU, not
+    ///   bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_scanned: Option<u64>,
+    /// Adapter-reported bytes-written figure. Currently `None` on
+    /// every adapter — BigQuery doesn't expose a bytes-written figure
+    /// for query jobs, and the Databricks / Snowflake paths haven't
+    /// wired it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     /// Observed cost for this execution. `None` when the adapter

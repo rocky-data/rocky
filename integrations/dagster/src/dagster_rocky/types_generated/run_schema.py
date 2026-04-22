@@ -385,11 +385,13 @@ class MaterializationOutput(BaseModel):
     asset_key: list[str]
     bytes_scanned: conint(ge=0) | None = None
     """
-    Bytes the warehouse reported reading to produce the result, summed across all statements executed for this materialization. For BigQuery on-demand this is `statistics.query.totalBytesBilled` (with the 10 MB minimum already applied) — fed straight into [`rocky_core::cost::compute_observed_cost_usd`] to produce `cost_usd`. `None` when the adapter does not report bytes (today: Databricks / Snowflake / DuckDB).
+    Adapter-reported bytes figure used for cost accounting, summed across all statements executed for this materialization. This is the *billing-relevant* number per adapter, not literal scan volume — so anyone comparing this to a warehouse console should know which column lines up.
+
+    - **BigQuery:** `statistics.query.totalBytesBilled` (with the 10 MB per-query minimum already applied) — matches the BigQuery console's "Bytes billed" field, **not** "Bytes processed". Fed straight into [`rocky_core::cost::compute_observed_cost_usd`] to produce `cost_usd`. - **Databricks:** when populated, byte count from the statement-execution manifest (`total_byte_count`); `None` today until the manifest plumbing lands. - **Snowflake:** `None` — deferred by design (QUERY_HISTORY round-trip cost; Snowflake cost is duration × DBU, not bytes-driven). - **DuckDB:** `None` — no billed-bytes concept.
     """
     bytes_written: conint(ge=0) | None = None
     """
-    Bytes the warehouse reported writing to the destination, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a natural bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Field reserved so future waves can populate it without a schema break.
+    Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so future waves can populate it without a schema break.
     """
     cost_usd: float | None = None
     """
