@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-04-22
+
+Reliability hardening for the state backend. Closes the last mutation path in `rocky-core` without retry / circuit-breaker parity with the adapter layer, and turns `rocky doctor` into a real smoke test of state-backend connectivity instead of a credentials-only check. Two PRs since v1.12.0.
+
+### Added
+
+- **`[state.retry]` block on `StateConfig`** (#213) — shape identical to `[adapter.databricks.retry]`, so operators reason about both layers with a single mental model. Fields: `max_retries` (default 3), `initial_backoff_ms` (1000), `max_backoff_ms` (30000), `backoff_multiplier` (2.0), `jitter` (true), `circuit_breaker_threshold` (5), `circuit_breaker_recovery_timeout_secs` (None), `max_retries_per_run` (None). Reuses the existing `rocky_core::circuit_breaker::CircuitBreaker` + `rocky_core::retry_budget::RetryBudget` already battle-tested by the Databricks adapter. The retry loop is wrapped by the existing `with_transfer_timeout`, so `transfer_timeout_seconds` (default 300 s) remains the total wall-clock cap — retries *share* the budget rather than extend it. No liveness regression vs v1.12.0.
+- **`[state] on_upload_failure = "skip" | "fail"`** (#213) — policy applied after retries + circuit are exhausted. Default `skip` matches the de-facto behaviour of existing callers that `warn + continue` on upload failure; `fail` is the opt-in for strict environments where state durability trumps liveness. New `StateUploadFailureMode` enum exported from `rocky_core::config`.
+- **New `StateSyncError::CircuitOpen` + `RetryBudgetExhausted` variants** (#213) — terminal outcomes that were previously masquerading as generic upload/timeout errors now surface with attribution, so log-grep and `match`-based error handling can distinguish "breaker tripped" from "network blip".
+- **`outcome` field on every terminal `state.upload` / `state.download` event** (#213) — `ok` / `absent` / `timeout` / `error_then_fresh` / `skipped_after_failure` / `transient_exhausted` / `circuit_open` / `budget_exhausted`. Terminal success events also carry a `retries` counter. Lets operators diagnose incidents from structured log lines instead of free-form message regex.
+- **`rocky doctor` gains a 7th check: `state_rw`** (#214) — runs a put/get/delete round-trip against the configured state backend (S3 / GCS / Valkey / Tiered). Uses a distinct marker key (`doctor-probe-{pid}-{nanos}.marker`, never `state.redb`), honours `transfer_timeout_seconds`, no retries — probes produce a single-pass pass/fail signal, not resilient writes. Local backend is a no-op. Tiered probes both legs; either failing fails the probe. Complements the existing `state_sync` check (backend-type inspection only) by surfacing IAM / reachability problems at cold start instead of at end-of-run upload time.
+- **`rocky_core::state_sync::probe_state_backend` public helper** (#214) — exposes the RW probe so downstream `doctor`-like tooling (Dagster asset checks, scheduled sensors) can reuse it without shelling out to `rocky doctor`.
+
+### Internal
+
+- **`compute_backoff` + `is_transient` for state sync intentionally duplicated** from `rocky-databricks::connector` and `rocky-snowflake::connector`. A follow-up PR should hoist all three copies into a shared `rocky-core` helper; this release kept scope narrow.
+
 ## [1.12.0] — 2026-04-21
 
 Arc 1 wave 2 shipped + a short cleanup wave around it. Eight PRs since v1.11.0. `record_run` wiring finally makes the run-history query surfaces (`rocky history` / `replay` / `trace` / `cost`) return real data end-to-end, plus two new commands (`rocky cost`, `rocky branch compare`) and a SIGPIPE fix.
