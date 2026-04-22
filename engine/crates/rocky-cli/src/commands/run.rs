@@ -25,6 +25,7 @@ use rocky_core::traits::{
 
 use crate::output::*;
 use crate::registry::{self, AdapterRegistry};
+use crate::schema_cache_writer::{SchemaCacheWriteTap, persist_batch_describe};
 
 use super::{matches_filter, parse_filter, parsed_to_json_map};
 
@@ -1087,6 +1088,13 @@ pub async fn run(
             }))
             .await;
 
+        // Arc 7 wave 2 wave-2 PR 2: tap successful describes into the schema
+        // cache. One key per table in the returned map — the DESCRIBE cost
+        // is already paid, so populating the cache for sibling tables is
+        // free signal for future compiles. Write failures are logged at
+        // `warn!` level and never fail the run.
+        let mut schema_cache_tap = SchemaCacheWriteTap::default();
+
         for (side, cat, sch, result) in describe_results {
             match result {
                 Ok(cols_map) => {
@@ -1096,6 +1104,14 @@ pub async fn run(
                         schema = sch.as_str(),
                         tables = cols_map.len(),
                         "batch describe complete"
+                    );
+                    persist_batch_describe(
+                        &state_store,
+                        &rocky_cfg.cache.schemas,
+                        &mut schema_cache_tap,
+                        &cat,
+                        &sch,
+                        &cols_map,
                     );
                     prefetched.insert((cat, sch), cols_map);
                 }
