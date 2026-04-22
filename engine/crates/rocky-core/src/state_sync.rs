@@ -17,6 +17,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::circuit_breaker::TransitionOutcome;
 use crate::config::{RetryConfig, StateBackend, StateConfig, StateUploadFailureMode};
 use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
+use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
 
 #[derive(Debug, Error)]
@@ -787,31 +788,6 @@ fn is_transient(err: &StateSyncError) -> bool {
     }
 }
 
-/// Compute exponential-with-jitter backoff (ms) for retry attempt `attempt`.
-///
-/// Intentionally duplicated from `rocky-databricks::connector::compute_backoff`
-/// and `rocky-snowflake::connector::compute_backoff`. A follow-up PR should
-/// hoist the three copies into a single shared helper; this PR keeps scope
-/// narrow to the state-backend wiring.
-fn compute_backoff(cfg: &RetryConfig, attempt: u32) -> u64 {
-    let base = (cfg.initial_backoff_ms as f64) * cfg.backoff_multiplier.powi(attempt as i32);
-    let capped = base.min(cfg.max_backoff_ms as f64) as u64;
-
-    if cfg.jitter {
-        let jitter_range = capped / 4;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-        let jitter = nanos % (jitter_range.max(1));
-        capped
-            .saturating_sub(jitter_range / 2)
-            .saturating_add(jitter)
-    } else {
-        capped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,45 +930,6 @@ mod tests {
         assert!(!is_transient(&StateSyncError::RetryBudgetExhausted {
             limit: 3
         }));
-    }
-
-    #[test]
-    fn test_compute_backoff_without_jitter() {
-        let cfg = RetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 100,
-            max_backoff_ms: 1000,
-            backoff_multiplier: 2.0,
-            jitter: false,
-            ..RetryConfig::default()
-        };
-        assert_eq!(compute_backoff(&cfg, 0), 100);
-        assert_eq!(compute_backoff(&cfg, 1), 200);
-        assert_eq!(compute_backoff(&cfg, 2), 400);
-        assert_eq!(compute_backoff(&cfg, 3), 800);
-        // caps at max_backoff_ms
-        assert_eq!(compute_backoff(&cfg, 10), 1000);
-    }
-
-    #[test]
-    fn test_compute_backoff_jitter_within_bounds() {
-        let cfg = RetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 400,
-            max_backoff_ms: 10_000,
-            backoff_multiplier: 2.0,
-            jitter: true,
-            ..RetryConfig::default()
-        };
-        // With jitter, the returned value is within ±25 % of the base
-        // (400 ms at attempt=0). Allow 300..=500 as the safe envelope.
-        for _ in 0..50 {
-            let b = compute_backoff(&cfg, 0);
-            assert!(
-                (300..=500).contains(&b),
-                "jittered backoff out of envelope: {b}"
-            );
-        }
     }
 
     #[tokio::test]

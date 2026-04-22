@@ -8,11 +8,12 @@
 //! Supports retry with exponential backoff for transient failures.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use reqwest::Client;
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
+use rocky_core::retry::compute_backoff;
 use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -500,26 +501,6 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
     }
 }
 
-/// Computes backoff duration with exponential growth, capped at max, with optional jitter.
-fn compute_backoff(cfg: &RetryConfig, attempt: u32) -> u64 {
-    let base = (cfg.initial_backoff_ms as f64) * cfg.backoff_multiplier.powi(attempt as i32);
-    let capped = base.min(cfg.max_backoff_ms as f64) as u64;
-
-    if cfg.jitter {
-        let jitter_range = capped / 4;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-        let jitter = nanos % (jitter_range.max(1));
-        capped
-            .saturating_sub(jitter_range / 2)
-            .saturating_add(jitter)
-    } else {
-        capped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,49 +624,5 @@ mod tests {
             consecutive_failures: 5,
         };
         assert!(!is_transient(&err));
-    }
-
-    #[test]
-    fn test_backoff_exponential_no_jitter() {
-        let cfg = RetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 1000,
-            max_backoff_ms: 30000,
-            backoff_multiplier: 2.0,
-            jitter: false,
-            ..Default::default()
-        };
-        assert_eq!(compute_backoff(&cfg, 0), 1000);
-        assert_eq!(compute_backoff(&cfg, 1), 2000);
-        assert_eq!(compute_backoff(&cfg, 2), 4000);
-    }
-
-    #[test]
-    fn test_backoff_capped() {
-        let cfg = RetryConfig {
-            max_retries: 5,
-            initial_backoff_ms: 1000,
-            max_backoff_ms: 5000,
-            backoff_multiplier: 2.0,
-            jitter: false,
-            ..Default::default()
-        };
-        assert_eq!(compute_backoff(&cfg, 3), 5000);
-        assert_eq!(compute_backoff(&cfg, 4), 5000);
-    }
-
-    #[test]
-    fn test_backoff_with_jitter_in_range() {
-        let cfg = RetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 1000,
-            max_backoff_ms: 30000,
-            backoff_multiplier: 2.0,
-            jitter: true,
-            ..Default::default()
-        };
-        let result = compute_backoff(&cfg, 0);
-        assert!(result >= 750, "backoff {result} should be >= 750");
-        assert!(result <= 1250, "backoff {result} should be <= 1250");
     }
 }
