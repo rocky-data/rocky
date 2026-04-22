@@ -346,7 +346,7 @@ pub enum GrantTarget {
 }
 
 /// The diff between desired and current permissions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PermissionDiff {
     pub grants_to_add: Vec<Grant>,
     pub grants_to_revoke: Vec<Grant>,

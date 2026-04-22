@@ -202,6 +202,20 @@ impl GovernanceAdapter for BigQueryGovernanceAdapter<'_> {
         // Catalog isolation is a Databricks concept; not applicable to BigQuery.
         Ok(())
     }
+
+    async fn list_workspace_bindings(&self, _catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        // BigQuery has no workspace-binding concept; reconcile sees no drift.
+        Ok(vec![])
+    }
+
+    async fn remove_workspace_binding(
+        &self,
+        _catalog: &str,
+        _workspace_id: u64,
+    ) -> AdapterResult<()> {
+        // BigQuery has no workspace-binding concept; silent success.
+        Ok(())
+    }
 }
 
 #[cfg(test)]
