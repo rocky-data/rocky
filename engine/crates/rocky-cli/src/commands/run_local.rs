@@ -70,6 +70,7 @@ pub async fn run_transformation(
             &mut output,
             None, // run_local doesn't build a HookRegistry
             None,
+            &rocky_cfg.cache.schemas,
         )
         .await?;
     } else {

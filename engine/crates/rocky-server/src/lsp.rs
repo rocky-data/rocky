@@ -28,6 +28,8 @@ use tracing::info;
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
 use rocky_compiler::typecheck::RefLocation;
 
+use crate::schema_cache_throttle::SchemaCacheThrottle;
+
 // ── SQL function catalog ────────────────────────────────────────────────────
 
 /// Full function catalog with parameter info for signature help.
@@ -348,6 +350,11 @@ pub struct RockyLsp {
     /// pass when the cached hash matches the current model SQL —
     /// editors call this hook on every scroll on large files.
     semantic_tokens_cache: SemanticTokensCache,
+    /// Arc 7 wave 2 wave-2: throttle the "N sources hit" info log so it
+    /// fires once per session per `models_dir` rather than per keystroke.
+    /// PR 2 will encode a cache version in the throttle key so the log
+    /// re-fires after a write tap bump. See `schema_cache_throttle.rs`.
+    schema_cache_throttle: SchemaCacheThrottle,
 }
 
 impl RockyLsp {
@@ -370,10 +377,23 @@ impl RockyLsp {
         let models_dir = self.models_dir.read().await;
         let Some(ref dir) = *models_dir else { return };
 
+        // Wave-2 of Arc 7 wave 2: plug cached warehouse schemas into the
+        // LSP typecheck so `FROM <schema>.<table>` inlay hints and hover
+        // types resolve against real columns instead of `Unknown`.
+        let dir_path = std::path::PathBuf::from(dir);
+        let source_schemas = Self::load_cached_source_schemas(
+            &dir_path,
+            &self.schema_cache_throttle,
+            // LSP throttle key: once-per-session per project (models_dir).
+            // PR 2 will extend the suffix with a cache-version counter.
+            dir,
+        )
+        .await;
+
         let config = CompilerConfig {
-            models_dir: std::path::PathBuf::from(dir),
+            models_dir: dir_path,
             contracts_dir: None,
-            source_schemas: HashMap::new(),
+            source_schemas,
             source_column_info: HashMap::new(),
         };
 
@@ -386,6 +406,78 @@ impl RockyLsp {
                 info!(error = %e, "LSP compilation failed");
             }
         }
+    }
+
+    /// Arc 7 wave 2 wave-2: load the persisted schema cache for use as
+    /// `CompilerConfig.source_schemas`. Mirrors
+    /// `rocky-cli::source_schemas::load_cached_source_schemas` but (a)
+    /// reuses the LSP's per-session throttle so the info log doesn't fire
+    /// on every recompile, and (b) resolves the state file relative to
+    /// `models_dir` (same convention as `api.rs`, `dashboard.rs`, and
+    /// `state::ServerState`).
+    ///
+    /// Honours `[cache.schemas]` from the project's `rocky.toml` (found
+    /// one level above `models_dir` — the same `<root>/models` layout the
+    /// `initialize` handler already assumes). Missing or invalid config
+    /// falls back to defaults (`enabled = true`, 24h TTL) so a
+    /// zero-config project behaves like the CLI would.
+    async fn load_cached_source_schemas(
+        models_dir: &std::path::Path,
+        throttle: &SchemaCacheThrottle,
+        throttle_key: &str,
+    ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+        // Derive the project root as `models_dir.parent()` and read the
+        // project's `rocky.toml`. The LSP `initialize` handler sets
+        // `models_dir = <root>/models`, so the parent is the project root.
+        // Missing file / parse error -> defaults; this keeps the behaviour
+        // continuous with the CLI's `load_cached_source_schemas`.
+        let schema_cache_config = models_dir
+            .parent()
+            .map(|root| root.join("rocky.toml"))
+            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
+            .map(|c| c.cache.schemas)
+            .unwrap_or_default();
+
+        if !schema_cache_config.enabled {
+            return HashMap::new();
+        }
+
+        let state_path = models_dir.join(".rocky-state.redb");
+        if !state_path.exists() {
+            return HashMap::new();
+        }
+
+        let store = match rocky_core::state::StateStore::open_read_only(&state_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "LSP schema cache: state open failed");
+                return HashMap::new();
+            }
+        };
+
+        let map = match rocky_compiler::schema_cache::load_source_schemas_from_cache(
+            &store,
+            chrono::Utc::now(),
+            schema_cache_config.ttl(),
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(error = %e, "LSP schema cache: scan failed");
+                return HashMap::new();
+            }
+        };
+
+        if !map.is_empty() && throttle.mark_logged(throttle_key).await {
+            info!(
+                target: "rocky::schema_cache",
+                sources_hit = map.len(),
+                "schema cache: {} source(s) hit — run `rocky run` (PR 2 write tap) or \
+                 `rocky discover --with-schemas` (PR 3) to warm-cache more sources",
+                map.len(),
+            );
+        }
+
+        map
     }
 
     async fn publish_diagnostics(&self, result: &CompileResult) {
@@ -747,6 +839,10 @@ impl LanguageServer for RockyLsp {
             let compile_result = self.compile_result.clone();
             let models_dir = self.models_dir.clone();
             let pending = self.recompile_pending.clone();
+            // Arc 7 wave 2 wave-2: share the throttle so the did_change
+            // debounced recompile doesn't re-emit the info log that
+            // `recompile()` already emitted for the same project.
+            let schema_cache_throttle = self.schema_cache_throttle.clone();
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -755,10 +851,18 @@ impl LanguageServer for RockyLsp {
                 let dir = models_dir.read().await;
                 let Some(ref dir) = *dir else { return };
 
+                // Wave-2 of Arc 7 wave 2: keep the per-keystroke typecheck
+                // grounded in real warehouse types when the cache is warm.
+                // Throttle guarantees the info log fires at most once per
+                // session per project.
+                let dir_path = std::path::PathBuf::from(dir);
+                let source_schemas =
+                    Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
+
                 let config = CompilerConfig {
-                    models_dir: std::path::PathBuf::from(dir),
+                    models_dir: dir_path,
                     contracts_dir: None,
-                    source_schemas: HashMap::new(),
+                    source_schemas,
                     source_column_info: HashMap::new(),
                 };
 
@@ -2719,6 +2823,7 @@ pub async fn run_lsp() {
         init_done: Arc::new(AtomicBool::new(false)),
         init_notify: Arc::new(Notify::new()),
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+        schema_cache_throttle: SchemaCacheThrottle::new(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -3120,5 +3225,123 @@ mod tests {
         assert_eq!(encoded[1].delta_start, 2);
         assert_eq!(encoded[2].delta_line, 2);
         assert_eq!(encoded[2].delta_start, 10);
+    }
+
+    // ---- Arc 7 wave 2 wave-2: LSP schema-cache loader ----
+
+    /// LSP must honour `[cache.schemas] enabled = false` from
+    /// `<root>/rocky.toml` and NOT read cache entries even when the
+    /// state file exists and is populated.
+    #[tokio::test]
+    async fn lsp_loader_respects_cache_disabled_in_config() {
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // Seed the cache so we'd get a hit if the loader didn't respect
+        // the disabled flag.
+        let state_path = models_dir.join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let key = schema_cache_key("cat", "staging", "orders");
+            store
+                .write_schema_cache_entry(
+                    &key,
+                    &SchemaCacheEntry {
+                        columns: vec![StoredColumn {
+                            name: "id".into(),
+                            data_type: "BIGINT".into(),
+                            nullable: false,
+                        }],
+                        cached_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+
+        // Write a rocky.toml at the project root with cache disabled.
+        fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\n\
+             type = \"duckdb\"\n\
+             path = \":memory:\"\n\
+             \n\
+             [cache.schemas]\n\
+             enabled = false\n",
+        )
+        .unwrap();
+
+        let throttle = SchemaCacheThrottle::new();
+        let map = RockyLsp::load_cached_source_schemas(&models_dir, &throttle, "file:///x").await;
+        assert!(
+            map.is_empty(),
+            "LSP must honour `[cache.schemas] enabled = false`; got {map:?}"
+        );
+    }
+
+    /// Zero-config project (no rocky.toml) falls back to defaults
+    /// (`enabled = true`, 24h TTL) — keeps the CLI/LSP parity.
+    #[tokio::test]
+    async fn lsp_loader_falls_back_to_defaults_without_rocky_toml() {
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let state_path = models_dir.join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let key = schema_cache_key("cat", "staging", "orders");
+            store
+                .write_schema_cache_entry(
+                    &key,
+                    &SchemaCacheEntry {
+                        columns: vec![StoredColumn {
+                            name: "id".into(),
+                            data_type: "BIGINT".into(),
+                            nullable: false,
+                        }],
+                        cached_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+        // No rocky.toml — loader should use defaults (enabled).
+
+        let throttle = SchemaCacheThrottle::new();
+        let map = RockyLsp::load_cached_source_schemas(&models_dir, &throttle, "file:///y").await;
+        assert_eq!(map.len(), 1, "zero-config default should be enabled");
+        assert!(map.contains_key("staging.orders"));
+    }
+
+    /// Missing state file -> empty map and no side-effect file creation.
+    #[tokio::test]
+    async fn lsp_loader_cold_cache_does_not_create_state_file() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        let state_path = models_dir.join(".rocky-state.redb");
+        assert!(!state_path.exists());
+
+        let throttle = SchemaCacheThrottle::new();
+        let map = RockyLsp::load_cached_source_schemas(&models_dir, &throttle, "file:///z").await;
+        assert!(map.is_empty());
+        assert!(
+            !state_path.exists(),
+            "LSP loader must not create state.redb as a side effect"
+        );
     }
 }

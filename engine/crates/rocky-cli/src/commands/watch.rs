@@ -100,8 +100,13 @@ pub async fn run_watch(
 /// Run compile and print the result. Errors are printed, not propagated,
 /// so the watch loop continues after a failed compilation.
 fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_json: bool) {
+    // Watch doesn't take a state_path arg today; default to the same
+    // location `main.rs` does (`.rocky-state.redb` in CWD). Arc 7 wave 2
+    // wave-2: if the file doesn't exist (fresh project, no runs yet) the
+    // cache loader gracefully returns an empty map.
     match run_compile(
         None,
+        Path::new(".rocky-state.redb"),
         models_dir,
         contracts_dir,
         None,

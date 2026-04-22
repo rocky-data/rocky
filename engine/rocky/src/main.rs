@@ -1158,6 +1158,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             with_seed,
         } => rocky_cli::commands::run_compile(
             Some(cli.config.as_path()),
+            &cli.state_path,
             &models,
             contracts.as_deref(),
             model.as_deref(),
@@ -1173,6 +1174,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             column_lineage,
         } => rocky_cli::commands::run_dag(
             &cli.config,
+            &cli.state_path,
             &models,
             seeds.as_deref(),
             contracts.as_deref(),
@@ -1187,6 +1189,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             downstream,
             upstream: _,
         } => rocky_cli::commands::run_lineage(
+            &cli.config,
+            &cli.state_path,
             &models,
             &target,
             column.as_deref(),
@@ -1198,28 +1202,68 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             intent,
             format,
             models,
-        } => rocky_cli::commands::run_ai(&intent, format.as_deref(), &models, json).await,
+        } => {
+            rocky_cli::commands::run_ai(
+                &cli.config,
+                &cli.state_path,
+                &intent,
+                format.as_deref(),
+                &models,
+                json,
+            )
+            .await
+        }
         Command::AiSync {
             apply,
             model,
             with_intent,
             models,
         } => {
-            rocky_cli::commands::run_ai_sync(&models, apply, model.as_deref(), with_intent, json)
-                .await
+            rocky_cli::commands::run_ai_sync(
+                &cli.config,
+                &cli.state_path,
+                &models,
+                apply,
+                model.as_deref(),
+                with_intent,
+                json,
+            )
+            .await
         }
         Command::AiExplain {
             model,
             all,
             save,
             models,
-        } => rocky_cli::commands::run_ai_explain(&models, model.as_deref(), all, save, json).await,
+        } => {
+            rocky_cli::commands::run_ai_explain(
+                &cli.config,
+                &cli.state_path,
+                &models,
+                model.as_deref(),
+                all,
+                save,
+                json,
+            )
+            .await
+        }
         Command::AiTest {
             model,
             all,
             save,
             models,
-        } => rocky_cli::commands::run_ai_test(&models, model.as_deref(), all, save, json).await,
+        } => {
+            rocky_cli::commands::run_ai_test(
+                &cli.config,
+                &cli.state_path,
+                &models,
+                model.as_deref(),
+                all,
+                save,
+                json,
+            )
+            .await
+        }
         Command::Playground { path, template } => {
             rocky_cli::commands::run_playground_with_template(&path, &template)
         }
@@ -1288,7 +1332,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
         }
         Command::CiDiff { base_ref, models } => {
-            rocky_cli::commands::run_ci_diff(&base_ref, &models, json)
+            rocky_cli::commands::run_ci_diff(&cli.config, &cli.state_path, &base_ref, &models, json)
         }
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
         Command::TestAdapter {
