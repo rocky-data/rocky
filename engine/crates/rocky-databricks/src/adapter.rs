@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 
 use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
-    AdapterError, AdapterResult, BatchCheckAdapter, FreshnessResult, QueryResult, RowCountResult,
-    SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, BatchCheckAdapter, ExecutionStats, FreshnessResult, QueryResult,
+    RowCountResult, SqlDialect, WarehouseAdapter,
 };
 
 use crate::batch::{self, BatchTableRef};
@@ -47,6 +47,20 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .execute_statement(sql)
             .await
             .map(|_| ())
+            .map_err(AdapterError::new)
+    }
+
+    async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
+        // `total_byte_count` from the Databricks manifest is the
+        // byte count Databricks natively reports for a statement —
+        // surfaced here in the `bytes_scanned` slot to match the
+        // BigQuery `totalBytesBilled` convention set in PR #219.
+        // Databricks is DBU-priced (not bytes-priced), so this
+        // figure isn't a cost driver today — it's still threaded
+        // through so downstream observability has a real number.
+        self.connector
+            .execute_statement_with_stats(sql)
+            .await
             .map_err(AdapterError::new)
     }
 

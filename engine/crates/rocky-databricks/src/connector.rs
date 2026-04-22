@@ -117,11 +117,18 @@ pub struct StatusError {
     pub message: Option<String>,
 }
 
-/// Result manifest containing schema and row count metadata.
+/// Result manifest containing schema and row / byte count metadata.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub schema: Option<ManifestSchema>,
     pub total_row_count: Option<u64>,
+    /// Total bytes in the statement result payload, aggregated across all
+    /// chunks. Populated for SUCCEEDED `SELECT`s that return data;
+    /// Databricks omits the field (and we see `None`) for DDL / DML
+    /// where the response has no result payload. Surfaced into
+    /// [`rocky_core::traits::ExecutionStats::bytes_scanned`] — see
+    /// [`stats_from_response`] for the semantic-impurity note.
+    pub total_byte_count: Option<u64>,
 }
 
 /// Column schema from a statement result manifest.
@@ -236,6 +243,19 @@ impl DatabricksConnector {
     pub async fn execute_statement(&self, sql: &str) -> Result<String, ConnectorError> {
         let response = self.submit_and_wait(sql).await?;
         Ok(response.statement_id)
+    }
+
+    /// Executes a SQL statement and returns the warehouse-reported
+    /// [`ExecutionStats`] for it — the stats-aware counterpart to
+    /// [`Self::execute_statement`]. Feeds
+    /// [`WarehouseAdapter::execute_statement_with_stats`] on
+    /// [`crate::adapter::DatabricksWarehouseAdapter`].
+    pub async fn execute_statement_with_stats(
+        &self,
+        sql: &str,
+    ) -> Result<rocky_core::traits::ExecutionStats, ConnectorError> {
+        let response = self.submit_and_wait(sql).await?;
+        Ok(stats_from_response(&response))
     }
 
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
@@ -551,6 +571,38 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
     }
 }
 
+/// Extract [`rocky_core::traits::ExecutionStats`] from a successful
+/// [`StatementResponse`].
+///
+/// Maps `response.manifest.total_byte_count` (the aggregate size of the
+/// statement result payload across all chunks, per Databricks's
+/// Statement Execution REST contract) into
+/// [`ExecutionStats::bytes_scanned`]. Databricks is priced in
+/// DBU-hours, not bytes, so this figure isn't a cost driver the way
+/// BigQuery's `totalBytesBilled` is — it's the byte count Databricks
+/// natively reports for the statement, surfaced unchanged so callers
+/// can observe it. The `bytes_scanned` slot name is retained (rather
+/// than introducing a Databricks-specific field) to keep the
+/// [`crate::adapter::DatabricksWarehouseAdapter`] cost path free of
+/// adapter-specific branching — see the matching BigQuery comment in
+/// `rocky_bigquery::connector::stats_from_response`.
+///
+/// Returns all-`None` when Databricks omits the manifest (e.g. on
+/// DDL / DML that produces no result payload) or when the manifest is
+/// present but `total_byte_count` isn't set. `bytes_written` and
+/// `rows_affected` are always `None` — Databricks doesn't expose
+/// bytes-written on the Statement Execution response, and
+/// `total_row_count` on the manifest is the result-row count, not the
+/// rows-affected figure for DML.
+fn stats_from_response(response: &StatementResponse) -> rocky_core::traits::ExecutionStats {
+    let bytes_scanned = response.manifest.as_ref().and_then(|m| m.total_byte_count);
+    rocky_core::traits::ExecutionStats {
+        bytes_scanned,
+        bytes_written: None,
+        rows_affected: None,
+    }
+}
+
 /// Fixed polling delays (ms) for the first 5 statement status checks.
 const POLL_DELAY_STEPS_MS: [u64; 5] = [100, 200, 500, 1000, 2000];
 /// Maximum polling delay after exponential growth.
@@ -750,5 +802,88 @@ mod tests {
             consecutive_failures: 5,
         };
         assert!(!is_transient(&err));
+    }
+
+    #[test]
+    fn manifest_deserializes_total_byte_count() {
+        // Happy path: SUCCEEDED SELECT with a result payload — the
+        // manifest carries `total_byte_count` alongside
+        // `total_row_count`.
+        let json = r#"{
+            "statement_id": "id-1",
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "col1", "type_name": "STRING", "position": 0}
+                    ]
+                },
+                "total_row_count": 10,
+                "total_byte_count": 2843848
+            }
+        }"#;
+        let resp: StatementResponse = serde_json::from_str(json).unwrap();
+        let manifest = resp.manifest.unwrap();
+        assert_eq!(manifest.total_byte_count, Some(2_843_848));
+        assert_eq!(manifest.total_row_count, Some(10));
+    }
+
+    #[test]
+    fn stats_from_response_populates_bytes_scanned() {
+        // Happy path into `stats_from_response`: `manifest.total_byte_count`
+        // flows into `ExecutionStats.bytes_scanned`. `bytes_written`
+        // and `rows_affected` stay `None` (Databricks doesn't expose
+        // them on the Statement Execution response).
+        let json = r#"{
+            "statement_id": "id-1",
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "total_row_count": 10,
+                "total_byte_count": 2843848
+            }
+        }"#;
+        let resp: StatementResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, Some(2_843_848));
+        assert_eq!(stats.bytes_written, None);
+        assert_eq!(stats.rows_affected, None);
+    }
+
+    #[test]
+    fn stats_from_response_without_manifest_is_all_none() {
+        // DDL / DML case: Databricks omits the manifest when there's
+        // no result payload. `stats_from_response` must degrade to
+        // all-`None` rather than erroring, mirroring BigQuery's
+        // `statistics-absent` case.
+        let json = r#"{
+            "statement_id": "id-1",
+            "status": {"state": "SUCCEEDED"}
+        }"#;
+        let resp: StatementResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.manifest.is_none());
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
+        assert_eq!(stats.bytes_written, None);
+        assert_eq!(stats.rows_affected, None);
+    }
+
+    #[test]
+    fn stats_from_response_manifest_without_total_byte_count_is_none() {
+        // Defensive: manifest is present (we have `total_row_count`)
+        // but Databricks didn't include `total_byte_count` — the
+        // helper should return `None` for bytes rather than
+        // inventing a value.
+        let json = r#"{
+            "statement_id": "id-1",
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "total_row_count": 0
+            }
+        }"#;
+        let resp: StatementResponse = serde_json::from_str(json).unwrap();
+        let manifest = resp.manifest.as_ref().unwrap();
+        assert_eq!(manifest.total_byte_count, None);
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
     }
 }
