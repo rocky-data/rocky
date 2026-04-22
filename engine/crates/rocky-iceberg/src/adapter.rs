@@ -71,6 +71,7 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
                         source_type: "iceberg".to_string(),
                         last_sync_at: None,
                         tables,
+                        metadata: Default::default(),
                     });
                 }
                 Err(e) => {
@@ -185,6 +186,7 @@ mod tests {
                     row_count: None,
                 },
             ],
+            metadata: Default::default(),
         };
 
         assert_eq!(connector.id, "raw_shopify");
@@ -227,6 +229,7 @@ mod tests {
             source_type: "iceberg".to_string(),
             last_sync_at: None,
             tables: vec![],
+            metadata: Default::default(),
         };
         assert_eq!(connector.source_type, "iceberg");
     }

@@ -77,6 +77,7 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
                 source_type: "duckdb".to_string(),
                 last_sync_at: None,
                 tables,
+                metadata: Default::default(),
             });
         }
 

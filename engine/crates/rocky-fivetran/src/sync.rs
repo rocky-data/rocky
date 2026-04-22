@@ -72,6 +72,7 @@ mod tests {
             },
             succeeded_at,
             failed_at: None,
+            config: serde_json::Value::Null,
         }
     }
 

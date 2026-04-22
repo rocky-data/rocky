@@ -246,3 +246,50 @@ def test_metadata():
     meta = t.get_metadata(src, src.tables[0])
     assert meta["source_id"] == "src_001"
     assert meta["row_count"] == "15000"
+
+
+def test_metadata_forwards_adapter_namespaced_fields():
+    """FR-002: adapter-namespaced metadata keys (``fivetran.service``,
+    ``fivetran.custom_reports``, ...) flow into ``AssetSpec.metadata`` so
+    downstream logic can branch on connector type without re-parsing
+    connector strings."""
+    import json
+
+    t = RockyDagsterTranslator()
+    src = SourceInfo(
+        id="conn_ads",
+        components={"tenant": "acme", "source": "fb_ads"},
+        source_type="facebook_ads",
+        last_sync_at=None,
+        tables=[TableInfo(name="ads_insights")],
+        metadata={
+            "fivetran.service": "facebook_ads",
+            "fivetran.connector_id": "conn_ads",
+            "fivetran.custom_reports": [
+                {"name": "custom_report_revenue", "report_type": "ads_insights"}
+            ],
+        },
+    )
+    meta = t.get_metadata(src, src.tables[0])
+    # Core fields are unchanged.
+    assert meta["source_id"] == "conn_ads"
+    # String adapter fields pass through verbatim.
+    assert meta["fivetran.service"] == "facebook_ads"
+    assert meta["fivetran.connector_id"] == "conn_ads"
+    # Structured adapter fields are JSON-encoded so Dagster's
+    # ``dict[str, str]`` contract holds; consumers ``json.loads()`` for
+    # richer structure.
+    reports = json.loads(meta["fivetran.custom_reports"])
+    assert reports[0]["name"] == "custom_report_revenue"
+
+
+def test_metadata_no_opt_in_preserves_legacy_surface():
+    """Adapters that haven't opted in to ``SourceInfo.metadata`` must
+    produce the same ``get_metadata`` output as before — regression
+    guard for backward compat."""
+    t = RockyDagsterTranslator()
+    src = _source()  # default source has empty metadata
+    meta = t.get_metadata(src, src.tables[0])
+    # No adapter keys leaked in.
+    for key in meta:
+        assert "." not in key, f"unexpected namespaced key {key!r}"

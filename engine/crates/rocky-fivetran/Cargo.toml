@@ -11,6 +11,7 @@ rocky-core = { path = "../rocky-core" }
 rocky-observe = { path = "../rocky-observe" }
 async-trait = { workspace = true }
 futures = { workspace = true }
+indexmap = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

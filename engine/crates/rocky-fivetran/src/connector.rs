@@ -5,6 +5,15 @@ use tracing::debug;
 use crate::client::{FivetranClient, FivetranError};
 
 /// A Fivetran connector as returned by the API.
+///
+/// `config` is the service-specific configuration blob returned by
+/// `GET /v1/connectors/{id}` (and `GET /v1/groups/{groupId}/connectors`
+/// — the listing endpoint returns the same per-connector shape). Rocky
+/// keeps it as an opaque `serde_json::Value` rather than trying to model
+/// every Fivetran service: the discovery adapter projects a namespaced
+/// subset into [`rocky_core::source::DiscoveredConnector::metadata`], and
+/// downstream consumers that need richer structure (e.g. `custom_reports`
+/// vs stock tables) read the projected fields directly.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Connector {
     pub id: String,
@@ -14,6 +23,11 @@ pub struct Connector {
     pub status: ConnectorStatus,
     pub succeeded_at: Option<DateTime<Utc>>,
     pub failed_at: Option<DateTime<Utc>>,
+    /// Raw, service-specific connector configuration. Absent (=`Value::Null`)
+    /// when Fivetran omits the field — connectors in partial setup states may
+    /// not include it.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +104,7 @@ mod tests {
             },
             succeeded_at: None,
             failed_at: None,
+            config: serde_json::Value::Null,
         }
     }
 
@@ -129,5 +144,48 @@ mod tests {
         assert!(conn.is_connected());
         assert!(conn.succeeded_at.is_some());
         assert!(conn.failed_at.is_none());
+        // Missing `config` field defaults to `Value::Null` so the adapter
+        // can fall back cleanly when Fivetran omits it on partial-setup
+        // connectors.
+        assert!(conn.config.is_null());
+    }
+
+    #[test]
+    fn test_deserialize_connector_with_config_blob() {
+        // Real Fivetran ad-platform connectors return a rich `config` object.
+        // Rocky captures it opaquely so downstream consumers can project
+        // service-specific fields (custom_reports, custom_tables,
+        // schema_prefix, ...) without re-calling the API.
+        let json = r#"{
+            "id": "conn_ads",
+            "group_id": "group_xyz",
+            "service": "facebook_ads",
+            "schema": "src__acme__na__fb_ads",
+            "status": {
+                "setup_state": "connected",
+                "sync_state": "scheduled"
+            },
+            "succeeded_at": null,
+            "failed_at": null,
+            "config": {
+                "schema_prefix": "fb_ads",
+                "custom_tables": [
+                    {"table_name": "ads_insights", "breakdowns": ["age", "gender"]}
+                ],
+                "reports": [
+                    {"name": "custom_report_revenue", "report_type": "ads_insights"}
+                ]
+            }
+        }"#;
+
+        let conn: Connector = serde_json::from_str(json).unwrap();
+        assert_eq!(conn.service, "facebook_ads");
+        assert_eq!(conn.config["schema_prefix"], "fb_ads");
+        assert!(conn.config["custom_tables"].is_array());
+        assert!(conn.config["reports"].is_array());
+        assert_eq!(
+            conn.config["reports"][0]["name"].as_str(),
+            Some("custom_report_revenue")
+        );
     }
 }

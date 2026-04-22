@@ -200,6 +200,7 @@ mod tests {
             source_type: "fivetran".into(),
             last_sync_at: None,
             tables: vec![],
+            metadata: Default::default(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
@@ -216,6 +217,7 @@ mod tests {
             source_type: "fivetran".into(),
             last_sync_at: None,
             tables: vec![],
+            metadata: Default::default(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([
@@ -236,6 +238,7 @@ mod tests {
             source_type: "fivetran".into(),
             last_sync_at: None,
             tables: vec![],
+            metadata: Default::default(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([(
@@ -256,6 +259,7 @@ mod tests {
             source_type: "fivetran".into(),
             last_sync_at: None,
             tables: vec![],
+            metadata: Default::default(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
