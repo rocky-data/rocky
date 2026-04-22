@@ -30,6 +30,11 @@ pub async fn run_transformation(
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
     partition_opts: &super::run::PartitionRunOptions,
+    // Already-overridden schema cache config (Arc 7 wave 2 wave-2 PR 4).
+    // Caller (`run::run`) has folded the CLI `--cache-ttl` flag into
+    // this value via `with_ttl_override` so the override propagates
+    // consistently across replication and transformation paths.
+    schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -70,7 +75,7 @@ pub async fn run_transformation(
             &mut output,
             None, // run_local doesn't build a HookRegistry
             None,
-            &rocky_cfg.cache.schemas,
+            schema_cache_cfg,
         )
         .await?;
     } else {

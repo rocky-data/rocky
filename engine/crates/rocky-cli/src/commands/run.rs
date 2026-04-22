@@ -279,6 +279,11 @@ pub async fn run(
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     partition_opts: &PartitionRunOptions,
     model_name_filter: Option<&str>,
+    // `--cache-ttl <seconds>` override (Arc 7 wave 2 wave-2 PR 4).
+    // Applied to the model-execution schema cache read; the replication
+    // path doesn't consult the cache, so this flag is a no-op for
+    // replication-only runs.
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -307,6 +312,16 @@ pub async fn run(
         config_path.display()
     ))?;
     let config_hash = crate::output::config_fingerprint(config_path);
+
+    // Apply the optional `--cache-ttl` override once at the top of the
+    // run. All downstream `execute_models` calls receive this already-
+    // overridden `SchemaCacheConfig`, so threading an `Option<u64>`
+    // through the execution tree isn't needed.
+    let schema_cache_cfg = rocky_cfg
+        .cache
+        .schemas
+        .clone()
+        .with_ttl_override(cache_ttl_override);
 
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
@@ -364,7 +379,7 @@ pub async fn run(
             &mut output,
             None, // model-only run has no pipeline hooks
             None,
-            &rocky_cfg.cache.schemas,
+            &schema_cache_cfg,
         )
         .await?;
 
@@ -434,6 +449,7 @@ pub async fn run(
                 &rocky_cfg,
                 output_json,
                 partition_opts,
+                &schema_cache_cfg,
             )
             .await;
         }
@@ -2207,7 +2223,7 @@ pub async fn run(
                     &mut output,
                     Some(&hook_registry),
                     Some(pipeline_name),
-                    &rocky_cfg.cache.schemas,
+                    &schema_cache_cfg,
                 )
                 .await?;
                 Ok(())

@@ -18,6 +18,11 @@ use rocky_sql::transpile::Dialect;
 use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
 /// Execute `rocky compile`.
+///
+/// `cache_ttl_override`: optional CLI flag value from the binary's
+/// `--cache-ttl <seconds>` global arg. Replaces
+/// `[cache.schemas] ttl_seconds` for this invocation only (Arc 7 wave 2
+/// wave-2 PR 4). `None` keeps the config/default TTL.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compile(
     config_path: Option<&Path>,
@@ -29,6 +34,7 @@ pub fn run_compile(
     do_expand_macros: bool,
     target_dialect: Option<Dialect>,
     with_seed: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     // `source_schemas` precedence (Arc 7 wave 2):
     //   1. `--with-seed` wins -> wave-1 seed loader (explicit user intent,
@@ -44,10 +50,12 @@ pub fn run_compile(
         load_source_schemas_from_seed(models_dir)?
     } else if let Some(path) = config_path {
         // Wave-2: TTL-filtered load from `state.redb`'s `SCHEMA_CACHE`
-        // table. Honours `[cache.schemas] enabled` + `ttl_seconds`.
+        // table. Honours `[cache.schemas] enabled` + `ttl_seconds`
+        // (after applying the optional CLI `--cache-ttl` override).
         match rocky_config::load_rocky_config(path) {
             Ok(cfg) => {
-                crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+                let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
+                crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
             }
             Err(_) => HashMap::new(),
         }
@@ -492,6 +500,7 @@ schema_template = "s"
             false,
             Some(Dialect::BigQuery),
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -518,6 +527,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("compile should succeed without lint");
     }
@@ -540,6 +550,7 @@ schema_template = "s"
             false,
             Some(Dialect::Snowflake),
             false,
+            None,
         )
         .expect("snowflake target should accept NVL");
     }
@@ -564,6 +575,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -595,6 +607,7 @@ schema_template = "s"
             false,
             Some(Dialect::BigQuery),
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"));
@@ -622,6 +635,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("allow-listed NVL should not trip the lint");
     }
@@ -649,6 +663,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("pragma-exempted model should not trip the lint");
     }
@@ -677,6 +692,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -705,6 +721,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("missing config should fall through, not error");
     }
@@ -753,6 +770,7 @@ schema_template = "s"
             false,
             None,
             true,
+            None,
         )
         .expect("with-seed compile should succeed");
     }
@@ -776,6 +794,7 @@ schema_template = "s"
             false,
             None,
             true,
+            None,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -802,6 +821,7 @@ schema_template = "s"
             false,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -906,6 +926,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("compile with cache-backed source_schemas should succeed");
     }
@@ -980,6 +1001,7 @@ schema_template = "s"
             false,
             None,
             false,
+            None,
         )
         .expect("compile without state file should succeed");
         assert!(

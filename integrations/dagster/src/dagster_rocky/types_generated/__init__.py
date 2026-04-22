@@ -137,6 +137,9 @@ from .run_schema import (
 # State command
 from .state_schema import StateOutput, WatermarkEntry
 
+# State clear-schema-cache (Arc 7 wave 2 wave-2 PR 4)
+from .state_clear_schema_cache_schema import ClearSchemaCacheOutput
+
 # Test command — canonical source for TestFailure
 from .test_schema import TestFailure, TestOutput
 
@@ -256,6 +259,8 @@ __all__ = [
     # state
     "StateOutput",
     "WatermarkEntry",
+    # state clear-schema-cache (Arc 7 wave 2 wave-2 PR 4)
+    "ClearSchemaCacheOutput",
     # test
     "TestOutput",
     "TestFailure",

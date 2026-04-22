@@ -19,12 +19,12 @@ use crate::commands::doctor::DoctorOutput;
 use crate::output::{
     AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput,
     BranchDeleteOutput, BranchListOutput, BranchOutput, CiDiffOutput, CiOutput,
-    ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
-    CostOutput, DagOutput, DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput,
-    HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageOutput, LoadOutput,
-    MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput, ProfileStorageOutput,
-    ReplayOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput,
-    ValidateMigrationOutput, ValidateOutput,
+    ClearSchemaCacheOutput, ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput,
+    CompileOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput, DriftOutput,
+    EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
+    LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
+    ProfileStorageOutput, ReplayOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -50,6 +50,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<PlanOutput>("plan"),
         entry::<DriftOutput>("drift"),
         entry::<StateOutput>("state"),
+        entry::<ClearSchemaCacheOutput>("state_clear_schema_cache"),
         entry::<DoctorOutput>("doctor"),
         entry::<CompileOutput>("compile"),
         entry::<TestOutput>("test"),

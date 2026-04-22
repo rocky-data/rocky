@@ -463,15 +463,18 @@ pub fn run_ci_diff(
     base_ref: &str,
     models_dir: &Path,
     output_json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     // Wave-2 of Arc 7 wave 2: load cached source schemas once and seed
     // both compiles (current tree + base ref) with the same map so the
     // resulting per-model type diffs measure real schema drift rather
     // than `Unknown`-vs-`Unknown` noise. Degrades to empty when the
     // cache is cold or `[cache.schemas] enabled = false`.
+    // `cache_ttl_override` is the CLI `--cache-ttl` value (PR 4).
     let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => {
-            crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
         }
         Err(_) => HashMap::new(),
     };

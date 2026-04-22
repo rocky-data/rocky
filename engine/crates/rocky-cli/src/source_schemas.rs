@@ -201,4 +201,61 @@ mod tests {
         let map = load_cached_source_schemas(&config, &path);
         assert!(map.is_empty(), "stale entry must be filtered");
     }
+
+    #[test]
+    fn cache_ttl_override_flips_hit_to_miss() {
+        // Arc 7 wave 2 wave-2 PR 4: `--cache-ttl <seconds>` overrides
+        // `[cache.schemas] ttl_seconds`. Baseline (default 24h): a
+        // 1-hour-old entry is a hit. With `--cache-ttl 30` (30s) the
+        // same entry is a miss — the CLI-flag-overridden config is
+        // what `load_cached_source_schemas` ends up using.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            seed_cache(&store, "staging", "orders", Utc::now() - Duration::hours(1));
+        }
+
+        let baseline = SchemaCacheConfig::default();
+        assert_eq!(
+            load_cached_source_schemas(&baseline, &path).len(),
+            1,
+            "1h-old entry should hit at 24h TTL"
+        );
+
+        let overridden = SchemaCacheConfig::default().with_ttl_override(Some(30));
+        assert!(
+            load_cached_source_schemas(&overridden, &path).is_empty(),
+            "1h-old entry should miss at 30s TTL override"
+        );
+    }
+
+    #[test]
+    fn cache_ttl_override_zero_is_full_flush_for_read_path() {
+        // `--cache-ttl 0` treats every entry as instantly stale — a
+        // parallel to `rocky state clear-schema-cache` for users who
+        // want a flush for just one invocation without touching redb.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            seed_cache(&store, "staging", "orders", Utc::now());
+            seed_cache(&store, "staging", "customers", Utc::now());
+        }
+
+        let config = SchemaCacheConfig::default().with_ttl_override(Some(0));
+        assert!(
+            load_cached_source_schemas(&config, &path).is_empty(),
+            "ttl=0 must treat fresh entries as stale"
+        );
+
+        // Critical: the read-path flush is non-destructive. The entries
+        // stay in redb for the next invocation's default TTL.
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.list_schema_cache().unwrap().len(),
+            2,
+            "read-path ttl=0 must not delete entries — that's what `clear-schema-cache` is for"
+        );
+    }
 }

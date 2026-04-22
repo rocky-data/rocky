@@ -22,6 +22,9 @@ use crate::output::*;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky dag`.
+///
+/// `cache_ttl_override`: CLI `--cache-ttl` flag (Arc 7 wave 2 wave-2 PR 4).
+/// Only relevant when `include_column_lineage` drives a compile.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dag(
     config_path: &Path,
@@ -31,8 +34,16 @@ pub fn run_dag(
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
     json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
+    // Apply `--cache-ttl` once up-front; the column-lineage compile
+    // below consumes the already-overridden `SchemaCacheConfig`.
+    let schema_cache_cfg = cfg
+        .cache
+        .schemas
+        .clone()
+        .with_ttl_override(cache_ttl_override);
 
     // Load models from the models directory (including subdirectories).
     let models = load_all_models(models_dir)?;
@@ -73,6 +84,7 @@ pub fn run_dag(
         contracts_dir,
         &cfg,
         state_path,
+        &schema_cache_cfg,
     )?;
 
     if json {
@@ -95,6 +107,7 @@ fn build_dag_output(
     contracts_dir: Option<&Path>,
     cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
+    schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<DagOutput> {
     // Build lookup maps.
     let model_map: HashMap<&str, &Model> =
@@ -196,7 +209,13 @@ fn build_dag_output(
 
     // Column lineage (optional).
     let column_lineage = if include_column_lineage {
-        build_column_lineage_from_models(models_dir, contracts_dir, cfg, state_path)?
+        build_column_lineage_from_models(
+            models_dir,
+            contracts_dir,
+            cfg,
+            state_path,
+            schema_cache_cfg,
+        )?
     } else {
         vec![]
     };
@@ -247,8 +266,9 @@ fn extract_partition_shape(strategy: &StrategyConfig) -> Option<PartitionShapeOu
 fn build_column_lineage_from_models(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
-    cfg: &rocky_core::config::RockyConfig,
+    _cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
+    schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<Vec<LineageEdgeRecord>> {
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -257,9 +277,10 @@ fn build_column_lineage_from_models(
         // schema cache (populated by `rocky run` / `rocky discover
         // --with-schemas` in later PRs) straight into column lineage
         // extraction, so downstream edges carry real types instead of
-        // `RockyType::Unknown`.
+        // `RockyType::Unknown`. `schema_cache_cfg` already has the
+        // `--cache-ttl` override applied by `run_dag`.
         source_schemas: crate::source_schemas::load_cached_source_schemas(
-            &cfg.cache.schemas,
+            schema_cache_cfg,
             state_path,
         ),
         source_column_info: std::collections::HashMap::new(),

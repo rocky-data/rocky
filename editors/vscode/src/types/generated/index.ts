@@ -113,6 +113,9 @@ export type {
 // State
 export type { StateOutput, WatermarkEntry } from "./state";
 
+// State clear-schema-cache (Arc 7 wave 2 wave-2 PR 4)
+export type { ClearSchemaCacheOutput } from "./state_clear_schema_cache";
+
 // Test (canonical source for TestFailure)
 export type { TestOutput, TestFailure } from "./test";
 

@@ -76,6 +76,7 @@ from .types import (
     CheckResult,
     ChecksConfig,
     CiResult,
+    ClearSchemaCacheOutput,
     ColumnDef,
     ColumnLineageResult,
     CompileResult,
@@ -227,6 +228,7 @@ __all__ = [
     # Plan / State
     "PlanResult",
     "StateResult",
+    "ClearSchemaCacheOutput",
     # Compile
     "CompileResult",
     "Diagnostic",
