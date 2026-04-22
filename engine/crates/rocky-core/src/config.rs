@@ -1264,6 +1264,27 @@ impl SchemaCacheConfig {
     pub fn ttl(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.ttl_seconds as i64)
     }
+
+    /// Apply an optional `--cache-ttl <seconds>` CLI override.
+    ///
+    /// Precedence (Arc 7 wave 2 wave-2 PR 4):
+    /// CLI flag > env var (future) > `[cache.schemas] ttl_seconds` > default
+    /// (86400s).
+    ///
+    /// `override_seconds = Some(0)` is deliberately meaningful: every
+    /// cached entry reports as expired on read, so the typecheck path
+    /// degrades to an empty map. To fully disable the cache set
+    /// `[cache.schemas] enabled = false` — `--cache-ttl 0` is the
+    /// "everything is stale" knob, not the "off" knob.
+    pub fn with_ttl_override(self, override_seconds: Option<u64>) -> Self {
+        match override_seconds {
+            Some(secs) => Self {
+                ttl_seconds: secs,
+                ..self
+            },
+            None => self,
+        }
+    }
 }
 
 /// Matches `${VAR}` and `${VAR:-default}` env-var substitution placeholders.
@@ -5231,5 +5252,51 @@ max_rows = 1000000
         assert!(cfg.cache.schemas.enabled);
         assert_eq!(cfg.cache.schemas.ttl_seconds, 86_400);
         assert!(!cfg.cache.schemas.replicate);
+    }
+
+    #[test]
+    fn with_ttl_override_none_returns_unchanged_config() {
+        let cfg = SchemaCacheConfig {
+            enabled: true,
+            ttl_seconds: 7200,
+            replicate: false,
+        };
+        let overridden = cfg.clone().with_ttl_override(None);
+        assert_eq!(overridden.ttl_seconds, 7200);
+        assert_eq!(overridden.enabled, cfg.enabled);
+        assert_eq!(overridden.replicate, cfg.replicate);
+    }
+
+    #[test]
+    fn with_ttl_override_some_replaces_ttl_only() {
+        // CLI flag wins over the config value. Other fields are untouched
+        // — enabled/replicate are not a CLI-flag surface today.
+        let cfg = SchemaCacheConfig {
+            enabled: true,
+            ttl_seconds: 86_400,
+            replicate: true,
+        };
+        let overridden = cfg.with_ttl_override(Some(60));
+        assert_eq!(overridden.ttl_seconds, 60);
+        assert!(overridden.enabled);
+        assert!(overridden.replicate);
+    }
+
+    #[test]
+    fn with_ttl_override_zero_flips_every_entry_to_stale() {
+        // `--cache-ttl 0` is the "everything is instantly stale" knob, not
+        // the "off" knob. Setting it to 0 means every entry in the cache
+        // has `cached_at > now - 0s`, so `is_expired` returns true for
+        // everything and the read path degrades to an empty map.
+        let cfg = SchemaCacheConfig::default().with_ttl_override(Some(0));
+        assert_eq!(cfg.ttl_seconds, 0);
+        // An entry cached one millisecond ago is already stale at ttl=0
+        // (is_expired uses strict `>`). Smoke-test the boundary here so
+        // the invariant doesn't drift.
+        let entry = crate::schema_cache::SchemaCacheEntry {
+            columns: vec![],
+            cached_at: chrono::Utc::now() - chrono::Duration::milliseconds(1),
+        };
+        assert!(entry.is_expired(chrono::Utc::now(), cfg.ttl()));
     }
 }

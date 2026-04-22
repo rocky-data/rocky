@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky state clear-schema-cache`.\n\n`dry_run = true` reports what *would* be deleted without touching redb; `dry_run = false` deletes the entries. `entries_deleted` is the actual removed count (or would-be-removed count in dry-run).",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dry_run": {
+      "description": "`true` when `--dry-run` was set; the cache is left untouched.",
+      "type": "boolean"
+    },
+    "entries_deleted": {
+      "description": "Number of entries removed (or that would be removed in dry-run mode). Zero when the cache was already empty.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "dry_run",
+    "entries_deleted",
+    "version"
+  ],
+  "title": "ClearSchemaCacheOutput",
+  "type": "object"
+}

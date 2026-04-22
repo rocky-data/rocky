@@ -114,6 +114,12 @@ fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_
         false,
         None,
         false,
+        // Watch uses the config-derived / default TTL. Wiring a CLI
+        // `--cache-ttl` through a background recompile loop would tie
+        // the override's lifetime to the loop; users who want stricter
+        // freshness in a watch session should set `[cache.schemas]
+        // ttl_seconds` in `rocky.toml` instead.
+        None,
     ) {
         Ok(()) => {
             if !output_json {

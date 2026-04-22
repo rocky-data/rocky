@@ -920,6 +920,7 @@ from .types_generated import (  # noqa: E402, F401
     ChecksConfigOutput,
     CiDiffOutput,
     CiOutput,
+    ClearSchemaCacheOutput,
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,
@@ -990,6 +991,7 @@ RockyOutput = (
     | RunResult
     | PlanResult
     | StateResult
+    | ClearSchemaCacheOutput
     | CompileResult
     | ModelLineageResult
     | ColumnLineageResult
@@ -1021,6 +1023,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "run": RunResult,
     "plan": PlanResult,
     "state": StateResult,
+    "state-clear-schema-cache": ClearSchemaCacheOutput,
     "compile": CompileResult,
     "test": TestResult,
     "ci": CiResult,

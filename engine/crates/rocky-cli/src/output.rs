@@ -1199,6 +1199,22 @@ pub struct WatermarkEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// JSON output for `rocky state clear-schema-cache`.
+///
+/// `dry_run = true` reports what *would* be deleted without touching
+/// redb; `dry_run = false` deletes the entries. `entries_deleted` is
+/// the actual removed count (or would-be-removed count in dry-run).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ClearSchemaCacheOutput {
+    pub version: String,
+    pub command: String,
+    /// Number of entries removed (or that would be removed in dry-run
+    /// mode). Zero when the cache was already empty.
+    pub entries_deleted: usize,
+    /// `true` when `--dry-run` was set; the cache is left untouched.
+    pub dry_run: bool,
+}
+
 /// JSON output for `rocky list pipelines`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ListPipelinesOutput {
@@ -2172,6 +2188,17 @@ impl StateOutput {
             version: VERSION.to_string(),
             command: "state".to_string(),
             watermarks,
+        }
+    }
+}
+
+impl ClearSchemaCacheOutput {
+    pub fn new(entries_deleted: usize, dry_run: bool) -> Self {
+        ClearSchemaCacheOutput {
+            version: VERSION.to_string(),
+            command: "state-clear-schema-cache".to_string(),
+            entries_deleted,
+            dry_run,
         }
     }
 }

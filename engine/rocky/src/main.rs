@@ -71,6 +71,23 @@ struct Cli {
     #[arg(long, default_value = ".rocky-state.redb")]
     state_path: PathBuf,
 
+    /// Override `[cache.schemas] ttl_seconds` for this invocation.
+    ///
+    /// Precedence (Arc 7 wave 2 wave-2 PR 4):
+    /// `--cache-ttl` > `[cache.schemas] ttl_seconds` in `rocky.toml`
+    /// > built-in default (86400s / 24h).
+    ///
+    /// `--cache-ttl 0` treats every entry as instantly stale (the read
+    /// path returns an empty map). To disable the cache entirely, set
+    /// `[cache.schemas] enabled = false` in `rocky.toml` instead.
+    ///
+    /// Applies to the CLI read path only (`rocky compile`, `rocky run`,
+    /// etc.); the `rocky lsp` daemon and `rocky serve` continue to use
+    /// the config-derived TTL because daemon lifetimes outlive a single
+    /// invocation flag.
+    #[arg(long, global = true)]
+    cache_ttl: Option<u64>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -324,8 +341,15 @@ enum Command {
         output_path: PathBuf,
     },
 
-    /// Show stored watermarks
-    State,
+    /// Inspect or manage the state store.
+    ///
+    /// Bare `rocky state` shows stored watermarks (the default since
+    /// before Arc 7). Subcommands cover schema-cache maintenance and
+    /// similar targeted operations.
+    State {
+        #[command(subcommand)]
+        action: Option<StateAction>,
+    },
 
     /// Compile models: resolve dependencies, type check, validate contracts
     Compile {
@@ -864,6 +888,37 @@ enum BranchAction {
     },
 }
 
+/// Subcommands under `rocky state`.
+#[derive(Subcommand)]
+enum StateAction {
+    /// Show stored watermarks (same as bare `rocky state`).
+    Show,
+    /// Flush the Arc 7 wave 2 wave-2 `DESCRIBE TABLE` cache.
+    ///
+    /// Removes every `SCHEMA_CACHE` entry from `state.redb`. The next
+    /// `rocky run` (PR 2 write tap) or `rocky discover --with-schemas`
+    /// (PR 3) warms it back up — until then, `rocky compile` falls back
+    /// to `RockyType::Unknown` for leaf models, matching pre-wave-2
+    /// behaviour.
+    ///
+    /// Use cases:
+    ///   * After a manual warehouse DDL change, when TTL expiry would
+    ///     be too slow.
+    ///   * Before a strict-CI run that must typecheck against fresh
+    ///     warehouse metadata.
+    ///   * Debugging a suspected stale-cache typecheck mismatch.
+    ///
+    /// The cache is explicitly opt-in to clear (no prompt): entries are
+    /// cheap to rebuild, and a missing state store is treated as "nothing
+    /// to flush" rather than an error so the command is safe to run on
+    /// an ephemeral CI runner.
+    ClearSchemaCache {
+        /// Show what would be removed without touching the cache.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ListAction {
     /// List all pipelines defined in the project
@@ -1099,6 +1154,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     shadow_config.as_ref(),
                     &partition_opts,
                     model.as_deref(),
+                    cli.cache_ttl,
                 )
                 .await
             }
@@ -1170,7 +1226,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             output_path,
         } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
-        Command::State => rocky_cli::commands::state_show(&cli.state_path, json),
+        Command::State { action } => match action {
+            None | Some(StateAction::Show) => {
+                rocky_cli::commands::state_show(&cli.state_path, json)
+            }
+            Some(StateAction::ClearSchemaCache { dry_run }) => {
+                rocky_cli::commands::state_clear_schema_cache(&cli.state_path, dry_run, json)
+            }
+        },
         Command::Compile {
             models,
             contracts,
@@ -1188,6 +1251,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             expand_macros,
             target_dialect.map(Into::into),
             with_seed,
+            cli.cache_ttl,
         ),
         Command::Dag {
             models,
@@ -1202,6 +1266,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             contracts.as_deref(),
             column_lineage,
             json,
+            cli.cache_ttl,
         ),
         Command::Lineage {
             target,
@@ -1219,6 +1284,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             format.as_deref(),
             downstream,
             json,
+            cli.cache_ttl,
         ),
         Command::Ai {
             intent,
@@ -1232,6 +1298,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 format.as_deref(),
                 &models,
                 json,
+                cli.cache_ttl,
             )
             .await
         }
@@ -1249,6 +1316,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 model.as_deref(),
                 with_intent,
                 json,
+                cli.cache_ttl,
             )
             .await
         }
@@ -1266,6 +1334,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 all,
                 save,
                 json,
+                cli.cache_ttl,
             )
             .await
         }
@@ -1283,6 +1352,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 all,
                 save,
                 json,
+                cli.cache_ttl,
             )
             .await
         }
@@ -1353,9 +1423,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Ci { models, contracts } => {
             rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
         }
-        Command::CiDiff { base_ref, models } => {
-            rocky_cli::commands::run_ci_diff(&cli.config, &cli.state_path, &base_ref, &models, json)
-        }
+        Command::CiDiff { base_ref, models } => rocky_cli::commands::run_ci_diff(
+            &cli.config,
+            &cli.state_path,
+            &base_ref,
+            &models,
+            json,
+            cli.cache_ttl,
+        ),
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
         Command::TestAdapter {
             adapter,

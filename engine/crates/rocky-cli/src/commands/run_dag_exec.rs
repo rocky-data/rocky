@@ -173,6 +173,12 @@ impl NodeDispatcher for CliDispatcher {
                     None,
                     &partition_opts,
                     None,
+                    // DAG sub-runs inherit config-derived TTL. Threading
+                    // the outer `--cache-ttl` through a unified-DAG
+                    // orchestration layer would complicate the sub-run
+                    // contract without clear signal; defer unless a
+                    // concrete use case shows up.
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())

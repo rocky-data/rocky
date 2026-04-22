@@ -40,14 +40,18 @@ fn make_client() -> Result<LlmClient> {
 /// PRs) so the AI prompt is grounded in real warehouse types when the
 /// cache is warm. Cold cache degrades to empty, which matches the
 /// pre-wave-2 behaviour this function had.
+///
+/// `cache_ttl_override` is the CLI `--cache-ttl` flag from PR 4.
 fn compile_project(
     config_path: &Path,
     state_path: &Path,
     models_dir: &str,
+    cache_ttl_override: Option<u64>,
 ) -> Result<CompileResult> {
     let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => {
-            crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
         }
         Err(_) => std::collections::HashMap::new(),
     };
@@ -104,6 +108,7 @@ pub async fn run_ai(
     format: Option<&str>,
     models_dir: &str,
     output_json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let client = make_client()?;
     let fmt = format.unwrap_or("rocky");
@@ -111,7 +116,8 @@ pub async fn run_ai(
     // Best-effort compile of the project to ground the prompt.
     // If it fails (missing dir, parse errors, etc.) we degrade to unschema'd
     // generation rather than refusing.
-    let compile_result = compile_project(config_path, state_path, models_dir).ok();
+    let compile_result =
+        compile_project(config_path, state_path, models_dir, cache_ttl_override).ok();
 
     let (model_schemas, source_tables) = match &compile_result {
         Some(r) => build_schema_context(r),
@@ -177,9 +183,10 @@ pub async fn run_ai_sync(
     model_filter: Option<&str>,
     with_intent: bool,
     output_json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(config_path, state_path, models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     // For now, use the current compilation as both "previous" and "current".
     // In practice, the previous would come from the state store.
@@ -279,9 +286,10 @@ pub async fn run_ai_explain(
     all: bool,
     save: bool,
     output_json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(config_path, state_path, models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_explain: Vec<&rocky_core::models::Model> = result
         .project
@@ -348,9 +356,10 @@ pub async fn run_ai_test(
     all: bool,
     save: bool,
     output_json: bool,
+    cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(config_path, state_path, models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_test: Vec<&rocky_core::models::Model> = result
         .project
