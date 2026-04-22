@@ -42,7 +42,7 @@ from .freshness import (
     freshness_policy_from_model,
     per_model_freshness_policies,
 )
-from .health import HealthcheckResult, rocky_healthcheck
+from .health import HealthcheckResult, rocky_healthcheck, state_health
 from .observability import (
     ANOMALY_CHECK_NAME,
     anomaly_check_results,
@@ -98,6 +98,7 @@ from .types import (
     HealthCheck,
     HealthStatus,
     HistoryResult,
+    LastRunStatus,
     LineageEdge,
     MaterializationCost,
     MaterializationInfo,
@@ -112,6 +113,7 @@ from .types import (
     PartitionSummary,
     PermissionInfo,
     PlanResult,
+    ProbeOutcome,
     QualifiedColumn,
     QualityMetrics,
     QualitySnapshot,
@@ -120,6 +122,8 @@ from .types import (
     Severity,
     SourceInfo,
     SourceSpan,
+    StateBackendKind,
+    StateHealthResult,
     StateResult,
     TableInfo,
     TestResult,
@@ -189,6 +193,11 @@ __all__ = [
     # Health (T5.5)
     "HealthcheckResult",
     "rocky_healthcheck",
+    "state_health",
+    "StateHealthResult",
+    "StateBackendKind",
+    "LastRunStatus",
+    "ProbeOutcome",
     # Project bootstrap (T5.1)
     "init_rocky_project",
     # Branch deployment detection (T5.3, descoped)

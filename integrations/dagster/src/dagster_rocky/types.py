@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -784,6 +784,75 @@ class DoctorResult(BaseModel):
     overall: str
     checks: list[HealthCheck]
     suggestions: list[str]
+
+
+# ---------------------------------------------------------------------------
+# State health — accessor aggregating doctor + history
+# ---------------------------------------------------------------------------
+
+
+#: State backend identifiers, mirroring ``rocky_core::config::StateBackend``.
+#: The CLI emits the lowercase variant name for each backend kind.
+StateBackendKind = Literal["local", "tiered", "valkey", "s3", "gcs"]
+
+
+#: Whole-run status captured by ``rocky_core::state::RunStatus``. Emitted by
+#: ``rocky history --output json`` via Rust ``{:?}`` formatting, so values use
+#: CamelCase on the wire (``"Success"``/``"PartialFailure"``/``"Failure"``).
+#: :class:`StateHealthResult` normalises these to the snake_case variants
+#: below so callers can match string-literal equality without knowing the
+#: wire encoding.
+LastRunStatus = Literal["success", "partial_failure", "failure"]
+
+
+#: Outcome of the optional state-backend write probe. Mirrors the tri-state the
+#: engine's ``probe_state_backend`` helper surfaces via the ``state_rw``
+#: doctor check: probe wrote + read + deleted cleanly (``ok``), probe exceeded
+#: the configured ``transfer_timeout_seconds`` (``timeout``), or some other
+#: failure (auth/permissions/network/missing config).
+ProbeOutcome = Literal["ok", "timeout", "error"]
+
+
+class StateHealthResult(BaseModel):
+    """Aggregated snapshot of Rocky's state-backend health.
+
+    Surfaces the pair of already-shipped signals — :meth:`RockyResource.doctor`
+    for the live ``state_rw`` probe and :meth:`RockyResource.history` for the
+    most recent whole-run status — behind one typed API. The primary consumer
+    is a Dagster sensor that wants to observe state-backend health per tick
+    (see :meth:`RockyResource.state_health`).
+
+    Always-populated fields (cheap path — one ``rocky history`` call plus a
+    ``tomllib.load`` of the config):
+
+    * :attr:`backend` — the configured :data:`StateBackendKind`. Defaults to
+      ``"local"`` when the config can't be parsed or doesn't declare a
+      ``[state]`` table, which matches the engine's default.
+    * :attr:`last_run_status` — normalised :data:`LastRunStatus` from the most
+      recent run the state store has recorded, or ``None`` when the store
+      has no run history yet.
+    * :attr:`last_run_at` — ``started_at`` of that same record, or ``None``.
+
+    Probe fields (populated only when the caller passes
+    ``probe_write=True``):
+
+    * :attr:`probe_outcome` — :data:`ProbeOutcome` mapped from the ``state_rw``
+      doctor check status / message (``healthy`` → ``"ok"``; ``critical`` with
+      a ``"timed out"`` / ``"timeout"`` substring in the message → ``"timeout"``;
+      any other ``critical`` / ``warning`` → ``"error"``).
+    * :attr:`probe_duration_ms` — wall-clock time the probe took, from the
+      matching :class:`HealthCheck`. ``None`` when the probe wasn't requested.
+    * :attr:`probe_error` — human-readable failure message from the same
+      check when :attr:`probe_outcome` is ``"timeout"`` or ``"error"``.
+      ``None`` on success and when the probe wasn't requested.
+    """
+
+    backend: StateBackendKind
+    last_run_status: LastRunStatus | None = None
+    last_run_at: datetime | None = None
+    probe_outcome: ProbeOutcome | None = None
+    probe_duration_ms: int | None = None
+    probe_error: str | None = None
 
 
 # ---------------------------------------------------------------------------

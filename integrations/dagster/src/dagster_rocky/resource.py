@@ -57,6 +57,7 @@ from .types import (
     OptimizeResult,
     PlanResult,
     RunResult,
+    StateHealthResult,
     StateResult,
     TestResult,
     ValidateMigrationResult,
@@ -1608,6 +1609,55 @@ class RockyResource(dg.ConfigurableResource):
     def doctor(self) -> DoctorResult:
         """Run ``rocky doctor`` and return the parsed health-check results."""
         return _parse_rocky_json(self._run_rocky(["doctor"]), DoctorResult, command="doctor")
+
+    def state_health(self, *, probe_write: bool = False) -> StateHealthResult:
+        """Return a live snapshot of Rocky's state-backend health.
+
+        Aggregates two already-shipped observability signals — the
+        configured ``[state] backend`` plus the most recent run
+        recorded in the state store — into a single typed snapshot
+        that Dagster sensors / schedules / asset checks can gate on
+        without having to shell out to ``rocky doctor`` on every
+        tick or log-scrape state-sync events.
+
+        The cheap path (the default, ``probe_write=False``) does one
+        ``rocky history`` subprocess plus a ``tomllib`` read of
+        :attr:`config_path` — bounded sub-second on any backend. When
+        ``probe_write=True`` we additionally invoke ``rocky doctor``
+        (which reuses the engine's ``probe_state_backend`` helper to
+        do a bounded put/get/delete round-trip against the configured
+        backend) and translate its ``state_rw`` check into the
+        :attr:`~.types.StateHealthResult.probe_outcome` /
+        :attr:`~.types.StateHealthResult.probe_duration_ms` /
+        :attr:`~.types.StateHealthResult.probe_error` fields.
+
+        Tolerance: the accessor is deliberately designed to survive a
+        sensor tick even when the underlying rocky binary is missing
+        or the state store is unreadable — in both cases the recent-run
+        fields degrade to ``None`` rather than raising. The probe
+        branch surfaces failures through the ``probe_*`` fields too
+        (``probe_outcome="error"``, ``probe_error=<description>``) so
+        a caller has a single source of truth for state-backend
+        liveness without wrapping this method in try/except.
+
+        Delegates to :func:`dagster_rocky.health.state_health` to keep
+        the resource thin and match the standalone
+        :func:`~.health.rocky_healthcheck` pattern.
+
+        Args:
+            probe_write: When ``True``, run the ``state_rw`` put/get/delete
+                probe. Default ``False`` — the cheap path.
+
+        Returns:
+            A :class:`~.types.StateHealthResult` describing the current
+            state-backend health.
+        """
+        # Import locally to avoid a module-level cycle between
+        # ``resource`` and ``health`` (health uses ``RockyResource`` via
+        # ``TYPE_CHECKING``).
+        from .health import state_health as _state_health
+
+        return _state_health(self, probe_write=probe_write)
 
     def resume_run(
         self,
