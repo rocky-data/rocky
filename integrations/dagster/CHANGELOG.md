@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-04-22
+
+Tracks engine 1.13.0 (state-backend reliability hardening + `state_rw` doctor check).
+
+### Changed
+
+- **`types_generated/rocky_project_schema.py` picks up the new `StateConfig.retry` + `StateConfig.on_upload_failure` fields** and the new `StateUploadFailureMode` Pydantic enum from engine 1.13.0. Fully additive — existing code consuming `StateConfig` continues to validate; new fields default to the engine's defaults. IDE hover / Pyright on `StateConfig` now shows the new fields.
+- **`tests/fixtures_generated/doctor.json` + `doctor_ci/doctor.json` regenerated** for the new `state_rw` doctor check row in engine 1.13.0. Test-only; no wheel surface change.
+
 ## [1.8.0] — 2026-04-21
 
 Tracks engine 1.12.0 (Arc 1 wave 2 + cleanup cascade).
