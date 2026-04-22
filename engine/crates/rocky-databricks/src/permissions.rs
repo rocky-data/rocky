@@ -3,6 +3,7 @@ use rocky_sql::validation;
 use tracing::debug;
 
 use crate::connector::{ConnectorError, DatabricksConnector};
+use crate::workspace::{WorkspaceBinding, WorkspaceError, WorkspaceManager};
 
 /// Manages Databricks permission reconciliation.
 ///
@@ -22,6 +23,9 @@ pub enum PermissionError {
 
     #[error("failed to parse grant row: {0}")]
     ParseError(String),
+
+    #[error("workspace binding error: {0}")]
+    Workspace(#[from] WorkspaceError),
 }
 
 /// Permissions that Rocky manages. Others (OWNERSHIP, ALL PRIVILEGES, CREATE SCHEMA) are skipped.
@@ -33,6 +37,43 @@ const MANAGED_PERMISSIONS: &[&str] = &[
     "MODIFY",
     "MANAGE",
 ];
+
+/// Desired state for a single catalog-to-workspace binding.
+///
+/// Mirrors the config-side `WorkspaceBindingConfig` but lives on the
+/// adapter seam so reconcile() can compare against the Unity Catalog API
+/// response without dragging config types into rocky-databricks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBindingDesired {
+    pub workspace_id: u64,
+    /// Databricks API string, e.g. `"BINDING_TYPE_READ_WRITE"` or
+    /// `"BINDING_TYPE_READ_ONLY"`.
+    pub binding_type: String,
+}
+
+/// Diff between desired and current workspace bindings for one catalog.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceBindingDiff {
+    /// New bindings to add, or existing bindings whose access level changed.
+    pub bindings_to_add: Vec<WorkspaceBindingDesired>,
+    /// Bindings present on the catalog but not in the desired state.
+    pub bindings_to_remove: Vec<WorkspaceBindingDesired>,
+}
+
+impl WorkspaceBindingDiff {
+    pub fn is_empty(&self) -> bool {
+        self.bindings_to_add.is_empty() && self.bindings_to_remove.is_empty()
+    }
+}
+
+/// Combined reconcile result for a single catalog covering grants and
+/// workspace bindings. `rocky plan` / `rocky run` group these deltas
+/// together because both flow from the same governance block.
+#[derive(Debug, Clone, Default)]
+pub struct AccessDiff {
+    pub permissions: PermissionDiff,
+    pub bindings: WorkspaceBindingDiff,
+}
 
 impl<'a> PermissionManager<'a> {
     pub fn new(connector: &'a DatabricksConnector) -> Self {
@@ -132,6 +173,132 @@ impl<'a> PermissionManager<'a> {
         let diff = Self::compute_diff(desired, &current);
         self.apply_diff(&diff).await?;
         Ok(diff)
+    }
+
+    /// Computes the binding diff between desired and current workspace bindings.
+    ///
+    /// Key equality is `workspace_id`. A binding whose access level changed
+    /// lands in both `bindings_to_remove` (old) and `bindings_to_add` (new);
+    /// Unity Catalog's PATCH endpoint applies the remove + add atomically.
+    pub fn compute_binding_diff(
+        desired: &[WorkspaceBindingDesired],
+        current: &[(u64, String)],
+    ) -> WorkspaceBindingDiff {
+        let mut to_add = Vec::new();
+        let mut to_remove = Vec::new();
+
+        for d in desired {
+            let matching = current.iter().find(|(id, _)| *id == d.workspace_id);
+            match matching {
+                Some((_, cur_type)) if cur_type == &d.binding_type => {
+                    // unchanged
+                }
+                Some((_, cur_type)) => {
+                    // access level changed — remove old then add new
+                    to_remove.push(WorkspaceBindingDesired {
+                        workspace_id: d.workspace_id,
+                        binding_type: cur_type.clone(),
+                    });
+                    to_add.push(d.clone());
+                }
+                None => {
+                    to_add.push(d.clone());
+                }
+            }
+        }
+
+        for (cur_id, cur_type) in current {
+            if !desired.iter().any(|d| d.workspace_id == *cur_id) {
+                to_remove.push(WorkspaceBindingDesired {
+                    workspace_id: *cur_id,
+                    binding_type: cur_type.clone(),
+                });
+            }
+        }
+
+        WorkspaceBindingDiff {
+            bindings_to_add: to_add,
+            bindings_to_remove: to_remove,
+        }
+    }
+
+    /// Applies a binding diff via a single PATCH to the Unity Catalog
+    /// workspace-bindings endpoint.
+    pub async fn apply_binding_diff(
+        ws_mgr: &WorkspaceManager,
+        catalog: &str,
+        diff: &WorkspaceBindingDiff,
+    ) -> Result<(), PermissionError> {
+        if diff.is_empty() {
+            return Ok(());
+        }
+        let add: Vec<WorkspaceBinding> = diff
+            .bindings_to_add
+            .iter()
+            .map(|b| WorkspaceBinding {
+                workspace_id: b.workspace_id,
+                binding_type: Some(b.binding_type.clone()),
+            })
+            .collect();
+        let remove: Vec<WorkspaceBinding> = diff
+            .bindings_to_remove
+            .iter()
+            .map(|b| WorkspaceBinding {
+                workspace_id: b.workspace_id,
+                binding_type: None,
+            })
+            .collect();
+        debug!(
+            catalog,
+            adds = add.len(),
+            removes = remove.len(),
+            "applying workspace binding diff"
+        );
+        ws_mgr.update_bindings(catalog, add, remove).await?;
+        Ok(())
+    }
+
+    /// Unified reconcile pass for grants and workspace bindings on a single
+    /// catalog.
+    ///
+    /// This is the entry point `rocky run` uses for Databricks-backed
+    /// pipelines that declare workspace bindings in their governance config.
+    /// When `ws_mgr` is `None` or `desired_bindings` is empty, the bindings
+    /// leg is a no-op and only grants reconcile — callers using the previous
+    /// grants-only reconcile are unaffected.
+    pub async fn reconcile_access(
+        &self,
+        desired_grants: &[Grant],
+        target: &GrantTarget,
+        ws_mgr: Option<&WorkspaceManager>,
+        desired_bindings: &[WorkspaceBindingDesired],
+    ) -> Result<AccessDiff, PermissionError> {
+        let permissions = self.reconcile(desired_grants, target).await?;
+
+        let bindings = match (ws_mgr, target) {
+            (Some(mgr), GrantTarget::Catalog(catalog)) => {
+                let current = mgr
+                    .get_bindings(catalog)
+                    .await?
+                    .into_iter()
+                    .map(|b| {
+                        let kind = b
+                            .binding_type
+                            .unwrap_or_else(|| "BINDING_TYPE_READ_WRITE".to_string());
+                        (b.workspace_id, kind)
+                    })
+                    .collect::<Vec<_>>();
+                let diff = Self::compute_binding_diff(desired_bindings, &current);
+                Self::apply_binding_diff(mgr, catalog, &diff).await?;
+                diff
+            }
+            _ => WorkspaceBindingDiff::default(),
+        };
+
+        Ok(AccessDiff {
+            permissions,
+            bindings,
+        })
     }
 
     async fn parse_grants_result(
@@ -340,5 +507,98 @@ mod tests {
         let diff = PermissionManager::compute_diff(&desired, &current);
         assert!(diff.grants_to_add.is_empty());
         assert!(diff.grants_to_revoke.is_empty());
+    }
+
+    // ---- Workspace binding diff ----
+
+    #[test]
+    fn test_binding_diff_add_when_missing() {
+        let desired = vec![WorkspaceBindingDesired {
+            workspace_id: 123,
+            binding_type: "BINDING_TYPE_READ_WRITE".into(),
+        }];
+        let current = vec![];
+        let diff = PermissionManager::compute_binding_diff(&desired, &current);
+        assert_eq!(diff.bindings_to_add.len(), 1);
+        assert_eq!(diff.bindings_to_add[0].workspace_id, 123);
+        assert!(diff.bindings_to_remove.is_empty());
+    }
+
+    #[test]
+    fn test_binding_diff_remove_when_undesired() {
+        let desired = vec![];
+        let current = vec![(999, "BINDING_TYPE_READ_WRITE".into())];
+        let diff = PermissionManager::compute_binding_diff(&desired, &current);
+        assert!(diff.bindings_to_add.is_empty());
+        assert_eq!(diff.bindings_to_remove.len(), 1);
+        assert_eq!(diff.bindings_to_remove[0].workspace_id, 999);
+    }
+
+    #[test]
+    fn test_binding_diff_unchanged() {
+        let desired = vec![WorkspaceBindingDesired {
+            workspace_id: 123,
+            binding_type: "BINDING_TYPE_READ_WRITE".into(),
+        }];
+        let current = vec![(123, "BINDING_TYPE_READ_WRITE".into())];
+        let diff = PermissionManager::compute_binding_diff(&desired, &current);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_binding_diff_access_level_change() {
+        let desired = vec![WorkspaceBindingDesired {
+            workspace_id: 123,
+            binding_type: "BINDING_TYPE_READ_ONLY".into(),
+        }];
+        let current = vec![(123, "BINDING_TYPE_READ_WRITE".into())];
+        let diff = PermissionManager::compute_binding_diff(&desired, &current);
+        // Access level change = one remove + one add, not two adds.
+        assert_eq!(diff.bindings_to_add.len(), 1);
+        assert_eq!(
+            diff.bindings_to_add[0].binding_type,
+            "BINDING_TYPE_READ_ONLY"
+        );
+        assert_eq!(diff.bindings_to_remove.len(), 1);
+        assert_eq!(
+            diff.bindings_to_remove[0].binding_type,
+            "BINDING_TYPE_READ_WRITE"
+        );
+        assert_eq!(diff.bindings_to_add[0].workspace_id, 123);
+        assert_eq!(diff.bindings_to_remove[0].workspace_id, 123);
+    }
+
+    #[test]
+    fn test_binding_diff_mixed() {
+        // workspace 1 unchanged, workspace 2 added, workspace 3 removed.
+        let desired = vec![
+            WorkspaceBindingDesired {
+                workspace_id: 1,
+                binding_type: "BINDING_TYPE_READ_WRITE".into(),
+            },
+            WorkspaceBindingDesired {
+                workspace_id: 2,
+                binding_type: "BINDING_TYPE_READ_ONLY".into(),
+            },
+        ];
+        let current = vec![
+            (1, "BINDING_TYPE_READ_WRITE".into()),
+            (3, "BINDING_TYPE_READ_WRITE".into()),
+        ];
+        let diff = PermissionManager::compute_binding_diff(&desired, &current);
+        assert_eq!(diff.bindings_to_add.len(), 1);
+        assert_eq!(diff.bindings_to_add[0].workspace_id, 2);
+        assert_eq!(diff.bindings_to_remove.len(), 1);
+        assert_eq!(diff.bindings_to_remove[0].workspace_id, 3);
+    }
+
+    // ---- Combined reconcile (AccessDiff) ----
+
+    #[test]
+    fn test_access_diff_default_is_empty() {
+        let diff = AccessDiff::default();
+        assert!(diff.permissions.grants_to_add.is_empty());
+        assert!(diff.permissions.grants_to_revoke.is_empty());
+        assert!(diff.bindings.is_empty());
     }
 }

@@ -616,23 +616,82 @@ pub async fn run(
                     v
                 };
 
-                // Workspace binding + isolation via GovernanceAdapter (best-effort)
-                for binding in &all_bindings {
-                    if let Err(e) = governance_adapter
-                        .bind_workspace(
-                            &target_catalog,
-                            binding.id,
-                            binding.binding_type.as_api_str(),
-                        )
-                        .await
-                    {
+                // Reconcile workspace bindings via GovernanceAdapter (best-effort).
+                //
+                // Unity Catalog users isolating catalogs per workspace previously
+                // reconciled bindings out-of-band via scripts; Rocky now treats the
+                // desired binding set as declarative state and reconciles
+                // current-vs-desired in one pass alongside grants. Bindings
+                // declared in config are added, bindings present on the catalog
+                // but absent from config are removed, and access-level changes
+                // (`READ_WRITE` → `READ_ONLY`) land as a single remove + add.
+                //
+                // Behavior change: prior releases treated `workspace_ids` as
+                // imperative additive state (never removed drift); reconcile
+                // semantics now mean bindings not declared in config are
+                // removed on next run. Users who hand-added bindings outside
+                // `rocky.toml` should declare them there before upgrading.
+                //
+                // Adapters that don't support workspace bindings (Snowflake,
+                // BigQuery, DuckDB) return `Ok(vec![])` from
+                // `list_workspace_bindings`, so the diff is empty and the loop
+                // is a no-op — matching the existing "not applicable" semantics.
+                let current_bindings: Vec<(u64, String)> = governance_adapter
+                    .list_workspace_bindings(&target_catalog)
+                    .await
+                    .unwrap_or_else(|e| {
                         warn!(
                             catalog = target_catalog,
-                            workspace_id = binding.id,
-                            binding_type = binding.binding_type.as_api_str(),
                             error = %e,
-                            "workspace binding failed"
+                            "workspace-binding reconcile skipped; \
+                             drift will not be detected this run \
+                             (list_workspace_bindings failed)"
                         );
+                        vec![]
+                    });
+
+                // Compute add/remove diff by workspace_id.
+                let desired_ids: std::collections::HashSet<u64> =
+                    all_bindings.iter().map(|b| b.id).collect();
+                let current_ids: std::collections::HashMap<u64, String> =
+                    current_bindings.into_iter().collect();
+
+                for binding in &all_bindings {
+                    let desired_kind = binding.binding_type.as_api_str();
+                    let needs_apply = !matches!(
+                        current_ids.get(&binding.id),
+                        Some(current_kind) if current_kind == desired_kind
+                    );
+                    if needs_apply {
+                        if let Err(e) = governance_adapter
+                            .bind_workspace(&target_catalog, binding.id, desired_kind)
+                            .await
+                        {
+                            warn!(
+                                catalog = target_catalog,
+                                workspace_id = binding.id,
+                                binding_type = desired_kind,
+                                error = %e,
+                                "workspace binding failed"
+                            );
+                        }
+                    }
+                }
+
+                // Remove bindings that exist on the catalog but aren't desired.
+                for &cur_id in current_ids.keys() {
+                    if !desired_ids.contains(&cur_id) {
+                        if let Err(e) = governance_adapter
+                            .remove_workspace_binding(&target_catalog, cur_id)
+                            .await
+                        {
+                            warn!(
+                                catalog = target_catalog,
+                                workspace_id = cur_id,
+                                error = %e,
+                                "remove workspace binding failed"
+                            );
+                        }
                     }
                 }
 

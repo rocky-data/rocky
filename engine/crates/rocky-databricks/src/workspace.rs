@@ -21,6 +21,9 @@ pub struct WorkspaceManager {
     host: String,
     auth: Auth,
     client: Client,
+    /// Override for the base URL scheme + host (used by tests to point at wiremock).
+    #[cfg(any(test, feature = "test-support"))]
+    base_url_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +58,26 @@ impl WorkspaceManager {
             host,
             auth,
             client: Client::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            base_url_override: None,
         }
+    }
+
+    /// Overrides the base URL for API calls (for testing with wiremock).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url_override = Some(base_url);
+        self
+    }
+
+    /// Returns the base URL for API calls.
+    fn api_base_url(&self) -> String {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(url) = &self.base_url_override {
+            return url.clone();
+        }
+        format!("https://{}", self.host)
     }
 
     /// Gets current workspace bindings for a catalog.
@@ -65,8 +87,8 @@ impl WorkspaceManager {
     ) -> Result<Vec<WorkspaceBinding>, WorkspaceError> {
         let token = self.auth.get_token().await?;
         let url = format!(
-            "https://{}/api/2.1/unity-catalog/bindings/catalog/{catalog}",
-            self.host
+            "{}/api/2.1/unity-catalog/bindings/catalog/{catalog}",
+            self.api_base_url()
         );
 
         let resp = self.client.get(&url).bearer_auth(&token).send().await?;
@@ -90,8 +112,8 @@ impl WorkspaceManager {
     ) -> Result<(), WorkspaceError> {
         let token = self.auth.get_token().await?;
         let url = format!(
-            "https://{}/api/2.1/unity-catalog/bindings/catalog/{catalog}",
-            self.host
+            "{}/api/2.1/unity-catalog/bindings/catalog/{catalog}",
+            self.api_base_url()
         );
 
         debug!(
@@ -124,8 +146,8 @@ impl WorkspaceManager {
     pub async fn set_catalog_isolated(&self, catalog: &str) -> Result<(), WorkspaceError> {
         let token = self.auth.get_token().await?;
         let url = format!(
-            "https://{}/api/2.1/unity-catalog/catalogs/{catalog}",
-            self.host
+            "{}/api/2.1/unity-catalog/catalogs/{catalog}",
+            self.api_base_url()
         );
 
         debug!(catalog, "setting catalog isolation mode");

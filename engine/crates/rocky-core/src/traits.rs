@@ -465,6 +465,46 @@ pub trait GovernanceAdapter: Send + Sync {
     /// Set catalog isolation mode.
     /// Not all warehouses support this; default returns Ok.
     async fn set_isolation(&self, catalog: &str, enabled: bool) -> AdapterResult<()>;
+
+    /// List current workspace bindings for a catalog.
+    ///
+    /// Returns the tuples `(workspace_id, binding_type)` currently applied
+    /// to the catalog. Used by reconciliation to diff desired-vs-current
+    /// bindings alongside grants.
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError` so adapters that don't
+    /// support workspace bindings must explicitly override and declare their
+    /// semantics (either "silently Ok with `vec![]`" or "surface the gap").
+    /// `NoopGovernanceAdapter`, `SnowflakeGovernanceAdapter`, and
+    /// `BigQueryGovernanceAdapter` override to return `Ok(vec![])`; the
+    /// Databricks adapter implements the Unity Catalog workspace-bindings API.
+    async fn list_workspace_bindings(&self, _catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        Err(AdapterError::msg(
+            "list_workspace_bindings not supported by this adapter",
+        ))
+    }
+
+    /// Remove a workspace binding from a catalog.
+    ///
+    /// Used by reconciliation to drop bindings that exist on the catalog
+    /// but aren't in the desired state.
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError`; adapters that don't
+    /// support workspace bindings override to return `Ok(())` (silent
+    /// success, matching `bind_workspace`/`set_isolation` semantics).
+    async fn remove_workspace_binding(
+        &self,
+        _catalog: &str,
+        _workspace_id: u64,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::msg(
+            "remove_workspace_binding not supported by this adapter",
+        ))
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -514,6 +554,18 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
     }
 
     async fn set_isolation(&self, _catalog: &str, _enabled: bool) -> AdapterResult<()> {
+        Ok(())
+    }
+
+    async fn list_workspace_bindings(&self, _catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        Ok(vec![])
+    }
+
+    async fn remove_workspace_binding(
+        &self,
+        _catalog: &str,
+        _workspace_id: u64,
+    ) -> AdapterResult<()> {
         Ok(())
     }
 }
@@ -606,4 +658,69 @@ mod tests {
     fn _assert_batch_check_object_safe(_: &dyn BatchCheckAdapter) {}
     // SqlDialect is not async, but still needs to be object-safe.
     fn _assert_dialect_object_safe(_: &dyn SqlDialect) {}
+
+    // Default workspace-binding primitives error out so adapters that don't
+    // support the concept must override with explicit semantics.
+    struct MinimalGovernance;
+
+    #[async_trait]
+    impl GovernanceAdapter for MinimalGovernance {
+        async fn set_tags(
+            &self,
+            _target: &TagTarget,
+            _tags: &BTreeMap<String, String>,
+        ) -> AdapterResult<()> {
+            Ok(())
+        }
+        async fn get_grants(&self, _target: &GrantTarget) -> AdapterResult<Vec<Grant>> {
+            Ok(vec![])
+        }
+        async fn apply_grants(&self, _grants: &[Grant]) -> AdapterResult<()> {
+            Ok(())
+        }
+        async fn revoke_grants(&self, _grants: &[Grant]) -> AdapterResult<()> {
+            Ok(())
+        }
+        async fn bind_workspace(
+            &self,
+            _catalog: &str,
+            _workspace_id: u64,
+            _binding_type: &str,
+        ) -> AdapterResult<()> {
+            Ok(())
+        }
+        async fn set_isolation(&self, _catalog: &str, _enabled: bool) -> AdapterResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn trait_default_list_workspace_bindings_errors() {
+        let err = MinimalGovernance
+            .list_workspace_bindings("cat")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("list_workspace_bindings"));
+    }
+
+    #[tokio::test]
+    async fn trait_default_remove_workspace_binding_errors() {
+        let err = MinimalGovernance
+            .remove_workspace_binding("cat", 123)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("remove_workspace_binding"));
+    }
+
+    #[tokio::test]
+    async fn noop_governance_overrides_workspace_bindings() {
+        let noop = NoopGovernanceAdapter;
+        assert!(
+            noop.list_workspace_bindings("cat")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(noop.remove_workspace_binding("cat", 123).await.is_ok());
+    }
 }

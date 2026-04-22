@@ -649,3 +649,206 @@ async fn test_bearer_token_sent() {
     connector.execute_statement("SELECT 1").await.unwrap();
     // If the header didn't match, the mock would not have responded with 200
 }
+
+// ---------------------------------------------------------------------------
+// Workspace-binding reconcile (Unity Catalog)
+// ---------------------------------------------------------------------------
+//
+// Unity Catalog workspace bindings control *which Databricks workspaces a
+// catalog is visible in*, distinct from *who within a workspace can read or
+// write it*. Rocky treats the desired binding set as declarative state and
+// reconciles current-vs-desired alongside grants — these tests cover the
+// list / add / remove / access-level-change paths against a wiremock'd UC
+// REST API.
+
+fn test_workspace_mgr(server: &MockServer) -> rocky_databricks::workspace::WorkspaceManager {
+    let auth = Auth::from_config(AuthConfig {
+        host: "test.databricks.com".into(),
+        token: Some("test-token".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .unwrap();
+    rocky_databricks::workspace::WorkspaceManager::new("test.databricks.com".into(), auth)
+        .with_base_url(server.uri())
+}
+
+/// `list_workspace_bindings` returns the current bindings from the UC API.
+#[tokio::test]
+async fn test_list_workspace_bindings_parses_api_response() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/bindings/catalog/my_catalog"))
+        .and(header("Authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bindings": [
+                { "workspace_id": 100, "binding_type": "BINDING_TYPE_READ_WRITE" },
+                { "workspace_id": 200, "binding_type": "BINDING_TYPE_READ_ONLY" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ws_mgr = test_workspace_mgr(&server);
+    let bindings = ws_mgr.get_bindings("my_catalog").await.unwrap();
+
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].workspace_id, 100);
+    assert_eq!(
+        bindings[0].binding_type.as_deref(),
+        Some("BINDING_TYPE_READ_WRITE")
+    );
+    assert_eq!(bindings[1].workspace_id, 200);
+    assert_eq!(
+        bindings[1].binding_type.as_deref(),
+        Some("BINDING_TYPE_READ_ONLY")
+    );
+}
+
+/// `update_bindings` posts a single PATCH with add + remove payloads, so the
+/// reconcile apply is one API call even with many deltas.
+#[tokio::test]
+async fn test_update_bindings_single_patch_for_add_and_remove() {
+    use rocky_databricks::workspace::WorkspaceBinding;
+    use wiremock::matchers::body_partial_json;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/api/2.1/unity-catalog/bindings/catalog/my_catalog"))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(body_partial_json(serde_json::json!({
+            "add": [{"workspace_id": 300, "binding_type": "BINDING_TYPE_READ_ONLY"}],
+            "remove": [{"workspace_id": 400}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ws_mgr = test_workspace_mgr(&server);
+    ws_mgr
+        .update_bindings(
+            "my_catalog",
+            vec![WorkspaceBinding {
+                workspace_id: 300,
+                binding_type: Some("BINDING_TYPE_READ_ONLY".into()),
+            }],
+            vec![WorkspaceBinding {
+                workspace_id: 400,
+                binding_type: None,
+            }],
+        )
+        .await
+        .unwrap();
+    // Mock `.expect(1)` would panic at drop if the PATCH wasn't called exactly once.
+}
+
+/// Combined reconcile pass: `PermissionManager::reconcile_access` diffs grants
+/// and bindings together and applies both in one flow. Verifies the unified
+/// plan delta with current grants + current bindings mocked separately from
+/// the desired state.
+#[tokio::test]
+async fn test_reconcile_access_combined_grants_and_bindings() {
+    use rocky_core::ir::{Grant, GrantTarget, Permission};
+    use rocky_databricks::permissions::{PermissionManager, WorkspaceBindingDesired};
+
+    let server = MockServer::start().await;
+
+    // SHOW GRANTS returns no current grants → desired grant is a pure add.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SHOW GRANTS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-show",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": { "columns": [
+                    {"name": "Principal", "type_name": "STRING", "position": 0},
+                    {"name": "ActionType", "type_name": "STRING", "position": 1},
+                    {"name": "ObjectType", "type_name": "STRING", "position": 2},
+                    {"name": "ObjectKey", "type_name": "STRING", "position": 3}
+                ]},
+                "total_row_count": 0
+            },
+            "result": { "data_array": [] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // GRANT apply — succeeds with an empty statement body.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("GRANT BROWSE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-grant",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // GET bindings — current state has workspace 3 (READ_WRITE).
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/bindings/catalog/my_catalog"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bindings": [
+                { "workspace_id": 3, "binding_type": "BINDING_TYPE_READ_WRITE" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PATCH bindings — desired adds workspace 2, removes workspace 3.
+    Mock::given(method("PATCH"))
+        .and(path("/api/2.1/unity-catalog/bindings/catalog/my_catalog"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let ws_mgr = test_workspace_mgr(&server);
+    let perm_mgr = PermissionManager::new(&connector);
+
+    let desired_grants = vec![Grant {
+        principal: "engineers".into(),
+        permission: Permission::Browse,
+        target: GrantTarget::Catalog("my_catalog".into()),
+    }];
+    let desired_bindings = vec![WorkspaceBindingDesired {
+        workspace_id: 2,
+        binding_type: "BINDING_TYPE_READ_ONLY".into(),
+    }];
+
+    let diff = perm_mgr
+        .reconcile_access(
+            &desired_grants,
+            &GrantTarget::Catalog("my_catalog".into()),
+            Some(&ws_mgr),
+            &desired_bindings,
+        )
+        .await
+        .expect("combined reconcile should succeed");
+
+    // Grants: empty current → one add, nothing revoked.
+    assert_eq!(diff.permissions.grants_to_add.len(), 1);
+    assert_eq!(diff.permissions.grants_to_add[0].principal, "engineers");
+    assert!(diff.permissions.grants_to_revoke.is_empty());
+
+    // Bindings: desired {2}, current {3} → add 2, remove 3.
+    assert_eq!(diff.bindings.bindings_to_add.len(), 1);
+    assert_eq!(diff.bindings.bindings_to_add[0].workspace_id, 2);
+    assert_eq!(
+        diff.bindings.bindings_to_add[0].binding_type,
+        "BINDING_TYPE_READ_ONLY"
+    );
+    assert_eq!(diff.bindings.bindings_to_remove.len(), 1);
+    assert_eq!(diff.bindings.bindings_to_remove[0].workspace_id, 3);
+}

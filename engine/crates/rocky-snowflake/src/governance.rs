@@ -142,6 +142,20 @@ impl GovernanceAdapter for SnowflakeGovernanceAdapter<'_> {
         // Snowflake does not support catalog isolation mode.
         Ok(())
     }
+
+    async fn list_workspace_bindings(&self, _catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        // Snowflake does not have workspace bindings; reconcile sees no drift.
+        Ok(vec![])
+    }
+
+    async fn remove_workspace_binding(
+        &self,
+        _catalog: &str,
+        _workspace_id: u64,
+    ) -> AdapterResult<()> {
+        // Snowflake does not support workspace binding removal.
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

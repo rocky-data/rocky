@@ -134,4 +134,46 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
             .await
             .map_err(AdapterError::new)
     }
+
+    async fn list_workspace_bindings(&self, catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        let ws_mgr = self
+            .workspace_mgr
+            .as_ref()
+            .ok_or_else(|| AdapterError::msg("workspace manager not configured"))?;
+        let bindings = ws_mgr
+            .get_bindings(catalog)
+            .await
+            .map_err(AdapterError::new)?;
+        Ok(bindings
+            .into_iter()
+            .map(|b| {
+                let kind = b
+                    .binding_type
+                    .unwrap_or_else(|| "BINDING_TYPE_READ_WRITE".to_string());
+                (b.workspace_id, kind)
+            })
+            .collect())
+    }
+
+    async fn remove_workspace_binding(
+        &self,
+        catalog: &str,
+        workspace_id: u64,
+    ) -> AdapterResult<()> {
+        let ws_mgr = self
+            .workspace_mgr
+            .as_ref()
+            .ok_or_else(|| AdapterError::msg("workspace manager not configured"))?;
+        ws_mgr
+            .update_bindings(
+                catalog,
+                vec![],
+                vec![crate::workspace::WorkspaceBinding {
+                    workspace_id,
+                    binding_type: None,
+                }],
+            )
+            .await
+            .map_err(AdapterError::new)
+    }
 }
