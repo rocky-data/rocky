@@ -233,7 +233,7 @@ def test_run_pipes_injects_custom_reader_when_asset_key_fn_is_set():
         rocky.run_pipes(
             context,
             filter="tenant=acme",
-            asset_key_fn=lambda path: dg.AssetKey(path),
+            asset_key_fn=dg.AssetKey,
         )
 
     # The client was constructed with a message_reader kwarg.
@@ -287,7 +287,7 @@ def test_run_pipes_caller_supplied_client_wins_over_translation_kwargs():
         rocky.run_pipes(
             context,
             filter="tenant=acme",
-            asset_key_fn=lambda path: dg.AssetKey(path),
+            asset_key_fn=dg.AssetKey,
             pipes_client=fake_client,
         )
     # Our branch should never have constructed a default client.
