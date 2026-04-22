@@ -8,8 +8,9 @@
 //! so credential resolution follows the standard AWS SDK / GCP ADC chains.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -401,6 +402,162 @@ async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(),
     .await
 }
 
+/// Round-trip RW probe against the configured state backend.
+///
+/// Writes a short-lived marker to a **distinct key** (never the real
+/// `state.redb`), reads it back, and deletes it. Used by `rocky doctor`
+/// to verify a state backend is actually reachable and writable — not
+/// merely configured. Honours `transfer_timeout_seconds` as an outer
+/// wall-clock cap; no retries — probes should produce a single-pass
+/// pass/fail signal, not resilient writes.
+///
+/// For `tiered` both legs (Valkey + S3) must pass — either one failing
+/// fails the probe. For `local` this is a no-op returning `Ok`.
+pub async fn probe_state_backend(config: &StateConfig) -> Result<(), StateSyncError> {
+    match config.backend {
+        StateBackend::Local => Ok(()),
+        StateBackend::S3 => {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
+            })?;
+            let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+            probe_object_store("s3", bucket, prefix, transfer_timeout(config)).await
+        }
+        StateBackend::Gcs => {
+            let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
+            })?;
+            let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
+            probe_object_store("gs", bucket, prefix, transfer_timeout(config)).await
+        }
+        StateBackend::Valkey => probe_valkey(config).await,
+        StateBackend::Tiered => {
+            let valkey_config = StateConfig {
+                backend: StateBackend::Valkey,
+                ..config.clone()
+            };
+            let s3_config = StateConfig {
+                backend: StateBackend::S3,
+                ..config.clone()
+            };
+            Box::pin(probe_state_backend(&valkey_config)).await?;
+            Box::pin(probe_state_backend(&s3_config)).await
+        }
+    }
+}
+
+/// Build a per-call probe key under the configured prefix. Uses PID +
+/// nanosecond epoch so concurrent doctor invocations don't collide.
+fn probe_key() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("doctor-probe-{}-{}.marker", std::process::id(), nanos)
+}
+
+async fn probe_object_store(
+    scheme: &str,
+    bucket: &str,
+    prefix: &str,
+    timeout: Duration,
+) -> Result<(), StateSyncError> {
+    let provider = cloud_provider(scheme, bucket, prefix)?;
+    let key = probe_key();
+    let data = Bytes::from_static(b"rocky doctor probe");
+    let span = info_span!(
+        "state.probe",
+        backend = %provider.scheme(),
+        bucket = %provider.bucket(),
+    );
+    async move {
+        with_transfer_timeout(timeout, async {
+            provider.put(&key, data.clone()).await?;
+            let got = provider.get(&key).await?;
+            if got != data {
+                // Reuse the backend-specific Upload variant so the message
+                // carries the scheme; the probe-vs-real-upload distinction
+                // is captured by the `state.probe` span name above.
+                let err = format!("probe content mismatch (wrote {} bytes, read {} bytes)", data.len(), got.len());
+                return match scheme {
+                    "s3" => Err(StateSyncError::S3Upload(err)),
+                    "gs" => Err(StateSyncError::GcsUpload(err)),
+                    _ => Err(StateSyncError::S3Upload(err)),
+                };
+            }
+            // Best-effort cleanup — a stale probe object is a small cost
+            // (< 20 bytes, lifecycle rules clean up eventually); surfacing
+            // a delete failure on an otherwise successful probe would
+            // mask the real signal (RW works).
+            if let Err(e) = provider.delete(&key).await {
+                warn!(error = %e, key = %key, outcome = "probe_cleanup_failed", "state probe cleanup failed (object will remain until lifecycle rule cleans it up)");
+            }
+            info!(outcome = "ok", "state backend probe succeeded");
+            Ok(())
+        })
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+async fn probe_valkey(config: &StateConfig) -> Result<(), StateSyncError> {
+    let url = config
+        .valkey_url
+        .as_deref()
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
+        .to_string();
+    let prefix = config
+        .valkey_prefix
+        .as_deref()
+        .unwrap_or(DEFAULT_VALKEY_PREFIX)
+        .to_string();
+    let key = format!("{prefix}{}", probe_key());
+    let timeout = transfer_timeout(config);
+
+    let span = info_span!("state.probe", backend = "valkey");
+    async move {
+        with_transfer_timeout(timeout, async move {
+            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
+                let client =
+                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let mut conn = client
+                    .get_connection()
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg("rocky doctor probe")
+                    .query::<()>(&mut conn)
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                let val: Option<String> = redis::cmd("GET")
+                    .arg(&key)
+                    .query(&mut conn)
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                if val.as_deref() != Some("rocky doctor probe") {
+                    return Err(StateSyncError::Valkey(format!(
+                        "probe value mismatch (got {val:?})"
+                    )));
+                }
+                // Best-effort cleanup — same rationale as the object-store path.
+                let _ = redis::cmd("DEL").arg(&key).query::<()>(&mut conn);
+                Ok(())
+            })
+            .await;
+            match join {
+                Ok(inner) => inner,
+                Err(e) => Err(StateSyncError::Valkey(format!(
+                    "valkey worker task failed: {e}"
+                ))),
+            }
+        })
+        .await?;
+        info!(outcome = "ok", "state backend probe succeeded");
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +624,49 @@ mod tests {
     fn test_default_state_transfer_timeout() {
         let config = StateConfig::default();
         assert_eq!(config.transfer_timeout_seconds, 300);
+    }
+
+    #[tokio::test]
+    async fn test_probe_state_backend_local_is_noop() {
+        let config = StateConfig::default();
+        assert!(matches!(config.backend, StateBackend::Local));
+        probe_state_backend(&config)
+            .await
+            .expect("Local backend probe should be a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_probe_state_backend_s3_missing_bucket_fails_fast() {
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None,
+            ..Default::default()
+        };
+        let err = probe_state_backend(&config)
+            .await
+            .expect_err("missing bucket should error");
+        assert!(matches!(err, StateSyncError::MissingConfig(..)));
+    }
+
+    #[tokio::test]
+    async fn test_probe_state_backend_valkey_missing_url_fails_fast() {
+        let config = StateConfig {
+            backend: StateBackend::Valkey,
+            valkey_url: None,
+            ..Default::default()
+        };
+        let err = probe_state_backend(&config)
+            .await
+            .expect_err("missing URL should error");
+        assert!(matches!(err, StateSyncError::MissingConfig(..)));
+    }
+
+    #[test]
+    fn test_probe_key_is_unique_across_calls() {
+        let a = probe_key();
+        let b = probe_key();
+        assert_ne!(a, b, "probe_key should produce unique values per call");
+        assert!(a.starts_with("doctor-probe-"));
+        assert!(a.ends_with(".marker"));
     }
 }

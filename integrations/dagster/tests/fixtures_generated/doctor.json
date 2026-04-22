@@ -33,6 +33,12 @@
       "duration_ms": 0
     },
     {
+      "name": "state_rw",
+      "status": "healthy",
+      "message": "Local backend \u2014 no remote probe needed",
+      "duration_ms": 0
+    },
+    {
       "name": "auth/default",
       "status": "healthy",
       "message": "Authenticated to default",
