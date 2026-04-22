@@ -7,9 +7,11 @@
 
 ## What it shows
 
-`rocky doctor` aggregates health checks across config, state, adapters,
-pipelines, and state sync — all in one JSON output. `rocky ci` is a
-combined `compile + test` command with proper exit codes for CI.
+`rocky doctor` aggregates health checks across config, local state, adapters,
+pipelines, state backend config (`state_sync`), live state read/write
+(`state_rw`, v1.13.0+), and auth (`auth` + per-adapter `auth/<name>`) — all
+in one JSON output. `rocky ci` is a combined `compile + test` command with
+proper exit codes for CI.
 
 This POC also ships an example `.github/workflows/rocky-ci.yml` that you
 can drop into any project to wire Rocky into GitHub Actions.

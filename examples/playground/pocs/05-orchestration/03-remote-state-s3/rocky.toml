@@ -19,3 +19,14 @@ schema_template = "staging__{source}"
 backend = "s3"
 s3_bucket = "rocky-state"
 s3_prefix = "playground/"
+# on_upload_failure = "skip" is the default — swap to "fail" in strict environments
+# transfer_timeout_seconds = 300 is the default (raise for large state / slow networks)
+
+# Retry + circuit-breaker for transient S3 failures.
+# Same shape as [adapter.NAME.retry] so operators reason about both layers with
+# one mental model. Retries share transfer_timeout_seconds — they don't extend it.
+[state.retry]
+max_retries = 3
+initial_backoff_ms = 500
+circuit_breaker_threshold = 5
+circuit_breaker_recovery_timeout_secs = 30

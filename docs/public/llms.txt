@@ -63,7 +63,7 @@ Scope on the ELT spectrum:
 - `rocky ai-test` — Generate test assertions from intent
 
 ### Administration
-- `rocky doctor` — Aggregate health check
+- `rocky doctor` — Aggregate health check (7 categories: `config`, `state`, `adapters`, `pipelines`, `state_sync`, `state_rw` live RW probe, `auth`/`auth/<adapter>`)
 - `rocky compare` — Shadow-vs-production comparison
 - `rocky history` — Run + model execution history
 - `rocky metrics <model>` — Quality metrics and trends
@@ -109,7 +109,7 @@ Top-level sections:
 - `[pipeline.NAME.source.schema_pattern]` — multi-tenant schema name parser
 - `[pipeline.NAME.checks]` — inline data quality checks
 - `[pipeline.NAME.governance]` — tags, permissions, workspace isolation
-- `[state]` — watermark backend (`local`, `s3`, `valkey`)
+- `[state]` — watermark backend (`local`, `s3`, `gcs`, `valkey`, `tiered`) with `[state.retry]` exponential-backoff + circuit-breaker and `on_upload_failure = "skip" | "fail"`
 - `[cache]` / `[cost]` / `[hooks]` — optional subsystems
 
 Select pipelines at runtime with `--pipeline NAME`.

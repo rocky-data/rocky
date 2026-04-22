@@ -344,7 +344,7 @@ Aggregate health checks across config, state, adapters, and pipelines.
 | Field | Type | Description |
 |-------|------|-------------|
 | `overall` | string | Aggregate status: `"healthy"`, `"warning"`, or `"critical"`. |
-| `checks[].name` | string | Check category (`"config"`, `"state"`, `"adapters"`, `"pipelines"`, `"state_sync"`). |
+| `checks[].name` | string | Check category: `"config"`, `"state"`, `"adapters"`, `"pipelines"`, `"state_sync"`, `"state_rw"`, `"auth"`, or `"auth/<adapter>"` (per-adapter auth result). |
 | `checks[].status` | string | `"healthy"`, `"warning"`, or `"critical"`. |
 | `checks[].message` | string | Human-readable result. |
 | `checks[].duration_ms` | integer | Time spent on this check in milliseconds. |

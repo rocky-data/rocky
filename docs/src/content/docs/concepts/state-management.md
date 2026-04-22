@@ -166,7 +166,45 @@ When `backend` is not `local`, Rocky syncs state automatically:
 2. **During run**: Read/write from local `.redb` (fast, no network)
 3. **After run**: Upload local `.redb` → remote storage
 
-If download fails, Rocky logs a warning and starts fresh. If upload fails with S3 or Valkey, it logs an error but the run still succeeds.
+If download fails, Rocky logs a warning and starts fresh from target-table metadata. Upload failure behaviour is governed by the [retry + failure policy](#retry-and-failure-policy) below.
+
+### Retry and Failure Policy
+
+Every remote transfer (upload *or* download) runs inside a wall-clock budget with exponential-backoff retries and a three-state circuit breaker — the same machinery the Databricks and Snowflake adapters already use. Configuration lives under `[state.retry]` in `rocky.toml`; the full field list is in the [configuration reference](/reference/configuration/#stateretry).
+
+```toml
+[state]
+backend = "s3"
+s3_bucket = "${ROCKY_STATE_BUCKET}"
+transfer_timeout_seconds = 300       # total wall-clock ceiling — retries share this budget
+on_upload_failure = "skip"           # "skip" (default) or "fail"
+
+[state.retry]
+max_retries = 3                       # defaults shown; omit the block to use them
+circuit_breaker_threshold = 5
+```
+
+**`on_upload_failure`** controls what happens when retries *and* the circuit breaker are both exhausted:
+
+| Mode | Behaviour | When to use |
+|---|---|---|
+| `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
+| `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
+
+**Terminal outcomes are structured.** Every `state.upload` / `state.download` event now carries an `outcome` field so you can alert on state-layer health without log-message regex:
+
+| `outcome` | Meaning |
+|---|---|
+| `ok` | Transfer completed successfully. |
+| `absent` | Remote state was empty — first run against this backend. |
+| `timeout` | Hit `transfer_timeout_seconds` wall-clock cap. |
+| `error_then_fresh` | Existence check failed; Rocky started fresh. |
+| `transient_exhausted` | `max_retries` exhausted on transient errors. |
+| `budget_exhausted` | `max_retries_per_run` exhausted across transfers. |
+| `circuit_open` | Breaker is open; transfer skipped without attempting. |
+| `skipped_after_failure` | Upload failed, `on_upload_failure = "skip"` applied. |
+
+Run `rocky doctor --check state_rw` at cold start to catch IAM / reachability problems before they show up as end-of-run upload failures.
 
 ## State Per Environment
 

@@ -523,11 +523,15 @@ Global state persistence — where Rocky stores watermarks, run history, and che
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `backend` | string | `"local"` | Storage backend: `"local"`, `"s3"`, `"valkey"`, or `"tiered"`. |
+| `backend` | string | `"local"` | Storage backend: `"local"`, `"s3"`, `"gcs"`, `"valkey"`, or `"tiered"`. |
 | `s3_bucket` | string | | S3 bucket name. Required when `backend` is `"s3"` or `"tiered"`. |
 | `s3_prefix` | string | `"rocky/state/"` | S3 key prefix for state files. |
+| `gcs_bucket` | string | | GCS bucket name. Required when `backend` is `"gcs"`. |
+| `gcs_prefix` | string | `"rocky/state/"` | GCS object prefix for state files. |
 | `valkey_url` | string | | Valkey/Redis connection URL. Required when `backend` is `"valkey"` or `"tiered"`. |
 | `valkey_prefix` | string | `"rocky:state:"` | Valkey key prefix for state entries. |
+| `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it — raise for large state or slow networks. |
+| `on_upload_failure` | string | `"skip"` | What to do when upload exhausts retries + circuit-breaker. `"skip"` logs a warning and continues (state goes stale, next run re-derives); `"fail"` propagates the error. |
 
 **Local (default):**
 
@@ -563,6 +567,35 @@ s3_bucket = "${ROCKY_STATE_BUCKET}"
 ```
 
 Tiered downloads from Valkey first (fast), falls back to S3 (durable). Uploads to both.
+
+### `[state.retry]`
+
+Retry policy applied to transient state-transfer failures (network hiccups, transient 5xx, hung endpoints that hit the per-request HTTP timeout). Same shape as [`[adapter.NAME.retry]`](#adapternameretry) so both layers share one mental model. Retries share the outer `transfer_timeout_seconds` budget — the total wall-clock ceiling is unchanged.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_retries` | int | `3` | Maximum retry attempts per transfer. Set to `0` to disable retries. |
+| `initial_backoff_ms` | int | `1000` | Initial backoff before the first retry. |
+| `max_backoff_ms` | int | `30000` | Cap on exponential backoff growth. |
+| `backoff_multiplier` | float | `2.0` | Multiplier applied between retries (e.g. 2.0 = doubling). |
+| `jitter` | bool | `true` | Add random jitter to prevent concurrent runs from retrying in lockstep. |
+| `circuit_breaker_threshold` | int | `5` | Trip the breaker after this many consecutive failures. `0` disables. |
+| `circuit_breaker_recovery_timeout_secs` | int \| null | `null` | Seconds in `Open` before a half-open trial is allowed. `null` = manual reset only. |
+| `max_retries_per_run` | int \| null | `null` | Cross-transfer retry budget for a single run. `null` = unbounded (per-transfer `max_retries` is the only cap). |
+
+```toml
+[state]
+backend = "s3"
+s3_bucket = "${ROCKY_STATE_BUCKET}"
+on_upload_failure = "fail"    # strict: treat state durability as required
+
+[state.retry]
+max_retries = 5
+circuit_breaker_threshold = 3
+circuit_breaker_recovery_timeout_secs = 30
+```
+
+Terminal outcomes surface as structured `outcome` fields on `state.upload` / `state.download` events — `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, `budget_exhausted`. Grep those instead of the free-form log message when building alerts.
 
 ---
 
