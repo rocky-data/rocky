@@ -271,6 +271,39 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     sensor_granularity: Literal["per_source", "per_group"] = "per_source"
     #: Minimum interval between sensor evaluations in seconds.
     sensor_interval_seconds: int = 300
+    #: Execution mode for the component-backed multi-asset.
+    #:
+    #: * ``"streaming"`` (default) — each ``rocky run`` invocation is
+    #:   buffered by :meth:`RockyResource.run_streaming`, and the
+    #:   component's own ``_emit_results`` translates Rocky's JSON output
+    #:   into Dagster events (materializations, checks, drift
+    #:   observations, anomalies, contract results). Preserves the
+    #:   historical behaviour so upgrading is a no-op.
+    #: * ``"pipes"`` — each ``rocky run`` invocation goes through the
+    #:   Dagster Pipes protocol via :meth:`RockyResource.run_pipes`. The
+    #:   engine emits structured materialization / check events directly
+    #:   over the Pipes wire, and the run viewer's
+    #:   ``MaterializationEvent`` / ``AssetCheckEvaluation`` entries come
+    #:   from the engine rather than from JSON post-processing. Asset-key
+    #:   translation and subset filtering happen at the reader layer via
+    #:   :class:`RockyPipesMessageReader`, so engine-native paths
+    #:   (``[source_type, *components, table]``) resolve to the
+    #:   Dagster-translated keys this component declares. The buffered
+    #:   ``_emit_results`` pass is skipped in this mode — Pipes is the
+    #:   single source of truth for run events, so running both would
+    #:   double-emit.
+    execution_mode: Literal["streaming", "pipes"] = "streaming"
+    #: When ``True``, run ``rocky doctor`` at resource startup and fail
+    #: fast on critical checks. Forwarded to
+    #: :attr:`RockyResource.strict_doctor`. Default ``False`` preserves
+    #: the tolerant behaviour of earlier releases — doctor is not
+    #: invoked on startup.
+    strict_doctor: bool = False
+    #: Per-check allowlist for the strict doctor gate. Forwarded to
+    #: :attr:`RockyResource.strict_doctor_checks`. Empty (default) +
+    #: ``strict_doctor=True`` means fail on any critical check;
+    #: non-empty scopes the fail-fast gate to just those check names.
+    strict_doctor_checks: list[str] = []
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -290,6 +323,8 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             state_path=self.state_path,
             models_dir=self.models_dir,
             contracts_dir=self.contracts_dir,
+            strict_doctor=self.strict_doctor,
+            strict_doctor_checks=self.strict_doctor_checks,
         )
 
     def _get_translator(self) -> RockyDagsterTranslator:
@@ -502,6 +537,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 rocky=rocky,
                 compile_state=compile_state,
                 contract_rules_by_model=contract_rules_by_model,
+                execution_mode=self.execution_mode,
             )
             for group in groups
         ]
@@ -920,12 +956,23 @@ def _make_rocky_asset(
     rocky: RockyResource,
     compile_state: _CompileState,
     contract_rules_by_model: dict[str, ContractRules] | None = None,
+    execution_mode: Literal["streaming", "pipes"] = "streaming",
 ) -> dg.AssetsDefinition:
     """Create a multi-asset that executes ``rocky run`` for one group.
 
     Subset-aware: when Dagster selects only some of the group's assets,
     we run ``--filter id=<source_id>`` per selected source instead of the
     full group filter.
+
+    Two execution modes, controlled by ``execution_mode``:
+
+    * ``"streaming"`` — Rocky's JSON output is post-processed by
+      :func:`_emit_results` to produce Dagster events.
+    * ``"pipes"`` — Rocky emits Dagster events directly over the Pipes
+      protocol; the buffered ``_emit_results`` pass is skipped.
+      Contract check results remain sourced from compile diagnostics in
+      both modes because those are a build-time signal, not a run-time
+      signal.
     """
     contract_rules_by_model = contract_rules_by_model or {}
 
@@ -940,26 +987,38 @@ def _make_rocky_asset(
 
         selected_keys = set(context.selected_asset_keys)
         filters = _select_filters(group, selected_keys, context)
-        results = _run_filters(context, rocky, filters)
 
-        if len(filters) > 1:
-            context.log.info(
-                f"Total across {len(filters)} sources: "
-                f"{sum(r.tables_copied for r in results)} tables in "
-                f"{sum(r.duration_ms for r in results)}ms"
+        if execution_mode == "pipes":
+            yield from _run_filters_pipes(
+                context=context,
+                rocky=rocky,
+                filters=filters,
+                group=group,
+                selected_keys=selected_keys,
             )
+        else:
+            results = _run_filters(context, rocky, filters)
 
-        yield from _emit_results(
-            results=results,
-            check_specs=check_specs,
-            selected_keys=selected_keys,
-            rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
-        )
+            if len(filters) > 1:
+                context.log.info(
+                    f"Total across {len(filters)} sources: "
+                    f"{sum(r.tables_copied for r in results)} tables in "
+                    f"{sum(r.duration_ms for r in results)}ms"
+                )
+
+            yield from _emit_results(
+                results=results,
+                check_specs=check_specs,
+                selected_keys=selected_keys,
+                rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
+            )
 
         # Contract check results — sourced from compile diagnostics, not
         # from the run. Each declared contract spec gets exactly one
         # result (pass/fail) per materialization. Specs without
-        # corresponding rule entries are skipped.
+        # corresponding rule entries are skipped. Emitted in both modes
+        # because compile diagnostics are a build-time signal Pipes
+        # doesn't carry.
         if contract_rules_by_model:
             yield from _emit_contract_check_results(
                 group=group,
@@ -969,6 +1028,51 @@ def _make_rocky_asset(
             )
 
     return _asset
+
+
+def _run_filters_pipes(
+    *,
+    context: dg.AssetExecutionContext,
+    rocky: RockyResource,
+    filters: list[str],
+    group: _GroupBuild,
+    selected_keys: set[dg.AssetKey],
+) -> Iterator[object]:
+    """Execute ``rocky run`` for each filter over the Dagster Pipes protocol.
+
+    Invokes :meth:`RockyResource.run_pipes` per filter with the group's
+    ``rocky_key_to_dagster_key`` lookup plumbed as ``asset_key_fn`` so the
+    engine-native paths in Pipes events resolve to the Dagster keys this
+    component declared. ``include_keys`` is plumbed too so events for
+    unselected tables are dropped at the reader layer — Rocky runs at
+    source granularity even on partial subsets, so without the filter
+    the run viewer would show events for tables the user didn't request.
+    """
+    rocky_key_to_dagster_key = group.rocky_key_to_dagster_key
+
+    def asset_key_fn(path: list[str]) -> dg.AssetKey | None:
+        # Exact tuple match — engine and component agree on the shape
+        # (``[source_type, *components, table]``). Fall through to the
+        # last-segment match for drift events, whose ``asset_key`` is
+        # just the source-side table identifier.
+        key = rocky_key_to_dagster_key.get(tuple(path))
+        if key is not None:
+            return key
+        last = path[-1]
+        for tup, candidate in rocky_key_to_dagster_key.items():
+            if tup and tup[-1] == last:
+                return candidate
+        return None
+
+    for f in filters:
+        context.log.info(f"Executing (pipes): rocky run --filter {f}")
+        invocation = rocky.run_pipes(
+            context,
+            filter=f,
+            asset_key_fn=asset_key_fn,
+            include_keys=selected_keys,
+        )
+        yield from invocation.get_results()
 
 
 def _emit_contract_check_results(
