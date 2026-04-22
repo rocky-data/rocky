@@ -1295,3 +1295,66 @@ def test_verify_version_called_by_run_rocky_streaming():
 
     # If we got here without a Failure, the version check passed and
     # the streaming path ran successfully.
+
+
+# ---------------------------------------------------------------------------
+# doctor — --check filter argv plumbing
+# ---------------------------------------------------------------------------
+
+
+def _doctor_json() -> str:
+    """Minimal well-formed DoctorResult JSON payload."""
+    return json.dumps(
+        {
+            "command": "doctor",
+            "overall": "healthy",
+            "checks": [],
+            "suggestions": [],
+        }
+    )
+
+
+def test_doctor_without_check_kwarg_omits_check_flag():
+    """Default ``doctor()`` call must not emit ``--check`` — backwards compat."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return _doctor_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.doctor()
+
+    assert captured[0] == ["doctor"]
+    assert "--check" not in captured[0]
+
+
+def test_doctor_with_check_kwarg_appends_check_flag():
+    """``doctor(check="state_rw")`` must forward ``--check state_rw`` to the CLI."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return _doctor_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.doctor(check="state_rw")
+
+    assert captured[0] == ["doctor", "--check", "state_rw"]
+
+
+def test_doctor_with_check_kwarg_forwards_arbitrary_id():
+    """The Python side must not pre-validate the check id — the engine owns that set."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return _doctor_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.doctor(check="totally-made-up-id")
+
+    assert captured[0] == ["doctor", "--check", "totally-made-up-id"]

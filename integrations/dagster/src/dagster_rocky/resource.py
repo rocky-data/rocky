@@ -1606,9 +1606,21 @@ class RockyResource(dg.ConfigurableResource):
     # Doctor and resume commands                                         #
     # ------------------------------------------------------------------ #
 
-    def doctor(self) -> DoctorResult:
-        """Run ``rocky doctor`` and return the parsed health-check results."""
-        return _parse_rocky_json(self._run_rocky(["doctor"]), DoctorResult, command="doctor")
+    def doctor(self, *, check: str | None = None) -> DoctorResult:
+        """Run ``rocky doctor`` and return the parsed health-check results.
+
+        Args:
+            check: Optional single-check id (e.g. ``"state_rw"``) forwarded
+                as ``--check <id>``. When set, the engine runs only that
+                check — the output is still a :class:`DoctorResult` with
+                the same schema, just fewer entries in ``checks``. The set
+                of valid ids lives on the engine side; invalid values are
+                surfaced by the engine rather than pre-validated here.
+        """
+        args = ["doctor"]
+        if check is not None:
+            args.extend(["--check", check])
+        return _parse_rocky_json(self._run_rocky(args), DoctorResult, command="doctor")
 
     def state_health(self, *, probe_write: bool = False) -> StateHealthResult:
         """Return a live snapshot of Rocky's state-backend health.
@@ -1623,10 +1635,11 @@ class RockyResource(dg.ConfigurableResource):
         The cheap path (the default, ``probe_write=False``) does one
         ``rocky history`` subprocess plus a ``tomllib`` read of
         :attr:`config_path` — bounded sub-second on any backend. When
-        ``probe_write=True`` we additionally invoke ``rocky doctor``
-        (which reuses the engine's ``probe_state_backend`` helper to
-        do a bounded put/get/delete round-trip against the configured
-        backend) and translate its ``state_rw`` check into the
+        ``probe_write=True`` we additionally invoke
+        ``rocky doctor --check state_rw`` (which reuses the engine's
+        ``probe_state_backend`` helper to do a bounded put/get/delete
+        round-trip against the configured backend) and translate its
+        ``state_rw`` check into the
         :attr:`~.types.StateHealthResult.probe_outcome` /
         :attr:`~.types.StateHealthResult.probe_duration_ms` /
         :attr:`~.types.StateHealthResult.probe_error` fields.
