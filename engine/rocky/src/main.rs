@@ -149,6 +149,18 @@ enum Command {
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
+        /// Warm the schema cache for every discovered source.
+        ///
+        /// For each `(catalog, schema)` pair reachable via the source
+        /// adapter, issues one `batch_describe_schema` round-trip and
+        /// persists the per-table columns to `state.redb::schema_cache`.
+        /// Subsequent `rocky compile` / `rocky lsp` invocations pick up
+        /// the entries via the Arc 7 wave 2 wave-2 schema cache instead
+        /// of typechecking leaf models as `Unknown`. Errors on individual
+        /// sources are logged and skipped — one bad source does not
+        /// abort the warm-up.
+        #[arg(long)]
+        with_schemas: bool,
     },
 
     /// Generate SQL without executing (dry-run)
@@ -963,8 +975,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
-        Command::Discover { pipeline } => {
-            rocky_cli::commands::discover(&cli.config, pipeline.as_deref(), json).await
+        Command::Discover {
+            pipeline,
+            with_schemas,
+        } => {
+            rocky_cli::commands::discover(
+                &cli.config,
+                pipeline.as_deref(),
+                &cli.state_path,
+                with_schemas,
+                json,
+            )
+            .await
         }
         Command::Plan { filter, pipeline } => {
             rocky_cli::commands::plan(&cli.config, filter.as_deref(), pipeline.as_deref(), json)
