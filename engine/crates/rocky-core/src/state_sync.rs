@@ -14,8 +14,10 @@ use bytes::Bytes;
 use thiserror::Error;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use crate::config::{StateBackend, StateConfig};
+use crate::circuit_breaker::TransitionOutcome;
+use crate::config::{RetryConfig, StateBackend, StateConfig, StateUploadFailureMode};
 use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
+use crate::retry_budget::RetryBudget;
 
 #[derive(Debug, Error)]
 pub enum StateSyncError {
@@ -45,6 +47,14 @@ pub enum StateSyncError {
 
     #[error("state transfer timed out after {0:?}")]
     Timeout(Duration),
+
+    #[error(
+        "state backend circuit breaker tripped after {consecutive_failures} consecutive transient failures"
+    )]
+    CircuitOpen { consecutive_failures: u32 },
+
+    #[error("state retry budget exhausted (limit {limit}); aborting remaining retries")]
+    RetryBudgetExhausted { limit: u32 },
 }
 
 /// State file name within the configured prefix.
@@ -124,12 +134,27 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
 }
 
 /// Uploads state from a local file to remote storage after a run.
+///
+/// Applies `config.retry` to transient failures and `config.on_upload_failure`
+/// to the final result — by default (`Skip`) a post-retry failure is logged
+/// and reported back as `Ok` so the run continues in degraded mode, matching
+/// the de-facto behaviour of existing callers that `warn + continue` on upload
+/// errors. Set `on_upload_failure = "fail"` for strict environments that must
+/// treat state durability as a hard requirement.
 pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     if !local_path.exists() {
         debug!("No local state file to upload");
         return Ok(());
     }
+    let result = dispatch_upload(config, local_path).await;
+    apply_upload_failure_policy(config, result)
+}
 
+/// Internal upload dispatch — runs the raw upload (with retry) without
+/// applying the `on_upload_failure` policy. Tiered recursion uses this
+/// directly so the skip/fail decision is evaluated exactly once at the
+/// outermost `upload_state` call, not per-leg.
+async fn dispatch_upload(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
@@ -140,14 +165,30 @@ pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(),
                 StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
             })?;
             let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
-            upload_to_object_store("s3", bucket, prefix, local_path, transfer_timeout(config)).await
+            upload_to_object_store(
+                "s3",
+                bucket,
+                prefix,
+                local_path,
+                transfer_timeout(config),
+                &config.retry,
+            )
+            .await
         }
         StateBackend::Gcs => {
             let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
             })?;
             let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
-            upload_to_object_store("gs", bucket, prefix, local_path, transfer_timeout(config)).await
+            upload_to_object_store(
+                "gs",
+                bucket,
+                prefix,
+                local_path,
+                transfer_timeout(config),
+                &config.retry,
+            )
+            .await
         }
         StateBackend::Valkey => upload_to_valkey(config, local_path).await,
         StateBackend::Tiered => {
@@ -162,14 +203,40 @@ pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(),
                 ..config.clone()
             };
 
-            // Valkey first (fast, best-effort)
-            if let Err(e) = Box::pin(upload_state(&valkey_config, local_path)).await {
+            // Valkey first (fast, best-effort). Recurse into the *inner*
+            // dispatch so `on_upload_failure` is not applied here — the
+            // outer `upload_state` owns that decision for the tiered leg
+            // as a whole.
+            if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path)).await {
                 warn!(error = %e, "Valkey upload failed (non-fatal, S3 is durable)");
             }
 
             // S3 second (durable, required)
-            Box::pin(upload_state(&s3_config, local_path)).await
+            Box::pin(dispatch_upload(&s3_config, local_path)).await
         }
+    }
+}
+
+/// Apply the `on_upload_failure` policy to a terminal upload result. `Skip`
+/// converts Err → Ok with a structured warn; `Fail` propagates Err unchanged.
+fn apply_upload_failure_policy(
+    config: &StateConfig,
+    result: Result<(), StateSyncError>,
+) -> Result<(), StateSyncError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => match config.on_upload_failure {
+            StateUploadFailureMode::Skip => {
+                warn!(
+                    error = %e,
+                    outcome = "skipped_after_failure",
+                    "state upload failed after retries; continuing in degraded mode \
+                     (next run's discover will re-derive state)"
+                );
+                Ok(())
+            }
+            StateUploadFailureMode::Fail => Err(e),
+        },
     }
 }
 
@@ -203,16 +270,17 @@ async fn download_from_object_store(
                     provider.download_file(STATE_FILE, local_path).await?;
                     info!(
                         size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        outcome = "ok",
                         "state restored from object store"
                     );
                     Ok(())
                 }
                 Ok(false) => {
-                    info!("No existing state in object store — starting fresh");
+                    info!(outcome = "absent", "No existing state in object store — starting fresh");
                     Ok(())
                 }
                 Err(e) => {
-                    warn!(error = %e, "state existence check failed (non-fatal, starting fresh)");
+                    warn!(error = %e, outcome = "error_then_fresh", "state existence check failed (non-fatal, starting fresh)");
                     Ok(())
                 }
             }
@@ -224,12 +292,18 @@ async fn download_from_object_store(
 }
 
 /// Upload `STATE_FILE` to an object store rooted at `<scheme>://<bucket>/<prefix>`.
+///
+/// Wraps the put in a retry loop driven by `retry` (shared-shape
+/// [`RetryConfig`]) and a call-local circuit breaker + retry budget. The
+/// outer `with_transfer_timeout` still caps total wall-clock, so retries
+/// share — not extend — the configured transfer budget.
 async fn upload_to_object_store(
     scheme: &str,
     bucket: &str,
     prefix: &str,
     local_path: &Path,
     timeout: Duration,
+    retry: &RetryConfig,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
     let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -244,11 +318,22 @@ async fn upload_to_object_store(
             uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
             "uploading state to object store"
         );
-        with_transfer_timeout(timeout, async {
-            provider.upload_file(local_path, STATE_FILE).await?;
-            Ok::<(), StateSyncError>(())
+        let retries = with_transfer_timeout(timeout, async {
+            retry_transient(retry, "state.upload.object_store", || async {
+                provider
+                    .upload_file(local_path, STATE_FILE)
+                    .await
+                    .map_err(StateSyncError::from)
+            })
+            .await
         })
         .await?;
+        info!(
+            bytes = size_bytes,
+            retries,
+            outcome = "ok",
+            "state upload complete"
+        );
         Ok(())
     }
     .instrument(span)
@@ -271,6 +356,7 @@ where
         Err(_) => {
             warn!(
                 duration_ms = timeout.as_millis() as u64,
+                outcome = "timeout",
                 "state transfer exceeded timeout budget"
             );
             Err(StateSyncError::Timeout(timeout))
@@ -327,10 +413,13 @@ async fn download_from_valkey(
                         let size = std::fs::metadata(&local_for_task)
                             .map(|m| m.len())
                             .unwrap_or(0);
-                        info!(size, "state restored from Valkey");
+                        info!(size, outcome = "ok", "state restored from Valkey");
                     }
                     None => {
-                        info!("No existing state in Valkey — starting fresh");
+                        info!(
+                            outcome = "absent",
+                            "No existing state in Valkey — starting fresh"
+                        );
                     }
                 }
                 Ok(())
@@ -369,34 +458,51 @@ async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(),
     let data = std::fs::read(local_path)?;
     let size_bytes = data.len() as u64;
     let timeout = transfer_timeout(config);
+    let retry = &config.retry;
 
     let span = info_span!("state.upload", backend = "valkey", size_bytes);
     async move {
         info!(key = %key, size = size_bytes, "uploading state to Valkey");
-        with_transfer_timeout(timeout, async move {
-            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
-                let client =
-                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-                let mut conn = client
-                    .get_connection()
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+        let retries = with_transfer_timeout(timeout, async {
+            retry_transient(retry, "state.upload.valkey", || {
+                let url = url.clone();
+                let key = key.clone();
+                let data = data.clone();
+                async move {
+                    let join =
+                        tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
+                            let client = redis::Client::open(url)
+                                .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                            let mut conn = client
+                                .get_connection()
+                                .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-                redis::cmd("SET")
-                    .arg(&key)
-                    .arg(data)
-                    .query::<()>(&mut conn)
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-                Ok(())
+                            redis::cmd("SET")
+                                .arg(&key)
+                                .arg(data)
+                                .query::<()>(&mut conn)
+                                .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                            Ok(())
+                        })
+                        .await;
+                    match join {
+                        Ok(inner) => inner,
+                        Err(e) => Err(StateSyncError::Valkey(format!(
+                            "valkey worker task failed: {e}"
+                        ))),
+                    }
+                }
             })
-            .await;
-            match join {
-                Ok(inner) => inner,
-                Err(e) => Err(StateSyncError::Valkey(format!(
-                    "valkey worker task failed: {e}"
-                ))),
-            }
+            .await
         })
-        .await
+        .await?;
+        info!(
+            bytes = size_bytes,
+            retries,
+            outcome = "ok",
+            "state upload complete"
+        );
+        Ok(())
     }
     .instrument(span)
     .await
@@ -558,6 +664,154 @@ async fn probe_valkey(config: &StateConfig) -> Result<(), StateSyncError> {
     .await
 }
 
+/// Drive `op` through the shared retry + circuit-breaker + budget policy.
+///
+/// Returns the number of retries consumed by the successful attempt (0 when
+/// the first try wins) so the caller can stamp `retries` on the terminal
+/// span event. On permanent failure returns the underlying
+/// [`StateSyncError`] — or [`StateSyncError::CircuitOpen`] /
+/// [`StateSyncError::RetryBudgetExhausted`] when the abort happens inside
+/// this helper rather than at the transport layer.
+///
+/// The circuit breaker and retry budget are built per-call from `cfg`. This
+/// keeps state-sync's lifecycle simple (each upload/download is independent)
+/// and mirrors the `[adapter.databricks.retry]` shape end-to-end for
+/// operational parity. Cross-call breaker state could be wired in later via
+/// a state-sync context struct, but no caller needs that today.
+async fn retry_transient<F, Fut>(
+    cfg: &RetryConfig,
+    op_name: &str,
+    mut op: F,
+) -> Result<u32, StateSyncError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), StateSyncError>>,
+{
+    let breaker = cfg.build_circuit_breaker();
+    let budget = RetryBudget::from_config(cfg.max_retries_per_run);
+
+    if let Err(e) = breaker.check() {
+        return Err(StateSyncError::CircuitOpen {
+            consecutive_failures: e.consecutive_failures,
+        });
+    }
+
+    for attempt in 0..=cfg.max_retries {
+        match op().await {
+            Ok(()) => {
+                if breaker.record_success() == TransitionOutcome::Recovered {
+                    info!(
+                        op = op_name,
+                        outcome = "recovered",
+                        "state backend circuit breaker recovered"
+                    );
+                }
+                return Ok(attempt);
+            }
+            Err(err) if is_transient(&err) => {
+                if breaker.record_failure(&err.to_string()) == TransitionOutcome::Tripped {
+                    warn!(
+                        op = op_name,
+                        outcome = "circuit_open",
+                        error = %err,
+                        "state backend circuit breaker tripped"
+                    );
+                }
+                if attempt < cfg.max_retries {
+                    if !budget.try_consume() {
+                        let limit = budget.total().unwrap_or(0);
+                        warn!(
+                            op = op_name,
+                            attempt = attempt + 1,
+                            budget_limit = limit,
+                            error = %err,
+                            outcome = "budget_exhausted",
+                            "state retry budget exhausted; aborting further retries"
+                        );
+                        return Err(StateSyncError::RetryBudgetExhausted { limit });
+                    }
+                    let backoff_ms = compute_backoff(cfg, attempt);
+                    warn!(
+                        op = op_name,
+                        attempt = attempt + 1,
+                        max_retries = cfg.max_retries,
+                        backoff_ms,
+                        error = %err,
+                        outcome = "retry",
+                        "state transient error, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                warn!(
+                    op = op_name,
+                    attempts = attempt + 1,
+                    error = %err,
+                    outcome = "transient_exhausted",
+                    "state transient retries exhausted"
+                );
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("retry loop always returns within the for body")
+}
+
+/// Classify a state-sync error for retry decisions.
+///
+/// Network/SDK-level errors and timeouts are treated as transient — a
+/// fresh attempt might clear a single flake. Config errors and local disk
+/// I/O are permanent; retrying them wastes budget. The breaker/budget
+/// sentinels are already terminal by construction and must not re-enter
+/// the retry loop.
+fn is_transient(err: &StateSyncError) -> bool {
+    match err {
+        StateSyncError::S3Download(_)
+        | StateSyncError::S3Upload(_)
+        | StateSyncError::GcsDownload(_)
+        | StateSyncError::GcsUpload(_)
+        | StateSyncError::Valkey(_)
+        | StateSyncError::Timeout(_) => true,
+        StateSyncError::ObjectStore(ObjectStoreError::Backend(_)) => true,
+        StateSyncError::ObjectStore(
+            ObjectStoreError::InvalidUri(..)
+            | ObjectStoreError::UnsupportedScheme(_)
+            | ObjectStoreError::Io(_),
+        )
+        | StateSyncError::Io(_)
+        | StateSyncError::MissingConfig(..)
+        | StateSyncError::CircuitOpen { .. }
+        | StateSyncError::RetryBudgetExhausted { .. } => false,
+    }
+}
+
+/// Compute exponential-with-jitter backoff (ms) for retry attempt `attempt`.
+///
+/// Intentionally duplicated from `rocky-databricks::connector::compute_backoff`
+/// and `rocky-snowflake::connector::compute_backoff`. A follow-up PR should
+/// hoist the three copies into a single shared helper; this PR keeps scope
+/// narrow to the state-backend wiring.
+fn compute_backoff(cfg: &RetryConfig, attempt: u32) -> u64 {
+    let base = (cfg.initial_backoff_ms as f64) * cfg.backoff_multiplier.powi(attempt as i32);
+    let capped = base.min(cfg.max_backoff_ms as f64) as u64;
+
+    if cfg.jitter {
+        let jitter_range = capped / 4;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        let jitter = nanos % (jitter_range.max(1));
+        capped
+            .saturating_sub(jitter_range / 2)
+            .saturating_add(jitter)
+    } else {
+        capped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +922,173 @@ mod tests {
         assert_ne!(a, b, "probe_key should produce unique values per call");
         assert!(a.starts_with("doctor-probe-"));
         assert!(a.ends_with(".marker"));
+    }
+
+    #[test]
+    fn test_default_on_upload_failure_is_skip() {
+        let config = StateConfig::default();
+        assert_eq!(config.on_upload_failure, StateUploadFailureMode::Skip);
+    }
+
+    #[test]
+    fn test_is_transient_network_and_timeout() {
+        assert!(is_transient(&StateSyncError::S3Upload("boom".into())));
+        assert!(is_transient(&StateSyncError::S3Download("boom".into())));
+        assert!(is_transient(&StateSyncError::GcsUpload("boom".into())));
+        assert!(is_transient(&StateSyncError::GcsDownload("boom".into())));
+        assert!(is_transient(&StateSyncError::Valkey("boom".into())));
+        assert!(is_transient(&StateSyncError::Timeout(Duration::from_secs(
+            1
+        ))));
+    }
+
+    #[test]
+    fn test_is_transient_permanent_errors_not_retried() {
+        assert!(!is_transient(&StateSyncError::MissingConfig(
+            "s3".into(),
+            "bucket".into()
+        )));
+        assert!(!is_transient(&StateSyncError::CircuitOpen {
+            consecutive_failures: 5
+        }));
+        assert!(!is_transient(&StateSyncError::RetryBudgetExhausted {
+            limit: 3
+        }));
+    }
+
+    #[test]
+    fn test_compute_backoff_without_jitter() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 1000,
+            backoff_multiplier: 2.0,
+            jitter: false,
+            ..RetryConfig::default()
+        };
+        assert_eq!(compute_backoff(&cfg, 0), 100);
+        assert_eq!(compute_backoff(&cfg, 1), 200);
+        assert_eq!(compute_backoff(&cfg, 2), 400);
+        assert_eq!(compute_backoff(&cfg, 3), 800);
+        // caps at max_backoff_ms
+        assert_eq!(compute_backoff(&cfg, 10), 1000);
+    }
+
+    #[test]
+    fn test_compute_backoff_jitter_within_bounds() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 400,
+            max_backoff_ms: 10_000,
+            backoff_multiplier: 2.0,
+            jitter: true,
+            ..RetryConfig::default()
+        };
+        // With jitter, the returned value is within ±25 % of the base
+        // (400 ms at attempt=0). Allow 300..=500 as the safe envelope.
+        for _ in 0..50 {
+            let b = compute_backoff(&cfg, 0);
+            assert!(
+                (300..=500).contains(&b),
+                "jittered backoff out of envelope: {b}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_transient_succeeds_after_two_transient_failures() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+            backoff_multiplier: 2.0,
+            jitter: false,
+            ..RetryConfig::default()
+        };
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient(&cfg, "test", || {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(StateSyncError::S3Upload(format!("flake {n}")))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2, "should have taken 2 retries");
+    }
+
+    #[tokio::test]
+    async fn test_retry_transient_gives_up_after_max_retries() {
+        let cfg = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+            backoff_multiplier: 2.0,
+            jitter: false,
+            ..RetryConfig::default()
+        };
+        let result = retry_transient(&cfg, "test", || async {
+            Err(StateSyncError::S3Upload("always fails".into()))
+        })
+        .await;
+        assert!(matches!(result, Err(StateSyncError::S3Upload(_))));
+    }
+
+    #[tokio::test]
+    async fn test_retry_transient_does_not_retry_permanent_errors() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+            backoff_multiplier: 2.0,
+            jitter: false,
+            ..RetryConfig::default()
+        };
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient(&cfg, "test", || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(StateSyncError::MissingConfig("s3".into(), "bucket".into())) }
+        })
+        .await;
+        assert!(matches!(result, Err(StateSyncError::MissingConfig(..))));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "permanent errors should not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_budget_exhaustion_aborts_early() {
+        let cfg = RetryConfig {
+            max_retries: 5,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+            backoff_multiplier: 2.0,
+            jitter: false,
+            max_retries_per_run: Some(1),
+            ..RetryConfig::default()
+        };
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient(&cfg, "test", || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(StateSyncError::S3Upload("always flakes".into())) }
+        })
+        .await;
+        // With budget=1: first attempt fails → consume retry slot → one
+        // retry attempt → fails → budget exhausted → return
+        // RetryBudgetExhausted. Total 2 calls to op() before we error.
+        assert!(matches!(
+            result,
+            Err(StateSyncError::RetryBudgetExhausted { limit: 1 })
+        ));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "budget should abort after first retry",
+        );
     }
 }

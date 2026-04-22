@@ -2214,6 +2214,33 @@
             "null"
           ]
         },
+        "on_upload_failure": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/StateUploadFailureMode"
+            }
+          ],
+          "default": "skip",
+          "description": "What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`]."
+        },
+        "retry": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RetryConfig"
+            }
+          ],
+          "default": {
+            "backoff_multiplier": 2.0,
+            "circuit_breaker_recovery_timeout_secs": null,
+            "circuit_breaker_threshold": 5,
+            "initial_backoff_ms": 1000,
+            "jitter": true,
+            "max_backoff_ms": 30000,
+            "max_retries": 3,
+            "max_retries_per_run": null
+          },
+          "description": "Retry policy applied to transient state-transfer failures (network hiccups, hung endpoints that hit the per-request HTTP timeout, transient 5xx, etc.). Shares the same shape as the adapter retry config so operators can reason about both with a single mental model. Retries share the outer `transfer_timeout_seconds` budget, so the total wall-clock ceiling is unchanged."
+        },
         "s3_bucket": {
           "description": "S3 bucket for state persistence",
           "type": [
@@ -2251,6 +2278,25 @@
         }
       },
       "type": "object"
+    },
+    "StateUploadFailureMode": {
+      "description": "Policy applied when state upload fails after retries + circuit-breaker are exhausted. See [`StateConfig::on_upload_failure`].",
+      "oneOf": [
+        {
+          "description": "Log a warning and continue the run successfully. State becomes stale until the next healthy upload; the next run's `discover` re-derives watermarks from target-table metadata. Trades state durability for run liveness — matches the de-facto behaviour of the pre-retry callers in `rocky run`, which already `warn + continue` on a failed upload.",
+          "enum": [
+            "skip"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Propagate the error to the caller. Appropriate for strict environments where state durability matters more than liveness (e.g. long-running backfills where re-deriving watermarks is prohibitively expensive).",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "TableRef": {
       "additionalProperties": false,
@@ -2613,6 +2659,17 @@
         "backend": "local",
         "gcs_bucket": null,
         "gcs_prefix": null,
+        "on_upload_failure": "skip",
+        "retry": {
+          "backoff_multiplier": 2.0,
+          "circuit_breaker_recovery_timeout_secs": null,
+          "circuit_breaker_threshold": 5,
+          "initial_backoff_ms": 1000,
+          "jitter": true,
+          "max_backoff_ms": 30000,
+          "max_retries": 3,
+          "max_retries_per_run": null
+        },
         "s3_bucket": null,
         "s3_prefix": null,
         "transfer_timeout_seconds": 300,

@@ -272,6 +272,10 @@ export type Dialect = "databricks" | "snowflake" | "bigquery" | "duckdb";
  * State storage backend variants.
  */
 export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
+/**
+ * Policy applied when state upload fails after retries + circuit-breaker are exhausted. See [`StateConfig::on_upload_failure`].
+ */
+export type StateUploadFailureMode = "skip" | "fail";
 
 /**
  * Top-level Rocky configuration (v2 format).
@@ -1157,6 +1161,14 @@ export interface StateConfig {
    * GCS key prefix (default: "rocky/state/")
    */
   gcs_prefix?: string | null;
+  /**
+   * What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
+   */
+  on_upload_failure?: StateUploadFailureMode & string;
+  /**
+   * Retry policy applied to transient state-transfer failures (network hiccups, hung endpoints that hit the per-request HTTP timeout, transient 5xx, etc.). Shares the same shape as the adapter retry config so operators can reason about both with a single mental model. Retries share the outer `transfer_timeout_seconds` budget, so the total wall-clock ceiling is unchanged.
+   */
+  retry?: RetryConfig;
   /**
    * S3 bucket for state persistence
    */

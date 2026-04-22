@@ -410,6 +410,26 @@ impl std::fmt::Display for StateBackend {
     }
 }
 
+/// Policy applied when state upload fails after retries + circuit-breaker
+/// are exhausted. See [`StateConfig::on_upload_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateUploadFailureMode {
+    /// Log a warning and continue the run successfully. State becomes
+    /// stale until the next healthy upload; the next run's `discover`
+    /// re-derives watermarks from target-table metadata. Trades state
+    /// durability for run liveness — matches the de-facto behaviour of
+    /// the pre-retry callers in `rocky run`, which already `warn + continue`
+    /// on a failed upload.
+    #[default]
+    Skip,
+    /// Propagate the error to the caller. Appropriate for strict
+    /// environments where state durability matters more than liveness
+    /// (e.g. long-running backfills where re-deriving watermarks is
+    /// prohibitively expensive).
+    Fail,
+}
+
 /// State persistence configuration.
 ///
 /// Controls where Rocky stores watermarks and anomaly history between runs.
@@ -442,6 +462,20 @@ pub struct StateConfig {
     /// Defaults to 300s; raise for large state or slow networks.
     #[serde(default = "default_state_transfer_timeout_secs")]
     pub transfer_timeout_seconds: u64,
+    /// Retry policy applied to transient state-transfer failures (network
+    /// hiccups, hung endpoints that hit the per-request HTTP timeout,
+    /// transient 5xx, etc.). Shares the same shape as the adapter retry
+    /// config so operators can reason about both with a single mental
+    /// model. Retries share the outer `transfer_timeout_seconds` budget,
+    /// so the total wall-clock ceiling is unchanged.
+    #[serde(default)]
+    pub retry: RetryConfig,
+    /// What to do when state upload exhausts retries + circuit-breaker.
+    /// Defaults to `skip` — rocky continues the run and the next run
+    /// re-derives state from target-table metadata. See
+    /// [`StateUploadFailureMode`].
+    #[serde(default)]
+    pub on_upload_failure: StateUploadFailureMode,
 }
 
 impl Default for StateConfig {
@@ -455,6 +489,8 @@ impl Default for StateConfig {
             valkey_url: None,
             valkey_prefix: None,
             transfer_timeout_seconds: default_state_transfer_timeout_secs(),
+            retry: RetryConfig::default(),
+            on_upload_failure: StateUploadFailureMode::default(),
         }
     }
 }
