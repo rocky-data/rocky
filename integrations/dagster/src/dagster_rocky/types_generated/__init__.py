@@ -143,6 +143,9 @@ from .test_schema import TestFailure, TestOutput
 # Compare command
 from .compare_schema import CompareOutput, TableCompareResult
 
+# Cost command (historical per-run cost attribution)
+from .cost_schema import CostOutput, PerModelCostHistorical
+
 # Compact command — canonical source for NamedStatement (also used by archive)
 from .compact_schema import CompactOutput, NamedStatement
 
@@ -259,6 +262,9 @@ __all__ = [
     # compare
     "CompareOutput",
     "TableCompareResult",
+    # cost
+    "CostOutput",
+    "PerModelCostHistorical",
     # compact (canonical source for NamedStatement)
     "CompactOutput",
     "NamedStatement",

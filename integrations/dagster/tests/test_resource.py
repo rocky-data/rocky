@@ -1016,6 +1016,79 @@ def test_metrics_uses_http_when_server_url_is_set():
 
 
 # ---------------------------------------------------------------------------
+# cost — historical per-run cost attribution
+# ---------------------------------------------------------------------------
+
+
+def _cost_json(run_id: str = "run-abc123") -> str:
+    """Return a minimal valid CostOutput JSON payload for `run_id`."""
+    return json.dumps(
+        {
+            "version": "1.0.0",
+            "command": "cost",
+            "run_id": run_id,
+            "trigger": "Manual",
+            "status": "Success",
+            "started_at": "2026-04-22T10:00:00Z",
+            "finished_at": "2026-04-22T10:00:05Z",
+            "duration_ms": 5000,
+            "total_duration_ms": 5000,
+            "total_bytes_scanned": 1024,
+            "total_bytes_written": 512,
+            "total_cost_usd": 0.0001,
+            "adapter_type": "duckdb",
+            "per_model": [
+                {
+                    "model_name": "orders",
+                    "status": "Success",
+                    "duration_ms": 5000,
+                    "rows_affected": 100,
+                    "bytes_scanned": 1024,
+                    "bytes_written": 512,
+                    "cost_usd": 0.0001,
+                },
+            ],
+        }
+    )
+
+
+def test_cost_defaults_to_latest():
+    """``cost()`` with no arg should shell out with ``cost latest``."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return _cost_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.cost()
+
+    assert captured[0] == ["cost", "latest"]
+    assert result.command == "cost"
+    assert result.run_id == "run-abc123"
+    assert result.total_cost_usd == 0.0001
+    assert len(result.per_model) == 1
+    assert result.per_model[0].model_name == "orders"
+
+
+def test_cost_passes_explicit_run_id():
+    """A specific run_id is forwarded positionally to the CLI."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return _cost_json(run_id="run-xyz789")
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.cost("run-xyz789")
+
+    assert captured[0] == ["cost", "run-xyz789"]
+    assert result.run_id == "run-xyz789"
+
+
+# ---------------------------------------------------------------------------
 # _http_get
 # ---------------------------------------------------------------------------
 

@@ -46,6 +46,7 @@ from .types import (
     ColumnLineageResult,
     CompileResult,
     ConformanceResult,
+    CostOutput,
     DagResult,
     DiscoverResult,
     DoctorResult,
@@ -1167,6 +1168,22 @@ class RockyResource(dg.ConfigurableResource):
         if model is not None:
             args.extend(["--model", model])
         return _parse_rocky_json(self._run_rocky(args), OptimizeResult, command="optimize")
+
+    def cost(self, run_id: str = "latest") -> CostOutput:
+        """Run ``rocky cost <run_id>`` and return the historical cost attribution.
+
+        Reads the persisted ``RunRecord`` from the embedded state store and
+        rolls per-model duration / bytes_scanned / bytes_written / cost_usd up
+        from the stored materialization records. The same formula
+        ``rocky_core::cost::compute_observed_cost_usd`` applied at the end of a
+        live run is re-applied here, so the historical surface stays consistent
+        with the per-run summary on ``RunOutput``.
+
+        Args:
+            run_id: Specific run ID to attribute, or the literal ``"latest"``
+                (the default) to look up the most recent recorded run.
+        """
+        return _parse_rocky_json(self._run_rocky(["cost", run_id]), CostOutput, command="cost")
 
     # ------------------------------------------------------------------ #
     # AI Level 3 commands                                                #

@@ -843,6 +843,7 @@ from .types_generated import (  # noqa: E402, F401
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,
+    CostOutput,
     DagEdgeOutput,
     DagNodeOutput,
     DagOutput,
@@ -870,6 +871,7 @@ from .types_generated import (  # noqa: E402, F401
     OptimizeRecommendation,
     PartitionShapeOutput,
     PermissionSummary,
+    PerModelCostHistorical,
     PhaseTimings,
     PlanOutput,
     ReplayModelOutput,
@@ -918,6 +920,7 @@ RockyOutput = (
     | ModelHistoryResult
     | MetricsResult
     | OptimizeResult
+    | CostOutput
     | AiResult
     | AiSyncResult
     | AiExplainResult
@@ -944,6 +947,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "ci-diff": CiDiffOutput,
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
+    "cost": CostOutput,
     "ai": AiResult,
     "ai_sync": AiSyncResult,
     "ai_explain": AiExplainResult,
