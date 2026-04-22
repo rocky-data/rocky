@@ -674,6 +674,11 @@ pub async fn run_snapshot(
             },
             partition: None,
             cost_usd: None,
+            // snapshot_scd2 uses `execute_query` (multi-statement) and
+            // doesn't thread stats through yet — BigQuery snapshot cost
+            // attribution is a follow-up wave.
+            bytes_scanned: None,
+            bytes_written: None,
         });
     } else {
         output.tables_failed = 1;

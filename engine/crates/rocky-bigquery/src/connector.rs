@@ -9,7 +9,9 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use rocky_core::ir::{ColumnInfo, TableRef};
-use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+};
 
 use crate::auth::BigQueryAuth;
 use crate::dialect::BigQueryDialect;
@@ -265,6 +267,11 @@ impl WarehouseAdapter for BigQueryAdapter {
             .map_err(AdapterError::new)
     }
 
+    async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
+        let response = self.run_query(sql).await.map_err(AdapterError::new)?;
+        Ok(stats_from_response(&response))
+    }
+
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
         let response = self.run_query(sql).await.map_err(AdapterError::new)?;
 
@@ -331,6 +338,41 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 }
 
+/// Extract [`ExecutionStats`] from a successful [`BigQueryResponse`].
+///
+/// # The "billed-in-scanned" slot
+///
+/// The field is called `bytes_scanned` but BigQuery emits **two** byte
+/// counts per query job: `totalBytesProcessed` (what the engine read)
+/// and `totalBytesBilled` (what the customer pays for — strictly `>=`
+/// processed due to the 10 MB per-query minimum floor). This function
+/// stores **billed** bytes in [`ExecutionStats::bytes_scanned`]
+/// because [`rocky_core::cost::compute_observed_cost_usd`] multiplies
+/// that field by the per-TB rate to produce the dollar figure
+/// displayed in `rocky cost`. Using `processed` here would
+/// under-report the cost for sub-10 MB queries. The semantic impurity
+/// (field name says "scanned" but holds "billed") is accepted so that
+/// every downstream consumer can keep treating `bytes_scanned` as the
+/// single cost driver without BigQuery-specific branching.
+///
+/// Returns an all-`None` [`ExecutionStats`] when BigQuery omits the
+/// `statistics` block (most commonly for DDL that completes without a
+/// query job) or when `totalBytesBilled` is missing / unparseable.
+/// `bytes_written` is always `None` — BigQuery query jobs don't expose
+/// a bytes-written figure naturally.
+fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
+    let bytes_scanned = response
+        .statistics
+        .as_ref()
+        .and_then(|s| s.query.as_ref())
+        .and_then(BigQueryQueryStatistics::total_bytes_billed_u64);
+    ExecutionStats {
+        bytes_scanned,
+        bytes_written: None,
+        rows_affected: None,
+    }
+}
+
 // -- BigQuery REST API types --
 
 #[derive(Debug, Serialize)]
@@ -354,6 +396,58 @@ struct BigQueryResponse {
     #[allow(dead_code)]
     #[serde(default)]
     total_rows: Option<String>,
+    /// Query-job statistics. Populated for completed query jobs;
+    /// BigQuery may omit the field for DDL statements or async jobs
+    /// that haven't yet finished, so it's `Option`.
+    #[serde(default)]
+    statistics: Option<BigQueryStatistics>,
+}
+
+/// Top-level `statistics` block on a BigQuery job response. Only the
+/// `query` slice is currently parsed; other nested shapes (load, extract,
+/// copy) are ignored.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BigQueryStatistics {
+    #[serde(default)]
+    query: Option<BigQueryQueryStatistics>,
+}
+
+/// `statistics.query` subset we care about today.
+///
+/// BigQuery returns byte counts as decimal strings (JSON doesn't have a
+/// native 64-bit integer; GCP APIs encode `int64` fields as strings), so
+/// both fields are `Option<String>` and parsed to `u64` via
+/// [`BigQueryQueryStatistics::total_bytes_billed_u64`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BigQueryQueryStatistics {
+    /// Bytes BigQuery read to produce the result. Strictly `>=`
+    /// `total_bytes_billed` because the billable figure has the 10 MB
+    /// minimum floor applied.
+    #[allow(dead_code)]
+    #[serde(default)]
+    total_bytes_processed: Option<String>,
+    /// Bytes the user is actually billed for. This is the figure
+    /// threaded into [`ExecutionStats::bytes_scanned`] because
+    /// [`rocky_core::cost::compute_observed_cost_usd`] multiplies it by
+    /// the per-TB rate to produce the billed cost. Storing "billed" in
+    /// a field named "scanned" is a deliberate impurity — the cost
+    /// formula wants billed, and introducing a separate "billed" field
+    /// would force every downstream consumer to special-case BigQuery.
+    #[serde(default)]
+    total_bytes_billed: Option<String>,
+}
+
+impl BigQueryQueryStatistics {
+    /// Parse `totalBytesBilled` to `u64`. Invalid / overflowing / missing
+    /// values all return `None` so the stats remain best-effort and
+    /// never fail a run.
+    fn total_bytes_billed_u64(&self) -> Option<u64> {
+        self.total_bytes_billed
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,6 +571,87 @@ mod tests {
         assert!(!resp.job_complete);
         let job_ref = resp.job_reference.unwrap();
         assert_eq!(job_ref.job_id, "job_abc");
+    }
+
+    #[test]
+    fn statistics_deserializes_when_present() {
+        // Happy path: completed query job with totalBytesBilled.
+        // BigQuery always encodes int64 as decimal strings — parser
+        // must handle the string form.
+        let json = r#"{
+            "jobComplete": true,
+            "statistics": {
+                "query": {
+                    "totalBytesProcessed": "12345678",
+                    "totalBytesBilled": "10485760"
+                }
+            }
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, Some(10_485_760));
+        assert_eq!(stats.bytes_written, None);
+        assert_eq!(stats.rows_affected, None);
+    }
+
+    #[test]
+    fn statistics_absent_yields_all_none() {
+        // BigQuery omits `statistics` for some DDL responses — must not
+        // fail to deserialize, and stats should be all-None.
+        let json = r#"{"jobComplete": true}"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.statistics.is_none());
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
+        assert_eq!(stats.bytes_written, None);
+    }
+
+    #[test]
+    fn statistics_query_absent_yields_none() {
+        // The outer `statistics` block is present but the `query` slice
+        // isn't — shouldn't blow up.
+        let json = r#"{
+            "jobComplete": true,
+            "statistics": {}
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
+    }
+
+    #[test]
+    fn statistics_total_bytes_billed_absent_yields_none() {
+        // `statistics.query` is present but only `totalBytesProcessed`
+        // is set — the billed-field parse returns None.
+        let json = r#"{
+            "jobComplete": true,
+            "statistics": {
+                "query": {
+                    "totalBytesProcessed": "12345678"
+                }
+            }
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
+    }
+
+    #[test]
+    fn statistics_unparseable_bytes_yields_none() {
+        // Defensive: if BigQuery ever returns a non-integer (never
+        // observed but the REST contract is a string), parsing must
+        // fail softly rather than erroring the whole run.
+        let json = r#"{
+            "jobComplete": true,
+            "statistics": {
+                "query": {
+                    "totalBytesBilled": "not-a-number"
+                }
+            }
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, None);
     }
 
     #[test]

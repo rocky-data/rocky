@@ -88,6 +88,39 @@ pub struct ExplainResult {
     pub raw_explain: String,
 }
 
+/// Statistics the warehouse reported for a single executed statement.
+///
+/// Returned by [`WarehouseAdapter::execute_statement_with_stats`]. Every
+/// field is `Option<u64>` because not every adapter reports every number:
+/// DuckDB returns `None` everywhere, BigQuery populates `bytes_scanned`
+/// from `statistics.query.totalBytesBilled`, Databricks / Snowflake
+/// currently return `None` but may populate these in a future wave.
+///
+/// Threaded up into [`crate::state::ModelExecution`] and
+/// `MaterializationOutput.bytes_scanned` / `.bytes_written` so
+/// `rocky cost` can compute real dollar figures without re-querying the
+/// warehouse.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ExecutionStats {
+    /// Bytes read by the warehouse to produce the result. For BigQuery
+    /// on-demand this is `totalBytesBilled` (what the user is actually
+    /// charged for — the 10 MB minimum floor is already applied),
+    /// intentionally stored in this field because
+    /// [`crate::cost::compute_observed_cost_usd`] multiplies it by the
+    /// per-TB rate to compute the billed cost.
+    pub bytes_scanned: Option<u64>,
+    /// Bytes written to the destination. Only populated by adapters
+    /// that report it natively (none today — Databricks and Snowflake
+    /// return bytes-written in statement results but aren't wired yet;
+    /// BigQuery doesn't expose a bytes-written figure for query jobs).
+    pub bytes_written: Option<u64>,
+    /// Rows affected by the statement (inserts + updates + deletes).
+    /// Not populated yet — reserved so a follow-up wave can thread
+    /// per-adapter row counts through without another trait-method
+    /// addition.
+    pub rows_affected: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
@@ -123,6 +156,26 @@ pub trait WarehouseAdapter: Send + Sync {
 
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
+
+    /// Execute a SQL statement and return the warehouse-reported
+    /// [`ExecutionStats`] (bytes scanned, bytes written, rows affected).
+    ///
+    /// Default: delegates to [`Self::execute_statement`] and returns
+    /// [`ExecutionStats::default`] (all `None`). Adapters that have
+    /// access to statement-level stats (BigQuery's
+    /// `statistics.query.totalBytesBilled`, Databricks's
+    /// `result.manifest.total_byte_count`, Snowflake's
+    /// `statistics.queryLoad`) should override to populate the fields.
+    ///
+    /// Used by the materialize path in `rocky-cli` to populate
+    /// `MaterializationOutput.bytes_scanned` / `.bytes_written` so
+    /// `rocky cost` can derive a real dollar figure for bytes-priced
+    /// warehouses (BigQuery on-demand).
+    async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
+        self.execute_statement(sql)
+            .await
+            .map(|()| ExecutionStats::default())
+    }
 
     /// Execute a SQL query and return rows.
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult>;

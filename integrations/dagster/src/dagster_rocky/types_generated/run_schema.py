@@ -383,6 +383,14 @@ class CheckResult6(BaseModel):
 
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
+    bytes_scanned: conint(ge=0) | None = None
+    """
+    Bytes the warehouse reported reading to produce the result, summed across all statements executed for this materialization. For BigQuery on-demand this is `statistics.query.totalBytesBilled` (with the 10 MB minimum already applied) — fed straight into [`rocky_core::cost::compute_observed_cost_usd`] to produce `cost_usd`. `None` when the adapter does not report bytes (today: Databricks / Snowflake / DuckDB).
+    """
+    bytes_written: conint(ge=0) | None = None
+    """
+    Bytes the warehouse reported writing to the destination, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a natural bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Field reserved so future waves can populate it without a schema break.
+    """
     cost_usd: float | None = None
     """
     Observed dollar cost of this materialization, computed post-hoc from the adapter-appropriate formula (duration × DBU rate for Databricks/Snowflake, bytes × $/TB for BigQuery, zero for DuckDB). `None` when the warehouse type isn't billed or the adapter didn't report the inputs the formula needs. Populated by the run finalizer via `rocky_core::cost::compute_observed_cost_usd`.
