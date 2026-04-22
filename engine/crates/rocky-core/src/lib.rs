@@ -31,6 +31,7 @@ pub mod plan_partition;
 pub mod preview;
 pub mod quarantine;
 pub mod redacted;
+pub mod retry;
 pub mod retry_budget;
 pub mod schema;
 pub mod seeds;
