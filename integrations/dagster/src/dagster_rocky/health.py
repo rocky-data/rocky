@@ -140,16 +140,14 @@ def state_health(rocky: RockyResource, *, probe_write: bool = False) -> StateHea
        caller running this every sensor tick doesn't crash the tick
        when rocky itself can't be invoked.
     3. Optional ``state_rw`` probe: when ``probe_write=True``, runs
-       ``rocky doctor`` and extracts the ``state_rw`` check into
-       :attr:`~.types.StateHealthResult.probe_outcome` / duration /
-       error fields. A probe failure populates the ``probe_*`` fields
-       rather than raising. Full doctor is invoked because
-       :meth:`RockyResource.doctor` does not currently accept a
-       ``--check`` filter — selectively running just the ``state_rw``
-       check is a follow-up optimisation that would cut the probe cost
-       to the same sub-second figure the engine's
-       :func:`rocky_core::state_sync::probe_state_backend` helper runs
-       in, without the surrounding config/adapter/pipelines checks.
+       ``rocky doctor --check state_rw`` and extracts the ``state_rw``
+       check into :attr:`~.types.StateHealthResult.probe_outcome` /
+       duration / error fields. A probe failure populates the
+       ``probe_*`` fields rather than raising. The ``--check`` filter
+       keeps the probe cost bounded to the engine's
+       :func:`rocky_core::state_sync::probe_state_backend` helper —
+       sub-second on every backend — instead of paying for the
+       surrounding config/adapter/pipelines checks.
 
     The design is a thin facade over existing CLI surfaces — the FR's
     stretch-goal "recent outcomes" rollup (persisted ring buffer of
@@ -268,7 +266,7 @@ def _run_state_rw_probe(rocky: RockyResource) -> tuple[ProbeOutcome, int | None,
     wasn't run" from "probe failed."
     """
     try:
-        report = rocky.doctor()
+        report = rocky.doctor(check="state_rw")
     except dg.Failure as exc:
         return "error", None, str(exc.description or exc)
 

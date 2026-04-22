@@ -311,6 +311,32 @@ def test_state_health_probe_skipped_by_default(
     assert result.probe_error is None
 
 
+def test_state_health_probe_forwards_state_rw_check_filter(
+    rocky_with_local_backend: RockyResource,
+) -> None:
+    """The probe path must call ``doctor(check="state_rw")`` so the engine
+    runs only the ``state_rw`` check — keeping the probe sub-second rather
+    than paying for the full doctor suite.
+    """
+    state_rw = HealthCheck(
+        name="state_rw",
+        status=HealthStatus.healthy,
+        message="State backend RW probe succeeded",
+        duration_ms=12,
+    )
+    with (
+        patch.object(RockyResource, "history", return_value=_history_with_runs()),
+        patch.object(
+            RockyResource,
+            "doctor",
+            return_value=_doctor(state_rw=state_rw),
+        ) as doctor_mock,
+    ):
+        state_health(rocky_with_local_backend, probe_write=True)
+
+    doctor_mock.assert_called_once_with(check="state_rw")
+
+
 def test_state_health_probe_healthy_check_maps_to_ok(
     rocky_with_local_backend: RockyResource,
 ) -> None:
