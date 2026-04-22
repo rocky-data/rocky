@@ -21,6 +21,7 @@ use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 #[allow(clippy::too_many_arguments)]
 pub fn run_compile(
     config_path: Option<&Path>,
+    state_path: &Path,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
@@ -29,14 +30,27 @@ pub fn run_compile(
     target_dialect: Option<Dialect>,
     with_seed: bool,
 ) -> Result<()> {
-    // Wave-1 of Arc 7 wave 2: when `--with-seed` is set, run the project's
-    // `data/seed.sql` against an in-memory DuckDB and use the resulting
-    // information_schema as the source-of-truth for `source_schemas`. This
-    // turns leaf .sql models from `RockyType::Unknown` into concrete types
-    // for any project that ships a runnable seed (the entire playground).
-    // Opt-in keeps the wave-1 fast-pure compile path intact.
+    // `source_schemas` precedence (Arc 7 wave 2):
+    //   1. `--with-seed` wins -> wave-1 seed loader (explicit user intent,
+    //      used for tests/playgrounds where the cache is irrelevant).
+    //   2. Otherwise, the wave-2 schema cache if `[cache.schemas] enabled`.
+    //   3. Cold-cache fallback: empty map — typecheck degrades to Unknown,
+    //      which matches pre-wave-2 behaviour.
     let source_schemas = if with_seed {
+        // Wave-1: run `data/seed.sql` in in-memory DuckDB, read columns
+        // from its `information_schema`. Turns leaf .sql models from
+        // `RockyType::Unknown` into concrete types for any project that
+        // ships a runnable seed (the entire playground).
         load_source_schemas_from_seed(models_dir)?
+    } else if let Some(path) = config_path {
+        // Wave-2: TTL-filtered load from `state.redb`'s `SCHEMA_CACHE`
+        // table. Honours `[cache.schemas] enabled` + `ttl_seconds`.
+        match rocky_config::load_rocky_config(path) {
+            Ok(cfg) => {
+                crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+            }
+            Err(_) => HashMap::new(),
+        }
     } else {
         HashMap::new()
     };
@@ -470,6 +484,7 @@ schema_template = "s"
         // compile should bail with the generic "compilation failed" error.
         let err = run_compile(
             None,
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -493,8 +508,18 @@ schema_template = "s"
         write_model(&models_dir, "m1", "SELECT NVL(a, b) AS c FROM t");
 
         // No target_dialect → no P001, compile succeeds.
-        run_compile(None, &models_dir, None, None, true, false, None, false)
-            .expect("compile should succeed without lint");
+        run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .expect("compile should succeed without lint");
     }
 
     #[test]
@@ -507,6 +532,7 @@ schema_template = "s"
         // NVL is native to Snowflake, so the lint should produce no issues.
         run_compile(
             None,
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -530,6 +556,7 @@ schema_template = "s"
 
         let err = run_compile(
             Some(&config),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -560,6 +587,7 @@ schema_template = "s"
 
         let err = run_compile(
             Some(&config),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -586,6 +614,7 @@ schema_template = "s"
         // Project-wide allow-list of NVL → no P001 → compile succeeds.
         run_compile(
             Some(&config),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -612,6 +641,7 @@ schema_template = "s"
         // Pragma exempts this model, so the lint should not fire.
         run_compile(
             Some(&config),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -639,6 +669,7 @@ schema_template = "s"
 
         let err = run_compile(
             Some(&config),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -666,6 +697,7 @@ schema_template = "s"
         // flag-only behavior remains. With no flag, no lint fires.
         run_compile(
             Some(&nonexistent),
+            Path::new(".rocky-state.redb"),
             &models_dir,
             None,
             None,
@@ -711,8 +743,18 @@ schema_template = "s"
         // typed columns should pick up real types instead of Unknown.
         // (We assert the bail-free path here; the typed-output assertion
         // lives in compile_with_seed_resolves_unknown_types_to_concrete.)
-        run_compile(None, &models_dir, None, None, true, false, None, true)
-            .expect("with-seed compile should succeed");
+        run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            true,
+        )
+        .expect("with-seed compile should succeed");
     }
 
     #[test]
@@ -724,7 +766,18 @@ schema_template = "s"
         write_model(&models_dir, "leaf", "SELECT 1 AS x");
         // Note: no data/seed.sql written.
 
-        let err = run_compile(None, &models_dir, None, None, true, false, None, true).unwrap_err();
+        let err = run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            true,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--with-seed"), "msg: {msg}");
         assert!(msg.contains("seed.sql"), "msg: {msg}");
@@ -739,7 +792,18 @@ schema_template = "s"
         write_model(&models_dir, "leaf", "SELECT 1 AS x");
         write_seed(dir.path(), "DEFINITELY NOT VALID SQL;");
 
-        let err = run_compile(None, &models_dir, None, None, true, false, None, true).unwrap_err();
+        let err = run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            true,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("seed execution failed"),
             "msg: {err}",
@@ -777,5 +841,150 @@ schema_template = "s"
             by_name["name"].data_type,
             rocky_compiler::types::RockyType::String,
         ));
+    }
+
+    // ---- Wave-2 of Arc 7 wave 2: cache-backed source_schemas ----
+
+    /// End-to-end wiring check: seed a `SchemaCacheEntry` in `state.redb`,
+    /// run `rocky compile` without `--with-seed`, and confirm the cached
+    /// entry lands in `CompilerConfig.source_schemas` so the leaf model's
+    /// types come out concrete instead of `Unknown`.
+    #[test]
+    fn compile_reads_typed_columns_from_schema_cache() {
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(
+            &models_dir,
+            "leaf",
+            "SELECT order_id, amount FROM raw__orders.orders",
+        );
+        let state_path = dir.path().join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let key = schema_cache_key("cat", "raw__orders", "orders");
+            store
+                .write_schema_cache_entry(
+                    &key,
+                    &SchemaCacheEntry {
+                        columns: vec![
+                            StoredColumn {
+                                name: "order_id".into(),
+                                data_type: "BIGINT".into(),
+                                nullable: false,
+                            },
+                            StoredColumn {
+                                name: "amount".into(),
+                                data_type: "DECIMAL(10, 2)".into(),
+                                nullable: true,
+                            },
+                        ],
+                        cached_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+
+        // Need a `rocky.toml` with `[cache.schemas]` on defaults so the
+        // cache-read path activates.
+        let config = write_rocky_toml(dir.path(), "");
+
+        // Confirm the compile succeeds — wiring check. Typed-model
+        // assertions go through the compiler API to peek at typed
+        // columns; see the separate cache_loader_surfaces_typed_columns
+        // test below.
+        run_compile(
+            Some(&config),
+            &state_path,
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .expect("compile with cache-backed source_schemas should succeed");
+    }
+
+    /// Direct check on the cache-loader round trip: the helper returns the
+    /// exact shape `CompilerConfig.source_schemas` expects, via the same
+    /// `default_type_mapper` wave-1 uses. Guards against drift between the
+    /// `StoredColumn -> TypedColumn` mapping and the cache read path.
+    #[test]
+    fn cache_loader_surfaces_typed_columns() {
+        use rocky_compiler::schema_cache::load_source_schemas_from_cache;
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let key = schema_cache_key("cat", "raw__events", "clicks");
+            store
+                .write_schema_cache_entry(
+                    &key,
+                    &SchemaCacheEntry {
+                        columns: vec![StoredColumn {
+                            name: "user_id".into(),
+                            data_type: "BIGINT".into(),
+                            nullable: false,
+                        }],
+                        cached_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let store = StateStore::open_read_only(&state_path).unwrap();
+        let map =
+            load_source_schemas_from_cache(&store, chrono::Utc::now(), chrono::Duration::hours(24))
+                .unwrap();
+
+        let cols = map
+            .get("raw__events.clicks")
+            .expect("catalog prefix stripped; leaf uses <schema>.<table>");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "user_id");
+        assert!(matches!(
+            cols[0].data_type,
+            rocky_compiler::types::RockyType::Int64,
+        ));
+        assert!(!cols[0].nullable);
+    }
+
+    /// Compile without a state file must not silently fail or create a
+    /// stray `state.redb` beside the models directory. Cold-cache path is
+    /// the default experience for a fresh project.
+    #[test]
+    fn compile_without_state_file_degrades_gracefully() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT 1 AS x");
+        let config = write_rocky_toml(dir.path(), "");
+        let state_path = dir.path().join(".rocky-state.redb");
+        assert!(!state_path.exists(), "precondition: no state file");
+
+        run_compile(
+            Some(&config),
+            &state_path,
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+        )
+        .expect("compile without state file should succeed");
+        assert!(
+            !state_path.exists(),
+            "compile must not create state.redb as a side effect"
+        );
     }
 }

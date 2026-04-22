@@ -1,6 +1,6 @@
 //! `rocky ai` — AI intent layer: generate, explain, sync, test.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -34,11 +34,28 @@ fn make_client() -> Result<LlmClient> {
 }
 
 /// Compile the project from a models directory.
-fn compile_project(models_dir: &str) -> Result<CompileResult> {
+///
+/// Wave-2 of Arc 7 wave 2: source schemas flow from the persisted cache
+/// (populated by `rocky run` / `rocky discover --with-schemas` in later
+/// PRs) so the AI prompt is grounded in real warehouse types when the
+/// cache is warm. Cold cache degrades to empty, which matches the
+/// pre-wave-2 behaviour this function had.
+fn compile_project(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &str,
+) -> Result<CompileResult> {
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+        }
+        Err(_) => std::collections::HashMap::new(),
+    };
+
     let config = CompilerConfig {
         models_dir: PathBuf::from(models_dir),
         contracts_dir: None,
-        source_schemas: std::collections::HashMap::new(),
+        source_schemas,
         source_column_info: std::collections::HashMap::new(),
     };
     compile(&config).map_err(|e| anyhow::anyhow!("{e}"))
@@ -81,6 +98,8 @@ fn build_schema_context(result: &CompileResult) -> SchemaBuckets {
 /// typechecker is lenient on unresolved columns today, so schema grounding
 /// in the prompt is the primary mechanism preventing hallucinated columns.
 pub async fn run_ai(
+    config_path: &Path,
+    state_path: &Path,
     intent: &str,
     format: Option<&str>,
     models_dir: &str,
@@ -92,17 +111,19 @@ pub async fn run_ai(
     // Best-effort compile of the project to ground the prompt.
     // If it fails (missing dir, parse errors, etc.) we degrade to unschema'd
     // generation rather than refusing.
-    let compile_result = compile_project(models_dir).ok();
+    let compile_result = compile_project(config_path, state_path, models_dir).ok();
 
     let (model_schemas, source_tables) = match &compile_result {
         Some(r) => build_schema_context(r),
         None => (Vec::new(), Vec::new()),
     };
 
-    // Empty maps act as stand-ins for source_schemas / source_column_info
-    // until the CLI threads real warehouse discovery into `rocky ai`
-    // (deferred to a later wave). Project-aware validation still catches
-    // hallucinated references to existing *models* via the project graph.
+    // TODO(arc7-wave2): promote stub once `rocky-ai`'s generate callpath is
+    // audited — the `ValidationContext`-bound `source_schemas` differs from
+    // the `CompilerConfig.source_schemas` wired above. Empty maps here keep
+    // AI validation's behaviour unchanged; swapping them for the cache
+    // loader would change prompt grounding in ways that want a dedicated
+    // review against `rocky-ai::generate::ValidationContext` semantics.
     let empty_source_schemas = std::collections::HashMap::new();
     let empty_source_column_info = std::collections::HashMap::new();
     let validation_context = compile_result
@@ -147,7 +168,10 @@ pub async fn run_ai(
 }
 
 /// Execute `rocky ai sync` — detect schema changes and propose intent-guided updates.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ai_sync(
+    config_path: &Path,
+    state_path: &Path,
     models_dir: &str,
     apply: bool,
     model_filter: Option<&str>,
@@ -155,7 +179,7 @@ pub async fn run_ai_sync(
     output_json: bool,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir)?;
 
     // For now, use the current compilation as both "previous" and "current".
     // In practice, the previous would come from the state store.
@@ -246,7 +270,10 @@ pub async fn run_ai_sync(
 }
 
 /// Execute `rocky ai explain` — generate intent descriptions from code.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ai_explain(
+    config_path: &Path,
+    state_path: &Path,
     models_dir: &str,
     model_name: Option<&str>,
     all: bool,
@@ -254,7 +281,7 @@ pub async fn run_ai_explain(
     output_json: bool,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir)?;
 
     let models_to_explain: Vec<&rocky_core::models::Model> = result
         .project
@@ -312,7 +339,10 @@ pub async fn run_ai_explain(
 }
 
 /// Execute `rocky ai test` — generate test assertions from intent.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ai_test(
+    config_path: &Path,
+    state_path: &Path,
     models_dir: &str,
     model_name: Option<&str>,
     all: bool,
@@ -320,7 +350,7 @@ pub async fn run_ai_test(
     output_json: bool,
 ) -> Result<()> {
     let client = make_client()?;
-    let result = compile_project(models_dir)?;
+    let result = compile_project(config_path, state_path, models_dir)?;
 
     let models_to_test: Vec<&rocky_core::models::Model> = result
         .project

@@ -363,6 +363,7 @@ pub async fn run(
             &mut output,
             None, // model-only run has no pipeline hooks
             None,
+            &rocky_cfg.cache.schemas,
         )
         .await?;
 
@@ -2131,6 +2132,7 @@ pub async fn run(
                     &mut output,
                     Some(&hook_registry),
                     Some(pipeline_name),
+                    &rocky_cfg.cache.schemas,
                 )
                 .await?;
                 Ok(())
@@ -2430,13 +2432,36 @@ pub(crate) async fn execute_models(
     // the caller having to synthesise a fake pipeline name.
     hook_registry: Option<&HookRegistry>,
     pipeline_name: Option<&str>,
+    // Arc 7 wave 2 wave-2: honour `[cache.schemas]` for source-schema
+    // loading during compile. The write tap that keeps the cache fresh
+    // lands in PR 2; today the loader reads whatever's there.
+    schema_cache_config: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
+
+    // Wave-2 of Arc 7 wave 2: load the persisted schema cache directly
+    // from the live `StateStore` — no round-trip through
+    // `crate::source_schemas::load_cached_source_schemas`, because that
+    // helper opens a read-only handle and we already hold a write-capable
+    // one here. Degrades silently when the cache is cold or disabled.
+    let source_schemas = if schema_cache_config.enabled {
+        match state_store {
+            Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                store,
+                chrono::Utc::now(),
+                schema_cache_config.ttl(),
+            )
+            .unwrap_or_default(),
+            None => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
-        source_schemas: std::collections::HashMap::new(),
+        source_schemas,
         source_column_info: std::collections::HashMap::new(),
     };
 

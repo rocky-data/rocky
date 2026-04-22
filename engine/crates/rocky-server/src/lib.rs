@@ -8,5 +8,6 @@ pub mod api;
 pub mod dag_viz;
 pub mod dashboard;
 pub mod lsp;
+pub(crate) mod schema_cache_throttle;
 pub mod state;
 pub mod watch;

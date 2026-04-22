@@ -22,8 +22,10 @@ use crate::output::*;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky dag`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_dag(
     config_path: &Path,
+    state_path: &Path,
     models_dir: &Path,
     seeds_dir: Option<&Path>,
     contracts_dir: Option<&Path>,
@@ -69,6 +71,8 @@ pub fn run_dag(
         include_column_lineage,
         models_dir,
         contracts_dir,
+        &cfg,
+        state_path,
     )?;
 
     if json {
@@ -80,6 +84,7 @@ pub fn run_dag(
 }
 
 /// Build the full `DagOutput` from the unified DAG plus model/seed metadata.
+#[allow(clippy::too_many_arguments)]
 fn build_dag_output(
     dag: &UnifiedDag,
     phases: &[Vec<&rocky_core::unified_dag::UnifiedNode>],
@@ -88,6 +93,8 @@ fn build_dag_output(
     include_column_lineage: bool,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
+    cfg: &rocky_core::config::RockyConfig,
+    state_path: &Path,
 ) -> Result<DagOutput> {
     // Build lookup maps.
     let model_map: HashMap<&str, &Model> =
@@ -189,7 +196,7 @@ fn build_dag_output(
 
     // Column lineage (optional).
     let column_lineage = if include_column_lineage {
-        build_column_lineage_from_models(models_dir, contracts_dir)?
+        build_column_lineage_from_models(models_dir, contracts_dir, cfg, state_path)?
     } else {
         vec![]
     };
@@ -240,11 +247,21 @@ fn extract_partition_shape(strategy: &StrategyConfig) -> Option<PartitionShapeOu
 fn build_column_lineage_from_models(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
+    cfg: &rocky_core::config::RockyConfig,
+    state_path: &Path,
 ) -> Result<Vec<LineageEdgeRecord>> {
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),
-        source_schemas: std::collections::HashMap::new(),
+        // Wave-2 of Arc 7 wave 2: typed columns flow from the persisted
+        // schema cache (populated by `rocky run` / `rocky discover
+        // --with-schemas` in later PRs) straight into column lineage
+        // extraction, so downstream edges carry real types instead of
+        // `RockyType::Unknown`.
+        source_schemas: crate::source_schemas::load_cached_source_schemas(
+            &cfg.cache.schemas,
+            state_path,
+        ),
         source_column_info: std::collections::HashMap::new(),
     };
 

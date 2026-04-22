@@ -254,6 +254,14 @@ fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
     let dir = tempfile::TempDir::new().unwrap();
     generate_synthetic_project(model_count, dir.path());
 
+    // TODO(arc7-wave2): bench intentionally unwired — the synthetic
+    // tempdir project has no `state.redb`, so wiring
+    // `crate::source_schemas::load_cached_source_schemas` here would
+    // always return empty and either (a) tempt readers of this benchmark
+    // into thinking it exercises the cache path, or (b) worse, read a
+    // surrounding CWD's cache and make benchmarks non-reproducible across
+    // machines. Keep bench pure until there's a dedicated micro-bench for
+    // the wave-2 read path.
     let config = CompilerConfig {
         models_dir: dir.path().join("models"),
         contracts_dir: None,

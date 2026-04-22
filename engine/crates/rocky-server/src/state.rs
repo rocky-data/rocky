@@ -8,10 +8,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
 use rocky_core::dag_status::DagStatusStore;
+
+use crate::schema_cache_throttle::SchemaCacheThrottle;
 
 /// Shared server state holding the latest compilation result.
 pub struct ServerState {
@@ -21,6 +23,11 @@ pub struct ServerState {
     pub compile_result: RwLock<Option<CompileResult>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
+    /// Arc 7 wave 2 wave-2: per-session throttle for the "N sources hit"
+    /// info log so it emits once per server start, not once per recompile.
+    /// PR 2 will key it on `(document_uri, cache_version)` — the only LSP
+    /// analogue today is `models_dir`, which stays constant.
+    schema_cache_throttle: SchemaCacheThrottle,
 }
 
 impl ServerState {
@@ -36,6 +43,7 @@ impl ServerState {
             config_path,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
         });
 
         // Initial compile
@@ -51,10 +59,17 @@ impl ServerState {
     pub async fn recompile(&self) {
         info!(models_dir = %self.models_dir.display(), "compiling project");
 
+        // Wave-2 of Arc 7 wave 2: load cached source schemas so the
+        // server's hover/inlay-hint surfaces typecheck against real
+        // warehouse types when the cache is warm. Degrades to empty on
+        // cold cache, missing state.redb, or `[cache.schemas] enabled =
+        // false`. See `rocky-cli::source_schemas` for the CLI equivalent.
+        let source_schemas = self.load_cached_source_schemas().await;
+
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: self.contracts_dir.clone(),
-            source_schemas: HashMap::new(),
+            source_schemas,
             source_column_info: HashMap::new(),
         };
 
@@ -75,5 +90,69 @@ impl ServerState {
                 warn!(error = %e, "compilation failed");
             }
         }
+    }
+
+    /// Load the schema-cache-backed `source_schemas` map for this
+    /// server's project. Gated on `[cache.schemas] enabled`; resolves the
+    /// state file relative to `models_dir` (the same convention
+    /// `api.rs`/`dashboard.rs` already follow).
+    async fn load_cached_source_schemas(
+        &self,
+    ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+        // Config lookup: fall back to defaults (enabled + 24h TTL) when
+        // no rocky.toml is wired in, so LSP/server behaviour mirrors the
+        // CLI for zero-config projects.
+        let schema_cache_config = match &self.config_path {
+            Some(path) => rocky_core::config::load_rocky_config(path)
+                .map(|c| c.cache.schemas)
+                .unwrap_or_default(),
+            None => rocky_core::config::SchemaCacheConfig::default(),
+        };
+
+        if !schema_cache_config.enabled {
+            return HashMap::new();
+        }
+
+        let state_path = self.models_dir.join(".rocky-state.redb");
+        if !state_path.exists() {
+            return HashMap::new();
+        }
+
+        let store = match rocky_core::state::StateStore::open_read_only(&state_path) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(error = %e, "schema cache: state open failed in server path");
+                return HashMap::new();
+            }
+        };
+
+        let map = match rocky_compiler::schema_cache::load_source_schemas_from_cache(
+            &store,
+            chrono::Utc::now(),
+            schema_cache_config.ttl(),
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(error = %e, "schema cache: scan failed in server path");
+                return HashMap::new();
+            }
+        };
+
+        if !map.is_empty()
+            && self
+                .schema_cache_throttle
+                .mark_logged(&self.models_dir.display().to_string())
+                .await
+        {
+            info!(
+                target: "rocky::schema_cache",
+                sources_hit = map.len(),
+                "schema cache: {} source(s) hit — run `rocky run` (write tap in PR 2) or \
+                 `rocky discover --with-schemas` (PR 3) to warm-cache more sources",
+                map.len(),
+            );
+        }
+
+        map
     }
 }

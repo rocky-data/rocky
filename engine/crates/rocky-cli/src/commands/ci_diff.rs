@@ -167,11 +167,14 @@ struct TypedColumn {
 }
 
 /// Compile the models directory and extract per-model column schemas.
-fn compile_and_extract_schemas(models_dir: &Path) -> Result<HashMap<String, Vec<TypedColumn>>> {
+fn compile_and_extract_schemas(
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> Result<HashMap<String, Vec<TypedColumn>>> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
-        source_schemas: HashMap::new(),
+        source_schemas,
         source_column_info: HashMap::new(),
     };
 
@@ -197,7 +200,17 @@ fn compile_and_extract_schemas(models_dir: &Path) -> Result<HashMap<String, Vec<
 ///
 /// This is best-effort: if the base ref doesn't have a complete models directory
 /// or compilation fails, we return an empty map rather than erroring.
-fn extract_base_schemas(base_ref: &str, models_dir: &Path) -> HashMap<String, Vec<TypedColumn>> {
+///
+/// Arc 7 wave 2 wave-2 note: `source_schemas` seeds the compile from the
+/// *current* warehouse cache, not historical types. That's fine for diff
+/// purposes — typecheck on historical models with today's leaf types still
+/// detects the model-level schema drift that ci-diff is looking for, and
+/// there's no per-ref cache to restore from.
+fn extract_base_schemas(
+    base_ref: &str,
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> HashMap<String, Vec<TypedColumn>> {
     // Try to get the models directory path relative to the repo root
     let models_rel = find_models_relative_path(models_dir);
     let models_rel = match models_rel {
@@ -266,7 +279,7 @@ fn extract_base_schemas(base_ref: &str, models_dir: &Path) -> HashMap<String, Ve
     let config = CompilerConfig {
         models_dir: tmp.path().to_path_buf(),
         contracts_dir: None,
-        source_schemas: HashMap::new(),
+        source_schemas,
         source_column_info: HashMap::new(),
     };
 
@@ -444,7 +457,24 @@ fn build_diff_results(
 // ---------------------------------------------------------------------------
 
 /// Execute `rocky ci-diff`.
-pub fn run_ci_diff(base_ref: &str, models_dir: &Path, output_json: bool) -> Result<()> {
+pub fn run_ci_diff(
+    config_path: &Path,
+    state_path: &Path,
+    base_ref: &str,
+    models_dir: &Path,
+    output_json: bool,
+) -> Result<()> {
+    // Wave-2 of Arc 7 wave 2: load cached source schemas once and seed
+    // both compiles (current tree + base ref) with the same map so the
+    // resulting per-model type diffs measure real schema drift rather
+    // than `Unknown`-vs-`Unknown` noise. Degrades to empty when the
+    // cache is cold or `[cache.schemas] enabled = false`.
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+        }
+        Err(_) => HashMap::new(),
+    };
     // 1. Find changed files between base_ref and HEAD
     let changed_files = git_changed_files(base_ref)?;
 
@@ -500,7 +530,7 @@ pub fn run_ci_diff(base_ref: &str, models_dir: &Path, output_json: bool) -> Resu
 
     // 3. Compile current working tree
     let head_schemas = if models_dir.is_dir() {
-        compile_and_extract_schemas(models_dir).unwrap_or_else(|e| {
+        compile_and_extract_schemas(models_dir, source_schemas.clone()).unwrap_or_else(|e| {
             debug!("HEAD compilation failed: {e}");
             HashMap::new()
         })
@@ -510,7 +540,7 @@ pub fn run_ci_diff(base_ref: &str, models_dir: &Path, output_json: bool) -> Resu
 
     // 4. Extract base schemas (best-effort)
     let base_schemas = if models_dir.is_dir() {
-        extract_base_schemas(base_ref, models_dir)
+        extract_base_schemas(base_ref, models_dir, source_schemas)
     } else {
         HashMap::new()
     };

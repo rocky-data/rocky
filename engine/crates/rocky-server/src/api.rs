@@ -343,13 +343,10 @@ mod tests {
         // Use the simple_project fixture
         let models_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../rocky-compiler/tests/fixtures/simple_project/models");
-        Arc::new(ServerState {
-            models_dir,
-            contracts_dir: None,
-            config_path: None,
-            compile_result: tokio::sync::RwLock::new(None),
-            dag_status: rocky_core::dag_status::DagStatusStore::new(),
-        })
+        // Skip the spawned initial compile — tests hit the router directly
+        // without needing a warmed `compile_result`, and the spawn is cheap
+        // to absorb at test end.
+        ServerState::new(models_dir, None, None)
     }
 
     #[tokio::test]

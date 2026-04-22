@@ -30,7 +30,10 @@ fn to_edge_record(edge: &rocky_compiler::semantic::LineageEdge) -> LineageEdgeRe
 }
 
 /// Execute `rocky lineage`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_lineage(
+    config_path: &Path,
+    state_path: &Path,
     models_dir: &Path,
     target: &str,
     column: Option<&str>,
@@ -38,10 +41,20 @@ pub fn run_lineage(
     downstream: bool,
     output_json: bool,
 ) -> Result<()> {
+    // Wave-2 of Arc 7 wave 2: load cached warehouse schemas so lineage
+    // edges inherit real types instead of `RockyType::Unknown` on the
+    // leaves. Degrades to empty on cold cache / missing config.
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            crate::source_schemas::load_cached_source_schemas(&cfg.cache.schemas, state_path)
+        }
+        Err(_) => HashMap::new(),
+    };
+
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
-        source_schemas: HashMap::new(),
+        source_schemas,
         source_column_info: HashMap::new(),
     };
 
