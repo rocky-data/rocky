@@ -378,6 +378,26 @@
       },
       "type": "object"
     },
+    "CacheConfig": {
+      "additionalProperties": false,
+      "description": "Top-level `[cache]` configuration.\n\nHolds every cache surface that lives at the project level (i.e. has a `rocky.toml` knob). Today that's only the schema cache, but the shape is deliberately extensible: if a future `[cache.query]` or `[cache.plan]` surfaces, it lands as a new field on this struct with a `#[serde(default)]` attribute and its own `*Config` type — no breaking change to existing `rocky.toml` files.",
+      "properties": {
+        "schemas": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SchemaCacheConfig"
+            }
+          ],
+          "default": {
+            "enabled": true,
+            "replicate": false,
+            "ttl_seconds": 86400
+          },
+          "description": "Schema cache (Arc 7 wave 2 wave-2). Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile."
+        }
+      },
+      "type": "object"
+    },
     "ChecksConfig": {
       "additionalProperties": false,
       "description": "Data quality checks configuration (row count, column match, freshness, null rate, custom).",
@@ -1954,6 +1974,30 @@
       },
       "type": "object"
     },
+    "SchemaCacheConfig": {
+      "additionalProperties": false,
+      "description": "`[cache.schemas]` — schema cache configuration.\n\nControls the Arc 7 wave 2 wave-2 DESCRIBE-result cache. Defaults are chosen so the feature is useful out of the box: the cache is on, entries live for 24 hours, and nothing replicates off-machine until the user opts in. See the design doc at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md` (§4.3, §5.7) for the rationale.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Enable schema cache reads + writes. Defaults to `true`. Set to `false` for strict CI where every typecheck should resolve against the current warehouse and never fall back to a cached entry.",
+          "type": "boolean"
+        },
+        "replicate": {
+          "default": false,
+          "description": "Replicate the schema cache via `state_sync` to the remote backend. Defaults to `false`: a dev on a fresh clone should not inherit another machine's stale type stamps. Opt in to `true` for teams that want cross-machine cache warm-up via a shared state backend.",
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "default": 86400,
+          "description": "TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "SchemaEvolutionConfig": {
       "additionalProperties": false,
       "description": "Schema evolution configuration.\n\nControls how Rocky handles columns that disappear from the source but still exist in the target table. Instead of immediately dropping them, Rocky can keep them for a grace period (filling with NULL) so downstream consumers have time to adapt.",
@@ -2578,6 +2622,21 @@
         "on_breach": "warn"
       },
       "description": "Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action."
+    },
+    "cache": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheConfig"
+        }
+      ],
+      "default": {
+        "schemas": {
+          "enabled": true,
+          "replicate": false,
+          "ttl_seconds": 86400
+        }
+      },
+      "description": "Project-level cache configuration. Arc 7 wave 2 wave-2 introduces `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`]."
     },
     "cost": {
       "allOf": [

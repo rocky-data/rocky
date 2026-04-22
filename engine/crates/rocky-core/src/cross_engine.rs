@@ -574,6 +574,7 @@ mod tests {
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),
+            cache: Default::default(),
         }
     }
 

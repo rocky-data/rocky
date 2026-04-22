@@ -3406,7 +3406,9 @@ dependencies = [
 name = "rocky-compiler"
 version = "1.13.0"
 dependencies = [
+ "anyhow",
  "bumpalo",
+ "chrono",
  "indexmap",
  "miette",
  "rayon",

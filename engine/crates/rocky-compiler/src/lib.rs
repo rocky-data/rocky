@@ -19,6 +19,7 @@ pub mod limits;
 pub mod partial;
 pub mod project;
 pub mod resolve;
+pub mod schema_cache;
 pub mod semantic;
 pub mod typecheck;
 pub mod types;

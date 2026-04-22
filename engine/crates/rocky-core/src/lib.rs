@@ -34,6 +34,7 @@ pub mod redacted;
 pub mod retry;
 pub mod retry_budget;
 pub mod schema;
+pub mod schema_cache;
 pub mod seeds;
 pub mod shadow;
 pub mod snapshots;

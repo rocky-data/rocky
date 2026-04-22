@@ -601,18 +601,31 @@ Terminal outcomes surface as structured `outcome` fields on `state.upload` / `st
 
 ## `[cache]`
 
-Optional caching configuration. Rocky uses a three-tier cache (memory, Valkey, API) to reduce redundant warehouse calls.
+Project-level cache configuration. Today this is the schema cache
+(Arc 7 wave 2 wave-2) — a persisted cache of `DESCRIBE TABLE` results that
+lets `rocky compile` / `rocky lsp` typecheck leaf models against real
+warehouse column types without paying a live round-trip on every call.
+
+### `[cache.schemas]`
+
+Controls the schema cache.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `valkey_url` | string | | Valkey/Redis URL for distributed caching. |
+| `enabled` | bool | `true` | Enable schema cache reads + writes. Set to `false` for strict CI where every typecheck should resolve against the current warehouse. |
+| `ttl_seconds` | integer | `86400` | TTL for cache entries in seconds (default 24h). Lower for high-DDL-churn teams. |
+| `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off — a fresh clone should warm its cache from its own `rocky run`, not inherit another machine's stale types. |
 
 ```toml
-[cache]
-valkey_url = "${VALKEY_URL}"
+[cache.schemas]
+ttl_seconds = 3600   # 1h TTL for teams with high-DDL churn
+replicate = true     # opt in to share cache via the remote state backend
 ```
 
-When configured, Rocky caches metadata queries (table descriptions, schema lookups) in Valkey to avoid repeated warehouse API calls across runs. Without Valkey, only in-memory caching is used (effective within a single run).
+Note: a separate Valkey-backed runtime cache (`ValkeyCacheConfig`) exists in
+the codebase for future three-tier caching of API responses but is not
+wired into `rocky.toml` today. When that surface lands it'll live under a
+sibling key (e.g. `[cache.valkey]`).
 
 ---
 

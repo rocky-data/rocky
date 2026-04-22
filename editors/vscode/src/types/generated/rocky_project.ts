@@ -294,6 +294,10 @@ export interface RockyConfig {
    */
   budget?: BudgetConfig;
   /**
+   * Project-level cache configuration. Arc 7 wave 2 wave-2 introduces `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`].
+   */
+  cache?: CacheConfig;
+  /**
    * Cost estimation configuration.
    */
   cost?: CostSection;
@@ -459,6 +463,36 @@ export interface BudgetConfig {
    * What to do when a limit is breached. Defaults to `warn` — fire the event, keep the run successful. Set to `error` to fail the run.
    */
   on_breach?: BudgetBreachAction & string;
+}
+/**
+ * Top-level `[cache]` configuration.
+ *
+ * Holds every cache surface that lives at the project level (i.e. has a `rocky.toml` knob). Today that's only the schema cache, but the shape is deliberately extensible: if a future `[cache.query]` or `[cache.plan]` surfaces, it lands as a new field on this struct with a `#[serde(default)]` attribute and its own `*Config` type — no breaking change to existing `rocky.toml` files.
+ */
+export interface CacheConfig {
+  /**
+   * Schema cache (Arc 7 wave 2 wave-2). Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile.
+   */
+  schemas?: SchemaCacheConfig;
+}
+/**
+ * `[cache.schemas]` — schema cache configuration.
+ *
+ * Controls the Arc 7 wave 2 wave-2 DESCRIBE-result cache. Defaults are chosen so the feature is useful out of the box: the cache is on, entries live for 24 hours, and nothing replicates off-machine until the user opts in. See the design doc at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md` (§4.3, §5.7) for the rationale.
+ */
+export interface SchemaCacheConfig {
+  /**
+   * Enable schema cache reads + writes. Defaults to `true`. Set to `false` for strict CI where every typecheck should resolve against the current warehouse and never fall back to a cached entry.
+   */
+  enabled?: boolean;
+  /**
+   * Replicate the schema cache via `state_sync` to the remote backend. Defaults to `false`: a dev on a fresh clone should not inherit another machine's stale type stamps. Opt in to `true` for teams that want cross-machine cache warm-up via a shared state backend.
+   */
+  replicate?: boolean;
+  /**
+   * TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.
+   */
+  ttl_seconds?: number;
 }
 /**
  * Cost estimation configuration.

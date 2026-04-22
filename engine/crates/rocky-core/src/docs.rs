@@ -710,6 +710,7 @@ mod tests {
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),
+            cache: Default::default(),
         };
 
         let models = vec![
@@ -781,6 +782,7 @@ mod tests {
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),
+            cache: Default::default(),
         };
 
         let models = vec![Model {
@@ -848,6 +850,7 @@ mod tests {
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),
+            cache: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);
