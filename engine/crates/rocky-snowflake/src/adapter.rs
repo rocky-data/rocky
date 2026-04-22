@@ -44,6 +44,27 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .map_err(AdapterError::new)
     }
 
+    // `execute_statement_with_stats` intentionally NOT overridden.
+    //
+    // Snowflake does not return `bytes_scanned` in the immediate SQL API
+    // response; it only surfaces per-statement in QUERY_HISTORY (keyed
+    // by `query_id`), so populating it would add a second round-trip per
+    // statement — violating the implicit "cheap, piggybacked on the
+    // existing response" contract that BigQuery and Databricks satisfy.
+    //
+    // More importantly, Snowflake cost is duration-based, not
+    // bytes-based: `rocky_core::cost::compute_observed_cost_usd` routes
+    // the Snowflake branch through `duration_hours × dbu_per_hour ×
+    // cost_per_dbu` and never reads `bytes_scanned`. Adding a
+    // QUERY_HISTORY lookup per statement would only affect display in
+    // `rocky trace` / `rocky history`, not `rocky cost` accuracy.
+    //
+    // If bytes_scanned is wanted for display, revisit with a batched
+    // QUERY_HISTORY lookup at run-finalise time (one query for all
+    // statement IDs, not N queries). If Snowflake's pricing ever shifts
+    // to bytes-based (e.g., serverless compute, query acceleration),
+    // reconsider the trade-off — at that point the cost-correctness win
+    // would justify the extra round-trip.
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
         let result = self
             .connector
