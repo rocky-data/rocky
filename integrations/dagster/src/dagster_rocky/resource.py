@@ -35,7 +35,7 @@ import dagster as dg
 from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 from .types import (
     AiExplainResult,
@@ -207,6 +207,162 @@ def _accumulate_stdout(stdout: IO[str] | None, sink: list[str]) -> None:
         _log.warning("rocky stdout accumulator terminated: %s", exc)
 
 
+class RockyPipesMessageReader(dg.PipesTempFileMessageReader):
+    """Pipes message reader that translates + filters Rocky asset keys in flight.
+
+    The Rocky CLI emits Pipes messages with asset keys keyed by the
+    engine's native ``[source_type, *components, table]`` path (see
+    ``engine/crates/rocky-cli/src/commands/run.rs::emit_pipes_events``),
+    slash-joined per the Dagster wire convention. That is the correct
+    shape for a direct ``@dg.asset`` callsite that picks matching
+    keys, but :class:`RockyComponent` remaps those paths to Dagster
+    asset keys via :class:`RockyDagsterTranslator` before declaring
+    the multi-asset.
+
+    Without this reader the Pipes path would deliver materialization /
+    check events on keys Dagster's asset graph doesn't recognise, so
+    the run viewer would show "unexpected asset key" errors or drop
+    events silently. Intercepting in the reader lets us rewrite keys
+    and drop events for tables outside the selected subset *before*
+    the events reach Dagster's handler — so nothing leaks through and
+    nothing races.
+
+    The interception point is :meth:`handle_message` on the handler
+    wrapper we hand to :class:`PipesFileMessageReader._reader_thread`.
+    Subclassing :class:`PipesTempFileMessageReader` is a small private
+    API dependency (the reader-thread hook is prefixed with an
+    underscore in Dagster); if that contract ever changes, the
+    dagster bump check in CI will surface it before release.
+
+    Two transformations happen on each message:
+
+    1. ``asset_key_fn`` rewrites the wire ``asset_key`` string. It
+       receives the slash-split path (``list[str]``) — the exact tuple
+       the engine emits — and returns a :class:`dagster.AssetKey` or
+       ``None``. Returning ``None`` drops the event (the key isn't
+       known to this component).
+    2. ``include_keys`` filters on the *resolved* :class:`AssetKey`.
+       Events whose resolved key isn't in the set are dropped.
+
+    Both hooks are optional — the default reader is the unmodified
+    file-based tempfile reader.
+    """
+
+    def __init__(
+        self,
+        *,
+        asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
+        include_keys: set[dg.AssetKey] | None = None,
+        include_stdio_in_messages: bool = False,
+    ) -> None:
+        super().__init__(include_stdio_in_messages=include_stdio_in_messages)
+        self._asset_key_fn = asset_key_fn
+        self._include_keys = include_keys
+
+    @contextlib.contextmanager
+    def read_messages(self, handler):  # type: ignore[override]
+        """Wrap the upstream handler with a filter + asset-key rewriter.
+
+        We build a tiny proxy whose ``handle_message`` inspects each
+        Pipes envelope, transforms the ``asset_key`` where applicable,
+        then either forwards it to the real handler or drops it. Every
+        other method is delegated to the underlying handler so the
+        upstream reader thread sees the full interface (opened /
+        closed counts, framework exception reporting, etc.).
+        """
+        proxy = _PipesHandlerProxy(
+            handler,
+            asset_key_fn=self._asset_key_fn,
+            include_keys=self._include_keys,
+        )
+        with super().read_messages(proxy) as params:
+            yield params
+
+
+class _PipesHandlerProxy:
+    """Duck-typed handler wrapper that filters Rocky Pipes messages.
+
+    Kept private: this wraps a single call site —
+    :meth:`PipesFileMessageReader._reader_thread` invoking
+    ``handler.handle_message(message)``. Every other attribute is
+    forwarded unchanged via :meth:`__getattr__` so the reader thread's
+    exception-reporting helpers still work.
+    """
+
+    # Messages whose ``params`` dict carries an asset key. Other
+    # messages (``opened``, ``closed``, ``log``, ``log_external_stream``,
+    # ``report_custom_message``) pass through untouched.
+    _ASSET_KEYED_METHODS = frozenset(("report_asset_materialization", "report_asset_check"))
+
+    def __init__(
+        self,
+        inner,
+        *,
+        asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None,
+        include_keys: set[dg.AssetKey] | None,
+    ) -> None:
+        self._inner = inner
+        self._asset_key_fn = asset_key_fn
+        self._include_keys = include_keys
+
+    def handle_message(self, message) -> None:
+        method = message.get("method")
+        if method in self._ASSET_KEYED_METHODS:
+            transformed = self._transform_asset_key(message)
+            if transformed is None:
+                # Event dropped (either asset_key_fn rejected it or the
+                # resolved key isn't in include_keys). Silent by design
+                # — Rocky always runs at source granularity so emitting
+                # a log per dropped event would flood on any partial
+                # subset run.
+                return
+            message = transformed
+
+        self._inner.handle_message(message)
+
+    def _transform_asset_key(self, message):
+        params = message.get("params") or {}
+        raw_key = params.get("asset_key")
+        if not isinstance(raw_key, str) or not raw_key:
+            # Defensive — let the inner handler raise if the envelope
+            # is malformed. We only transform well-formed wire values.
+            return message
+
+        path = raw_key.split("/")
+
+        if self._asset_key_fn is not None:
+            resolved = self._asset_key_fn(path)
+            if resolved is None:
+                return None
+            # Dagster expects slash-escaped user strings on the wire
+            # (the handler calls AssetKey.from_escaped_user_string).
+            new_key_str = resolved.to_user_string()
+        else:
+            resolved = dg.AssetKey(path)
+            new_key_str = raw_key
+
+        if self._include_keys is not None and resolved not in self._include_keys:
+            return None
+
+        # Only rebuild the envelope when we actually changed the key —
+        # otherwise the inner handler's check.str_param is happy with
+        # the original dict.
+        if new_key_str == raw_key:
+            return message
+
+        new_params = dict(params)
+        new_params["asset_key"] = new_key_str
+        new_message = dict(message)
+        new_message["params"] = new_params
+        return new_message
+
+    def __getattr__(self, name):
+        # Forward every attribute we don't handle explicitly — the
+        # upstream reader needs report_pipes_framework_exception,
+        # on_launched, properties, and internal state.
+        return getattr(self._inner, name)
+
+
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     """Terminate ``proc`` and any children via its POSIX process group.
 
@@ -256,9 +412,126 @@ class RockyResource(dg.ConfigurableResource):
     contracts_dir: str | None = None
     server_url: str | None = None
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    #: Run ``rocky doctor`` at resource startup and gate execution on
+    #: the result. Defaults to ``False`` — doctor is *not* invoked, and
+    #: startup cost stays zero for users who don't opt in. When
+    #: ``True``, :meth:`setup_for_execution` runs doctor once per
+    #: resource initialization and may raise :class:`dagster.Failure`
+    #: based on :attr:`strict_doctor_checks`.
+    strict_doctor: bool = False
+    #: Per-check allowlist for the strict doctor gate. Only meaningful
+    #: when :attr:`strict_doctor` is ``True``.
+    #:
+    #: * Empty list (default) — fail on *any* critical check. The
+    #:   fail-fast-on-anything-critical shape.
+    #: * Non-empty — fail only when a critical check whose ``name``
+    #:   appears in this list fires. Critical checks outside the list
+    #:   are logged as warnings so operators still see them.
+    #:
+    #: Non-critical severities (``healthy``, ``warning``) never raise
+    #: regardless of this list — warnings are logged at ``warning``
+    #: level. A failure here blocks the Dagster run from launching
+    #: rather than producing a mid-run error.
+    strict_doctor_checks: list[str] = []
 
     # Instance-level cache for the version check (not a Dagster config field).
     _version_checked: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Startup hook — opt-in strict rocky doctor gate                     #
+    # ------------------------------------------------------------------ #
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        """Run the optional :meth:`rocky doctor` startup gate.
+
+        Invoked by Dagster once per resource initialization before any
+        asset / op body executes. When :attr:`strict_doctor` is
+        ``False`` (the default) this is a cheap no-op — we skip the
+        subprocess entirely to keep cold-start overhead zero for users
+        who don't opt in.
+
+        When enabled, ``rocky doctor`` runs and its result is triaged:
+
+        * Non-critical severities (``healthy``, ``warning``) are never
+          failed on. Warnings are logged at ``warning`` so operators
+          still see them.
+        * Critical checks in :attr:`strict_doctor_checks` (or *all*
+          critical checks when the list is empty) raise a
+          :class:`dagster.Failure`, preventing the run from starting.
+        * Critical checks *outside* the allowlist are logged at
+          ``warning`` so they're visible without being fatal — this is
+          the point of per-check strictness.
+
+        The binary itself failing (missing, timeout, malformed JSON)
+        also raises :class:`dagster.Failure`: when the user has opted
+        into a strict gate, "couldn't run doctor" is more aligned with
+        fail-fast than "silently pretend everything's fine."
+        """
+        if not self.strict_doctor:
+            return
+
+        log = context.log if context is not None and context.log is not None else _log
+
+        try:
+            report = self.doctor()
+        except dg.Failure as exc:
+            # User opted in to strict doctor but the binary can't run —
+            # the whole point of this hook is to fail fast on
+            # infrastructure problems, so surface the failure.
+            description = str(exc.description or exc)
+            raise dg.Failure(
+                description=(
+                    "rocky doctor could not execute during RockyResource startup "
+                    f"(strict_doctor=True, checks={self.strict_doctor_checks!r}): "
+                    f"{description}"
+                ),
+            ) from exc
+
+        log.info(
+            f"rocky doctor: overall={report.overall}, {len(report.checks)} check(s) "
+            f"(strict_doctor=True, checks={self.strict_doctor_checks!r})"
+        )
+
+        strict_failures: list[str] = []
+        warn_failures: list[str] = []
+        for check in report.checks:
+            status = check.status.value if hasattr(check.status, "value") else str(check.status)
+            if status.lower() != "critical":
+                # healthy / warning — surface warnings but never fail.
+                if status.lower() == "warning":
+                    log.warning(f"rocky doctor [{check.name}]: {check.message}")
+                continue
+
+            if self._is_strict_check(check.name):
+                strict_failures.append(f"{check.name}: {check.message}")
+            else:
+                warn_failures.append(f"{check.name}: {check.message}")
+                log.warning(f"rocky doctor [{check.name}] critical (non-strict): {check.message}")
+
+        if strict_failures:
+            raise dg.Failure(
+                description=(
+                    "rocky doctor reported critical issues on strict checks: "
+                    + "; ".join(strict_failures)
+                ),
+                metadata={
+                    "strict_failures": dg.MetadataValue.text("\n".join(strict_failures)),
+                    "non_strict_warnings": dg.MetadataValue.text(
+                        "\n".join(warn_failures) if warn_failures else "(none)"
+                    ),
+                    "strict_doctor_checks": dg.MetadataValue.text(repr(self.strict_doctor_checks)),
+                },
+            )
+
+    def _is_strict_check(self, check_name: str) -> bool:
+        """Return ``True`` when ``check_name`` is treated as strict.
+
+        * Empty allowlist → every critical check is strict (fail-on-any).
+        * Non-empty → only listed names are strict.
+        """
+        if not self.strict_doctor_checks:
+            return True
+        return check_name in self.strict_doctor_checks
 
     # ------------------------------------------------------------------ #
     # Version compatibility check                                        #
@@ -858,6 +1131,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None = None,
         shadow_suffix: str | None = None,
         pipes_client: dg.PipesSubprocessClient | None = None,
+        asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
+        include_keys: set[dg.AssetKey] | None = None,
     ) -> dg.PipesClientCompletedInvocation:
         """Full Dagster Pipes execution: structured events streamed via the protocol.
 
@@ -907,8 +1182,24 @@ class RockyResource(dg.ConfigurableResource):
             pipes_client: Optional pre-configured
                 ``PipesSubprocessClient`` (for tests or for users who
                 need custom env / cwd / message_reader / context_injector).
-                When ``None``, a fresh client is constructed with
-                Dagster defaults.
+                When supplied, ``asset_key_fn`` / ``include_keys`` are
+                ignored — the caller's client wins. When ``None``, a
+                fresh client is constructed with Dagster defaults, plus
+                a :class:`RockyPipesMessageReader` when either
+                ``asset_key_fn`` or ``include_keys`` is non-``None``.
+            asset_key_fn: Optional transform applied to each Pipes
+                event's asset key at the reader layer. The function
+                receives the slash-split path the engine emits (a
+                ``[source_type, *components, table]`` list) and returns
+                a :class:`dagster.AssetKey` — or ``None`` to drop the
+                event. Used by :class:`RockyComponent` to translate
+                engine-native paths into Dagster-translated keys before
+                they reach the handler.
+            include_keys: Optional allowlist of Dagster asset keys.
+                Events whose resolved key is not in the set are dropped
+                before reaching Dagster's materialization bookkeeping.
+                Intended for subset-aware multi-assets that must ignore
+                events for tables outside the requested subset.
 
         Returns:
             A :class:`PipesClientCompletedInvocation` ready for
@@ -932,7 +1223,21 @@ class RockyResource(dg.ConfigurableResource):
             parallel=parallel,
             shadow_suffix=shadow_suffix,
         )
-        client = pipes_client or dg.PipesSubprocessClient()
+        if pipes_client is not None:
+            client = pipes_client
+        elif asset_key_fn is not None or include_keys is not None:
+            # Custom reader only when the caller actually asked for
+            # translation / filtering — keeps the default path identical
+            # to canonical Dagster Pipes and avoids regressions for
+            # users who don't use :class:`RockyComponent`.
+            client = dg.PipesSubprocessClient(
+                message_reader=RockyPipesMessageReader(
+                    asset_key_fn=asset_key_fn,
+                    include_keys=include_keys,
+                ),
+            )
+        else:
+            client = dg.PipesSubprocessClient()
         return client.run(
             context=context,
             command=self._build_cmd(args),

@@ -44,6 +44,24 @@ attributes:
   binary_path: rocky
   config_path: rocky.toml
   models_dir: models
+
+  # execution_mode: streaming (default) | pipes
+  #   "streaming" — rocky stderr forwards to context.log, Dagster events
+  #                 are built from rocky's JSON output.
+  #   "pipes"     — Dagster Pipes protocol; rocky emits MaterializationEvent /
+  #                 AssetCheckEvaluation directly over the wire.
+  # execution_mode: streaming
+
+  # strict_doctor (bool, default false) + strict_doctor_checks (list[str], default [])
+  #   When strict_doctor is true, runs `rocky doctor` at startup and fails
+  #   fast on critical checks. strict_doctor_checks scopes the gate:
+  #     []                    → fail on any critical check
+  #     [state_rw, auth, ...] → fail only on the listed critical checks;
+  #                             others are logged as warnings.
+  #   Default (false + []) preserves the tolerant behaviour — doctor is
+  #   not run on startup.
+  # strict_doctor: false
+  # strict_doctor_checks: []
 """
 
 #: Starter ``rocky.toml`` using the DuckDB local-execution adapter so the
