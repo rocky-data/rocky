@@ -6,6 +6,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
 use crate::ir::WatermarkState;
+use crate::schema_cache::SchemaCacheEntry;
 
 const WATERMARKS: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
 const CHECK_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("check_history");
@@ -44,15 +45,37 @@ const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_
 /// zero-copy `CLONE`) are a follow-up — the schema-prefix approach ships first
 /// because it works uniformly across every adapter.
 const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
+/// Cache of `DESCRIBE TABLE` results for source warehouses (Arc 7 wave 2
+/// wave-2).
+///
+/// Key format: `"<catalog>.<schema>.<table>"` (lowercased). Value: serialized
+/// [`crate::schema_cache::SchemaCacheEntry`]. Read by
+/// `rocky_compiler::schema_cache::load_source_schemas_from_cache` to populate
+/// `CompilerConfig.source_schemas` without a live round-trip. Written
+/// opportunistically by `rocky run`'s drift/materialize paths and explicitly
+/// by `rocky discover --with-schemas` (wiring lands in PR 1b / PR 2 / PR 3).
+///
+/// Replicates as `replicate = false` by default in `state_sync.rs` so a fresh
+/// clone doesn't inherit another machine's stale types — see design doc §5.7.
+const SCHEMA_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("schema_cache");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
+
+/// Tables that should NOT be replicated by `state_sync` by default.
+///
+/// Exposed so `state_sync::upload_state` can filter them out of the remote
+/// copy when the user has not opted in via `[cache.schemas] replicate = true`.
+/// Kept alongside the table definitions so the replicate-posture decision
+/// travels with the table name — adding a new local-only table is a
+/// one-place edit instead of "grep the whole crate for replicate lists".
+pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 
 /// Schema version for the current set of state tables.
 ///
 /// Increment this constant whenever a table is added, removed, or structurally
 /// changed in a way that is incompatible with an older binary. Rocky will
 /// refuse to open a database whose stored version exceeds this value.
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -215,7 +238,7 @@ impl StateStore {
                 }
                 None => {
                     // Fresh database or pre-versioning database — stamp the version.
-                    metadata.insert("schema_version", "3")?;
+                    metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
                 }
             }
 
@@ -229,6 +252,7 @@ impl StateStore {
             let _table = txn.open_table(GRACE_PERIODS)?;
             let _table = txn.open_table(LOADED_FILES)?;
             let _table = txn.open_table(BRANCHES)?;
+            let _table = txn.open_table(SCHEMA_CACHE)?;
         }
         txn.commit()?;
 
@@ -1095,6 +1119,90 @@ impl StateStore {
         }
         txn.commit()?;
         Ok(removed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema cache (Arc 7 wave 2 wave-2)
+    // -----------------------------------------------------------------------
+
+    /// Read a single schema cache entry by key.
+    ///
+    /// Key shape is `"<catalog>.<schema>.<table>"` — see
+    /// [`crate::schema_cache::schema_cache_key`]. Returns `None` when the key
+    /// is absent; the compiler-side loader treats that as a miss and falls
+    /// back to the existing `HashMap::new()` behaviour (which typechecks the
+    /// leaf columns as `RockyType::Unknown`).
+    pub fn read_schema_cache_entry(
+        &self,
+        key: &str,
+    ) -> Result<Option<SchemaCacheEntry>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEMA_CACHE)?;
+        match table.get(key)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write a schema cache entry.
+    ///
+    /// Always overwrites — the wave-2 design is TTL-bounded staleness, not
+    /// versioned entries. Callers who want drift detection compare the old
+    /// and new entries themselves before calling (that logic belongs in the
+    /// `rocky run` write tap landing in PR 2).
+    pub fn write_schema_cache_entry(
+        &self,
+        key: &str,
+        entry: &SchemaCacheEntry,
+    ) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(entry)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEMA_CACHE)?;
+            table.insert(key, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete a single schema cache entry. Returns `true` when a row was
+    /// actually removed, `false` when the key was already absent.
+    ///
+    /// Used by the future `rocky state clear-schema-cache [--key ...]`
+    /// subcommand (wiring in PR 4). Defined now so the read path and the
+    /// admin path share one CRUD surface.
+    pub fn delete_schema_cache_entry(&self, key: &str) -> Result<bool, StateError> {
+        let txn = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = txn.open_table(SCHEMA_CACHE)?;
+            removed = table.remove(key)?.is_some();
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Enumerate the full contents of the schema cache.
+    ///
+    /// Returns `(key, entry)` tuples in arbitrary order. The compiler-side
+    /// loader prefers this over per-key reads because typecheck wants the
+    /// whole `<schema>.<table> -> Vec<TypedColumn>` map at once, and redb's
+    /// single-table scan is measurably cheaper than N point reads when the
+    /// cache has more than a handful of entries.
+    ///
+    /// Expired entries are NOT filtered here — the TTL check lives in the
+    /// compiler-side loader so that deletion (clear-schema-cache) and read
+    /// (typecheck) have a single source of truth for the eviction decision.
+    pub fn list_schema_cache(&self) -> Result<Vec<(String, SchemaCacheEntry)>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEMA_CACHE)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let cached: SchemaCacheEntry = serde_json::from_slice(value.value())?;
+            results.push((key.value().to_string(), cached));
+        }
+        Ok(results)
     }
 }
 
@@ -2197,5 +2305,143 @@ mod tests {
 
         let fetched = store.get_branch("x").unwrap().unwrap();
         assert_eq!(fetched.description.as_deref(), Some("v2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema cache (Arc 7 wave 2 wave-2)
+    // -----------------------------------------------------------------------
+
+    use crate::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+
+    fn make_schema_cache_entry(columns: Vec<(&str, &str, bool)>) -> SchemaCacheEntry {
+        SchemaCacheEntry {
+            columns: columns
+                .into_iter()
+                .map(|(name, data_type, nullable)| StoredColumn {
+                    name: name.to_string(),
+                    data_type: data_type.to_string(),
+                    nullable,
+                })
+                .collect(),
+            cached_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_schema_cache_write_and_read_round_trip() {
+        let (store, _dir) = temp_store();
+        let key = schema_cache_key("cat", "staging", "orders");
+        let entry =
+            make_schema_cache_entry(vec![("id", "BIGINT", false), ("email", "STRING", true)]);
+        store.write_schema_cache_entry(&key, &entry).unwrap();
+
+        let fetched = store.read_schema_cache_entry(&key).unwrap().unwrap();
+        assert_eq!(fetched.columns.len(), 2);
+        assert_eq!(fetched.columns[0].name, "id");
+        assert_eq!(fetched.columns[0].data_type, "BIGINT");
+        assert!(!fetched.columns[0].nullable);
+        assert_eq!(fetched.columns[1].name, "email");
+        assert!(fetched.columns[1].nullable);
+    }
+
+    #[test]
+    fn test_schema_cache_read_missing_is_none() {
+        let (store, _dir) = temp_store();
+        let key = schema_cache_key("cat", "s", "nope");
+        assert!(store.read_schema_cache_entry(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_schema_cache_write_overwrites() {
+        let (store, _dir) = temp_store();
+        let key = schema_cache_key("c", "s", "t");
+
+        let first = make_schema_cache_entry(vec![("id", "INT", false)]);
+        store.write_schema_cache_entry(&key, &first).unwrap();
+
+        let second =
+            make_schema_cache_entry(vec![("id", "BIGINT", false), ("name", "STRING", true)]);
+        store.write_schema_cache_entry(&key, &second).unwrap();
+
+        let fetched = store.read_schema_cache_entry(&key).unwrap().unwrap();
+        assert_eq!(fetched.columns.len(), 2);
+        assert_eq!(fetched.columns[0].data_type, "BIGINT");
+    }
+
+    #[test]
+    fn test_schema_cache_delete_returns_true_when_present() {
+        let (store, _dir) = temp_store();
+        let key = schema_cache_key("c", "s", "t");
+        let entry = make_schema_cache_entry(vec![("id", "BIGINT", false)]);
+        store.write_schema_cache_entry(&key, &entry).unwrap();
+
+        assert!(store.delete_schema_cache_entry(&key).unwrap());
+        assert!(store.read_schema_cache_entry(&key).unwrap().is_none());
+        // Idempotent: second delete returns false.
+        assert!(!store.delete_schema_cache_entry(&key).unwrap());
+    }
+
+    #[test]
+    fn test_schema_cache_delete_missing_returns_false() {
+        let (store, _dir) = temp_store();
+        assert!(!store.delete_schema_cache_entry("never.seen.key").unwrap());
+    }
+
+    #[test]
+    fn test_schema_cache_list_returns_all_entries() {
+        let (store, _dir) = temp_store();
+        store
+            .write_schema_cache_entry(
+                &schema_cache_key("c", "s", "a"),
+                &make_schema_cache_entry(vec![("id", "BIGINT", false)]),
+            )
+            .unwrap();
+        store
+            .write_schema_cache_entry(
+                &schema_cache_key("c", "s", "b"),
+                &make_schema_cache_entry(vec![("id", "BIGINT", false)]),
+            )
+            .unwrap();
+        store
+            .write_schema_cache_entry(
+                &schema_cache_key("other", "s", "c"),
+                &make_schema_cache_entry(vec![("id", "BIGINT", false)]),
+            )
+            .unwrap();
+
+        let all = store.list_schema_cache().unwrap();
+        assert_eq!(all.len(), 3);
+        let keys: std::collections::HashSet<&str> = all.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains("c.s.a"));
+        assert!(keys.contains("c.s.b"));
+        assert!(keys.contains("other.s.c"));
+    }
+
+    #[test]
+    fn test_schema_cache_list_empty() {
+        let (store, _dir) = temp_store();
+        assert!(store.list_schema_cache().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_schema_cache_entry_ttl_expiry_semantics() {
+        // Deliberately test the TTL predicate at the state-store layer
+        // too — a regression in `is_expired` would silently cause every
+        // cache read to count as fresh, which is exactly the correctness
+        // failure mode the design doc §5.1 flags.
+        let now = Utc::now();
+        let ttl = chrono::Duration::hours(24);
+
+        let fresh = SchemaCacheEntry {
+            columns: vec![],
+            cached_at: now - chrono::Duration::hours(1),
+        };
+        assert!(!fresh.is_expired(now, ttl));
+
+        let stale = SchemaCacheEntry {
+            columns: vec![],
+            cached_at: now - chrono::Duration::hours(25),
+        };
+        assert!(stale.is_expired(now, ttl));
     }
 }

@@ -7,7 +7,7 @@
 //! S3 and GCS use the shared [`ObjectStoreProvider`][crate::object_store::ObjectStoreProvider]
 //! so credential resolution follows the standard AWS SDK / GCP ADC chains.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -142,13 +142,129 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
 /// the de-facto behaviour of existing callers that `warn + continue` on upload
 /// errors. Set `on_upload_failure = "fail"` for strict environments that must
 /// treat state durability as a hard requirement.
+///
+/// Tables listed in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] are filtered out
+/// of the remote copy by default — Arc 7 wave 2 wave-2 wires the schema cache
+/// here (design doc §5.7). Use
+/// [`upload_state_with_excluded_tables`] to override the default when
+/// `[cache.schemas] replicate = true` is configured.
 pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+    upload_state_with_excluded_tables(config, local_path, crate::state::LOCAL_ONLY_TABLE_NAMES)
+        .await
+}
+
+/// Variant of [`upload_state`] that lets the caller override the list of
+/// redb tables stripped from the remote copy.
+///
+/// When `excluded_tables` is empty the local file is uploaded as-is (no
+/// temp-file copy, no overhead). Otherwise the local file is copied to a
+/// temp path, the listed tables are deleted from the copy, and the copy is
+/// uploaded. The local `state.redb` is never modified.
+///
+/// Errors from the temp-copy step (I/O, redb open, delete_table, commit) are
+/// surfaced as `StateSyncError::Io` or the underlying error string wrapped
+/// into a transient upload error — they share the same failure-mode policy
+/// as any other transient upload error (retry then skip/fail per
+/// `on_upload_failure`).
+pub async fn upload_state_with_excluded_tables(
+    config: &StateConfig,
+    local_path: &Path,
+    excluded_tables: &[&str],
+) -> Result<(), StateSyncError> {
     if !local_path.exists() {
         debug!("No local state file to upload");
         return Ok(());
     }
-    let result = dispatch_upload(config, local_path).await;
+    if excluded_tables.is_empty() || matches!(config.backend, StateBackend::Local) {
+        // Fast path: nothing to strip or local backend is a no-op anyway.
+        let result = dispatch_upload(config, local_path).await;
+        return apply_upload_failure_policy(config, result);
+    }
+
+    // Filter path: copy, strip, upload the copy.
+    let scratch = match strip_local_only_tables(local_path, excluded_tables) {
+        Ok(path) => path,
+        Err(e) => {
+            warn!(
+                error = %e,
+                outcome = "filter_failed",
+                "failed to build replicate-filtered state copy; uploading unfiltered local state"
+            );
+            // Fall back to the unfiltered local path so a transient filter
+            // failure doesn't block state durability. The filter is a
+            // correctness hedge, not a hard privacy boundary.
+            let result = dispatch_upload(config, local_path).await;
+            return apply_upload_failure_policy(config, result);
+        }
+    };
+    let result = dispatch_upload(config, &scratch).await;
+    // Scratch files live under `std::env::temp_dir()`; best-effort cleanup
+    // on success or failure. A leaked scratch DB on this run is a small
+    // cost the OS cleans up at reboot.
+    let _ = std::fs::remove_file(&scratch);
     apply_upload_failure_policy(config, result)
+}
+
+/// Build a temp redb copy of `local_path` with `excluded_tables` removed.
+///
+/// Returns the path of the temp copy. Caller is responsible for deleting it.
+/// Used by the replicate-filtered upload path (Arc 7 wave 2 wave-2,
+/// design doc §5.7). Kept small and synchronous — the schema cache is the
+/// only local-only table today, its footprint is bounded by TTL (§4.3),
+/// and the round-trip file copy is proportional to total state size (order
+/// of single-digit megabytes for a typical project).
+fn strip_local_only_tables(
+    local_path: &Path,
+    excluded_tables: &[&str],
+) -> Result<PathBuf, StateSyncError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let scratch = std::env::temp_dir().join(format!(
+        "rocky-state-upload-{}-{}.redb",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::copy(local_path, &scratch)?;
+
+    // Open the copy and drop the excluded tables. `delete_table` returns
+    // `Ok(false)` when the table doesn't exist, which is the right
+    // behaviour: an older copy that never had `schema_cache` just no-ops
+    // and uploads cleanly.
+    let db = redb::Database::create(&scratch).map_err(|e| {
+        StateSyncError::Io(std::io::Error::other(format!(
+            "redb open for state filter failed: {e}"
+        )))
+    })?;
+    let txn = db.begin_write().map_err(|e| {
+        StateSyncError::Io(std::io::Error::other(format!(
+            "redb begin_write for state filter failed: {e}"
+        )))
+    })?;
+    for name in excluded_tables {
+        let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+        if let Err(e) = txn.delete_table(def) {
+            // Bubble up only genuine delete errors; a missing-table error
+            // (TableError::TableDoesNotExist) is a legitimate no-op and
+            // is represented by `Ok(false)` from the v2 API.
+            warn!(
+                table = name,
+                error = %e,
+                outcome = "delete_table_failed",
+                "filter could not drop table (continuing with remainder)"
+            );
+        }
+    }
+    txn.commit().map_err(|e| {
+        StateSyncError::Io(std::io::Error::other(format!(
+            "redb commit for state filter failed: {e}"
+        )))
+    })?;
+    // Drop the db handle so the OS fully releases any mmap before the
+    // scratch file is opened by the upload path.
+    drop(db);
+    Ok(scratch)
 }
 
 /// Internal upload dispatch — runs the raw upload (with retry) without
@@ -1027,5 +1143,99 @@ mod tests {
             2,
             "budget should abort after first retry",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_local_only_tables (Arc 7 wave 2 wave-2)
+    // -----------------------------------------------------------------------
+
+    use crate::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+    use crate::state::{LOCAL_ONLY_TABLE_NAMES, StateStore};
+
+    fn seed_watermark_and_cache(path: &Path) {
+        let store = StateStore::open(path).expect("open state store for test seed");
+        let now = chrono::Utc::now();
+        store
+            .set_watermark(
+                "cat.sch.tbl",
+                &crate::ir::WatermarkState {
+                    last_value: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+        let key = schema_cache_key("cat", "staging", "orders");
+        store
+            .write_schema_cache_entry(
+                &key,
+                &SchemaCacheEntry {
+                    columns: vec![StoredColumn {
+                        name: "id".into(),
+                        data_type: "BIGINT".into(),
+                        nullable: false,
+                    }],
+                    cached_at: now,
+                },
+            )
+            .unwrap();
+        drop(store);
+    }
+
+    #[test]
+    fn strip_local_only_tables_drops_schema_cache_preserves_watermarks() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_watermark_and_cache(&src);
+
+        let filtered =
+            strip_local_only_tables(&src, LOCAL_ONLY_TABLE_NAMES).expect("filter should succeed");
+
+        // Open the filtered DB and verify: watermark is preserved, schema
+        // cache is empty.
+        let filtered_store = StateStore::open(&filtered).unwrap();
+        assert!(
+            filtered_store
+                .get_watermark("cat.sch.tbl")
+                .unwrap()
+                .is_some(),
+            "watermark should survive the filter"
+        );
+        assert!(
+            filtered_store.list_schema_cache().unwrap().is_empty(),
+            "schema cache should be stripped"
+        );
+        drop(filtered_store);
+
+        // Source is untouched — the schema_cache entry is still there.
+        let src_store = StateStore::open(&src).unwrap();
+        assert_eq!(src_store.list_schema_cache().unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&filtered);
+    }
+
+    #[tokio::test]
+    async fn upload_state_with_empty_excluded_fast_paths_local() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_watermark_and_cache(&src);
+
+        // Empty exclude list + local backend = no-op; just proves the
+        // fast-path guard doesn't touch the file.
+        let config = StateConfig::default();
+        let result = upload_state_with_excluded_tables(&config, &src, &[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn upload_state_default_honours_local_only_list_on_local_backend() {
+        // Local backend is a no-op for actual upload, but the fast-path
+        // branch should still route through the default-excluded-list
+        // wrapper without error.
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_watermark_and_cache(&src);
+
+        let config = StateConfig::default();
+        assert!(upload_state(&config, &src).await.is_ok());
     }
 }

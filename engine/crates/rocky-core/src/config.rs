@@ -1195,9 +1195,75 @@ pub struct BudgetBreach {
 }
 
 /// Valkey/Redis cache configuration for distributed caching.
+///
+/// Note: this type has existed since the early cache experiments and is
+/// currently not wired into [`RockyConfig`] — see `CHANGELOG.md` for the
+/// history. Kept `pub` because downstream tooling may still reference it,
+/// but the top-level `[cache]` config surface is now [`CacheConfig`]
+/// (schemas section for Arc 7 wave 2 wave-2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheConfig {
+pub struct ValkeyCacheConfig {
     pub valkey_url: String,
+}
+
+/// Top-level `[cache]` configuration.
+///
+/// Holds every cache surface that lives at the project level (i.e. has a
+/// `rocky.toml` knob). Today that's only the schema cache, but the shape
+/// is deliberately extensible: if a future `[cache.query]` or
+/// `[cache.plan]` surfaces, it lands as a new field on this struct with a
+/// `#[serde(default)]` attribute and its own `*Config` type — no breaking
+/// change to existing `rocky.toml` files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Schema cache (Arc 7 wave 2 wave-2). Stores `DESCRIBE TABLE` results
+    /// in `state.redb` so leaf models typecheck against real warehouse
+    /// types without a live round-trip on every compile.
+    pub schemas: SchemaCacheConfig,
+}
+
+/// `[cache.schemas]` — schema cache configuration.
+///
+/// Controls the Arc 7 wave 2 wave-2 DESCRIBE-result cache. Defaults are
+/// chosen so the feature is useful out of the box: the cache is on,
+/// entries live for 24 hours, and nothing replicates off-machine until
+/// the user opts in. See the design doc at
+/// `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md`
+/// (§4.3, §5.7) for the rationale.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchemaCacheConfig {
+    /// Enable schema cache reads + writes. Defaults to `true`. Set to
+    /// `false` for strict CI where every typecheck should resolve against
+    /// the current warehouse and never fall back to a cached entry.
+    pub enabled: bool,
+    /// TTL for cache entries in seconds. Defaults to 86400 (24 hours).
+    /// Lower it for high-DDL-churn teams; raise it for projects whose
+    /// sources change on a weekly or slower cadence.
+    pub ttl_seconds: u64,
+    /// Replicate the schema cache via `state_sync` to the remote backend.
+    /// Defaults to `false`: a dev on a fresh clone should not inherit
+    /// another machine's stale type stamps. Opt in to `true` for teams
+    /// that want cross-machine cache warm-up via a shared state backend.
+    pub replicate: bool,
+}
+
+impl Default for SchemaCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: 86_400,
+            replicate: false,
+        }
+    }
+}
+
+impl SchemaCacheConfig {
+    /// Convenience: TTL as a `chrono::Duration` for the read path.
+    pub fn ttl(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.ttl_seconds as i64)
+    }
 }
 
 /// Matches `${VAR}` and `${VAR:-default}` env-var substitution placeholders.
@@ -1404,6 +1470,12 @@ pub struct RockyConfig {
     /// [`PortabilityConfig::target_dialect`].
     #[serde(default)]
     pub portability: PortabilityConfig,
+
+    /// Project-level cache configuration. Arc 7 wave 2 wave-2 introduces
+    /// `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future
+    /// cache surfaces live as sibling fields under [`CacheConfig`].
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 /// Project-wide dialect portability configuration.
@@ -5069,5 +5141,95 @@ max_rows = 1000000
         };
         let breaches = cfg.check_breaches(Some(12.0), 90_000);
         assert_eq!(breaches.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache / schema cache config (Arc 7 wave 2 wave-2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema_cache_config_defaults() {
+        let cfg = SchemaCacheConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.ttl_seconds, 86_400);
+        assert!(!cfg.replicate);
+        assert_eq!(cfg.ttl(), chrono::Duration::seconds(86_400));
+    }
+
+    #[test]
+    fn cache_config_defaults_schemas_section() {
+        let cfg = CacheConfig::default();
+        assert!(cfg.schemas.enabled);
+        assert_eq!(cfg.schemas.ttl_seconds, 86_400);
+        assert!(!cfg.schemas.replicate);
+    }
+
+    #[test]
+    fn parse_cache_schemas_full_block() {
+        // Parse as a full `RockyConfig` so the `[cache.schemas]` TOML path
+        // lands on `RockyConfig.cache.schemas` — matches how users
+        // actually author `rocky.toml`.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [cache.schemas]
+            enabled = true
+            ttl_seconds = 3600
+            replicate = true
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.cache.schemas.enabled);
+        assert_eq!(cfg.cache.schemas.ttl_seconds, 3600);
+        assert!(cfg.cache.schemas.replicate);
+    }
+
+    #[test]
+    fn parse_cache_schemas_partial_override_keeps_other_defaults() {
+        // Setting only ttl_seconds: enabled + replicate should remain at
+        // their defaults. This is the #[serde(default)] contract.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [cache.schemas]
+            ttl_seconds = 7200
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.cache.schemas.enabled); // default true
+        assert_eq!(cfg.cache.schemas.ttl_seconds, 7200);
+        assert!(!cfg.cache.schemas.replicate); // default false
+    }
+
+    #[test]
+    fn parse_cache_schemas_empty_section_uses_all_defaults() {
+        // A bare `[cache]` block with no children should defer every
+        // schema-cache knob to its default. Verifies the
+        // `#[serde(default)]` on `CacheConfig.schemas`.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [cache]
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.cache.schemas.enabled);
+        assert_eq!(cfg.cache.schemas.ttl_seconds, 86_400);
+        assert!(!cfg.cache.schemas.replicate);
+    }
+
+    #[test]
+    fn rocky_config_default_includes_cache_defaults() {
+        // When a user's rocky.toml omits `[cache]` entirely, the top-level
+        // RockyConfig still exposes a usable `.cache` field with the
+        // shipped defaults — this is the zero-config contract.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.cache.schemas.enabled);
+        assert_eq!(cfg.cache.schemas.ttl_seconds, 86_400);
+        assert!(!cfg.cache.schemas.replicate);
     }
 }
