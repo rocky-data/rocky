@@ -12,7 +12,15 @@ class TraceModelEntry(BaseModel):
     """
 
     bytes_scanned: conint(ge=0) | None = None
+    """
+    Adapter-reported bytes figure used for cost accounting. This is the *billing-relevant* number per adapter, not literal scan volume:
+
+    - **BigQuery:** `totalBytesBilled` — includes the 10 MB per-query minimum floor; matches the BigQuery console's "Bytes billed" field, **not** "Bytes processed". - **Databricks:** when populated, byte count from the statement-execution manifest (`total_byte_count`); `None` today until the manifest plumbing lands. - **Snowflake:** `None` — deferred by design (QUERY_HISTORY round-trip cost; Snowflake cost is duration × DBU, not bytes-driven). - **DuckDB:** `None` — no billed-bytes concept.
+    """
     bytes_written: conint(ge=0) | None = None
+    """
+    Adapter-reported bytes-written figure. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet.
+    """
     duration_ms: conint(ge=0)
     lane: conint(ge=0) | None = 0
     """

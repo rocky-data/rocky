@@ -509,7 +509,28 @@ pub struct ModelExecution {
     pub rows_affected: Option<u64>,
     pub status: String,
     pub sql_hash: String,
+    /// Adapter-reported bytes figure used for cost accounting. This is
+    /// the *billing-relevant* number per adapter, not literal scan
+    /// volume:
+    ///
+    /// - **BigQuery:** `totalBytesBilled` — includes the 10 MB
+    ///   per-query minimum floor; matches the BigQuery console's
+    ///   "Bytes billed" field, **not** "Bytes processed".
+    /// - **Databricks:** when populated, byte count from the
+    ///   statement-execution manifest (`total_byte_count`); `None`
+    ///   today until the manifest plumbing lands.
+    /// - **Snowflake:** `None` — deferred by design (QUERY_HISTORY
+    ///   round-trip cost; Snowflake cost is duration × DBU, not
+    ///   bytes-driven).
+    /// - **DuckDB:** `None` — no billed-bytes concept.
+    ///
+    /// Persisted mirror of `MaterializationOutput.bytes_scanned`.
     pub bytes_scanned: Option<u64>,
+    /// Adapter-reported bytes-written figure. Currently `None` on
+    /// every adapter — BigQuery doesn't expose a bytes-written figure
+    /// for query jobs, and the Databricks / Snowflake paths haven't
+    /// wired it yet. Reserved for adapters that produce a natural
+    /// bytes-written figure via their statistics surface.
     pub bytes_written: Option<u64>,
 }
 
