@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-04-23
+
+Tracks engine 1.14.0. Ships four GOLD-origin feature requests (Pipes execution mode, strict doctor on startup, `state_health()` accessor, `cost()` wiring) plus a sub-second `state_health()` follow-up. Four PRs since v1.9.0.
+
+### Added
+
+- **`RockyResource.cost()` method** (#218) — wraps `rocky cost <run_id|latest>` and returns a typed `CostOutput`. Closes the Dagster wiring follow-up deferred by engine PR #202. Dispatch-table entry, `regen_fixtures.sh` capture step, and `test_generated_fixtures.py` parse-guard shipped together. No `--model` filter yet (CLI flag exists; follow-up).
+- **`RockyComponent` Pipes execution mode** (FR-001, #224) — opt-in `execution_mode="pipes"` wraps `run_pipes` as the execution backend. Custom `RockyPipesMessageReader` subclass catches events at source with `asset_key_fn` + `include_keys` support. 30 new tests. **Spec deviation worth flagging:** `asset_key_fn` signature is `Callable[[list[str]], dg.AssetKey | None]` (not the FR's `Callable[[SourceInfo | ModelInfo], AssetKey]`) because Pipes carries slash-joined paths on the wire, not model objects.
+- **Strict `rocky doctor` on `RockyResource` startup** (FR-006, #224) — `setup_for_execution` runs `rocky doctor` when `strict_doctor: bool = False` / `strict_doctor_checks: list[str]` opts in. **Spec deviation:** strictness surface flipped from `fail_on_doctor_critical: list[str] | Literal["none", "all"]` to two fields because Dagster's Pydantic config serializer rejects the `Union` with `DagsterInvalidPythonicConfigDefinitionError`; same semantic space.
+- **`RockyResource.state_health()` accessor** (FR-003, #227) — returns a typed `StateHealthResult` Pydantic model. Parses `rocky.toml` backend via `tomllib`, fetches `rocky history` for last-run info, optionally runs a doctor probe; sensor-tick safe (doctor/history failures degrade to typed `None` / error fields rather than propagating `dg.Failure`). 24 new tests.
+
+### Changed
+
+- **`RockyResource.doctor(check=...)` filter** (#229) — optional `check: str | None = None` kwarg forwards to `rocky doctor --check <id>`. `state_health()` now calls `doctor(check="state_rw")` instead of the full doctor suite, cutting probe cost from full-doctor (~1 s) to sub-100 ms. Closes the known follow-up from #227.
+- **`SourceInfo.metadata` now carries adapter-namespaced keys** forwarded by the translator (engine #225). Fivetran connectors surface `fivetran.service` / `fivetran.connector_id` / `fivetran.schema_prefix` / `fivetran.custom_tables` / `fivetran.custom_reports` as Dagster asset metadata.
+- **Generated types refreshed** for engine 1.14.0: new `ClearSchemaCacheOutput`, new `schemas_cached` field on `DiscoverOutput`, new `metadata` field on `SourceOutput`, new `bytes_scanned` / `bytes_written` on `MaterializationOutput`.
+
 ## [1.9.0] — 2026-04-22
 
 Tracks engine 1.13.0 (state-backend reliability hardening + `state_rw` doctor check).
