@@ -1201,11 +1201,9 @@ pub struct WatermarkEntry {
 
 /// JSON output for `rocky state clear-schema-cache`.
 ///
-/// Part of Arc 7 wave 2 wave-2 PR 4 — the explicit-flush path for the
-/// schema cache written by PR 2 (`rocky run` write tap) and read by PR 1b
-/// (compile/lsp/etc.). `dry_run = true` reports what *would* be deleted
-/// without touching redb; `dry_run = false` deletes the entries and
-/// `entries_deleted` is the actual removed count.
+/// `dry_run = true` reports what *would* be deleted without touching
+/// redb; `dry_run = false` deletes the entries. `entries_deleted` is
+/// the actual removed count (or would-be-removed count in dry-run).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ClearSchemaCacheOutput {
     pub version: String,
