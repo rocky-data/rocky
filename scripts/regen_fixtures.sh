@@ -102,6 +102,9 @@ capture history history
 capture metrics metrics revenue_summary
 capture optimize optimize
 capture dag dag --models models
+# The bootstrap `rocky run` above persists a RunRecord to the state store,
+# so `rocky cost latest` rolls up real per-model durations / bytes / cost.
+capture cost cost latest
 
 # Drift detection requires the engine to detect schema changes against an
 # already-existing target. The 00-playground-default POC always uses

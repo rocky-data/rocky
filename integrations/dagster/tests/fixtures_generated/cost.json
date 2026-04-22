@@ -1,0 +1,21 @@
+{
+  "version": "1.13.0",
+  "command": "cost",
+  "run_id": "run-SENTINEL",
+  "status": "success",
+  "trigger": "manual",
+  "started_at": "2000-01-01T00:00:00Z",
+  "finished_at": "2000-01-01T00:00:00Z",
+  "duration_ms": 0,
+  "adapter_type": "duckdb",
+  "total_cost_usd": 0.0,
+  "total_duration_ms": 0,
+  "per_model": [
+    {
+      "model_name": "orders",
+      "status": "success",
+      "duration_ms": 0,
+      "cost_usd": 0.0
+    }
+  ]
+}
