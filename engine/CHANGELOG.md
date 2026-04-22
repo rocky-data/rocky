@@ -7,11 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-04-23
+
+Big batch of arcs shipping together: Arc 7 wave 2 wave-2 (cached DESCRIBE end-to-end), Arc 2 wave 3 (`bytes_scanned` plumbing → real $ cost on BigQuery + Databricks), three inbound governance / adapter feature requests (Unity Catalog workspace bindings, Fivetran connector metadata), plus a dedup of the retry backoff helper. Twelve engine PRs since v1.13.0.
+
 ### Added
 
-- **`rocky discover --with-schemas`** — explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache (design doc §4.2 route B). When set, walks each unique `(catalog, schema)` pair reachable via the source's `BatchCheckAdapter`, issues one `batch_describe_schema` round-trip, and persists every returned table as a `SchemaCacheEntry` in `state.redb::schema_cache`. Intended for CI warm-up so downstream `rocky compile` / `rocky lsp` invocations typecheck leaf models against real warehouse types. Per-schema describe failures and per-entry write failures are logged at `warn` and skipped — one bad source does not abort the warm-up. Missing `source.catalog` or an adapter without a `BatchCheckAdapter` (DuckDB today) warns once and skips writes. Passing `--with-schemas` when `[cache.schemas] enabled = false` errors with a clear message instead of silently no-op'ing. New `schemas_cached: usize` field on `DiscoverOutput` (skipped from JSON when zero, so existing fixtures stay byte-stable).
-- **`rocky state clear-schema-cache [--dry-run]`** — explicit flush for the schema cache. Removes every `SCHEMA_CACHE` entry from `state.redb`. Missing state store is treated as a no-op (reports `entries_deleted = 0`, exits zero) so the command is safe to run on a fresh clone / ephemeral CI runner before a strict build. `--dry-run` reports what would be removed without touching redb. New `ClearSchemaCacheOutput` through the codegen cascade. Existing bare `rocky state` (watermark view) is preserved as the default when no subcommand is given.
-- **`rocky --cache-ttl <seconds>`** global CLI flag — overrides `[cache.schemas] ttl_seconds` for this invocation only. Precedence: `--cache-ttl` > `rocky.toml` > built-in default (86400 s / 24 h). `--cache-ttl 0` treats every cache entry as instantly stale (read path returns an empty map); to disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml` instead. Applies to CLI read paths (`rocky compile`, `rocky run`, etc.); the `rocky lsp` and `rocky serve` daemons continue to use the config-derived TTL because daemon lifetimes outlive a single-invocation flag.
+#### Arc 7 wave 2 wave-2 — cached DESCRIBE
+
+Leaf models now typecheck against real warehouse types without a live `DESCRIBE TABLE` round-trip on every `rocky compile` / `rocky lsp` invocation. Five PRs land end-to-end:
+
+- **`rocky-core::schema_cache` + `SCHEMA_CACHE` redb table** (#223, PR 1a) — `SchemaCacheEntry` / `StoredColumn` / `schema_cache_key` / `is_expired` helpers in `rocky-core`; adapter-neutral strings keep the core clear of `RockyType`. New `[cache.schemas]` config (`enabled = true`, `ttl_seconds = 86400`, `replicate = false`). `StateStore` gains CRUD on the new table (schema version 3 → 4). `state_sync::upload_state_with_excluded_tables` filters local-only tables out of remote state by default. `rocky-compiler::schema_cache::load_source_schemas_from_cache` TTL-filtered loader.
+- **Typecheck callsites wired against the cache** (#228, PR 1b) — 9 of 10 `CompilerConfig.source_schemas: HashMap::new()` callsites in `rocky-cli` + `rocky-server/LSP` now read from `StateStore::open_read_only` (no write lock, safe alongside live `rocky run`). `ai.rs:112` (ValidationContext) and `bench.rs:268` (synthetic tempdir) left unwired by design. LSP throttle module gates the cache loads per `models_dir`; honours `[cache.schemas] enabled`.
+- **`rocky run` write tap** (#230, PR 2) — `SchemaCacheWriteTap` persists every successful `batch_describe_schema` result into `SCHEMA_CACHE`. Dedup within one run; best-effort (cache-write failures logged at `warn`, never fail the run). Gated on `[cache.schemas] enabled`.
+- **`rocky discover --with-schemas`** (#231, PR 3) — explicit warm-up path for CI / scripted cache priming. Walks each `(catalog, schema)` pair via the source's `BatchCheckAdapter`, persists every returned table. Setting the flag with `[cache.schemas] enabled = false` errors with a clear message instead of silently no-op'ing. New `schemas_cached: usize` on `DiscoverOutput` (`skip_serializing_if = is_zero` keeps existing fixtures byte-stable).
+- **`rocky state clear-schema-cache [--dry-run]`** (#232, PR 4) — explicit flush. Missing state store treated as no-op (CI-safe on ephemeral runners). New `ClearSchemaCacheOutput` through the codegen cascade. `rocky state` becomes a subcommand group; bare `rocky state` (watermarks view) is preserved.
+- **`rocky --cache-ttl <seconds>` global CLI flag** (#232, PR 4) — overrides `[cache.schemas] ttl_seconds` for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > built-in default (86400 s / 24 h). `--cache-ttl 0` treats every cache entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false`. Applies to CLI read paths (`rocky compile`, `rocky run`, …); the `rocky lsp` / `rocky serve` daemons keep the config-derived TTL because daemon lifetimes outlive a single-invocation flag.
+
+**Known follow-up** (not in these five PRs): CLI default state_path (`.rocky-state.redb` in CWD) and LSP default (`models_dir.join(".rocky-state.redb")`) diverge — until they're unified, LSP inlay-hints don't observe what `rocky run` wrote. Needs a migration story for existing users' state files; tracked as a separate PR.
+
+#### Arc 2 wave 3 — `bytes_scanned` adapter plumbing
+
+Billing-relevant bytes flow through `MaterializationOutput.bytes_scanned` on BigQuery and Databricks, so `rocky cost` produces real dollar numbers end-to-end.
+
+- **Non-breaking `WarehouseAdapter::execute_statement_with_stats` trait method** (#219) — default impl returns all-`None`. BigQuery override parses `statistics.query.totalBytesBilled` from the REST response. New `ExecutionStats { bytes_scanned, bytes_written, rows_affected }` public type. `MaterializationOutput` gains `bytes_scanned` / `bytes_written`. `populate_cost_summary` now consumes `mat.bytes_scanned`. Naming note: `bytes_scanned` carries *billing-relevant* bytes (BQ returns `totalBytesBilled` with a 10 MB floor), not literal scan volume.
+- **Databricks override** (#221) — `manifest.total_byte_count` maps to `bytes_scanned`. Databricks cost is DBU-priced, so bytes aren't the primary cost driver; surfaced as-is for observability parity with BQ.
+- **Snowflake deferred-by-design** (#220) — 21-line adapter comment explaining why Snowflake does NOT override: `QUERY_HISTORY` round-trip cost + Snowflake cost is duration × DBU, never consumes `bytes_scanned`. Serverless pricing would flip the trade-off; batched-lookup-at-finalise is the future path if demand materialises.
+- **Adapter-keyed `bytes_scanned` docstring cascade** (#222) — six field-declaration sites carry billing-semantic doc through `schemars` to 12 generated files (JSON schema + Pydantic + TypeScript). VS Code hover and Dagster Pydantic IDE consumers see the BQ-console-comparison nugget in place.
+
+**Residual gaps surfaced but not addressed this release** (demand-gated): plain transformation models don't push `MaterializationOutput` in the `execute_models` loop today, so derived BQ models via `full_refresh` / `incremental` / `merge` still report `None`; `snapshot_scd2` uses multi-statement `execute_query`.
+
+#### Unity Catalog workspace-binding reconcile
+
+- **`GovernanceAdapter::list_workspace_bindings` + `remove_workspace_binding`** (#226) — additive trait extension; new `reconcile_access` combined-pass entry in `permissions.rs` (grants + bindings in one pass; `rocky plan` groups them). Databricks-only implementation via existing `WorkspaceManager`; non-Databricks adapters silently no-op. **Behaviour change to flag for users:** the reconciler removes hand-added bindings not in `rocky.toml`. Consider a `reconcile_bindings = false` default or `--dry-run` before a policy-sensitive rollout.
+
+#### Fivetran connector metadata
+
+- **`SourceOutput.metadata` + `DiscoveredConnector.metadata`** (#225) — adapter-namespaced `IndexMap<String, Value>`. Fivetran populates `fivetran.service` / `fivetran.connector_id` / `fivetran.schema_prefix` / `fivetran.custom_tables` / `fivetran.custom_reports`. Other adapters (Airbyte, DuckDB, Iceberg) pass empty maps; `skip_serializing_if = "IndexMap::is_empty"` keeps DuckDB playground fixtures byte-stable. `IndexMap` over `HashMap` for insertion-stable iteration (deterministic fixture bytes). Dagster translator forwards adapter-namespaced keys as asset metadata.
+
+### Internal
+
+- **`compute_backoff` dedup** (#217) — lifted three identical copies from `rocky-core::state_sync` / `rocky-databricks::connector` / `rocky-snowflake::connector` into a new `rocky_core::retry` module. Net −99 lines. All three bodies were byte-identical (cosmetic drift only), so zero unification choices. Closes the follow-up left open by #213.
 
 ## [1.13.0] — 2026-04-22
 
