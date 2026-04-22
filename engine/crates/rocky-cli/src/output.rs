@@ -339,6 +339,22 @@ pub struct MaterializationOutput {
     /// `rocky_core::cost::compute_observed_cost_usd`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Bytes the warehouse reported reading to produce the result, summed
+    /// across all statements executed for this materialization. For
+    /// BigQuery on-demand this is `statistics.query.totalBytesBilled`
+    /// (with the 10 MB minimum already applied) — fed straight into
+    /// [`rocky_core::cost::compute_observed_cost_usd`] to produce
+    /// `cost_usd`. `None` when the adapter does not report bytes (today:
+    /// Databricks / Snowflake / DuckDB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+    /// Bytes the warehouse reported writing to the destination, summed
+    /// across all statements. Currently `None` on every adapter — BigQuery
+    /// doesn't expose a natural bytes-written figure for query jobs, and
+    /// the Databricks / Snowflake paths haven't wired it yet. Field
+    /// reserved so future waves can populate it without a schema break.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1881,16 +1897,17 @@ impl RunOutput {
         let mut total_duration_ms: u64 = 0;
 
         for mat in &mut self.materializations {
-            // `bytes_scanned` is not yet plumbed into `MaterializationOutput`
-            // from the adapter layer — a later wave will wire
-            // Databricks's `result.manifest.total_byte_count` /
-            // Snowflake's `statistics.queryLoad` / BigQuery's
-            // `totalBytesProcessed` through. Until then BigQuery cost
-            // stays `None`; Databricks/Snowflake/DuckDB compute from
-            // `duration_ms` alone.
+            // BigQuery: `mat.bytes_scanned` is populated by the adapter
+            // from `statistics.query.totalBytesBilled` (Arc 2 wave 3).
+            // Databricks / Snowflake / DuckDB still inherit the default
+            // [`rocky_core::traits::WarehouseAdapter::execute_statement_with_stats`]
+            // stub which returns `None`, so those adapters continue to
+            // compute cost from `duration_ms` alone; wiring their native
+            // stats (Databricks `result.manifest.total_byte_count`,
+            // Snowflake `statistics.queryLoad`) is a follow-up wave.
             let cost = rocky_core::cost::compute_observed_cost_usd(
                 wh,
-                None,
+                mat.bytes_scanned,
                 mat.duration_ms,
                 dbu_per_hour,
                 cost_per_dbu,
@@ -2036,8 +2053,8 @@ impl RunOutput {
                 rows_affected: mat.rows_copied,
                 status: "success".to_string(),
                 sql_hash: mat.metadata.sql_hash.clone().unwrap_or_default(),
-                bytes_scanned: None,
-                bytes_written: None,
+                bytes_scanned: mat.bytes_scanned,
+                bytes_written: mat.bytes_written,
             });
         }
 
@@ -2279,6 +2296,8 @@ mod cost_finalize_tests {
             },
             partition: None,
             cost_usd: None,
+            bytes_scanned: None,
+            bytes_written: None,
         }
     }
 
@@ -2303,6 +2322,42 @@ mod cost_finalize_tests {
         assert_eq!(summary.per_model.len(), 1);
         assert_eq!(summary.per_model[0].cost_usd, Some(0.0));
         assert_eq!(out.materializations[0].cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn populate_cost_summary_bigquery_uses_bytes_scanned() {
+        // Arc 2 wave 3: when the BigQuery adapter populates
+        // `bytes_scanned` from `statistics.query.totalBytesBilled`,
+        // `populate_cost_summary` must produce a real dollar figure
+        // rather than the `None` it returned before the plumbing landed.
+        // 1 TB billed at $6.25/TB → $6.25.
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        let mut m = mat(&["orders"], 1_000);
+        m.bytes_scanned = Some(1_000_000_000_000); // 1 TB.
+        out.materializations.push(m);
+        out.populate_cost_summary("bigquery", &CostSection::default());
+        let summary = out
+            .cost_summary
+            .as_ref()
+            .expect("BigQuery is a billed warehouse");
+        let total = summary.total_cost_usd.expect("bytes_scanned drives cost");
+        assert!((total - 6.25).abs() < 1.0e-6, "total cost = {total}");
+        assert_eq!(out.materializations[0].cost_usd, Some(6.25));
+    }
+
+    #[test]
+    fn populate_cost_summary_bigquery_none_when_bytes_missing() {
+        // When the adapter doesn't report bytes (e.g. a DDL that
+        // BigQuery returned without `statistics`), the cost column
+        // stays `None` — don't silently fall back to a duration-based
+        // figure that would be off by orders of magnitude for a
+        // bytes-priced warehouse.
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        out.materializations.push(mat(&["orders"], 1_000));
+        out.populate_cost_summary("bigquery", &CostSection::default());
+        let summary = out.cost_summary.as_ref().unwrap();
+        assert!(summary.total_cost_usd.is_none());
+        assert!(out.materializations[0].cost_usd.is_none());
     }
 
     #[test]
@@ -2398,6 +2453,8 @@ mod run_record_tests {
             },
             partition: None,
             cost_usd: None,
+            bytes_scanned: None,
+            bytes_written: None,
         }
     }
 

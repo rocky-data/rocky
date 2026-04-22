@@ -2931,11 +2931,27 @@ async fn run_one_partition(
     // Execute each statement in order. On any failure, attempt ROLLBACK so
     // transactional dialects (Snowflake / DuckDB) don't leave partial state
     // visible.
+    //
+    // Accumulate warehouse-reported bytes across all statements — the BQ
+    // `insert_overwrite_partition` contract emits 4 statements
+    // (BEGIN / DELETE / INSERT / COMMIT), each of which potentially reports
+    // its own `totalBytesBilled`. Summing gives the partition-total cost
+    // input. Non-BQ adapters return `None` from the default trait method,
+    // so `bytes_acc` stays `None` and `compute_observed_cost_usd` falls
+    // through to the duration-based branch.
     let mut exec_err: Option<anyhow::Error> = None;
+    let mut bytes_scanned_acc: Option<u64> = None;
+    let mut bytes_written_acc: Option<u64> = None;
     for stmt in &stmts {
-        if let Err(e) = warehouse.execute_statement(stmt).await {
-            exec_err = Some(anyhow::anyhow!("{e}"));
-            break;
+        match warehouse.execute_statement_with_stats(stmt).await {
+            Ok(stats) => {
+                bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+                bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+            }
+            Err(e) => {
+                exec_err = Some(anyhow::anyhow!("{e}"));
+                break;
+            }
         }
     }
 
@@ -2996,7 +3012,25 @@ async fn run_one_partition(
                 batched_with: partition_plan.batch_with.clone(),
             }),
             cost_usd: None,
+            bytes_scanned: bytes_scanned_acc,
+            bytes_written: bytes_written_acc,
         }),
+    }
+}
+
+/// Combine an existing byte accumulator with a newly reported value.
+///
+/// `None + None` stays `None` (adapter reported nothing). `Some(n) +
+/// None` keeps the partial figure because at least one statement in
+/// the transaction did report bytes. `Some(a) + Some(b)` uses
+/// `saturating_add` so a 64-bit overflow can't panic (would require a
+/// single partition to scan ~18 exabytes — defensive, not expected).
+fn accumulate_bytes(acc: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (acc, next) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
     }
 }
 
@@ -3181,8 +3215,8 @@ async fn process_table(
         strategy = strategy_name,
         "copying data"
     );
-    warehouse
-        .execute_statement(&sql)
+    let exec_stats = warehouse
+        .execute_statement_with_stats(&sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -3267,6 +3301,8 @@ async fn process_table(
             // Replication tables are never time_interval; no partition info.
             partition: None,
             cost_usd: None,
+            bytes_scanned: exec_stats.bytes_scanned,
+            bytes_written: exec_stats.bytes_written,
         },
         drift_checked: true,
         drift_detected: drift_action,
