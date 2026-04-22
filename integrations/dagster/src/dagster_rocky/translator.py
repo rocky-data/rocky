@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import TYPE_CHECKING
 
@@ -91,7 +92,15 @@ class RockyDagsterTranslator:
         return tags
 
     def get_metadata(self, source: SourceInfo, table: TableInfo) -> dict[str, str]:
-        """Returns Dagster metadata for a table asset."""
+        """Returns Dagster metadata for a table asset.
+
+        Adapter-namespaced metadata from ``source.metadata`` (keys like
+        ``fivetran.service``, ``fivetran.custom_reports``) is forwarded
+        verbatim — non-string values are JSON-encoded so Dagster's metadata
+        dict stays ``str``-keyed/``str``-valued while downstream consumers
+        can ``json.loads(...)`` the projected JSON blobs for richer
+        structure (e.g. custom-reports lists).
+        """
         meta: dict[str, str] = {
             "source_id": source.id,
             "source_type": source.source_type,
@@ -100,6 +109,11 @@ class RockyDagsterTranslator:
             meta["last_sync_at"] = source.last_sync_at.isoformat()
         if table.row_count is not None:
             meta["row_count"] = str(table.row_count)
+        for key, value in source.metadata.items():
+            if isinstance(value, str):
+                meta[key] = value
+            else:
+                meta[key] = json.dumps(value, sort_keys=True, default=str)
         return meta
 
     def get_asset_deps(self, source: SourceInfo, table: TableInfo) -> list[dg.AssetKey]:

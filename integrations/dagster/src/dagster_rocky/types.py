@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Discover output
@@ -31,6 +32,16 @@ class SourceInfo(BaseModel):
     source_type: str
     last_sync_at: datetime | None = None
     tables: list[TableInfo]
+    #: Adapter-namespaced metadata surfaced by the discovery adapter.
+    #: Keys are conventionally prefixed with the adapter kind
+    #: (``fivetran.service``, ``fivetran.connector_id``,
+    #: ``fivetran.custom_reports``, ``fivetran.custom_tables``,
+    #: ``fivetran.schema_prefix``, ...) so entries from different adapters
+    #: don't collide when the component folds them into the asset graph.
+    #: Values are opaque (Rocky relays the service-specific payload as-is).
+    #: Empty when the adapter hasn't opted in — absent on the wire in that
+    #: case, surfaced here as ``{}``.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class FreshnessConfig(BaseModel):

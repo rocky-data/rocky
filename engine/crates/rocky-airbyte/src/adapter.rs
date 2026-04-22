@@ -114,6 +114,7 @@ fn map_connection(conn: Connection) -> DiscoveredConnector {
         source_type: "airbyte".to_string(),
         last_sync_at: conn.last_sync_at,
         tables,
+        metadata: Default::default(),
     }
 }
 

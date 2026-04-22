@@ -4,6 +4,8 @@
 //! verifying correct behavior for connector listing, auth failures,
 //! pagination, and malformed responses.
 
+use rocky_core::traits::DiscoveryAdapter;
+use rocky_fivetran::adapter::FivetranDiscoveryAdapter;
 use rocky_fivetran::client::{FivetranClient, FivetranError};
 use rocky_fivetran::connector;
 use rocky_fivetran::schema;
@@ -340,4 +342,144 @@ async fn test_discover_connectors_filters() {
     // c3 right prefix but incomplete -> excluded
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].id, "c1");
+}
+
+/// End-to-end discover path: the adapter should project the connector's
+/// service-specific `config` into the adapter-neutral
+/// [`DiscoveredConnector::metadata`] map, using the `fivetran.*` key
+/// namespace. This is what lets downstream consumers branch on connector
+/// type (stock vs custom) without re-calling the Fivetran API.
+#[tokio::test]
+async fn test_discover_projects_namespaced_metadata() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_meta/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_ads",
+                        "group_id": "dest_meta",
+                        "service": "facebook_ads",
+                        "schema": "src__acme__na__fb_ads",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "succeeded_at": null,
+                        "failed_at": null,
+                        "config": {
+                            "schema_prefix": "fb_ads",
+                            "custom_tables": [
+                                {"table_name": "ads_insights", "breakdowns": ["age"]}
+                            ],
+                            "reports": [
+                                {"name": "custom_report_revenue", "report_type": "ads_insights"}
+                            ]
+                        }
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_ads/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "schemas": {
+                    "src__acme__na__fb_ads": {
+                        "enabled": true,
+                        "tables": {
+                            "ads_insights": {
+                                "enabled": true,
+                                "columns": {"id": {"enabled": true}}
+                            }
+                        }
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let adapter = FivetranDiscoveryAdapter::new(client, "dest_meta".into());
+    let connectors = adapter.discover("src__").await.unwrap();
+
+    assert_eq!(connectors.len(), 1);
+    let conn = &connectors[0];
+    assert_eq!(conn.id, "conn_ads");
+    assert_eq!(conn.source_type, "facebook_ads");
+    // Core identity is always stamped.
+    assert_eq!(conn.metadata["fivetran.service"], "facebook_ads");
+    assert_eq!(conn.metadata["fivetran.connector_id"], "conn_ads");
+    // Service-specific projections relay the JSON verbatim.
+    assert_eq!(conn.metadata["fivetran.schema_prefix"], "fb_ads");
+    assert!(conn.metadata["fivetran.custom_tables"].is_array());
+    // Fivetran's wire-level `config.reports` is surfaced under
+    // `fivetran.custom_reports` — the semantic rename is load-bearing for
+    // downstream stock-vs-custom branching.
+    assert_eq!(
+        conn.metadata["fivetran.custom_reports"][0]["name"],
+        "custom_report_revenue"
+    );
+    assert!(!conn.metadata.contains_key("fivetran.reports"));
+}
+
+/// Connectors without a `config` blob (partial-setup, legacy) still get
+/// core identity metadata so downstream consumers can always rely on
+/// `fivetran.service` / `fivetran.connector_id` being present.
+#[tokio::test]
+async fn test_discover_without_config_still_stamps_identity() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_noconfig/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_bare",
+                        "group_id": "dest_noconfig",
+                        "service": "stripe",
+                        "schema": "src__acme__na__stripe",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "succeeded_at": null,
+                        "failed_at": null
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_bare/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": { "schemas": {} }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let adapter = FivetranDiscoveryAdapter::new(client, "dest_noconfig".into());
+    let connectors = adapter.discover("src__").await.unwrap();
+
+    assert_eq!(connectors.len(), 1);
+    let conn = &connectors[0];
+    assert_eq!(conn.metadata["fivetran.service"], "stripe");
+    assert_eq!(conn.metadata["fivetran.connector_id"], "conn_bare");
+    // No service-specific keys since `config` was absent.
+    assert!(!conn.metadata.contains_key("fivetran.custom_reports"));
+    assert!(!conn.metadata.contains_key("fivetran.schema_prefix"));
 }

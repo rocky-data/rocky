@@ -121,6 +121,7 @@ pub async fn discover(
             source_type: conn.source_type.clone(),
             last_sync_at: conn.last_sync_at,
             tables,
+            metadata: conn.metadata.clone(),
         });
     }
 

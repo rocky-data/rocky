@@ -74,6 +74,16 @@ export interface SourceOutput {
   };
   id: string;
   last_sync_at?: string | null;
+  /**
+   * Adapter-namespaced metadata surfaced by the discovery adapter.
+   *
+   * Keys are conventionally prefixed with the adapter kind (e.g. `fivetran.service`, `fivetran.connector_id`, `fivetran.custom_reports`, `fivetran.custom_tables`, `fivetran.schema_prefix`) so entries from different adapters don't collide when an orchestrator folds them into an asset graph. Values are opaque `serde_json::Value` — Rocky relays service-specific payloads rather than modelling them.
+   *
+   * Empty for adapters that haven't opted in; the field is skipped from the wire format in that case so existing fixtures stay byte-stable. Populated per-adapter in the discover command — see [`rocky_core::source::DiscoveredConnector::metadata`].
+   */
+  metadata?: {
+    [k: string]: unknown;
+  };
   source_type: string;
   tables: TableOutput[];
   [k: string]: unknown;
