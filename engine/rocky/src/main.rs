@@ -129,6 +129,15 @@ impl From<TargetDialect> for rocky_cli::commands::Dialect {
     }
 }
 
+/// Gate-condition values for `rocky compliance --fail-on`. The only
+/// supported value in v1 is `exception` (exit 1 when any compliance
+/// exception is emitted); the enum leaves room for future conditions
+/// (e.g., `warning`) without a breaking CLI change.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ComplianceFailOn {
+    Exception,
+}
+
 /// Command groups (Plan 22 design)
 ///
 /// These commands will be reorganized into nested subcommand trees in a
@@ -805,6 +814,29 @@ enum Command {
         /// Run only a specific check (config, state, adapters, pipelines, state_sync)
         #[arg(long)]
         check: Option<String>,
+    },
+
+    /// Governance compliance rollup: classification tags + `[mask]`
+    /// policy. Answers "are all classified columns masked wherever
+    /// policy says they should be?"
+    Compliance {
+        /// Scope the report to a single environment (e.g. `prod`). When
+        /// unset, the report expands across the defaults plus every
+        /// `[mask.<env>]` override block declared in `rocky.toml`.
+        #[arg(long)]
+        env: Option<String>,
+        /// Filter `per_column` to only rows that produced at least one
+        /// exception. The `exceptions` list is unaffected.
+        #[arg(long)]
+        exceptions_only: bool,
+        /// Exit 1 when any exception is emitted. Useful as a CI gate:
+        /// `rocky compliance --fail-on exception` in a pipeline blocks
+        /// merges that leave classified columns unmasked.
+        #[arg(long, value_name = "CONDITION")]
+        fail_on: Option<ComplianceFailOn>,
+        /// Models directory to scan for `[classification]` sidecars.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
 
     /// Run performance benchmarks (requires DuckDB feature)
@@ -1641,6 +1673,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Doctor { check } => {
             rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref()).await
         }
+        Command::Compliance {
+            env,
+            exceptions_only,
+            fail_on,
+            models,
+        } => rocky_cli::commands::run_compliance(
+            &cli.config,
+            &models,
+            env.as_deref(),
+            exceptions_only,
+            matches!(fail_on, Some(ComplianceFailOn::Exception)),
+            json,
+        ),
         #[cfg(feature = "duckdb")]
         Command::Bench {
             group,

@@ -179,6 +179,15 @@ from .branch_delete_schema import BranchDeleteOutput
 # Replay (inspection-only run record)
 from .replay_schema import ReplayModelOutput, ReplayOutput
 
+# Compliance — governance rollup over classification + masking policy
+from .compliance_schema import (
+    ColumnClassificationStatus,
+    ComplianceException,
+    ComplianceOutput,
+    ComplianceSummary,
+    EnvMaskingStatus,
+)
+
 __all__ = [
     # ai
     "AiGenerateOutput",
@@ -300,4 +309,10 @@ __all__ = [
     # replay
     "ReplayOutput",
     "ReplayModelOutput",
+    # compliance
+    "ComplianceOutput",
+    "ComplianceSummary",
+    "ColumnClassificationStatus",
+    "EnvMaskingStatus",
+    "ComplianceException",
 ]

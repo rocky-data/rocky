@@ -921,9 +921,13 @@ from .types_generated import (  # noqa: E402, F401
     CiDiffOutput,
     CiOutput,
     ClearSchemaCacheOutput,
+    ColumnClassificationStatus,
     ColumnLineageOutput,
     ColumnTrendPoint,
     CompileOutput,
+    ComplianceException,
+    ComplianceOutput,
+    ComplianceSummary,
     CostOutput,
     DagEdgeOutput,
     DagNodeOutput,
@@ -936,6 +940,7 @@ from .types_generated import (  # noqa: E402, F401
     DriftActionOutput,
     DriftOutput,
     DriftSummary,
+    EnvMaskingStatus,
     FreshnessConfigOutput,
     HistoryOutput,
     LineageColumnDef,
@@ -1012,6 +1017,7 @@ RockyOutput = (
     | DoctorResult
     | DriftDetectResult
     | DagResult
+    | ComplianceOutput
 )
 
 
@@ -1040,6 +1046,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "doctor": DoctorResult,
     "drift": DriftDetectResult,
     "dag": DagResult,
+    "compliance": ComplianceOutput,
 }
 
 
