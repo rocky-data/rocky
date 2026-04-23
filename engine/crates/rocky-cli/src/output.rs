@@ -3248,3 +3248,51 @@ pub struct ComplianceException {
     /// widen this.
     pub reason: String,
 }
+
+// ---------------------------------------------------------------------------
+// Retention status (Wave C-2)
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky retention-status`.
+///
+/// Reports which models declare a `retention = "<N>[dy]"` sidecar value and
+/// — when `--drift` is set in a future wave — whether the warehouse's
+/// current retention matches. Today `warehouse_days` is always `None`
+/// because the probe is deferred to v2; the schema is stable so v2 can
+/// populate the field without a JSON shape break.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RetentionStatusOutput {
+    pub version: String,
+    pub command: String,
+    pub models: Vec<ModelRetentionStatus>,
+}
+
+/// Per-model retention declaration + (eventually) warehouse-observed value.
+///
+/// - `configured_days` is `None` when the model's sidecar has no
+///   `retention` key.
+/// - `warehouse_days` is populated by the (v2) `--drift` probe via
+///   `SHOW TBLPROPERTIES` on Databricks or `SHOW PARAMETERS ... FOR
+///   TABLE` on Snowflake. Always `None` in v1.
+/// - `in_sync` is `true` iff `configured_days == warehouse_days`, or
+///   both are `None`. A model with no configured retention is never
+///   flagged as out-of-sync.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ModelRetentionStatus {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_days: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warehouse_days: Option<u32>,
+    pub in_sync: bool,
+}
+
+impl RetentionStatusOutput {
+    pub fn new(models: Vec<ModelRetentionStatus>) -> Self {
+        RetentionStatusOutput {
+            version: VERSION.to_string(),
+            command: "retention-status".to_string(),
+            models,
+        }
+    }
+}

@@ -13,6 +13,7 @@ use tracing::debug;
 
 use rocky_core::ir::{Grant, GrantTarget, PermissionDiff, ResolvedRole, TableRef};
 use rocky_core::masking;
+use rocky_core::retention::RetentionPolicy;
 use rocky_core::traits::{
     AdapterError, AdapterResult, GovernanceAdapter, MaskStrategy, MaskingPolicy, TagTarget,
 };
@@ -301,6 +302,27 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         }
 
         Ok(())
+    }
+
+    async fn apply_retention_policy(
+        &self,
+        table: &TableRef,
+        retention: &RetentionPolicy,
+    ) -> AdapterResult<()> {
+        // Delta Lake uses a pair of TBLPROPERTIES for time-travel retention:
+        // `delta.logRetentionDuration` governs how far back the version
+        // history is readable, and `delta.deletedFileRetentionDuration`
+        // governs when tombstoned files become VACUUM-eligible. Both are
+        // set in a single ALTER TABLE so the pair stays consistent.
+        let mgr = CatalogManager::new(&self.connector);
+        mgr.set_delta_retention(
+            &table.catalog,
+            &table.schema,
+            table.table.as_str(),
+            retention.duration_days,
+        )
+        .await
+        .map_err(AdapterError::new)
     }
 }
 

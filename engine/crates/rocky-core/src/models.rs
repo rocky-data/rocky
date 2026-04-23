@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::str::FromStr;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use crate::ir::{
     GovernanceConfig, MaterializationStrategy, SourceRef, TargetRef, TransformationPlan,
 };
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
+use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
 
 /// Errors from loading and parsing model files.
@@ -34,6 +36,13 @@ pub enum ModelError {
 
     #[error("_defaults.toml must not declare per-model field '{field}'")]
     InvalidDefaultsField { field: String },
+
+    #[error("model '{model}' has invalid retention value '{value}': {reason}")]
+    InvalidRetention {
+        model: String,
+        value: String,
+        reason: String,
+    },
 }
 
 /// TOML frontmatter in a model SQL file.
@@ -102,6 +111,28 @@ pub struct ModelConfig {
     /// [`GovernanceAdapter`]: crate::traits::GovernanceAdapter
     #[serde(default)]
     pub classification: std::collections::BTreeMap<String, String>,
+    /// Declarative data-retention policy for this model. Parsed from the
+    /// `retention` sidecar key:
+    ///
+    /// ```toml
+    /// name = "events_daily"
+    /// retention = "90d"   # grammar: \d+[dy] (days or years); null disables
+    /// ```
+    ///
+    /// After the DAG run completes, Rocky forwards the resolved
+    /// [`RetentionPolicy`] to the governance adapter via
+    /// [`GovernanceAdapter::apply_retention_policy`]. On Databricks this
+    /// compiles to a pair of Delta `TBLPROPERTIES`; on Snowflake to
+    /// `DATA_RETENTION_TIME_IN_DAYS`. Best-effort — failures warn but
+    /// never abort the run.
+    ///
+    /// Garbage inputs (`"abc"`, `"90"`, `"-3d"`, …) are rejected at
+    /// sidecar parse time via [`ModelError::InvalidRetention`].
+    ///
+    /// [`RetentionPolicy`]: crate::retention::RetentionPolicy
+    /// [`GovernanceAdapter::apply_retention_policy`]: crate::traits::GovernanceAdapter::apply_retention_policy
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionPolicy>,
 }
 
 /// Per-model freshness configuration.
@@ -314,6 +345,13 @@ pub struct RawModelConfig {
     /// block. See [`ModelConfig::classification`].
     #[serde(default)]
     pub classification: std::collections::BTreeMap<String, String>,
+    /// Raw retention string from the `retention` sidecar key. Parsed into
+    /// [`RetentionPolicy`] by [`resolve_model_config`]. Kept as
+    /// `Option<String>` at the toml layer so parse errors surface as
+    /// [`ModelError::InvalidRetention`] with the offending input visible,
+    /// rather than a generic toml deserialization error.
+    #[serde(default)]
+    pub retention: Option<String>,
 }
 
 /// Permissive target config — all fields optional.
@@ -429,6 +467,23 @@ fn resolve_model_config(
 
     let table = raw_target.table.unwrap_or_else(|| name.clone());
 
+    // Parse `retention = "<N>[dy]"` into a typed RetentionPolicy. Garbage
+    // inputs surface as ModelError::InvalidRetention so the diagnostic
+    // names the model and the offending value.
+    let retention = match raw.retention.as_deref() {
+        None => None,
+        Some(value) => {
+            let policy = RetentionPolicy::from_str(value).map_err(|e: RetentionParseError| {
+                ModelError::InvalidRetention {
+                    model: name.clone(),
+                    value: value.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            Some(policy)
+        }
+    };
+
     Ok(ModelConfig {
         name,
         depends_on: raw.depends_on,
@@ -446,6 +501,7 @@ fn resolve_model_config(
         format: raw.format,
         format_options: raw.format_options,
         classification: raw.classification,
+        retention,
     })
 }
 
@@ -1496,6 +1552,78 @@ SELECT 1
 "#;
         let model = parse_model_inline(content, "no_class.sql", None).unwrap();
         assert!(model.config.classification.is_empty());
+    }
+
+    // ---- retention sidecar parsing ----
+
+    #[test]
+    fn test_parse_retention_days() {
+        let content = r#"---toml
+name = "events_daily"
+target = { catalog = "ops", schema = "raw", table = "events" }
+retention = "90d"
+---
+
+SELECT * FROM raw.events
+"#;
+        let model = parse_model_inline(content, "events_daily.sql", None).unwrap();
+        assert_eq!(model.config.retention.map(|r| r.duration_days), Some(90));
+    }
+
+    #[test]
+    fn test_parse_retention_years_flat_365() {
+        let content = r#"---toml
+name = "long_history"
+target = { catalog = "ops", schema = "raw", table = "events" }
+retention = "3y"
+---
+
+SELECT * FROM raw.events
+"#;
+        let model = parse_model_inline(content, "long_history.sql", None).unwrap();
+        assert_eq!(
+            model.config.retention.map(|r| r.duration_days),
+            Some(3 * 365)
+        );
+    }
+
+    #[test]
+    fn test_parse_no_retention_defaults_none() {
+        let content = r#"---toml
+name = "no_retention"
+target = { catalog = "c", schema = "s", table = "t" }
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "no_retention.sql", None).unwrap();
+        assert!(model.config.retention.is_none());
+    }
+
+    #[test]
+    fn test_parse_retention_rejects_garbage() {
+        // Every reject case from the waveplan — "abc", "90", "-3d", "-1y" —
+        // surfaces as InvalidRetention with the value + reason threaded
+        // through from RetentionParseError.
+        for bad in &["abc", "90", "-3d", "-1y", "90days"] {
+            let content = format!(
+                r#"---toml
+name = "m"
+target = {{ catalog = "c", schema = "s", table = "t" }}
+retention = "{bad}"
+---
+
+SELECT 1
+"#
+            );
+            let err = parse_model_inline(&content, "m.sql", None).unwrap_err();
+            match err {
+                ModelError::InvalidRetention { value, .. } => {
+                    assert_eq!(value, *bad, "value field should be {bad}, got {value}");
+                }
+                other => panic!("expected InvalidRetention for {bad:?}, got {other}"),
+            }
+        }
     }
 
     #[test]

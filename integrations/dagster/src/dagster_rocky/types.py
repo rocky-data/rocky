@@ -953,6 +953,7 @@ from .types_generated import (  # noqa: E402, F401
     MetricsSnapshotEntry,
     ModelExecutionRecord,
     ModelHistoryOutput,
+    ModelRetentionStatus,
     OptimizeOutput,
     OptimizeRecommendation,
     PartitionShapeOutput,
@@ -962,6 +963,7 @@ from .types_generated import (  # noqa: E402, F401
     PlanOutput,
     ReplayModelOutput,
     ReplayOutput,
+    RetentionStatusOutput,
     RunHistoryRecord,
     RunOutput,
     SourceOutput,
@@ -1018,6 +1020,7 @@ RockyOutput = (
     | DriftDetectResult
     | DagResult
     | ComplianceOutput
+    | RetentionStatusOutput
 )
 
 
@@ -1047,6 +1050,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "drift": DriftDetectResult,
     "dag": DagResult,
     "compliance": ComplianceOutput,
+    "retention-status": RetentionStatusOutput,
 }
 
 

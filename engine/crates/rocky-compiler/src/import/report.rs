@@ -512,6 +512,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                retention: None,
             },
         }
     }

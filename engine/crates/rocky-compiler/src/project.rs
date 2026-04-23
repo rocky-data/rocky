@@ -242,6 +242,7 @@ fn load_single_rocky_model(
             format: None,
             format_options: None,
             classification: Default::default(),
+            retention: None,
         }
     };
 
@@ -285,6 +286,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                retention: None,
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),

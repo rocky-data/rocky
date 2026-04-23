@@ -108,6 +108,37 @@ pub fn generate_describe_catalog_sql(catalog: &str) -> Result<String, CatalogErr
     Ok(format!("DESCRIBE CATALOG {catalog}"))
 }
 
+/// Generates `ALTER TABLE <catalog>.<schema>.<table> SET TBLPROPERTIES (
+/// 'delta.logRetentionDuration' = '<N> days',
+/// 'delta.deletedFileRetentionDuration' = '<N> days'
+/// )` for Delta Lake time-travel retention.
+///
+/// Both properties are set together so a single statement covers the pair
+/// Delta uses for time-travel (log retention) and tombstone eligibility
+/// (deleted-file retention). Used by
+/// [`GovernanceAdapter::apply_retention_policy`] on Databricks.
+///
+/// Identifiers are validated against Rocky's SQL identifier allowlist
+/// (`rocky-sql/validation.rs`) before interpolation — never `format!` on
+/// unvalidated input.
+///
+/// [`GovernanceAdapter::apply_retention_policy`]: crate::traits::GovernanceAdapter::apply_retention_policy
+pub fn generate_set_delta_retention_sql(
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    duration_days: u32,
+) -> Result<String, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(table)?;
+    Ok(format!(
+        "ALTER TABLE {catalog}.{schema}.{table} SET TBLPROPERTIES \
+('delta.logRetentionDuration' = '{duration_days} days', \
+'delta.deletedFileRetentionDuration' = '{duration_days} days')"
+    ))
+}
+
 /// Generates `SHOW SCHEMAS IN <catalog>`.
 pub fn generate_show_schemas_sql(catalog: &str) -> Result<String, CatalogError> {
     validation::validate_identifier(catalog)?;
@@ -268,6 +299,32 @@ mod tests {
     fn test_describe_catalog() {
         let sql = generate_describe_catalog_sql("acme_warehouse").unwrap();
         assert_eq!(sql, "DESCRIBE CATALOG acme_warehouse");
+    }
+
+    #[test]
+    fn test_set_delta_retention_emits_both_properties() {
+        let sql = generate_set_delta_retention_sql("warehouse", "silver", "events", 90).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE warehouse.silver.events SET TBLPROPERTIES \
+             ('delta.logRetentionDuration' = '90 days', \
+             'delta.deletedFileRetentionDuration' = '90 days')"
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn test_set_delta_retention_large_value() {
+        let sql = generate_set_delta_retention_sql("w", "s", "t", 2555).unwrap();
+        assert!(sql.contains("'delta.logRetentionDuration' = '2555 days'"));
+        assert!(sql.contains("'delta.deletedFileRetentionDuration' = '2555 days'"));
+    }
+
+    #[test]
+    fn test_set_delta_retention_rejects_invalid_identifier() {
+        assert!(generate_set_delta_retention_sql("db; DROP", "s", "t", 90).is_err());
+        assert!(generate_set_delta_retention_sql("db", "s ace", "t", 90).is_err());
+        assert!(generate_set_delta_retention_sql("db", "s", "t' --", 90).is_err());
     }
 
     #[test]

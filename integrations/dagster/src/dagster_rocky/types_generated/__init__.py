@@ -188,6 +188,9 @@ from .compliance_schema import (
     EnvMaskingStatus,
 )
 
+# Retention status (per-model data retention report)
+from .retention_status_schema import ModelRetentionStatus, RetentionStatusOutput
+
 __all__ = [
     # ai
     "AiGenerateOutput",
@@ -315,4 +318,7 @@ __all__ = [
     "ColumnClassificationStatus",
     "EnvMaskingStatus",
     "ComplianceException",
+    # retention status
+    "RetentionStatusOutput",
+    "ModelRetentionStatus",
 ]

@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ModelRetentionStatus": {
+      "description": "Per-model retention declaration + (eventually) warehouse-observed value.\n\n- `configured_days` is `None` when the model's sidecar has no `retention` key. - `warehouse_days` is populated by the (v2) `--drift` probe via `SHOW TBLPROPERTIES` on Databricks or `SHOW PARAMETERS ... FOR TABLE` on Snowflake. Always `None` in v1. - `in_sync` is `true` iff `configured_days == warehouse_days`, or both are `None`. A model with no configured retention is never flagged as out-of-sync.",
+      "properties": {
+        "configured_days": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "in_sync": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "warehouse_days": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "in_sync",
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky retention-status`.\n\nReports which models declare a `retention = \"<N>[dy]\"` sidecar value and — when `--drift` is set in a future wave — whether the warehouse's current retention matches. Today `warehouse_days` is always `None` because the probe is deferred to v2; the schema is stable so v2 can populate the field without a JSON shape break.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/ModelRetentionStatus"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "models",
+    "version"
+  ],
+  "title": "RetentionStatusOutput",
+  "type": "object"
+}

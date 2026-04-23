@@ -96,6 +96,30 @@ impl<'a> CatalogManager<'a> {
         Ok(())
     }
 
+    /// Sets Delta Lake time-travel retention on a table by updating the pair
+    /// of `TBLPROPERTIES` (`delta.logRetentionDuration` +
+    /// `delta.deletedFileRetentionDuration`) in a single ALTER TABLE.
+    ///
+    /// Used by [`GovernanceAdapter::apply_retention_policy`] on Databricks.
+    ///
+    /// [`GovernanceAdapter::apply_retention_policy`]: rocky_core::traits::GovernanceAdapter::apply_retention_policy
+    pub async fn set_delta_retention(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        duration_days: u32,
+    ) -> Result<(), CatalogManagerError> {
+        let sql =
+            catalog_sql::generate_set_delta_retention_sql(catalog, schema, table, duration_days)?;
+        debug!(
+            catalog,
+            schema, table, duration_days, "setting Delta retention properties"
+        );
+        self.connector.execute_statement(&sql).await?;
+        Ok(())
+    }
+
     /// Lists schemas in a catalog.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<String>, CatalogManagerError> {
         let sql = catalog_sql::generate_show_schemas_sql(catalog)?;

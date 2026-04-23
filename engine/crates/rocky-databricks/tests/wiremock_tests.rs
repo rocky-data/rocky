@@ -928,3 +928,124 @@ async fn test_reconcile_role_graph_empty_is_ok() {
         .await
         .expect("empty role graph should be a no-op");
 }
+
+// ---------------------------------------------------------------------------
+// Retention policy (Wave C-2)
+// ---------------------------------------------------------------------------
+
+/// `apply_retention_policy` translates a RetentionPolicy into the paired
+/// Delta TBLPROPERTIES and executes a single ALTER TABLE.
+#[tokio::test]
+async fn test_apply_retention_policy_emits_paired_tblproperties() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER TABLE warehouse.silver.events"))
+        .and(body_string_contains(
+            "'delta.logRetentionDuration' = '90 days'",
+        ))
+        .and(body_string_contains(
+            "'delta.deletedFileRetentionDuration' = '90 days'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-retention-90",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "events".into(),
+    };
+    governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 90 })
+        .await
+        .expect("apply_retention_policy should succeed");
+}
+
+/// A `"1y"` (365 days) retention value flows through to the same DDL
+/// shape — adapters never see the raw string.
+#[tokio::test]
+async fn test_apply_retention_policy_year_equivalent_emits_days() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("'365 days'"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-retention-365",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "gold".into(),
+        table: "archive".into(),
+    };
+    governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 365 })
+        .await
+        .unwrap();
+}
+
+/// Warehouse 400 on the ALTER (unknown property, unsupported table format,
+/// etc.) propagates as an AdapterError so the runtime can warn!.
+#[tokio::test]
+async fn test_apply_retention_policy_propagates_api_error() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error_code": "INVALID_PARAMETER",
+            "message": "retention duration out of range"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "w".into(),
+        schema: "s".into(),
+        table: "t".into(),
+    };
+    let err = governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 999 })
+        .await
+        .unwrap_err();
+    // The AdapterError wraps the connector error; surface any signal we can.
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "AdapterError should not be empty: {msg}");
+}
