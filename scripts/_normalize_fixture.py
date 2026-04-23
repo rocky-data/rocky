@@ -49,6 +49,11 @@ AUDIT_FIELD_SENTINELS: dict[str, str] = {
     "triggering_identity": "user-SENTINEL",
     "rocky_version": "0.0.0-SENTINEL",
     "target_catalog": "catalog-SENTINEL",
+    # Every CLI output's top-level `version` field is `env!("CARGO_PKG_VERSION")`
+    # at emit time. Sentinel it so a routine version bump doesn't ripple drift
+    # through every captured fixture (otherwise every release PR fails
+    # `codegen-drift.yml` until `just regen-fixtures` is re-run).
+    "version": "0.0.0-SENTINEL",
 }
 
 # Numeric fields whose value is a deterministic function of a
