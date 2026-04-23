@@ -5564,7 +5564,7 @@ max_rows = 1000000
 
         // default env (None) only has the scalar default.
         let default = cfg.resolve_mask_for_env(None);
-        assert!(default.get("confidential").is_none());
+        assert!(!default.contains_key("confidential"));
     }
 
     #[test]
