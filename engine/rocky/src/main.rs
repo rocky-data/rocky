@@ -147,6 +147,7 @@ impl From<TargetDialect> for rocky_cli::commands::Dialect {
 /// ## AI — AI-powered features
 /// `ai`, `ai-sync`, `ai-explain`, `ai-test`
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Initialize a new Rocky project
     Init {
@@ -268,6 +269,22 @@ enum Command {
         /// execution order. Layers run in parallel.
         #[arg(long)]
         dag: bool,
+
+        /// Caller-supplied opaque key used to dedup this run against prior
+        /// runs with the same key. If a prior run with this key completed
+        /// successfully (or any terminal status under `dedup_on = "any"`),
+        /// this call exits early with `status = skipped_idempotent` and no
+        /// work is done. If another caller currently holds the key's
+        /// in-flight claim, exits with `skipped_in_flight`.
+        ///
+        /// Supported on `local`, `valkey`, and `tiered` state backends.
+        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
+        /// `tiered` for multi-pod deployments.
+        ///
+        /// ⚠️ Keys are stored verbatim in the state store; do NOT put
+        /// secrets in idempotency keys.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
 
     /// Compare shadow tables against production tables
@@ -1068,7 +1085,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             lookback,
             parallel,
             dag,
+            idempotency_key,
         } => {
+            // --idempotency-key is mutually exclusive with --resume / --resume-latest:
+            // a resume is an explicit override and should never be short-circuited.
+            if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
+                anyhow::bail!(
+                    "--idempotency-key cannot be combined with --resume / --resume-latest \
+                     (resume is an explicit override of idempotent skip)"
+                );
+            }
             // Parse governance override (JSON string or @file.json)
             let gov_override = match governance_override {
                 Some(ref s) if s.starts_with('@') => {
@@ -1155,6 +1181,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &partition_opts,
                     model.as_deref(),
                     cli.cache_ttl,
+                    idempotency_key.as_deref(),
                 )
                 .await
             }

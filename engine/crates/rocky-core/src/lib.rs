@@ -19,6 +19,7 @@ pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;
 pub mod hooks;
+pub mod idempotency;
 pub mod incremental;
 pub mod ir;
 pub mod lakehouse;

@@ -64,6 +64,12 @@ export type CheckResult1 =
  * Severity of a test failure.
  */
 export type TestSeverity = "error" | "warning";
+/**
+ * Status of a pipeline run.
+ *
+ * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
+ */
+export type RunStatus = ("Success" | "PartialFailure" | "Failure") | "SkippedIdempotent" | "SkippedInFlight";
 
 /**
  * JSON output for `rocky run`.
@@ -90,6 +96,10 @@ export interface RunOutput {
   execution: ExecutionSummary;
   filter: string;
   /**
+   * The `--idempotency-key` value this run was invoked with, echoed back for operator cross-reference in logs and `rocky history`. `None` for runs that didn't pass the flag.
+   */
+  idempotency_key?: string | null;
+  /**
    * `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so orchestrators can distinguish "user interrupted" from "run failed". Tables that hadn't reached `Success` or `Failed` at interrupt time are recorded as `TableStatus::Interrupted` in the state store. Always serialised (even when `false`) so consumers don't have to treat its absence specially.
    */
   interrupted: boolean;
@@ -113,6 +123,14 @@ export interface RunOutput {
    * True when running in shadow mode (targets rewritten).
    */
   shadow: boolean;
+  /**
+   * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
+   */
+  skipped_by_run_id?: string | null;
+  /**
+   * Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
+   */
+  status: RunStatus;
   tables_copied: number;
   tables_failed: number;
   tables_skipped: number;

@@ -1,0 +1,25 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[state]
+backend = "local"
+
+# Tuning knobs — all fields are optional. Defaults shown for
+# documentation only; removing the block keeps the same behaviour.
+[state.idempotency]
+retention_days = 30
+dedup_on = "success"      # "success" (default) | "any"
+in_flight_ttl_hours = 24
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
