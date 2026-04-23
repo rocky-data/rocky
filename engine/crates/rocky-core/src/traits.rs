@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
 
 use crate::ir::{ColumnInfo, ColumnSelection, Grant, GrantTarget, MetadataColumn, TableRef};
+use crate::retention::RetentionPolicy;
 use crate::source::DiscoveredConnector;
 
 // ---------------------------------------------------------------------------
@@ -674,6 +675,42 @@ pub trait GovernanceAdapter: Send + Sync {
             "reconcile_role_graph not supported by this adapter",
         ))
     }
+
+    /// Apply a data-retention policy to a table.
+    ///
+    /// Rocky calls this after a successful DAG run for every model whose
+    /// sidecar declared `retention = "<N>[dy]"`. The resolved
+    /// [`RetentionPolicy`] carries `duration_days: u32` — adapters turn
+    /// that into warehouse-native retention DDL:
+    ///
+    /// - **Databricks (Delta):** pair of `TBLPROPERTIES` — both
+    ///   `delta.logRetentionDuration` and
+    ///   `delta.deletedFileRetentionDuration` updated to `'{N} days'`.
+    /// - **Snowflake:** `ALTER TABLE ... SET
+    ///   DATA_RETENTION_TIME_IN_DAYS = {N}` (Snowflake enforces its
+    ///   edition-specific cap — 90 for Standard, 365 for Enterprise —
+    ///   server-side; Rocky emits the DDL and surfaces any rejection).
+    /// - **BigQuery / DuckDB:** not supported (no first-class
+    ///   time-travel retention knob at the config level). The trait
+    ///   default returns an error, which the runtime downgrades to a
+    ///   `warn!` — the run is not aborted.
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError`. Adapters must declare
+    /// explicit semantics: [`NoopGovernanceAdapter`] returns `Ok(())` so
+    /// pipelines targeting a no-governance warehouse degrade gracefully;
+    /// Databricks + Snowflake implement the DDL; BigQuery falls through
+    /// to the default.
+    async fn apply_retention_policy(
+        &self,
+        _table: &TableRef,
+        _retention: &RetentionPolicy,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::msg(
+            "apply_retention_policy not supported by this adapter",
+        ))
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -768,6 +805,18 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
         // a no-governance warehouse silently accepts role-graph config so
         // pipelines downgrade gracefully. Cycle / unknown-parent errors
         // still surface at config-load time via flatten_role_graph.
+        Ok(())
+    }
+
+    async fn apply_retention_policy(
+        &self,
+        _table: &TableRef,
+        _retention: &RetentionPolicy,
+    ) -> AdapterResult<()> {
+        // No-op governance treats retention as optional metadata: pipelines
+        // targeting a no-governance warehouse (DuckDB, or any adapter
+        // without a governance impl) degrade gracefully instead of aborting
+        // a successful run.
         Ok(())
     }
 }
@@ -987,6 +1036,35 @@ mod tests {
     async fn noop_governance_accepts_role_graph() {
         let noop = NoopGovernanceAdapter;
         assert!(noop.reconcile_role_graph(&BTreeMap::new()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn trait_default_apply_retention_policy_errors() {
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let err = MinimalGovernance
+            .apply_retention_policy(&t, &RetentionPolicy { duration_days: 90 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("apply_retention_policy"));
+    }
+
+    #[tokio::test]
+    async fn noop_governance_accepts_retention() {
+        let noop = NoopGovernanceAdapter;
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        assert!(
+            noop.apply_retention_policy(&t, &RetentionPolicy { duration_days: 90 })
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

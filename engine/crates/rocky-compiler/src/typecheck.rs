@@ -1906,6 +1906,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                retention: None,
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),
@@ -2588,6 +2589,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                retention: None,
             },
             sql: format!(
                 "SELECT {time_column} FROM upstream WHERE {time_column} >= @start_date AND {time_column} < @end_date"

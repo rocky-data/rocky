@@ -1012,6 +1012,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                retention: None,
             },
             sql: format!("SELECT * FROM upstream_{name}"),
             file_path: format!("models/{name}.sql"),
