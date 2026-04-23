@@ -442,7 +442,9 @@ pub enum TagTarget {
 ///
 /// Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`,
 /// `"partial"`, `"none"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MaskStrategy {
     /// SHA-256 hex digest of the column value. Deterministic, one-way.
