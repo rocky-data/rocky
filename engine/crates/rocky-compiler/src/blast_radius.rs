@@ -136,6 +136,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),

@@ -80,6 +80,28 @@ pub struct ModelConfig {
     /// and comments. Only used when `format` is set.
     #[serde(default)]
     pub format_options: Option<LakehouseOptions>,
+    /// Per-column classification tags. Keys are column names, values are
+    /// free-form classification strings (e.g., `email = "pii"`). Parsed
+    /// from a `[classification]` sidecar block:
+    ///
+    /// ```toml
+    /// name = "users"
+    ///
+    /// [classification]
+    /// email = "pii"
+    /// phone = "pii"
+    /// ssn = "confidential"
+    /// ```
+    ///
+    /// Rocky resolves each value against `[mask]` / `[mask.<env>]` in
+    /// `rocky.toml` to pick the masking strategy, then applies both the
+    /// column tag and the mask via [`GovernanceAdapter`]. Tags are
+    /// free-form strings — no enum — so teams can coin new classifications
+    /// without touching the engine.
+    ///
+    /// [`GovernanceAdapter`]: crate::traits::GovernanceAdapter
+    #[serde(default)]
+    pub classification: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-model freshness configuration.
@@ -288,6 +310,10 @@ pub struct RawModelConfig {
     pub format: Option<LakehouseFormat>,
     #[serde(default)]
     pub format_options: Option<LakehouseOptions>,
+    /// Column classification tags from the `[classification]` sidecar
+    /// block. See [`ModelConfig::classification`].
+    #[serde(default)]
+    pub classification: std::collections::BTreeMap<String, String>,
 }
 
 /// Permissive target config — all fields optional.
@@ -419,6 +445,7 @@ fn resolve_model_config(
         tests: raw.tests,
         format: raw.format,
         format_options: raw.format_options,
+        classification: raw.classification,
     })
 }
 
@@ -1396,5 +1423,111 @@ timestamp_column = "updated_at"
             models[0].config.strategy,
             StrategyConfig::Incremental { .. }
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // [classification] sidecar block
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_classification_block() {
+        let content = r#"---toml
+name = "users"
+target = { catalog = "analytics", schema = "raw", table = "users" }
+
+[classification]
+email = "pii"
+phone = "pii"
+ssn = "confidential"
+---
+
+SELECT email, phone, ssn FROM raw.users
+"#;
+        let model = parse_model_inline(content, "users.sql", None).unwrap();
+        assert_eq!(model.config.classification.get("email"), Some(&"pii".to_string()));
+        assert_eq!(model.config.classification.get("phone"), Some(&"pii".to_string()));
+        assert_eq!(
+            model.config.classification.get("ssn"),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_classification_free_form_tags() {
+        // Tags are free-form strings — teams should be able to coin
+        // classifications beyond the canonical pii/confidential without
+        // touching the engine.
+        let content = r#"---toml
+name = "telemetry"
+target = { catalog = "ops", schema = "raw", table = "events" }
+
+[classification]
+user_id = "gdpr_subject"
+ip_address = "location_adjacent"
+---
+
+SELECT * FROM raw.events
+"#;
+        let model = parse_model_inline(content, "telemetry.sql", None).unwrap();
+        assert_eq!(
+            model.config.classification.get("user_id"),
+            Some(&"gdpr_subject".to_string())
+        );
+        assert_eq!(
+            model.config.classification.get("ip_address"),
+            Some(&"location_adjacent".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_no_classification_block_defaults_empty() {
+        let content = r#"---toml
+name = "no_class"
+target = { catalog = "c", schema = "s", table = "t" }
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "no_class.sql", None).unwrap();
+        assert!(model.config.classification.is_empty());
+    }
+
+    #[test]
+    fn test_parse_sidecar_classification_from_toml_file() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("users.toml"),
+            r#"
+name = "users"
+
+[target]
+catalog = "analytics"
+schema = "raw"
+table = "users"
+
+[classification]
+email = "pii"
+ssn = "confidential"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("users.sql"),
+            "SELECT email, ssn FROM upstream.users",
+        )
+        .unwrap();
+
+        let models = load_models_from_dir(dir.path()).unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(
+            m.config.classification.get("email"),
+            Some(&"pii".to_string())
+        );
+        assert_eq!(
+            m.config.classification.get("ssn"),
+            Some(&"confidential".to_string())
+        );
     }
 }

@@ -511,6 +511,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
         }
     }

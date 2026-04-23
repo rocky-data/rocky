@@ -212,6 +212,7 @@ fn import_manifest_node(
         tests: vec![],
         format: None,
         format_options: None,
+        classification: Default::default(),
     };
 
     result.imported.push(ImportedModel {
@@ -598,6 +599,7 @@ fn import_single_model(
         tests: vec![],
         format: None,
         format_options: None,
+        classification: Default::default(),
     };
 
     Ok((

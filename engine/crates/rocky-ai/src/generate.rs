@@ -220,6 +220,7 @@ fn build_generated_model(name: &str, sql: String, source: &str, format: &str) ->
             tests: vec![],
             format: None,
             format_options: None,
+            classification: Default::default(),
         },
         sql: if format == "rocky" {
             sql
@@ -299,6 +300,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
             sql: sql.to_string(),
             file_path: format!("upstream/{name}.sql"),

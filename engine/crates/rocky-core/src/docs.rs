@@ -711,6 +711,8 @@ mod tests {
             retry: None,
             portability: Default::default(),
             cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
         };
 
         let models = vec![
@@ -731,6 +733,7 @@ mod tests {
                     tests: vec![],
                     format: None,
                     format_options: None,
+                    classification: Default::default(),
                 },
                 sql: String::new(),
                 file_path: "z.sql".into(),
@@ -753,6 +756,7 @@ mod tests {
                     tests: vec![],
                     format: None,
                     format_options: None,
+                    classification: Default::default(),
                 },
                 sql: String::new(),
                 file_path: "a.sql".into(),
@@ -783,6 +787,8 @@ mod tests {
             retry: None,
             portability: Default::default(),
             cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
         };
 
         let models = vec![Model {
@@ -802,6 +808,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
             sql: String::new(),
             file_path: "my_model.sql".into(),
@@ -851,6 +858,8 @@ mod tests {
             retry: None,
             portability: Default::default(),
             cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);

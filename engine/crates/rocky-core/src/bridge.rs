@@ -307,6 +307,8 @@ mod tests {
             retry: None,
             portability: Default::default(),
             cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
         }
     }
 

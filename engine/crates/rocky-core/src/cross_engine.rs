@@ -575,6 +575,8 @@ mod tests {
             retry: None,
             portability: Default::default(),
             cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
         }
     }
 
@@ -968,6 +970,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
             sql: format!("SELECT * FROM upstream_{name}"),
             file_path: format!("models/{name}.sql"),

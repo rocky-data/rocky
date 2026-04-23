@@ -74,6 +74,34 @@ pub fn generate_set_table_tags_sql(
     ))
 }
 
+/// Generates `ALTER TABLE <catalog>.<schema>.<table> ALTER COLUMN <column> SET TAGS (...)`
+/// for a single column. Returns `Ok(None)` when `tags` is empty so callers
+/// can skip the statement rather than emit a syntactically-empty `SET TAGS ()`.
+///
+/// Used by [`GovernanceAdapter::apply_column_tags`] on Databricks — Unity
+/// Catalog supports column-level tags via this DDL since Runtime 13.3+.
+///
+/// [`GovernanceAdapter::apply_column_tags`]: crate::traits::GovernanceAdapter::apply_column_tags
+pub fn generate_set_column_tags_sql(
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    column: &str,
+    tags: &BTreeMap<String, String>,
+) -> Result<Option<String>, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(table)?;
+    validation::validate_identifier(column)?;
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    let tags_clause = format_tags(tags)?;
+    Ok(Some(format!(
+        "ALTER TABLE {catalog}.{schema}.{table} ALTER COLUMN {column} SET TAGS ({tags_clause})"
+    )))
+}
+
 /// Generates `DESCRIBE CATALOG <catalog>`.
 pub fn generate_describe_catalog_sql(catalog: &str) -> Result<String, CatalogError> {
     validation::validate_identifier(catalog)?;
@@ -203,6 +231,37 @@ mod tests {
         assert!(sql.contains("'source' = 'shopify'"));
         assert!(sql.contains("'region-1' = 'us_west'"));
         assert!(sql.contains("'layer' = 'raw'"));
+    }
+
+    #[test]
+    fn test_set_column_tags() {
+        let mut tags = BTreeMap::new();
+        tags.insert("classification".to_string(), "pii".to_string());
+        let sql = generate_set_column_tags_sql("warehouse", "raw", "users", "email", &tags)
+            .unwrap()
+            .expect("non-empty tags yield a statement");
+        assert_eq!(
+            sql,
+            "ALTER TABLE warehouse.raw.users ALTER COLUMN email SET TAGS ('classification' = 'pii')"
+        );
+    }
+
+    #[test]
+    fn test_set_column_tags_empty_is_none() {
+        let tags = BTreeMap::new();
+        let result = generate_set_column_tags_sql("db", "s", "t", "c", &tags).unwrap();
+        assert!(
+            result.is_none(),
+            "empty tags should skip the statement rather than emit SET TAGS ()"
+        );
+    }
+
+    #[test]
+    fn test_set_column_tags_rejects_bad_column_name() {
+        let mut tags = BTreeMap::new();
+        tags.insert("classification".to_string(), "pii".to_string());
+        assert!(generate_set_column_tags_sql("db", "s", "t", "bad col", &tags).is_err());
+        assert!(generate_set_column_tags_sql("db", "s", "t", "bad;DROP", &tags).is_err());
     }
 
     #[test]
