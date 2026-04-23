@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use rocky_core::ir::{Grant, GrantTarget, PermissionDiff, TableRef};
+use rocky_core::ir::{Grant, GrantTarget, PermissionDiff, ResolvedRole, TableRef};
 use rocky_core::masking;
 use rocky_core::traits::{
     AdapterError, AdapterResult, GovernanceAdapter, MaskStrategy, MaskingPolicy, TagTarget,
@@ -208,6 +208,13 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         Ok(())
     }
 
+    async fn reconcile_role_graph(
+        &self,
+        roles: &BTreeMap<String, ResolvedRole>,
+    ) -> AdapterResult<()> {
+        reconcile_role_graph_impl(&self.connector, roles).await
+    }
+
     async fn apply_masking_policy(
         &self,
         table: &TableRef,
@@ -294,5 +301,190 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         }
 
         Ok(())
+    }
+}
+
+/// Prefix Rocky prepends to every group it provisions for a role, to
+/// keep its managed groups disjoint from user-created groups in the
+/// Unity Catalog metastore.
+///
+/// `role.admin` -> `rocky_role_admin`. Changing this string is a
+/// breaking change — existing grants in the wild reference the old
+/// name.
+const ROCKY_ROLE_GROUP_PREFIX: &str = "rocky_role_";
+
+/// Compute the Databricks UC group name for a Rocky role.
+///
+/// See [`ROCKY_ROLE_GROUP_PREFIX`] for the naming convention. Exposed as
+/// a free function so tests + downstream tooling can reason about the
+/// mapping without instantiating an adapter.
+pub fn role_group_name(role_name: &str) -> String {
+    format!("{ROCKY_ROLE_GROUP_PREFIX}{role_name}")
+}
+
+/// v1 implementation of `reconcile_role_graph`.
+///
+/// Databricks / Unity Catalog does not have "roles" natively; Rocky
+/// maps each role to a UC group (`rocky_role_<name>`). A fully-native
+/// impl would:
+///
+/// 1. Create each group via the SCIM `POST /api/2.0/preview/scim/v2/Groups`
+///    endpoint if missing.
+/// 2. For every catalog Rocky manages, emit a `GRANT <permission> ON
+///    CATALOG ... TO <group>` per flattened permission.
+///
+/// Neither piece exists in `rocky-databricks` yet — there's no SCIM
+/// client, and the catalogs-to-apply set isn't plumbed through the
+/// [`GovernanceAdapter::reconcile_role_graph`] signature. Both are
+/// deliberate follow-ups (see `feat/governance-role-graph` PR body).
+///
+/// In v1 this function validates each group name against the principal
+/// rules and emits a structured `debug` log of the reconciled role
+/// graph. It returns `Ok(())` so pipelines that declare `[role.*]` in
+/// their `rocky.toml` against a Databricks target don't abort — the
+/// role graph is still flattened + validated by [`rocky_core::role_graph`]
+/// at config-load time, which is where real failures surface.
+async fn reconcile_role_graph_impl(
+    _connector: &DatabricksConnector,
+    roles: &BTreeMap<String, ResolvedRole>,
+) -> AdapterResult<()> {
+    if roles.is_empty() {
+        return Ok(());
+    }
+
+    for (name, role) in roles {
+        let group = role_group_name(name);
+        // Validate the group name matches Databricks principal syntax
+        // so the deferred GRANT-emission path can't silently generate
+        // invalid SQL later.
+        rocky_sql::validation::validate_principal(&group).map_err(AdapterError::new)?;
+
+        debug!(
+            role = name.as_str(),
+            group = group.as_str(),
+            inherits = ?role.inherits_from,
+            permissions = ?role
+                .flattened_permissions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "reconciled role graph entry (v1: log-only; SCIM group creation + per-catalog GRANT application are follow-ups)"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocky_core::ir::Permission;
+
+    #[test]
+    fn role_group_name_prefixes_rocky_role() {
+        assert_eq!(role_group_name("reader"), "rocky_role_reader");
+        assert_eq!(
+            role_group_name("analytics_engineer"),
+            "rocky_role_analytics_engineer"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_graph_impl_accepts_empty_map() {
+        // We don't actually use the connector in v1, but the signature
+        // requires one. Construct a minimal one via the same test helpers
+        // that wiremock_tests uses — except we never make a network call,
+        // so the URL/token values are fake.
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "example.databricks.com".into(),
+            token: Some("fake".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        let config = crate::connector::ConnectorConfig {
+            host: "example.databricks.com".into(),
+            warehouse_id: "w".into(),
+            timeout: std::time::Duration::from_secs(1),
+            retry: rocky_core::config::RetryConfig::default(),
+        };
+        let connector = crate::connector::DatabricksConnector::new(config, auth);
+
+        let empty = BTreeMap::new();
+        assert!(reconcile_role_graph_impl(&connector, &empty).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_graph_impl_accepts_valid_roles() {
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "example.databricks.com".into(),
+            token: Some("fake".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        let config = crate::connector::ConnectorConfig {
+            host: "example.databricks.com".into(),
+            warehouse_id: "w".into(),
+            timeout: std::time::Duration::from_secs(1),
+            retry: rocky_core::config::RetryConfig::default(),
+        };
+        let connector = crate::connector::DatabricksConnector::new(config, auth);
+
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "reader".to_string(),
+            ResolvedRole {
+                name: "reader".into(),
+                flattened_permissions: vec![Permission::Select, Permission::UseCatalog],
+                inherits_from: vec![],
+            },
+        );
+        roles.insert(
+            "admin".to_string(),
+            ResolvedRole {
+                name: "admin".into(),
+                flattened_permissions: vec![
+                    Permission::UseCatalog,
+                    Permission::Select,
+                    Permission::Manage,
+                ],
+                inherits_from: vec!["reader".to_string()],
+            },
+        );
+        assert!(reconcile_role_graph_impl(&connector, &roles).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_graph_impl_rejects_invalid_group_name() {
+        // A role name with characters outside the principal regex (e.g.
+        // backtick or semicolon) would produce an invalid UC group name.
+        // The v1 impl catches this via validate_principal so the deferred
+        // GRANT path can't generate invalid SQL later.
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "example.databricks.com".into(),
+            token: Some("fake".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        let config = crate::connector::ConnectorConfig {
+            host: "example.databricks.com".into(),
+            warehouse_id: "w".into(),
+            timeout: std::time::Duration::from_secs(1),
+            retry: rocky_core::config::RetryConfig::default(),
+        };
+        let connector = crate::connector::DatabricksConnector::new(config, auth);
+
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "bad;name".to_string(),
+            ResolvedRole {
+                name: "bad;name".into(),
+                flattened_permissions: vec![Permission::Select],
+                inherits_from: vec![],
+            },
+        );
+        assert!(reconcile_role_graph_impl(&connector, &roles).await.is_err());
     }
 }

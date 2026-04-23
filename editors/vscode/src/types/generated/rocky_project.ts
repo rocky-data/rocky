@@ -360,6 +360,14 @@ export interface RockyConfig {
    */
   retry?: RunRetryConfig | null;
   /**
+   * Hierarchical role declarations reconciled against the warehouse's native role/group system.
+   *
+   * See [`RoleConfig`] for the TOML shape and [`crate::role_graph::flatten_role_graph`] for the inheritance resolution semantics (DAG walk with cycle detection).
+   */
+  role?: {
+    [k: string]: RoleConfig;
+  };
+  /**
    * Schema evolution configuration (grace-period column drops).
    */
   schema_evolution?: SchemaEvolutionConfig;
@@ -1214,6 +1222,29 @@ export interface RunRetryConfig {
    * Total number of retries allowed across every adapter for this run. `None` means no cross-adapter cap (each adapter's own `retry.max_retries_per_run` still applies in isolation).
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.
+ *
+ * ```toml [role.reader] permissions = ["SELECT", "USE CATALOG", "USE SCHEMA"]
+ *
+ * [role.analytics_engineer] inherits = ["reader"] permissions = ["MODIFY"]
+ *
+ * [role.admin] inherits = ["analytics_engineer"] permissions = ["MANAGE"] ```
+ *
+ * Resolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.
+ *
+ * Permission strings must match the canonical uppercase spellings of [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+ */
+export interface RoleConfig {
+  /**
+   * Immediate parent role names. Rocky walks these transitively at reconcile time; cycles are rejected. Defaults to `[]` when omitted.
+   */
+  inherits?: string[];
+  /**
+   * Permissions this role grants. Rocky unions these with every ancestor's permissions before passing the flattened set to the governance adapter. Defaults to `[]` (permissionless grouping roles are legal — they exist only for inheritance).
+   */
+  permissions?: string[];
 }
 /**
  * Schema evolution configuration.

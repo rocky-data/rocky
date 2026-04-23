@@ -2829,6 +2829,34 @@ pub async fn run(
                     }
                 }
             }
+
+            // Governance: role-graph reconcile (§1.1 + §1.2 Wave C-1).
+            // Flatten the `[role.*]` config and dispatch through the same
+            // `GovernanceAdapter` that handled classification + masking
+            // above. Best-effort: failures warn but never abort, mirroring
+            // the Wave A semantics.
+            //
+            // Cycle detection + unknown-parent validation already ran when
+            // the config was loaded (see `RockyConfig::role_graph`), so a
+            // failure here is an adapter-side one (e.g., SCIM API down
+            // when group creation lands in a follow-up).
+            match rocky_cfg.role_graph() {
+                Ok(resolved) if !resolved.is_empty() => {
+                    if let Err(e) = governance_adapter.reconcile_role_graph(&resolved).await {
+                        warn!(
+                            roles = resolved.len(),
+                            error = %e,
+                            "reconcile role graph failed"
+                        );
+                    }
+                }
+                Ok(_) => {
+                    // No `[role.*]` block — nothing to reconcile.
+                }
+                Err(e) => {
+                    warn!(error = %e, "role graph flatten failed; skipping role reconcile");
+                }
+            }
         }
     }
 

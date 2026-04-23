@@ -35,6 +35,7 @@ pub mod quarantine;
 pub mod redacted;
 pub mod retry;
 pub mod retry_budget;
+pub mod role_graph;
 pub mod schema;
 pub mod schema_cache;
 pub mod seeds;

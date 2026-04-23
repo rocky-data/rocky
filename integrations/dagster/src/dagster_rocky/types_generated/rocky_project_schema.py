@@ -619,6 +619,34 @@ class RetryConfig(BaseModel):
     """
 
 
+class RoleConfig(BaseModel):
+    """
+    A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.
+
+    ```toml [role.reader] permissions = ["SELECT", "USE CATALOG", "USE SCHEMA"]
+
+    [role.analytics_engineer] inherits = ["reader"] permissions = ["MODIFY"]
+
+    [role.admin] inherits = ["analytics_engineer"] permissions = ["MANAGE"] ```
+
+    Resolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.
+
+    Permission strings must match the canonical uppercase spellings of [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    inherits: list[str] | None = []
+    """
+    Immediate parent role names. Rocky walks these transitively at reconcile time; cycles are rejected. Defaults to `[]` when omitted.
+    """
+    permissions: list[str] | None = []
+    """
+    Permissions this role grants. Rocky unions these with every ancestor's permissions before passing the flattened set to the governance adapter. Defaults to `[]` (permissionless grouping roles are legal — they exist only for inheritance).
+    """
+
+
 class RunRetryConfig(BaseModel):
     """
     Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.
@@ -2357,6 +2385,12 @@ class RockyConfig(BaseModel):
     When set, `rocky run` builds a single [`crate::retry_budget::RetryBudget`] from [`RunRetryConfig::max_retries_per_run`] and passes it to every connector via `with_retry_budget(...)`. One bad table that burns through retries on adapter A then has less budget available for adapter B's retries — the protection §P2.7 added within a single adapter now extends across the whole run.
 
     Unset (the default) preserves per-adapter semantics: each adapter still honours its own `retry.max_retries_per_run` independently. That's the backward-compatible path and stays the right choice when adapters have wildly different rate limits.
+    """
+    role: dict[str, RoleConfig] | None = Field({}, validate_default=True)
+    """
+    Hierarchical role declarations reconciled against the warehouse's native role/group system.
+
+    See [`RoleConfig`] for the TOML shape and [`crate::role_graph::flatten_role_graph`] for the inheritance resolution semantics (DAG walk with cycle detection).
     """
     schema_evolution: SchemaEvolutionConfig | None = Field(
         {"grace_period_days": 7}, validate_default=True

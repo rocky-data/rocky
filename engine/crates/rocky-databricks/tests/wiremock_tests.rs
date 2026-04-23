@@ -852,3 +852,79 @@ async fn test_reconcile_access_combined_grants_and_bindings() {
     assert_eq!(diff.bindings.bindings_to_remove.len(), 1);
     assert_eq!(diff.bindings.bindings_to_remove[0].workspace_id, 3);
 }
+
+/// Verifies `reconcile_role_graph` routes through the GovernanceAdapter
+/// trait dispatch on `DatabricksGovernanceAdapter`.
+///
+/// v1 is log-only (no SCIM group creation, no per-catalog GRANT
+/// application), so this test asserts the trait method returns `Ok(())`
+/// and, critically, **no HTTP request is made** — the adapter's failure
+/// mode if it accidentally started calling the warehouse would be a
+/// wiremock "unmatched request" panic.
+#[tokio::test]
+async fn test_reconcile_role_graph_is_log_only_v1() {
+    use rocky_core::ir::{Permission, ResolvedRole};
+    use rocky_core::traits::GovernanceAdapter as _;
+    use rocky_databricks::governance::{DatabricksGovernanceAdapter, role_group_name};
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+    // Intentionally no mocks mounted: the test fails fast if v1
+    // accidentally starts calling the warehouse.
+
+    let connector = test_connector(&server);
+    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector));
+
+    let mut roles: BTreeMap<String, ResolvedRole> = BTreeMap::new();
+    roles.insert(
+        "reader".into(),
+        ResolvedRole {
+            name: "reader".into(),
+            flattened_permissions: vec![Permission::UseCatalog, Permission::Select],
+            inherits_from: vec![],
+        },
+    );
+    roles.insert(
+        "admin".into(),
+        ResolvedRole {
+            name: "admin".into(),
+            flattened_permissions: vec![
+                Permission::UseCatalog,
+                Permission::Select,
+                Permission::Manage,
+            ],
+            inherits_from: vec!["reader".into()],
+        },
+    );
+
+    adapter
+        .reconcile_role_graph(&roles)
+        .await
+        .expect("v1 reconcile_role_graph should succeed without network calls");
+
+    // Naming-convention assertion lives alongside the dispatch test so
+    // anyone refactoring the helper sees this test pin the public
+    // contract.
+    assert_eq!(role_group_name("reader"), "rocky_role_reader");
+    assert_eq!(role_group_name("admin"), "rocky_role_admin");
+}
+
+/// Empty role graph is a no-op — exercise the early-return path through
+/// the trait dispatch.
+#[tokio::test]
+async fn test_reconcile_role_graph_empty_is_ok() {
+    use rocky_core::ir::ResolvedRole;
+    use rocky_core::traits::GovernanceAdapter as _;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+    let connector = test_connector(&server);
+    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector));
+
+    let empty: BTreeMap<String, ResolvedRole> = BTreeMap::new();
+    adapter
+        .reconcile_role_graph(&empty)
+        .await
+        .expect("empty role graph should be a no-op");
+}

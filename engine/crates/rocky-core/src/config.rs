@@ -1052,6 +1052,47 @@ pub struct GrantConfig {
     pub permissions: Vec<String>,
 }
 
+/// A single entry in the top-level `[role.*]` block, declaring a
+/// hierarchical role with optional inheritance and a list of
+/// permissions.
+///
+/// ```toml
+/// [role.reader]
+/// permissions = ["SELECT", "USE CATALOG", "USE SCHEMA"]
+///
+/// [role.analytics_engineer]
+/// inherits = ["reader"]
+/// permissions = ["MODIFY"]
+///
+/// [role.admin]
+/// inherits = ["analytics_engineer"]
+/// permissions = ["MANAGE"]
+/// ```
+///
+/// Resolution happens at reconcile time via
+/// [`crate::role_graph::flatten_role_graph`], which walks the
+/// `inherits` DAG and unions permissions from the role and every
+/// transitive ancestor. Cycles and unknown parents are caught as
+/// structured [`crate::role_graph::RoleGraphError`] values.
+///
+/// Permission strings must match the canonical uppercase spellings of
+/// [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleConfig {
+    /// Immediate parent role names. Rocky walks these transitively at
+    /// reconcile time; cycles are rejected. Defaults to `[]` when
+    /// omitted.
+    #[serde(default)]
+    pub inherits: Vec<String>,
+    /// Permissions this role grants. Rocky unions these with every
+    /// ancestor's permissions before passing the flattened set to the
+    /// governance adapter. Defaults to `[]` (permissionless grouping
+    /// roles are legal — they exist only for inheritance).
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
 /// One entry in the top-level `[mask]` block. A scalar value (`pii =
 /// "hash"`) binds a classification tag to a default masking strategy; a
 /// nested table (`[mask.prod] pii = "none"`) overrides strategies for a
@@ -1625,6 +1666,15 @@ pub struct RockyConfig {
     /// `allow_unmasked` list that suppresses W004 warnings.
     #[serde(default)]
     pub classifications: ClassificationsConfig,
+
+    /// Hierarchical role declarations reconciled against the warehouse's
+    /// native role/group system.
+    ///
+    /// See [`RoleConfig`] for the TOML shape and
+    /// [`crate::role_graph::flatten_role_graph`] for the inheritance
+    /// resolution semantics (DAG walk with cycle detection).
+    #[serde(default, rename = "role", alias = "roles")]
+    pub roles: std::collections::BTreeMap<String, RoleConfig>,
 }
 
 impl RockyConfig {
@@ -1663,6 +1713,23 @@ impl RockyConfig {
         }
 
         out
+    }
+
+    /// Flatten the `[role.*]` config into a deterministic `name →
+    /// ResolvedRole` map, ready to pass to
+    /// [`crate::traits::GovernanceAdapter::reconcile_role_graph`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::role_graph::RoleGraphError`] on cycles, unknown
+    /// parents, or unknown permission spellings.
+    pub fn role_graph(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<String, crate::ir::ResolvedRole>,
+        crate::role_graph::RoleGraphError,
+    > {
+        crate::role_graph::flatten_role_graph(&self.roles)
     }
 }
 
