@@ -5576,7 +5576,8 @@ max_rows = 1000000
             [mask]
             pii = "scramble"
         "#;
-        let err = toml::from_str::<RockyConfig>(toml_str).expect_err("unknown strategy should fail");
+        let err =
+            toml::from_str::<RockyConfig>(toml_str).expect_err("unknown strategy should fail");
         assert!(
             err.to_string().contains("scramble") || err.to_string().contains("unknown variant"),
             "expected error to mention bad strategy, got: {err}"

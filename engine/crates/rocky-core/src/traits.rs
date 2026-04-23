@@ -925,11 +925,7 @@ mod tests {
             schema: "s".into(),
             table: "t".into(),
         };
-        assert!(
-            noop.apply_column_tags(&t, &BTreeMap::new())
-                .await
-                .is_ok()
-        );
+        assert!(noop.apply_column_tags(&t, &BTreeMap::new()).await.is_ok());
         assert!(
             noop.apply_masking_policy(&t, &MaskingPolicy::default(), "prod")
                 .await
@@ -949,7 +945,10 @@ mod tests {
         all_none
             .column_strategies
             .insert("phone".into(), MaskStrategy::None);
-        assert!(all_none.is_empty(), "all-None policies are effectively empty");
+        assert!(
+            all_none.is_empty(),
+            "all-None policies are effectively empty"
+        );
 
         let mut with_hash = MaskingPolicy::default();
         with_hash

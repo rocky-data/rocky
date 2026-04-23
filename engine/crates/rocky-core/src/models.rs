@@ -1444,8 +1444,14 @@ ssn = "confidential"
 SELECT email, phone, ssn FROM raw.users
 "#;
         let model = parse_model_inline(content, "users.sql", None).unwrap();
-        assert_eq!(model.config.classification.get("email"), Some(&"pii".to_string()));
-        assert_eq!(model.config.classification.get("phone"), Some(&"pii".to_string()));
+        assert_eq!(
+            model.config.classification.get("email"),
+            Some(&"pii".to_string())
+        );
+        assert_eq!(
+            model.config.classification.get("phone"),
+            Some(&"pii".to_string())
+        );
         assert_eq!(
             model.config.classification.get("ssn"),
             Some(&"confidential".to_string())

@@ -146,7 +146,7 @@ fn partial_mask_expr() -> String {
        WHEN length(v) < 5 THEN '***' \
        ELSE concat(substring(v, 1, 2), '***', substring(v, length(v) - 1, 2)) \
      END"
-        .to_string()
+    .to_string()
 }
 
 #[cfg(test)]
@@ -207,8 +207,7 @@ mod tests {
 
     #[test]
     fn test_create_mask_none_returns_nothing() {
-        let result =
-            generate_create_mask_sql("cat", "sch", MaskStrategy::None, "prod").unwrap();
+        let result = generate_create_mask_sql("cat", "sch", MaskStrategy::None, "prod").unwrap();
         assert!(
             result.is_none(),
             "MaskStrategy::None is identity — no CREATE FUNCTION needed"
@@ -217,16 +216,9 @@ mod tests {
 
     #[test]
     fn test_set_mask_hash() {
-        let sql = generate_set_mask_sql(
-            "cat",
-            "sch",
-            "users",
-            "email",
-            MaskStrategy::Hash,
-            "prod",
-        )
-        .unwrap()
-        .expect("Hash has SQL");
+        let sql = generate_set_mask_sql("cat", "sch", "users", "email", MaskStrategy::Hash, "prod")
+            .unwrap()
+            .expect("Hash has SQL");
         assert_eq!(
             sql,
             "ALTER TABLE cat.sch.users ALTER COLUMN email SET MASK cat.sch.rocky_mask_hash_prod"
@@ -235,15 +227,9 @@ mod tests {
 
     #[test]
     fn test_set_mask_none_returns_nothing() {
-        let result = generate_set_mask_sql(
-            "cat",
-            "sch",
-            "users",
-            "email",
-            MaskStrategy::None,
-            "prod",
-        )
-        .unwrap();
+        let result =
+            generate_set_mask_sql("cat", "sch", "users", "email", MaskStrategy::None, "prod")
+                .unwrap();
         assert!(
             result.is_none(),
             "None is the explicit-identity case — no SET MASK"
@@ -261,21 +247,12 @@ mod tests {
 
     #[test]
     fn test_rejects_bad_identifiers() {
+        assert!(generate_create_mask_sql("bad; DROP", "sch", MaskStrategy::Hash, "prod").is_err());
+        assert!(generate_create_mask_sql("cat", "sch", MaskStrategy::Hash, "bad env").is_err());
         assert!(
-            generate_create_mask_sql("bad; DROP", "sch", MaskStrategy::Hash, "prod").is_err()
+            generate_set_mask_sql("cat", "sch", "users", "bad col", MaskStrategy::Hash, "prod")
+                .is_err()
         );
-        assert!(
-            generate_create_mask_sql("cat", "sch", MaskStrategy::Hash, "bad env").is_err()
-        );
-        assert!(generate_set_mask_sql(
-            "cat",
-            "sch",
-            "users",
-            "bad col",
-            MaskStrategy::Hash,
-            "prod"
-        )
-        .is_err());
         assert!(generate_drop_mask_sql("cat", "sch", "users", "bad col").is_err());
     }
 }

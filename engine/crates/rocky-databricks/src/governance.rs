@@ -195,9 +195,15 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         // One statement per column — Databricks rejects multi-column
         // ALTER COLUMN in a single DDL, so we can't coalesce.
         for (column, tags) in column_tags {
-            mgr.set_column_tags(&table.catalog, &table.schema, table.table.as_str(), column, tags)
-                .await
-                .map_err(AdapterError::new)?;
+            mgr.set_column_tags(
+                &table.catalog,
+                &table.schema,
+                table.table.as_str(),
+                column,
+                tags,
+            )
+            .await
+            .map_err(AdapterError::new)?;
         }
         Ok(())
     }
@@ -223,13 +229,9 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
             .collect();
 
         for strategy in &distinct_strategies {
-            let sql = masking::generate_create_mask_sql(
-                &table.catalog,
-                &table.schema,
-                *strategy,
-                env,
-            )
-            .map_err(AdapterError::new)?;
+            let sql =
+                masking::generate_create_mask_sql(&table.catalog, &table.schema, *strategy, env)
+                    .map_err(AdapterError::new)?;
             if let Some(sql) = sql {
                 debug!(
                     catalog = %table.catalog,
