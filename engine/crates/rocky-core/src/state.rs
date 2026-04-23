@@ -58,6 +58,18 @@ const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
 /// Replicates as `replicate = false` by default in `state_sync.rs` so a fresh
 /// clone doesn't inherit another machine's stale types — see design doc §5.7.
 const SCHEMA_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("schema_cache");
+/// Idempotency-key stamps for `rocky run --idempotency-key` dedup.
+///
+/// Key: the caller-supplied idempotency key (opaque UTF-8 string; stored
+/// verbatim — never hash, never truncate). Value: serialized
+/// [`crate::idempotency::IdempotencyEntry`]. A new entry is inserted as
+/// `InFlight` when a run claims the key, updated to `Succeeded` or `Failed`
+/// at run end (see [`crate::config::DedupPolicy`]).
+///
+/// Replicates across backends by default — the table is intentionally NOT
+/// in [`LOCAL_ONLY_TABLE_NAMES`] so tiered-backend snapshots surface the
+/// same stamp to other pods after upload.
+const IDEMPOTENCY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("idempotency_keys");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -75,7 +87,7 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 /// Increment this constant whenever a table is added, removed, or structurally
 /// changed in a way that is incompatible with an older binary. Rocky will
 /// refuse to open a database whose stored version exceeds this value.
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -253,6 +265,7 @@ impl StateStore {
             let _table = txn.open_table(LOADED_FILES)?;
             let _table = txn.open_table(BRANCHES)?;
             let _table = txn.open_table(SCHEMA_CACHE)?;
+            let _table = txn.open_table(IDEMPOTENCY_KEYS)?;
         }
         txn.commit()?;
 
@@ -507,11 +520,24 @@ fn partition_record_key(model_name: &str, partition_key: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Status of a pipeline run.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a
+/// run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are
+/// the short-circuit outcomes of `rocky run --idempotency-key` — see
+/// [`crate::idempotency`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub enum RunStatus {
     Success,
     PartialFailure,
     Failure,
+    /// The run was short-circuited because an idempotency key already
+    /// mapped to a prior completed run. No work was done.
+    SkippedIdempotent,
+    /// The run was short-circuited because another caller held the
+    /// idempotency key's in-flight claim. No work was done.
+    SkippedInFlight,
 }
 
 /// What triggered the run.
@@ -894,6 +920,224 @@ impl StateStore {
             }
         }
         Ok(latest)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency-key persistence (see `crate::idempotency`)
+// ---------------------------------------------------------------------------
+
+impl StateStore {
+    /// Read an idempotency entry by key.
+    pub fn idempotency_get(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::idempotency::IdempotencyEntry>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(IDEMPOTENCY_KEYS)?;
+        match table.get(key)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace an idempotency entry. Used by the Tiered backend's
+    /// best-effort redb mirror; prefer
+    /// [`StateStore::idempotency_check_and_claim`] for racing callers.
+    pub fn idempotency_put(
+        &self,
+        entry: &crate::idempotency::IdempotencyEntry,
+    ) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(entry)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            table.insert(entry.key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete an idempotency entry. Returns `true` if the key was present.
+    pub fn idempotency_delete(&self, key: &str) -> Result<bool, StateError> {
+        let txn = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            removed = table.remove(key)?.is_some();
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Atomically inspect the idempotency table and claim the key if no
+    /// non-stale entry already holds it.
+    ///
+    /// Everything happens inside one redb write transaction — because the
+    /// `StateStore` holds the advisory `state.redb.lock`, we also have
+    /// per-process exclusion. Combined, the local backend provides true
+    /// "check-if-absent-then-claim" semantics without a second primitive.
+    pub fn idempotency_check_and_claim(
+        &self,
+        new_entry: &crate::idempotency::IdempotencyEntry,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::idempotency::IdempotencyCheck, StateError> {
+        use crate::idempotency::{IdempotencyCheck, IdempotencyEntry, classify_existing};
+
+        let new_bytes = serde_json::to_vec(new_entry)?;
+        let txn = self.db.begin_write()?;
+        let result;
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            let prior_entry: Option<IdempotencyEntry> = match table.get(new_entry.key.as_str())? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+
+            result = match prior_entry {
+                None => {
+                    table.insert(new_entry.key.as_str(), new_bytes.as_slice())?;
+                    IdempotencyCheck::Proceed
+                }
+                Some(prior) => {
+                    let verdict = classify_existing(prior, now, new_entry);
+                    match &verdict {
+                        IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. } => {
+                            // Overwrite the stale entry with the fresh InFlight claim.
+                            table.insert(new_entry.key.as_str(), new_bytes.as_slice())?;
+                        }
+                        IdempotencyCheck::SkipCompleted { .. }
+                        | IdempotencyCheck::SkipInFlight { .. } => {
+                            // Leave the prior entry untouched.
+                        }
+                    }
+                    verdict
+                }
+            };
+        }
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Finalize an idempotency entry — update to `Succeeded` / `Failed`, or
+    /// delete the entry entirely when [`crate::config::DedupPolicy::Success`]
+    /// + failure semantics mean retries should proceed.
+    ///
+    /// No-op (returns `Ok(())`) if the key is absent or held by a different
+    /// `run_id` — another caller already finalized it, which is not an error
+    /// (e.g. a `rocky replay` with `--force` that bypassed idempotency mid-run).
+    pub fn idempotency_finalize(
+        &self,
+        key: &str,
+        run_id: &str,
+        outcome: crate::idempotency::FinalOutcome,
+        retention_until: chrono::DateTime<chrono::Utc>,
+        dedup_on: crate::config::DedupPolicy,
+    ) -> Result<(), StateError> {
+        use crate::config::DedupPolicy;
+        use crate::idempotency::{FinalOutcome, IdempotencyEntry, IdempotencyState};
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            let existing: Option<IdempotencyEntry> = match table.get(key)? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            match existing {
+                None => {
+                    // Nothing to finalize — already swept, or claim was never
+                    // written (e.g. tiered mirror race). Silently succeed.
+                }
+                Some(prior) if prior.run_id != run_id => {
+                    // Another run owns the key now (AdoptStale path). Leave alone.
+                }
+                Some(prior) => {
+                    let should_keep = match (outcome, dedup_on) {
+                        (FinalOutcome::Succeeded, _) => true,
+                        (FinalOutcome::Failed, DedupPolicy::Any) => true,
+                        (FinalOutcome::Failed, DedupPolicy::Success) => false,
+                    };
+                    if should_keep {
+                        let updated = IdempotencyEntry {
+                            key: prior.key,
+                            run_id: prior.run_id,
+                            state: match outcome {
+                                FinalOutcome::Succeeded => IdempotencyState::Succeeded,
+                                FinalOutcome::Failed => IdempotencyState::Failed,
+                            },
+                            stamped_at: chrono::Utc::now(),
+                            expires_at: retention_until,
+                            dedup_on,
+                        };
+                        let bytes = serde_json::to_vec(&updated)?;
+                        table.insert(key, bytes.as_slice())?;
+                    } else {
+                        table.remove(key)?;
+                    }
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Sweep expired idempotency entries.
+    ///
+    /// Removes:
+    /// - Entries whose `expires_at < now` (retention exhausted).
+    /// - Entries still in `InFlight` whose `stamped_at + in_flight_ttl_hours`
+    ///   is in the past (crashed-pod corpses missed by the `AdoptStale`
+    ///   reader path — e.g. a claim whose run crashed and no follow-up run
+    ///   ever tried the same key).
+    ///
+    /// Returns the count removed.
+    pub fn idempotency_sweep_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        in_flight_ttl_hours: u32,
+    ) -> Result<usize, StateError> {
+        use crate::idempotency::{IdempotencyEntry, IdempotencyState};
+
+        let in_flight_cutoff = now - chrono::Duration::hours(in_flight_ttl_hours as i64);
+
+        // Phase 1: collect keys to drop (can't mutate during iter).
+        let to_drop: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            let mut drop = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let parsed: IdempotencyEntry = serde_json::from_slice(value.value())?;
+                let stale = match parsed.state {
+                    IdempotencyState::InFlight => parsed.stamped_at < in_flight_cutoff,
+                    IdempotencyState::Succeeded | IdempotencyState::Failed => {
+                        parsed.expires_at < now
+                    }
+                };
+                if stale {
+                    drop.push(key.value().to_string());
+                }
+            }
+            drop
+        };
+
+        if to_drop.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin_write()?;
+        let mut removed = 0;
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            for key in &to_drop {
+                if table.remove(key.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
     }
 }
 
@@ -2443,5 +2687,275 @@ mod tests {
             cached_at: now - chrono::Duration::hours(25),
         };
         assert!(stale.is_expired(now, ttl));
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency StateStore integration tests
+    // -----------------------------------------------------------------------
+
+    fn mk_idemp_entry(key: &str, run_id: &str) -> crate::idempotency::IdempotencyEntry {
+        let now = Utc::now();
+        crate::idempotency::IdempotencyEntry {
+            key: key.into(),
+            run_id: run_id.into(),
+            state: crate::idempotency::IdempotencyState::InFlight,
+            stamped_at: now,
+            expires_at: now + chrono::Duration::hours(24),
+            dedup_on: crate::config::DedupPolicy::Success,
+        }
+    }
+
+    #[test]
+    fn idempotency_first_claim_proceeds() {
+        let (store, _dir) = temp_store();
+        let entry = mk_idemp_entry("fresh-key", "run-1");
+        let verdict = store
+            .idempotency_check_and_claim(&entry, Utc::now())
+            .unwrap();
+        assert!(matches!(
+            verdict,
+            crate::idempotency::IdempotencyCheck::Proceed
+        ));
+
+        // Entry was written.
+        let got = store.idempotency_get("fresh-key").unwrap().unwrap();
+        assert_eq!(got.run_id, "run-1");
+        assert_eq!(got.state, crate::idempotency::IdempotencyState::InFlight);
+    }
+
+    #[test]
+    fn idempotency_repeat_with_succeeded_skips() {
+        let (store, _dir) = temp_store();
+        // Seed a Succeeded entry.
+        let now = Utc::now();
+        let mut entry = mk_idemp_entry("done-key", "run-prior");
+        entry.state = crate::idempotency::IdempotencyState::Succeeded;
+        entry.expires_at = now + chrono::Duration::days(30);
+        store.idempotency_put(&entry).unwrap();
+
+        // New claim attempt must skip.
+        let new_entry = mk_idemp_entry("done-key", "run-new");
+        let verdict = store.idempotency_check_and_claim(&new_entry, now).unwrap();
+        match verdict {
+            crate::idempotency::IdempotencyCheck::SkipCompleted { run_id } => {
+                assert_eq!(run_id, "run-prior");
+            }
+            other => panic!("expected SkipCompleted, got {other:?}"),
+        }
+        // Existing entry unchanged.
+        let got = store.idempotency_get("done-key").unwrap().unwrap();
+        assert_eq!(got.run_id, "run-prior");
+    }
+
+    #[test]
+    fn idempotency_repeat_with_inflight_in_ttl_skips() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let prior = crate::idempotency::IdempotencyEntry {
+            key: "busy-key".into(),
+            run_id: "run-busy".into(),
+            state: crate::idempotency::IdempotencyState::InFlight,
+            stamped_at: now - chrono::Duration::minutes(5),
+            expires_at: now + chrono::Duration::hours(23),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        store.idempotency_put(&prior).unwrap();
+
+        let new_entry = mk_idemp_entry("busy-key", "run-new");
+        let verdict = store.idempotency_check_and_claim(&new_entry, now).unwrap();
+        match verdict {
+            crate::idempotency::IdempotencyCheck::SkipInFlight { run_id } => {
+                assert_eq!(run_id, "run-busy");
+            }
+            other => panic!("expected SkipInFlight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idempotency_stale_inflight_adopts() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let stale = crate::idempotency::IdempotencyEntry {
+            key: "stale-key".into(),
+            run_id: "run-crashed".into(),
+            state: crate::idempotency::IdempotencyState::InFlight,
+            stamped_at: now - chrono::Duration::hours(25),
+            expires_at: now - chrono::Duration::hours(1),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        store.idempotency_put(&stale).unwrap();
+
+        let new_entry = mk_idemp_entry("stale-key", "run-adopter");
+        let verdict = store.idempotency_check_and_claim(&new_entry, now).unwrap();
+        match verdict {
+            crate::idempotency::IdempotencyCheck::AdoptStale { prior_run_id } => {
+                assert_eq!(prior_run_id, "run-crashed");
+            }
+            other => panic!("expected AdoptStale, got {other:?}"),
+        }
+        // Entry overwritten with the adopter.
+        let got = store.idempotency_get("stale-key").unwrap().unwrap();
+        assert_eq!(got.run_id, "run-adopter");
+        assert_eq!(got.state, crate::idempotency::IdempotencyState::InFlight);
+    }
+
+    #[test]
+    fn idempotency_finalize_succeeded_keeps_entry() {
+        let (store, _dir) = temp_store();
+        let entry = mk_idemp_entry("key-a", "run-a");
+        store
+            .idempotency_check_and_claim(&entry, Utc::now())
+            .unwrap();
+
+        let retention = Utc::now() + chrono::Duration::days(30);
+        store
+            .idempotency_finalize(
+                "key-a",
+                "run-a",
+                crate::idempotency::FinalOutcome::Succeeded,
+                retention,
+                crate::config::DedupPolicy::Success,
+            )
+            .unwrap();
+
+        let got = store.idempotency_get("key-a").unwrap().unwrap();
+        assert_eq!(got.state, crate::idempotency::IdempotencyState::Succeeded);
+    }
+
+    #[test]
+    fn idempotency_finalize_failed_with_dedup_success_deletes() {
+        let (store, _dir) = temp_store();
+        let entry = mk_idemp_entry("key-b", "run-b");
+        store
+            .idempotency_check_and_claim(&entry, Utc::now())
+            .unwrap();
+
+        store
+            .idempotency_finalize(
+                "key-b",
+                "run-b",
+                crate::idempotency::FinalOutcome::Failed,
+                Utc::now() + chrono::Duration::days(30),
+                crate::config::DedupPolicy::Success,
+            )
+            .unwrap();
+
+        assert!(store.idempotency_get("key-b").unwrap().is_none());
+    }
+
+    #[test]
+    fn idempotency_finalize_failed_with_dedup_any_keeps_entry() {
+        let (store, _dir) = temp_store();
+        let entry = mk_idemp_entry("key-c", "run-c");
+        store
+            .idempotency_check_and_claim(&entry, Utc::now())
+            .unwrap();
+
+        store
+            .idempotency_finalize(
+                "key-c",
+                "run-c",
+                crate::idempotency::FinalOutcome::Failed,
+                Utc::now() + chrono::Duration::days(30),
+                crate::config::DedupPolicy::Any,
+            )
+            .unwrap();
+
+        let got = store.idempotency_get("key-c").unwrap().unwrap();
+        assert_eq!(got.state, crate::idempotency::IdempotencyState::Failed);
+    }
+
+    #[test]
+    fn idempotency_finalize_mismatched_run_id_is_noop() {
+        let (store, _dir) = temp_store();
+        let entry = mk_idemp_entry("key-d", "run-d");
+        store
+            .idempotency_check_and_claim(&entry, Utc::now())
+            .unwrap();
+
+        // Pretend another run adopted the key; finalizing with a stale
+        // `run_id` must not clobber the current owner.
+        store
+            .idempotency_finalize(
+                "key-d",
+                "stale-run",
+                crate::idempotency::FinalOutcome::Succeeded,
+                Utc::now() + chrono::Duration::days(30),
+                crate::config::DedupPolicy::Success,
+            )
+            .unwrap();
+
+        let got = store.idempotency_get("key-d").unwrap().unwrap();
+        assert_eq!(got.run_id, "run-d");
+        assert_eq!(got.state, crate::idempotency::IdempotencyState::InFlight);
+    }
+
+    #[test]
+    fn idempotency_sweep_expired_removes_past_retention() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+
+        // Fresh entry — within retention.
+        let fresh = crate::idempotency::IdempotencyEntry {
+            key: "fresh".into(),
+            run_id: "r-fresh".into(),
+            state: crate::idempotency::IdempotencyState::Succeeded,
+            stamped_at: now - chrono::Duration::days(1),
+            expires_at: now + chrono::Duration::days(29),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        // Past retention — should be swept.
+        let expired = crate::idempotency::IdempotencyEntry {
+            key: "expired".into(),
+            run_id: "r-expired".into(),
+            state: crate::idempotency::IdempotencyState::Succeeded,
+            stamped_at: now - chrono::Duration::days(60),
+            expires_at: now - chrono::Duration::days(30),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        // InFlight past TTL — crashed pod corpse.
+        let corpse = crate::idempotency::IdempotencyEntry {
+            key: "corpse".into(),
+            run_id: "r-corpse".into(),
+            state: crate::idempotency::IdempotencyState::InFlight,
+            stamped_at: now - chrono::Duration::hours(48),
+            expires_at: now - chrono::Duration::hours(24),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        store.idempotency_put(&fresh).unwrap();
+        store.idempotency_put(&expired).unwrap();
+        store.idempotency_put(&corpse).unwrap();
+
+        let removed = store.idempotency_sweep_expired(now, 24).unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.idempotency_get("fresh").unwrap().is_some());
+        assert!(store.idempotency_get("expired").unwrap().is_none());
+        assert!(store.idempotency_get("corpse").unwrap().is_none());
+    }
+
+    #[test]
+    fn idempotency_concurrent_claim_only_one_wins() {
+        // Local backend atomicity: the state.redb.lock enforces one writer
+        // at a time, so a second `check_and_claim` for the same key from
+        // the same store instance observes the first entry and skips.
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+
+        let a = mk_idemp_entry("race-key", "run-a");
+        let b = mk_idemp_entry("race-key", "run-b");
+
+        let verdict_a = store.idempotency_check_and_claim(&a, now).unwrap();
+        let verdict_b = store.idempotency_check_and_claim(&b, now).unwrap();
+
+        assert!(matches!(
+            verdict_a,
+            crate::idempotency::IdempotencyCheck::Proceed
+        ));
+        match verdict_b {
+            crate::idempotency::IdempotencyCheck::SkipInFlight { run_id } => {
+                assert_eq!(run_id, "run-a");
+            }
+            other => panic!("expected SkipInFlight for second claim, got {other:?}"),
+        }
     }
 }

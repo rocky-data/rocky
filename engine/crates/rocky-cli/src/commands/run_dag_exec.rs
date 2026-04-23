@@ -179,6 +179,12 @@ impl NodeDispatcher for CliDispatcher {
                     // contract without clear signal; defer unless a
                     // concrete use case shows up.
                     None,
+                    // DAG sub-runs do not accept `--idempotency-key`; the
+                    // caller stamps dedup on the outer DAG driver, and
+                    // cascading the key into every pipeline sub-run would
+                    // cause every sibling to short-circuit on a single
+                    // stamp.
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())

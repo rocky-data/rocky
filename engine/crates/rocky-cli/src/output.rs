@@ -161,6 +161,23 @@ pub struct TableOutput {
 pub struct RunOutput {
     pub version: String,
     pub command: String,
+    /// Terminal status of the run. `success` / `partial_failure` / `failure`
+    /// match the lifecycle semantics callers already understand; the two
+    /// `skipped_*` variants short-circuit via the idempotency key (see
+    /// `idempotency_key` below). Always populated — non-skipped runs derive
+    /// this field from `tables_failed` / materialization counts, so JSON
+    /// consumers no longer need to re-derive status from counts themselves.
+    pub status: rocky_core::state::RunStatus,
+    /// Prior run whose idempotency key deflected this call, or the run
+    /// currently holding the in-flight claim. Populated only when `status`
+    /// is `skipped_idempotent` or `skipped_in_flight`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_by_run_id: Option<String>,
+    /// The `--idempotency-key` value this run was invoked with, echoed back
+    /// for operator cross-reference in logs and `rocky history`. `None` for
+    /// runs that didn't pass the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// Pipeline type that was executed (e.g., "replication").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_type: Option<String>,
@@ -1896,6 +1913,9 @@ impl RunOutput {
         RunOutput {
             version: VERSION.to_string(),
             command: "run".to_string(),
+            status: rocky_core::state::RunStatus::Success,
+            skipped_by_run_id: None,
+            idempotency_key: None,
             pipeline_type: Some("replication".to_string()),
             filter,
             duration_ms,

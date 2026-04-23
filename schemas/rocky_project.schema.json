@@ -575,6 +575,25 @@
       ],
       "type": "object"
     },
+    "DedupPolicy": {
+      "description": "Policy controlling which terminal outcomes count for [`IdempotencyConfig::dedup_on`].",
+      "oneOf": [
+        {
+          "description": "Only successful runs stamp a persistent dedup entry; failed runs leave the key claimable for a retry. Default — matches the common \"dedup successful notifications, allow retries\" use case.",
+          "enum": [
+            "success"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Any terminal status stamps a persistent entry — subsequent calls with the same key always skip, regardless of whether the prior run succeeded. Use when replays are expensive even for failures.",
+          "enum": [
+            "any"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "Dialect": {
       "description": "Target dialect for transpilation.\n\nSerializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.",
       "enum": [
@@ -831,6 +850,36 @@
           "default": {},
           "description": "Webhook configurations keyed by event name.",
           "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "IdempotencyConfig": {
+      "additionalProperties": false,
+      "description": "Config for `rocky run --idempotency-key` dedup.\n\nAll fields are optional with sensible defaults. Block is present even when the user doesn't set `--idempotency-key`; it's a no-op in that case.",
+      "properties": {
+        "dedup_on": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DedupPolicy"
+            }
+          ],
+          "default": "success",
+          "description": "Which terminal statuses count as \"already processed\" for dedup. See [`DedupPolicy`]. Default [`DedupPolicy::Success`]."
+        },
+        "in_flight_ttl_hours": {
+          "default": 24,
+          "description": "Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retention_days": {
+          "default": 30,
+          "description": "Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -2257,6 +2306,19 @@
             "null"
           ]
         },
+        "idempotency": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/IdempotencyConfig"
+            }
+          ],
+          "default": {
+            "dedup_on": "success",
+            "in_flight_ttl_hours": 24,
+            "retention_days": 30
+          },
+          "description": "Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as \"deduplicated\", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`]."
+        },
         "on_upload_failure": {
           "allOf": [
             {
@@ -2717,6 +2779,11 @@
         "backend": "local",
         "gcs_bucket": null,
         "gcs_prefix": null,
+        "idempotency": {
+          "dedup_on": "success",
+          "in_flight_ttl_hours": 24,
+          "retention_days": 30
+        },
         "on_upload_failure": "skip",
         "retry": {
           "backoff_multiplier": 2.0,

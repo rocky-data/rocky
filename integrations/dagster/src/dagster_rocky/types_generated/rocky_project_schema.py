@@ -178,6 +178,22 @@ class CostSection(BaseModel):
     """
 
 
+class DedupPolicy1(StrEnum):
+    """
+    Only successful runs stamp a persistent dedup entry; failed runs leave the key claimable for a retry. Default — matches the common "dedup successful notifications, allow retries" use case.
+    """
+
+    success = "success"
+
+
+class DedupPolicy2(StrEnum):
+    """
+    Any terminal status stamps a persistent entry — subsequent calls with the same key always skip, regardless of whether the prior run succeeded. Use when replays are expensive even for failures.
+    """
+
+    any = "any"
+
+
 class Dialect(StrEnum):
     """
     Target dialect for transpilation.
@@ -299,6 +315,30 @@ class HookConfigOrList(RootModel[HookConfig | list[HookConfig]]):
     Supports both single-hook and multi-hook syntax per event.
 
     Single: `[hook.on_pipeline_start]` Multiple: `[[hook.on_after_checks]]`
+    """
+
+
+class IdempotencyConfig(BaseModel):
+    """
+    Config for `rocky run --idempotency-key` dedup.
+
+    All fields are optional with sensible defaults. Block is present even when the user doesn't set `--idempotency-key`; it's a no-op in that case.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    dedup_on: DedupPolicy1 | DedupPolicy2 | None = "success"
+    """
+    Which terminal statuses count as "already processed" for dedup. See [`DedupPolicy`]. Default [`DedupPolicy::Success`].
+    """
+    in_flight_ttl_hours: conint(ge=0) | None = 24
+    """
+    Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them.
+    """
+    retention_days: conint(ge=0) | None = 30
+    """
+    Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.
     """
 
 
@@ -1520,6 +1560,13 @@ class StateConfig(BaseModel):
     """
     GCS key prefix (default: "rocky/state/")
     """
+    idempotency: IdempotencyConfig | None = Field(
+        {"dedup_on": "success", "in_flight_ttl_hours": 24, "retention_days": 30},
+        validate_default=True,
+    )
+    """
+    Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
+    """
     on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
     """
     What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
@@ -2246,6 +2293,11 @@ class RockyConfig(BaseModel):
             "backend": "local",
             "gcs_bucket": None,
             "gcs_prefix": None,
+            "idempotency": {
+                "dedup_on": "success",
+                "in_flight_ttl_hours": 24,
+                "retention_days": 30,
+            },
             "on_upload_failure": "skip",
             "retry": {
                 "backoff_multiplier": 2.0,

@@ -476,6 +476,13 @@ pub struct StateConfig {
     /// [`StateUploadFailureMode`].
     #[serde(default)]
     pub on_upload_failure: StateUploadFailureMode,
+    /// Per-run idempotency-key policy (`rocky run --idempotency-key`).
+    /// Controls retention of stamped keys, what terminal statuses count as
+    /// "deduplicated", and how long an `InFlight` entry survives before it's
+    /// treated as a crashed-pod corpse and adopted by a fresh caller. See
+    /// [`IdempotencyConfig`].
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
 }
 
 impl Default for StateConfig {
@@ -491,12 +498,71 @@ impl Default for StateConfig {
             transfer_timeout_seconds: default_state_transfer_timeout_secs(),
             retry: RetryConfig::default(),
             on_upload_failure: StateUploadFailureMode::default(),
+            idempotency: IdempotencyConfig::default(),
         }
     }
 }
 
 fn default_state_transfer_timeout_secs() -> u64 {
     300
+}
+
+/// Policy controlling which terminal outcomes count for
+/// [`IdempotencyConfig::dedup_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupPolicy {
+    /// Only successful runs stamp a persistent dedup entry; failed runs
+    /// leave the key claimable for a retry. Default — matches the common
+    /// "dedup successful notifications, allow retries" use case.
+    #[default]
+    Success,
+    /// Any terminal status stamps a persistent entry — subsequent calls
+    /// with the same key always skip, regardless of whether the prior run
+    /// succeeded. Use when replays are expensive even for failures.
+    Any,
+}
+
+/// Config for `rocky run --idempotency-key` dedup.
+///
+/// All fields are optional with sensible defaults. Block is present even
+/// when the user doesn't set `--idempotency-key`; it's a no-op in that case.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotencyConfig {
+    /// Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept
+    /// before GC. Default 30. GC runs during the state upload sweep.
+    #[serde(default = "default_idempotency_retention_days")]
+    pub retention_days: u32,
+    /// Which terminal statuses count as "already processed" for dedup. See
+    /// [`DedupPolicy`]. Default [`DedupPolicy::Success`].
+    #[serde(default)]
+    pub dedup_on: DedupPolicy,
+    /// Hours after which an `InFlight` entry is treated as a crashed-pod
+    /// corpse and adopted by a fresh caller. Default 24. Applies only to
+    /// backends whose in-flight lock does not carry a server-side TTL —
+    /// Valkey providers set `EX` directly on `SET NX`, so this field is
+    /// informational for them.
+    #[serde(default = "default_idempotency_in_flight_ttl_hours")]
+    pub in_flight_ttl_hours: u32,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_idempotency_retention_days(),
+            dedup_on: DedupPolicy::default(),
+            in_flight_ttl_hours: default_idempotency_in_flight_ttl_hours(),
+        }
+    }
+}
+
+fn default_idempotency_retention_days() -> u32 {
+    30
+}
+
+fn default_idempotency_in_flight_ttl_hours() -> u32 {
+    24
 }
 
 /// Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).

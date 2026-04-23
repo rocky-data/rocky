@@ -252,6 +252,34 @@ class RunCostSummary(BaseModel):
     """
 
 
+class RunStatus1(StrEnum):
+    """
+    Status of a pipeline run.
+
+    `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
+    """
+
+    Success = "Success"
+    PartialFailure = "PartialFailure"
+    Failure = "Failure"
+
+
+class RunStatus2(StrEnum):
+    """
+    The run was short-circuited because an idempotency key already mapped to a prior completed run. No work was done.
+    """
+
+    SkippedIdempotent = "SkippedIdempotent"
+
+
+class RunStatus3(StrEnum):
+    """
+    The run was short-circuited because another caller held the idempotency key's in-flight claim. No work was done.
+    """
+
+    SkippedInFlight = "SkippedInFlight"
+
+
 class TableErrorOutput(BaseModel):
     """
     Error from a table that failed during parallel processing.
@@ -447,6 +475,10 @@ class RunOutput(BaseModel):
     """
     execution: ExecutionSummary
     filter: str
+    idempotency_key: str | None = None
+    """
+    The `--idempotency-key` value this run was invoked with, echoed back for operator cross-reference in logs and `rocky history`. `None` for runs that didn't pass the flag.
+    """
     interrupted: bool
     """
     `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so orchestrators can distinguish "user interrupted" from "run failed". Tables that hadn't reached `Success` or `Failed` at interrupt time are recorded as `TableStatus::Interrupted` in the state store. Always serialised (even when `false`) so consumers don't have to treat its absence specially.
@@ -470,6 +502,14 @@ class RunOutput(BaseModel):
     shadow: bool
     """
     True when running in shadow mode (targets rewritten).
+    """
+    skipped_by_run_id: str | None = None
+    """
+    Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
+    """
+    status: RunStatus1 | RunStatus2 | RunStatus3
+    """
+    Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
     """
     tables_copied: conint(ge=0)
     tables_failed: conint(ge=0)

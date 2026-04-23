@@ -262,6 +262,234 @@ fn persist_run_record(
     }
 }
 
+/// Context captured at idempotency claim time so the finalize path (every
+/// `persist_run_record` call site) can stamp the correct terminal state.
+struct IdempotencyCtx {
+    key: String,
+    backend: rocky_core::idempotency::IdempotencyBackend,
+    config: rocky_core::config::IdempotencyConfig,
+    /// Captured at the claim point; surfaced in the echoed `RunOutput`
+    /// field for operator cross-reference.
+    _claim_backend_label: &'static str,
+}
+
+/// Outcome of the initial claim attempt at the top of `rocky run`.
+enum IdempotencyOutcome {
+    /// Key dedups — the caller already emitted a `skipped_*` `RunOutput`
+    /// and exited. `run()` should return immediately.
+    Skipped,
+    /// Key claimed (or adopted from stale) — run proceeds; ctx is threaded
+    /// to the finalize path.
+    Proceed(IdempotencyCtx),
+}
+
+/// Attempt to claim the idempotency key. On skip, emit the short-circuit
+/// `RunOutput` and return [`IdempotencyOutcome::Skipped`]. On proceed /
+/// adopt-stale, return the claim context for the caller to thread into
+/// [`finalize_idempotency`] at every exit path.
+async fn try_claim_idempotency(
+    state_cfg: &rocky_core::config::StateConfig,
+    state_path: &Path,
+    key: &str,
+    run_id: &str,
+    output_json: bool,
+) -> Result<IdempotencyOutcome> {
+    use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck, IdempotencyError};
+
+    let backend = IdempotencyBackend::from_state_config(state_cfg);
+    let backend_label = backend.backend_label();
+
+    // For the local + tiered paths the StateStore is the primary (local) or
+    // mirror (tiered) write target. `open_read_only` is insufficient — the
+    // claim performs a redb write txn. Fall back to an in-memory store
+    // error-out when the state store can't be opened at all so a broken
+    // state file doesn't silently bypass dedup.
+    let state_store = match backend {
+        IdempotencyBackend::Local
+        | IdempotencyBackend::Valkey {
+            mirror_to_redb: true,
+            ..
+        } => Some(StateStore::open(state_path).with_context(|| {
+            format!(
+                "failed to open state store at {} for idempotency claim",
+                state_path.display()
+            )
+        })?),
+        _ => None,
+    };
+
+    let verdict = backend
+        .check_and_claim(state_store.as_ref(), key, run_id, &state_cfg.idempotency)
+        .await
+        .map_err(|e| match e {
+            IdempotencyError::UnsupportedBackend { backend } => anyhow::anyhow!(
+                "--idempotency-key is not supported on state backend \"{backend}\" yet. \
+                 Switch to `tiered` (Valkey + S3 fallback — recommended for multi-pod) \
+                 or `valkey` to enable idempotency, or drop the flag to proceed without dedup."
+            ),
+            other => anyhow::Error::from(other),
+        })?;
+
+    match verdict {
+        IdempotencyCheck::Proceed => {
+            info!(
+                idempotency_key = key,
+                run_id = run_id,
+                backend = backend_label,
+                "idempotency key claimed — proceeding"
+            );
+            Ok(IdempotencyOutcome::Proceed(IdempotencyCtx {
+                key: key.to_string(),
+                backend,
+                config: state_cfg.idempotency.clone(),
+                _claim_backend_label: backend_label,
+            }))
+        }
+        IdempotencyCheck::AdoptStale { prior_run_id } => {
+            warn!(
+                idempotency_key = key,
+                run_id = run_id,
+                prior_run_id = %prior_run_id,
+                backend = backend_label,
+                "adopted stale idempotency claim (previous run appears crashed) — proceeding"
+            );
+            Ok(IdempotencyOutcome::Proceed(IdempotencyCtx {
+                key: key.to_string(),
+                backend,
+                config: state_cfg.idempotency.clone(),
+                _claim_backend_label: backend_label,
+            }))
+        }
+        IdempotencyCheck::SkipCompleted {
+            run_id: prior_run_id,
+        } => {
+            emit_skipped_run_output(
+                key,
+                &prior_run_id,
+                rocky_core::state::RunStatus::SkippedIdempotent,
+                output_json,
+            )?;
+            Ok(IdempotencyOutcome::Skipped)
+        }
+        IdempotencyCheck::SkipInFlight {
+            run_id: prior_run_id,
+        } => {
+            emit_skipped_run_output(
+                key,
+                &prior_run_id,
+                rocky_core::state::RunStatus::SkippedInFlight,
+                output_json,
+            )?;
+            Ok(IdempotencyOutcome::Skipped)
+        }
+    }
+}
+
+/// Emit a short-circuit `RunOutput` (status = `skipped_*`) and exit. No
+/// state-store mutation, no hook fires, no pipeline-start event — the run
+/// never actually started.
+fn emit_skipped_run_output(
+    key: &str,
+    prior_run_id: &str,
+    status: rocky_core::state::RunStatus,
+    output_json: bool,
+) -> Result<()> {
+    let mut output = RunOutput::new(String::new(), 0, 0);
+    output.status = status;
+    output.skipped_by_run_id = Some(prior_run_id.to_string());
+    output.idempotency_key = Some(key.to_string());
+    if output_json {
+        print_json(&output)?;
+    } else {
+        let label = match status {
+            rocky_core::state::RunStatus::SkippedIdempotent => "skipped_idempotent",
+            rocky_core::state::RunStatus::SkippedInFlight => "skipped_in_flight",
+            _ => "skipped",
+        };
+        info!(
+            idempotency_key = key,
+            prior_run_id = prior_run_id,
+            status = label,
+            "idempotency key already claimed — skipping run"
+        );
+    }
+    Ok(())
+}
+
+/// Sweep expired idempotency entries + stale-InFlight corpses on the
+/// local/mirror state store. Runs regardless of whether THIS invocation
+/// supplied `--idempotency-key` — keeps the table tidy for future dedup
+/// consumers and bounds redb growth.
+///
+/// Failures are logged and swallowed; GC is purely opportunistic.
+async fn sweep_idempotency_best_effort(
+    _ctx: Option<&IdempotencyCtx>,
+    state_store: Option<&StateStore>,
+    config: &rocky_core::config::IdempotencyConfig,
+) {
+    let Some(store) = state_store else {
+        return;
+    };
+    match store.idempotency_sweep_expired(Utc::now(), config.in_flight_ttl_hours) {
+        Ok(count) if count > 0 => {
+            info!(
+                swept_count = count,
+                retention_days = config.retention_days,
+                in_flight_ttl_hours = config.in_flight_ttl_hours,
+                "swept expired idempotency entries"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => warn!(
+            error = %e,
+            "idempotency sweep failed; retrying on next run"
+        ),
+    }
+}
+
+/// Finalize the idempotency entry for the current run. Called from the
+/// same exit paths as [`persist_run_record`] (every terminal branch of
+/// `rocky run`).
+///
+/// Swallows errors with a warn — state-store or Valkey flakiness here must
+/// not flip the exit code of an otherwise successful run. The worst case
+/// is a stale `InFlight` entry that the `in_flight_ttl_hours` sweep will
+/// eventually reap.
+async fn finalize_idempotency(
+    ctx: Option<&IdempotencyCtx>,
+    state_store: Option<&StateStore>,
+    run_id: &str,
+    output: &RunOutput,
+) {
+    let Some(ctx) = ctx else {
+        return;
+    };
+    let outcome = match output.derive_run_status() {
+        rocky_core::state::RunStatus::Success => rocky_core::idempotency::FinalOutcome::Succeeded,
+        rocky_core::state::RunStatus::PartialFailure | rocky_core::state::RunStatus::Failure => {
+            rocky_core::idempotency::FinalOutcome::Failed
+        }
+        // Skip variants never reach finalize — we short-circuit before
+        // starting the pipeline — but be safe.
+        rocky_core::state::RunStatus::SkippedIdempotent
+        | rocky_core::state::RunStatus::SkippedInFlight => {
+            return;
+        }
+    };
+    if let Err(e) = ctx
+        .backend
+        .finalize(state_store, &ctx.key, run_id, outcome, &ctx.config)
+        .await
+    {
+        warn!(
+            error = %e,
+            idempotency_key = %ctx.key,
+            run_id = run_id,
+            "failed to finalize idempotency entry; key may remain InFlight until TTL sweep"
+        );
+    }
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run")]
@@ -284,9 +512,47 @@ pub async fn run(
     // path doesn't consult the cache, so this flag is a no-op for
     // replication-only runs.
     cache_ttl_override: Option<u64>,
+    // Caller-supplied `--idempotency-key`. `None` bypasses the dedup path
+    // entirely. When `Some`, the run is skipped if the key already dedups
+    // (see `rocky_core::idempotency`) or proceeds and stamps the key at
+    // every terminal exit.
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
+    // Unified run_id minted up front so the idempotency claim and every
+    // downstream persistence site (model-only, replication, interrupted,
+    // main exit) share one identifier. That keeps
+    // `IdempotencyEntry::run_id` == `RunRecord::run_id` so operators can
+    // cross-reference a `skipped_by_run_id` directly against
+    // `rocky history`.
+    let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+
+    // -------------------------------------------------------------------
+    // Idempotency check + claim (before any state mutation / run_id mint).
+    // Dispatch on the configured state backend; short-circuit with a typed
+    // `RunOutput` + exit 0 when the key dedups.
+    // -------------------------------------------------------------------
+    let rocky_cfg_for_idemp = rocky_core::config::load_rocky_config(config_path).context(
+        format!("failed to load config from {}", config_path.display()),
+    )?;
+    let idempotency_ctx = match idempotency_key {
+        Some(key) => {
+            match try_claim_idempotency(
+                &rocky_cfg_for_idemp.state,
+                state_path,
+                key,
+                &run_id,
+                output_json,
+            )
+            .await?
+            {
+                IdempotencyOutcome::Skipped => return Ok(()),
+                IdempotencyOutcome::Proceed(ctx) => Some(ctx),
+            }
+        }
+        None => None,
+    };
 
     // OTLP metrics exporter (feature-gated). Auto-initialises when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
@@ -358,16 +624,16 @@ pub async fn run(
 
         let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
         let state_store = rocky_core::state::StateStore::open(state_path).ok();
-        let run_id = format!(
-            "model-{}-{}",
-            target_model,
-            chrono::Utc::now().format("%Y%m%d-%H%M%S")
-        );
+        // `run_id` minted at the top of `run()` — model-only, replication,
+        // and idempotency-claim paths all share one identifier.
         let mut output = RunOutput::new(
             filter.unwrap_or("").to_string(),
             0, // duration filled at end
             1, // concurrency
         );
+        if let Some(ctx) = &idempotency_ctx {
+            output.idempotency_key = Some(ctx.key.clone());
+        }
 
         execute_models(
             mdir,
@@ -403,6 +669,13 @@ pub async fn run(
             started_at,
             &config_hash,
         );
+        finalize_idempotency(
+            idempotency_ctx.as_ref(),
+            state_store.as_ref(),
+            &run_id,
+            &output,
+        )
+        .await;
 
         if output_json {
             print_json(&output)?;
@@ -538,6 +811,9 @@ pub async fn run(
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
+    if let Some(ctx) = &idempotency_ctx {
+        output.idempotency_key = Some(ctx.key.clone());
+    }
     let mut catalogs_created: usize = 0;
     let mut schemas_created: usize = 0;
     let mut created_catalogs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -968,7 +1244,7 @@ pub async fn run(
         }
     }
     // --- Checkpoint / resume: filter already-completed tables ---
-    let run_id = format!("run-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+    // `run_id` minted at the top of `run()`.
 
     // §P2.6 emit: pipeline_start. Failures here are logged by the
     // registry itself; we swallow the Result because hook failures
@@ -1691,6 +1967,13 @@ pub async fn run(
                 started_at,
                 &config_hash,
             );
+            finalize_idempotency(
+                idempotency_ctx.as_ref(),
+                Some(&state),
+                &shared_run_id,
+                &output,
+            )
+            .await;
         }
 
         if output_json {
@@ -2248,6 +2531,16 @@ pub async fn run(
     output.permissions.schemas_created = schemas_created;
     output.metrics = Some(rocky_observe::metrics::METRICS.snapshot());
 
+    // Sweep expired idempotency stamps + stale InFlight corpses before
+    // the remote upload so the uploaded snapshot doesn't carry dead
+    // state. Swallow errors — the sweep is purely opportunistic.
+    sweep_idempotency_best_effort(
+        idempotency_ctx.as_ref(),
+        state_store.as_ref(),
+        &rocky_cfg.state.idempotency,
+    )
+    .await;
+
     // Upload state to remote storage
     if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
         warn!(error = %e, "state upload failed");
@@ -2300,6 +2593,13 @@ pub async fn run(
         started_at,
         &config_hash,
     );
+    finalize_idempotency(
+        idempotency_ctx.as_ref(),
+        state_store.as_ref(),
+        &run_id,
+        &output,
+    )
+    .await;
 
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
@@ -3963,6 +4263,9 @@ mod tests {
         let output = RunOutput {
             version: "1.0.2".into(),
             command: "run".into(),
+            status: rocky_core::state::RunStatus::Success,
+            skipped_by_run_id: None,
+            idempotency_key: None,
             pipeline_type: None,
             filter: "tenant=acme".into(),
             duration_ms: 100,

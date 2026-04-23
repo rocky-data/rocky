@@ -21,6 +21,8 @@ fn status_str(status: &RunStatus) -> &'static str {
         RunStatus::Success => "success",
         RunStatus::PartialFailure => "partial_failure",
         RunStatus::Failure => "failure",
+        RunStatus::SkippedIdempotent => "skipped_idempotent",
+        RunStatus::SkippedInFlight => "skipped_in_flight",
     }
 }
 

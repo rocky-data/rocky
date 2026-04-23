@@ -273,6 +273,10 @@ export type Dialect = "databricks" | "snowflake" | "bigquery" | "duckdb";
  */
 export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
 /**
+ * Policy controlling which terminal outcomes count for [`IdempotencyConfig::dedup_on`].
+ */
+export type DedupPolicy = "success" | "any";
+/**
  * Policy applied when state upload fails after retries + circuit-breaker are exhausted. See [`StateConfig::on_upload_failure`].
  */
 export type StateUploadFailureMode = "skip" | "fail";
@@ -1196,6 +1200,10 @@ export interface StateConfig {
    */
   gcs_prefix?: string | null;
   /**
+   * Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
+   */
+  idempotency?: IdempotencyConfig;
+  /**
    * What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
    */
   on_upload_failure?: StateUploadFailureMode & string;
@@ -1223,4 +1231,23 @@ export interface StateConfig {
    * Valkey/Redis URL for state persistence
    */
   valkey_url?: string | null;
+}
+/**
+ * Config for `rocky run --idempotency-key` dedup.
+ *
+ * All fields are optional with sensible defaults. Block is present even when the user doesn't set `--idempotency-key`; it's a no-op in that case.
+ */
+export interface IdempotencyConfig {
+  /**
+   * Which terminal statuses count as "already processed" for dedup. See [`DedupPolicy`]. Default [`DedupPolicy::Success`].
+   */
+  dedup_on?: DedupPolicy & string;
+  /**
+   * Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them.
+   */
+  in_flight_ttl_hours?: number;
+  /**
+   * Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.
+   */
+  retention_days?: number;
 }

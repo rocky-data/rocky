@@ -939,6 +939,7 @@ class RockyResource(dg.ConfigurableResource):
         lookback: int | None = None,
         parallel: int | None = None,
         shadow_suffix: str | None = None,
+        idempotency_key: str | None = None,
     ) -> RunResult:
         """Run ``rocky run --filter <key=value>`` and return the parsed result.
 
@@ -972,6 +973,22 @@ class RockyResource(dg.ConfigurableResource):
             shadow_suffix: When set, enables shadow mode and uses the given
                 suffix for shadow table names (e.g. ``"_dagster_pr_42"``).
                 Typically derived from :func:`.branch_deploy.branch_deploy_shadow_suffix`.
+            idempotency_key: Caller-supplied opaque key used to dedup this
+                run against prior runs with the same key. If a prior run with
+                this key completed successfully, this call returns a
+                :class:`RunResult` with ``status = "skipped_idempotent"`` and
+                ``skipped_by_run_id`` set to the prior ``run_id``; no rocky
+                subprocess work is performed beyond the short-circuit
+                output. If another caller currently holds the key's
+                in-flight claim, exits with ``status = "skipped_in_flight"``.
+
+                Defense-in-depth below Dagster's ``run_key`` — catches pod
+                retries, Kafka re-delivery, webhook duplicates, cron races.
+                Works on state backends ``local``, ``valkey``, ``tiered``,
+                ``s3``, and ``gcs``.
+
+                ⚠️ Keys are stored verbatim in the state store; do NOT put
+                secrets in idempotency keys.
         """
         args = self._build_run_args(
             filter,
@@ -986,6 +1003,7 @@ class RockyResource(dg.ConfigurableResource):
             lookback=lookback,
             parallel=parallel,
             shadow_suffix=shadow_suffix,
+            idempotency_key=idempotency_key,
         )
         return _parse_rocky_json(
             self._run_rocky(args, allow_partial=True), RunResult, command="run"
@@ -1006,6 +1024,7 @@ class RockyResource(dg.ConfigurableResource):
         lookback: int | None = None,
         parallel: int | None = None,
         shadow_suffix: str | None = None,
+        idempotency_key: str | None = None,
     ) -> RunResult:
         """``rocky run`` with live stderr streaming to ``context.log``.
 
@@ -1061,6 +1080,7 @@ class RockyResource(dg.ConfigurableResource):
             lookback=lookback,
             parallel=parallel,
             shadow_suffix=shadow_suffix,
+            idempotency_key=idempotency_key,
         )
         return _parse_rocky_json(
             self._run_rocky_streaming(args, context, allow_partial=True),
@@ -1083,6 +1103,7 @@ class RockyResource(dg.ConfigurableResource):
         lookback: int | None,
         parallel: int | None,
         shadow_suffix: str | None = None,
+        idempotency_key: str | None = None,
     ) -> list[str]:
         """Shared argv builder used by :meth:`run`, :meth:`run_streaming`, and :meth:`run_pipes`.
 
@@ -1114,6 +1135,8 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--lookback", str(lookback)])
         if parallel is not None:
             args.extend(["--parallel", str(parallel)])
+        if idempotency_key is not None:
+            args.extend(["--idempotency-key", idempotency_key])
         return args
 
     def run_pipes(
@@ -1131,6 +1154,7 @@ class RockyResource(dg.ConfigurableResource):
         lookback: int | None = None,
         parallel: int | None = None,
         shadow_suffix: str | None = None,
+        idempotency_key: str | None = None,
         pipes_client: dg.PipesSubprocessClient | None = None,
         asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
         include_keys: set[dg.AssetKey] | None = None,
@@ -1223,6 +1247,7 @@ class RockyResource(dg.ConfigurableResource):
             lookback=lookback,
             parallel=parallel,
             shadow_suffix=shadow_suffix,
+            idempotency_key=idempotency_key,
         )
         if pipes_client is not None:
             client = pipes_client

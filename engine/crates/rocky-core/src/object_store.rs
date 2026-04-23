@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{ClientOptions, ObjectStore, path::Path as ObjectPath};
+use object_store::{ClientOptions, ObjectStore, PutMode, PutOptions, path::Path as ObjectPath};
 use thiserror::Error;
 use tracing::debug;
 
@@ -71,6 +71,21 @@ pub enum ObjectStoreError {
 
 /// Result type for object store operations.
 pub type ObjectStoreResult<T> = Result<T, ObjectStoreError>;
+
+/// Outcome of [`ObjectStoreProvider::put_if_not_exists`].
+///
+/// The backend's atomic "create-if-absent" primitive returns `Created` on a
+/// successful write and `AlreadyExists` when another writer got there first
+/// (S3 412 `PreconditionFailed` / GCS 412 `preconditionFailed` / local
+/// filesystem `EEXIST`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutIfNotExistsOutcome {
+    /// The object was written. Caller has exclusive claim on the key.
+    Created,
+    /// The object already existed; no bytes were written. Caller should
+    /// read the existing object to resolve the conflict.
+    AlreadyExists,
+}
 
 /// Wraps an [`ObjectStore`] with a root path, providing a simple async API for
 /// reading and writing objects.
@@ -204,6 +219,45 @@ impl ObjectStoreProvider {
         Ok(())
     }
 
+    /// Write bytes only if the object does not yet exist.
+    ///
+    /// Uses [`PutMode::Create`], which maps to:
+    /// - S3: `If-None-Match: "*"` on `PutObject` (available since Nov 2024).
+    /// - GCS: `x-goog-if-generation-match: 0` precondition.
+    /// - Local filesystem: `O_CREAT | O_EXCL` open.
+    /// - Memory: atomic check inside the in-memory map.
+    ///
+    /// Returns [`PutIfNotExistsOutcome::Created`] on a successful claim or
+    /// [`PutIfNotExistsOutcome::AlreadyExists`] when the backend refuses the
+    /// write because the object is already present. Other errors propagate
+    /// through [`ObjectStoreError::Backend`].
+    ///
+    /// This is the atomic primitive backing `rocky run --idempotency-key` on
+    /// `s3`-only and `gcs`-only state backends (FR-004 Phase 2 / Phase 3).
+    pub async fn put_if_not_exists(
+        &self,
+        relative_path: &str,
+        data: Bytes,
+    ) -> ObjectStoreResult<PutIfNotExistsOutcome> {
+        let path = self.absolute_path(relative_path);
+        debug!(
+            path = %path,
+            size = data.len(),
+            "object_store put_if_not_exists"
+        );
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(&path, data.into(), opts).await {
+            Ok(_) => Ok(PutIfNotExistsOutcome::Created),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                Ok(PutIfNotExistsOutcome::AlreadyExists)
+            }
+            Err(e) => Err(ObjectStoreError::Backend(e)),
+        }
+    }
+
     /// Upload a local file to the object store.
     pub async fn upload_file(
         &self,
@@ -309,6 +363,35 @@ mod tests {
         assert!(provider.exists("k").await.unwrap());
         provider.delete("k").await.unwrap();
         assert!(!provider.exists("k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_put_if_not_exists_first_call_creates() {
+        let provider = ObjectStoreProvider::in_memory();
+        let outcome = provider
+            .put_if_not_exists("claim-key", Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PutIfNotExistsOutcome::Created);
+        let stored = provider.get("claim-key").await.unwrap();
+        assert_eq!(stored.as_ref(), b"first");
+    }
+
+    #[tokio::test]
+    async fn test_put_if_not_exists_second_call_reports_existing() {
+        let provider = ObjectStoreProvider::in_memory();
+        provider
+            .put_if_not_exists("claim-key", Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let outcome = provider
+            .put_if_not_exists("claim-key", Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PutIfNotExistsOutcome::AlreadyExists);
+        // Original value preserved — second call was a no-op.
+        let stored = provider.get("claim-key").await.unwrap();
+        assert_eq!(stored.as_ref(), b"first");
     }
 
     #[tokio::test]
