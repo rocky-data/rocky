@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Success-path idempotency finalize for non-replication dispatches (FR-004 F2).** A `rocky run --idempotency-key K` against a Transformation / Quality / Snapshot / Load pipeline successfully returned `Ok(())` but left the `InFlight` claim in place — the four non-replication dispatch arms returned directly from `run()` without calling `finalize_idempotency`, and the error-path wrapper from [#237](https://github.com/rocky-data/rocky/pull/237) only fires on `is_err()`. A retry with the same key inside `in_flight_ttl_hours` (default 24h) then returned `skipped_in_flight` for up to 24h instead of `skipped_idempotent`. Each of the four arms now stamps `Succeeded` on its happy-path exit via a new `finalize_idempotency_on_success` helper; the one-shot `.take()` on the shared `IdempotencyCtx` keeps the error-path wrapper a no-op when the success path already drained. Replication was never affected — it already finalized correctly at its main exit in [#235](https://github.com/rocky-data/rocky/pull/235).
+
 ### Changed
 
 - **CLI and LSP state-path unification.** The CLI's `--state-path` default (previously `.rocky-state.redb` in CWD) now resolves through the new `rocky_core::state::resolve_state_path` helper, matching the LSP's `<models>/.rocky-state.redb` convention. Fresh projects land on the canonical `<models>/.rocky-state.redb` path; existing users with a CWD state file keep working and see a one-time deprecation warning on stderr pointing at the migration path. The inlay-hint cache-hit path (PR #228) and the schema-cache write tap (PR #230) now observe the same state file end-to-end — the known follow-up called out in the 1.14.0 release notes. Passing `--state-path` explicitly remains a hard override. Behaviour when both `<models>/.rocky-state.redb` and a legacy CWD state file exist: CWD wins (to preserve existing watermarks / branches / partitions) and a louder warning asks you to reconcile. Merge is lossy, so delete one copy to silence the warning.

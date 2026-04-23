@@ -572,6 +572,79 @@ async fn finalize_idempotency_on_error(
     }
 }
 
+/// Finalize the idempotency entry as `Succeeded` on the happy-path exit of
+/// a non-replication dispatch arm (Transformation / Quality / Snapshot /
+/// Load), which returns early from [`run`] without touching the replication
+/// path's `finalize_idempotency` site.
+///
+/// Without this, a successful run of one of those four arms leaves its
+/// `InFlight` stamp in place — the outer error-path wrapper only fires when
+/// the body returns `Err`. The next retry of the same key then returns
+/// `skipped_in_flight` for up to `in_flight_ttl_hours` (default 24h), the
+/// exact latent-landmine behaviour the F1 wrapper closed for the error
+/// path. FR-004 F2.
+///
+/// Opens its own `StateStore` because the four dispatch arms delegate to
+/// helpers in `run_local.rs` / `load.rs` that don't thread the claim's
+/// state store back out. The claim and this finalize both target the
+/// canonical `state_path` owned by `run()`, so stamping here matches the
+/// claim's location exactly.
+///
+/// Best-effort throughout — any error here is swallowed with `warn!` so a
+/// successful pipeline run never exits non-zero due to bookkeeping flake.
+/// One-shot via `.take()` so the outer error-path wrapper is a no-op after
+/// this call, mirroring [`finalize_idempotency`]'s contract.
+async fn finalize_idempotency_on_success(
+    ctx_slot: &mut Option<IdempotencyCtx>,
+    state_path: &Path,
+    run_id: &str,
+) {
+    use rocky_core::idempotency::{FinalOutcome, IdempotencyBackend};
+    let Some(ctx) = ctx_slot.take() else {
+        return;
+    };
+    // Local + mirrored Tiered need an open state store; pure Valkey /
+    // object-store backends finalize through the backend itself.
+    let state_store = match ctx.backend {
+        IdempotencyBackend::Local
+        | IdempotencyBackend::Valkey {
+            mirror_to_redb: true,
+            ..
+        } => match StateStore::open(state_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    idempotency_key = %ctx.key,
+                    run_id = run_id,
+                    "failed to open state store to stamp idempotency success; \
+                     key may remain InFlight until TTL sweep"
+                );
+                return;
+            }
+        },
+        _ => None,
+    };
+    if let Err(e) = ctx
+        .backend
+        .finalize(
+            state_store.as_ref(),
+            &ctx.key,
+            run_id,
+            FinalOutcome::Succeeded,
+            &ctx.config,
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            idempotency_key = %ctx.key,
+            run_id = run_id,
+            "failed to stamp idempotency success; key may remain InFlight until TTL sweep"
+        );
+    }
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run")]
@@ -808,9 +881,20 @@ pub async fn run(
 
     // Dispatch by pipeline type. Non-replication types have their own
     // execution paths and don't fall through to the replication logic below.
+    //
+    // Idempotency finalize: each non-replication arm stamps `Succeeded` on
+    // its happy-path exit via `finalize_idempotency_on_success`. We can't
+    // thread the claim into `run_local::run_*` / `load::run_load` without
+    // restructuring those four public entry points, so we stamp at the
+    // dispatch site after the delegated call returns `Ok(())`. The one-
+    // shot `.take()` on the ctx means the outer `run_result.is_err()`
+    // wrapper below is a no-op on the happy path — same invariant #237
+    // established for `finalize_idempotency`. On delegated `Err`, the
+    // `?` propagates out of the async block and the wrapper releases the
+    // `InFlight` stamp. FR-004 F2.
     match pipeline_config {
         rocky_core::config::PipelineConfig::Transformation(t) => {
-            return super::run_local::run_transformation(
+            super::run_local::run_transformation(
                 config_path,
                 t,
                 &rocky_cfg,
@@ -818,20 +902,26 @@ pub async fn run(
                 partition_opts,
                 &schema_cache_cfg,
             )
-            .await;
+            .await?;
+            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
+            return Ok(());
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
-            return super::run_local::run_quality(config_path, q, &rocky_cfg, output_json).await;
+            super::run_local::run_quality(config_path, q, &rocky_cfg, output_json).await?;
+            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
+            return Ok(());
         }
         rocky_core::config::PipelineConfig::Snapshot(s) => {
-            return super::run_local::run_snapshot(config_path, s, &rocky_cfg, output_json).await;
+            super::run_local::run_snapshot(config_path, s, &rocky_cfg, output_json).await?;
+            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
+            return Ok(());
         }
         rocky_core::config::PipelineConfig::Replication(_) => {}
         rocky_core::config::PipelineConfig::Load(_) => {
             // Delegate to the `rocky load` command, driving with the pipeline's
             // own source_dir/format/target. This lets `rocky run --pipeline X`
             // work uniformly across all pipeline types.
-            return super::load::run_load(
+            super::load::run_load(
                 config_path,
                 None, // cli_source_dir — take from config
                 None, // format — take from config
@@ -840,7 +930,9 @@ pub async fn run(
                 false, // truncate — honour config only
                 output_json,
             )
-            .await;
+            .await?;
+            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
+            return Ok(());
         }
     }
 
@@ -4625,5 +4717,107 @@ mod tests {
         // Second call is a no-op — no panic, ctx remains None.
         finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output).await;
         assert!(ctx_slot.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // FR-004 F2 — success-path idempotency finalize for non-replication
+    // dispatch arms.
+    //
+    // The four non-replication arms (Transformation, Quality, Snapshot,
+    // Load) delegate to helpers in `run_local.rs` / `load.rs` that don't
+    // receive or produce an `IdempotencyCtx`. Before F2, those arms
+    // returned `Ok(())` directly from their dispatch branch — the happy
+    // path never called `finalize_idempotency`, and the error-path
+    // wrapper's `is_err()` check skipped it. The `InFlight` stamp then
+    // lingered until the 24h `in_flight_ttl_hours` sweep reaped it, and
+    // a retry with the same key inside that window returned
+    // `skipped_in_flight` instead of proceeding — the exact latent
+    // landmine #237 closed for the error path.
+    //
+    // This test drives `run()` end-to-end against a transformation
+    // pipeline and confirms the redb entry is `Succeeded`, not
+    // `InFlight`, after a successful run. Transformation is the cleanest
+    // of the four arms to exercise — a transformation pipeline with a
+    // missing models directory succeeds trivially without needing live
+    // adapter credentials, DDL, or warehouse mocks. Without the F2 fix,
+    // the `Succeeded` assertion fails because the entry is still
+    // `InFlight`.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn transformation_success_stamps_idempotency_succeeded_not_inflight() {
+        use rocky_core::idempotency::IdempotencyState;
+        use rocky_core::state::StateStore;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let config_path = config_dir.join("rocky.toml");
+        // Transformation pipeline with a non-existent models dir.
+        // `run_transformation` warns and returns `Ok(())` — perfect for
+        // exercising the happy-path dispatch without needing warehouse
+        // state beyond an in-memory DuckDB handle.
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[state]
+backend = "local"
+
+[pipeline.t]
+type = "transformation"
+models = "models_nonexistent/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .expect("write rocky.toml");
+
+        let state_path = config_dir.join("state.redb");
+
+        let key = "fr-004-f2-transformation-success";
+        let opts = PartitionRunOptions::default();
+
+        // Drive `run()` end-to-end. With `--idempotency-key`, the claim
+        // stamps InFlight before dispatch, then the Transformation arm
+        // returns Ok(()) and (post-F2) fires `finalize_idempotency_on_success`.
+        super::run(
+            &config_path,
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            Some(key),
+        )
+        .await
+        .expect("transformation run should succeed");
+
+        // Post-condition: the idempotency entry exists and is `Succeeded`.
+        // Pre-F2 this fails because the entry is still `InFlight` — the
+        // success-path never called finalize, and the error-path wrapper
+        // is a no-op when the body returned `Ok`.
+        let store = StateStore::open(&state_path).expect("reopen state store");
+        let entry = store
+            .idempotency_get(key)
+            .expect("get idempotency entry")
+            .expect("entry present — claim should have stamped it");
+        assert_eq!(
+            entry.state,
+            IdempotencyState::Succeeded,
+            "success-path finalize on the Transformation dispatch arm must stamp \
+             Succeeded, not leave the InFlight claim for the TTL sweep to reap \
+             (FR-004 F2 regression guard)"
+        );
     }
 }
