@@ -803,6 +803,27 @@ enum Command {
         model: Option<String>,
     },
 
+    /// Report per-model data retention configuration.
+    ///
+    /// Walks the compiled model set and reports each model's declared
+    /// `retention = "<N>[dy]"` value (or `null` when unset). Use
+    /// `--model <name>` to scope. `--drift` is accepted for forward
+    /// compatibility but is a v2 feature — today it filters to models
+    /// with a declared policy and leaves `warehouse_days` null.
+    RetentionStatus {
+        /// Models directory (defaults to `models/` relative to rocky.toml)
+        #[arg(long)]
+        models: Option<PathBuf>,
+        /// Scope the report to a single model by name
+        #[arg(long)]
+        model: Option<String>,
+        /// Probe the warehouse for the currently-applied retention
+        /// (stretch: deferred to v2 — today this filters to configured
+        /// models but does not fill `warehouse_days`).
+        #[arg(long)]
+        drift: bool,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -1657,6 +1678,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::Cost { target, model } => {
             rocky_cli::commands::run_cost(&state_path, &cli.config, &target, model.as_deref(), json)
+        }
+        Command::RetentionStatus {
+            models,
+            model,
+            drift,
+        } => {
+            let models_dir = models.unwrap_or_else(|| PathBuf::from("models"));
+            rocky_cli::commands::run_retention_status(&models_dir, model.as_deref(), drift, json)
         }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),

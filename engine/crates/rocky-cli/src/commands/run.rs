@@ -2780,9 +2780,6 @@ pub async fn run(
             if let Ok(gov_compile) = governance_compile {
                 let tag_to_strategy = rocky_cfg.resolve_mask_for_env(None);
                 for model in &gov_compile.project.models {
-                    if model.config.classification.is_empty() {
-                        continue;
-                    }
                     let plan = model.to_plan();
                     let table_ref = TableRef {
                         catalog: plan.target.catalog.clone(),
@@ -2790,40 +2787,65 @@ pub async fn run(
                         table: plan.target.table.clone(),
                     };
 
-                    let mut column_tags: BTreeMap<String, BTreeMap<String, String>> =
-                        BTreeMap::new();
-                    for (col, tag) in &model.config.classification {
-                        let mut m = BTreeMap::new();
-                        m.insert("classification".to_string(), tag.clone());
-                        column_tags.insert(col.clone(), m);
-                    }
-                    if let Err(e) = governance_adapter
-                        .apply_column_tags(&table_ref, &column_tags)
-                        .await
-                    {
-                        warn!(
-                            model = %model.config.name,
-                            error = %e,
-                            "apply column classification tags failed"
-                        );
-                    }
-
-                    let mut column_strategies: BTreeMap<String, MaskStrategy> = BTreeMap::new();
-                    for (col, tag) in &model.config.classification {
-                        if let Some(strategy) = tag_to_strategy.get(tag) {
-                            column_strategies.insert(col.clone(), *strategy);
+                    // --- Classification tags + masking (Wave A) ---
+                    if !model.config.classification.is_empty() {
+                        let mut column_tags: BTreeMap<String, BTreeMap<String, String>> =
+                            BTreeMap::new();
+                        for (col, tag) in &model.config.classification {
+                            let mut m = BTreeMap::new();
+                            m.insert("classification".to_string(), tag.clone());
+                            column_tags.insert(col.clone(), m);
                         }
-                    }
-                    if !column_strategies.is_empty() {
-                        let policy = MaskingPolicy { column_strategies };
                         if let Err(e) = governance_adapter
-                            .apply_masking_policy(&table_ref, &policy, "default")
+                            .apply_column_tags(&table_ref, &column_tags)
                             .await
                         {
                             warn!(
                                 model = %model.config.name,
                                 error = %e,
-                                "apply column masking policy failed"
+                                "apply column classification tags failed"
+                            );
+                        }
+
+                        let mut column_strategies: BTreeMap<String, MaskStrategy> =
+                            BTreeMap::new();
+                        for (col, tag) in &model.config.classification {
+                            if let Some(strategy) = tag_to_strategy.get(tag) {
+                                column_strategies.insert(col.clone(), *strategy);
+                            }
+                        }
+                        if !column_strategies.is_empty() {
+                            let policy = MaskingPolicy { column_strategies };
+                            if let Err(e) = governance_adapter
+                                .apply_masking_policy(&table_ref, &policy, "default")
+                                .await
+                            {
+                                warn!(
+                                    model = %model.config.name,
+                                    error = %e,
+                                    "apply column masking policy failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // --- Data retention policy (Wave C-2) ---
+                    //
+                    // Sidecar `retention = "<N>[dy]"` resolved to a typed
+                    // RetentionPolicy at parse time. Forward to the
+                    // governance adapter; best-effort — failure warns
+                    // but does not abort the run, matching the
+                    // classification/masking contract above.
+                    if let Some(retention) = model.config.retention {
+                        if let Err(e) = governance_adapter
+                            .apply_retention_policy(&table_ref, &retention)
+                            .await
+                        {
+                            warn!(
+                                model = %model.config.name,
+                                duration_days = retention.duration_days,
+                                error = %e,
+                                "apply retention policy failed"
                             );
                         }
                     }
