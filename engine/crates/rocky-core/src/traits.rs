@@ -644,6 +644,36 @@ pub trait GovernanceAdapter: Send + Sync {
             "apply_masking_policy not supported by this adapter",
         ))
     }
+
+    /// Reconcile a flattened role graph against the warehouse's native
+    /// role/group system.
+    ///
+    /// `roles` is the post-[`crate::role_graph::flatten_role_graph`]
+    /// map: each [`crate::ir::ResolvedRole`] carries its own permissions
+    /// plus every transitive ancestor's, deduped and sorted. Adapters
+    /// translate this into warehouse-specific primitives — on
+    /// Databricks / Unity Catalog that means a group per role
+    /// (convention: `rocky_role_<name>`) plus GRANT statements bound to
+    /// the group; on Snowflake it would be `CREATE ROLE` + per-role
+    /// GRANTs.
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError` to match the other
+    /// optional capabilities (`apply_column_tags`,
+    /// `apply_masking_policy`). [`NoopGovernanceAdapter`] overrides to
+    /// `Ok(())` so pipelines with a `[role.*]` block against a
+    /// no-governance warehouse degrade gracefully — the resolver itself
+    /// still catches cycles at config-load time, the adapter just skips
+    /// the no-op application.
+    async fn reconcile_role_graph(
+        &self,
+        _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::msg(
+            "reconcile_role_graph not supported by this adapter",
+        ))
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -727,6 +757,17 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
         _env: &str,
     ) -> AdapterResult<()> {
         // Same rationale as `apply_column_tags`.
+        Ok(())
+    }
+
+    async fn reconcile_role_graph(
+        &self,
+        _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+    ) -> AdapterResult<()> {
+        // Same rationale as `apply_column_tags` / `apply_masking_policy`:
+        // a no-governance warehouse silently accepts role-graph config so
+        // pipelines downgrade gracefully. Cycle / unknown-parent errors
+        // still surface at config-load time via flatten_role_graph.
         Ok(())
     }
 }
@@ -931,6 +972,21 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn trait_default_reconcile_role_graph_errors() {
+        let err = MinimalGovernance
+            .reconcile_role_graph(&BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reconcile_role_graph"));
+    }
+
+    #[tokio::test]
+    async fn noop_governance_accepts_role_graph() {
+        let noop = NoopGovernanceAdapter;
+        assert!(noop.reconcile_role_graph(&BTreeMap::new()).await.is_ok());
     }
 
     #[test]

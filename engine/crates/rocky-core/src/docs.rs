@@ -713,6 +713,7 @@ mod tests {
             cache: Default::default(),
             mask: Default::default(),
             classifications: Default::default(),
+            roles: Default::default(),
         };
 
         let models = vec![
@@ -789,6 +790,7 @@ mod tests {
             cache: Default::default(),
             mask: Default::default(),
             classifications: Default::default(),
+            roles: Default::default(),
         };
 
         let models = vec![Model {
@@ -860,6 +862,7 @@ mod tests {
             cache: Default::default(),
             mask: Default::default(),
             classifications: Default::default(),
+            roles: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);

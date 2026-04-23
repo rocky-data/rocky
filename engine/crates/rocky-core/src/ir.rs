@@ -315,7 +315,12 @@ pub struct Grant {
 }
 
 /// Databricks permissions that Rocky manages.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+///
+/// `Ord` / `PartialOrd` are derived so that callers which need a
+/// deterministic enumeration (e.g. [`crate::role_graph::flatten_role_graph`]
+/// collecting permissions into a `BTreeSet`) get a stable ordering keyed by
+/// the declaration order below, independent of input traversal order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
     Browse,
     UseCatalog,
@@ -338,6 +343,41 @@ impl std::fmt::Display for Permission {
     }
 }
 
+impl std::str::FromStr for Permission {
+    type Err = UnknownPermission;
+
+    /// Parse one of the managed Rocky permissions from its canonical
+    /// uppercase spelling (`"SELECT"`, `"USE CATALOG"`, ...).
+    ///
+    /// Unknown strings return [`UnknownPermission`] so callers can surface
+    /// a typed error (e.g. [`crate::role_graph::RoleGraphError::UnknownPermission`])
+    /// rather than silently skipping the entry.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "BROWSE" => Ok(Permission::Browse),
+            "USE CATALOG" => Ok(Permission::UseCatalog),
+            "USE SCHEMA" => Ok(Permission::UseSchema),
+            "SELECT" => Ok(Permission::Select),
+            "MODIFY" => Ok(Permission::Modify),
+            "MANAGE" => Ok(Permission::Manage),
+            other => Err(UnknownPermission(other.to_string())),
+        }
+    }
+}
+
+/// Error returned by [`Permission`]'s `FromStr` impl when the input string
+/// isn't one of the managed permissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPermission(pub String);
+
+impl std::fmt::Display for UnknownPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown permission: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownPermission {}
+
 /// Target of a GRANT/REVOKE statement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum GrantTarget {
@@ -350,6 +390,27 @@ pub enum GrantTarget {
 pub struct PermissionDiff {
     pub grants_to_add: Vec<Grant>,
     pub grants_to_revoke: Vec<Grant>,
+}
+
+/// A role with its fully flattened permission set, after walking the
+/// `inherits` DAG and deduplicating.
+///
+/// Produced by [`crate::role_graph::flatten_role_graph`] and consumed by
+/// [`crate::traits::GovernanceAdapter::reconcile_role_graph`]. The
+/// `flattened_permissions` list is deterministically sorted via
+/// [`Permission`]'s `Ord` impl so adapter-level SQL generation is stable
+/// across runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRole {
+    /// Role name, matching the key in the owning `BTreeMap`.
+    pub name: String,
+    /// Union of the role's own permissions and every ancestor's
+    /// permissions, deduplicated and sorted.
+    pub flattened_permissions: Vec<Permission>,
+    /// Immediate parents declared via the role's `inherits` list,
+    /// preserved verbatim for audit/debug reporting — **not** the full
+    /// transitive closure.
+    pub inherits_from: Vec<String>,
 }
 
 #[cfg(test)]

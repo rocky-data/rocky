@@ -577,6 +577,7 @@ mod tests {
             cache: Default::default(),
             mask: Default::default(),
             classifications: Default::default(),
+            roles: Default::default(),
         }
     }
 
