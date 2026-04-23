@@ -164,3 +164,12 @@ export type { BranchDeleteOutput } from "./branch_delete";
 
 // Replay (inspection-only run record)
 export type { ReplayOutput, ReplayModelOutput } from "./replay";
+
+// Compliance — governance rollup over classification + masking policy
+export type {
+  ColumnClassificationStatus,
+  ComplianceException,
+  ComplianceOutput,
+  ComplianceSummary,
+  EnvMaskingStatus,
+} from "./compliance";
