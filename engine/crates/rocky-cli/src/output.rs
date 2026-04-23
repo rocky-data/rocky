@@ -996,6 +996,14 @@ pub struct ModelHistoryOutput {
 
 /// One run from the state store, mirroring `rocky_core::state::RunRecord`
 /// with serializable field types (no enums or non-JSON-friendly Rust types).
+///
+/// The governance audit fields (`triggering_identity`, `session_source`,
+/// `git_commit`, `git_branch`, `idempotency_key`, `target_catalog`,
+/// `hostname`, `rocky_version`) are only populated in the
+/// `rocky history --audit` shape; the default shape continues to emit
+/// just the existing 7 fields. The `#[serde(skip_serializing_if = "…")]`
+/// attributes keep the default payload byte-identical to schema v5
+/// unless `--audit` flips the fields on.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct RunHistoryRecord {
     pub run_id: String,
@@ -1007,6 +1015,40 @@ pub struct RunHistoryRecord {
     pub duration_ms: u64,
     /// Per-model execution details for this run.
     pub models: Vec<RunModelRecord>,
+
+    // --- Governance audit trail (populated only with `--audit`) ---
+    /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
+    /// `None` in CI / container contexts where no human caller is
+    /// discernible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_identity: Option<String>,
+    /// Session origin — `"cli"`, `"dagster"`, `"lsp"`, or `"http_api"`.
+    /// Emitted as the lowercase variant string so JSON consumers can
+    /// match on it without knowing the Rust enum shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_source: Option<String>,
+    /// `git rev-parse HEAD` at claim time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+    /// `git symbolic-ref --short HEAD` at claim time, or `None` on
+    /// detached HEAD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// The `--idempotency-key` value supplied to `rocky run`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Best-available target catalog — the `catalog_template` for
+    /// replication pipelines, the literal `target.catalog` for
+    /// transformation/quality/snapshot/load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_catalog: Option<String>,
+    /// Machine hostname that produced the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"`
+    /// on schema-v5 rows that predate the audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_version: Option<String>,
 }
 
 /// Per-model execution record embedded in [`RunHistoryRecord`].
@@ -1908,6 +1950,50 @@ impl ChecksConfigOutput {
     }
 }
 
+/// Governance audit-trail values threaded into
+/// [`RunOutput::to_run_record`] at run finalise time. Mirrors the 8
+/// audit fields on [`rocky_core::state::RunRecord`] (§1.4).
+///
+/// Populated once per invocation by
+/// `rocky_cli::commands::run_audit::AuditContext::detect` and then
+/// re-used for every `persist_run_record` call site (model-only
+/// happy path, interrupted, replication main exit). Re-collecting at
+/// every call site would stamp the interrupted exit path with a
+/// different `hostname` than the initial claim on a machine that
+/// changed identity mid-run — unlikely, but trivially prevented by
+/// caching the bundle up front.
+#[derive(Debug, Clone)]
+pub struct RunRecordAudit {
+    pub triggering_identity: Option<String>,
+    pub session_source: rocky_core::state::SessionSource,
+    pub git_commit: Option<String>,
+    pub git_branch: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub target_catalog: Option<String>,
+    pub hostname: String,
+    pub rocky_version: String,
+}
+
+impl RunRecordAudit {
+    /// Test-only constructor — every field set to a sentinel that
+    /// makes any field confusion in a unit test obvious. Never used
+    /// outside `#[cfg(test)]` call sites, so the `_test` suffix is an
+    /// API tripwire rather than an invariant.
+    #[cfg(test)]
+    pub fn test_sentinels() -> Self {
+        Self {
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "output-test-host".to_string(),
+            rocky_version: "0.0.0-test".to_string(),
+        }
+    }
+}
+
 impl RunOutput {
     pub fn new(filter: String, duration_ms: u64, concurrency: usize) -> Self {
         RunOutput {
@@ -2112,6 +2198,15 @@ impl RunOutput {
     /// `model_name` is derived from the last element of
     /// [`MaterializationOutput::asset_key`] to match how `rocky cost` /
     /// `rocky history` reference models.
+    ///
+    /// # Audit context
+    ///
+    /// Every `RunRecord` stamps the governance audit trail (schema v6,
+    /// §1.4) from an
+    /// [`rocky_core::state::RunRecordAudit`] bundle. Callers collect
+    /// the fields once at claim time via
+    /// `rocky_cli::commands::run_audit::AuditContext::detect`.
+    #[allow(clippy::too_many_arguments)]
     pub fn to_run_record(
         &self,
         run_id: &str,
@@ -2120,6 +2215,7 @@ impl RunOutput {
         config_hash: String,
         trigger: rocky_core::state::RunTrigger,
         status: rocky_core::state::RunStatus,
+        audit: RunRecordAudit,
     ) -> rocky_core::state::RunRecord {
         let mut models = Vec::with_capacity(self.materializations.len() + self.errors.len());
 
@@ -2173,6 +2269,14 @@ impl RunOutput {
             models_executed: models,
             trigger,
             config_hash,
+            triggering_identity: audit.triggering_identity,
+            session_source: audit.session_source,
+            git_commit: audit.git_commit,
+            git_branch: audit.git_branch,
+            idempotency_key: audit.idempotency_key,
+            target_catalog: audit.target_catalog,
+            hostname: audit.hostname,
+            rocky_version: audit.rocky_version,
         }
     }
 
@@ -2587,6 +2691,7 @@ mod run_record_tests {
             "cfghash".to_string(),
             RunTrigger::Manual,
             RunStatus::Success,
+            RunRecordAudit::test_sentinels(),
         );
 
         assert_eq!(record.run_id, "run-test-1");
@@ -2640,6 +2745,7 @@ mod run_record_tests {
             String::new(),
             RunTrigger::Manual,
             out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
         );
 
         assert_eq!(record.models_executed.len(), 2);

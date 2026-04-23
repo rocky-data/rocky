@@ -87,7 +87,21 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 /// Increment this constant whenever a table is added, removed, or structurally
 /// changed in a way that is incompatible with an older binary. Rocky will
 /// refuse to open a database whose stored version exceeds this value.
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+///
+/// # Version history
+///
+/// - **v5** — idempotency keys table; pre-audit `RunRecord` shape
+///   (run_id / started_at / finished_at / status / models_executed /
+///   trigger / config_hash).
+/// - **v6** — adds the 8-field governance audit trail to
+///   [`RunRecord`] (`triggering_identity`, `session_source`, `git_commit`,
+///   `git_branch`, `idempotency_key`, `target_catalog`, `hostname`,
+///   `rocky_version`). v5 records forward-deserialize as v6 via
+///   `#[serde(default)]` on each new field — no in-place blob rewrite
+///   is required. See the `RunRecord` docs for the default-value
+///   contract (`hostname = "unknown"`, `rocky_version = "<pre-audit>"`,
+///   `session_source = Cli`).
+const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -549,6 +563,50 @@ pub enum RunTrigger {
     Ci,
 }
 
+/// Where the `rocky` invocation originated — the calling surface that
+/// spawned the process.
+///
+/// Stamped on every [`RunRecord`] at claim time for the governance audit
+/// trail (§1.4 item 2). The CLI derives it from the environment:
+///
+/// - [`SessionSource::Dagster`] — `DAGSTER_PIPES_CONTEXT` is set (Dagster's
+///   Pipes protocol populates this when a Pipes client launches the
+///   subprocess — whether or not the binary emits Pipes messages back).
+/// - [`SessionSource::HttpApi`] — `ROCKY_SESSION_SOURCE=http_api` is set
+///   (an HTTP caller explicitly stamps itself; Rocky's server never
+///   spawns `rocky run` today, but the variant is reserved for future
+///   wiring).
+/// - [`SessionSource::Lsp`] — `ROCKY_SESSION_SOURCE=lsp` is set. Reserved
+///   for completeness; the LSP server (`rocky lsp`) handles requests
+///   in-process rather than shelling out to `rocky run`, so this is
+///   effectively unreachable today.
+/// - [`SessionSource::Cli`] — the fallback. A human / script / CI runner
+///   invoking `rocky run` directly.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSource {
+    /// Direct invocation — shell, script, or CI runner.
+    Cli,
+    /// Dagster Pipes / subprocess client launched the process.
+    Dagster,
+    /// LSP server invoked the run. Reserved; see enum-level docs.
+    Lsp,
+    /// HTTP API caller stamped itself via `ROCKY_SESSION_SOURCE=http_api`.
+    HttpApi,
+}
+
+impl Default for SessionSource {
+    /// The deserialization default for `session_source` on v5→v6 records.
+    /// Pre-audit rows that predate the audit-trail field surface as
+    /// [`SessionSource::Cli`] — a safe, maximally-general choice since the
+    /// overwhelming majority of historical invocations ran via shell.
+    fn default() -> Self {
+        SessionSource::Cli
+    }
+}
+
 /// Execution record for a single model within a run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelExecution {
@@ -585,6 +643,30 @@ pub struct ModelExecution {
 }
 
 /// A complete pipeline run record.
+///
+/// # Governance audit trail (schema v6)
+///
+/// The eight `triggering_identity` / `session_source` / `git_commit` /
+/// `git_branch` / `idempotency_key` / `target_catalog` / `hostname` /
+/// `rocky_version` fields form the governance audit trail introduced in
+/// state schema v6. They are populated at claim time in
+/// `rocky_cli::commands::run::persist_run_record` via helpers in
+/// `rocky_cli::commands::run_audit`.
+///
+/// Every new field is serde-defaulted so v5 records (which lack these
+/// fields entirely) forward-deserialize cleanly:
+///
+/// - Option-typed fields default to `None`.
+/// - [`SessionSource`] defaults to [`SessionSource::Cli`].
+/// - `hostname` defaults to `"unknown"`.
+/// - `rocky_version` defaults to `"<pre-audit>"` — a sentinel so
+///   operators can tell a pre-audit row apart from a real binary that
+///   happened to read `CARGO_PKG_VERSION` as `"unknown"`.
+///
+/// The redb blob format is `serde_json::to_vec(&record)`, so the upgrade
+/// is zero-touch at the storage layer: no in-place migration, no blob
+/// walk. A `test_v5_run_record_forward_deserializes_with_defaults` guard
+/// in this file pins the contract.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
@@ -594,6 +676,72 @@ pub struct RunRecord {
     pub models_executed: Vec<ModelExecution>,
     pub trigger: RunTrigger,
     pub config_hash: String,
+
+    // --- Governance audit trail (schema v6 — §1.4) ---
+    /// Best-effort caller identity. `$USER` on Unix, `%USERNAME%` on
+    /// Windows; `None` in CI/containers without a clear human caller.
+    /// SSO `sub` claim extraction (Snowflake / Databricks OAuth) is a
+    /// deferred follow-up.
+    #[serde(default)]
+    pub triggering_identity: Option<String>,
+
+    /// Where the `rocky` invocation originated (CLI / Dagster / LSP /
+    /// HTTP). See [`SessionSource`] for the derivation rules. Defaults
+    /// to [`SessionSource::Cli`] on v5 records.
+    #[serde(default)]
+    pub session_source: SessionSource,
+
+    /// `git rev-parse HEAD` at claim time. `None` when the working
+    /// directory is not a git checkout or `git` is not on PATH.
+    #[serde(default)]
+    pub git_commit: Option<String>,
+
+    /// `git symbolic-ref --short HEAD` at claim time. `None` on detached
+    /// HEAD or non-git checkouts.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+
+    /// The `--idempotency-key` value for this run, or `None` if the flag
+    /// was not supplied. When present, matches the key stamped into the
+    /// `idempotency_keys` table (PR #235).
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+
+    /// Best-available target catalog for the pipeline at claim time.
+    /// `None` when no catalog is resolvable (e.g. model-only run without
+    /// a concrete pipeline context). For templated catalogs
+    /// (`catalog_template = "{client}"`) this captures the literal
+    /// template string — per-table resolutions are already recorded on
+    /// the individual [`ModelExecution`] entries.
+    #[serde(default)]
+    pub target_catalog: Option<String>,
+
+    /// The machine that produced the run, from the `hostname` crate.
+    /// Defaults to `"unknown"` on v5 records.
+    #[serde(default = "default_hostname_sentinel")]
+    pub hostname: String,
+
+    /// Compile-time `env!("CARGO_PKG_VERSION")` of the `rocky` binary.
+    /// Defaults to `"<pre-audit>"` on v5 records — distinguishes a
+    /// pre-audit row from a future binary that reports a literal
+    /// `"unknown"` version string.
+    #[serde(default = "default_rocky_version_sentinel")]
+    pub rocky_version: String,
+}
+
+/// Default-value contract for `RunRecord.hostname` on v5→v6 upgrade.
+/// Kept as a top-level fn because `#[serde(default = "...")]` requires a
+/// function path, not a closure or const.
+fn default_hostname_sentinel() -> String {
+    "unknown".to_string()
+}
+
+/// Default-value contract for `RunRecord.rocky_version` on v5→v6
+/// upgrade. The `<…>` bracket syntax is intentionally not a valid
+/// semver string — operators inspecting `rocky history --audit` can
+/// tell a pre-audit row apart from any real binary at a glance.
+fn default_rocky_version_sentinel() -> String {
+    "<pre-audit>".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2036,15 +2184,35 @@ mod tests {
 
     // --- Run history tests ---
 
-    #[test]
-    fn test_record_and_get_run() {
-        let (store, _dir) = temp_store();
-        let run = RunRecord {
-            run_id: "run-001".to_string(),
+    /// Test-only builder for a minimal [`RunRecord`] with audit fields
+    /// zeroed to their defaults. Centralised so adding a future audit
+    /// field doesn't churn every existing test in this file.
+    fn minimal_run_record(run_id: &str, models: Vec<ModelExecution>) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
             started_at: Utc::now(),
             finished_at: Utc::now(),
             status: RunStatus::Success,
-            models_executed: vec![ModelExecution {
+            models_executed: models,
+            trigger: RunTrigger::Manual,
+            config_hash: "config-hash".to_string(),
+            triggering_identity: None,
+            session_source: SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test-host".to_string(),
+            rocky_version: "0.0.0-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_record_and_get_run() {
+        let (store, _dir) = temp_store();
+        let run = minimal_run_record(
+            "run-001",
+            vec![ModelExecution {
                 model_name: "orders".to_string(),
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
@@ -2055,9 +2223,7 @@ mod tests {
                 bytes_scanned: None,
                 bytes_written: None,
             }],
-            trigger: RunTrigger::Manual,
-            config_hash: "config-hash".to_string(),
-        };
+        );
         store.record_run(&run).unwrap();
 
         let retrieved = store.get_run("run-001").unwrap().unwrap();
@@ -2070,15 +2236,7 @@ mod tests {
     fn test_list_runs() {
         let (store, _dir) = temp_store();
         for i in 0..5 {
-            let run = RunRecord {
-                run_id: format!("run-{i:03}"),
-                started_at: Utc::now(),
-                finished_at: Utc::now(),
-                status: RunStatus::Success,
-                models_executed: vec![],
-                trigger: RunTrigger::Manual,
-                config_hash: "hash".to_string(),
-            };
+            let run = minimal_run_record(&format!("run-{i:03}"), vec![]);
             store.record_run(&run).unwrap();
         }
 
@@ -2089,12 +2247,9 @@ mod tests {
     #[test]
     fn test_get_model_history() {
         let (store, _dir) = temp_store();
-        let run = RunRecord {
-            run_id: "run-001".to_string(),
-            started_at: Utc::now(),
-            finished_at: Utc::now(),
-            status: RunStatus::Success,
-            models_executed: vec![
+        let run = minimal_run_record(
+            "run-001",
+            vec![
                 ModelExecution {
                     model_name: "orders".to_string(),
                     started_at: Utc::now(),
@@ -2118,9 +2273,7 @@ mod tests {
                     bytes_written: None,
                 },
             ],
-            trigger: RunTrigger::Manual,
-            config_hash: "hash".to_string(),
-        };
+        );
         store.record_run(&run).unwrap();
 
         let history = store.get_model_history("orders", 10).unwrap();
@@ -2132,12 +2285,9 @@ mod tests {
     fn test_get_average_duration() {
         let (store, _dir) = temp_store();
         for (i, dur) in [100u64, 200, 300].iter().enumerate() {
-            let run = RunRecord {
-                run_id: format!("run-{i}"),
-                started_at: Utc::now(),
-                finished_at: Utc::now(),
-                status: RunStatus::Success,
-                models_executed: vec![ModelExecution {
+            let run = minimal_run_record(
+                &format!("run-{i}"),
+                vec![ModelExecution {
                     model_name: "orders".to_string(),
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
@@ -2148,14 +2298,88 @@ mod tests {
                     bytes_scanned: None,
                     bytes_written: None,
                 }],
-                trigger: RunTrigger::Manual,
-                config_hash: "hash".to_string(),
-            };
+            );
             store.record_run(&run).unwrap();
         }
 
         let avg = store.get_average_duration("orders", 10).unwrap().unwrap();
         assert!((avg - 200.0).abs() < 0.01);
+    }
+
+    /// Guard the v5→v6 forward-deserialization contract: a JSON blob
+    /// written by a v5 binary (no audit fields at all) must deserialize
+    /// cleanly with every new field populated to its documented default.
+    ///
+    /// The blob shape below is the exact `serde_json::to_vec(&RunRecord)`
+    /// output of the pre-audit struct as of schema v5 — hand-crafted so
+    /// the test fails if someone accidentally drops the serde-default
+    /// on a new field, reintroducing a breaking-change in redb row
+    /// compatibility.
+    #[test]
+    fn test_v5_run_record_forward_deserializes_with_defaults() {
+        let v5_blob = br#"{
+            "run_id": "run-v5-legacy",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:05:00Z",
+            "status": "Success",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "legacy-hash"
+        }"#;
+
+        let record: RunRecord =
+            serde_json::from_slice(v5_blob).expect("v5 blob must forward-deserialize");
+
+        // Original fields preserved.
+        assert_eq!(record.run_id, "run-v5-legacy");
+        assert_eq!(record.status, RunStatus::Success);
+        assert_eq!(record.config_hash, "legacy-hash");
+
+        // Audit fields populated to documented defaults.
+        assert_eq!(record.triggering_identity, None);
+        assert_eq!(record.session_source, SessionSource::Cli);
+        assert_eq!(record.git_commit, None);
+        assert_eq!(record.git_branch, None);
+        assert_eq!(record.idempotency_key, None);
+        assert_eq!(record.target_catalog, None);
+        assert_eq!(record.hostname, "unknown");
+        assert_eq!(record.rocky_version, "<pre-audit>");
+    }
+
+    /// End-to-end variant of the forward-compat guard: write a v5 blob
+    /// directly into the `run_history` redb table (bypassing
+    /// `record_run`'s serialization), then read it back via the normal
+    /// `get_run` / `list_runs` path. Catches both the serde-level
+    /// default wiring and any downstream code path that would panic on
+    /// a missing field.
+    #[test]
+    fn test_v5_redb_row_reads_as_v6_with_defaults() {
+        let (store, _dir) = temp_store();
+        let v5_blob = br#"{
+            "run_id": "run-v5-via-redb",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:05:00Z",
+            "status": "Failure",
+            "models_executed": [],
+            "trigger": "Ci",
+            "config_hash": "legacy-via-redb"
+        }"#;
+
+        // Insert the raw v5 bytes directly into the redb table — no
+        // `record_run` roundtrip, so the blob stays byte-identical to
+        // what a v5 binary would have written.
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("run-v5-via-redb", v5_blob.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let retrieved = store.get_run("run-v5-via-redb").unwrap().unwrap();
+        assert_eq!(retrieved.hostname, "unknown");
+        assert_eq!(retrieved.rocky_version, "<pre-audit>");
+        assert!(retrieved.triggering_identity.is_none());
+        assert_eq!(retrieved.session_source, SessionSource::Cli);
     }
 
     // --- Quality metrics tests ---

@@ -2,13 +2,41 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "RunHistoryRecord": {
-      "description": "One run from the state store, mirroring `rocky_core::state::RunRecord` with serializable field types (no enums or non-JSON-friendly Rust types).",
+      "description": "One run from the state store, mirroring `rocky_core::state::RunRecord` with serializable field types (no enums or non-JSON-friendly Rust types).\n\nThe governance audit fields (`triggering_identity`, `session_source`, `git_commit`, `git_branch`, `idempotency_key`, `target_catalog`, `hostname`, `rocky_version`) are only populated in the `rocky history --audit` shape; the default shape continues to emit just the existing 7 fields. The `#[serde(skip_serializing_if = \"…\")]` attributes keep the default payload byte-identical to schema v5 unless `--audit` flips the fields on.",
       "properties": {
         "duration_ms": {
           "description": "Duration in milliseconds (`finished_at - started_at`).",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "git_branch": {
+          "description": "`git symbolic-ref --short HEAD` at claim time, or `None` on detached HEAD.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_commit": {
+          "description": "`git rev-parse HEAD` at claim time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "description": "Machine hostname that produced the run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "description": "The `--idempotency-key` value supplied to `rocky run`, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "models": {
           "description": "Per-model execution details for this run.",
@@ -22,8 +50,22 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "rocky_version": {
+          "description": "`CARGO_PKG_VERSION` of the `rocky` binary, or `\"<pre-audit>\"` on schema-v5 rows that predate the audit trail.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "run_id": {
           "type": "string"
+        },
+        "session_source": {
+          "description": "Session origin — `\"cli\"`, `\"dagster\"`, `\"lsp\"`, or `\"http_api\"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "started_at": {
           "format": "date-time",
@@ -32,8 +74,22 @@
         "status": {
           "type": "string"
         },
+        "target_catalog": {
+          "description": "Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "trigger": {
           "type": "string"
+        },
+        "triggering_identity": {
+          "description": "Resolved caller identity (Unix `$USER` / Windows `$USERNAME`). `None` in CI / container contexts where no human caller is discernible.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

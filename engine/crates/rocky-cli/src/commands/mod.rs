@@ -34,6 +34,7 @@ mod playground;
 mod profile_storage;
 mod replay;
 mod run;
+mod run_audit;
 mod run_dag_exec;
 mod run_local;
 mod seed;

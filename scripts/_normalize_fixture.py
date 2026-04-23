@@ -33,6 +33,24 @@ WALL_CLOCK_FIELDS: frozenset[str] = frozenset(
 # corpus is byte-stable across regens.
 WALL_CLOCK_ID_FIELDS: frozenset[str] = frozenset({"run_id"})
 
+# Governance audit-trail fields stamped on ``RunRecord`` at claim time
+# (schema v6). Each is wall-clock- or environment-derived and therefore
+# naturally wiggles across regen runs / CI machines. The map pairs each
+# field name with its sentinel replacement so the corpus stays
+# byte-stable regardless of who ran ``just regen-fixtures``.
+#
+# ``idempotency_key`` is intentionally excluded: when set, it's
+# supplied by the caller and deterministic in test runs; when unset,
+# it serialises out entirely (``#[serde(skip_serializing_if)]``).
+AUDIT_FIELD_SENTINELS: dict[str, str] = {
+    "hostname": "host-SENTINEL",
+    "git_commit": "sha-SENTINEL",
+    "git_branch": "branch-SENTINEL",
+    "triggering_identity": "user-SENTINEL",
+    "rocky_version": "0.0.0-SENTINEL",
+    "target_catalog": "catalog-SENTINEL",
+}
+
 # Numeric fields whose value is a deterministic function of a
 # wall-clock-derived number (e.g. ``compute_cost_per_run =
 # avg_duration_seconds * compute_cost_per_second``). Even though the
@@ -66,6 +84,8 @@ def normalize(node: object) -> None:
                 node[k] = SENTINEL_TS
             elif isinstance(v, str) and k in WALL_CLOCK_ID_FIELDS:
                 node[k] = SENTINEL_RUN_ID
+            elif isinstance(v, str) and k in AUDIT_FIELD_SENTINELS:
+                node[k] = AUDIT_FIELD_SENTINELS[k]
             else:
                 normalize(v)
     elif isinstance(node, list):

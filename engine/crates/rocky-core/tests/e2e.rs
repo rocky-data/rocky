@@ -441,7 +441,7 @@ fn test_drift_new_column_not_drift() {
 
 #[test]
 fn test_run_history_flow() {
-    use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger};
+    use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource};
 
     let (store, _dir) = temp_state();
 
@@ -478,6 +478,14 @@ fn test_run_history_flow() {
         ],
         trigger: RunTrigger::Manual,
         config_hash: "config-abc".to_string(),
+        triggering_identity: None,
+        session_source: SessionSource::Cli,
+        git_commit: None,
+        git_branch: None,
+        idempotency_key: None,
+        target_catalog: None,
+        hostname: "e2e-test-host".to_string(),
+        rocky_version: "0.0.0-e2e".to_string(),
     };
 
     store.record_run(&run).unwrap();

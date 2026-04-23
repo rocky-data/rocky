@@ -647,6 +647,12 @@ enum Command {
         /// Only show runs since this date (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
+        /// Include the governance audit trail for each run (identity,
+        /// git commit, branch, hostname, session source, target catalog,
+        /// idempotency key, rocky version). Default output omits these
+        /// fields for byte-stability with schema v5 consumers.
+        #[arg(long)]
+        audit: bool,
     },
 
     /// Show quality metrics for a model
@@ -1501,9 +1507,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 anyhow::bail!("either --adapter or --command is required for test-adapter")
             }
         },
-        Command::History { model, since } => {
-            rocky_cli::commands::run_history(&state_path, model.as_deref(), since.as_deref(), json)
-        }
+        Command::History {
+            model,
+            since,
+            audit,
+        } => rocky_cli::commands::run_history(
+            &state_path,
+            model.as_deref(),
+            since.as_deref(),
+            audit,
+            json,
+        ),
         Command::Metrics {
             model,
             trend,
