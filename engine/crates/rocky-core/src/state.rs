@@ -1572,6 +1572,112 @@ pub fn detect_anomaly(
     }
 }
 
+/// Standard file name for Rocky's embedded state store.
+///
+/// Both the CLI (`rocky run`, `rocky state`, …) and the LSP/server
+/// resolve paths ending in this name via [`resolve_state_path`]; the
+/// constant lives here so the two halves of the binary can't disagree
+/// on spelling.
+pub const STATE_FILE_NAME: &str = ".rocky-state.redb";
+
+/// Resolution outcome for [`resolve_state_path`].
+///
+/// `path` is always the state file the caller should open. `warning` is
+/// `Some` when the resolver fell back to a deprecated CWD-relative state
+/// file (case 3 or 5 below); the CLI prints it to stderr so users see
+/// exactly one deprecation nudge per invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStatePath {
+    pub path: std::path::PathBuf,
+    pub warning: Option<String>,
+}
+impl ResolvedStatePath {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Resolve the canonical state-file path for a project.
+///
+/// Unifies the CLI and LSP defaults that diverged through Arc 7 wave 2
+/// wave-2: the CLI wrote `./rocky-state.redb` in CWD while the LSP read
+/// `<models_dir>/.rocky-state.redb`, so the schema-cache write tap and
+/// inlay-hint read path missed each other in every project where they
+/// weren't already co-located.
+///
+/// Policy (checked in order):
+///
+/// 1. `explicit` is `Some` — use the user's path verbatim, no warning.
+///    This keeps `rocky --state-path <file>` a hard override.
+/// 2. `<models_dir>/.rocky-state.redb` exists — use it, no warning.
+///    New projects and users who already migrated land here.
+/// 3. CWD `.rocky-state.redb` exists — use it, return a deprecation
+///    warning. This is the legacy layout; the caller is responsible for
+///    surfacing the warning (CLI prints to stderr, LSP logs it).
+/// 4. **Both** CWD and `<models_dir>/.rocky-state.redb` exist — use the
+///    CWD file (the historical default that still holds the user's
+///    watermarks and branch state) and return a louder warning asking
+///    the user to reconcile. Merging is lossy, so we don't attempt it.
+/// 5. Neither exists — fresh project; default to
+///    `<models_dir>/.rocky-state.redb`, no warning.
+pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> ResolvedStatePath {
+    if let Some(p) = explicit {
+        return ResolvedStatePath {
+            path: p.to_path_buf(),
+            warning: None,
+        };
+    }
+
+    let models_state = models_dir.join(STATE_FILE_NAME);
+    let cwd_state = std::path::PathBuf::from(STATE_FILE_NAME);
+
+    // Case 4: both exist. Prefer CWD so existing watermarks/branch state
+    // keep working, but shout about the ambiguity.
+    if cwd_state.exists() && models_state.exists() {
+        return ResolvedStatePath {
+            path: cwd_state,
+            warning: Some(format!(
+                "two Rocky state files detected: `{}` (CWD, in use) and `{}` \
+                 (models_dir, ignored). Merge is lossy — delete one to silence \
+                 this warning. Run `rocky state` from each to decide which \
+                 holds the state you want to keep.",
+                STATE_FILE_NAME,
+                models_state.display(),
+            )),
+        };
+    }
+
+    // Case 2: canonical (new default).
+    if models_state.exists() {
+        return ResolvedStatePath {
+            path: models_state,
+            warning: None,
+        };
+    }
+
+    // Case 3: legacy CWD fallback.
+    if cwd_state.exists() {
+        return ResolvedStatePath {
+            path: cwd_state,
+            warning: Some(format!(
+                "using legacy state file `{}` in the current directory. \
+                 The canonical location is `{}`; move the file there to \
+                 silence this warning. The CLI will keep honouring the \
+                 CWD fallback for now, but it is deprecated and may be \
+                 removed in a future release.",
+                STATE_FILE_NAME,
+                models_state.display(),
+            )),
+        };
+    }
+
+    // Case 5: fresh project — pick the new default.
+    ResolvedStatePath {
+        path: models_state,
+        warning: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -2957,5 +3063,120 @@ mod tests {
             }
             other => panic!("expected SkipInFlight for second claim, got {other:?}"),
         }
+    }
+
+    // -------- resolve_state_path --------
+    //
+    // These tests exercise the CLI-vs-LSP unification helper. The test
+    // moves into a temp CWD (via `std::env::set_current_dir`) so that the
+    // CWD probe in the resolver looks at a clean directory; no test in
+    // the rocky-core suite runs in parallel with CWD-mutating cargo
+    // tests today (see `#[cfg(test)]` usage across the crate).
+
+    /// Serialise CWD-mutating tests — all resolver tests share the
+    /// process-wide CWD, so running them concurrently would race.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_cwd<F: FnOnce() -> R, R>(dir: &Path, f: F) -> R {
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(dir).expect("set_current_dir to temp");
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_current_dir(&prev).expect("restore cwd");
+        match out {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn resolve_state_path_explicit_wins() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // Seed both potential locations so we can prove `explicit` beats them.
+        std::fs::File::create(models.join(STATE_FILE_NAME)).unwrap();
+        with_cwd(tmp.path(), || {
+            std::fs::File::create(STATE_FILE_NAME).unwrap();
+            let explicit = tmp.path().join("custom.redb");
+            let resolved = resolve_state_path(Some(&explicit), &models);
+            assert_eq!(resolved.path, explicit);
+            assert!(resolved.warning.is_none());
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_prefers_models_dir_when_only_it_exists() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::File::create(models.join(STATE_FILE_NAME)).unwrap();
+        with_cwd(tmp.path(), || {
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(resolved.path, models.join(STATE_FILE_NAME));
+            assert!(
+                resolved.warning.is_none(),
+                "models_dir-only layout is the canonical path; no warning expected"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_falls_back_to_cwd_with_warning() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        with_cwd(tmp.path(), || {
+            std::fs::File::create(STATE_FILE_NAME).unwrap();
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(resolved.path, std::path::PathBuf::from(STATE_FILE_NAME));
+            let warning = resolved.warning.expect("deprecation warning expected");
+            assert!(
+                warning.contains("legacy state file"),
+                "warning should name the legacy layout explicitly: {warning}"
+            );
+            assert!(
+                warning.contains(STATE_FILE_NAME),
+                "warning should name the file: {warning}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_both_prefer_cwd_but_warn_louder() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::File::create(models.join(STATE_FILE_NAME)).unwrap();
+        with_cwd(tmp.path(), || {
+            std::fs::File::create(STATE_FILE_NAME).unwrap();
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(
+                resolved.path,
+                std::path::PathBuf::from(STATE_FILE_NAME),
+                "both-exist case must prefer CWD to preserve existing state"
+            );
+            let warning = resolved
+                .warning
+                .expect("both-exist case must warn about ambiguity");
+            assert!(
+                warning.contains("two Rocky state files"),
+                "louder warning should call out the ambiguity: {warning}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_fresh_project_picks_models_dir() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        with_cwd(tmp.path(), || {
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(resolved.path, models.join(STATE_FILE_NAME));
+            assert!(resolved.warning.is_none());
+        });
     }
 }

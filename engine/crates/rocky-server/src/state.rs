@@ -94,8 +94,10 @@ impl ServerState {
 
     /// Load the schema-cache-backed `source_schemas` map for this
     /// server's project. Gated on `[cache.schemas] enabled`; resolves the
-    /// state file relative to `models_dir` (the same convention
-    /// `api.rs`/`dashboard.rs` already follow).
+    /// state file via [`rocky_core::state::resolve_state_path`] so the
+    /// server observes exactly the same file that `rocky run` writes to
+    /// (unified default — `<models>/.rocky-state.redb` — with the legacy
+    /// CWD fallback for existing projects).
     async fn load_cached_source_schemas(
         &self,
     ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
@@ -113,7 +115,11 @@ impl ServerState {
             return HashMap::new();
         }
 
-        let state_path = self.models_dir.join(".rocky-state.redb");
+        let resolved = rocky_core::state::resolve_state_path(None, &self.models_dir);
+        if let Some(ref w) = resolved.warning {
+            debug!(target: "rocky::state_path", "{w}");
+        }
+        let state_path = resolved.path;
         if !state_path.exists() {
             return HashMap::new();
         }

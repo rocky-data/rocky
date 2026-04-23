@@ -231,7 +231,7 @@ async fn full_dag(
 async fn list_runs(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let state_path = state.models_dir.join(".rocky-state.redb");
+    let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
     let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let runs = store
@@ -262,7 +262,7 @@ async fn model_history(
     State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let state_path = state.models_dir.join(".rocky-state.redb");
+    let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
     let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let history = store
@@ -295,7 +295,7 @@ async fn model_metrics(
     State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let state_path = state.models_dir.join(".rocky-state.redb");
+    let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
     let store = rocky_core::state::StateStore::open_read_only(&state_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshots = store

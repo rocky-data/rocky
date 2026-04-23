@@ -67,9 +67,18 @@ struct Cli {
     #[arg(short, long, default_value = "json", global = true)]
     output: OutputFormat,
 
-    /// State store path
-    #[arg(long, default_value = ".rocky-state.redb")]
-    state_path: PathBuf,
+    /// State store path.
+    ///
+    /// When unset, Rocky resolves the location via
+    /// [`rocky_core::state::resolve_state_path`]: `<models>/.rocky-state.redb`
+    /// is the canonical default for new projects, but a legacy
+    /// `.rocky-state.redb` in the current directory keeps working (with
+    /// a one-time deprecation warning on stderr) so existing watermarks,
+    /// branch state, partitions, and run history aren't silently left
+    /// behind. Passing this flag explicitly is always honoured verbatim
+    /// and skips the fallback logic.
+    #[arg(long)]
+    state_path: Option<PathBuf>,
 
     /// Override `[cache.schemas] ttl_seconds` for this invocation.
     ///
@@ -1044,6 +1053,26 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
     let config_path = cli.config.clone();
 
+    // Resolve `--state-path` once so every command below sees the same
+    // canonical location. When the caller didn't pass `--state-path`
+    // explicitly, the resolver prefers `<models>/.rocky-state.redb`
+    // (the new default — matches `rocky lsp`), falls back to a legacy
+    // `.rocky-state.redb` in CWD with a one-time deprecation warning on
+    // stderr, and picks the new default for fresh projects.
+    //
+    // `models_dir` here is the top-level convention (`./models`); the
+    // per-command `--models` override (on `rocky run`, `rocky compile`,
+    // etc.) intentionally doesn't feed back in — the state file lives
+    // with the project, not with a one-shot `--models` override.
+    let resolved = rocky_core::state::resolve_state_path(
+        cli.state_path.as_deref(),
+        std::path::Path::new("models"),
+    );
+    if let Some(ref w) = resolved.warning {
+        warn!(target: "rocky::state_path", "{w}");
+    }
+    let state_path: PathBuf = resolved.path;
+
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
@@ -1054,7 +1083,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::discover(
                 &cli.config,
                 pipeline.as_deref(),
-                &cli.state_path,
+                &state_path,
                 with_schemas,
                 json,
             )
@@ -1115,9 +1144,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // Resolve --branch to the same machinery as --shadow. clap
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
             let shadow_config = if let Some(name) = &branch {
-                let store = rocky_core::state::StateStore::open_read_only(&cli.state_path)
+                let store = rocky_core::state::StateStore::open_read_only(&state_path)
                     .with_context(|| {
-                        format!("failed to open state store at {}", cli.state_path.display())
+                        format!("failed to open state store at {}", state_path.display())
                     })?;
                 let record = store.get_branch(name)?.with_context(|| {
                     format!(
@@ -1170,7 +1199,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &cli.config,
                     filter.as_deref(),
                     pipeline.as_deref(),
-                    &cli.state_path,
+                    &state_path,
                     gov_override.as_ref(),
                     json,
                     models_dir.as_deref(),
@@ -1254,11 +1283,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             output_path,
         } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
         Command::State { action } => match action {
-            None | Some(StateAction::Show) => {
-                rocky_cli::commands::state_show(&cli.state_path, json)
-            }
+            None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
             Some(StateAction::ClearSchemaCache { dry_run }) => {
-                rocky_cli::commands::state_clear_schema_cache(&cli.state_path, dry_run, json)
+                rocky_cli::commands::state_clear_schema_cache(&state_path, dry_run, json)
             }
         },
         Command::Compile {
@@ -1270,7 +1297,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             with_seed,
         } => rocky_cli::commands::run_compile(
             Some(cli.config.as_path()),
-            &cli.state_path,
+            &state_path,
             &models,
             contracts.as_deref(),
             model.as_deref(),
@@ -1287,7 +1314,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             column_lineage,
         } => rocky_cli::commands::run_dag(
             &cli.config,
-            &cli.state_path,
+            &state_path,
             &models,
             seeds.as_deref(),
             contracts.as_deref(),
@@ -1304,7 +1331,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             upstream: _,
         } => rocky_cli::commands::run_lineage(
             &cli.config,
-            &cli.state_path,
+            &state_path,
             &models,
             &target,
             column.as_deref(),
@@ -1320,7 +1347,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             rocky_cli::commands::run_ai(
                 &cli.config,
-                &cli.state_path,
+                &state_path,
                 &intent,
                 format.as_deref(),
                 &models,
@@ -1337,7 +1364,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             rocky_cli::commands::run_ai_sync(
                 &cli.config,
-                &cli.state_path,
+                &state_path,
                 &models,
                 apply,
                 model.as_deref(),
@@ -1355,7 +1382,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             rocky_cli::commands::run_ai_explain(
                 &cli.config,
-                &cli.state_path,
+                &state_path,
                 &models,
                 model.as_deref(),
                 all,
@@ -1373,7 +1400,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             rocky_cli::commands::run_ai_test(
                 &cli.config,
-                &cli.state_path,
+                &state_path,
                 &models,
                 model.as_deref(),
                 all,
@@ -1452,7 +1479,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::CiDiff { base_ref, models } => rocky_cli::commands::run_ci_diff(
             &cli.config,
-            &cli.state_path,
+            &state_path,
             &base_ref,
             &models,
             json,
@@ -1474,19 +1501,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 anyhow::bail!("either --adapter or --command is required for test-adapter")
             }
         },
-        Command::History { model, since } => rocky_cli::commands::run_history(
-            &cli.state_path,
-            model.as_deref(),
-            since.as_deref(),
-            json,
-        ),
+        Command::History { model, since } => {
+            rocky_cli::commands::run_history(&state_path, model.as_deref(), since.as_deref(), json)
+        }
         Command::Metrics {
             model,
             trend,
             column,
             alerts,
         } => rocky_cli::commands::run_metrics(
-            &cli.state_path,
+            &state_path,
             &model,
             trend,
             column.as_deref(),
@@ -1500,7 +1524,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 None
             };
-            rocky_cli::commands::run_optimize(&cli.state_path, models_dir, model.as_deref(), json)
+            rocky_cli::commands::run_optimize(&state_path, models_dir, model.as_deref(), json)
         }
         Command::Estimate {
             models,
@@ -1556,21 +1580,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         },
         Command::Branch { action } => match action {
             BranchAction::Create { name, description } => rocky_cli::commands::run_branch_create(
-                &cli.state_path,
+                &state_path,
                 &name,
                 description.as_deref(),
                 json,
             ),
             BranchAction::Delete { name } => {
-                rocky_cli::commands::run_branch_delete(&cli.state_path, &name, json)
+                rocky_cli::commands::run_branch_delete(&state_path, &name, json)
             }
-            BranchAction::List => rocky_cli::commands::run_branch_list(&cli.state_path, json),
+            BranchAction::List => rocky_cli::commands::run_branch_list(&state_path, json),
             BranchAction::Show { name } => {
-                rocky_cli::commands::run_branch_show(&cli.state_path, &name, json)
+                rocky_cli::commands::run_branch_show(&state_path, &name, json)
             }
             BranchAction::Compare { name, filter } => {
                 rocky_cli::commands::run_branch_compare(
-                    &cli.state_path,
+                    &state_path,
                     &cli.config,
                     &name,
                     filter.as_deref(),
@@ -1580,18 +1604,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         },
         Command::Replay { target, model } => {
-            rocky_cli::commands::run_replay(&cli.state_path, &target, model.as_deref(), json)
+            rocky_cli::commands::run_replay(&state_path, &target, model.as_deref(), json)
         }
         Command::Trace { target, model } => {
-            rocky_cli::commands::run_trace(&cli.state_path, &target, model.as_deref(), json)
+            rocky_cli::commands::run_trace(&state_path, &target, model.as_deref(), json)
         }
-        Command::Cost { target, model } => rocky_cli::commands::run_cost(
-            &cli.state_path,
-            &cli.config,
-            &target,
-            model.as_deref(),
-            json,
-        ),
+        Command::Cost { target, model } => {
+            rocky_cli::commands::run_cost(&state_path, &cli.config, &target, model.as_deref(), json)
+        }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
             ListAction::Adapters => rocky_cli::commands::list_adapters(&cli.config, json),
@@ -1605,7 +1625,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         },
         Command::Doctor { check } => {
-            rocky_cli::commands::doctor(&cli.config, &cli.state_path, json, check.as_deref()).await
+            rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref()).await
         }
         #[cfg(feature = "duckdb")]
         Command::Bench {

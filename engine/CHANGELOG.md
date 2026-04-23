@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CLI and LSP state-path unification.** The CLI's `--state-path` default (previously `.rocky-state.redb` in CWD) now resolves through the new `rocky_core::state::resolve_state_path` helper, matching the LSP's `<models>/.rocky-state.redb` convention. Fresh projects land on the canonical `<models>/.rocky-state.redb` path; existing users with a CWD state file keep working and see a one-time deprecation warning on stderr pointing at the migration path. The inlay-hint cache-hit path (PR #228) and the schema-cache write tap (PR #230) now observe the same state file end-to-end — the known follow-up called out in the 1.14.0 release notes. Passing `--state-path` explicitly remains a hard override. Behaviour when both `<models>/.rocky-state.redb` and a legacy CWD state file exist: CWD wins (to preserve existing watermarks / branches / partitions) and a louder warning asks you to reconcile. Merge is lossy, so delete one copy to silence the warning.
+
 ## [1.15.0] — 2026-04-23
 
 Ships FR-004 `rocky run --idempotency-key` for state-store-backed run dedup across every state backend (Phase 1 local/valkey/tiered + Phase 2 S3 + Phase 3 GCS), plus a routine `rand` dependency bump. Two PRs since v1.14.0.
@@ -77,7 +81,7 @@ Leaf models now typecheck against real warehouse types without a live `DESCRIBE 
 - **`rocky state clear-schema-cache [--dry-run]`** (#232, PR 4) — explicit flush. Missing state store treated as no-op (CI-safe on ephemeral runners). New `ClearSchemaCacheOutput` through the codegen cascade. `rocky state` becomes a subcommand group; bare `rocky state` (watermarks view) is preserved.
 - **`rocky --cache-ttl <seconds>` global CLI flag** (#232, PR 4) — overrides `[cache.schemas] ttl_seconds` for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > built-in default (86400 s / 24 h). `--cache-ttl 0` treats every cache entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false`. Applies to CLI read paths (`rocky compile`, `rocky run`, …); the `rocky lsp` / `rocky serve` daemons keep the config-derived TTL because daemon lifetimes outlive a single-invocation flag.
 
-**Known follow-up** (not in these five PRs): CLI default state_path (`.rocky-state.redb` in CWD) and LSP default (`models_dir.join(".rocky-state.redb")`) diverge — until they're unified, LSP inlay-hints don't observe what `rocky run` wrote. Needs a migration story for existing users' state files; tracked as a separate PR.
+**Known follow-up** (not in these five PRs): CLI default state_path (`.rocky-state.redb` in CWD) and LSP default (`models_dir.join(".rocky-state.redb")`) diverge — until they're unified, LSP inlay-hints don't observe what `rocky run` wrote. Needs a migration story for existing users' state files; tracked as a separate PR. **Resolved in [Unreleased]** via `rocky_core::state::resolve_state_path`.
 
 #### Arc 2 wave 3 — `bytes_scanned` adapter plumbing
 
