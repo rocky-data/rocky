@@ -75,6 +75,27 @@ impl<'a> CatalogManager<'a> {
         Ok(())
     }
 
+    /// Sets tags on a single column of a table. Empty tag maps are skipped
+    /// (Unity Catalog rejects `SET TAGS ()`). One statement per column —
+    /// Databricks does not support multi-column tag application in a
+    /// single DDL.
+    pub async fn set_column_tags(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        column: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<(), CatalogManagerError> {
+        let maybe_sql =
+            catalog_sql::generate_set_column_tags_sql(catalog, schema, table, column, tags)?;
+        if let Some(sql) = maybe_sql {
+            debug!(catalog, schema, table, column, "setting column tags");
+            self.connector.execute_statement(&sql).await?;
+        }
+        Ok(())
+    }
+
     /// Lists schemas in a catalog.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<String>, CatalogManagerError> {
         let sql = catalog_sql::generate_show_schemas_sql(catalog)?;

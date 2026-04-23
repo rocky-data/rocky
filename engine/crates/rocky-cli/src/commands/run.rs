@@ -19,8 +19,8 @@ use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
 use rocky_core::traits::{
-    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
-    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskStrategy,
+    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 
 use crate::output::*;
@@ -2756,6 +2756,78 @@ pub async fn run(
                     .await;
                 let _ = hook_registry.wait_async_webhooks().await;
                 return Err(e);
+            }
+
+            // Governance: column classification + masking reconcile (§1.1 + §1.2).
+            // Walks the model set after a successful DAG run and applies
+            // `[classification]` sidecar tags + the resolved `[mask]` strategy
+            // through the same `GovernanceAdapter` that handled catalog and
+            // schema grants above. Best-effort: failures warn but never abort,
+            // mirroring the `apply_grants` semantics earlier in this path.
+            //
+            // v1 resolves against project defaults (`env = None`). The
+            // `--env` flag threading is a follow-up — the resolver already
+            // accepts `Option<&str>`, the caller just doesn't plumb a choice
+            // yet.
+            let governance_compile = rocky_compiler::compile::compile(
+                &rocky_compiler::compile::CompilerConfig {
+                    models_dir: mdir.to_path_buf(),
+                    contracts_dir: None,
+                    source_schemas: std::collections::HashMap::new(),
+                    source_column_info: std::collections::HashMap::new(),
+                },
+            );
+            if let Ok(gov_compile) = governance_compile {
+                let tag_to_strategy = rocky_cfg.resolve_mask_for_env(None);
+                for model in &gov_compile.project.models {
+                    if model.config.classification.is_empty() {
+                        continue;
+                    }
+                    let plan = model.to_plan();
+                    let table_ref = TableRef {
+                        catalog: plan.target.catalog.clone(),
+                        schema: plan.target.schema.clone(),
+                        table: plan.target.table.clone(),
+                    };
+
+                    let mut column_tags: BTreeMap<String, BTreeMap<String, String>> =
+                        BTreeMap::new();
+                    for (col, tag) in &model.config.classification {
+                        let mut m = BTreeMap::new();
+                        m.insert("classification".to_string(), tag.clone());
+                        column_tags.insert(col.clone(), m);
+                    }
+                    if let Err(e) = governance_adapter
+                        .apply_column_tags(&table_ref, &column_tags)
+                        .await
+                    {
+                        warn!(
+                            model = %model.config.name,
+                            error = %e,
+                            "apply column classification tags failed"
+                        );
+                    }
+
+                    let mut column_strategies: BTreeMap<String, MaskStrategy> = BTreeMap::new();
+                    for (col, tag) in &model.config.classification {
+                        if let Some(strategy) = tag_to_strategy.get(tag) {
+                            column_strategies.insert(col.clone(), *strategy);
+                        }
+                    }
+                    if !column_strategies.is_empty() {
+                        let policy = MaskingPolicy { column_strategies };
+                        if let Err(e) = governance_adapter
+                            .apply_masking_policy(&table_ref, &policy, "default")
+                            .await
+                        {
+                            warn!(
+                                model = %model.config.name,
+                                error = %e,
+                                "apply column masking policy failed"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

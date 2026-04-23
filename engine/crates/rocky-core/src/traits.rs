@@ -16,6 +16,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use schemars::JsonSchema;
+
 use crate::ir::{ColumnInfo, ColumnSelection, Grant, GrantTarget, MetadataColumn, TableRef};
 use crate::source::DiscoveredConnector;
 
@@ -429,6 +431,82 @@ pub enum TagTarget {
     },
 }
 
+/// Column-masking strategy applied to a classified column at materialization
+/// time.
+///
+/// Rocky translates a classification tag (e.g., `pii`) into one of these
+/// strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The
+/// adapter renders each strategy as a warehouse-native function:
+/// Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`;
+/// other adapters default-unsupported until demand.
+///
+/// Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`,
+/// `"partial"`, `"none"`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MaskStrategy {
+    /// SHA-256 hex digest of the column value. Deterministic, one-way.
+    Hash,
+    /// Replace the column value with the literal string `'***'`.
+    Redact,
+    /// Keep the first and last two characters; replace the middle with `***`.
+    /// Short values (<5 chars) are fully replaced with `'***'`.
+    Partial,
+    /// Explicit identity — no masking applied. Useful as a per-env override
+    /// to "unmask" a column that defaults to masked at the workspace level.
+    None,
+}
+
+impl MaskStrategy {
+    /// Wire name used in `rocky.toml` and JSON schemas.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MaskStrategy::Hash => "hash",
+            MaskStrategy::Redact => "redact",
+            MaskStrategy::Partial => "partial",
+            MaskStrategy::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for MaskStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A concrete masking policy resolved for a specific environment.
+///
+/// The pipeline config supplies a default `[mask]` block keyed by
+/// classification tag; each `[mask.<env>]` block overrides individual
+/// strategies. At apply time Rocky resolves classifications → strategies
+/// for the active environment and passes the result to the adapter as a
+/// `MaskingPolicy`.
+///
+/// `column_strategies` maps **column name → strategy** (not tag → strategy);
+/// the translation from classification tag to strategy happens above the
+/// adapter layer so the adapter only needs to know what to apply to each
+/// column.
+#[derive(Debug, Clone, Default)]
+pub struct MaskingPolicy {
+    /// Column name → resolved [`MaskStrategy`] for that column.
+    pub column_strategies: BTreeMap<String, MaskStrategy>,
+}
+
+impl MaskingPolicy {
+    /// Returns `true` when no columns need masking (either no classifications
+    /// matched or every resolved strategy is [`MaskStrategy::None`]).
+    pub fn is_empty(&self) -> bool {
+        self.column_strategies.is_empty()
+            || self
+                .column_strategies
+                .values()
+                .all(|s| *s == MaskStrategy::None)
+    }
+}
+
 /// Optional governance capabilities for warehouses that support
 /// catalog/schema lifecycle, tagging, and permission management.
 ///
@@ -505,6 +583,67 @@ pub trait GovernanceAdapter: Send + Sync {
             "remove_workspace_binding not supported by this adapter",
         ))
     }
+
+    /// Apply classification tags to individual columns of a table.
+    ///
+    /// `column_tags` maps **column name → (tag-key → tag-value)**. The outer
+    /// key is the column, the inner map is an arbitrary set of tag pairs —
+    /// `set_tags`' column-scoped cousin. Column-level tagging is a
+    /// Databricks-specific Unity Catalog capability; other adapters
+    /// override to return an `AdapterError` signalling the gap so the
+    /// mismatch is visible at plan/run time rather than silently skipped.
+    ///
+    /// Rocky calls this after writing a model's bytes so the tags land on
+    /// the freshly-materialized table — matching the `set_tags` timing.
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError` to force adapters to
+    /// declare explicit semantics. `NoopGovernanceAdapter` overrides to
+    /// `Ok(())` so pipelines that declare classifications against a
+    /// no-governance warehouse degrade gracefully; Snowflake / BigQuery
+    /// surface the gap by returning an error.
+    async fn apply_column_tags(
+        &self,
+        _table: &TableRef,
+        _column_tags: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::msg(
+            "apply_column_tags not supported by this adapter",
+        ))
+    }
+
+    /// Apply a column-level masking policy to a table.
+    ///
+    /// `policy.column_strategies` maps column name → [`MaskStrategy`].
+    /// `env` is the currently-active environment name (e.g., `"dev"`,
+    /// `"prod"`), which Rocky uses to disambiguate per-env policy names
+    /// at the warehouse layer. Adapters must:
+    ///
+    /// 1. Generate one masking function per distinct strategy (idempotent
+    ///    `CREATE OR REPLACE` — two models with the same strategy share
+    ///    a function).
+    /// 2. Bind each column to its function via the warehouse's
+    ///    column-masking primitive (Databricks: `ALTER TABLE ... ALTER
+    ///    COLUMN ... SET MASK ...`).
+    /// 3. Leave columns with [`MaskStrategy::None`] untouched (or clear
+    ///    any existing mask, at the adapter's discretion).
+    ///
+    /// # Errors
+    ///
+    /// The trait default returns an `AdapterError`. Only Databricks
+    /// implements masking in v1 — Snowflake / BigQuery default-unsupported
+    /// until Rocky gains native demand for those dialects.
+    async fn apply_masking_policy(
+        &self,
+        _table: &TableRef,
+        _policy: &MaskingPolicy,
+        _env: &str,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::msg(
+            "apply_masking_policy not supported by this adapter",
+        ))
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -566,6 +705,28 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
         _catalog: &str,
         _workspace_id: u64,
     ) -> AdapterResult<()> {
+        Ok(())
+    }
+
+    async fn apply_column_tags(
+        &self,
+        _table: &TableRef,
+        _column_tags: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> AdapterResult<()> {
+        // No-op governance treats classification as optional metadata:
+        // pipelines that declare classifications against a warehouse
+        // without governance degrade gracefully. Surfacing the gap is the
+        // compiler's job (W004), not this adapter's.
+        Ok(())
+    }
+
+    async fn apply_masking_policy(
+        &self,
+        _table: &TableRef,
+        _policy: &MaskingPolicy,
+        _env: &str,
+    ) -> AdapterResult<()> {
+        // Same rationale as `apply_column_tags`.
         Ok(())
     }
 }
@@ -722,5 +883,92 @@ mod tests {
                 .is_empty()
         );
         assert!(noop.remove_workspace_binding("cat", 123).await.is_ok());
+    }
+
+    // Default classification / masking primitives: same "must override"
+    // contract as the workspace-binding primitives — adapters must declare
+    // whether they support the capability.
+
+    #[tokio::test]
+    async fn trait_default_apply_column_tags_errors() {
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let err = MinimalGovernance
+            .apply_column_tags(&t, &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("apply_column_tags"));
+    }
+
+    #[tokio::test]
+    async fn trait_default_apply_masking_policy_errors() {
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let err = MinimalGovernance
+            .apply_masking_policy(&t, &MaskingPolicy::default(), "prod")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("apply_masking_policy"));
+    }
+
+    #[tokio::test]
+    async fn noop_governance_accepts_classification_and_masking() {
+        let noop = NoopGovernanceAdapter;
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        assert!(noop.apply_column_tags(&t, &BTreeMap::new()).await.is_ok());
+        assert!(
+            noop.apply_masking_policy(&t, &MaskingPolicy::default(), "prod")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn masking_policy_is_empty() {
+        let empty = MaskingPolicy::default();
+        assert!(empty.is_empty());
+
+        let mut all_none = MaskingPolicy::default();
+        all_none
+            .column_strategies
+            .insert("email".into(), MaskStrategy::None);
+        all_none
+            .column_strategies
+            .insert("phone".into(), MaskStrategy::None);
+        assert!(
+            all_none.is_empty(),
+            "all-None policies are effectively empty"
+        );
+
+        let mut with_hash = MaskingPolicy::default();
+        with_hash
+            .column_strategies
+            .insert("email".into(), MaskStrategy::Hash);
+        assert!(!with_hash.is_empty());
+    }
+
+    #[test]
+    fn mask_strategy_serde_roundtrip() {
+        for (strat, wire) in [
+            (MaskStrategy::Hash, "\"hash\""),
+            (MaskStrategy::Redact, "\"redact\""),
+            (MaskStrategy::Partial, "\"partial\""),
+            (MaskStrategy::None, "\"none\""),
+        ] {
+            let s = serde_json::to_string(&strat).unwrap();
+            assert_eq!(s, wire);
+            let parsed: MaskStrategy = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, strat);
+        }
     }
 }

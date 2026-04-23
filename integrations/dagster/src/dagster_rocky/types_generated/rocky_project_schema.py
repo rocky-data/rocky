@@ -127,6 +127,24 @@ class BudgetConfig(BaseModel):
     """
 
 
+class ClassificationsConfig(BaseModel):
+    """
+    Advisory settings for column classification.
+
+    ```toml [classifications] allow_unmasked = ["internal"] ```
+
+    Any classification tag listed in `allow_unmasked` suppresses the W004 "tag has no masking strategy" compiler warning. This is the escape hatch for teams that want to tag columns for discovery/lineage without requiring a matching `[mask]` strategy for every tag.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    allow_unmasked: list[str] | None = []
+    """
+    Classification tags that are allowed to appear in a model's `[classification]` block without a corresponding `[mask]` strategy.
+    """
+
+
 class CompositeKind1(StrEnum):
     """
     `(col1, col2, ...)` is unique across all rows.
@@ -382,6 +400,38 @@ class LoadOptionsConfig(BaseModel):
     """
     Truncate the target table before loading. Default: false.
     """
+
+
+class MaskStrategy1(StrEnum):
+    """
+    SHA-256 hex digest of the column value. Deterministic, one-way.
+    """
+
+    hash = "hash"
+
+
+class MaskStrategy2(StrEnum):
+    """
+    Replace the column value with the literal string `'***'`.
+    """
+
+    redact = "redact"
+
+
+class MaskStrategy3(StrEnum):
+    """
+    Keep the first and last two characters; replace the middle with `***`. Short values (<5 chars) are fully replaced with `'***'`.
+    """
+
+    partial = "partial"
+
+
+class MaskStrategy4(StrEnum):
+    """
+    Explicit identity — no masking applied. Useful as a per-env override to "unmask" a column that defaults to masked at the workspace level.
+    """
+
+    none = "none"
 
 
 class MetadataColumnConfig(BaseModel):
@@ -2233,6 +2283,12 @@ class RockyConfig(BaseModel):
     """
     Project-level cache configuration. Arc 7 wave 2 wave-2 introduces `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`].
     """
+    classifications: ClassificationsConfig | None = Field(
+        {"allow_unmasked": []}, validate_default=True
+    )
+    """
+    Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings.
+    """
     cost: CostSection | None = Field(
         {
             "compute_cost_per_dbu": 0.4,
@@ -2248,6 +2304,26 @@ class RockyConfig(BaseModel):
     hook: HooksConfig | None = Field({"webhooks": {}}, validate_default=True)
     """
     Shell hooks configuration.
+    """
+    mask: (
+        dict[
+            str,
+            dict[str, MaskStrategy1 | MaskStrategy2 | MaskStrategy3 | MaskStrategy4]
+            | MaskStrategy1
+            | MaskStrategy2
+            | MaskStrategy3
+            | MaskStrategy4,
+        ]
+        | None
+    ) = {}
+    """
+    Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:
+
+    ```toml [mask] pii = "hash"            # default strategy for "pii" classification confidential = "redact" # default strategy for "confidential"
+
+    [mask.prod] pii = "none"            # prod override: do not mask pii confidential = "partial" ```
+
+    Resolved per model at apply time via [`RockyConfig::resolve_mask_for_env`].
     """
     pipeline: (
         dict[

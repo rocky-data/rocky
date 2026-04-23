@@ -241,6 +241,7 @@ fn load_single_rocky_model(
             tests: vec![],
             format: None,
             format_options: None,
+            classification: Default::default(),
         }
     };
 
@@ -283,6 +284,7 @@ mod tests {
                 tests: vec![],
                 format: None,
                 format_options: None,
+                classification: Default::default(),
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),

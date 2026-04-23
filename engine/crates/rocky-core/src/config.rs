@@ -1052,6 +1052,45 @@ pub struct GrantConfig {
     pub permissions: Vec<String>,
 }
 
+/// One entry in the top-level `[mask]` block. A scalar value (`pii =
+/// "hash"`) binds a classification tag to a default masking strategy; a
+/// nested table (`[mask.prod] pii = "none"`) overrides strategies for a
+/// specific environment.
+///
+/// Serde deserializes the outer `[mask]` map as `BTreeMap<String,
+/// MaskEntry>`; scalars are tried first, then the nested table shape.
+/// Unknown strategy spellings (e.g., `"mask"`) hard-fail at config load
+/// time — Rocky never silently accepts something it can't emit SQL for.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum MaskEntry {
+    /// Default masking strategy for a classification tag.
+    Strategy(crate::traits::MaskStrategy),
+    /// Per-env override map: `[mask.<env>]` section with
+    /// `<classification> = "<strategy>"` pairs.
+    EnvOverride(std::collections::BTreeMap<String, crate::traits::MaskStrategy>),
+}
+
+/// Advisory settings for column classification.
+///
+/// ```toml
+/// [classifications]
+/// allow_unmasked = ["internal"]
+/// ```
+///
+/// Any classification tag listed in `allow_unmasked` suppresses the W004
+/// "tag has no masking strategy" compiler warning. This is the escape
+/// hatch for teams that want to tag columns for discovery/lineage without
+/// requiring a matching `[mask]` strategy for every tag.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassificationsConfig {
+    /// Classification tags that are allowed to appear in a model's
+    /// `[classification]` block without a corresponding `[mask]` strategy.
+    #[serde(default)]
+    pub allow_unmasked: Vec<String>,
+}
+
 /// Per-run governance override, merged additively on top of rocky.toml defaults.
 ///
 /// Passed via `--governance-override` CLI flag as JSON string or `@file.json`.
@@ -1563,6 +1602,68 @@ pub struct RockyConfig {
     /// cache surfaces live as sibling fields under [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+
+    /// Workspace-default column-masking strategies plus optional per-env
+    /// overrides. See [`MaskEntry`] for the TOML shape:
+    ///
+    /// ```toml
+    /// [mask]
+    /// pii = "hash"            # default strategy for "pii" classification
+    /// confidential = "redact" # default strategy for "confidential"
+    ///
+    /// [mask.prod]
+    /// pii = "none"            # prod override: do not mask pii
+    /// confidential = "partial"
+    /// ```
+    ///
+    /// Resolved per model at apply time via
+    /// [`RockyConfig::resolve_mask_for_env`].
+    #[serde(default)]
+    pub mask: std::collections::BTreeMap<String, MaskEntry>,
+
+    /// Advisory settings for column classification — currently just the
+    /// `allow_unmasked` list that suppresses W004 warnings.
+    #[serde(default)]
+    pub classifications: ClassificationsConfig,
+}
+
+impl RockyConfig {
+    /// Resolve `[mask]` + `[mask.<env>]` into a flat `classification → strategy`
+    /// map for the active environment.
+    ///
+    /// Resolution order:
+    /// 1. All top-level scalar entries (`pii = "hash"`) become defaults.
+    /// 2. If `env` is `Some(name)` and a matching `[mask.<name>]` override
+    ///    table exists, its entries overlay the defaults (same-key wins).
+    ///
+    /// When `env` is `None` or no matching override table exists, the
+    /// returned map contains only the top-level defaults. Non-matching
+    /// override tables are ignored for this env (they may apply to other
+    /// envs in the same config).
+    pub fn resolve_mask_for_env(
+        &self,
+        env: Option<&str>,
+    ) -> std::collections::BTreeMap<String, crate::traits::MaskStrategy> {
+        let mut out = std::collections::BTreeMap::new();
+
+        // Pass 1: every scalar entry is a workspace-default.
+        for (key, entry) in &self.mask {
+            if let MaskEntry::Strategy(s) = entry {
+                out.insert(key.clone(), *s);
+            }
+        }
+
+        // Pass 2: if env matches a nested override table, overlay.
+        if let Some(env_name) = env {
+            if let Some(MaskEntry::EnvOverride(overrides)) = self.mask.get(env_name) {
+                for (k, v) in overrides {
+                    out.insert(k.clone(), *v);
+                }
+            }
+        }
+
+        out
+    }
 }
 
 /// Project-wide dialect portability configuration.
@@ -5364,5 +5465,164 @@ max_rows = 1000000
             cached_at: chrono::Utc::now() - chrono::Duration::milliseconds(1),
         };
         assert!(entry.is_expired(chrono::Utc::now(), cfg.ttl()));
+    }
+
+    // ----------------------------------------------------------------------
+    // [mask] + [classifications] parsing
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn parse_mask_defaults_only() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [mask]
+            pii = "hash"
+            confidential = "redact"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        let resolved = cfg.resolve_mask_for_env(None);
+        assert_eq!(
+            resolved.get("pii").copied(),
+            Some(crate::traits::MaskStrategy::Hash)
+        );
+        assert_eq!(
+            resolved.get("confidential").copied(),
+            Some(crate::traits::MaskStrategy::Redact)
+        );
+    }
+
+    #[test]
+    fn parse_mask_env_override_wins_over_default() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [mask]
+            pii = "hash"
+            confidential = "redact"
+
+            [mask.prod]
+            pii = "none"
+            confidential = "partial"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+
+        // No env: scalars only.
+        let default = cfg.resolve_mask_for_env(None);
+        assert_eq!(
+            default.get("pii").copied(),
+            Some(crate::traits::MaskStrategy::Hash)
+        );
+
+        // prod env: overrides win.
+        let prod = cfg.resolve_mask_for_env(Some("prod"));
+        assert_eq!(
+            prod.get("pii").copied(),
+            Some(crate::traits::MaskStrategy::None)
+        );
+        assert_eq!(
+            prod.get("confidential").copied(),
+            Some(crate::traits::MaskStrategy::Partial)
+        );
+
+        // Non-matching env ignores the override table.
+        let staging = cfg.resolve_mask_for_env(Some("staging"));
+        assert_eq!(
+            staging.get("pii").copied(),
+            Some(crate::traits::MaskStrategy::Hash)
+        );
+    }
+
+    #[test]
+    fn parse_mask_env_override_only_adds_keys_for_its_env() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [mask]
+            pii = "hash"
+
+            [mask.prod]
+            confidential = "partial"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+
+        // prod inherits defaults AND gets override-only keys.
+        let prod = cfg.resolve_mask_for_env(Some("prod"));
+        assert_eq!(
+            prod.get("pii").copied(),
+            Some(crate::traits::MaskStrategy::Hash),
+            "prod should inherit the default pii"
+        );
+        assert_eq!(
+            prod.get("confidential").copied(),
+            Some(crate::traits::MaskStrategy::Partial),
+            "prod should gain confidential from its override"
+        );
+
+        // default env (None) only has the scalar default.
+        let default = cfg.resolve_mask_for_env(None);
+        assert!(!default.contains_key("confidential"));
+    }
+
+    #[test]
+    fn parse_mask_rejects_unknown_strategy() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [mask]
+            pii = "scramble"
+        "#;
+        let err =
+            toml::from_str::<RockyConfig>(toml_str).expect_err("unknown strategy should fail");
+        assert!(
+            err.to_string().contains("scramble") || err.to_string().contains("unknown variant"),
+            "expected error to mention bad strategy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_mask_empty_block_resolves_to_empty_map() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [mask]
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.resolve_mask_for_env(None).is_empty());
+        assert!(cfg.resolve_mask_for_env(Some("prod")).is_empty());
+    }
+
+    #[test]
+    fn parse_classifications_allow_unmasked() {
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [classifications]
+            allow_unmasked = ["internal", "lineage_only"]
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.classifications.allow_unmasked,
+            vec!["internal".to_string(), "lineage_only".to_string()]
+        );
+    }
+
+    #[test]
+    fn rocky_config_default_omits_mask_and_classifications() {
+        // Zero-config contract: no [mask] / [classifications] block means
+        // both fields are empty. This is the shipping default.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.mask.is_empty());
+        assert!(cfg.classifications.allow_unmasked.is_empty());
     }
 }

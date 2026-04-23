@@ -485,6 +485,21 @@
       },
       "type": "object"
     },
+    "ClassificationsConfig": {
+      "additionalProperties": false,
+      "description": "Advisory settings for column classification.\n\n```toml [classifications] allow_unmasked = [\"internal\"] ```\n\nAny classification tag listed in `allow_unmasked` suppresses the W004 \"tag has no masking strategy\" compiler warning. This is the escape hatch for teams that want to tag columns for discovery/lineage without requiring a matching `[mask]` strategy for every tag.",
+      "properties": {
+        "allow_unmasked": {
+          "default": [],
+          "description": "Classification tags that are allowed to appear in a model's `[classification]` block without a corresponding `[mask]` strategy.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "CompositeKind": {
       "description": "Kind of composite (multi-column) assertion.",
       "oneOf": [
@@ -1084,6 +1099,59 @@
         "schema"
       ],
       "type": "object"
+    },
+    "MaskEntry": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MaskStrategy"
+            }
+          ],
+          "description": "Default masking strategy for a classification tag."
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/definitions/MaskStrategy"
+          },
+          "description": "Per-env override map: `[mask.<env>]` section with `<classification> = \"<strategy>\"` pairs.",
+          "type": "object"
+        }
+      ],
+      "description": "One entry in the top-level `[mask]` block. A scalar value (`pii = \"hash\"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = \"none\"`) overrides strategies for a specific environment.\n\nSerde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `\"mask\"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for."
+    },
+    "MaskStrategy": {
+      "description": "Column-masking strategy applied to a classified column at materialization time.\n\nRocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.\n\nSerialized in lowercase to match the TOML spelling (`\"hash\"`, `\"redact\"`, `\"partial\"`, `\"none\"`).",
+      "oneOf": [
+        {
+          "description": "SHA-256 hex digest of the column value. Deterministic, one-way.",
+          "enum": [
+            "hash"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Replace the column value with the literal string `'***'`.",
+          "enum": [
+            "redact"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Keep the first and last two characters; replace the middle with `***`. Short values (<5 chars) are fully replaced with `'***'`.",
+          "enum": [
+            "partial"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Explicit identity — no masking applied. Useful as a per-env override to \"unmask\" a column that defaults to masked at the workspace level.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "MetadataColumnConfig": {
       "additionalProperties": false,
@@ -2700,6 +2768,17 @@
       },
       "description": "Project-level cache configuration. Arc 7 wave 2 wave-2 introduces `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`]."
     },
+    "classifications": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ClassificationsConfig"
+        }
+      ],
+      "default": {
+        "allow_unmasked": []
+      },
+      "description": "Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings."
+    },
     "cost": {
       "allOf": [
         {
@@ -2724,6 +2803,14 @@
         "webhooks": {}
       },
       "description": "Shell hooks configuration."
+    },
+    "mask": {
+      "additionalProperties": {
+        "$ref": "#/definitions/MaskEntry"
+      },
+      "default": {},
+      "description": "Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:\n\n```toml [mask] pii = \"hash\"            # default strategy for \"pii\" classification confidential = \"redact\" # default strategy for \"confidential\"\n\n[mask.prod] pii = \"none\"            # prod override: do not mask pii confidential = \"partial\" ```\n\nResolved per model at apply time via [`RockyConfig::resolve_mask_for_env`].",
+      "type": "object"
     },
     "pipeline": {
       "allOf": [

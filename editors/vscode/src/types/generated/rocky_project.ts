@@ -38,6 +38,24 @@ export type BudgetBreachAction = "warn" | "error";
 export type WebhookConfigOrList = WebhookConfig | WebhookConfig[];
 export type FailureAction = "abort" | "warn" | "ignore";
 /**
+ * One entry in the top-level `[mask]` block. A scalar value (`pii = "hash"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = "none"`) overrides strategies for a specific environment.
+ *
+ * Serde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `"mask"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for.
+ */
+export type MaskEntry =
+  | MaskStrategy
+  | {
+      [k: string]: MaskStrategy;
+    };
+/**
+ * Column-masking strategy applied to a classified column at materialization time.
+ *
+ * Rocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.
+ *
+ * Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`, `"partial"`, `"none"`).
+ */
+export type MaskStrategy = "hash" | "redact" | "partial" | "none";
+/**
  * Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.
  *
  * The flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants.
@@ -302,6 +320,10 @@ export interface RockyConfig {
    */
   cache?: CacheConfig;
   /**
+   * Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings.
+   */
+  classifications?: ClassificationsConfig;
+  /**
    * Cost estimation configuration.
    */
   cost?: CostSection;
@@ -309,6 +331,18 @@ export interface RockyConfig {
    * Shell hooks configuration.
    */
   hook?: HooksConfig;
+  /**
+   * Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:
+   *
+   * ```toml [mask] pii = "hash"            # default strategy for "pii" classification confidential = "redact" # default strategy for "confidential"
+   *
+   * [mask.prod] pii = "none"            # prod override: do not mask pii confidential = "partial" ```
+   *
+   * Resolved per model at apply time via [`RockyConfig::resolve_mask_for_env`].
+   */
+  mask?: {
+    [k: string]: MaskEntry;
+  };
   /**
    * Named pipeline configurations (keyed by pipeline name).
    */
@@ -497,6 +531,19 @@ export interface SchemaCacheConfig {
    * TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.
    */
   ttl_seconds?: number;
+}
+/**
+ * Advisory settings for column classification.
+ *
+ * ```toml [classifications] allow_unmasked = ["internal"] ```
+ *
+ * Any classification tag listed in `allow_unmasked` suppresses the W004 "tag has no masking strategy" compiler warning. This is the escape hatch for teams that want to tag columns for discovery/lineage without requiring a matching `[mask]` strategy for every tag.
+ */
+export interface ClassificationsConfig {
+  /**
+   * Classification tags that are allowed to appear in a model's `[classification]` block without a corresponding `[mask]` strategy.
+   */
+  allow_unmasked?: string[];
 }
 /**
  * Cost estimation configuration.
