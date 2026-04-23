@@ -1611,15 +1611,22 @@ impl ResolvedStatePath {
 ///    This keeps `rocky --state-path <file>` a hard override.
 /// 2. `<models_dir>/.rocky-state.redb` exists — use it, no warning.
 ///    New projects and users who already migrated land here.
-/// 3. CWD `.rocky-state.redb` exists — use it, return a deprecation
-///    warning. This is the legacy layout; the caller is responsible for
-///    surfacing the warning (CLI prints to stderr, LSP logs it).
+/// 3. CWD `.rocky-state.redb` exists — use it. Emit a deprecation
+///    warning when `models_dir` is a real directory (the caller can
+///    act on it); stay silent for replication-only / quality-only
+///    pipelines that have no `models/` directory at all (nothing to
+///    migrate to, and the LSP never attaches to those projects so
+///    there's no divergence to unify).
 /// 4. **Both** CWD and `<models_dir>/.rocky-state.redb` exist — use the
 ///    CWD file (the historical default that still holds the user's
 ///    watermarks and branch state) and return a louder warning asking
 ///    the user to reconcile. Merging is lossy, so we don't attempt it.
-/// 5. Neither exists — fresh project; default to
-///    `<models_dir>/.rocky-state.redb`, no warning.
+/// 5. Neither exists — fresh project. Default to
+///    `<models_dir>/.rocky-state.redb` when `models_dir` is a real
+///    directory; otherwise fall back to CWD `.rocky-state.redb`. The
+///    fallback keeps `rocky run` working for pipelines that legitimately
+///    don't have a `models/` directory (e.g. replication-only POCs)
+///    without requiring them to create one just to hold state.
 pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> ResolvedStatePath {
     if let Some(p) = explicit {
         return ResolvedStatePath {
@@ -1630,9 +1637,12 @@ pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> Resolve
 
     let models_state = models_dir.join(STATE_FILE_NAME);
     let cwd_state = std::path::PathBuf::from(STATE_FILE_NAME);
+    let has_models_dir = models_dir.is_dir();
 
     // Case 4: both exist. Prefer CWD so existing watermarks/branch state
-    // keep working, but shout about the ambiguity.
+    // keep working, but shout about the ambiguity. (Only reachable when
+    // `models_dir` is a real directory, since `models_state` lives
+    // inside it.)
     if cwd_state.exists() && models_state.exists() {
         return ResolvedStatePath {
             path: cwd_state,
@@ -1655,11 +1665,12 @@ pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> Resolve
         };
     }
 
-    // Case 3: legacy CWD fallback.
+    // Case 3: legacy CWD fallback. Only nudge the user to migrate when a
+    // real `models_dir` exists — without one, there's nowhere to move the
+    // file to and the warning would be pure noise.
     if cwd_state.exists() {
-        return ResolvedStatePath {
-            path: cwd_state,
-            warning: Some(format!(
+        let warning = if has_models_dir {
+            Some(format!(
                 "using legacy state file `{}` in the current directory. \
                  The canonical location is `{}`; move the file there to \
                  silence this warning. The CLI will keep honouring the \
@@ -1667,14 +1678,32 @@ pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> Resolve
                  removed in a future release.",
                 STATE_FILE_NAME,
                 models_state.display(),
-            )),
+            ))
+        } else {
+            None
+        };
+        return ResolvedStatePath {
+            path: cwd_state,
+            warning,
         };
     }
 
-    // Case 5: fresh project — pick the new default.
-    ResolvedStatePath {
-        path: models_state,
-        warning: None,
+    // Case 5: fresh project. Default to `<models_dir>/.rocky-state.redb`
+    // when the models directory exists; otherwise fall back to CWD so
+    // replication-only pipelines (no `models/`) still work out of the
+    // box. The LSP only attaches to projects with `.rocky` files (which
+    // implies a models dir), so the no-models path has no divergence to
+    // unify.
+    if has_models_dir {
+        ResolvedStatePath {
+            path: models_state,
+            warning: None,
+        }
+    } else {
+        ResolvedStatePath {
+            path: cwd_state,
+            warning: None,
+        }
     }
 }
 
@@ -3177,6 +3206,43 @@ mod tests {
             let resolved = resolve_state_path(None, &models);
             assert_eq!(resolved.path, models.join(STATE_FILE_NAME));
             assert!(resolved.warning.is_none());
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_fresh_project_without_models_dir_falls_back_to_cwd() {
+        // Replication-only / quality-only pipelines (and many POCs) have
+        // no `models/` directory. Case 5 must fall back to CWD rather
+        // than return a path whose parent doesn't exist — otherwise the
+        // next `rocky run` fails trying to open the state lock file.
+        // Regression for the drift POC fixture-regen failure on PR #238.
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models"); // deliberately NOT created
+        with_cwd(tmp.path(), || {
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(resolved.path, std::path::PathBuf::from(STATE_FILE_NAME));
+            assert!(
+                resolved.warning.is_none(),
+                "silent fallback — no models dir means nothing to migrate to"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_state_path_cwd_without_models_dir_is_silent() {
+        // Follow-on from the case above: if a legacy CWD state file
+        // already exists AND there's no `models/` directory, the
+        // deprecation warning has no useful target. Stay quiet.
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models"); // deliberately NOT created
+        with_cwd(tmp.path(), || {
+            std::fs::File::create(STATE_FILE_NAME).unwrap();
+            let resolved = resolve_state_path(None, &models);
+            assert_eq!(resolved.path, std::path::PathBuf::from(STATE_FILE_NAME));
+            assert!(
+                resolved.warning.is_none(),
+                "no models dir → no migration nudge"
+            );
         });
     }
 }
