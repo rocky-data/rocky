@@ -7,7 +7,7 @@ use rocky_compiler::compile::PhaseTimings;
 use rocky_compiler::diagnostic::Diagnostic;
 use rocky_observe::metrics::MetricsSnapshot;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use rocky_core::checks::CheckResult;
 
@@ -3134,4 +3134,117 @@ pub struct PerModelCostHistorical {
     /// `bytes_scanned`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// `rocky compliance` — governance compliance rollup (Wave B)
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky compliance`.
+///
+/// A thin rollup over Wave A governance: classification sidecars
+/// (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]`
+/// policy. Answers the question **"are all classified columns masked
+/// wherever policy says they should be?"** without making any warehouse
+/// calls — purely a static resolver over `rocky.toml` + model sidecars.
+///
+/// Consumers (CI gates, dagster) dispatch on the top-level `command` field
+/// (`"compliance"`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceOutput {
+    /// `CARGO_PKG_VERSION` at the time this payload was emitted.
+    pub version: String,
+    /// Always `"compliance"`. Consumers key dispatch off this field.
+    pub command: String,
+    /// Aggregate tallies over the full `per_column` / `exceptions` lists.
+    pub summary: ComplianceSummary,
+    /// One entry per `(model, column)` pair carrying a classification tag.
+    /// When `--exceptions-only` is set, this list is filtered to only the
+    /// pairs whose `envs` contain at least one exception.
+    pub per_column: Vec<ColumnClassificationStatus>,
+    /// The unmasked-where-expected list. An exception fires when a
+    /// classification tag has no resolved masking strategy **and** the tag
+    /// is not on the project-level `[classifications] allow_unmasked`
+    /// advisory list.
+    pub exceptions: Vec<ComplianceException>,
+}
+
+/// Aggregate counters for a compliance report.
+///
+/// All three counters are over `(model, column, env)` triples — so a
+/// single classified column evaluated across three envs contributes up to
+/// three to `total_classified`. This matches the granularity of
+/// `total_exceptions` and `total_masked`, keeping the invariant
+/// `total_classified = total_masked + total_exceptions + <allow_listed
+/// unresolved>` (the third term is not counted in either bucket, so it
+/// surfaces implicitly as the gap).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceSummary {
+    /// Total `(model, column, env)` triples across every classified
+    /// column in the project, expanded across the env enumeration.
+    pub total_classified: u64,
+    /// Triples where a masking strategy successfully resolved
+    /// (`enforced = true`). `MaskStrategy::None` ("explicit identity —
+    /// no masking") counts as masked here because the project has
+    /// deliberately opted out, which is a conscious policy decision
+    /// rather than an enforcement gap.
+    pub total_masked: u64,
+    /// Triples where no masking strategy resolved and the classification
+    /// tag is **not** on the `allow_unmasked` advisory list. Matches the
+    /// length of [`ComplianceOutput::exceptions`].
+    pub total_exceptions: u64,
+}
+
+/// Per-`(model, column)` report: the classification tag and the resolved
+/// masking status across every evaluated environment.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ColumnClassificationStatus {
+    /// Model name — matches `ModelConfig::name` (the `.toml` sidecar key
+    /// or the `.sql`/`.rocky` filename stem).
+    pub model: String,
+    /// Column name — the key under the model's `[classification]` block.
+    pub column: String,
+    /// Free-form classification tag (e.g., `"pii"`, `"confidential"`).
+    /// The engine does not enum-constrain these — projects coin tags as
+    /// needed.
+    pub classification: String,
+    /// One entry per evaluated environment. When `--env X` is set, this
+    /// is a single-element list labeled `"X"`. When unset, it expands
+    /// across the union of the defaults (labeled `"default"`) and every
+    /// named `[mask.<env>]` override block.
+    pub envs: Vec<EnvMaskingStatus>,
+}
+
+/// Masking status for one `(model, column, env)` triple.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvMaskingStatus {
+    /// Environment label. `"default"` when the row came from the
+    /// unscoped `[mask]` block; otherwise the name of the matching
+    /// `[mask.<env>]` override, or the raw `--env` value.
+    pub env: String,
+    /// Resolved masking strategy. One of `"hash"`, `"redact"`,
+    /// `"partial"`, `"none"`, or `"unresolved"` when no strategy
+    /// applies to this classification tag in this env.
+    pub masking_strategy: String,
+    /// `true` iff `masking_strategy != "unresolved"`. Allow-listed tags
+    /// (on `[classifications] allow_unmasked`) still report
+    /// `enforced = false` — the allow list only suppresses the
+    /// [`ComplianceException`] emission, not the underlying fact that
+    /// no strategy resolved.
+    pub enforced: bool,
+}
+
+/// A single compliance exception — a classified column with no resolved
+/// masking strategy in some environment, and whose classification tag is
+/// **not** on the advisory allow list.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceException {
+    pub model: String,
+    pub column: String,
+    pub env: String,
+    /// Human-readable explanation. Always of the shape
+    /// `"no masking strategy resolves for classification tag '<tag>'"`
+    /// in v1; future variants (e.g., adapter-specific violations) may
+    /// widen this.
+    pub reason: String,
 }
