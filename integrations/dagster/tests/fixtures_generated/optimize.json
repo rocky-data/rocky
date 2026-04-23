@@ -1,13 +1,13 @@
 {
-  "version": "1.15.0",
+  "version": "0.0.0-SENTINEL",
   "command": "optimize",
   "recommendations": [
     {
       "model_name": "orders",
       "current_strategy": "table",
-      "recommended_strategy": "table",
+      "recommended_strategy": "ephemeral",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "insufficient history: 2 runs (need 5)",
+      "reasoning": "fast execution (0.0s) with 0 downstream consumer(s); inline into consumer query to eliminate materialization overhead",
       "compute_cost_per_run": 0.0,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 0

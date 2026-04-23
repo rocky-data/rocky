@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-04-23
+
+Tracks engine 1.16.0 (governance waveplan). New `ComplianceOutput` + `RetentionStatusOutput` Pydantic models, extended `RockyOutput` union, regenerated bindings for classification / masking / role-graph / retention config surfaces.
+
+### Added
+
+- **`ComplianceOutput` and its subtypes** (`ComplianceSummary`, `ColumnClassificationStatus`, `EnvMaskingStatus`, `ComplianceException`) re-exported from the generated barrel (engine [#242](https://github.com/rocky-data/rocky/pull/242)). `parse_rocky_output()` dispatches `"compliance"` → `ComplianceOutput`; the output joins the `RockyOutput` union.
+- **`RetentionStatusOutput` + `ModelRetentionStatus`** re-exported from the generated barrel (engine [#244](https://github.com/rocky-data/rocky/pull/244)). `parse_rocky_output()` dispatches `"retention-status"` → `RetentionStatusOutput`; the output joins the `RockyOutput` union. `ModelRetentionStatus.warehouse_days` is `Optional[int]` and always `None` in v1 — the engine's `--drift` warehouse probe is a v2 follow-up; the schema is stable.
+
+### Changed
+
+- **Generated types refreshed** for engine 1.16.0:
+  - `RunRecord` (history output) gains the 8-field governance audit trail: `triggering_identity` / `session_source` (`Cli` / `Dagster` / `Lsp` / `HttpApi`) / `git_commit` / `git_branch` / `idempotency_key` / `target_catalog` / `hostname` / `rocky_version` (engine [#240](https://github.com/rocky-data/rocky/pull/240)).
+  - `rocky-project.schema.json` regenerated — `ModelConfig` now surfaces `classification: dict[str, str]` + `retention: RetentionPolicy | None`; `RockyConfig` surfaces `mask: dict[str, MaskEntry]`, `classifications: ClassificationsConfig`, `roles: dict[str, RoleConfig]`.
+  - `MaskStrategy` enum surfaced in the project schema (`hash` / `redact` / `partial` / `none`).
+
 ## [1.11.0] — 2026-04-23
 
 Tracks engine 1.15.0. Adds the `idempotency_key` kwarg to every `RockyResource` run method (wraps FR-004). One PR since v1.10.0.
