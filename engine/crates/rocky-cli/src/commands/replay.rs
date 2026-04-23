@@ -156,6 +156,14 @@ mod tests {
             models_executed,
             trigger: RunTrigger::Manual,
             config_hash: "cfghash".to_string(),
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "replay-test-host".to_string(),
+            rocky_version: "0.0.0-test".to_string(),
         }
     }
 

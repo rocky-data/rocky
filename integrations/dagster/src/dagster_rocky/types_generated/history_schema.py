@@ -20,21 +20,55 @@ class RunModelRecord(BaseModel):
 class RunHistoryRecord(BaseModel):
     """
     One run from the state store, mirroring `rocky_core::state::RunRecord` with serializable field types (no enums or non-JSON-friendly Rust types).
+
+    The governance audit fields (`triggering_identity`, `session_source`, `git_commit`, `git_branch`, `idempotency_key`, `target_catalog`, `hostname`, `rocky_version`) are only populated in the `rocky history --audit` shape; the default shape continues to emit just the existing 7 fields. The `#[serde(skip_serializing_if = "…")]` attributes keep the default payload byte-identical to schema v5 unless `--audit` flips the fields on.
     """
 
     duration_ms: conint(ge=0)
     """
     Duration in milliseconds (`finished_at - started_at`).
     """
+    git_branch: str | None = None
+    """
+    `git symbolic-ref --short HEAD` at claim time, or `None` on detached HEAD.
+    """
+    git_commit: str | None = None
+    """
+    `git rev-parse HEAD` at claim time.
+    """
+    hostname: str | None = None
+    """
+    Machine hostname that produced the run.
+    """
+    idempotency_key: str | None = None
+    """
+    The `--idempotency-key` value supplied to `rocky run`, if any.
+    """
     models: list[RunModelRecord]
     """
     Per-model execution details for this run.
     """
     models_executed: conint(ge=0)
+    rocky_version: str | None = None
+    """
+    `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.
+    """
     run_id: str
+    session_source: str | None = None
+    """
+    Session origin — `"cli"`, `"dagster"`, `"lsp"`, or `"http_api"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.
+    """
     started_at: AwareDatetime
     status: str
+    target_catalog: str | None = None
+    """
+    Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.
+    """
     trigger: str
+    triggering_identity: str | None = None
+    """
+    Resolved caller identity (Unix `$USER` / Windows `$USERNAME`). `None` in CI / container contexts where no human caller is discernible.
+    """
 
 
 class HistoryOutput(BaseModel):

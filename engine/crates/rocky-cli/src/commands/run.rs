@@ -27,6 +27,7 @@ use crate::output::*;
 use crate::registry::{self, AdapterRegistry};
 use crate::schema_cache_writer::{SchemaCacheWriteTap, persist_batch_describe};
 
+use super::run_audit::AuditContext;
 use super::{matches_filter, parse_filter, parsed_to_json_map};
 
 /// Accumulated check results for a table, assembled after batched execution.
@@ -233,12 +234,31 @@ impl<'a> ExecutionContext<'a> {
 /// succeeded (or not) by the time we reach here; a state-store write
 /// failure must not flip the exit code. Matches the resilience posture
 /// of state_sync aborts elsewhere in this file.
+/// Convert the CLI-level [`AuditContext`] into the output-layer
+/// [`RunRecordAudit`] bundle. Kept as a free fn (not a `From` impl) so
+/// `run_audit` stays free of a dependency on `crate::output` — the
+/// audit module is pure environment-probing with no JSON-schema
+/// surface.
+fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
+    RunRecordAudit {
+        triggering_identity: ctx.triggering_identity.clone(),
+        session_source: ctx.session_source,
+        git_commit: ctx.git_commit.clone(),
+        git_branch: ctx.git_branch.clone(),
+        idempotency_key: ctx.idempotency_key.clone(),
+        target_catalog: ctx.target_catalog.clone(),
+        hostname: ctx.hostname.clone(),
+        rocky_version: ctx.rocky_version.clone(),
+    }
+}
+
 fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
     run_id: &str,
     started_at: DateTime<Utc>,
     config_hash: &str,
+    audit: &RunRecordAudit,
 ) {
     let Some(store) = state_store else {
         return;
@@ -252,6 +272,7 @@ fn persist_run_record(
         config_hash.to_string(),
         rocky_core::state::RunTrigger::Manual,
         status,
+        audit.clone(),
     );
     if let Err(e) = store.record_run(&record) {
         warn!(
@@ -829,12 +850,23 @@ pub async fn run(
         // Persist the model-only RunRecord. `rocky replay <run_id>` + cost
         // queries work against per-asset materializations the same way as
         // full-pipeline runs.
+        //
+        // Audit context: model-only runs have no single target catalog
+        // (we don't know which pipeline's templates are in scope), so
+        // `target_catalog = None`. Every other audit field populates
+        // normally.
+        let audit_ctx = AuditContext::detect(
+            idempotency_ctx.as_ref().map(|c| c.key.clone()),
+            None,
+        );
+        let audit = audit_to_record(&audit_ctx);
         persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
             started_at,
             &config_hash,
+            &audit,
         );
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -939,6 +971,21 @@ pub async fn run(
     let pipeline = pipeline_config
         .as_replication()
         .context("expected replication pipeline")?;
+
+    // Build the governance audit context once, at the top of the
+    // replication path. Every `persist_run_record` call site (happy
+    // exit, interrupted exit) pulls from the same bundle so a single
+    // `rocky run` invocation produces a consistent stamp across all
+    // terminal branches. For replication pipelines the target catalog
+    // is templated (`{client}`, etc.) and resolves per-table — we
+    // record the literal template string here as the "best available
+    // at claim time" answer; per-table resolutions remain on each
+    // `ModelExecution`.
+    let audit_ctx = AuditContext::detect(
+        idempotency_ctx.as_ref().map(|c| c.key.clone()),
+        Some(pipeline.target.catalog_template.clone()),
+    );
+    let audit = audit_to_record(&audit_ctx);
 
     // All adapters flow through this production-grade execution path.
     // Databricks-specific batch optimizations (batch describe, batch tagging,
@@ -2152,6 +2199,7 @@ pub async fn run(
                 &shared_run_id,
                 started_at,
                 &config_hash,
+                &audit,
             );
             finalize_idempotency(
                 &mut idempotency_ctx,
@@ -2778,6 +2826,7 @@ pub async fn run(
         &run_id,
         started_at,
         &config_hash,
+        &audit,
     );
     finalize_idempotency(
         &mut idempotency_ctx,

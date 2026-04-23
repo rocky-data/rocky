@@ -45,6 +45,11 @@ large_enum_variant = "warn"
 # Async traits
 async-trait = "0.1"
 
+# Machine hostname detection for governance audit trail
+# (portable across Linux/macOS/Windows — std::env::var("HOSTNAME")
+# is Linux-only and unset on macOS by default).
+hostname = "0.4"
+
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
