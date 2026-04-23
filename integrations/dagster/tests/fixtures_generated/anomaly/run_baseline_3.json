@@ -1,6 +1,7 @@
 {
   "version": "1.14.0",
   "command": "run",
+  "status": "Success",
   "pipeline_type": "replication",
   "filter": "source=events",
   "duration_ms": 0,
