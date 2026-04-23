@@ -604,3 +604,126 @@ async fn test_bearer_token_sent() {
     connector.execute_statement("SELECT 1").await.unwrap();
     // If the headers didn't match, the mock would not have responded with 200
 }
+
+// ---------------------------------------------------------------------------
+// Retention policy (Wave C-2)
+// ---------------------------------------------------------------------------
+
+/// `apply_retention_policy` on Snowflake compiles to
+/// `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = <N>`.
+#[tokio::test]
+async fn test_apply_retention_policy_emits_alter_table() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(
+            "ALTER TABLE TEST_DB.RAW.EVENTS SET DATA_RETENTION_TIME_IN_DAYS = 90",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-retention",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let table = TableRef {
+        catalog: "TEST_DB".into(),
+        schema: "RAW".into(),
+        table: "EVENTS".into(),
+    };
+    governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 90 })
+        .await
+        .expect("apply_retention_policy should succeed");
+}
+
+/// A 365-day retention (1y) flows through as the same DDL — the
+/// adapter layer never sees the `"1y"` string.
+#[tokio::test]
+async fn test_apply_retention_policy_year_equivalent() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("DATA_RETENTION_TIME_IN_DAYS = 365"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-retention-365",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let table = TableRef {
+        catalog: "DB".into(),
+        schema: "S".into(),
+        table: "T".into(),
+    };
+    governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 365 })
+        .await
+        .unwrap();
+}
+
+/// Snowflake rejects values outside the account's edition cap — simulate
+/// a 400 response and verify the error surfaces as AdapterError so the
+/// runtime can warn!.
+#[tokio::test]
+async fn test_apply_retention_policy_cap_exceeded_surfaces_error() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::retention::RetentionPolicy;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "code": "100097",
+            "message": "Data retention time in days exceeds maximum allowed."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let table = TableRef {
+        catalog: "DB".into(),
+        schema: "S".into(),
+        table: "T".into(),
+    };
+    let err = governance
+        .apply_retention_policy(&table, &RetentionPolicy { duration_days: 999 })
+        .await
+        .unwrap_err();
+    assert!(
+        !err.to_string().is_empty(),
+        "expected a non-empty AdapterError surface"
+    );
+}

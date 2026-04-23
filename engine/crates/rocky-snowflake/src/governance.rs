@@ -6,21 +6,23 @@
 //!
 //! ## Snowflake SQL mapping
 //!
-//! | Trait method       | Snowflake SQL                                                   |
-//! |--------------------|-----------------------------------------------------------------|
-//! | `set_tags`         | `ALTER DATABASE/SCHEMA/TABLE ... SET TAG key = 'value'`         |
-//! | `get_grants`       | `SHOW GRANTS ON DATABASE/SCHEMA ...`                            |
-//! | `apply_grants`     | `GRANT <priv> ON DATABASE/SCHEMA ... TO ROLE <role>`            |
-//! | `revoke_grants`    | `REVOKE <priv> ON DATABASE/SCHEMA ... FROM ROLE <role>`         |
-//! | `bind_workspace`   | No-op (not supported)                                           |
-//! | `set_isolation`    | No-op (not supported)                                           |
+//! | Trait method              | Snowflake SQL                                                   |
+//! |---------------------------|-----------------------------------------------------------------|
+//! | `set_tags`                | `ALTER DATABASE/SCHEMA/TABLE ... SET TAG key = 'value'`         |
+//! | `get_grants`              | `SHOW GRANTS ON DATABASE/SCHEMA ...`                            |
+//! | `apply_grants`            | `GRANT <priv> ON DATABASE/SCHEMA ... TO ROLE <role>`            |
+//! | `revoke_grants`           | `REVOKE <priv> ON DATABASE/SCHEMA ... FROM ROLE <role>`         |
+//! | `bind_workspace`          | No-op (not supported)                                           |
+//! | `set_isolation`           | No-op (not supported)                                           |
+//! | `apply_retention_policy`  | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = <N>`         |
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use tracing::debug;
 
-use rocky_core::ir::{Grant, GrantTarget, Permission};
+use rocky_core::ir::{Grant, GrantTarget, Permission, TableRef};
+use rocky_core::retention::RetentionPolicy;
 use rocky_core::traits::{AdapterError, AdapterResult, GovernanceAdapter, TagTarget};
 use rocky_sql::validation;
 
@@ -156,6 +158,35 @@ impl GovernanceAdapter for SnowflakeGovernanceAdapter<'_> {
         // Snowflake does not support workspace binding removal.
         Ok(())
     }
+
+    /// Applies `DATA_RETENTION_TIME_IN_DAYS` on the target table.
+    ///
+    /// Snowflake caps the retention period by edition — 90 days on Standard,
+    /// 365 on Enterprise+ — and enforces the cap server-side. Rocky emits
+    /// the DDL unconditionally and lets Snowflake surface the error if the
+    /// requested value exceeds the account's cap; this keeps the adapter
+    /// free of account-introspection logic and aligned with the "warehouse
+    /// is the source of truth" principle applied elsewhere.
+    async fn apply_retention_policy(
+        &self,
+        table: &TableRef,
+        retention: &RetentionPolicy,
+    ) -> AdapterResult<()> {
+        let sql = format_set_retention_sql(table, retention.duration_days)?;
+        debug!(
+            catalog = %table.catalog,
+            schema = %table.schema,
+            table = %table.table,
+            duration_days = retention.duration_days,
+            sql = sql.as_str(),
+            "setting Snowflake data retention"
+        );
+        self.connector
+            .execute_statement(&sql)
+            .await
+            .map(|_| ())
+            .map_err(AdapterError::new)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +291,22 @@ fn format_grant_target(target: &GrantTarget) -> AdapterResult<String> {
 fn format_role(name: &str) -> AdapterResult<String> {
     validation::validate_principal(name).map_err(AdapterError::new)?;
     Ok(format!("\"{name}\""))
+}
+
+/// Formats `ALTER TABLE <db>.<schema>.<table> SET DATA_RETENTION_TIME_IN_DAYS = <N>`.
+///
+/// Identifiers are validated against Rocky's SQL identifier allowlist before
+/// interpolation — never `format!` on unvalidated input.
+fn format_set_retention_sql(table: &TableRef, duration_days: u32) -> AdapterResult<String> {
+    validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+    validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
+    validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+    Ok(format!(
+        "ALTER TABLE {cat}.{sch}.{tbl} SET DATA_RETENTION_TIME_IN_DAYS = {duration_days}",
+        cat = table.catalog,
+        sch = table.schema,
+        tbl = table.table,
+    ))
 }
 
 /// Maps Rocky [`Permission`] variants to Snowflake privilege names.
@@ -551,5 +598,78 @@ mod tests {
     fn test_show_grants_invalid_identifier_rejected() {
         let result = format_show_grants_sql(&GrantTarget::Catalog("bad;name".into()));
         assert!(result.is_err());
+    }
+
+    // ---- retention DDL ----
+
+    #[test]
+    fn test_format_set_retention_sql() {
+        let t = TableRef {
+            catalog: "warehouse".into(),
+            schema: "raw".into(),
+            table: "events".into(),
+        };
+        let sql = format_set_retention_sql(&t, 90).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE warehouse.raw.events SET DATA_RETENTION_TIME_IN_DAYS = 90"
+        );
+    }
+
+    #[test]
+    fn test_format_set_retention_sql_year_equivalent() {
+        let t = TableRef {
+            catalog: "wh".into(),
+            schema: "raw".into(),
+            table: "t".into(),
+        };
+        // Rocky's grammar converts `"1y"` to 365 days at parse time; the
+        // adapter only ever sees the flattened day count.
+        let sql = format_set_retention_sql(&t, 365).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE wh.raw.t SET DATA_RETENTION_TIME_IN_DAYS = 365"
+        );
+    }
+
+    #[test]
+    fn test_format_set_retention_rejects_invalid_identifier() {
+        let t = TableRef {
+            catalog: "DROP TABLE;".into(),
+            schema: "raw".into(),
+            table: "t".into(),
+        };
+        assert!(format_set_retention_sql(&t, 90).is_err());
+
+        let t = TableRef {
+            catalog: "w".into(),
+            schema: "sch ema".into(),
+            table: "t".into(),
+        };
+        assert!(format_set_retention_sql(&t, 90).is_err());
+
+        let t = TableRef {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: "t' --".into(),
+        };
+        assert!(format_set_retention_sql(&t, 90).is_err());
+    }
+
+    #[test]
+    fn test_format_set_retention_large_value() {
+        // Snowflake Enterprise accepts up to 365; Rocky doesn't cap the
+        // value because the cap is edition-specific. The DDL still emits
+        // cleanly — Snowflake will reject at execute time if too large.
+        let t = TableRef {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let sql = format_set_retention_sql(&t, 1000).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE w.s.t SET DATA_RETENTION_TIME_IN_DAYS = 1000"
+        );
     }
 }
