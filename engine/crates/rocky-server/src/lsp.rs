@@ -412,9 +412,11 @@ impl RockyLsp {
     /// `CompilerConfig.source_schemas`. Mirrors
     /// `rocky-cli::source_schemas::load_cached_source_schemas` but (a)
     /// reuses the LSP's per-session throttle so the info log doesn't fire
-    /// on every recompile, and (b) resolves the state file relative to
-    /// `models_dir` (same convention as `api.rs`, `dashboard.rs`, and
-    /// `state::ServerState`).
+    /// on every recompile, and (b) resolves the state file via
+    /// [`rocky_core::state::resolve_state_path`] so the LSP observes the
+    /// same file the CLI writes to — unified default
+    /// `<models>/.rocky-state.redb` with the legacy CWD fallback for
+    /// existing projects.
     ///
     /// Honours `[cache.schemas]` from the project's `rocky.toml` (found
     /// one level above `models_dir` — the same `<root>/models` layout the
@@ -442,7 +444,11 @@ impl RockyLsp {
             return HashMap::new();
         }
 
-        let state_path = models_dir.join(".rocky-state.redb");
+        let resolved = rocky_core::state::resolve_state_path(None, models_dir);
+        if let Some(ref w) = resolved.warning {
+            tracing::debug!(target: "rocky::state_path", "{w}");
+        }
+        let state_path = resolved.path;
         if !state_path.exists() {
             return HashMap::new();
         }

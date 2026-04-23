@@ -113,7 +113,7 @@ async fn gather_project_info(state: &ServerState) -> ProjectInfo {
 
     // Read last run from state store.
     let last_run = {
-        let state_path = state.models_dir.join(".rocky-state.redb");
+        let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
         if state_path.exists() {
             rocky_core::state::StateStore::open_read_only(&state_path)
                 .ok()

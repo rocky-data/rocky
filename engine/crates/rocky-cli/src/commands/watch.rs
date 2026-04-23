@@ -100,13 +100,19 @@ pub async fn run_watch(
 /// Run compile and print the result. Errors are printed, not propagated,
 /// so the watch loop continues after a failed compilation.
 fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_json: bool) {
-    // Watch doesn't take a state_path arg today; default to the same
-    // location `main.rs` does (`.rocky-state.redb` in CWD). Arc 7 wave 2
-    // wave-2: if the file doesn't exist (fresh project, no runs yet) the
-    // cache loader gracefully returns an empty map.
+    // Watch doesn't take a `--state-path` arg today; resolve via the
+    // unified helper so the compile-time schema-cache read sees the same
+    // file that `rocky run` and the LSP see. Fresh projects with no
+    // runs yet still land on the new default
+    // `<models>/.rocky-state.redb` and the cache loader gracefully
+    // returns an empty map.
+    let resolved = rocky_core::state::resolve_state_path(None, models_dir);
+    if let Some(ref w) = resolved.warning {
+        warn!(target: "rocky::state_path", "{w}");
+    }
     match run_compile(
         None,
-        Path::new(".rocky-state.redb"),
+        &resolved.path,
         models_dir,
         contracts_dir,
         None,

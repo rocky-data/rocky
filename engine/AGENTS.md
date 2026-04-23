@@ -60,7 +60,7 @@ rocky compare                        # Shadow vs production comparison
 rocky drift                          # Schema drift detection
 ```
 
-Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `--state-path` (default: `.rocky-state.redb`)
+Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `--state-path` (default: `models/.rocky-state.redb`; an existing `.rocky-state.redb` in the current directory still works and emits a one-time deprecation warning)
 
 ## Project Structure
 
