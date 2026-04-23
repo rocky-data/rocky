@@ -180,8 +180,10 @@ pub fn run_history(
         };
 
         if output_json {
-            let runs: Vec<RunHistoryRecord> =
-                filtered.iter().map(|r| record_to_history(r, audit)).collect();
+            let runs: Vec<RunHistoryRecord> = filtered
+                .iter()
+                .map(|r| record_to_history(r, audit))
+                .collect();
             let output = HistoryOutput {
                 version: VERSION.to_string(),
                 command: "history".to_string(),
@@ -239,10 +241,7 @@ fn print_audit_table(runs: &[RunRecord]) {
     println!("{}", "-".repeat(100));
     for run in runs {
         let run_id = &run.run_id[..run.run_id.len().min(11)];
-        let identity = run
-            .triggering_identity
-            .as_deref()
-            .unwrap_or("-");
+        let identity = run.triggering_identity.as_deref().unwrap_or("-");
         let identity = if identity.len() > 17 {
             &identity[..17]
         } else {

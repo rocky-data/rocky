@@ -2371,9 +2371,7 @@ mod tests {
         let txn = store.db.begin_write().unwrap();
         {
             let mut table = txn.open_table(RUN_HISTORY).unwrap();
-            table
-                .insert("run-v5-via-redb", v5_blob.as_slice())
-                .unwrap();
+            table.insert("run-v5-via-redb", v5_blob.as_slice()).unwrap();
         }
         txn.commit().unwrap();
 

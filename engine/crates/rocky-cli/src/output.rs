@@ -2206,6 +2206,7 @@ impl RunOutput {
     /// [`rocky_core::state::RunRecordAudit`] bundle. Callers collect
     /// the fields once at claim time via
     /// `rocky_cli::commands::run_audit::AuditContext::detect`.
+    #[allow(clippy::too_many_arguments)]
     pub fn to_run_record(
         &self,
         run_id: &str,

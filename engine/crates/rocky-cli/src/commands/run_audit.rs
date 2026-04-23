@@ -64,10 +64,7 @@ impl AuditContext {
     ///   transformation/quality/snapshot/load pipelines it's the fully
     ///   resolved `target.catalog`. `None` on model-only runs where no
     ///   pipeline context exists.
-    pub fn detect(
-        idempotency_key: Option<String>,
-        target_catalog: Option<String>,
-    ) -> Self {
+    pub fn detect(idempotency_key: Option<String>, target_catalog: Option<String>) -> Self {
         Self {
             triggering_identity: detect_triggering_identity(),
             session_source: detect_session_source(),
