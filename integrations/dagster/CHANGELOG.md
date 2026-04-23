@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-04-23
+
+Tracks engine 1.15.0. Adds the `idempotency_key` kwarg to every `RockyResource` run method (wraps FR-004). One PR since v1.10.0.
+
+### Added
+
+- **`idempotency_key: str | None = None` kwarg** on `RockyResource.run()`, `run_streaming()`, and `run_pipes()` (engine [#235](https://github.com/rocky-data/rocky/pull/235), FR-004). Forwards to the CLI as `--idempotency-key <KEY>`. Defence-in-depth below Dagster's `run_key` — catches pod retries, Kafka re-delivery, webhook duplicates, and any duplicate sensor-tick that slipped past `run_key`.
+
+  When the key dedups, the returned `RunResult` surfaces `status = "SkippedIdempotent"` (or `"SkippedInFlight"`) and `skipped_by_run_id` carrying the prior or in-flight `run_id`. Downstream Dagster handlers can key off `result.status.startswith("Skipped")` to emit `AssetObservation` events instead of `MaterializeResult`s for the skip cases.
+
+  ⚠️ Keys are stored **verbatim** in the state store — do not put secrets in idempotency keys.
+
+### Changed
+
+- **Generated types refreshed** for engine 1.15.0: new `status: RunStatus` / `skipped_by_run_id: str | None` / `idempotency_key: str | None` fields on `RunResult`; `RunStatus` enum now includes `SkippedIdempotent` + `SkippedInFlight` variants alongside `Success` / `PartialFailure` / `Failure`. New `IdempotencyConfig` / `DedupPolicy` types surfacing the `[state.idempotency]` TOML block in the project schema.
+- **Regenerated fixtures** for all `run.json` / `run_*.json` test fixtures — every captured output now carries `"status": "Success"` (13 fixtures updated).
+
 ## [1.10.0] — 2026-04-23
 
 Tracks engine 1.14.0. Ships four GOLD-origin feature requests (Pipes execution mode, strict doctor on startup, `state_health()` accessor, `cost()` wiring) plus a sub-second `state_health()` follow-up. Four PRs since v1.9.0.

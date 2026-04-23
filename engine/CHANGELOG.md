@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-04-23
+
+Ships FR-004 `rocky run --idempotency-key` for state-store-backed run dedup across every state backend (Phase 1 local/valkey/tiered + Phase 2 S3 + Phase 3 GCS), plus a routine `rand` dependency bump. Two PRs since v1.14.0.
+
+### Added
+
+- **`rocky run --idempotency-key <KEY>`** (FR-004, [#235](https://github.com/rocky-data/rocky/pull/235)) — caller-supplied opaque key that dedups this run against prior runs with the same key. Three outcomes:
+  - **Seen, succeeded** (or any terminal status under `dedup_on = "any"`) → exit 0 with `status = "SkippedIdempotent"` and prior `run_id` surfaced as `skipped_by_run_id`. No work done.
+  - **Seen, in-flight within TTL** (another caller is running this key) → exit 0 with `status = "SkippedInFlight"` and the in-flight `run_id`.
+  - **Unseen** (or prior `InFlight` past TTL — treated as crashed-pod corpse via `AdoptStale`) → proceed normally, stamp `InFlight` at claim time, update to `Succeeded` / `Failed` at every terminal exit.
+
+  Works on all five state backends via each backend's native atomic primitive:
+
+  | Backend | Primitive |
+  |---|---|
+  | `local` | redb write-txn inside the existing `state.redb.lock` file lock |
+  | `valkey` / `tiered` | `SET NX EX` on `{prefix}:idempotency:<key>` |
+  | `s3` | `PutMode::Create` → `If-None-Match: "*"` on `PutObject` |
+  | `gcs` | `x-goog-if-generation-match: 0` precondition on `insertObject` |
+
+  Defence-in-depth below Dagster's `run_key` — catches pod retries, Kafka re-delivery, webhook duplicates, cron races. Works for non-Dagster callers (CI, cron, webhooks) equally. `--idempotency-key` + `--resume{,-latest}` is a clap-level error (resume is an explicit override). DAG sub-runs ignore the outer key so sibling pipelines don't short-circuit on a single stamp.
+
+- **New `[state.idempotency]` TOML block** — tuning knobs for the dedup subsystem. All fields are optional with the shown defaults:
+
+  ```toml
+  [state.idempotency]
+  retention_days = 30         # Stamp lifetime before GC
+  dedup_on = "success"        # "success" (default) | "any"
+  in_flight_ttl_hours = 24    # Stale-InFlight reaping window
+  ```
+
+- **New `IDEMPOTENCY_KEYS` redb table** + state-store schema version bump **4 → 5**. Additive migration (new table appears on first open at v5; no data shuffle). Deliberately NOT in `LOCAL_ONLY_TABLE_NAMES` — idempotency stamps must replicate on tiered backends so sibling pods see the same entry.
+
+- **`rocky-core::idempotency` module** — public surface for downstream consumers: `IdempotencyBackend::from_state_config`, `check_and_claim`, `finalize`, `sweep_expired`, plus `IdempotencyEntry` / `IdempotencyState` / `DedupPolicy` / `FinalOutcome` / `IdempotencyCheck` types.
+
+- **`ObjectStoreProvider::put_if_not_exists`** — atomic create-if-absent wrapper over `object_store::PutMode::Create`. Returns `PutIfNotExistsOutcome::{Created, AlreadyExists}`. Backs the S3 + GCS conditional-write paths but exposed on the provider directly so any caller needing the same primitive can use it.
+
+- **POC**: [`examples/playground/pocs/05-orchestration/09-idempotency-key/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration/09-idempotency-key) demonstrates the flag acceptance + short-circuit behaviour end-to-end.
+
+### Changed
+
+- **`RunStatus` enum** (`rocky-core/src/state.rs`) extended with `SkippedIdempotent` + `SkippedInFlight` variants; ripples through the codegen cascade to Pydantic + TypeScript via `schemars`.
+- **`RunOutput`** gains three fields: `status: RunStatus` (explicit — no longer derived-from-counts only), `skipped_by_run_id: Option<String>`, `idempotency_key: Option<String>` (echoed back for operator cross-reference in logs / `rocky history`).
+- **GC during state upload sweep** — expired idempotency stamps + stale `InFlight` corpses are swept inside `state_sync::upload_state_with_excluded_tables` (same post-run cadence as `schema_cache`); no new cron. Structured `swept_count` + `retention_days` + `in_flight_ttl_hours` fields on the tracing `info!` event.
+
+### Dependencies
+
+- **`rand` bumped from 0.8.5 → 0.8.6** ([#234](https://github.com/rocky-data/rocky/pull/234), dependabot).
+
+### Known follow-ups
+
+- **Error-path finalize (F1 in FR-004 plan §11).** A `rocky run` that errors before `persist_run_record()` leaves its `InFlight` entry until the 24h `in_flight_ttl_hours` sweep reaps it. Worst-case latency to retry a crashed run with the same key is 24h. Tighten via `run_inner()` extraction OR a `tokio::spawn`-based drop guard on `IdempotencyCtx`; dedicated follow-up PR.
+
 ## [1.14.0] — 2026-04-23
 
 Big batch of arcs shipping together: Arc 7 wave 2 wave-2 (cached DESCRIBE end-to-end), Arc 2 wave 3 (`bytes_scanned` plumbing → real $ cost on BigQuery + Databricks), three inbound governance / adapter feature requests (Unity Catalog workspace bindings, Fivetran connector metadata), plus a dedup of the retry backoff helper. Twelve engine PRs since v1.13.0.
