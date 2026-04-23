@@ -305,6 +305,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification,
+                retention: None,
             },
             sql: "SELECT 1".to_string(),
             file_path: format!("models/{name}.sql"),
