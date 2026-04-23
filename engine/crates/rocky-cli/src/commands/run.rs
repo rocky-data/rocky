@@ -451,17 +451,24 @@ async fn sweep_idempotency_best_effort(
 /// same exit paths as [`persist_run_record`] (every terminal branch of
 /// `rocky run`).
 ///
+/// One-shot: takes the ctx out of the `Option` on the first call so that
+/// the outer error-path wrapper in [`run`] doesn't re-finalize an already-
+/// stamped entry. (Without this, a `budget_result?` after a Succeeded
+/// finalize would trigger the wrapper to issue a Failed finalize, which
+/// under the default `dedup_on = "success"` policy would delete the
+/// Succeeded entry and incorrectly free the key for re-run. FR-004 F1.)
+///
 /// Swallows errors with a warn — state-store or Valkey flakiness here must
 /// not flip the exit code of an otherwise successful run. The worst case
 /// is a stale `InFlight` entry that the `in_flight_ttl_hours` sweep will
 /// eventually reap.
 async fn finalize_idempotency(
-    ctx: Option<&IdempotencyCtx>,
+    ctx_slot: &mut Option<IdempotencyCtx>,
     state_store: Option<&StateStore>,
     run_id: &str,
     output: &RunOutput,
 ) {
-    let Some(ctx) = ctx else {
+    let Some(ctx) = ctx_slot.take() else {
         return;
     };
     let outcome = match output.derive_run_status() {
@@ -486,6 +493,81 @@ async fn finalize_idempotency(
             idempotency_key = %ctx.key,
             run_id = run_id,
             "failed to finalize idempotency entry; key may remain InFlight until TTL sweep"
+        );
+    }
+}
+
+/// Finalize the idempotency entry as `Failed` on the error path of
+/// [`run`], used by the outer wrapper that catches any `?` / `bail!` that
+/// escapes the run body before the normal `finalize_idempotency` site
+/// runs.
+///
+/// Without this, a `rocky run --idempotency-key K` that bails with any
+/// error before [`persist_run_record`] (e.g. missing discovery adapter,
+/// state-store open failure, adapter auth, bad pipeline config) leaves
+/// the `InFlight` claim in place. The next retry with the same key then
+/// returns `skipped_in_flight` for up to `in_flight_ttl_hours` (default
+/// 24h) — the F1 follow-up to FR-004.
+///
+/// This helper opens its own `StateStore` because the body may have
+/// failed before one was successfully opened. Best-effort throughout —
+/// any error here is swallowed with a `warn!` so the original run error
+/// is the one that surfaces to the caller.
+async fn finalize_idempotency_on_error(
+    ctx_slot: &mut Option<IdempotencyCtx>,
+    state_path: &Path,
+    run_id: &str,
+) {
+    use rocky_core::idempotency::{FinalOutcome, IdempotencyBackend};
+    let Some(ctx) = ctx_slot.take() else {
+        return;
+    };
+    // For Local + mirrored Tiered, finalize needs an open state store.
+    // Pure Valkey / object-store backends don't — finalize dispatches
+    // on the backend enum itself.
+    let state_store = match ctx.backend {
+        IdempotencyBackend::Local
+        | IdempotencyBackend::Valkey {
+            mirror_to_redb: true,
+            ..
+        } => match StateStore::open(state_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    idempotency_key = %ctx.key,
+                    run_id = run_id,
+                    "failed to open state store to release idempotency claim on error; \
+                     key may remain InFlight until TTL sweep"
+                );
+                return;
+            }
+        },
+        _ => None,
+    };
+    if let Err(e) = ctx
+        .backend
+        .finalize(
+            state_store.as_ref(),
+            &ctx.key,
+            run_id,
+            FinalOutcome::Failed,
+            &ctx.config,
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            idempotency_key = %ctx.key,
+            run_id = run_id,
+            "failed to release idempotency claim on error path; \
+             key may remain InFlight until TTL sweep"
+        );
+    } else {
+        info!(
+            idempotency_key = %ctx.key,
+            run_id = run_id,
+            "released idempotency claim on error path; retry with the same key can proceed immediately"
         );
     }
 }
@@ -536,7 +618,7 @@ pub async fn run(
     let rocky_cfg_for_idemp = rocky_core::config::load_rocky_config(config_path).context(
         format!("failed to load config from {}", config_path.display()),
     )?;
-    let idempotency_ctx = match idempotency_key {
+    let mut idempotency_ctx = match idempotency_key {
         Some(key) => {
             match try_claim_idempotency(
                 &rocky_cfg_for_idemp.state,
@@ -553,6 +635,18 @@ pub async fn run(
         }
         None => None,
     };
+
+    // FR-004 F1: wrap the entire run body so that any `?` / `bail!` /
+    // early error return *after the claim* still releases the idempotency
+    // stamp. Without this wrapper, a run that errored before the existing
+    // `finalize_idempotency` sites would leave the `InFlight` claim in
+    // redb/Valkey/object-store until the 24h `in_flight_ttl_hours` sweep
+    // reaped it — so a retry with the same key returned `skipped_in_flight`
+    // for up to 24h instead of proceeding. The happy / interrupted /
+    // partial-failure paths each call `finalize_idempotency` which is
+    // one-shot (takes the ctx out of the `Option`); if that already fired,
+    // the wrapper's error-path finalize is a no-op.
+    let run_result: Result<()> = async {
 
     // OTLP metrics exporter (feature-gated). Auto-initialises when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
@@ -670,7 +764,7 @@ pub async fn run(
             &config_hash,
         );
         finalize_idempotency(
-            idempotency_ctx.as_ref(),
+            &mut idempotency_ctx,
             state_store.as_ref(),
             &run_id,
             &output,
@@ -1968,7 +2062,7 @@ pub async fn run(
                 &config_hash,
             );
             finalize_idempotency(
-                idempotency_ctx.as_ref(),
+                &mut idempotency_ctx,
                 Some(&state),
                 &shared_run_id,
                 &output,
@@ -2594,7 +2688,7 @@ pub async fn run(
         &config_hash,
     );
     finalize_idempotency(
-        idempotency_ctx.as_ref(),
+        &mut idempotency_ctx,
         state_store.as_ref(),
         &run_id,
         &output,
@@ -2692,7 +2786,24 @@ pub async fn run(
     // exits non-zero.
     budget_result?;
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    // FR-004 F1 error-path finalize. If the body returned `Err`, the
+    // claim is almost certainly still `InFlight` (the happy/interrupted/
+    // partial-failure sites all call `finalize_idempotency` which takes
+    // the ctx out). Release it so a retry with the same key proceeds
+    // immediately instead of waiting up to 24h for the TTL sweep. The
+    // one-shot semantics of `finalize_idempotency` guarantee we never
+    // over-write a Succeeded stamp with a Failed one here (which would
+    // delete the entry under `dedup_on = "success"` and silently strip
+    // the idempotency record of a genuinely-successful run).
+    if run_result.is_err() {
+        finalize_idempotency_on_error(&mut idempotency_ctx, state_path, &run_id).await;
+    }
+
+    run_result
 }
 
 /// Emit Dagster Pipes messages for every materialization, check, and
@@ -4342,5 +4453,177 @@ mod tests {
         let msg = log["params"]["message"].as_str().unwrap();
         assert!(msg.contains("acme.raw_orders"));
         assert!(msg.contains("add_column"));
+    }
+
+    // -----------------------------------------------------------------------
+    // FR-004 F1 — error-path idempotency finalize.
+    //
+    // These tests cover the guarantee that a `rocky run --idempotency-key K`
+    // which fails with any error *before* the existing happy-path
+    // `finalize_idempotency` site still releases its `InFlight` claim, so a
+    // retry with the same key proceeds immediately instead of waiting up to
+    // `in_flight_ttl_hours` (default 24h) for the sweep.
+    //
+    // We test `finalize_idempotency_on_error` directly because driving
+    // `run()` end-to-end through a contrived error path is substantially
+    // more setup than the guarantee requires — the helper is the single
+    // point of truth for the error-path release semantics.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn finalize_on_error_releases_inflight_claim_allowing_immediate_retry() {
+        use rocky_core::config::{DedupPolicy, IdempotencyConfig};
+        use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck, IdempotencyEntry};
+        use rocky_core::state::StateStore;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state_path = tmp.path().join("state.redb");
+
+        // --- Simulate run 1: claim the key, then crash before finalize. ---
+        let store = StateStore::open(&state_path).expect("open state store");
+        let key = "test-key-error-path";
+        let run_id_1 = "run-crashed-before-finalize";
+        let now = chrono::Utc::now();
+        let entry = IdempotencyEntry {
+            key: key.to_string(),
+            run_id: run_id_1.to_string(),
+            state: rocky_core::idempotency::IdempotencyState::InFlight,
+            stamped_at: now,
+            expires_at: now + chrono::Duration::hours(24),
+            dedup_on: DedupPolicy::Success,
+        };
+        let verdict = store
+            .idempotency_check_and_claim(&entry, now)
+            .expect("claim");
+        assert!(
+            matches!(verdict, IdempotencyCheck::Proceed),
+            "first claim must Proceed, got {verdict:?}"
+        );
+
+        // Pre-condition: an InFlight entry exists for run_id_1.
+        let got = store.idempotency_get(key).expect("get").expect("present");
+        assert_eq!(got.run_id, run_id_1);
+        assert_eq!(
+            got.state,
+            rocky_core::idempotency::IdempotencyState::InFlight
+        );
+
+        // Drop the store handle before running the error-path helper —
+        // matches the real-world flow where the claim's store goes out
+        // of scope and the helper opens its own read/write handle.
+        drop(store);
+
+        // --- Fire the error-path finalize helper. ---
+        let mut ctx_slot = Some(IdempotencyCtx {
+            key: key.to_string(),
+            backend: IdempotencyBackend::Local,
+            config: IdempotencyConfig {
+                retention_days: 30,
+                dedup_on: DedupPolicy::Success,
+                in_flight_ttl_hours: 24,
+            },
+            _claim_backend_label: "local",
+        });
+        finalize_idempotency_on_error(&mut ctx_slot, &state_path, run_id_1).await;
+        assert!(
+            ctx_slot.is_none(),
+            "finalize_idempotency_on_error must take the ctx (one-shot)"
+        );
+
+        // --- Post-condition: the entry is gone (dedup_on = success + Failed → delete). ---
+        let store = StateStore::open(&state_path).expect("reopen");
+        assert!(
+            store.idempotency_get(key).expect("get").is_none(),
+            "InFlight entry must be released on error so retries can claim immediately"
+        );
+
+        // --- Retry semantics: second claim with the same key must Proceed. ---
+        let run_id_2 = "run-retry-after-error";
+        let retry_entry = IdempotencyEntry {
+            key: key.to_string(),
+            run_id: run_id_2.to_string(),
+            state: rocky_core::idempotency::IdempotencyState::InFlight,
+            stamped_at: now,
+            expires_at: now + chrono::Duration::hours(24),
+            dedup_on: DedupPolicy::Success,
+        };
+        let retry_verdict = store
+            .idempotency_check_and_claim(&retry_entry, now)
+            .expect("retry claim");
+        assert!(
+            matches!(retry_verdict, IdempotencyCheck::Proceed),
+            "retry with same key must Proceed immediately after error-path release, got {retry_verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_on_error_is_one_shot_and_idempotent_when_ctx_already_taken() {
+        use rocky_core::config::{DedupPolicy, IdempotencyConfig};
+        use rocky_core::idempotency::IdempotencyBackend;
+        use rocky_core::state::StateStore;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state_path = tmp.path().join("state.redb");
+        // Create the file by opening and dropping a store so the helper
+        // doesn't have to deal with a missing state file.
+        drop(StateStore::open(&state_path).expect("init"));
+
+        let mut ctx_slot: Option<IdempotencyCtx> = None;
+        // Second call with `None` must be a no-op — guards against the
+        // wrapper firing after the happy-path finalize already ran.
+        finalize_idempotency_on_error(&mut ctx_slot, &state_path, "run-x").await;
+        assert!(ctx_slot.is_none());
+
+        // Seed once and verify the first call drains it.
+        ctx_slot = Some(IdempotencyCtx {
+            key: "k".into(),
+            backend: IdempotencyBackend::Local,
+            config: IdempotencyConfig {
+                retention_days: 30,
+                dedup_on: DedupPolicy::Success,
+                in_flight_ttl_hours: 24,
+            },
+            _claim_backend_label: "local",
+        });
+        finalize_idempotency_on_error(&mut ctx_slot, &state_path, "run-x").await;
+        assert!(ctx_slot.is_none(), "helper must drain the Option");
+    }
+
+    #[tokio::test]
+    async fn finalize_idempotency_is_one_shot_take() {
+        // Guards the contract that `finalize_idempotency` takes the ctx
+        // out of its `Option<_>` so the outer error-path wrapper in
+        // `run()` cannot over-write a Succeeded stamp with a Failed one
+        // (which under `dedup_on = "success"` would delete the entry).
+        use rocky_core::config::{DedupPolicy, IdempotencyConfig};
+        use rocky_core::idempotency::IdempotencyBackend;
+        use rocky_core::state::StateStore;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).expect("open");
+
+        let mut ctx_slot = Some(IdempotencyCtx {
+            key: "one-shot".into(),
+            backend: IdempotencyBackend::Local,
+            config: IdempotencyConfig {
+                retention_days: 30,
+                dedup_on: DedupPolicy::Success,
+                in_flight_ttl_hours: 24,
+            },
+            _claim_backend_label: "local",
+        });
+
+        // Synthetic successful output.
+        let output = RunOutput::new(String::new(), 0, 1);
+        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output).await;
+        assert!(
+            ctx_slot.is_none(),
+            "first finalize must drain the Option; the outer wrapper relies on this \
+             to skip the error-path finalize after a happy-path finalize ran"
+        );
+
+        // Second call is a no-op — no panic, ctx remains None.
+        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output).await;
+        assert!(ctx_slot.is_none());
     }
 }
