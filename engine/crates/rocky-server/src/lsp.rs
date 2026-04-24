@@ -458,22 +458,32 @@ impl RockyLsp {
             return HashMap::new();
         }
 
-        let store = match rocky_core::state::StateStore::open_read_only(&state_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "LSP schema cache: state open failed");
+        // The redb open + scan are sync work that can sleep up to ~250ms
+        // when contending with a CLI process for the state-file flock
+        // (see `StateStore::open_redb_with_retry`). Doing that on a Tokio
+        // worker would intermittently starve the LSP under heavy typing.
+        // Move it onto the blocking pool. The throttle log below stays on
+        // the async runtime because it awaits a tokio mutex.
+        let ttl = schema_cache_config.ttl();
+        let map = match tokio::task::spawn_blocking(move || {
+            let store = rocky_core::state::StateStore::open_read_only(&state_path)
+                .map_err(|e| ("state open", e.to_string()))?;
+            rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                &store,
+                chrono::Utc::now(),
+                ttl,
+            )
+            .map_err(|e| ("scan", e.to_string()))
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err((stage, e))) => {
+                tracing::debug!(error = %e, stage, "LSP schema cache: {stage} failed");
                 return HashMap::new();
             }
-        };
-
-        let map = match rocky_compiler::schema_cache::load_source_schemas_from_cache(
-            &store,
-            chrono::Utc::now(),
-            schema_cache_config.ttl(),
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(error = %e, "LSP schema cache: scan failed");
+            Err(join_err) => {
+                tracing::debug!(error = %join_err, "LSP schema cache: blocking task join failed");
                 return HashMap::new();
             }
         };
