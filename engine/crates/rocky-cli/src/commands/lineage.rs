@@ -84,7 +84,12 @@ pub fn run_lineage(
 
     let direction = if downstream { "downstream" } else { "upstream" };
 
-    if output_json {
+    // `--format dot` is lineage-specific and only produces DOT, so it wins
+    // over the global `--output json` (which defaults to `json`). Without
+    // this, `rocky lineage <m> --format dot` silently emits JSON.
+    let emit_dot = matches!(format, Some("dot"));
+
+    if output_json && !emit_dot {
         if let Some(col) = col_name {
             let trace_edges = if downstream {
                 result
@@ -130,7 +135,7 @@ pub fn run_lineage(
             };
             print_json(&output)?;
         }
-    } else if matches!(format, Some("dot")) {
+    } else if emit_dot {
         // Graphviz DOT output
         println!("digraph lineage {{");
         println!("  rankdir=LR;");
