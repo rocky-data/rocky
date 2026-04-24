@@ -39,7 +39,10 @@ export async function showLineage(arg?: unknown): Promise<void> {
 
   panel.webview.html = renderLoadingHtml(panel.webview, modelName);
 
-  const args = ["lineage", modelName, "--format", "dot"];
+  // `-o table` opts out of the CLI's default `--output json`, so the lineage
+  // handler honours `--format dot`. Without this, stdout is a JSON blob and
+  // viz.js rejects the leading `{` as invalid DOT.
+  const args = ["-o", "table", "lineage", modelName, "--format", "dot"];
   if (workspaceFolder) {
     args.unshift("--config", `${workspaceFolder}/rocky.toml`);
   }
