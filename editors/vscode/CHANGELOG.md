@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-04-24
+
+Tracks engine 1.17.0 (governance-waveplan polish wave). Regenerated TypeScript bindings for the expanded `PlanOutput` surface; no extension feature changes.
+
+### Changed
+
+- **Regenerated `src/types/generated/plan.ts`** for engine 1.17.0's `rocky plan` governance preview: `PlanOutput` gains an `env` field plus three additive collections — `classification_actions`, `mask_actions`, `retention_actions` — with matching `ClassificationAction` / `MaskAction` / `RetentionAction` interfaces. All fields are optional (`skip_serializing_if = "Vec::is_empty"` on the Rust side), so parsing a pre-1.17 `rocky plan --output json` still round-trips cleanly.
+
 ## [1.8.0] — 2026-04-23
 
 Tracks engine 1.16.0 (governance waveplan). Regenerated TypeScript bindings + `rocky-project.schema.json` for classification / masking / role-graph / retention / compliance / audit config surfaces; no extension feature changes.

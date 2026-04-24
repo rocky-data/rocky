@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] — 2026-04-24
+
+Governance waveplan polish wave. Five follow-ups on top of v1.16.0 plus one breaking data-integrity guardrail. Highlights: `rocky run --governance-override` now rejects `workspace_ids = []` without an explicit opt-in (breaking; set `allow_empty_workspace_ids: true` to keep the old "revoke everything" behaviour); `rocky run` + `rocky plan` accept `--env <name>` and plumb it into the masking resolver; `rocky plan` previews classification / mask / retention actions alongside SQL statements; `rocky compile` emits `W004` for classification tags that don't resolve to any masking strategy; Databricks role-graph reconciliation goes from log-only to real — SCIM group creation + per-catalog GRANT emission; `rocky retention-status --drift` now probes the warehouse (Databricks + Snowflake) instead of always returning `warehouse_days = null`.
+
 ### Added
 
 - **Databricks SCIM client + per-catalog GRANT emission for `reconcile_role_graph`.** Completes the Wave C-1 role-graph reconciler that shipped log-only in engine 1.16.0 (#243). New `rocky_databricks::scim` module wraps the workspace-level `/api/2.0/preview/scim/v2/Groups` surface with idempotent `create_group` (POST-first; falls back to `GET ?filter=displayName eq "<name>"` on 409 Conflict) and `get_group_by_name`. `DatabricksGovernanceAdapter::reconcile_role_graph` now actually creates `rocky_role_<name>` UC groups (catalog-independent, once per role) and emits `GRANT <permission> ON CATALOG <catalog> TO \`rocky_role_<name>\`` per `(role, catalog, permission)` triple against every catalog the current `rocky run` touched. ADD-ONLY v1: groups are never deleted and grants are never revoked by this path; a role removed from `rocky.toml` leaves its group + grants in place until a future reconcile mode adds delete semantics. Adapters constructed via `without_workspace()` (no SCIM client) fall back to log-only behaviour so pipelines without SCIM configured keep working.
