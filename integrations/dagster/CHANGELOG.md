@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`PlanResult` carries the governance preview from engine 1.16.0 follow-up.** New fields on `PlanResult`: `env: str | None`, `classification_actions: list[ClassificationAction]`, `mask_actions: list[MaskAction]`, `retention_actions: list[RetentionAction]`. All default to `[]` / `None` so existing consumers are unaffected. The three action types are re-exported from the package barrel alongside `PlanResult`. Wire shape matches the engine's additive JSON output (`skip_serializing_if = "Vec::is_empty"` on every new field), so parsing a pre-1.16 `rocky plan --output json` still round-trips cleanly.
 - **Pluggable per-call kwarg resolvers on `RockyResource`** — three optional callable fields (`shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`) that fire per `run` / `run_streaming` / `run_pipes` invocation to inject kwargs derived from the Dagster run context. Motivated by deployments that need to compute `shadow_suffix` / `governance_override` / `idempotency_key` from the Dagster run context on every call and were previously forced to hand-roll a composition wrapper around the resource.
 
   Design points (pinned by tests):

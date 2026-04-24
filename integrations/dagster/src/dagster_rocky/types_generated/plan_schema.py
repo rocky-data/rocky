@@ -3,7 +3,49 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
+
+
+class ClassificationAction(BaseModel):
+    """
+    Classification-tag application row in `PlanOutput.classification_actions`.
+    """
+
+    column: str
+    """
+    Column name the tag will be applied to.
+    """
+    model: str
+    """
+    Model name the action targets.
+    """
+    tag: str
+    """
+    Free-form classification tag (e.g. `"pii"`, `"confidential"`).
+    """
+
+
+class MaskAction(BaseModel):
+    """
+    Masking-policy application row in `PlanOutput.mask_actions`.
+    """
+
+    column: str
+    """
+    Column name the mask will be applied to.
+    """
+    model: str
+    """
+    Model name the action targets.
+    """
+    resolved_strategy: str
+    """
+    Wire name of the resolved strategy (`"hash"`, `"redact"`, `"partial"`, `"none"`). Matches `MaskStrategy::as_str`.
+    """
+    tag: str
+    """
+    Classification tag the mask is resolved against.
+    """
 
 
 class PlannedStatement(BaseModel):
@@ -12,12 +54,49 @@ class PlannedStatement(BaseModel):
     target: str
 
 
+class RetentionAction(BaseModel):
+    """
+    Retention-policy application row in `PlanOutput.retention_actions`.
+    """
+
+    duration_days: conint(ge=0)
+    """
+    Retention duration parsed from the sidecar (`"90d"` → 90, `"1y"` → 365). Flat day count — no leap-year semantics.
+    """
+    model: str
+    """
+    Model name the action targets.
+    """
+    warehouse_preview: str | None = None
+    """
+    Warehouse-native preview of the SQL / TBLPROPERTIES Rocky would issue for this model on the active adapter. `None` on warehouses that don't support a first-class retention knob (BigQuery, DuckDB).
+    """
+
+
 class PlanOutput(BaseModel):
     """
     JSON output for `rocky plan`.
+
+    `statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.
     """
 
+    classification_actions: list[ClassificationAction] | None = None
+    """
+    Column-tag applications the governance reconciler would issue via `apply_column_tags`. One row per `(model, column, tag)` triple declared in a model sidecar's `[classification]` block.
+    """
     command: str
+    env: str | None = None
+    """
+    Environment name passed via `--env <name>`. Propagates to `mask_actions` so the preview resolves `[mask.<env>]` overrides on top of the workspace `[mask]` defaults. `None` when the flag is absent — preview resolves against defaults only.
+    """
     filter: str
+    mask_actions: list[MaskAction] | None = None
+    """
+    Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.
+    """
+    retention_actions: list[RetentionAction] | None = None
+    """
+    Retention-policy applications the governance reconciler would issue via `apply_retention_policy`. One row per model whose sidecar declares `retention = "<N>[dy]"`. `warehouse_preview` shows the warehouse-native SQL that the current adapter would compile the policy to (Databricks / Snowflake); `None` on warehouses without a first-class retention knob.
+    """
     statements: list[PlannedStatement]
     version: str

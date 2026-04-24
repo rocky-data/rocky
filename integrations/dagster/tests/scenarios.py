@@ -287,6 +287,46 @@ PLAN: dict[str, Any] = {
     ],
 }
 
+
+# Populated variant — exercises the governance preview fields added in
+# engine 1.16.0 follow-up: classification_actions, mask_actions
+# (resolved under `--env prod`), and retention_actions. Keeps the
+# original PLAN above as the byte-stable minimal shape.
+PLAN_WITH_GOVERNANCE: dict[str, Any] = {
+    "version": "0.1.0",
+    "command": "plan",
+    "filter": "",
+    "env": "prod",
+    "statements": [],
+    "classification_actions": [
+        {"model": "users", "column": "email", "tag": "pii"},
+        {"model": "users", "column": "ssn", "tag": "confidential"},
+    ],
+    "mask_actions": [
+        # `pii` resolves to `redact` under `[mask.prod]`, not the default
+        # `[mask] pii = "hash"`. `confidential` has no `[mask]` entry so
+        # it does NOT appear — unresolved tags surface via
+        # `rocky compliance`, not the plan preview.
+        {
+            "model": "users",
+            "column": "email",
+            "tag": "pii",
+            "resolved_strategy": "redact",
+        },
+    ],
+    "retention_actions": [
+        {
+            "model": "users",
+            "duration_days": 90,
+            "warehouse_preview": (
+                "ALTER TABLE c.s.users SET TBLPROPERTIES "
+                "('delta.logRetentionDuration' = '90 days', "
+                "'delta.deletedFileRetentionDuration' = '90 days')"
+            ),
+        },
+    ],
+}
+
 # ---------------------------------------------------------------------------
 # state — single watermark
 # ---------------------------------------------------------------------------
