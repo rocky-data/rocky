@@ -1689,3 +1689,103 @@ async fn test_apply_retention_policy_propagates_api_error() {
     let msg = err.to_string();
     assert!(!msg.is_empty(), "AdapterError should not be empty: {msg}");
 }
+
+/// `read_retention_days` round-trips a `SHOW TBLPROPERTIES` call and
+/// parses the Delta `"interval N days"` value form.
+///
+/// Expected round-trip: Rocky writes `'90 days'` via
+/// `apply_retention_policy`; Delta reads it back as
+/// `"interval 90 days"`. The parse collapses the difference.
+#[tokio::test]
+async fn test_read_retention_days_parses_interval_form() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "SHOW TBLPROPERTIES warehouse.silver.events",
+        ))
+        .and(body_string_contains(
+            "'delta.logRetentionDuration', 'delta.deletedFileRetentionDuration'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-retention-probe",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        { "name": "key", "type_name": "STRING", "position": 0 },
+                        { "name": "value", "type_name": "STRING", "position": 1 }
+                    ]
+                },
+                "total_row_count": 2
+            },
+            "result": {
+                "data_array": [
+                    ["delta.logRetentionDuration", "interval 90 days"],
+                    ["delta.deletedFileRetentionDuration", "interval 90 days"]
+                ]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "events".into(),
+    };
+    let observed = governance
+        .read_retention_days(&table)
+        .await
+        .expect("read_retention_days should succeed");
+    assert_eq!(observed, Some(90));
+}
+
+/// When `SHOW TBLPROPERTIES` returns an empty rowset (e.g., a table with
+/// no Delta retention overrides — the Rocky-writable default case), the
+/// probe reports `Ok(None)` rather than faking an observation.
+#[tokio::test]
+async fn test_read_retention_days_empty_rows_returns_none() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-retention-empty",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        { "name": "key", "type_name": "STRING", "position": 0 },
+                        { "name": "value", "type_name": "STRING", "position": 1 }
+                    ]
+                },
+                "total_row_count": 0
+            },
+            "result": { "data_array": [] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "w".into(),
+        schema: "s".into(),
+        table: "t".into(),
+    };
+    assert_eq!(governance.read_retention_days(&table).await.unwrap(), None);
+}

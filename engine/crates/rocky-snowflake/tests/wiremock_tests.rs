@@ -638,7 +638,7 @@ async fn test_apply_retention_policy_emits_alter_table() {
         .await;
 
     let connector = test_connector(&server);
-    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let governance = SnowflakeGovernanceAdapter::from_ref(&connector);
     let table = TableRef {
         catalog: "TEST_DB".into(),
         schema: "RAW".into(),
@@ -677,7 +677,7 @@ async fn test_apply_retention_policy_year_equivalent() {
         .await;
 
     let connector = test_connector(&server);
-    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let governance = SnowflakeGovernanceAdapter::from_ref(&connector);
     let table = TableRef {
         catalog: "DB".into(),
         schema: "S".into(),
@@ -712,7 +712,7 @@ async fn test_apply_retention_policy_cap_exceeded_surfaces_error() {
         .await;
 
     let connector = test_connector(&server);
-    let governance = SnowflakeGovernanceAdapter::new(&connector);
+    let governance = SnowflakeGovernanceAdapter::from_ref(&connector);
     let table = TableRef {
         catalog: "DB".into(),
         schema: "S".into(),
@@ -726,4 +726,97 @@ async fn test_apply_retention_policy_cap_exceeded_surfaces_error() {
         !err.to_string().is_empty(),
         "expected a non-empty AdapterError surface"
     );
+}
+
+/// `read_retention_days` round-trips a `SHOW PARAMETERS LIKE
+/// 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE ...` call — mock the 6-column
+/// Snowflake response and assert the adapter parses out `Some(90)`.
+#[tokio::test]
+async fn test_read_retention_days_parses_show_parameters() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(
+            "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE TEST_DB.RAW.EVENTS",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-retention-probe",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 1,
+                "rowType": [
+                    {"name": "key", "type": "TEXT", "nullable": false},
+                    {"name": "value", "type": "TEXT", "nullable": false},
+                    {"name": "default", "type": "TEXT", "nullable": true},
+                    {"name": "level", "type": "TEXT", "nullable": true},
+                    {"name": "description", "type": "TEXT", "nullable": true},
+                    {"name": "type", "type": "TEXT", "nullable": true}
+                ]
+            },
+            "data": [[
+                "DATA_RETENTION_TIME_IN_DAYS",
+                "90",
+                "1",
+                "TABLE",
+                "Number of days to retain Time Travel data.",
+                "NUMBER"
+            ]]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let governance = SnowflakeGovernanceAdapter::from_ref(&connector);
+    let table = TableRef {
+        catalog: "TEST_DB".into(),
+        schema: "RAW".into(),
+        table: "EVENTS".into(),
+    };
+    let observed = governance
+        .read_retention_days(&table)
+        .await
+        .expect("read_retention_days should succeed");
+    assert_eq!(observed, Some(90));
+}
+
+/// When `SHOW PARAMETERS` returns an empty rowset, the probe reports
+/// `Ok(None)` — the CLI treats that as "no warehouse observation".
+#[tokio::test]
+async fn test_read_retention_days_empty_rows_returns_none() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-retention-empty",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": { "numRows": 0, "rowType": [] },
+            "data": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let governance = SnowflakeGovernanceAdapter::from_ref(&connector);
+    let table = TableRef {
+        catalog: "DB".into(),
+        schema: "S".into(),
+        table: "T".into(),
+    };
+    assert_eq!(governance.read_retention_days(&table).await.unwrap(), None);
 }

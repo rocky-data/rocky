@@ -348,6 +348,20 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         .await
         .map_err(AdapterError::new)
     }
+
+    async fn read_retention_days(&self, table: &TableRef) -> AdapterResult<Option<u32>> {
+        // Reads the same Delta TBLPROPERTIES pair that `apply_retention_policy`
+        // writes (`delta.logRetentionDuration` +
+        // `delta.deletedFileRetentionDuration`) via `SHOW TBLPROPERTIES`.
+        // The probe is filtered to those two keys SQL-side so Delta doesn't
+        // stream the full property set back; the parse is tolerant of the
+        // runtime-version differences in value formatting (see
+        // [`crate::catalog::CatalogManager::get_delta_retention_days`]).
+        let mgr = CatalogManager::new(&self.connector);
+        mgr.get_delta_retention_days(&table.catalog, &table.schema, table.table.as_str())
+            .await
+            .map_err(AdapterError::new)
+    }
 }
 
 /// Prefix Rocky prepends to every group it provisions for a role, to
