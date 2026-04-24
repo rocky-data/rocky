@@ -1,0 +1,3 @@
+# No `retention` key — retention is optional. `rocky retention-status`
+# reports `configured_days = null` for this model; `rocky run` skips
+# `apply_retention_policy` for it entirely.

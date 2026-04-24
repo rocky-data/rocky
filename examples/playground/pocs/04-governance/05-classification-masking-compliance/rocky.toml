@@ -1,0 +1,52 @@
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[state]
+backend = "local"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+# Workspace-default masking policy. Every classification tag that appears
+# in a model's `[classification]` sidecar should resolve to a strategy
+# here OR be opted out via `[classifications.allow_unmasked]` below.
+#
+# Strategies:
+#   "hash"    — SHA-256 fingerprint (deterministic, join-safe, one-way)
+#   "redact"  — replace with the constant '***'
+#   "partial" — keep first and last 2 chars, redact the middle
+#   "none"    — explicit identity (not a gap; a policy decision)
+[mask]
+pii = "hash"
+pii_high = "redact"
+internal = "none"
+
+# Per-env override. Keys present here shadow the top-level `[mask]`
+# strategy for that env only; keys absent here fall through to the
+# workspace default. Use this to tighten strategies in production
+# without loosening them in dev.
+#
+# Here: `pii` hardens from "hash" (dev) to "redact" (prod) and
+# `pii_high` stays "redact". `internal` is not overridden, so it
+# inherits the workspace "none" in prod too.
+[mask.prod]
+pii = "redact"
+pii_high = "redact"
+
+# Advisory list. Any classification tag listed here is allowed to appear
+# on a column WITHOUT a matching `[mask]` strategy — `rocky compliance`
+# will not emit an exception for it, and the W004 compiler warning is
+# suppressed. Uncomment to silence exceptions for a known unmapped tag:
+#
+# [classifications]
+# allow_unmasked = ["audit_only"]

@@ -12,7 +12,7 @@ Rocky provides a single binary with subcommands for the full pipeline lifecycle.
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `hooks`, `validate-migration`, `test-adapter`
-- **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`
+- **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
 - **Diagnostics**: `doctor`, `compare`
 
 See the dedicated command reference pages for detailed documentation of each category.
@@ -25,11 +25,15 @@ These flags apply to all commands.
 |------|-------|---------|-------------|
 | `--config <PATH>` | `-c` | `rocky.toml` | Path to the pipeline configuration file. |
 | `--output <FORMAT>` | `-o` | `json` | Output format. Accepted values: `json`, `table`. |
-| `--state-path <PATH>` | | `.rocky-state.redb` | Path to the embedded state store used for watermarks. |
+| `--state-path <PATH>` | | resolved (see below) | Path to the embedded state store. When omitted, Rocky resolves to `<models>/.rocky-state.redb` (canonical) or a legacy CWD `.rocky-state.redb` (deprecated, warns on stderr). Passing the flag explicitly is always a hard override. See [`rocky state`](/reference/commands/administration/#rocky-state). |
+| `--cache-ttl <SECONDS>` | | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
 
 ```bash
 # Example: use a custom config and table output
 rocky -c pipelines/prod.toml -o table discover
+
+# Force a fresh typecheck against warehouse metadata
+rocky --cache-ttl 0 compile
 ```
 
 ---
@@ -104,7 +108,7 @@ ok  pipeline.bronze: replication / incremental -> warehouse / stage__{source}
 Lists available connectors and their tables from the configured source.
 
 ```bash
-rocky discover [--pipeline NAME]
+rocky discover [--pipeline NAME] [--with-schemas]
 ```
 
 **Flags:**
@@ -112,6 +116,7 @@ rocky discover [--pipeline NAME]
 | Flag | Description |
 |------|-------------|
 | `--pipeline <NAME>` | Pipeline name. Required when more than one `[pipeline.NAME]` is defined. |
+| `--with-schemas` | Warm the schema cache for every discovered source. For each `(catalog, schema)` pair reachable via the source adapter, issues one `batch_describe_schema` round-trip and persists the per-table columns to `state.redb::schema_cache`. Subsequent `rocky compile` / `rocky lsp` invocations pick up the entries instead of typechecking leaf models as `Unknown`. Errors on individual sources are logged and skipped. Setting this flag with `[cache.schemas] enabled = false` errors with a clear message rather than silently no-op-ing. `DiscoverOutput.schemas_cached` records the count. |
 
 **Behavior:**
 
@@ -209,6 +214,7 @@ rocky run --filter <key=value> [flags]
 | `--shadow-suffix <SUFFIX>` | | Suffix appended to table names in shadow mode (default `_rocky_shadow`). |
 | `--shadow-schema <NAME>` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
 | `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Mutually exclusive with `--shadow` / `--shadow-schema`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
+| `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim — do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
 
 **Pipeline stages (in order):**
 
@@ -454,15 +460,35 @@ rocky compare --filter <key=value> [flags]
 
 ### `rocky state`
 
-Displays stored watermarks from the embedded state file.
+Inspect or manage the embedded state store. `rocky state` is a subcommand group; bare `rocky state` continues to display watermarks for backwards compatibility.
 
 ```bash
-rocky state
+rocky state                                # show watermarks (default)
+rocky state show                           # same as bare `rocky state`
+rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 ```
 
-**Behavior:**
+**Subcommands:**
 
-- Reads the redb state store (default: `.rocky-state.redb`).
+| Subcommand | Description |
+|------------|-------------|
+| `show` (default) | Display stored watermarks. |
+| `clear-schema-cache` | Remove every entry from the `SCHEMA_CACHE` redb table. `--dry-run` reports what would be removed without touching the store. A missing state store is a no-op (CI-safe on ephemeral runners). Emits `ClearSchemaCacheOutput`. See [`rocky state clear-schema-cache`](/reference/commands/administration/#rocky-state-clear-schema-cache). |
+
+**State-path resolution (v1.16.0):**
+
+When `--state-path` is not passed, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
+
+1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky run` writes.
+2. Legacy `.rocky-state.redb` in CWD — still works; emits a one-time deprecation warning on stderr.
+3. Both present — CWD wins (to preserve existing watermarks / branches / partitions); a louder warning asks you to reconcile. Merge is lossy.
+4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists, otherwise CWD.
+
+Explicit `--state-path <PATH>` always overrides the resolver.
+
+**`rocky state` behavior (show):**
+
+- Reads the redb state store at the resolved path.
 - Lists every tracked table with its last watermark value and the timestamp it was recorded.
 
 **JSON output:**
@@ -676,3 +702,53 @@ rocky fmt --check            # Check mode: exit non-zero if any file needs forma
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `paths` | `.` | Files or directories to format. |
+
+---
+
+### `rocky compliance`
+
+Governance rollup over classification sidecars plus the project `[mask]` policy. Answers: "are all classified columns masked wherever policy says they should be?" Static resolver — no warehouse calls.
+
+```bash
+rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--env <NAME>` | (expand all) | Scope the report to a single environment (e.g. `prod`). When unset, the report expands across the defaults plus every `[mask.<env>]` override block. |
+| `--exceptions-only` | `false` | Filter `per_column` to rows that produced at least one exception. The `exceptions` list is unaffected. |
+| `--fail-on <CONDITION>` | | Gate condition. The only supported value is `exception` — exits `1` when any exception is emitted. Useful as a CI gate to block merges that leave classified columns unmasked. |
+| `--models <PATH>` | `models` | Models directory to scan for `[classification]` sidecars. |
+
+**Behavior:**
+
+- Walks every model's `[classification]` sidecar block and, for each `(model, column, env)` triple, resolves the masking strategy from `[mask]` / `[mask.<env>]`.
+- `MaskStrategy::None` counts as masked — an explicit-identity policy is a conscious decision, not an enforcement gap.
+- Tags listed under `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown.
+- JSON output is [`ComplianceOutput`](/reference/json-output/) (`summary` / `per_column` / `exceptions`).
+
+---
+
+### `rocky retention-status`
+
+Report each model's declared data-retention policy (`retention = "<N>[dy]"` in the model sidecar).
+
+```bash
+rocky retention-status [--model NAME] [--drift]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model <NAME>` | (all) | Scope the report to a single model. |
+| `--drift` | `false` | Stretch goal reserved for v2 — today this filters output to models with a declared policy and leaves `warehouse_days` null. The warehouse probe (`SHOW TBLPROPERTIES` / `SHOW PARAMETERS`) is deferred. |
+| `--models <PATH>` | `models` (via `rocky.toml`) | Models directory. |
+
+**Behavior:**
+
+- Compiles the project, then emits one `ModelRetentionStatus` per model with `configured_days`, `warehouse_days` (always `None` in v1), and `in_sync`.
+- Models without a `retention` sidecar value report `configured_days = null` and `in_sync = true`.
+- JSON output is [`RetentionStatusOutput`](/reference/json-output/).

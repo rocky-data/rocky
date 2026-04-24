@@ -54,6 +54,7 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 |-------|------|----------|-------------|
 | `name` | string | Yes | Model identifier. Must be unique across all models. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
+| `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
 
 **`[strategy]`** -- Materialization configuration:
 
@@ -89,6 +90,63 @@ Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **mater
 | `catalog` | string | Yes | Source catalog name. |
 | `schema` | string | Yes | Source schema name. |
 | `table` | string | Yes | Source table name. |
+
+### `[classification]`
+
+Per-column classification tags. Keys are column names, values are free-form classification strings. Rocky resolves each value against `[mask]` / `[mask.<env>]` in `rocky.toml` to pick the masking strategy, then applies both the column tag and the mask via the governance adapter after a successful DAG.
+
+| Key pattern | Value type | Description |
+|---|---|---|
+| `<column_name>` | string | Free-form classification tag (e.g. `"pii"`, `"confidential"`, `"internal"`). Matched case-insensitively against `[mask]` keys in `rocky.toml`. Tags without a matching strategy emit the W004 compiler warning unless listed in [`[classifications] allow_unmasked`](/reference/configuration/#classifications). |
+
+```toml
+# models/customers.toml
+name = "customers"
+
+[classification]
+email = "pii"
+phone = "pii"
+ssn = "confidential"
+```
+
+Tags are free-form strings — no enum — so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
+
+:::note[Adapter support]
+Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort — failures emit `warn!` and don't abort the run.
+:::
+
+### Retention
+
+Top-level `retention` key on the sidecar declares a data-retention policy for the model. Parsed at load time into a typed `RetentionPolicy { duration_days: u32 }`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `retention` | string \| null | `null` (disabled) | Grammar `^\d+[dy]$`. `"d"` = days verbatim, `"y"` = years flattened at 365 days per year (no leap-year semantics). Zero (`"0d"`, `"0y"`) is rejected — use `null` to disable. |
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+retention = "90d"
+
+[strategy]
+type = "incremental"
+timestamp_column = "_fivetran_synced"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "fct_orders"
+```
+
+Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG run:
+
+| Adapter | SQL emitted |
+|---|---|
+| **Databricks (Delta)** | `ALTER TABLE ... SET TBLPROPERTIES ('delta.logRetentionDuration' = '{N} days', 'delta.deletedFileRetentionDuration' = '{N} days')` — both keys written together. |
+| **Snowflake** | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = {N}`. |
+| **BigQuery / DuckDB** | Default-unsupported — those warehouses lack a first-class retention knob at the config level. |
+
+Garbage inputs (`"abc"`, `"90"`, `"-3d"`, `"1.5d"`, leading signs, exponents) are rejected at sidecar parse time with a `ModelError::InvalidRetention` diagnostic naming the offending value. Inspect resolved policies + warehouse state with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
 
 ---
 

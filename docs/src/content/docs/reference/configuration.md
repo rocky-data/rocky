@@ -597,6 +597,25 @@ circuit_breaker_recovery_timeout_secs = 30
 
 Terminal outcomes surface as structured `outcome` fields on `state.upload` / `state.download` events — `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, `budget_exhausted`. Grep those instead of the free-form log message when building alerts.
 
+### `[state.idempotency]`
+
+Tuning knobs for `rocky run --idempotency-key <KEY>` dedup. All fields are optional with the shown defaults; the block is a no-op on runs that don't pass `--idempotency-key`. Unknown fields are rejected.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `retention_days` | integer | `30` | Lifetime of a terminal idempotency stamp before garbage collection. GC runs during the state upload sweep — no separate cron. |
+| `dedup_on` | string | `"success"` | Which terminal statuses count as "already processed". `"success"` only stamps successful runs (failures stay claimable for retries); `"any"` stamps every terminal status. |
+| `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Informational on Valkey/tiered backends, which set the TTL server-side via `SET NX EX`. |
+
+```toml
+[state.idempotency]
+retention_days = 30
+dedup_on = "success"
+in_flight_ttl_hours = 24
+```
+
+Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky run --idempotency-key`](/reference/cli/#rocky-run) for the three possible outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`).
+
 ---
 
 ## `[cache]`
@@ -707,6 +726,106 @@ Optional top-level cross-adapter retry budget. When set, `AdapterRegistry` build
 [retry]
 max_retries_per_run = 50
 ```
+
+---
+
+## `[mask]`
+
+Workspace-default column-masking strategies keyed by classification tag. Each value is a short string selecting how the warehouse should render masked reads of any column the sidecar tags with that classification. See [Governance](/guides/governance/) for the narrative.
+
+| Strategy | Behavior |
+|---|---|
+| `"hash"` | SHA-256 hex digest of the column value. Deterministic, one-way. |
+| `"redact"` | Replace the value with the literal string `'***'`. |
+| `"partial"` | Keep the first and last two characters; replace the middle with `***`. Values shorter than 5 chars are fully replaced with `'***'`. |
+| `"none"` | Explicit identity — no masking applied. Useful as a per-env override to unmask a column that defaults to masked at the workspace level. |
+
+```toml
+# models/customers.toml tags email + ssn with these classifications
+[mask]
+pii = "hash"
+confidential = "redact"
+```
+
+Unknown strategies (e.g. `"mask"`) hard-fail at config load — Rocky never silently accepts a spelling it can't emit SQL for.
+
+:::note[Adapter support]
+Masking is implemented today against **Databricks** Unity Catalog via column tags + `CREATE MASK` / `SET MASKING POLICY` (one statement per column — UC rejects multi-column masking DDL). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Masks are applied after a successful DAG run, best-effort — failures emit `warn!` and don't abort the pipeline (same semantics as grants).
+:::
+
+### `[mask.<env>]`
+
+Per-environment overrides that win over the workspace default for the matching env name. Rocky resolves `classification → strategy` by taking the `[mask]` defaults, then layering `[mask.<env>]` on top when the active env matches.
+
+```toml
+[mask]
+pii = "hash"
+confidential = "redact"
+
+[mask.prod]
+pii = "none"            # unmask pii in prod (e.g. service principal reads)
+confidential = "partial"
+
+[mask.staging]
+pii = "partial"         # staging gets a softer mask than the dev default
+```
+
+Resolution precedence:
+
+1. `[mask.<env>]` entry for the active env (when supplied to `rocky run --env <env>`).
+2. `[mask]` workspace default.
+3. Unmatched tag — W004 warning unless the tag is listed in [`[classifications] allow_unmasked`](#classifications).
+
+---
+
+## `[classifications]`
+
+Advisory settings for the column-classification feature. Distinct from the per-model `[classification]` sidecar block (see [Model Format](/reference/model-format/#classification)).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow_unmasked` | list of strings | `[]` | Classification tags allowed to appear in a model sidecar without a matching `[mask]` strategy. Suppresses the W004 compiler warning. |
+
+```toml
+[classifications]
+allow_unmasked = ["internal", "lineage_only"]
+```
+
+Use this escape hatch for tags that exist only for discovery or lineage tracking — Rocky still surfaces them on `rocky compliance` reports, just without enforcing a masking strategy.
+
+### `[classifications.allow_unmasked]` on the compliance resolver
+
+`rocky compliance` suppresses exceptions for every tag in `allow_unmasked`. The flag is advisory — it doesn't pretend those columns are enforced, it just keeps them off the exception list. See [`rocky compliance`](/reference/cli/#rocky-compliance).
+
+---
+
+## `[role.<name>]`
+
+Hierarchical role declarations reconciled against the warehouse's native role/group system. Each `[role.<name>]` block declares one role; Rocky flattens the inheritance DAG at reconcile time (DFS walk with cycle detection + unknown-parent errors at config-load).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `inherits` | list of strings | `[]` | Immediate parent role names. Rocky unions permissions transitively across every ancestor. Cycles and unknown parents are rejected at config-load time. |
+| `permissions` | list of strings | `[]` | Permissions this role grants. Canonical uppercase spellings (e.g. `"SELECT"`, `"USE CATALOG"`, `"USE SCHEMA"`, `"MODIFY"`, `"MANAGE"`). Empty lists are legal — pure grouping roles exist only to aggregate children. |
+
+```toml
+[role.reader]
+permissions = ["SELECT", "USE CATALOG", "USE SCHEMA"]
+
+[role.analyst]
+inherits = ["reader"]
+permissions = ["MODIFY"]
+
+[role.admin]
+inherits = ["analyst"]
+permissions = ["MANAGE"]
+```
+
+Rocky flattens the graph into `admin → {SELECT, USE CATALOG, USE SCHEMA, MODIFY, MANAGE}` and forwards the resolved set to `GovernanceAdapter::reconcile_role_graph` after a successful DAG.
+
+:::caution[v1 is log-only]
+The v1 Databricks implementation validates each `rocky_role_<name>` principal against the identifier grammar and emits a `debug!` trace. SCIM group creation and per-catalog GRANT emission are deferred as a follow-up. The resolver still catches cycles and unknown parents at config-load regardless of adapter capability — so invalid graphs fail fast even before reconcile runs.
+:::
 
 ---
 

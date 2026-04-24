@@ -1,0 +1,14 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"
+
+# Per-column classification tags. Rocky resolves each tag against
+# [mask] / [mask.<env>] in rocky.toml to pick a masking strategy, then
+# applies the tag + mask via the governance adapter. Tags are free-form.
+[classification]
+email = "pii"
+ssn = "pii_high"
+region = "internal"
