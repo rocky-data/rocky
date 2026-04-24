@@ -1104,6 +1104,18 @@ pub async fn run(
 
             // Create catalog + apply governance (once per catalog)
             if governance.auto_create_catalogs && !created_catalogs.contains(&target_catalog) {
+                // FR-009: fail fast on the silent full-revoke footgun.
+                // `governance_override.workspace_ids = []` without the
+                // opt-in flag would otherwise tell the reconciler below
+                // to revoke every existing binding on the catalog.
+                // Runs before any warehouse mutation for this catalog
+                // so an accidental payload can't leave partial state
+                // behind.
+                if let Some(ov) = governance_override {
+                    ov.validate_workspace_ids(&target_catalog)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+
                 // Create catalog via generic dialect SQL
                 if let Some(sql_result) = dialect.create_catalog_sql(&target_catalog) {
                     warehouse_adapter
@@ -1132,9 +1144,18 @@ pub async fn run(
                         binding_map.insert(b.id, b.clone());
                     }
                 }
+                // `workspace_ids` is `Option<Vec<_>>`: `None` means "no
+                // per-run override, preserve the config-default bindings",
+                // and `Some(ids)` (including `Some(vec![])` when the
+                // `allow_empty_workspace_ids` opt-in is set) is an
+                // explicit desired state that replaces any overlap by
+                // id. The FR-009 validator above has already rejected
+                // the dangerous shape (`Some(empty)` without opt-in).
                 if let Some(ov) = governance_override {
-                    for b in &ov.workspace_ids {
-                        binding_map.insert(b.id, b.clone());
+                    if let Some(ids) = ov.workspace_ids.as_ref() {
+                        for b in ids {
+                            binding_map.insert(b.id, b.clone());
+                        }
                     }
                 }
                 let all_bindings: Vec<rocky_core::config::WorkspaceBindingConfig> = {
