@@ -40,6 +40,7 @@ use rocky_iceberg::client::IcebergCatalogClient;
 use rocky_snowflake::adapter::SnowflakeWarehouseAdapter;
 use rocky_snowflake::batch::SnowflakeBatchCheckAdapter;
 use rocky_snowflake::connector::SnowflakeConnector;
+use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
 use rocky_bigquery::batch::BigQueryBatchCheckAdapter;
 use rocky_bigquery::connector::BigQueryAdapter;
@@ -418,32 +419,42 @@ impl AdapterRegistry {
 
     /// Build a governance adapter for the named warehouse.
     ///
-    /// Returns a Databricks-backed [`GovernanceAdapter`] when the target
-    /// adapter is Databricks (with Unity Catalog tagging, permissions, and
-    /// workspace binding). For every other adapter kind this returns a
-    /// [`NoopGovernanceAdapter`], which silently succeeds — governance
-    /// operations are skipped rather than failing.
+    /// Dispatches on the underlying connector kind:
+    ///
+    /// - **Databricks:** returns the Unity-Catalog-backed
+    ///   [`DatabricksGovernanceAdapter`] (tagging, permissions, workspace
+    ///   binding, retention probe + apply).
+    /// - **Snowflake:** returns [`SnowflakeGovernanceAdapter`] (tags,
+    ///   grants, retention probe + apply).
+    /// - **DuckDB / BigQuery / others:** returns [`NoopGovernanceAdapter`];
+    ///   governance operations silently succeed rather than aborting the
+    ///   run, and `read_retention_days` falls through to the trait default
+    ///   (`Ok(None)`) so `retention-status --drift` degrades to "no
+    ///   observation" on those adapters.
     pub fn governance_adapter(&self, name: &str) -> Box<dyn GovernanceAdapter> {
-        let Some(connector) = self.connectors.get(name).cloned() else {
-            return Box::new(NoopGovernanceAdapter);
-        };
-        let adapter_cfg = self.adapter_configs.get(name);
-        let auth = adapter_cfg.and_then(|cfg| {
-            Auth::from_config(AuthConfig {
-                host: cfg.host.clone().unwrap_or_default(),
-                token: cfg.token.as_ref().map(|s| s.expose().to_string()),
-                client_id: cfg.client_id.clone(),
-                client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
-            })
-            .ok()
-        });
-        match auth {
-            Some(a) => {
-                let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
-                Box::new(DatabricksGovernanceAdapter::new(connector, host, a))
-            }
-            None => Box::new(DatabricksGovernanceAdapter::without_workspace(connector)),
+        if let Some(connector) = self.connectors.get(name).cloned() {
+            let adapter_cfg = self.adapter_configs.get(name);
+            let auth = adapter_cfg.and_then(|cfg| {
+                Auth::from_config(AuthConfig {
+                    host: cfg.host.clone().unwrap_or_default(),
+                    token: cfg.token.as_ref().map(|s| s.expose().to_string()),
+                    client_id: cfg.client_id.clone(),
+                    client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
+                })
+                .ok()
+            });
+            return match auth {
+                Some(a) => {
+                    let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
+                    Box::new(DatabricksGovernanceAdapter::new(connector, host, a))
+                }
+                None => Box::new(DatabricksGovernanceAdapter::without_workspace(connector)),
+            };
         }
+        if let Some(sf_connector) = self.snowflake_connectors.get(name).cloned() {
+            return Box::new(SnowflakeGovernanceAdapter::new(sf_connector));
+        }
+        Box::new(NoopGovernanceAdapter)
     }
 
     /// Build a BigQuery `LoaderAdapter` wrapping the registered warehouse adapter.

@@ -17,6 +17,7 @@
 //! | `apply_retention_policy`  | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = <N>`         |
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::debug;
@@ -32,18 +33,34 @@ use crate::connector::SnowflakeConnector;
 ///
 /// Workspace binding and isolation are not supported by Snowflake and
 /// silently return `Ok(())`.
-pub struct SnowflakeGovernanceAdapter<'a> {
-    connector: &'a SnowflakeConnector,
+///
+/// Owns an [`Arc<SnowflakeConnector>`] so it can be constructed by the
+/// adapter registry and returned as a `Box<dyn GovernanceAdapter>` without
+/// borrowing from a shorter-lived handle.
+pub struct SnowflakeGovernanceAdapter {
+    connector: Arc<SnowflakeConnector>,
 }
 
-impl<'a> SnowflakeGovernanceAdapter<'a> {
-    pub fn new(connector: &'a SnowflakeConnector) -> Self {
+impl SnowflakeGovernanceAdapter {
+    /// Construct from an owned [`Arc<SnowflakeConnector>`] — used by the
+    /// CLI adapter registry.
+    pub fn new(connector: Arc<SnowflakeConnector>) -> Self {
         Self { connector }
+    }
+
+    /// Construct from a borrowed connector by cloning it into an `Arc` —
+    /// a convenience for tests that hold a short-lived connector on the
+    /// stack. Production code paths should prefer
+    /// [`Self::new`] to avoid the clone.
+    pub fn from_ref(connector: &SnowflakeConnector) -> Self {
+        Self {
+            connector: Arc::new(connector.clone()),
+        }
     }
 }
 
 #[async_trait]
-impl GovernanceAdapter for SnowflakeGovernanceAdapter<'_> {
+impl GovernanceAdapter for SnowflakeGovernanceAdapter {
     async fn set_tags(
         &self,
         target: &TagTarget,
@@ -187,6 +204,35 @@ impl GovernanceAdapter for SnowflakeGovernanceAdapter<'_> {
             .map(|_| ())
             .map_err(AdapterError::new)
     }
+
+    /// Probe `DATA_RETENTION_TIME_IN_DAYS` for a Snowflake table.
+    ///
+    /// Emits `SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE
+    /// <db>.<schema>.<table>` and parses the `value` column (column index 1)
+    /// of the single result row into a `u32`. Snowflake returns the value as
+    /// a JSON string even for integer parameters; the parser accepts both
+    /// shapes (`"90"` or `90`) for forward-compatibility with the REST API
+    /// shape.
+    ///
+    /// Returns `Ok(None)` if the `SHOW PARAMETERS` response is empty (table
+    /// exists but the parameter wasn't set — Snowflake will still report the
+    /// account default, so an empty rowset is the "no observation" signal).
+    async fn read_retention_days(&self, table: &TableRef) -> AdapterResult<Option<u32>> {
+        let sql = format_show_retention_sql(table)?;
+        debug!(
+            catalog = %table.catalog,
+            schema = %table.schema,
+            table = %table.table,
+            sql = sql.as_str(),
+            "probing Snowflake data retention"
+        );
+        let result = self
+            .connector
+            .execute_sql(&sql)
+            .await
+            .map_err(AdapterError::new)?;
+        Ok(parse_snowflake_retention_rows(&result.rows))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +353,58 @@ fn format_set_retention_sql(table: &TableRef, duration_days: u32) -> AdapterResu
         sch = table.schema,
         tbl = table.table,
     ))
+}
+
+/// Formats `SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE
+/// <db>.<schema>.<table>` — the read-side counterpart to
+/// [`format_set_retention_sql`].
+///
+/// Identifiers are validated against Rocky's SQL identifier allowlist before
+/// interpolation. The parameter-name literal is hard-coded, not interpolated,
+/// so there's nothing to validate on that side.
+fn format_show_retention_sql(table: &TableRef) -> AdapterResult<String> {
+    validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+    validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
+    validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+    Ok(format!(
+        "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE {cat}.{sch}.{tbl}",
+        cat = table.catalog,
+        sch = table.schema,
+        tbl = table.table,
+    ))
+}
+
+/// Parses `SHOW PARAMETERS` rows into a `u32` day count.
+///
+/// Snowflake's `SHOW PARAMETERS` returns 6 columns: `key, value, default,
+/// level, description, type`. The Rocky-facing probe scopes the query to
+/// `DATA_RETENTION_TIME_IN_DAYS`, so we expect at most one row — but we
+/// guard defensively against extras by filtering on the key column anyway.
+///
+/// The `value` column comes back as a JSON string (`"90"`) from the SQL
+/// REST API; older clients / mock responses may emit a JSON number
+/// (`90`). Both are accepted. Anything that doesn't parse as `u32` returns
+/// `None` — treated as "no observation" by the caller.
+fn parse_snowflake_retention_rows(rows: &[Vec<serde_json::Value>]) -> Option<u32> {
+    for row in rows {
+        let key = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+        if !key.eq_ignore_ascii_case("DATA_RETENTION_TIME_IN_DAYS") {
+            continue;
+        }
+        let raw = row.get(1)?;
+        // Accept both string and numeric JSON forms: Snowflake's SQL REST
+        // API has historically sent parameter values as strings, but the
+        // type is not guaranteed across versions / mock shapes.
+        if let Some(s) = raw.as_str() {
+            if let Ok(days) = s.trim().parse::<u32>() {
+                return Some(days);
+            }
+        }
+        if let Some(n) = raw.as_u64() {
+            return u32::try_from(n).ok();
+        }
+    }
+    None
 }
 
 /// Maps Rocky [`Permission`] variants to Snowflake privilege names.
@@ -671,5 +769,105 @@ mod tests {
             sql,
             "ALTER TABLE w.s.t SET DATA_RETENTION_TIME_IN_DAYS = 1000"
         );
+    }
+
+    // ---- retention probe (read-side) ----
+
+    #[test]
+    fn test_format_show_retention_sql() {
+        let t = TableRef {
+            catalog: "TEST_DB".into(),
+            schema: "RAW".into(),
+            table: "EVENTS".into(),
+        };
+        let sql = format_show_retention_sql(&t).unwrap();
+        assert_eq!(
+            sql,
+            "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE TEST_DB.RAW.EVENTS"
+        );
+    }
+
+    #[test]
+    fn test_format_show_retention_rejects_invalid_identifier() {
+        let t = TableRef {
+            catalog: "DROP TABLE;".into(),
+            schema: "RAW".into(),
+            table: "T".into(),
+        };
+        assert!(format_show_retention_sql(&t).is_err());
+
+        let t = TableRef {
+            catalog: "W".into(),
+            schema: "R AW".into(),
+            table: "T".into(),
+        };
+        assert!(format_show_retention_sql(&t).is_err());
+
+        let t = TableRef {
+            catalog: "W".into(),
+            schema: "R".into(),
+            table: "T' --".into(),
+        };
+        assert!(format_show_retention_sql(&t).is_err());
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_string_value() {
+        // SQL REST API sends integer parameters as JSON strings.
+        let rows = vec![vec![
+            serde_json::json!("DATA_RETENTION_TIME_IN_DAYS"),
+            serde_json::json!("90"),
+            serde_json::json!("1"),
+            serde_json::json!("TABLE"),
+            serde_json::json!("Number of days to retain Time Travel data."),
+            serde_json::json!("NUMBER"),
+        ]];
+        assert_eq!(parse_snowflake_retention_rows(&rows), Some(90));
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_numeric_value() {
+        // Forward-compat guard: accept integer JSON values too.
+        let rows = vec![vec![
+            serde_json::json!("DATA_RETENTION_TIME_IN_DAYS"),
+            serde_json::json!(365),
+        ]];
+        assert_eq!(parse_snowflake_retention_rows(&rows), Some(365));
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_empty() {
+        let rows: Vec<Vec<serde_json::Value>> = vec![];
+        assert_eq!(parse_snowflake_retention_rows(&rows), None);
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_key_mismatch() {
+        // Defensive: if SHOW PARAMETERS is somehow broader than our filter,
+        // skip non-matching keys instead of grabbing the wrong value.
+        let rows = vec![vec![
+            serde_json::json!("ROWS_PER_RESULTSET"),
+            serde_json::json!("0"),
+        ]];
+        assert_eq!(parse_snowflake_retention_rows(&rows), None);
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_case_insensitive_key() {
+        // Snowflake tends to uppercase parameter names, but match defensively.
+        let rows = vec![vec![
+            serde_json::json!("data_retention_time_in_days"),
+            serde_json::json!("7"),
+        ]];
+        assert_eq!(parse_snowflake_retention_rows(&rows), Some(7));
+    }
+
+    #[test]
+    fn test_parse_snowflake_retention_rows_garbage_value() {
+        let rows = vec![vec![
+            serde_json::json!("DATA_RETENTION_TIME_IN_DAYS"),
+            serde_json::json!("not a number"),
+        ]];
+        assert_eq!(parse_snowflake_retention_rows(&rows), None);
     }
 }

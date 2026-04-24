@@ -723,6 +723,35 @@ pub trait GovernanceAdapter: Send + Sync {
             "apply_retention_policy not supported by this adapter",
         ))
     }
+
+    /// Read the warehouse-observed retention period for a table, in days.
+    ///
+    /// This is the read-side counterpart to [`Self::apply_retention_policy`]:
+    /// `rocky retention-status --drift` calls it to compare the
+    /// warehouse-side value against the declared `retention = "<N>[dy]"`
+    /// sidecar. Adapters translate it to their warehouse's native probe:
+    ///
+    /// - **Databricks (Delta):** `SHOW TBLPROPERTIES ... (
+    ///   'delta.deletedFileRetentionDuration')` and parse the `"interval N days"`
+    ///   / `"N days"` value string.
+    /// - **Snowflake:** `SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE ...`
+    ///   and parse the integer value column.
+    /// - **BigQuery / DuckDB:** not supported — the trait default returns
+    ///   `Ok(None)`, which `retention-status --drift` surfaces as "no
+    ///   warehouse value observed" rather than as an error.
+    ///
+    /// Returning `Ok(None)` is the declared way to signal "unsupported on
+    /// this adapter" — it lets the CLI probe every model uniformly without
+    /// having to branch on adapter kind first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AdapterError`] on network / auth / malformed-response
+    /// failures. The trait default returns `Ok(None)` so callers can probe
+    /// unsupported adapters safely.
+    async fn read_retention_days(&self, _table: &TableRef) -> AdapterResult<Option<u32>> {
+        Ok(None)
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -1082,6 +1111,40 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    // `read_retention_days` is the read-side probe used by
+    // `rocky retention-status --drift`. Unlike the other governance
+    // capabilities, the trait default is `Ok(None)` — an adapter that
+    // doesn't implement it should degrade to "no observation" rather than
+    // erroring, so the CLI can probe every model uniformly without
+    // branching on adapter kind.
+    #[tokio::test]
+    async fn trait_default_read_retention_days_returns_none() {
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let got = MinimalGovernance.read_retention_days(&t).await.unwrap();
+        assert!(
+            got.is_none(),
+            "trait default should return Ok(None), got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_governance_read_retention_days_returns_none() {
+        let noop = NoopGovernanceAdapter;
+        let t = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        // Noop inherits the default (it doesn't override). Assert the
+        // behaviour Noop consumers depend on: no warehouse observation
+        // when no governance impl is wired.
+        assert!(noop.read_retention_days(&t).await.unwrap().is_none());
     }
 
     #[test]

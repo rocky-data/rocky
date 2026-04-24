@@ -1717,7 +1717,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             drift,
         } => {
             let models_dir = models.unwrap_or_else(|| PathBuf::from("models"));
-            rocky_cli::commands::run_retention_status(&models_dir, model.as_deref(), drift, json)
+            rocky_cli::commands::run_retention_status(
+                &cli.config,
+                &models_dir,
+                model.as_deref(),
+                drift,
+                json,
+            )
+            .await
         }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),

@@ -139,6 +139,35 @@ pub fn generate_set_delta_retention_sql(
     ))
 }
 
+/// Generates `SHOW TBLPROPERTIES <catalog>.<schema>.<table>` for the paired
+/// Delta retention properties.
+///
+/// Used by [`GovernanceAdapter::read_retention_days`] on Databricks to
+/// round-trip the write performed by
+/// [`GovernanceAdapter::apply_retention_policy`] (see
+/// [`generate_set_delta_retention_sql`]).
+///
+/// Delta returns a two-column result (`key`, `value`) — the caller
+/// filters to `delta.logRetentionDuration` /
+/// `delta.deletedFileRetentionDuration` and parses the value string.
+/// Identifiers are validated before interpolation.
+///
+/// [`GovernanceAdapter::read_retention_days`]: crate::traits::GovernanceAdapter::read_retention_days
+/// [`GovernanceAdapter::apply_retention_policy`]: crate::traits::GovernanceAdapter::apply_retention_policy
+pub fn generate_show_delta_retention_sql(
+    catalog: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(table)?;
+    Ok(format!(
+        "SHOW TBLPROPERTIES {catalog}.{schema}.{table} \
+('delta.logRetentionDuration', 'delta.deletedFileRetentionDuration')"
+    ))
+}
+
 /// Generates `SHOW SCHEMAS IN <catalog>`.
 pub fn generate_show_schemas_sql(catalog: &str) -> Result<String, CatalogError> {
     validation::validate_identifier(catalog)?;
@@ -325,6 +354,23 @@ mod tests {
         assert!(generate_set_delta_retention_sql("db; DROP", "s", "t", 90).is_err());
         assert!(generate_set_delta_retention_sql("db", "s ace", "t", 90).is_err());
         assert!(generate_set_delta_retention_sql("db", "s", "t' --", 90).is_err());
+    }
+
+    #[test]
+    fn test_show_delta_retention_emits_paired_property_filter() {
+        let sql = generate_show_delta_retention_sql("warehouse", "silver", "events").unwrap();
+        assert_eq!(
+            sql,
+            "SHOW TBLPROPERTIES warehouse.silver.events \
+('delta.logRetentionDuration', 'delta.deletedFileRetentionDuration')"
+        );
+    }
+
+    #[test]
+    fn test_show_delta_retention_rejects_invalid_identifier() {
+        assert!(generate_show_delta_retention_sql("db; DROP", "s", "t").is_err());
+        assert!(generate_show_delta_retention_sql("db", "s ace", "t").is_err());
+        assert!(generate_show_delta_retention_sql("db", "s", "t' --").is_err());
     }
 
     #[test]

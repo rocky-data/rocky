@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rocky_core::catalog as catalog_sql;
 use rocky_core::ir::TableRef;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::connector::{ConnectorError, DatabricksConnector};
 
@@ -120,6 +120,38 @@ impl<'a> CatalogManager<'a> {
         Ok(())
     }
 
+    /// Probes the paired Delta retention properties on a table.
+    ///
+    /// Issues `SHOW TBLPROPERTIES <cat>.<schema>.<table> (
+    /// 'delta.logRetentionDuration', 'delta.deletedFileRetentionDuration')` and
+    /// parses the returned `"interval N days"` / `"N days"` value strings into
+    /// a `u32` day count.
+    ///
+    /// Prefers `delta.deletedFileRetentionDuration` (the VACUUM-eligibility
+    /// knob, which is what user-facing retention semantics actually hinge
+    /// on); falls back to `delta.logRetentionDuration` when only the log
+    /// property is set. If neither is set on the table, returns `Ok(None)`
+    /// — the default Delta values are not read back here, since the
+    /// user-facing semantics are "did Rocky (or someone) override the
+    /// default?". If both are set to different values, prefers
+    /// `delta.deletedFileRetentionDuration` and emits a `warn!` trace event
+    /// so the divergence is observable without aborting a read.
+    ///
+    /// Used by
+    /// [`GovernanceAdapter::read_retention_days`](rocky_core::traits::GovernanceAdapter::read_retention_days)
+    /// on Databricks to back `rocky retention-status --drift`.
+    pub async fn get_delta_retention_days(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<u32>, CatalogManagerError> {
+        let sql = catalog_sql::generate_show_delta_retention_sql(catalog, schema, table)?;
+        debug!(catalog, schema, table, "probing Delta retention properties");
+        let result = self.connector.execute_sql(&sql).await?;
+        Ok(parse_delta_retention_rows(&result.rows))
+    }
+
     /// Lists schemas in a catalog.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<String>, CatalogManagerError> {
         let sql = catalog_sql::generate_show_schemas_sql(catalog)?;
@@ -226,3 +258,158 @@ pub enum CatalogManagerError {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct SqlGenError(#[from] rocky_core::sql_gen::SqlGenError);
+
+/// Parses the two-column `SHOW TBLPROPERTIES` response into a `u32` day count.
+///
+/// Accepts any `"interval N days"` / `"N days"` / `"N.000000000 days"`
+/// form Databricks has emitted across Delta runtime versions — the parser
+/// scans whitespace-split tokens and takes the first integer-parseable one.
+///
+/// Prefers `delta.deletedFileRetentionDuration` when both are present; if
+/// they disagree, emits a `warn!` so operators can see the divergence
+/// without aborting the read (see
+/// [`CatalogManager::get_delta_retention_days`] for the rationale).
+fn parse_delta_retention_rows(rows: &[Vec<serde_json::Value>]) -> Option<u32> {
+    let mut log_days: Option<u32> = None;
+    let mut deleted_days: Option<u32> = None;
+    for row in rows {
+        let key = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+        let value = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+        let Some(days) = parse_delta_duration_days(value) else {
+            continue;
+        };
+        match key {
+            "delta.logRetentionDuration" => log_days = Some(days),
+            "delta.deletedFileRetentionDuration" => deleted_days = Some(days),
+            _ => {}
+        }
+    }
+    match (log_days, deleted_days) {
+        (Some(l), Some(d)) if l != d => {
+            warn!(
+                log_days = l,
+                deleted_file_days = d,
+                "delta retention properties diverge; preferring deletedFileRetentionDuration"
+            );
+            Some(d)
+        }
+        (_, Some(d)) => Some(d),
+        (Some(l), None) => Some(l),
+        (None, None) => None,
+    }
+}
+
+/// Extracts the integer day count from a Delta duration string.
+///
+/// Handles the three forms seen in the wild across DBR versions:
+/// - `"interval 90 days"`
+/// - `"90 days"`
+/// - `"90.000000000 days"`
+///
+/// Returns the first whitespace-split token that parses as `u32` (trimming
+/// a trailing `.0*` if present to handle the decimal form). Returns `None`
+/// if no token parses — the caller treats that as "no observation".
+fn parse_delta_duration_days(value: &str) -> Option<u32> {
+    for tok in value.split_whitespace() {
+        // Handle the `"90.000000000"` decimal form by truncating at `.`
+        // — Delta has always meant integer days here.
+        let tok_int = tok.split('.').next().unwrap_or(tok);
+        if let Ok(days) = tok_int.parse::<u32>() {
+            return Some(days);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_duration_accepts_interval_form() {
+        assert_eq!(parse_delta_duration_days("interval 90 days"), Some(90));
+    }
+
+    #[test]
+    fn parse_duration_accepts_bare_form() {
+        assert_eq!(parse_delta_duration_days("90 days"), Some(90));
+    }
+
+    #[test]
+    fn parse_duration_accepts_decimal_form() {
+        // Some DBR versions emit "90.000000000 days".
+        assert_eq!(parse_delta_duration_days("90.000000000 days"), Some(90));
+    }
+
+    #[test]
+    fn parse_duration_returns_none_for_garbage() {
+        assert_eq!(parse_delta_duration_days(""), None);
+        assert_eq!(parse_delta_duration_days("days"), None);
+        assert_eq!(parse_delta_duration_days("interval weeks"), None);
+    }
+
+    #[test]
+    fn parse_rows_prefers_deleted_file_over_log() {
+        let rows = vec![
+            vec![
+                json!("delta.logRetentionDuration"),
+                json!("interval 30 days"),
+            ],
+            vec![
+                json!("delta.deletedFileRetentionDuration"),
+                json!("interval 90 days"),
+            ],
+        ];
+        // Diverging values: prefer deletedFileRetentionDuration (the
+        // VACUUM-eligibility knob).
+        assert_eq!(parse_delta_retention_rows(&rows), Some(90));
+    }
+
+    #[test]
+    fn parse_rows_falls_back_to_log_when_only_log_set() {
+        let rows = vec![vec![
+            json!("delta.logRetentionDuration"),
+            json!("interval 30 days"),
+        ]];
+        assert_eq!(parse_delta_retention_rows(&rows), Some(30));
+    }
+
+    #[test]
+    fn parse_rows_returns_none_when_neither_set() {
+        // Neither property in the result rows (e.g., SHOW TBLPROPERTIES on a
+        // non-Delta table, or a Delta table with no overrides).
+        let rows: Vec<Vec<serde_json::Value>> = vec![];
+        assert_eq!(parse_delta_retention_rows(&rows), None);
+    }
+
+    #[test]
+    fn parse_rows_ignores_unrelated_properties() {
+        // Extra properties shouldn't confuse the filter (paranoia — the SQL
+        // explicitly scopes to the two keys, but guard against loose impls).
+        let rows = vec![
+            vec![json!("delta.enableDeletionVectors"), json!("true")],
+            vec![
+                json!("delta.deletedFileRetentionDuration"),
+                json!("interval 120 days"),
+            ],
+        ];
+        assert_eq!(parse_delta_retention_rows(&rows), Some(120));
+    }
+
+    #[test]
+    fn parse_rows_handles_both_equal() {
+        // Common case: Rocky writes both, reads both, they agree.
+        let rows = vec![
+            vec![
+                json!("delta.logRetentionDuration"),
+                json!("interval 90 days"),
+            ],
+            vec![
+                json!("delta.deletedFileRetentionDuration"),
+                json!("interval 90 days"),
+            ],
+        ];
+        assert_eq!(parse_delta_retention_rows(&rows), Some(90));
+    }
+}
