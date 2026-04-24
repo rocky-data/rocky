@@ -23,6 +23,7 @@ rocky history [flags]
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter history to a specific model. |
 | `--since <DATE>` | `string` | | Only show runs since this date (ISO 8601 or `YYYY-MM-DD`). |
+| `--audit` | `bool` | `false` | Include the governance audit trail for each run in JSON output, and print a second governance table after the default summary in text output. See [Audit trail](#audit-trail) below. |
 
 ### Examples
 
@@ -108,6 +109,54 @@ run_id                   | started_at            | duration  | copied | failed |
 run_20260401_143022      | 2026-04-01T14:30:22Z  | 45.2s     | 20     | 0      | success
 run_20260401_080015      | 2026-04-01T08:00:15Z  | 52.1s     | 19     | 1      | partial
 ```
+
+### Audit trail
+
+`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky run` against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
+
+| Field | Description |
+|-------|-------------|
+| `triggering_identity` | Principal that initiated the run (OS user, CI service account, etc.). |
+| `session_source` | One of `cli`, `dagster`, `lsp`, `http_api` — auto-detected at run start. |
+| `git_commit` | Commit SHA at the project root (`None` when not a git repo). |
+| `git_branch` | Branch name at the project root (`None` when not a git repo). |
+| `idempotency_key` | Echoed value of `--idempotency-key` (`None` when the flag wasn't used). |
+| `target_catalog` | Resolved target catalog for the executed pipeline. |
+| `hostname` | Hostname where the run executed. Always populated (defaults to `"unknown"` on pre-v6 rows). |
+| `rocky_version` | `CARGO_PKG_VERSION` at run time. Always populated (`"<pre-audit>"` on pre-v6 rows). |
+
+```bash
+rocky history --audit
+```
+
+```json
+{
+  "version": "1.16.0",
+  "command": "history",
+  "count": 1,
+  "runs": [
+    {
+      "run_id": "run_20260423_143022",
+      "started_at": "2026-04-23T14:30:22Z",
+      "duration_ms": 45200,
+      "status": "Success",
+      "trigger": "Cli",
+      "models_executed": 14,
+      "models": [ /* per-model records */ ],
+      "triggering_identity": "alice@acme.io",
+      "session_source": "dagster",
+      "git_commit": "a3f2b1c4...",
+      "git_branch": "main",
+      "idempotency_key": "nightly-2026-04-23",
+      "target_catalog": "acme_warehouse",
+      "hostname": "runner-12",
+      "rocky_version": "1.16.0"
+    }
+  ]
+}
+```
+
+Text output appends a `Governance audit trail (--audit):` section after the default run summary with short-form columns (`git_commit` truncated to 8 chars, `hostname` to 11) plus a per-run detail line carrying `rocky_version` and `idempotency_key`.
 
 ### Related Commands
 
@@ -773,3 +822,232 @@ Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command st
 - [`rocky trace`](#rocky-trace) -- same `RunRecord`, shown as a Gantt-style timeline
 - [`rocky history`](#rocky-history) -- list recent runs to find a `run_id`
 - [`[budget]`](/reference/configuration/#budget) -- run-level budget that fires `budget_breach` events during the run itself
+
+---
+
+## `rocky state`
+
+Inspect or manage the embedded state store. `rocky state` is a subcommand group; the bare form continues to show watermarks for backwards compatibility.
+
+```bash
+rocky state                                # show watermarks (default)
+rocky state show                           # same as bare `rocky state`
+rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
+```
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `show` (default) | Display stored watermarks. Same output as bare `rocky state` — the named form is provided so scripts can be explicit. |
+| `clear-schema-cache` | Flush the `DESCRIBE TABLE` schema cache. See [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache). |
+
+### State-path resolution
+
+When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
+
+1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky run` writes.
+2. Legacy CWD `.rocky-state.redb` — still works; emits a one-time deprecation warning on stderr.
+3. Both present — CWD wins (preserves existing watermarks, branches, and partition bookkeeping); a louder warning asks you to reconcile. Merge is lossy — delete one copy to silence the warning.
+4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
+
+Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
+
+:::note[Upgrading to v1.16.0 state paths]
+Fresh projects land on `<models>/.rocky-state.redb`. Existing users with a CWD `.rocky-state.redb` will see a one-time deprecation warning on stderr and can either move the file into `models/` to silence the warning, or keep using the CWD location (it continues to work). If both files exist, CWD wins on collision — delete one to silence the louder reconcile warning. Passing `--state-path` explicitly bypasses the resolver.
+:::
+
+### Related Commands
+
+- [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache) -- flush the DESCRIBE cache
+- [`rocky history`](#rocky-history) -- read persisted run records
+- [`rocky replay`](#rocky-replay) / [`rocky trace`](#rocky-trace) / [`rocky cost`](#rocky-cost) -- read the same `RunRecord` the state store persists
+
+---
+
+## `rocky state clear-schema-cache`
+
+Flush the Arc 7 wave-2 `DESCRIBE TABLE` schema cache. Complement to the TTL-driven eviction on the read path — use this when the project needs a fresh typecheck *now* (e.g., after a manual warehouse DDL change, before a strict-CI run, while debugging a suspected stale-cache mismatch).
+
+```bash
+rocky state clear-schema-cache
+rocky state clear-schema-cache --dry-run
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dry-run` | `bool` | `false` | Report how many entries would be removed without touching the store. Useful for automation that asserts emptiness before a scheduled flush. |
+
+### Behavior
+
+- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild — the next `rocky run` (write tap) or `rocky discover --with-schemas` warms it back up.
+- **No prompt.** Entries are disposable; explicit opt-in by running the command is sufficient.
+- **Missing state store is a no-op.** A fresh CI runner with no `.rocky-state.redb` yet exits zero with `entries_deleted: 0`. This keeps "flush before build" safe to run unconditionally on ephemeral runners.
+- Uninitialised cache tables return `entries_deleted: 0` without touching redb.
+- JSON output is `ClearSchemaCacheOutput` (`entries_deleted`, `dry_run`).
+
+### Example
+
+```bash
+rocky state clear-schema-cache --dry-run --output json
+```
+
+```json
+{
+  "version": "1.16.0",
+  "command": "state-clear-schema-cache",
+  "entries_deleted": 12,
+  "dry_run": true
+}
+```
+
+### Related Commands
+
+- [`rocky discover --with-schemas`](/reference/cli/#rocky-discover) -- warm the cache after a flush
+- [`rocky --cache-ttl`](/reference/cli/#global-flags) -- per-invocation TTL override (use `--cache-ttl 0` for one-shot bypass without flushing)
+- [`[cache.schemas]`](/reference/configuration/) -- disable the cache entirely with `enabled = false`
+
+---
+
+## `rocky compliance`
+
+Governance rollup over classification sidecars plus the project `[mask]` policy. Static resolver: answers *"are all classified columns masked wherever policy says they should be?"* without issuing a single warehouse call.
+
+```bash
+rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--env <NAME>` | `string` | | Scope the report to a single environment. When unset, the report expands across the defaults plus every `[mask.<env>]` override block declared in `rocky.toml`. A named env that has no matching `[mask.<env>]` block still reports under that label — the resolver falls back to the `[mask]` defaults. |
+| `--exceptions-only` | `bool` | `false` | Filter `per_column` to rows that produced at least one exception. The `exceptions` list is unaffected; allow-listed tags are suppressed from `per_column` under this flag. |
+| `--fail-on <CONDITION>` | `exception` | | Gate condition. Only `exception` is supported in v1. When set, exits `1` when one or more exceptions are emitted. Useful as a CI gate that blocks merges that leave classified columns unmasked. |
+| `--models <PATH>` | `string` | `models` | Models directory to scan for `[classification]` sidecars. |
+
+### Behavior
+
+- Loads `rocky.toml` and every model sidecar with a non-empty `[classification]` block. Each `(model, column, env)` triple is evaluated against the resolved masking strategy.
+- `MaskStrategy::None` ("explicit identity") counts as masked: the project has deliberately opted out, which is a conscious policy decision, not an enforcement gap.
+- Tags listed on `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown — the allow list doesn't pretend the column is masked.
+- Exit `1` with `--fail-on exception` when any exception is emitted; otherwise exit `0` regardless of exception count (the JSON payload still reports them).
+- **Static rollup — no warehouse calls.** Fast enough to run in every PR.
+- JSON output is `ComplianceOutput` (`summary`, `per_column`, `exceptions`).
+
+### Example
+
+```bash
+rocky compliance --env prod --fail-on exception
+```
+
+```json
+{
+  "version": "1.16.0",
+  "command": "compliance",
+  "summary": {
+    "total_classified": 5,
+    "total_masked": 4,
+    "total_exceptions": 1
+  },
+  "per_column": [
+    {
+      "model": "users",
+      "column": "email",
+      "classification": "pii",
+      "envs": [
+        { "env": "prod", "masking_strategy": "hash", "enforced": true }
+      ]
+    },
+    {
+      "model": "users",
+      "column": "ssn",
+      "classification": "confidential",
+      "envs": [
+        { "env": "prod", "masking_strategy": "unresolved", "enforced": false }
+      ]
+    }
+  ],
+  "exceptions": [
+    {
+      "model": "users",
+      "column": "ssn",
+      "env": "prod",
+      "reason": "no masking strategy resolves for classification tag 'confidential'"
+    }
+  ]
+}
+```
+
+### Related Commands
+
+- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- applies classification tags + masking policies inline during the post-DAG governance pass
+- [`rocky retention-status`](#rocky-retention-status) -- sibling governance rollup for retention declarations
+- [Governance configuration](/guides/governance/) -- `[mask]`, `[mask.<env>]`, `[classifications] allow_unmasked`
+
+---
+
+## `rocky retention-status`
+
+Report each model's declared data-retention policy. Walks the compiled model set and emits one row per model with its declared `retention = "<N>[dy]"` value (or `null` when unset).
+
+```bash
+rocky retention-status [--model NAME] [--drift]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <NAME>` | `string` | | Scope the report to a single model by name. |
+| `--drift` | `bool` | `false` | **v2 stretch — deferred.** v1 filters output to models with a declared policy and leaves `warehouse_days` `null`. In v2, Rocky will probe the warehouse via `SHOW TBLPROPERTIES` (Databricks) / `SHOW PARAMETERS ... FOR TABLE` (Snowflake) and populate `warehouse_days`. The JSON schema is already stable so v2 fills the field without a shape break. Text output prints a `note: --drift probe is deferred to v2` on stderr. |
+| `--models <PATH>` | `string` | `models` | Models directory. |
+
+### Behavior
+
+- Compiles the project so each model's resolved `retention` sidecar value surfaces as a typed `Option<RetentionPolicy>`.
+- `configured_days` is `None` when the model's sidecar carries no `retention` key.
+- `warehouse_days` is always `None` in v1 (the probe is deferred).
+- `in_sync` is `true` iff `configured_days == warehouse_days`. In v1, unconfigured models collapse to `in_sync = true` (both sides are `None`).
+- Currently applied only by Databricks (Delta `delta.logRetentionDuration` + `delta.deletedFileRetentionDuration`) and Snowflake (`DATA_RETENTION_TIME_IN_DAYS`). BigQuery and DuckDB are default-unsupported.
+- JSON output is `RetentionStatusOutput` (a flat `models` array of `ModelRetentionStatus`).
+
+### Example
+
+```bash
+rocky retention-status --output json
+```
+
+```json
+{
+  "version": "1.16.0",
+  "command": "retention-status",
+  "models": [
+    { "model": "fct_revenue",   "configured_days": 90, "in_sync": true },
+    { "model": "dim_customers",                        "in_sync": true },
+    { "model": "events",        "configured_days": 30, "in_sync": true }
+  ]
+}
+```
+
+Text mode is a fixed-width table:
+
+```bash
+rocky -o table retention-status
+```
+
+```
+MODEL                                    CONFIGURED       WAREHOUSE        IN SYNC
+----------------------------------------------------------------------------------
+fct_revenue                              90 days          -                yes
+dim_customers                            -                -                yes
+events                                   30 days          -                yes
+```
+
+### Related Commands
+
+- [`rocky compliance`](#rocky-compliance) -- sibling governance rollup for classification + masking
+- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- applies retention policies inline during the post-DAG governance pass
+- [Model sidecar `retention`](/reference/model-format/) -- configure `retention = "<N>[dy]"`

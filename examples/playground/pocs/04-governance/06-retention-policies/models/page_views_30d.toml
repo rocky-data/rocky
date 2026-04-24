@@ -1,0 +1,13 @@
+# Data retention policy (engine-v1.16.0 / Wave C-2).
+#
+# Grammar: "<N>[dy]" — days (`d`) or years (`y`, flat 365-day
+# multiplication, no leap-year semantics). Parsed into
+# `RetentionPolicy { duration_days: u32 }` at project-load time.
+#
+# On Databricks this becomes a paired
+#   delta.logRetentionDuration / delta.deletedFileRetentionDuration
+# TBLPROPERTIES write. On Snowflake it becomes
+#   ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = 30.
+# On DuckDB (this POC's default) the apply is a silent no-op — the
+# sidecar still parses and `rocky retention-status` still reports it.
+retention = "30d"

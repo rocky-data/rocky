@@ -1,0 +1,3 @@
+# Year-long retention. Parsed as `1 * 365 = 365` days (flat, no
+# leap-year semantics — source: `rocky_core::retention::RetentionPolicy`).
+retention = "1y"

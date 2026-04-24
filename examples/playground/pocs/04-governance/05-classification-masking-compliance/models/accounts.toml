@@ -1,0 +1,16 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"
+
+# `owner_email` is tagged `pii` which resolves to `hash` (default) /
+# `redact` (prod). `audit_note` is tagged `audit_only` which has NO
+# matching entry in `[mask]` — this is the failure case the compliance
+# rollup is designed to catch. To silence it without adding a strategy,
+# list `audit_only` under `[classifications.allow_unmasked]` in
+# `rocky.toml`.
+[classification]
+owner_email = "pii"
+audit_note = "audit_only"
