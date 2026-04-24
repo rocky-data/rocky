@@ -321,11 +321,44 @@ class PlannedStatement(BaseModel):
     sql: str
 
 
+class ClassificationAction(BaseModel):
+    """Preview row for an `apply_column_tags` action Rocky would issue."""
+
+    model: str
+    column: str
+    tag: str
+
+
+class MaskAction(BaseModel):
+    """Preview row for an `apply_masking_policy` action Rocky would issue."""
+
+    model: str
+    column: str
+    tag: str
+    resolved_strategy: str
+
+
+class RetentionAction(BaseModel):
+    """Preview row for an `apply_retention_policy` action Rocky would issue."""
+
+    model: str
+    duration_days: int
+    warehouse_preview: str | None = None
+
+
 class PlanResult(BaseModel):
     version: str
     command: str
     filter: str
+    # Environment passed via `rocky plan --env <name>` — selects which
+    # `[mask.<env>]` overrides flow into `mask_actions`.
+    env: str | None = None
     statements: list[PlannedStatement]
+    # Governance preview — empty / absent on projects without
+    # `[classification]` / `[mask]` / `retention` sidecar config.
+    classification_actions: list[ClassificationAction] = []
+    mask_actions: list[MaskAction] = []
+    retention_actions: list[RetentionAction] = []
 
 
 # ---------------------------------------------------------------------------

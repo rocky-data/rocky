@@ -185,6 +185,12 @@ impl NodeDispatcher for CliDispatcher {
                     // cause every sibling to short-circuit on a single
                     // stamp.
                     None,
+                    // DAG sub-runs inherit no `--env`; the outer DAG
+                    // driver is pipeline-agnostic and the per-pipeline
+                    // governance reconcile picks up the resolved mask on
+                    // its own call path. Passing `None` preserves the
+                    // pre-1.16 workspace-default resolution for DAG runs.
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())

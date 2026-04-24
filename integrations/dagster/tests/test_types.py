@@ -359,6 +359,41 @@ def test_parse_plan(plan_json: str):
     assert "CREATE CATALOG" in result.statements[0].sql
     assert result.statements[2].purpose == "incremental_copy"
     assert "INSERT INTO" in result.statements[2].sql
+    # Minimal plan has no governance preview rows — defaulted to [].
+    assert result.env is None
+    assert result.classification_actions == []
+    assert result.mask_actions == []
+    assert result.retention_actions == []
+
+
+def test_parse_plan_with_governance(plan_with_governance_json: str):
+    """Exercise the governance preview fields added in engine 1.16.0
+    follow-up.
+
+    ``--env prod`` flips ``pii`` → ``redact`` on ``mask_actions``;
+    unresolved tags (``confidential``) do NOT surface in
+    ``mask_actions``; and ``retention_actions`` carries the Databricks
+    TBLPROPERTIES preview.
+    """
+    result = PlanResult.model_validate_json(plan_with_governance_json)
+    assert result.env == "prod"
+
+    # Classification is env-invariant: both tags preview.
+    assert len(result.classification_actions) == 2
+    assert {a.tag for a in result.classification_actions} == {"pii", "confidential"}
+
+    # Mask_actions only preview when the tag resolves. `confidential` has
+    # no `[mask]` entry in the fixture so it's absent here. `pii` under
+    # `--env prod` resolves to `redact` via the `[mask.prod]` override.
+    assert len(result.mask_actions) == 1
+    assert result.mask_actions[0].column == "email"
+    assert result.mask_actions[0].resolved_strategy == "redact"
+
+    # Retention is env-invariant and carries the warehouse preview.
+    assert len(result.retention_actions) == 1
+    assert result.retention_actions[0].duration_days == 90
+    preview = result.retention_actions[0].warehouse_preview
+    assert preview is not None and "delta.logRetentionDuration" in preview
 
 
 def test_parse_state(state_json: str):

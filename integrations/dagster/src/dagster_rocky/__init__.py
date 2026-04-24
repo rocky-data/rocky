@@ -82,6 +82,7 @@ from .types import (
     CheckResult,
     ChecksConfig,
     CiResult,
+    ClassificationAction,
     ClearSchemaCacheOutput,
     ColumnDef,
     ColumnLineageResult,
@@ -110,6 +111,7 @@ from .types import (
     HistoryResult,
     LastRunStatus,
     LineageEdge,
+    MaskAction,
     MaterializationCost,
     MaterializationInfo,
     MetricsResult,
@@ -128,6 +130,7 @@ from .types import (
     QualifiedColumn,
     QualityMetrics,
     QualitySnapshot,
+    RetentionAction,
     RetentionStatusOutput,
     RunRecord,
     RunResult,
@@ -246,6 +249,9 @@ __all__ = [
     "ContractViolation",
     # Plan / State
     "PlanResult",
+    "ClassificationAction",
+    "MaskAction",
+    "RetentionAction",
     "StateResult",
     "ClearSchemaCacheOutput",
     # Compile

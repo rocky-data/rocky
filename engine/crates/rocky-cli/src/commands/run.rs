@@ -693,6 +693,15 @@ pub async fn run(
     // (see `rocky_core::idempotency`) or proceeds and stamps the key at
     // every terminal exit.
     idempotency_key: Option<&str>,
+    // Caller-supplied `--env <name>`. Flows into
+    // `RockyConfig::resolve_mask_for_env` during the post-DAG
+    // governance reconcile so `[mask.<env>]` overrides win over the
+    // workspace `[mask]` defaults. `None` = resolve against defaults
+    // only (the pre-1.16 behavior). The role-graph reconcile is
+    // env-invariant — Rocky's role config has no `[role.<env>]`
+    // override shape — so this value does NOT flow into
+    // `reconcile_role_graph`.
+    env: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -2786,10 +2795,10 @@ pub async fn run(
             // schema grants above. Best-effort: failures warn but never abort,
             // mirroring the `apply_grants` semantics earlier in this path.
             //
-            // v1 resolves against project defaults (`env = None`). The
-            // `--env` flag threading is a follow-up — the resolver already
-            // accepts `Option<&str>`, the caller just doesn't plumb a choice
-            // yet.
+            // `env` threads the caller's `--env <name>` into
+            // `resolve_mask_for_env` so `[mask.<env>]` overrides win over
+            // the workspace `[mask]` defaults. `None` preserves the
+            // pre-1.16 behavior of resolving defaults only.
             let governance_compile = rocky_compiler::compile::compile(
                 &rocky_compiler::compile::CompilerConfig {
                     models_dir: mdir.to_path_buf(),
@@ -2799,7 +2808,7 @@ pub async fn run(
                 },
             );
             if let Ok(gov_compile) = governance_compile {
-                let tag_to_strategy = rocky_cfg.resolve_mask_for_env(None);
+                let tag_to_strategy = rocky_cfg.resolve_mask_for_env(env);
                 for model in &gov_compile.project.models {
                     let plan = model.to_plan();
                     let table_ref = TableRef {
@@ -2883,6 +2892,13 @@ pub async fn run(
             // the config was loaded (see `RockyConfig::role_graph`), so a
             // failure here is an adapter-side one (e.g., SCIM API down
             // when group creation lands in a follow-up).
+            //
+            // Role graph is intentionally env-invariant: `rocky.toml` has
+            // no `[role.<env>]` override shape (contrast `[mask.<env>]`).
+            // Roles represent deployment-wide permission groups; masks
+            // vary per env because dev/prod sensitivity differs. The
+            // caller's `--env` therefore does NOT flow into
+            // `reconcile_role_graph`.
             match rocky_cfg.role_graph() {
                 Ok(resolved) if !resolved.is_empty() => {
                     if let Err(e) = governance_adapter.reconcile_role_graph(&resolved).await {
@@ -4991,6 +5007,7 @@ adapter = "default"
             None,
             None,
             Some(key),
+            None,
         )
         .await
         .expect("transformation run should succeed");

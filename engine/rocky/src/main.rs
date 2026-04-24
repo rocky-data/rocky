@@ -207,6 +207,14 @@ enum Command {
         /// Pipeline name (required if multiple pipelines are defined)
         #[arg(long)]
         pipeline: Option<String>,
+        /// Scope the governance preview (`mask_actions`) to a specific
+        /// environment. When set, `[mask.<env>]` overrides from
+        /// `rocky.toml` overlay the workspace `[mask]` defaults in the
+        /// preview — matches the shape `rocky compliance --env <name>`
+        /// already uses. Classification tagging and retention policies
+        /// are env-invariant and previewed regardless.
+        #[arg(long)]
+        env: Option<String>,
     },
 
     /// Execute the full pipeline: discover → drift → create → copy → check
@@ -303,6 +311,18 @@ enum Command {
         /// secrets in idempotency keys.
         #[arg(long, value_name = "KEY")]
         idempotency_key: Option<String>,
+
+        /// Scope the post-DAG governance reconcile to a specific
+        /// environment. Flows into the masking resolver
+        /// (`resolve_mask_for_env`) so `[mask.<env>]` overrides overlay
+        /// the workspace `[mask]` defaults during
+        /// `apply_masking_policy`. Classification tagging and retention
+        /// policies are env-invariant (no `[classification.<env>]` /
+        /// `[retention.<env>]` shapes exist); role-graph reconcile is
+        /// also env-invariant. Matches `rocky plan --env` and `rocky
+        /// compliance --env`.
+        #[arg(long)]
+        env: Option<String>,
     },
 
     /// Compare shadow tables against production tables
@@ -1148,9 +1168,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             )
             .await
         }
-        Command::Plan { filter, pipeline } => {
-            rocky_cli::commands::plan(&cli.config, filter.as_deref(), pipeline.as_deref(), json)
-                .await
+        Command::Plan {
+            filter,
+            pipeline,
+            env,
+        } => {
+            rocky_cli::commands::plan(
+                &cli.config,
+                filter.as_deref(),
+                pipeline.as_deref(),
+                env.as_deref(),
+                json,
+            )
+            .await
         }
         Command::Run {
             filter,
@@ -1174,6 +1204,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             parallel,
             dag,
             idempotency_key,
+            env,
         } => {
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
@@ -1270,6 +1301,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     model.as_deref(),
                     cli.cache_ttl,
                     idempotency_key.as_deref(),
+                    env.as_deref(),
                 )
                 .await
             }

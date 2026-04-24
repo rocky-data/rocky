@@ -50,6 +50,11 @@ def plan_json() -> str:
 
 
 @pytest.fixture
+def plan_with_governance_json() -> str:
+    return json.dumps(scenarios.PLAN_WITH_GOVERNANCE)
+
+
+@pytest.fixture
 def state_json() -> str:
     return json.dumps(scenarios.STATE)
 
