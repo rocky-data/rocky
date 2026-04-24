@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-04-24
+
+Tracks engine 1.17.0 (governance-waveplan polish wave). Three new `RockyResource` / `RockyComponent` surfaces plus a breaking pre-flight validator on the `governance_override` payload:
+
+- **Pluggable per-call kwarg resolvers** on `RockyResource` (engine [#248](https://github.com/rocky-data/rocky/pull/248)) — inject `shadow_suffix` / `governance_override` / `idempotency_key` from the Dagster run context on every call without hand-rolling a composition wrapper.
+- **`RockyComponent.surface_compliance` + `.surface_retention_status`** ([#249](https://github.com/rocky-data/rocky/pull/249)) — opt-in YAML attributes auto-wire `rocky compliance` + `rocky retention-status` onto the Dagster asset graph. Default off.
+- **Pre-flight `governance_override.workspace_ids` validator** ([#250](https://github.com/rocky-data/rocky/pull/250)) — `dg.Failure` before subprocess spawn when the payload would silently revoke every workspace binding. Complements the engine-side guard; runs post-resolver so it covers `governance_override_fn` outputs too.
+- **`PlanResult` governance preview fields** ([#251](https://github.com/rocky-data/rocky/pull/251)) — `env`, `classification_actions`, `mask_actions`, `retention_actions` re-exported alongside `PlanResult`.
+
 ### Added
 
 - **`PlanResult` carries the governance preview from engine 1.16.0 follow-up.** New fields on `PlanResult`: `env: str | None`, `classification_actions: list[ClassificationAction]`, `mask_actions: list[MaskAction]`, `retention_actions: list[RetentionAction]`. All default to `[]` / `None` so existing consumers are unaffected. The three action types are re-exported from the package barrel alongside `PlanResult`. Wire shape matches the engine's additive JSON output (`skip_serializing_if = "Vec::is_empty"` on every new field), so parsing a pre-1.16 `rocky plan --output json` still round-trips cleanly.
