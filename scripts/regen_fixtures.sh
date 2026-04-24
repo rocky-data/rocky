@@ -62,7 +62,7 @@ mkdir -p "$DEST"
 
 echo "==> bootstrap"
 cd "$POC"
-rm -f .rocky-state.redb poc.duckdb playground.duckdb
+rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb playground.duckdb
 duckdb playground.duckdb < data/seed.sql >/dev/null
 "$ROCKY" run --filter source=orders >/dev/null 2>&1
 
@@ -119,7 +119,7 @@ echo "==> drift (zero-drift baseline)"
 # drift.json file unless the user wants to keep the hand-written one.
 
 # --- Cleanup the playground POC state ---
-rm -f .rocky-state.redb poc.duckdb playground.duckdb /tmp/_drift_run.json
+rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb playground.duckdb /tmp/_drift_run.json
 
 # ---------------------------------------------------------------------------
 # Partition fixtures (time_interval shape)
@@ -146,7 +146,7 @@ capture_partition() {
 
 if [[ -d "$PARTITION_POC" ]]; then
     cd "$PARTITION_POC"
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
     duckdb poc.duckdb < data/seed.sql >/dev/null
 
     # Phase 0: typed compile output for the time_interval model.
@@ -178,7 +178,7 @@ if [[ -d "$PARTITION_POC" ]]; then
         --partition 2026-04-07
 
     # Cleanup partition POC state.
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
 else
     echo "==> partition POC not found at $PARTITION_POC, skipping partition fixtures"
 fi
@@ -214,7 +214,7 @@ POCS_ROOT="$WORKSPACE_ROOT/examples/playground/pocs"
 DRIFT_POC="$POCS_ROOT/02-performance/06-schema-drift-recover"
 if [[ -d "$DRIFT_POC" ]]; then
     cd "$DRIFT_POC"
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
     duckdb poc.duckdb < data/seed.sql >/dev/null
     mkdir -p "$DEST/drift"
     # First run is a clean baseline.
@@ -225,7 +225,7 @@ if [[ -d "$DRIFT_POC" ]]; then
         >/dev/null
     # Second run triggers DROP + RECREATE → drift.actions_taken populated.
     capture_into drift run_after_drift -c rocky.toml run --filter source=orders
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
 else
     echo "==> drift POC not found at $DRIFT_POC, skipping"
 fi
@@ -234,10 +234,10 @@ fi
 CONTRACTS_POC="$POCS_ROOT/01-quality/01-data-contracts-strict"
 if [[ -d "$CONTRACTS_POC" ]]; then
     cd "$CONTRACTS_POC"
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
     mkdir -p "$DEST/contracts"
     capture_into contracts compile compile --models models --contracts contracts
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
 else
     echo "==> contracts POC not found at $CONTRACTS_POC, skipping"
 fi
@@ -246,7 +246,7 @@ fi
 INCREMENTAL_POC="$POCS_ROOT/02-performance/01-incremental-watermark"
 if [[ -d "$INCREMENTAL_POC" ]]; then
     cd "$INCREMENTAL_POC"
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
     duckdb poc.duckdb < data/seed_initial.sql >/dev/null
     mkdir -p "$DEST/incremental"
     capture_into incremental run1_initial -c rocky.toml run --filter source=events
@@ -254,7 +254,7 @@ if [[ -d "$INCREMENTAL_POC" ]]; then
     duckdb poc.duckdb < data/seed_delta.sql >/dev/null
     capture_into incremental run2_delta -c rocky.toml run --filter source=events
     capture_into incremental state_after_run2 -c rocky.toml state
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
 else
     echo "==> incremental POC not found at $INCREMENTAL_POC, skipping"
 fi
@@ -263,12 +263,12 @@ fi
 OPTIMIZE_POC="$POCS_ROOT/02-performance/05-optimize-recommendations"
 if [[ -d "$OPTIMIZE_POC" ]]; then
     cd "$OPTIMIZE_POC"
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
     duckdb poc.duckdb < data/seed.sql >/dev/null
     mkdir -p "$DEST/optimize"
     capture_into optimize run -c rocky.toml run --filter source=events
     capture_into optimize optimize -c rocky.toml optimize
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
 else
     echo "==> optimize POC not found at $OPTIMIZE_POC, skipping"
 fi
@@ -277,13 +277,13 @@ fi
 LINEAGE_POC="$POCS_ROOT/06-developer-experience/01-lineage-column-level"
 if [[ -d "$LINEAGE_POC" ]]; then
     cd "$LINEAGE_POC"
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
     mkdir -p "$DEST/lineage"
     capture_into lineage compile compile --models models
     capture_into lineage test test --models models
     capture_into lineage lineage_model lineage fct_revenue --models models
     capture_into lineage lineage_column lineage fct_revenue --models models --column total
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
 else
     echo "==> lineage POC not found at $LINEAGE_POC, skipping"
 fi
@@ -292,11 +292,11 @@ fi
 DOCTOR_CI_POC="$POCS_ROOT/06-developer-experience/05-doctor-and-ci"
 if [[ -d "$DOCTOR_CI_POC" ]]; then
     cd "$DOCTOR_CI_POC"
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
     mkdir -p "$DEST/doctor_ci"
     capture_into doctor_ci doctor -c rocky.toml doctor
     capture_into doctor_ci ci ci --models models
-    rm -f .rocky-state.redb
+    rm -f .rocky-state.redb models/.rocky-state.redb
 else
     echo "==> doctor_ci POC not found at $DOCTOR_CI_POC, skipping"
 fi
@@ -305,7 +305,7 @@ fi
 ANOMALY_POC="$POCS_ROOT/01-quality/03-anomaly-detection"
 if [[ -d "$ANOMALY_POC" ]]; then
     cd "$ANOMALY_POC"
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
     mkdir -p "$DEST/anomaly"
     # 3 baseline runs to populate run history.
     for i in 1 2 3; do
@@ -317,7 +317,7 @@ if [[ -d "$ANOMALY_POC" ]]; then
     capture_into anomaly run_incident -c rocky.toml run --filter source=events
     # History should now have 4 entries.
     capture_into anomaly history -c rocky.toml history
-    rm -f .rocky-state.redb poc.duckdb
+    rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb
 else
     echo "==> anomaly POC not found at $ANOMALY_POC, skipping"
 fi
