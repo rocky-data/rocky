@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`shadow_suffix_resolver()` convenience factory** in `dagster_rocky.branch_deploy` — returns a `Resolver` closure that calls `branch_deploy_shadow_suffix()` ignoring its context. Wire it into `RockyResource(shadow_suffix_fn=shadow_suffix_resolver())` to auto-inject the branch-deploy suffix on every run method without conditional caller code.
 
+- **`RockyResource.compliance(env=None)` / `RockyResource.retention_status(env=None)`** — first-class resource methods that shell out to `rocky compliance` / `rocky retention-status --output json` and return parsed `ComplianceOutput` / `RetentionStatusOutput`. Both accept an optional `env` kwarg that forwards as `--env <env>`. Metadata-only reads against the state store — no warehouse round-trip in v1.
+- **`compliance_check_results(output, *, key_resolver)`** (in `observability.py`) — folds a `ComplianceOutput` into one aggregated `AssetCheckResult` (severity `WARN`, `passed=False`) per asset with exceptions. Metadata surface: `rocky/compliance_exception_count`, `rocky/compliance_models`, `rocky/compliance_reasons`, `rocky/compliance_total_{classified,exceptions,masked}`. Exceptions whose model doesn't resolve via the caller's resolver fold into a sentinel `AssetKey(["_compliance"])` so the signal stays visible. Aggregation is deliberate: Dagster rejects duplicate `(asset_key, check_name)` pairs per materialization, so multiple exceptions for the same model (typically one per env) must collapse into one result.
+- **`retention_observations(output, *, key_resolver)`** (in `observability.py`) — folds a `RetentionStatusOutput` into one `AssetObservation` per `ModelRetentionStatus` row, keyed by model. Metadata surface: `rocky/retention_model`, `rocky/retention_configured_days` (omitted when `None`), `rocky/retention_warehouse_days` (omitted when `None` — the v1 engine always reports `None` here; the `--drift` warehouse probe is a v2 follow-up), `rocky/retention_in_sync`. Observation (not check) is the right primitive: retention is a configuration signal, not a pass/fail.
+- **`COMPLIANCE_CHECK_NAME`, `COMPLIANCE_FALLBACK_ASSET_KEY`, `RETENTION_OBSERVATION_NAME`** — module constants + public re-exports for consumers who want to key on the check / observation names outside the component bridge.
+- **`RockyComponent.surface_compliance: bool = False` + `surface_retention_status: bool = False`** — new opt-in YAML attributes. When `surface_compliance` is on, the component pre-declares a `compliance_exception` `AssetCheckSpec` per asset (so the check is visible in the UI before any run) and invokes `RockyResource.compliance()` once per materialization batch. When `surface_retention_status` is on, the component invokes `RockyResource.retention_status()` and yields observations. Binary failures are logged and swallowed — same tolerance as the drift / anomaly path. Both flags default to `False` so existing deployments see no behaviour change.
+
+  Adopters flip both on with two lines in `defs.yaml`:
+
+  ```yaml
+  type: dagster_rocky.RockyComponent
+  attributes:
+    binary_path: rocky
+    config_path: rocky/rocky.toml
+    surface_compliance: true
+    surface_retention_status: true
+  ```
+
 - **New top-level re-exports**: `ResolverContext`, `Resolver`, `shadow_suffix_resolver`.
 
 ## [1.12.0] — 2026-04-23

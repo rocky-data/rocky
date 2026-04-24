@@ -6,18 +6,25 @@ import dagster as dg
 
 from dagster_rocky.observability import (
     ANOMALY_CHECK_NAME,
+    COMPLIANCE_CHECK_NAME,
+    COMPLIANCE_FALLBACK_ASSET_KEY,
+    RETENTION_OBSERVATION_NAME,
     anomaly_check_results,
+    compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
+    retention_observations,
 )
 from dagster_rocky.types import (
     AnomalyResult,
+    ComplianceOutput,
     DriftAction,
     DriftInfo,
     ExecutionSummary,
     MaterializationCost,
     OptimizeResult,
     PermissionInfo,
+    RetentionStatusOutput,
     RunResult,
 )
 
@@ -248,3 +255,167 @@ def test_optimize_metadata_for_keys_empty_when_no_recommendations():
         optimize, model_to_key={"fct_orders": dg.AssetKey(["fct_orders"])}
     )
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# compliance_check_results
+# ---------------------------------------------------------------------------
+
+
+def test_compliance_check_results_parses_scenario(compliance_json: str):
+    """Scenario dict parses cleanly into ComplianceOutput (parse-guard)."""
+    output = ComplianceOutput.model_validate_json(compliance_json)
+    assert output.command == "compliance"
+    assert len(output.exceptions) == 2
+    assert output.summary.total_exceptions == 2
+    assert output.summary.total_masked == 2
+
+
+def test_compliance_check_results_aggregates_per_asset(compliance_json: str):
+    """Multiple exceptions on the same asset collapse to one WARN result.
+
+    Dagster rejects duplicate ``(asset_key, check_name)`` pairs per
+    materialization. The scenario has two ``payments.ssn`` exceptions
+    (one per env); both resolve to the same payments asset key and
+    must fold into a single aggregated check result.
+    """
+    output = ComplianceOutput.model_validate_json(compliance_json)
+    payments_key = dg.AssetKey(["fivetran", "acme", "payments"])
+    resolver = _resolver({"payments": payments_key})
+
+    results = list(compliance_check_results(output, key_resolver=resolver))
+
+    assert len(results) == 1
+    r = results[0]
+    assert isinstance(r, dg.AssetCheckResult)
+    assert r.check_name == COMPLIANCE_CHECK_NAME
+    assert r.passed is False
+    assert r.severity == dg.AssetCheckSeverity.WARN
+    assert r.asset_key == payments_key
+    assert r.metadata["rocky/compliance_exception_count"].value == 2
+    # Both (model, column, env) triples appear in the aggregated models string
+    models = r.metadata["rocky/compliance_models"].value
+    assert "payments.ssn (default)" in models
+    assert "payments.ssn (prod)" in models
+    # Summary counters are stamped on the aggregate
+    assert r.metadata["rocky/compliance_total_classified"].value == 4
+    assert r.metadata["rocky/compliance_total_exceptions"].value == 2
+    assert r.metadata["rocky/compliance_total_masked"].value == 2
+
+
+def test_compliance_check_results_falls_back_to_sentinel_when_unresolved(
+    compliance_json: str,
+):
+    output = ComplianceOutput.model_validate_json(compliance_json)
+    # Empty resolver → both exceptions aggregate into a single sentinel result
+    results = list(compliance_check_results(output, key_resolver=_resolver({})))
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.asset_key == COMPLIANCE_FALLBACK_ASSET_KEY
+    assert r.metadata["rocky/compliance_exception_count"].value == 2
+
+
+def test_compliance_check_results_empty_when_no_exceptions():
+    output = ComplianceOutput(
+        command="compliance",
+        version="1.16.0",
+        summary={
+            "total_classified": 0,
+            "total_masked": 0,
+            "total_exceptions": 0,
+        },
+        per_column=[],
+        exceptions=[],
+    )
+    results = list(compliance_check_results(output, key_resolver=_resolver({})))
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# retention_observations
+# ---------------------------------------------------------------------------
+
+
+def test_retention_observations_parses_scenario(retention_status_json: str):
+    """Scenario dict parses cleanly into RetentionStatusOutput (parse-guard)."""
+    output = RetentionStatusOutput.model_validate_json(retention_status_json)
+    assert output.command == "retention-status"
+    assert len(output.models) == 3
+    # All in v1 have warehouse_days=None — the --drift probe is a v2 follow-up
+    assert all(m.warehouse_days is None for m in output.models)
+
+
+def test_retention_observations_yields_one_per_model(retention_status_json: str):
+    output = RetentionStatusOutput.model_validate_json(retention_status_json)
+    orders_key = dg.AssetKey(["fivetran", "acme", "orders"])
+    payments_key = dg.AssetKey(["fivetran", "acme", "payments"])
+    revenue_key = dg.AssetKey(["marts", "revenue_summary"])
+    resolver = _resolver(
+        {
+            "orders": orders_key,
+            "payments": payments_key,
+            "revenue_summary": revenue_key,
+        }
+    )
+
+    obs = list(retention_observations(output, key_resolver=resolver))
+
+    assert len(obs) == 3
+    by_model = {o.metadata["rocky/retention_model"].value: o for o in obs}
+
+    # Orders: configured 30 days, warehouse_days is None so the metadata
+    # field is OMITTED (not None-valued) — the observation shape mirrors
+    # the schema's "None means no data yet" convention.
+    orders_obs = by_model["orders"]
+    assert orders_obs.asset_key == orders_key
+    assert orders_obs.metadata["rocky/retention_configured_days"].value == 30
+    assert "rocky/retention_warehouse_days" not in orders_obs.metadata
+    assert orders_obs.metadata["rocky/retention_in_sync"].value is True
+
+    # Revenue_summary: no declaration — configured_days omitted, warehouse omitted
+    revenue_obs = by_model["revenue_summary"]
+    assert "rocky/retention_configured_days" not in revenue_obs.metadata
+    assert "rocky/retention_warehouse_days" not in revenue_obs.metadata
+    assert revenue_obs.metadata["rocky/retention_in_sync"].value is True
+
+
+def test_retention_observations_skips_unresolved_models(retention_status_json: str):
+    output = RetentionStatusOutput.model_validate_json(retention_status_json)
+    # Only orders resolves — payments + revenue_summary silently dropped
+    orders_key = dg.AssetKey(["fivetran", "acme", "orders"])
+    resolver = _resolver({"orders": orders_key})
+
+    obs = list(retention_observations(output, key_resolver=resolver))
+
+    assert len(obs) == 1
+    assert obs[0].asset_key == orders_key
+
+
+def test_retention_observations_surfaces_warehouse_days_when_populated():
+    """Forward-compatibility: once v2 --drift ships warehouse_days, the
+    metadata field MUST appear with the observed value."""
+    output = RetentionStatusOutput(
+        command="retention-status",
+        version="1.17.0",
+        models=[
+            {
+                "model": "orders",
+                "configured_days": 30,
+                "warehouse_days": 60,
+                "in_sync": False,
+            },
+        ],
+    )
+    orders_key = dg.AssetKey(["orders"])
+    obs = list(retention_observations(output, key_resolver=_resolver({"orders": orders_key})))
+
+    assert len(obs) == 1
+    assert obs[0].metadata["rocky/retention_configured_days"].value == 30
+    assert obs[0].metadata["rocky/retention_warehouse_days"].value == 60
+    assert obs[0].metadata["rocky/retention_in_sync"].value is False
+
+
+def test_retention_observation_name_is_exposed():
+    """Constant is importable + stable (public API)."""
+    assert RETENTION_OBSERVATION_NAME == "retention_drift"

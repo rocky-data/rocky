@@ -41,7 +41,7 @@ from .checks import cost_metadata_from_optimize
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from .types import OptimizeResult, RunResult
+    from .types import ComplianceOutput, OptimizeResult, RetentionStatusOutput, RunResult
 
     #: Type alias for the key resolver callback used by drift/anomaly builders.
     #: Takes a Rocky table identifier (possibly ``catalog.schema.table``) and
@@ -54,6 +54,28 @@ if TYPE_CHECKING:
 #: a matching :class:`dg.AssetCheckSpec` with this name on every Rocky asset
 #: that should expose anomaly detection in the UI before any run.
 ANOMALY_CHECK_NAME: str = "row_count_anomaly"
+
+#: Canonical Dagster check name used to surface compliance exceptions from
+#: ``rocky compliance`` (governance Wave B). One check result is emitted per
+#: :class:`ComplianceException` in the rollup, keyed on the model that owns
+#: the classified column. Pre-declare a matching :class:`dg.AssetCheckSpec`
+#: on every Rocky asset that should expose governance compliance in the UI
+#: before any run.
+COMPLIANCE_CHECK_NAME: str = "compliance_exception"
+
+#: Sentinel Dagster asset key used when a compliance exception's model does
+#: not resolve to any asset key in the current selection (e.g. the model
+#: exists in the Rocky project but isn't a source-replication table). One
+#: run-level check result is emitted against this key per unresolved
+#: exception so the signal is still visible in the run viewer.
+COMPLIANCE_FALLBACK_ASSET_KEY: dg.AssetKey = dg.AssetKey(["_compliance"])
+
+#: Canonical name used for the retention observations emitted by
+#: :func:`retention_observations`. Included as an observation-level
+#: description tag so downstream filtering on the asset timeline can pick
+#: out retention-drift events by description without pattern matching on
+#: the metadata keys.
+RETENTION_OBSERVATION_NAME: str = "retention_drift"
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +217,166 @@ def optimize_metadata_for_keys(
         if metadata:
             out[asset_key] = metadata
     return out
+
+
+# ---------------------------------------------------------------------------
+# Compliance → AssetCheckResult (WARN)
+# ---------------------------------------------------------------------------
+
+
+def compliance_check_results(
+    output: ComplianceOutput,
+    *,
+    key_resolver: KeyResolver,
+) -> Iterator[dg.AssetCheckResult]:
+    """Yield one aggregated ``AssetCheckResult`` per asset with compliance exceptions.
+
+    Dagster's ``AssetCheckResult`` API requires at most one result per
+    ``(asset_key, check_name)`` per materialization — emitting one per
+    exception would trigger ``DagsterInvariantViolationError`` whenever
+    a single model has exceptions across multiple envs or columns. This
+    helper therefore aggregates per asset: all exceptions for the same
+    resolved ``AssetKey`` fold into a single WARN check result whose
+    metadata lists every offending ``(model, column, env)`` triple.
+
+    The check shape is::
+
+        check_name = COMPLIANCE_CHECK_NAME ("compliance_exception")
+        passed     = False
+        severity   = dg.AssetCheckSeverity.WARN
+
+    Severity is WARN uniformly today — the engine's ``ComplianceException``
+    schema v1 has no per-exception severity field (the ``reason`` string
+    is the only free-form dimension). If the engine later surfaces
+    severity or ``acknowledged`` metadata, this helper can start gating
+    ``passed`` / ``severity`` on it without a signature change.
+
+    Asset-key resolution is delegated to ``key_resolver`` — the component
+    bridge builds one keyed by model name from its
+    ``rocky_key_to_dagster_key`` map, mirroring the drift / anomaly
+    pattern. Exceptions whose model does not resolve to an asset key
+    fold into a single aggregate against
+    :data:`COMPLIANCE_FALLBACK_ASSET_KEY` (a synthesized ``_compliance``
+    key) so the helper remains usable by callers outside the
+    :class:`RockyComponent` bridge (hand-rolled multi-assets can declare
+    a matching check spec on the sentinel key). The component bridge
+    itself drops the sentinel-keyed result with a warning because it
+    cannot pre-declare a spec for a key that's not one of the
+    component's assets.
+
+    Args:
+        output: Parsed ``rocky compliance`` output.
+        key_resolver: Callable taking a Rocky model name and returning
+            the Dagster ``AssetKey`` it maps to, or ``None`` if no
+            mapping exists.
+
+    Yields:
+        One ``dg.AssetCheckResult`` per asset with exceptions, with
+        ``rocky/compliance_*`` metadata aggregating every exception
+        against that asset. Metadata keys:
+
+        * ``rocky/compliance_exception_count`` — number of exceptions
+          folded into this result.
+        * ``rocky/compliance_models`` — ``"model.column (env)"`` entries
+          joined by ``"; "``.
+        * ``rocky/compliance_reasons`` — distinct reason strings joined
+          by ``"; "``.
+        * ``rocky/compliance_total_*`` — project-wide summary counters.
+    """
+    by_key: dict[dg.AssetKey, list] = {}
+    for exception in output.exceptions:
+        asset_key = key_resolver(exception.model) or COMPLIANCE_FALLBACK_ASSET_KEY
+        by_key.setdefault(asset_key, []).append(exception)
+
+    for asset_key, exceptions in by_key.items():
+        model_parts = [f"{e.model}.{e.column} ({e.env})" for e in exceptions]
+        # Deduplicate reasons while preserving first-seen order.
+        reasons: list[str] = []
+        for e in exceptions:
+            if e.reason not in reasons:
+                reasons.append(e.reason)
+        yield dg.AssetCheckResult(
+            asset_key=asset_key,
+            check_name=COMPLIANCE_CHECK_NAME,
+            passed=False,
+            severity=dg.AssetCheckSeverity.WARN,
+            metadata={
+                "rocky/compliance_exception_count": dg.MetadataValue.int(len(exceptions)),
+                "rocky/compliance_models": dg.MetadataValue.text("; ".join(model_parts)),
+                "rocky/compliance_reasons": dg.MetadataValue.text("; ".join(reasons)),
+                "rocky/compliance_total_classified": dg.MetadataValue.int(
+                    output.summary.total_classified
+                ),
+                "rocky/compliance_total_exceptions": dg.MetadataValue.int(
+                    output.summary.total_exceptions
+                ),
+                "rocky/compliance_total_masked": dg.MetadataValue.int(output.summary.total_masked),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Retention → AssetObservation
+# ---------------------------------------------------------------------------
+
+
+def retention_observations(
+    output: RetentionStatusOutput,
+    *,
+    key_resolver: KeyResolver,
+) -> Iterator[dg.AssetObservation]:
+    """Yield one ``AssetObservation`` per :class:`ModelRetentionStatus` row.
+
+    Retention is a *configuration* signal, not a pass/fail check — a
+    model with no configured retention is a valid state, and
+    ``in_sync=False`` means the warehouse's current retention differs
+    from what the project declared (a change, not necessarily a
+    failure). Observation is therefore the right primitive.
+
+    Asset-key resolution is delegated to ``key_resolver`` — same
+    contract as :func:`drift_observations` and
+    :func:`compliance_check_results`. Rows whose model does not resolve
+    are silently skipped.
+
+    The metadata surface mirrors the fields on
+    :class:`ModelRetentionStatus`:
+
+    * ``rocky/retention_model`` — model name
+    * ``rocky/retention_configured_days`` — declared retention from the
+      model's ``retention`` sidecar (omitted when ``None`` — the model
+      has no retention declaration)
+    * ``rocky/retention_warehouse_days`` — observed retention from the
+      warehouse (omitted when ``None``; the engine's ``--drift``
+      warehouse probe is a v2 follow-up so this is always ``None`` in
+      v1)
+    * ``rocky/retention_in_sync`` — ``True`` iff configured and
+      warehouse retention match (or both are ``None``)
+
+    Args:
+        output: Parsed ``rocky retention-status`` output.
+        key_resolver: Callable taking a Rocky model name and returning
+            the Dagster ``AssetKey`` it maps to, or ``None`` if no
+            mapping exists.
+
+    Yields:
+        ``dg.AssetObservation`` events with ``rocky/retention_*`` metadata.
+    """
+    for status in output.models:
+        asset_key = key_resolver(status.model)
+        if asset_key is None:
+            continue
+        metadata: dict[str, dg.MetadataValue] = {
+            "rocky/retention_model": dg.MetadataValue.text(status.model),
+            "rocky/retention_in_sync": dg.MetadataValue.bool(status.in_sync),
+        }
+        if status.configured_days is not None:
+            metadata["rocky/retention_configured_days"] = dg.MetadataValue.int(
+                status.configured_days
+            )
+        if status.warehouse_days is not None:
+            metadata["rocky/retention_warehouse_days"] = dg.MetadataValue.int(status.warehouse_days)
+        yield dg.AssetObservation(
+            asset_key=asset_key,
+            description=f"Retention status: {RETENTION_OBSERVATION_NAME}",
+            metadata=metadata,
+        )

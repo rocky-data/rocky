@@ -53,9 +53,12 @@ from .derived_models import (
 from .freshness import freshness_policy_from_checks, per_model_freshness_policies
 from .observability import (
     ANOMALY_CHECK_NAME,
+    COMPLIANCE_CHECK_NAME,
     anomaly_check_results,
+    compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
+    retention_observations,
 )
 from .resource import RockyResource
 from .sensor import rocky_source_sensor
@@ -304,6 +307,26 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: ``strict_doctor=True`` means fail on any critical check;
     #: non-empty scopes the fail-fast gate to just those check names.
     strict_doctor_checks: list[str] = []
+    #: When ``True``, the multi-asset invokes :meth:`RockyResource.compliance`
+    #: once per materialization batch and folds each
+    #: :class:`~.types.ComplianceException` into a ``compliance_exception``
+    #: :class:`dg.AssetCheckResult` (severity ``WARN``) on the matching
+    #: asset. Pre-declares a :class:`dg.AssetCheckSpec` per asset so the
+    #: check is visible in the Dagster UI before any run — materializations
+    #: with no exceptions emit a passing placeholder via
+    #: :func:`_emit_placeholder_checks`. Default ``False`` preserves zero
+    #: behaviour change.
+    surface_compliance: bool = False
+    #: When ``True``, the multi-asset invokes
+    #: :meth:`RockyResource.retention_status` once per materialization batch
+    #: and emits one :class:`dg.AssetObservation` per
+    #: :class:`~.types.ModelRetentionStatus` row on the matching asset.
+    #: Observation (not check) is the right primitive because retention is
+    #: a configuration signal — ``in_sync=False`` means the warehouse's
+    #: current retention differs from the project's declaration, which is
+    #: a change to surface on the timeline rather than a pass/fail.
+    #: Default ``False`` preserves zero behaviour change.
+    surface_retention_status: bool = False
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -526,7 +549,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             else {}
         )
 
-        check_specs = _build_check_specs(groups, contract_rules_by_model)
+        check_specs = _build_check_specs(
+            groups,
+            contract_rules_by_model,
+            surface_compliance=self.surface_compliance,
+        )
 
         assets: list[dg.AssetsDefinition] = [
             _make_rocky_asset(
@@ -538,6 +565,8 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 compile_state=compile_state,
                 contract_rules_by_model=contract_rules_by_model,
                 execution_mode=self.execution_mode,
+                surface_compliance=self.surface_compliance,
+                surface_retention_status=self.surface_retention_status,
             )
             for group in groups
         ]
@@ -767,6 +796,8 @@ def _build_asset_spec(
 def _build_check_specs(
     groups: list[_GroupBuild],
     contract_rules_by_model: dict[str, ContractRules] | None = None,
+    *,
+    surface_compliance: bool = False,
 ) -> list[dg.AssetCheckSpec]:
     """Pre-declare check specs for every asset in every group.
 
@@ -778,6 +809,13 @@ def _build_check_specs(
     on the presence of the matching rule kind in the contract file
     (e.g. a contract with only `[[columns]]` constraints does NOT get a
     `contract_required_columns` spec).
+
+    When ``surface_compliance`` is ``True``, additionally pre-declares a
+    ``compliance_exception`` :class:`dg.AssetCheckSpec` per asset so the
+    UI surfaces it before any run — matches the ``row_count_anomaly``
+    pattern (check exists even if the current run produces no exceptions,
+    in which case :func:`_emit_placeholder_checks` emits a passing
+    placeholder).
     """
     contract_rules_by_model = contract_rules_by_model or {}
     specs: list[dg.AssetCheckSpec] = []
@@ -787,6 +825,10 @@ def _build_check_specs(
             # Default checks (4 per asset)
             for check_name in DEFAULT_CHECK_NAMES:
                 specs.append(dg.AssetCheckSpec(name=check_name, asset=spec.key))
+
+            # Governance compliance check (Wave B, opt-in)
+            if surface_compliance:
+                specs.append(dg.AssetCheckSpec(name=COMPLIANCE_CHECK_NAME, asset=spec.key))
 
             # Contract checks (per declared rule kind, when matched)
             table_name = spec.key.path[-1]
@@ -957,6 +999,8 @@ def _make_rocky_asset(
     compile_state: _CompileState,
     contract_rules_by_model: dict[str, ContractRules] | None = None,
     execution_mode: Literal["streaming", "pipes"] = "streaming",
+    surface_compliance: bool = False,
+    surface_retention_status: bool = False,
 ) -> dg.AssetsDefinition:
     """Create a multi-asset that executes ``rocky run`` for one group.
 
@@ -973,6 +1017,14 @@ def _make_rocky_asset(
       Contract check results remain sourced from compile diagnostics in
       both modes because those are a build-time signal, not a run-time
       signal.
+
+    Governance surfaces (``surface_compliance`` / ``surface_retention_status``):
+    both are opt-in and default to ``False``. When on, the asset invokes
+    :meth:`RockyResource.compliance` / :meth:`RockyResource.retention_status`
+    after the run loop and folds each output through the matching
+    observability helper. Emitted in both execution modes because
+    governance state lives in the state store, not in the ``rocky run``
+    JSON — so Pipes doesn't carry them either.
     """
     contract_rules_by_model = contract_rules_by_model or {}
 
@@ -988,6 +1040,57 @@ def _make_rocky_asset(
         selected_keys = set(context.selected_asset_keys)
         filters = _select_filters(group, selected_keys, context)
 
+        # Governance events (Waves B + C-2, opt-in). Collected first so
+        # the compliance check pairs can be passed into ``_emit_results``
+        # via ``extra_yielded_checks`` — otherwise the placeholder pass
+        # would emit a passing ``compliance_exception`` alongside each
+        # real WARN result, triggering Dagster's "output returned
+        # multiple times" invariant. Emitted in both execution modes
+        # because the compliance / retention-status rollups live in the
+        # state store — Pipes carries run events, not governance metadata.
+        #
+        # Compliance results whose ``(asset_key, check_name)`` is not
+        # pre-declared in ``check_specs`` are dropped with a warning —
+        # ``compliance_check_results`` may yield against the
+        # ``_compliance`` sentinel key (for model names the resolver
+        # can't map) or against assets outside the group selection,
+        # neither of which can be declared at spec-build time. Same
+        # guard as ``_emit_results`` applies to anomaly results.
+        declared_check_pairs: set[tuple[dg.AssetKey, str]] = {
+            (cs.asset_key, cs.name) for cs in check_specs
+        }
+        governance_events: list[dg.AssetCheckResult | dg.AssetObservation] = []
+        compliance_yielded: set[tuple[dg.AssetKey, str]] = set()
+        if surface_compliance or surface_retention_status:
+            for event in _emit_governance_events(
+                context=context,
+                rocky=rocky,
+                group=group,
+                selected_keys=selected_keys,
+                surface_compliance=surface_compliance,
+                surface_retention_status=surface_retention_status,
+            ):
+                if isinstance(event, dg.AssetCheckResult):
+                    pair = (event.asset_key, event.check_name)
+                    if pair not in declared_check_pairs:
+                        context.log.warning(
+                            f"compliance result for undeclared asset "
+                            f"{event.asset_key.to_user_string()!r} "
+                            f"(check {event.check_name!r}) — dropping. "
+                            f"This happens when a compliance exception targets "
+                            f"a model outside the current group's selection or "
+                            f"folds into the {COMPLIANCE_CHECK_NAME} sentinel "
+                            f"key. Surface this asset on the component to "
+                            f"receive the result."
+                        )
+                        continue
+                    compliance_yielded.add(pair)
+                    governance_events.append(event)
+                elif isinstance(event, dg.AssetObservation):
+                    # Observations are unconstrained by declared specs —
+                    # pass through unchanged.
+                    governance_events.append(event)
+
         if execution_mode == "pipes":
             yield from _run_filters_pipes(
                 context=context,
@@ -996,6 +1099,10 @@ def _make_rocky_asset(
                 group=group,
                 selected_keys=selected_keys,
             )
+            # In pipes mode, the placeholder pass inside ``_emit_results``
+            # doesn't run — but we still need to yield the collected
+            # governance events so the surfaces are wired in both modes.
+            yield from governance_events
         else:
             results = _run_filters(context, rocky, filters)
 
@@ -1006,11 +1113,17 @@ def _make_rocky_asset(
                     f"{sum(r.duration_ms for r in results)}ms"
                 )
 
+            # Yield governance events first so Dagster sees them before
+            # the placeholder pass. ``extra_yielded_checks`` primes
+            # ``_emit_results``'s dedup set so the placeholder doesn't
+            # double-emit ``compliance_exception`` against the same key.
+            yield from governance_events
             yield from _emit_results(
                 results=results,
                 check_specs=check_specs,
                 selected_keys=selected_keys,
                 rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
+                extra_yielded_checks=compliance_yielded,
             )
 
         # Contract check results — sourced from compile diagnostics, not
@@ -1073,6 +1186,55 @@ def _run_filters_pipes(
             include_keys=selected_keys,
         )
         yield from invocation.get_results()
+
+
+def _emit_governance_events(
+    *,
+    context: dg.AssetExecutionContext,
+    rocky: RockyResource,
+    group: _GroupBuild,
+    selected_keys: set[dg.AssetKey],
+    surface_compliance: bool,
+    surface_retention_status: bool,
+) -> Iterator[dg.AssetCheckResult | dg.AssetObservation]:
+    """Fold ``rocky compliance`` / ``rocky retention-status`` into Dagster events.
+
+    Both calls are metadata-only reads against the state store — cheap
+    enough to run once per materialization batch. Errors are logged and
+    swallowed so a transient governance read never fails a whole
+    materialization; the drift / anomaly path has the same tolerance
+    (a binary failure surfaces via the materialization itself).
+
+    Asset-key resolution reuses the group's ``rocky_key_to_dagster_key``
+    lookup — compliance exceptions and retention rows identify models by
+    name, so the resolver tries an exact last-segment match against the
+    selected subset. Models that don't resolve to a selected asset key
+    either fall back to the sentinel ``_compliance`` key (exceptions) or
+    are silently skipped (retention observations).
+    """
+    model_to_key = {tup[-1]: key for tup, key in group.rocky_key_to_dagster_key.items() if tup}
+
+    def resolver(model_name: str) -> dg.AssetKey | None:
+        key = model_to_key.get(model_name)
+        if key is not None and key in selected_keys:
+            return key
+        return None
+
+    if surface_compliance:
+        try:
+            compliance_output = rocky.compliance()
+        except Exception as exc:  # noqa: BLE001
+            context.log.warning(f"rocky compliance failed, skipping compliance events: {exc}")
+        else:
+            yield from compliance_check_results(compliance_output, key_resolver=resolver)
+
+    if surface_retention_status:
+        try:
+            retention_output = rocky.retention_status()
+        except Exception as exc:  # noqa: BLE001
+            context.log.warning(f"rocky retention-status failed, skipping retention events: {exc}")
+        else:
+            yield from retention_observations(retention_output, key_resolver=resolver)
 
 
 def _emit_contract_check_results(
@@ -1198,6 +1360,7 @@ def _emit_results(
     check_specs: list[dg.AssetCheckSpec],
     selected_keys: set[dg.AssetKey],
     rocky_key_to_dagster_key: dict[tuple[str, ...], dg.AssetKey],
+    extra_yielded_checks: set[tuple[dg.AssetKey, str]] | None = None,
 ) -> Iterator[dg.MaterializeResult | dg.AssetCheckResult | dg.AssetObservation]:
     """Yield Dagster events for every materialization, check, drift event and anomaly.
 
@@ -1271,7 +1434,7 @@ def _emit_results(
             metadata=metadata,
         )
 
-    yielded_checks: set[tuple[dg.AssetKey, str]] = set()
+    yielded_checks: set[tuple[dg.AssetKey, str]] = set(extra_yielded_checks or ())
     for table_check in table_checks:
         asset_key = remap(table_check.asset_key)
         if asset_key not in selected_keys:
