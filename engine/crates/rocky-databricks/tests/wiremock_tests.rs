@@ -1013,6 +1013,436 @@ async fn test_apply_retention_policy_year_equivalent_emits_days() {
         .unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Column tags + masking policy (Wave A — #241 follow-up)
+// ---------------------------------------------------------------------------
+//
+// `apply_column_tags` and `apply_masking_policy` have SQL-generation unit
+// coverage in `rocky_core::catalog` and `rocky_core::masking`, but the REST
+// path through `DatabricksGovernanceAdapter` into the SQL Statement
+// Execution API was wiremock-gapped. These tests pin the REST-level
+// contract: request count, per-request body shape, and the iteration
+// strategy (one statement per column / per distinct strategy).
+
+/// Happy path: one `ALTER TABLE ... ALTER COLUMN ... SET TAGS (...)` per
+/// column — `apply_column_tags` iterates because Unity Catalog rejects
+/// multi-column tag DDL in a single statement.
+#[tokio::test]
+async fn test_apply_column_tags_fires_one_request_per_column() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+
+    // One mock per column — each matches the column name in the body and
+    // carries its own `.expect(1)` so drift in either direction fails the
+    // test (missed column → unsatisfied expect; extra column → unmatched
+    // request panic).
+    for column in ["email", "phone", "ssn"] {
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains("ALTER COLUMN"))
+            .and(body_string_contains(column))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": format!("stmt-tag-{column}"),
+                "status": { "state": "SUCCEEDED" },
+                "manifest": null,
+                "result": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "users".into(),
+    };
+
+    // Each column gets a distinct classification tag so we can verify the
+    // per-column tags_clause makes it into the right request body.
+    let mut column_tags: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    column_tags.insert(
+        "email".into(),
+        BTreeMap::from([("classification".into(), "pii".into())]),
+    );
+    column_tags.insert(
+        "phone".into(),
+        BTreeMap::from([("classification".into(), "contact".into())]),
+    );
+    column_tags.insert(
+        "ssn".into(),
+        BTreeMap::from([("classification".into(), "sensitive".into())]),
+    );
+
+    governance
+        .apply_column_tags(&table, &column_tags)
+        .await
+        .expect("apply_column_tags happy path should succeed");
+}
+
+/// Partial failure: columns 1 + 2 succeed, column 3 returns FAILED. The
+/// adapter short-circuits via `?` on the third column and surfaces the
+/// error; since BTreeMap iterates in sorted order, `col_aaa` + `col_bbb`
+/// succeed before `col_zzz` fails. No column fires beyond the failure
+/// because the `?` on `set_column_tags` returns immediately.
+#[tokio::test]
+async fn test_apply_column_tags_short_circuits_on_column_failure() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::GovernanceAdapter;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+
+    // col_aaa + col_bbb succeed.
+    for column in ["col_aaa", "col_bbb"] {
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains(column))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": format!("stmt-tag-{column}"),
+                "status": { "state": "SUCCEEDED" },
+                "manifest": null,
+                "result": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    // col_zzz returns FAILED — the connector maps SUCCEEDED/FAILED based
+    // on the response `status.state`.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("col_zzz"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-tag-col_zzz",
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "error_code": "PERMISSION_DENIED",
+                    "message": "cannot set tags on column col_zzz"
+                }
+            },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "users".into(),
+    };
+
+    let mut column_tags: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    column_tags.insert(
+        "col_aaa".into(),
+        BTreeMap::from([("classification".into(), "ok".into())]),
+    );
+    column_tags.insert(
+        "col_bbb".into(),
+        BTreeMap::from([("classification".into(), "ok".into())]),
+    );
+    column_tags.insert(
+        "col_zzz".into(),
+        BTreeMap::from([("classification".into(), "fails".into())]),
+    );
+
+    let err = governance
+        .apply_column_tags(&table, &column_tags)
+        .await
+        .expect_err("column 3 failure should surface as Err");
+    assert!(
+        err.to_string().to_lowercase().contains("col_zzz")
+            || err.to_string().to_lowercase().contains("permission_denied")
+            || err.to_string().to_lowercase().contains("cannot set tags"),
+        "error should carry context about the failing column, got: {err}"
+    );
+    // The `.expect(1)` on every mock guarantees the adapter reached col_zzz
+    // (no short-circuit before column 3) and did not re-fire col_aaa / col_bbb.
+}
+
+/// Happy path for `apply_masking_policy`: two columns with distinct
+/// strategies (Hash + Redact) produce four requests total — Pass 1 fires
+/// one `CREATE OR REPLACE FUNCTION` per **distinct strategy** (not per
+/// column), Pass 2 fires one `ALTER TABLE ... SET MASK` per column.
+///
+/// Note: the impl emits `CREATE OR REPLACE FUNCTION ... RETURN <expr>` and
+/// `ALTER TABLE ... ALTER COLUMN ... SET MASK <fn>` — not `CREATE MASK` /
+/// `SET MASKING POLICY`. See `rocky_core::masking` for the exact shapes.
+#[tokio::test]
+async fn test_apply_masking_policy_happy_path_hash_plus_redact() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    // Pass 1: one CREATE FUNCTION per distinct strategy.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE OR REPLACE FUNCTION"))
+        .and(body_string_contains("rocky_mask_hash_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-hash",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE OR REPLACE FUNCTION"))
+        .and(body_string_contains("rocky_mask_redact_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-redact",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Pass 2: one SET MASK per column, binding the column to the correct
+    // strategy function.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER COLUMN email"))
+        .and(body_string_contains("SET MASK"))
+        .and(body_string_contains("rocky_mask_hash_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-bind-email",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER COLUMN phone"))
+        .and(body_string_contains("SET MASK"))
+        .and(body_string_contains("rocky_mask_redact_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-bind-phone",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "customers".into(),
+    };
+
+    let mut policy = MaskingPolicy::default();
+    policy
+        .column_strategies
+        .insert("email".into(), MaskStrategy::Hash);
+    policy
+        .column_strategies
+        .insert("phone".into(), MaskStrategy::Redact);
+
+    governance
+        .apply_masking_policy(&table, &policy, "prod")
+        .await
+        .expect("apply_masking_policy happy path should succeed");
+}
+
+/// `MaskStrategy::None` mixed with a non-None strategy emits `DROP MASK`
+/// for the None column — it is NOT a skip. The adapter's contract (see
+/// `apply_masking_policy` Pass 2 in `governance.rs`) is: None overrides a
+/// prior mask by explicitly clearing it. For a policy of {None, Hash},
+/// the request count is:
+///
+/// - Pass 1: 1 `CREATE OR REPLACE FUNCTION` for Hash (None is filtered out
+///   of `distinct_strategies`).
+/// - Pass 2: 1 `DROP MASK` for the None column + 1 `SET MASK` for Hash.
+///
+/// Total = 3 requests. This is a deliberate departure from "skip None
+/// entirely" — documenting that here so a future reader doesn't file a
+/// bug against the drop.
+#[tokio::test]
+async fn test_apply_masking_policy_none_emits_drop_mask_to_clear_prior_state() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    // Pass 1: CREATE FUNCTION fires only for Hash (distinct_strategies
+    // filters MaskStrategy::None out).
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE OR REPLACE FUNCTION"))
+        .and(body_string_contains("rocky_mask_hash_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-hash",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Pass 2a: DROP MASK for the None column.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER COLUMN cleared"))
+        .and(body_string_contains("DROP MASK"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-drop-cleared",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Pass 2b: SET MASK for the Hash column.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER COLUMN secret"))
+        .and(body_string_contains("SET MASK"))
+        .and(body_string_contains("rocky_mask_hash_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-bind-secret",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "customers".into(),
+    };
+
+    let mut policy = MaskingPolicy::default();
+    policy
+        .column_strategies
+        .insert("cleared".into(), MaskStrategy::None);
+    policy
+        .column_strategies
+        .insert("secret".into(), MaskStrategy::Hash);
+
+    governance
+        .apply_masking_policy(&table, &policy, "prod")
+        .await
+        .expect("mixed None+Hash policy should succeed");
+}
+
+/// SQL-injection guard: a column name with a character outside the
+/// identifier allowlist (`^[a-zA-Z0-9_]+$`) is rejected by
+/// `validate_identifier` inside `generate_set_mask_sql` — the Pass 2
+/// helper in `rocky_core::masking`. Before reaching Pass 2, the adapter
+/// fires Pass 1 (`CREATE OR REPLACE FUNCTION ...`), which only validates
+/// catalog/schema/env (the column name is not interpolated into that
+/// DDL). So for a bad column, the sequence is:
+///
+/// 1. Pass 1 `CREATE FUNCTION` — request fires successfully.
+/// 2. Pass 2 `generate_set_mask_sql` — `validate_identifier("bad;col")`
+///    returns `Err(ValidationError::InvalidIdentifier)` BEFORE any second
+///    HTTP call.
+///
+/// The pinned contract: the bad column never appears in an outbound SQL
+/// statement, and the adapter surfaces a validation error naming the
+/// offending value. Pass 2 is strict-mode for the column identifier; it
+/// does not get quoted/escaped and slip through.
+#[tokio::test]
+async fn test_apply_masking_policy_rejects_injection_in_column_identifier() {
+    use rocky_core::ir::TableRef;
+    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+
+    let server = MockServer::start().await;
+
+    // Pass 1 succeeds: CREATE FUNCTION doesn't use the column name.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE OR REPLACE FUNCTION"))
+        .and(body_string_contains("rocky_mask_hash_prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-hash",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // No mock for Pass 2 — validation must short-circuit before any
+    // second request hits the mock server. Unmatched requests panic the
+    // test, so reaching the REST layer with a bad identifier would fail
+    // loudly.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("ALTER COLUMN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "should-not-fire",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null,
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let governance = DatabricksGovernanceAdapter::without_workspace(connector);
+    let table = TableRef {
+        catalog: "warehouse".into(),
+        schema: "silver".into(),
+        table: "customers".into(),
+    };
+
+    // Column name contains a semicolon — classic SQL-injection probe and
+    // outside the `^[a-zA-Z0-9_]+$` identifier allowlist.
+    let mut policy = MaskingPolicy::default();
+    policy
+        .column_strategies
+        .insert("bad;col".into(), MaskStrategy::Hash);
+
+    let err = governance
+        .apply_masking_policy(&table, &policy, "prod")
+        .await
+        .expect_err("bad column identifier must be rejected by the validator");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("invalid") || msg.contains("identifier") || msg.contains("bad;col"),
+        "validation error should name the identifier rule or bad value, got: {err}"
+    );
+}
+
 /// Warehouse 400 on the ALTER (unknown property, unsupported table format,
 /// etc.) propagates as an AdapterError so the runtime can warn!.
 #[tokio::test]
