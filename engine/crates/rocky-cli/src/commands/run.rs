@@ -1059,6 +1059,14 @@ pub async fn run(
     let mut catalogs_created: usize = 0;
     let mut schemas_created: usize = 0;
     let mut created_catalogs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // All distinct target catalogs resolved from connectors this run,
+    // regardless of whether Rocky created them. Fed to
+    // `GovernanceAdapter::reconcile_role_graph` so role-graph GRANTs
+    // land on every managed catalog — not just the newly-created ones
+    // (`created_catalogs` above is gated on `auto_create_catalogs`,
+    // so pre-provisioned catalogs would otherwise be skipped).
+    let mut managed_catalogs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     let mut source_batch_refs: Vec<TableRef> = Vec::new();
     let mut target_batch_refs: Vec<TableRef> = Vec::new();
@@ -1102,6 +1110,11 @@ pub async fn run(
 
             let components = parsed_to_json_map(&parsed);
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            // Track every catalog this run touches — feeds the
+            // role-graph GRANT emission path downstream. Unconditional:
+            // we don't want to miss pre-provisioned catalogs where
+            // `auto_create_catalogs = false`.
+            managed_catalogs.insert(target_catalog.clone());
             let target_schema = if let Some(shadow_cfg) = shadow_config {
                 shadow_cfg
                     .schema_override
@@ -2901,9 +2914,18 @@ pub async fn run(
             // `reconcile_role_graph`.
             match rocky_cfg.role_graph() {
                 Ok(resolved) if !resolved.is_empty() => {
-                    if let Err(e) = governance_adapter.reconcile_role_graph(&resolved).await {
+                    // Borrow the `BTreeSet<String>` as `&[&str]` for the
+                    // trait call — keeps `managed_catalogs` alive and
+                    // lets the adapter iterate without cloning.
+                    let catalog_refs: Vec<&str> =
+                        managed_catalogs.iter().map(String::as_str).collect();
+                    if let Err(e) = governance_adapter
+                        .reconcile_role_graph(&resolved, &catalog_refs)
+                        .await
+                    {
                         warn!(
                             roles = resolved.len(),
+                            catalogs = catalog_refs.len(),
                             error = %e,
                             "reconcile role graph failed"
                         );

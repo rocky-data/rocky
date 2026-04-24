@@ -647,12 +647,23 @@ pub trait GovernanceAdapter: Send + Sync {
     }
 
     /// Reconcile a flattened role graph against the warehouse's native
-    /// role/group system.
+    /// role/group system, scoped to the given `catalogs`.
     ///
     /// `roles` is the post-[`crate::role_graph::flatten_role_graph`]
     /// map: each [`crate::ir::ResolvedRole`] carries its own permissions
-    /// plus every transitive ancestor's, deduped and sorted. Adapters
-    /// translate this into warehouse-specific primitives — on
+    /// plus every transitive ancestor's, deduped and sorted. `catalogs`
+    /// is the set of Unity Catalog / warehouse catalogs the current
+    /// `rocky run` touched — the adapter emits per-catalog GRANT
+    /// statements for each `(role, permission)` pair against every
+    /// catalog in the slice. Group creation (e.g. Databricks SCIM
+    /// `rocky_role_*`) is catalog-independent and fires once per role
+    /// regardless of how many catalogs are in scope.
+    ///
+    /// An empty `catalogs` slice is a valid call: the adapter still
+    /// creates groups so the warehouse is ready for later runs that
+    /// *do* touch catalogs; it just skips GRANT emission.
+    ///
+    /// Adapters translate this into warehouse-specific primitives — on
     /// Databricks / Unity Catalog that means a group per role
     /// (convention: `rocky_role_<name>`) plus GRANT statements bound to
     /// the group; on Snowflake it would be `CREATE ROLE` + per-role
@@ -670,6 +681,7 @@ pub trait GovernanceAdapter: Send + Sync {
     async fn reconcile_role_graph(
         &self,
         _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+        _catalogs: &[&str],
     ) -> AdapterResult<()> {
         Err(AdapterError::msg(
             "reconcile_role_graph not supported by this adapter",
@@ -800,6 +812,7 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
     async fn reconcile_role_graph(
         &self,
         _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+        _catalogs: &[&str],
     ) -> AdapterResult<()> {
         // Same rationale as `apply_column_tags` / `apply_masking_policy`:
         // a no-governance warehouse silently accepts role-graph config so
@@ -1026,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn trait_default_reconcile_role_graph_errors() {
         let err = MinimalGovernance
-            .reconcile_role_graph(&BTreeMap::new())
+            .reconcile_role_graph(&BTreeMap::new(), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reconcile_role_graph"));
@@ -1035,7 +1048,11 @@ mod tests {
     #[tokio::test]
     async fn noop_governance_accepts_role_graph() {
         let noop = NoopGovernanceAdapter;
-        assert!(noop.reconcile_role_graph(&BTreeMap::new()).await.is_ok());
+        assert!(
+            noop.reconcile_role_graph(&BTreeMap::new(), &[])
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

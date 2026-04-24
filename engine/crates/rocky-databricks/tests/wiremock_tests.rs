@@ -853,25 +853,269 @@ async fn test_reconcile_access_combined_grants_and_bindings() {
     assert_eq!(diff.bindings.bindings_to_remove[0].workspace_id, 3);
 }
 
-/// Verifies `reconcile_role_graph` routes through the GovernanceAdapter
-/// trait dispatch on `DatabricksGovernanceAdapter`.
-///
-/// v1 is log-only (no SCIM group creation, no per-catalog GRANT
-/// application), so this test asserts the trait method returns `Ok(())`
-/// and, critically, **no HTTP request is made** — the adapter's failure
-/// mode if it accidentally started calling the warehouse would be a
-/// wiremock "unmatched request" panic.
+/// Build a `ScimClient` pointing at the given wiremock server. Mirrors
+/// [`test_connector`] for the SQL side — same auth shape, same base-URL
+/// override pattern.
+fn test_scim_client(server: &MockServer) -> rocky_databricks::scim::ScimClient {
+    let auth = Auth::from_config(AuthConfig {
+        host: "test.databricks.com".into(),
+        token: Some("test-token".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .unwrap();
+    rocky_databricks::scim::ScimClient::new("test.databricks.com".into(), auth)
+        .with_base_url(server.uri())
+}
+
+/// `ScimClient::create_group` happy path — mock returns 201 with the
+/// freshly-created group; assert the request body carries `displayName`
+/// and the required SCIM 2.0 `schemas` envelope.
 #[tokio::test]
-async fn test_reconcile_role_graph_is_log_only_v1() {
+async fn test_scim_create_group_happy_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(body_string_contains(
+            "\"displayName\":\"rocky_role_reader\"",
+        ))
+        .and(body_string_contains(
+            "urn:ietf:params:scim:schemas:core:2.0:Group",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "grp-001",
+            "displayName": "rocky_role_reader",
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_scim_client(&server);
+    let group = client
+        .create_group("rocky_role_reader")
+        .await
+        .expect("create_group should succeed on 201");
+    assert_eq!(group.id, "grp-001");
+    assert_eq!(group.display_name, "rocky_role_reader");
+}
+
+/// `ScimClient::create_group` is idempotent — on 409 Conflict it falls
+/// back to the GET-by-displayName lookup and returns the existing
+/// group ID rather than erroring.
+#[tokio::test]
+async fn test_scim_create_group_idempotent_on_409() {
+    let server = MockServer::start().await;
+
+    // First POST → 409 Conflict.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("Group already exists"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Second GET filter → returns the existing group.
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "totalResults": 1,
+            "Resources": [
+                {"id": "existing-001", "displayName": "rocky_role_admin"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_scim_client(&server);
+    let group = client
+        .create_group("rocky_role_admin")
+        .await
+        .expect("409 → GET fallback should resolve to the existing group");
+    assert_eq!(group.id, "existing-001");
+    assert_eq!(group.display_name, "rocky_role_admin");
+}
+
+/// End-to-end reconcile: 2 roles × 2 catalogs with varied permissions.
+///
+/// Expected wire traffic:
+/// - 2× `POST /api/2.0/preview/scim/v2/Groups` (one per role, catalog-
+///   independent; idempotent on repeat but one per reconcile run).
+/// - Per-catalog SQL GRANT statements via `/api/2.0/sql/statements`:
+///   - reader has `[Select]`       → 1 perm × 2 catalogs = 2 GRANTs
+///   - admin  has `[Select, Manage]` → 2 perms × 2 catalogs = 4 GRANTs
+///   Total: 6 `POST /api/2.0/sql/statements`.
+#[tokio::test]
+async fn test_reconcile_role_graph_end_to_end_scim_plus_grants() {
+    use rocky_core::ir::{Permission, ResolvedRole};
+    use rocky_core::traits::GovernanceAdapter as _;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+
+    // Role 1 SCIM create.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .and(body_string_contains(
+            "\"displayName\":\"rocky_role_reader\"",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "grp-reader",
+            "displayName": "rocky_role_reader"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Role 2 SCIM create.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .and(body_string_contains("\"displayName\":\"rocky_role_admin\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "grp-admin",
+            "displayName": "rocky_role_admin"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Catch-all for every GRANT statement — wiremock counts them.
+    // We assert the exact total (6) below.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("GRANT"))
+        .and(body_string_contains("ON CATALOG"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "grant-stmt",
+            "status": {"state": "SUCCEEDED"}
+        })))
+        .expect(6)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector))
+        .with_scim_client(test_scim_client(&server));
+
+    let mut roles: BTreeMap<String, ResolvedRole> = BTreeMap::new();
+    roles.insert(
+        "reader".into(),
+        ResolvedRole {
+            name: "reader".into(),
+            flattened_permissions: vec![Permission::Select],
+            inherits_from: vec![],
+        },
+    );
+    roles.insert(
+        "admin".into(),
+        ResolvedRole {
+            name: "admin".into(),
+            flattened_permissions: vec![Permission::Select, Permission::Manage],
+            inherits_from: vec!["reader".into()],
+        },
+    );
+
+    let catalogs: Vec<&str> = vec!["acme_warehouse", "beta_warehouse"];
+    adapter
+        .reconcile_role_graph(&roles, &catalogs)
+        .await
+        .expect("reconcile should succeed — 2 SCIM creates + 6 GRANTs");
+
+    // wiremock's `.expect(N)` fires on drop if the call-count doesn't
+    // match; explicit `verify()` for clarity.
+    server.verify().await;
+}
+
+/// Empty `catalogs` slice: SCIM group creation still fires (groups are
+/// a workspace-level concept, independent of any catalog), but zero
+/// GRANTs are emitted. Pins the documented "empty catalogs is valid"
+/// behaviour.
+#[tokio::test]
+async fn test_reconcile_role_graph_empty_catalogs_still_creates_groups() {
+    use rocky_core::ir::{Permission, ResolvedRole};
+    use rocky_core::traits::GovernanceAdapter as _;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+
+    // One SCIM POST expected.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/preview/scim/v2/Groups"))
+        .and(body_string_contains(
+            "\"displayName\":\"rocky_role_reader\"",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "grp-reader",
+            "displayName": "rocky_role_reader"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Any SQL statement call would be a bug — no mocks mounted; a
+    // wiremock "unmatched request" would surface it.
+
+    let connector = test_connector(&server);
+    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector))
+        .with_scim_client(test_scim_client(&server));
+
+    let mut roles: BTreeMap<String, ResolvedRole> = BTreeMap::new();
+    roles.insert(
+        "reader".into(),
+        ResolvedRole {
+            name: "reader".into(),
+            flattened_permissions: vec![Permission::Select],
+            inherits_from: vec![],
+        },
+    );
+
+    adapter
+        .reconcile_role_graph(&roles, &[])
+        .await
+        .expect("empty catalogs is valid — group still created");
+
+    server.verify().await;
+}
+
+/// Empty role graph is a no-op — neither SCIM nor SQL endpoints are
+/// touched. Early-return path through the trait dispatch.
+#[tokio::test]
+async fn test_reconcile_role_graph_empty_is_ok() {
+    use rocky_core::ir::ResolvedRole;
+    use rocky_core::traits::GovernanceAdapter as _;
+    use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use std::collections::BTreeMap;
+
+    let server = MockServer::start().await;
+    // Intentionally no mocks mounted — an empty role map should never
+    // reach out to either SCIM or the SQL statements endpoint.
+    let connector = test_connector(&server);
+    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector));
+
+    let empty: BTreeMap<String, ResolvedRole> = BTreeMap::new();
+    adapter
+        .reconcile_role_graph(&empty, &[])
+        .await
+        .expect("empty role graph should be a no-op");
+}
+
+/// Back-compat: the `without_workspace` constructor (no SCIM client
+/// configured) falls back to log-only behaviour, same as the v1
+/// reconciler. No HTTP traffic should fire.
+#[tokio::test]
+async fn test_reconcile_role_graph_log_only_without_scim() {
     use rocky_core::ir::{Permission, ResolvedRole};
     use rocky_core::traits::GovernanceAdapter as _;
     use rocky_databricks::governance::{DatabricksGovernanceAdapter, role_group_name};
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
-    // Intentionally no mocks mounted: the test fails fast if v1
-    // accidentally starts calling the warehouse.
-
+    // No mocks mounted; log-only fallback must not hit the network.
     let connector = test_connector(&server);
     let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector));
 
@@ -884,49 +1128,15 @@ async fn test_reconcile_role_graph_is_log_only_v1() {
             inherits_from: vec![],
         },
     );
-    roles.insert(
-        "admin".into(),
-        ResolvedRole {
-            name: "admin".into(),
-            flattened_permissions: vec![
-                Permission::UseCatalog,
-                Permission::Select,
-                Permission::Manage,
-            ],
-            inherits_from: vec!["reader".into()],
-        },
-    );
 
     adapter
-        .reconcile_role_graph(&roles)
+        .reconcile_role_graph(&roles, &["cat"])
         .await
-        .expect("v1 reconcile_role_graph should succeed without network calls");
+        .expect("log-only fallback should succeed without network calls");
 
-    // Naming-convention assertion lives alongside the dispatch test so
-    // anyone refactoring the helper sees this test pin the public
-    // contract.
+    // Naming-convention assertion — pins the public contract across
+    // refactors of the reconciler helper.
     assert_eq!(role_group_name("reader"), "rocky_role_reader");
-    assert_eq!(role_group_name("admin"), "rocky_role_admin");
-}
-
-/// Empty role graph is a no-op — exercise the early-return path through
-/// the trait dispatch.
-#[tokio::test]
-async fn test_reconcile_role_graph_empty_is_ok() {
-    use rocky_core::ir::ResolvedRole;
-    use rocky_core::traits::GovernanceAdapter as _;
-    use rocky_databricks::governance::DatabricksGovernanceAdapter;
-    use std::collections::BTreeMap;
-
-    let server = MockServer::start().await;
-    let connector = test_connector(&server);
-    let adapter = DatabricksGovernanceAdapter::without_workspace(Arc::new(connector));
-
-    let empty: BTreeMap<String, ResolvedRole> = BTreeMap::new();
-    adapter
-        .reconcile_role_graph(&empty)
-        .await
-        .expect("empty role graph should be a no-op");
 }
 
 // ---------------------------------------------------------------------------

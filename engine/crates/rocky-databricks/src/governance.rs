@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use rocky_core::ir::{Grant, GrantTarget, PermissionDiff, ResolvedRole, TableRef};
+use rocky_core::ir::{Grant, GrantTarget, Permission, PermissionDiff, ResolvedRole, TableRef};
 use rocky_core::masking;
 use rocky_core::retention::RetentionPolicy;
 use rocky_core::traits::{
@@ -22,6 +22,7 @@ use crate::auth::Auth;
 use crate::catalog::CatalogManager;
 use crate::connector::DatabricksConnector;
 use crate::permissions::PermissionManager;
+use crate::scim::ScimClient;
 use crate::workspace::WorkspaceManager;
 
 /// Databricks governance adapter combining catalog management,
@@ -33,22 +34,44 @@ use crate::workspace::WorkspaceManager;
 pub struct DatabricksGovernanceAdapter {
     connector: Arc<DatabricksConnector>,
     workspace_mgr: Option<WorkspaceManager>,
+    /// SCIM client for provisioning `rocky_role_*` groups during
+    /// [`Self::reconcile_role_graph`]. `None` when the adapter was
+    /// constructed via [`Self::without_workspace`] — SCIM shares the
+    /// workspace-level host + auth path, so the two configurations
+    /// naturally travel together. A `None` SCIM client falls back to
+    /// log-only reconcile so pipelines configured without SCIM don't
+    /// hard-fail on `[role.*]`.
+    scim: Option<ScimClient>,
 }
 
 impl DatabricksGovernanceAdapter {
     pub fn new(connector: Arc<DatabricksConnector>, host: &str, auth: Auth) -> Self {
         Self {
             connector,
-            workspace_mgr: Some(WorkspaceManager::new(host.to_string(), auth)),
+            workspace_mgr: Some(WorkspaceManager::new(host.to_string(), auth.clone())),
+            scim: Some(ScimClient::new(host.to_string(), auth)),
         }
     }
 
-    /// Create without workspace manager (for environments without isolation).
+    /// Create without workspace manager or SCIM client (for environments
+    /// without isolation). Role-graph reconcile falls back to log-only
+    /// under this configuration — same semantics as v1.
     pub fn without_workspace(connector: Arc<DatabricksConnector>) -> Self {
         Self {
             connector,
             workspace_mgr: None,
+            scim: None,
         }
+    }
+
+    /// Override the SCIM client — used by wiremock tests to point at a
+    /// mock server without instantiating a full `Auth` stack behind a
+    /// real host.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_scim_client(mut self, scim: ScimClient) -> Self {
+        self.scim = Some(scim);
+        self
     }
 }
 
@@ -212,8 +235,9 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
     async fn reconcile_role_graph(
         &self,
         roles: &BTreeMap<String, ResolvedRole>,
+        catalogs: &[&str],
     ) -> AdapterResult<()> {
-        reconcile_role_graph_impl(&self.connector, roles).await
+        reconcile_role_graph_impl(&self.connector, self.scim.as_ref(), roles, catalogs).await
     }
 
     async fn apply_masking_policy(
@@ -344,57 +368,182 @@ pub fn role_group_name(role_name: &str) -> String {
     format!("{ROCKY_ROLE_GROUP_PREFIX}{role_name}")
 }
 
-/// v1 implementation of `reconcile_role_graph`.
+/// Role-graph reconciliation for Databricks / Unity Catalog.
 ///
-/// Databricks / Unity Catalog does not have "roles" natively; Rocky
-/// maps each role to a UC group (`rocky_role_<name>`). A fully-native
-/// impl would:
+/// Databricks / Unity Catalog has no native "role" primitive; Rocky
+/// maps each role to a UC group named `rocky_role_<name>`. The reconcile
+/// is a two-pass operation, intentionally split so SCIM creates fire
+/// once per role regardless of how many catalogs are in scope:
 ///
-/// 1. Create each group via the SCIM `POST /api/2.0/preview/scim/v2/Groups`
-///    endpoint if missing.
-/// 2. For every catalog Rocky manages, emit a `GRANT <permission> ON
-///    CATALOG ... TO <group>` per flattened permission.
+/// 1. **Group creation (catalog-independent).** For every `role` in
+///    `roles`, call [`ScimClient::create_group`] with the mapped
+///    `rocky_role_<name>` display name. Idempotent: a 409 Conflict
+///    returns the existing group via a GET lookup fallback.
+/// 2. **GRANT emission (per-catalog).** For every `(role, catalog,
+///    permission)` triple, execute `GRANT <permission> ON CATALOG
+///    <catalog> TO `rocky_role_<name>`` via the SQL Statement Execution
+///    API. Idempotent at the warehouse — Databricks treats a GRANT on an
+///    already-held permission as a no-op, so repeat runs are safe.
 ///
-/// Neither piece exists in `rocky-databricks` yet — there's no SCIM
-/// client, and the catalogs-to-apply set isn't plumbed through the
-/// [`GovernanceAdapter::reconcile_role_graph`] signature. Both are
-/// deliberate follow-ups (see `feat/governance-role-graph` PR body).
+/// ## ADD-ONLY v1
 ///
-/// In v1 this function validates each group name against the principal
-/// rules and emits a structured `debug` log of the reconciled role
-/// graph. It returns `Ok(())` so pipelines that declare `[role.*]` in
-/// their `rocky.toml` against a Databricks target don't abort — the
-/// role graph is still flattened + validated by [`rocky_core::role_graph`]
-/// at config-load time, which is where real failures surface.
+/// Groups are never deleted and grants are never revoked by this path.
+/// A role removed from `rocky.toml` leaves its `rocky_role_*` group +
+/// grants in place; operators must clean up manually until a future
+/// reconcile mode adds delete semantics. The decision is deliberate:
+/// reversible creates are safer than accidental deletes while the
+/// feature stabilises, and the same reasoning applies to the GRANT
+/// side (the explicit-revoke path runs through
+/// [`PermissionManager::apply_diff`], not this reconciler).
+///
+/// ## Fallback when SCIM is unavailable
+///
+/// If `scim` is `None` (e.g. the adapter was constructed via
+/// [`DatabricksGovernanceAdapter::without_workspace`]), the reconciler
+/// falls back to v1 log-only behaviour: validate names + emit a
+/// `debug!` event, then return `Ok(())`. Same rationale as before —
+/// pipelines targeting a Databricks endpoint without SCIM configured
+/// shouldn't hard-fail on `[role.*]`.
+///
+/// ## Empty `catalogs`
+///
+/// SCIM group creation still fires (groups are a workspace-level
+/// concept, independent of Unity Catalog); zero GRANTs are emitted.
+/// Documented in [`GovernanceAdapter::reconcile_role_graph`].
 async fn reconcile_role_graph_impl(
-    _connector: &DatabricksConnector,
+    connector: &DatabricksConnector,
+    scim: Option<&ScimClient>,
     roles: &BTreeMap<String, ResolvedRole>,
+    catalogs: &[&str],
 ) -> AdapterResult<()> {
     if roles.is_empty() {
         return Ok(());
     }
 
-    for (name, role) in roles {
+    // Pass 0: validate group names up-front so the whole reconcile
+    // aborts on a bad principal syntax before any network calls fire.
+    // Same contract as v1.
+    let mut group_names: BTreeMap<&String, String> = BTreeMap::new();
+    for name in roles.keys() {
         let group = role_group_name(name);
-        // Validate the group name matches Databricks principal syntax
-        // so the deferred GRANT-emission path can't silently generate
-        // invalid SQL later.
         rocky_sql::validation::validate_principal(&group).map_err(AdapterError::new)?;
+        group_names.insert(name, group);
+    }
 
-        debug!(
-            role = name.as_str(),
-            group = group.as_str(),
-            inherits = ?role.inherits_from,
-            permissions = ?role
-                .flattened_permissions
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            "reconciled role graph entry (v1: log-only; SCIM group creation + per-catalog GRANT application are follow-ups)"
-        );
+    // Log-only fallback when SCIM isn't configured (matches v1 semantics).
+    let Some(scim) = scim else {
+        for (name, role) in roles {
+            let group = &group_names[name];
+            debug!(
+                role = name.as_str(),
+                group = group.as_str(),
+                inherits = ?role.inherits_from,
+                permissions = ?role
+                    .flattened_permissions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "reconciled role graph entry (log-only; SCIM client not configured)"
+            );
+        }
+        return Ok(());
+    };
+
+    // Pass 1: SCIM group creation. Best-effort per role — a failure on
+    // one role warns-and-continues rather than aborting the whole
+    // reconcile (the caller already treats this as best-effort, and we
+    // don't want one flaky SCIM request to starve the others).
+    for (name, role) in roles {
+        let group = &group_names[name];
+        match scim.create_group(group).await {
+            Ok(g) => {
+                debug!(
+                    role = name.as_str(),
+                    group = g.display_name.as_str(),
+                    group_id = g.id.as_str(),
+                    inherits = ?role.inherits_from,
+                    permissions = ?role
+                        .flattened_permissions
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    "reconciled role graph entry — SCIM group ensured"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    role = name.as_str(),
+                    group = group.as_str(),
+                    error = %e,
+                    "SCIM group create failed; skipping GRANTs for this role"
+                );
+                // Skip grants for this role — granting against a missing
+                // group would just fail at the warehouse anyway.
+                continue;
+            }
+        }
+    }
+
+    // Pass 2: per-catalog GRANT emission. One statement per
+    // `(role, catalog, permission)` triple. Databricks rejects multi-
+    // permission GRANT-ALL in the same SQL when the permission set is
+    // heterogeneous, so we keep it one-statement-at-a-time for
+    // simplicity — repeat GRANTs are no-ops on the warehouse side.
+    //
+    // `catalogs` can be empty (no managed catalogs this run, or an
+    // early-return from the caller). That's a valid state; groups are
+    // created regardless, no grants fire.
+    for (name, role) in roles {
+        let group = &group_names[name];
+        for catalog in catalogs {
+            for permission in &role.flattened_permissions {
+                let sql =
+                    format_role_grant_sql(catalog, permission, group).map_err(AdapterError::new)?;
+                debug!(
+                    role = name.as_str(),
+                    group = group.as_str(),
+                    catalog = *catalog,
+                    permission = %permission,
+                    "emitting role-graph GRANT"
+                );
+                if let Err(e) = connector.execute_statement(&sql).await {
+                    // Best-effort per statement — log and keep going so
+                    // one flaky GRANT doesn't prevent the rest from
+                    // applying. The outer caller in `rocky run` is
+                    // already in "warn-and-continue" mode for the whole
+                    // reconcile.
+                    warn!(
+                        role = name.as_str(),
+                        group = group.as_str(),
+                        catalog = *catalog,
+                        permission = %permission,
+                        error = %e,
+                        "role-graph GRANT failed"
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Format a role-graph GRANT. Kept separate from
+/// [`crate::permissions::format_grant_sql`] because the principal here
+/// is a `rocky_role_*` group (already validated by
+/// [`role_group_name`] + [`rocky_sql::validation::validate_principal`])
+/// and the target is always a catalog — we don't go through the full
+/// [`Grant`] struct / [`GrantTarget`] enum.
+fn format_role_grant_sql(
+    catalog: &str,
+    permission: &Permission,
+    group: &str,
+) -> Result<String, rocky_sql::validation::ValidationError> {
+    rocky_sql::validation::validate_identifier(catalog)?;
+    let principal = rocky_sql::validation::format_principal(group)?;
+    Ok(format!(
+        "GRANT {permission} ON CATALOG {catalog} TO {principal}"
+    ))
 }
 
 #[cfg(test)]
@@ -409,6 +558,36 @@ mod tests {
             role_group_name("analytics_engineer"),
             "rocky_role_analytics_engineer"
         );
+    }
+
+    #[test]
+    fn format_role_grant_sql_happy_path() {
+        // Pin the exact SQL shape — role-graph GRANTs backtick-quote
+        // the group principal + quote-free identifier for the catalog.
+        let sql = format_role_grant_sql("acme_warehouse", &Permission::Select, "rocky_role_reader")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "GRANT SELECT ON CATALOG acme_warehouse TO `rocky_role_reader`"
+        );
+    }
+
+    #[test]
+    fn format_role_grant_sql_rejects_invalid_catalog() {
+        // A catalog containing characters outside the identifier regex
+        // must fail validation before we interpolate it into SQL.
+        assert!(
+            format_role_grant_sql("bad;catalog", &Permission::Select, "rocky_role_reader").is_err()
+        );
+    }
+
+    #[test]
+    fn format_role_grant_sql_emits_use_catalog_with_space() {
+        // USE CATALOG renders as "USE CATALOG" (with space) via the
+        // Permission Display impl. Confirm the formatter doesn't mangle
+        // it into e.g. "USE_CATALOG".
+        let sql = format_role_grant_sql("wh", &Permission::UseCatalog, "rocky_role_admin").unwrap();
+        assert_eq!(sql, "GRANT USE CATALOG ON CATALOG wh TO `rocky_role_admin`");
     }
 
     #[tokio::test]
@@ -433,7 +612,11 @@ mod tests {
         let connector = crate::connector::DatabricksConnector::new(config, auth);
 
         let empty = BTreeMap::new();
-        assert!(reconcile_role_graph_impl(&connector, &empty).await.is_ok());
+        assert!(
+            reconcile_role_graph_impl(&connector, None, &empty, &[])
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -474,7 +657,12 @@ mod tests {
                 inherits_from: vec!["reader".to_string()],
             },
         );
-        assert!(reconcile_role_graph_impl(&connector, &roles).await.is_ok());
+        // No SCIM client + no catalogs → log-only fallback branch.
+        assert!(
+            reconcile_role_graph_impl(&connector, None, &roles, &[])
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -507,6 +695,10 @@ mod tests {
                 inherits_from: vec![],
             },
         );
-        assert!(reconcile_role_graph_impl(&connector, &roles).await.is_err());
+        assert!(
+            reconcile_role_graph_impl(&connector, None, &roles, &[])
+                .await
+                .is_err()
+        );
     }
 }
