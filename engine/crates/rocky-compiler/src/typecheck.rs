@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, I001, I002, SourceSpan, W001, W002,
-    W003,
+    W003, W004,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -815,6 +815,67 @@ fn check_first_partition(
             )),
         ],
     }
+}
+
+/// W004 — emit one warning per `(model, column, tag)` triple where the
+/// classification tag has no matching `[mask]` / `[mask.<env>]` strategy
+/// and isn't listed in `[classifications.allow_unmasked]`.
+///
+/// A tag `T` is considered resolved if it appears either as a top-level
+/// `[mask]` default ([`rocky_core::config::MaskEntry::Strategy`]) OR as a
+/// key inside any `[mask.<env>]` override table
+/// ([`rocky_core::config::MaskEntry::EnvOverride`]). This is a compile-time
+/// completeness check — it doesn't gate on `--env`, so a tag defined only
+/// under `[mask.prod]` is still considered resolved in dev.
+///
+/// Iterates models in the project order the caller passed in, then each
+/// model's `classification` map in `BTreeMap` order; the resulting
+/// diagnostic sequence is therefore deterministic.
+pub fn check_classification_tags(
+    models: &[rocky_core::models::Model],
+    mask: &std::collections::BTreeMap<String, rocky_core::config::MaskEntry>,
+    allow_unmasked: &[String],
+) -> Vec<Diagnostic> {
+    use rocky_core::config::MaskEntry;
+
+    // Pre-compute the set of resolved tags once: any top-level Strategy key
+    // plus every key present in any EnvOverride map. Per-call cost is tiny
+    // (configs typically carry single-digit tags) but this keeps the inner
+    // loop a pure hash lookup.
+    let mut resolved: HashSet<&str> = HashSet::new();
+    for (name, entry) in mask {
+        match entry {
+            MaskEntry::Strategy(_) => {
+                resolved.insert(name.as_str());
+            }
+            MaskEntry::EnvOverride(inner) => {
+                for k in inner.keys() {
+                    resolved.insert(k.as_str());
+                }
+            }
+        }
+    }
+
+    let allow: HashSet<&str> = allow_unmasked.iter().map(String::as_str).collect();
+
+    let mut diagnostics = Vec::new();
+    for model in models {
+        for (column, tag) in &model.config.classification {
+            if resolved.contains(tag.as_str()) || allow.contains(tag.as_str()) {
+                continue;
+            }
+            let message = format!(
+                "classification tag '{tag}' on column '{column}' has no matching `[mask]` strategy"
+            );
+            let suggestion = format!(
+                "add `[mask.{tag}]` to rocky.toml or list `{tag}` in `[classifications.allow_unmasked]`"
+            );
+            diagnostics.push(
+                Diagnostic::warning(W004, &model.config.name, message).with_suggestion(suggestion),
+            );
+        }
+    }
+    diagnostics
 }
 
 /// Derive parallel execution layers from the semantic graph.
@@ -2770,5 +2831,140 @@ mod tests {
         // Should fire E024 (neither placeholder present, since @start_date_extra
         // doesn't count) — not W003.
         assert!(diags.iter().any(|d| &*d.code == "E024"));
+    }
+
+    // ----- W004: classification-tag completeness -----
+
+    /// Build a bare model carrying a single `[classification]` entry.
+    /// Mirrors `make_model` but lets each test customise the column → tag
+    /// map without rebuilding the whole `ModelConfig` literal.
+    fn make_classified_model(
+        name: &str,
+        classification: &[(&str, &str)],
+    ) -> rocky_core::models::Model {
+        let mut m = make_model(name, "SELECT 1 AS id");
+        m.config.classification = classification
+            .iter()
+            .map(|(col, tag)| ((*col).to_string(), (*tag).to_string()))
+            .collect();
+        m
+    }
+
+    /// Build a `[mask]` table seeded with default strategies for `tags`,
+    /// plus optional `[mask.<env>]` override tables. Returns the shape
+    /// `CompilerConfig.mask` expects.
+    fn mask_table(
+        defaults: &[&str],
+        env_overrides: &[(&str, &[&str])],
+    ) -> std::collections::BTreeMap<String, rocky_core::config::MaskEntry> {
+        use rocky_core::config::MaskEntry;
+        use rocky_core::traits::MaskStrategy;
+
+        let mut out = std::collections::BTreeMap::new();
+        for tag in defaults {
+            out.insert((*tag).to_string(), MaskEntry::Strategy(MaskStrategy::Hash));
+        }
+        for (env, tags) in env_overrides {
+            let inner: std::collections::BTreeMap<String, MaskStrategy> = tags
+                .iter()
+                .map(|t| ((*t).to_string(), MaskStrategy::Redact))
+                .collect();
+            out.insert((*env).to_string(), MaskEntry::EnvOverride(inner));
+        }
+        out
+    }
+
+    #[test]
+    fn w004_resolved_tag_emits_no_diagnostic() {
+        let models = vec![make_classified_model("users", &[("email", "pii")])];
+        let mask = mask_table(&["pii"], &[]);
+        let diags = check_classification_tags(&models, &mask, &[]);
+        assert!(
+            diags.is_empty(),
+            "a tag resolved via [mask] should emit no W004, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn w004_unresolved_tag_emits_diagnostic_with_helpful_text() {
+        let models = vec![make_classified_model(
+            "users",
+            &[("audit_note", "audit_only")],
+        )];
+        // No mask entry for `audit_only`, and no allow-list entry.
+        let mask = mask_table(&["pii"], &[]);
+        let diags = check_classification_tags(&models, &mask, &[]);
+
+        assert_eq!(diags.len(), 1, "expected exactly one W004, got: {diags:?}");
+        let d = &diags[0];
+        assert_eq!(&*d.code, "W004");
+        assert_eq!(d.severity, crate::diagnostic::Severity::Warning);
+        assert_eq!(d.model, "users");
+        // The message must name the model/column/tag so it's actionable.
+        let msg = d.message.as_ref();
+        assert!(msg.contains("audit_only"), "message missing tag: {msg}");
+        assert!(msg.contains("audit_note"), "message missing column: {msg}");
+        // And the remedy must point at both escape hatches.
+        let help = d.suggestion.as_deref().unwrap_or("");
+        assert!(
+            help.contains("[mask.audit_only]"),
+            "suggestion missing mask hint: {help}"
+        );
+        assert!(
+            help.contains("allow_unmasked"),
+            "suggestion missing allow_unmasked hint: {help}"
+        );
+    }
+
+    #[test]
+    fn w004_allow_unmasked_suppresses_diagnostic() {
+        let models = vec![make_classified_model(
+            "users",
+            &[("audit_note", "audit_only")],
+        )];
+        let mask = mask_table(&["pii"], &[]);
+        let allow = vec!["audit_only".to_string()];
+        let diags = check_classification_tags(&models, &mask, &allow);
+        assert!(
+            diags.is_empty(),
+            "allow_unmasked should suppress W004 for listed tags, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn w004_tag_resolved_only_via_env_override_is_resolved() {
+        // `pii_high` only appears under `[mask.prod]` — the compile-time
+        // check must treat it as resolved regardless of the active env.
+        let models = vec![make_classified_model("users", &[("ssn", "pii_high")])];
+        let mask = mask_table(&[], &[("prod", &["pii_high"])]);
+        let diags = check_classification_tags(&models, &mask, &[]);
+        assert!(
+            diags.is_empty(),
+            "tag present only in [mask.prod] should still resolve, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn w004_emits_one_diagnostic_per_model_column_tag() {
+        // Two models, each with a distinct unresolved tag. Expect two
+        // W004s, each attributed to its owning model.
+        let models = vec![
+            make_classified_model("users", &[("nickname", "internal_only")]),
+            make_classified_model("accounts", &[("audit_note", "audit_only")]),
+        ];
+        let mask = mask_table(&["pii"], &[]);
+        let diags = check_classification_tags(&models, &mask, &[]);
+
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected one W004 per (model, column, tag): {diags:?}"
+        );
+        let mut models_seen: Vec<&str> = diags.iter().map(|d| d.model.as_str()).collect();
+        models_seen.sort();
+        assert_eq!(models_seen, vec!["accounts", "users"]);
+        for d in &diags {
+            assert_eq!(&*d.code, "W004");
+        }
     }
 }

@@ -395,6 +395,11 @@ impl RockyLsp {
             contracts_dir: None,
             source_schemas,
             source_column_info: HashMap::new(),
+            // W004 is gated on a loaded RockyConfig; the LSP init path
+            // doesn't currently hold one, so leave the defaults empty.
+            // Follow-up: thread `rocky.toml` through initialize_params
+            // so IDEs surface unresolved-classification warnings live.
+            ..Default::default()
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -870,6 +875,9 @@ impl LanguageServer for RockyLsp {
                     contracts_dir: None,
                     source_schemas,
                     source_column_info: HashMap::new(),
+                    // Incremental LSP path: W004 stays disabled until
+                    // the LSP initialization plumbs rocky.toml in.
+                    ..Default::default()
                 };
 
                 // Try incremental compilation if we have a previous result.

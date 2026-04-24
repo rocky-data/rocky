@@ -54,7 +54,7 @@ pub struct ModelCompileTimings {
 }
 
 /// Configuration for the compiler.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct CompilerConfig {
     /// Directory containing model files.
     pub models_dir: PathBuf,
@@ -65,6 +65,19 @@ pub struct CompilerConfig {
     pub source_schemas: HashMap<String, Vec<TypedColumn>>,
     /// Known source column info for semantic graph (name, type string, nullable).
     pub source_column_info: HashMap<String, Vec<rocky_core::ir::ColumnInfo>>,
+    /// Project `[mask]` table from `rocky.toml` — used by the W004
+    /// classification-tag completeness check. Empty by default; callers
+    /// that don't load a `RockyConfig` get the status quo (no W004).
+    ///
+    /// Holds both workspace-default strategies (`MaskEntry::Strategy`)
+    /// and per-env override tables (`MaskEntry::EnvOverride`) in a single
+    /// map keyed first by tag or env name, matching
+    /// [`rocky_core::config::RockyConfig::mask`].
+    pub mask: std::collections::BTreeMap<String, rocky_core::config::MaskEntry>,
+    /// Classification tags allowed to appear on a column without a
+    /// matching `[mask]` strategy — the escape hatch documented on
+    /// `[classifications.allow_unmasked]`. Suppresses W004 for listed tags.
+    pub allow_unmasked: Vec<String>,
 }
 
 /// Result of compilation.
@@ -207,10 +220,19 @@ pub fn compile_project(
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
 
-    // 7. Merge all diagnostics.
+    // 7. Classification-tag completeness (W004). Warn on any
+    //    `[classification]` tag that doesn't resolve to a `[mask]` /
+    //    `[mask.<env>]` strategy and isn't listed in `[classifications.
+    //    allow_unmasked]`. No-op when `config.mask` is empty (the default
+    //    for call sites that don't load `RockyConfig`).
+    let classification_diagnostics =
+        typecheck::check_classification_tags(&project.models, &config.mask, &config.allow_unmasked);
+
+    // 8. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
+    diagnostics.extend(classification_diagnostics);
 
     let has_errors = diagnostics
         .iter()
@@ -387,9 +409,16 @@ pub fn compile_incremental(
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
 
+    // W004: whole-project classification-tag completeness. Cheap (O(models
+    // × columns)) and whole-project, so re-running on the incremental path
+    // keeps parity with the full-compile diagnostic surface.
+    let classification_diagnostics =
+        typecheck::check_classification_tags(&project.models, &config.mask, &config.allow_unmasked);
+
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
+    diagnostics.extend(classification_diagnostics);
 
     let has_errors = diagnostics
         .iter()

@@ -102,6 +102,7 @@ fn test_simple_project_full_compile() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile(&config).unwrap();
@@ -118,6 +119,7 @@ fn test_simple_project_lineage_edges() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile(&config).unwrap();
@@ -209,6 +211,7 @@ fn test_mixed_project_full_compile() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile(&config).unwrap();
@@ -226,6 +229,7 @@ fn test_contract_project_loads_contracts() {
         contracts_dir: Some(fixture_path("contract_project/contracts")),
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile(&config).unwrap();
@@ -245,6 +249,7 @@ fn test_contract_project_with_no_contracts_dir() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile(&config).unwrap();
@@ -322,6 +327,7 @@ fn incremental_matches_full_after_leaf_edit() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let seed = compile(&config).unwrap();
@@ -386,6 +392,7 @@ fn incremental_preserves_reference_map() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let seed = compile(&config).unwrap();
@@ -425,6 +432,7 @@ fn incremental_handles_new_model_file() {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let seed = compile(&config).unwrap();

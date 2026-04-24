@@ -61,6 +61,7 @@ fn compile_project(
         contracts_dir: None,
         source_schemas,
         source_column_info: std::collections::HashMap::new(),
+        ..Default::default()
     };
     compile(&config).map_err(|e| anyhow::anyhow!("{e}"))
 }

@@ -176,6 +176,7 @@ fn compile_and_extract_schemas(
         contracts_dir: None,
         source_schemas,
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile::compile(&config)
@@ -281,6 +282,7 @@ fn extract_base_schemas(
         contracts_dir: None,
         source_schemas,
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     match compile::compile(&config) {

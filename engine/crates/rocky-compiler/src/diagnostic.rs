@@ -55,6 +55,10 @@ pub const W001: &str = "W001";
 pub const W002: &str = "W002";
 /// `time_column` type is not DATE for day/month/year granularity (TIMESTAMP works but DATE preferred).
 pub const W003: &str = "W003";
+/// Classification tag on a model column doesn't resolve to any `[mask]` /
+/// `[mask.<env>]` strategy and isn't listed in `[classifications.allow_unmasked]`.
+/// One diagnostic per unresolved `(model, column, tag)` triple.
+pub const W004: &str = "W004";
 /// Contract defines a column not in model output (but not required).
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.

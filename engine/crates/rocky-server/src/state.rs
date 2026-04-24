@@ -71,6 +71,12 @@ impl ServerState {
             contracts_dir: self.contracts_dir.clone(),
             source_schemas,
             source_column_info: HashMap::new(),
+            // TODO: wire `[mask]` + `[classifications.allow_unmasked]`
+            // from the loaded `RockyConfig` so W004 surfaces in
+            // `rocky-server`'s HTTP compile path too. Today the server
+            // compile happens without a rocky.toml load step in scope,
+            // so the check is a no-op here.
+            ..Default::default()
         };
 
         match rocky_compiler::compile::compile(&config) {

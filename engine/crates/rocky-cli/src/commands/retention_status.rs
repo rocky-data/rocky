@@ -31,6 +31,7 @@ pub fn run_retention_status(
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
         source_column_info: std::collections::HashMap::new(),
+        ..Default::default()
     })
     .context("failed to compile project for retention-status")?;
 

@@ -284,6 +284,7 @@ fn build_column_lineage_from_models(
             state_path,
         ),
         source_column_info: std::collections::HashMap::new(),
+        ..Default::default()
     };
 
     let result = match rocky_compiler::compile::compile(&compile_config) {

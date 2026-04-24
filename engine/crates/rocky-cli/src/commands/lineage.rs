@@ -62,6 +62,7 @@ pub fn run_lineage(
         contracts_dir: None,
         source_schemas,
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let result = compile::compile(&config)?;

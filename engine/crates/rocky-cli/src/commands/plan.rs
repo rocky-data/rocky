@@ -246,15 +246,17 @@ fn populate_governance_actions(
     adapter_type: &str,
     output: &mut PlanOutput,
 ) -> Result<()> {
+    let tag_to_strategy = cfg.resolve_mask_for_env(env);
+
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
         source_column_info: std::collections::HashMap::new(),
+        mask: cfg.mask.clone(),
+        allow_unmasked: cfg.classifications.allow_unmasked.clone(),
     })
     .context("failed to compile project for governance preview")?;
-
-    let tag_to_strategy = cfg.resolve_mask_for_env(env);
 
     for model in &compile.project.models {
         let model_name = &model.config.name;
