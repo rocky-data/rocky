@@ -46,6 +46,7 @@ from .types import (
     CiResult,
     ColumnLineageResult,
     CompileResult,
+    ComplianceOutput,
     ConformanceResult,
     CostOutput,
     DagResult,
@@ -57,6 +58,7 @@ from .types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    RetentionStatusOutput,
     RunResult,
     StateHealthResult,
     StateResult,
@@ -1916,6 +1918,60 @@ class RockyResource(dg.ConfigurableResource):
         from .health import state_health as _state_health
 
         return _state_health(self, probe_write=probe_write)
+
+    def compliance(self, *, env: str | None = None) -> ComplianceOutput:
+        """Run ``rocky compliance`` and return the parsed governance rollup.
+
+        A thin wrapper over the engine's Wave B governance surface
+        (``rocky compliance``) — a static resolver over the project's
+        ``[classification]`` sidecars + ``[mask]`` / ``[mask.<env>]``
+        policy blocks that answers "are all classified columns masked
+        wherever policy says they should be?". The command makes no
+        warehouse calls and is safe to invoke per materialization batch.
+
+        Args:
+            env: Optional environment label forwarded as ``--env <env>``.
+                When set, masking status is evaluated only against that
+                environment's ``[mask.<env>]`` block. When unset, the
+                engine expands across the union of defaults and every
+                named override block.
+
+        Returns:
+            :class:`~.types.ComplianceOutput` — the parsed rollup. See
+            :meth:`~.types.ComplianceOutput.exceptions` for the
+            unmasked-where-expected list and
+            :meth:`~.types.ComplianceOutput.summary` for aggregate tallies.
+        """
+        args = ["compliance", "--output", "json"]
+        if env is not None:
+            args.extend(["--env", env])
+        return _parse_rocky_json(self._run_rocky(args), ComplianceOutput, command="compliance")
+
+    def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
+        """Run ``rocky retention-status`` and return the parsed per-model status.
+
+        Reports which models declare a ``retention = "<N>[dy]"`` sidecar
+        value and — once the engine's ``--drift`` warehouse probe lands
+        — whether the warehouse's current retention matches. The
+        command reads the project's model sidecars + state store only;
+        no warehouse round-trip in v1, so it's safe to invoke per
+        materialization batch.
+
+        Args:
+            env: Optional environment label forwarded as ``--env <env>``.
+
+        Returns:
+            :class:`~.types.RetentionStatusOutput` — one
+            :class:`~.types.ModelRetentionStatus` entry per model.
+            ``warehouse_days`` is always ``None`` until the engine's
+            v2 ``--drift`` probe ships.
+        """
+        args = ["retention-status", "--output", "json"]
+        if env is not None:
+            args.extend(["--env", env])
+        return _parse_rocky_json(
+            self._run_rocky(args), RetentionStatusOutput, command="retention-status"
+        )
 
     def resume_run(
         self,

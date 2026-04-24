@@ -326,3 +326,310 @@ def test_metadata_includes_source_info(discover_json: str, tmp_path: Path):
                 metadata = dict(spec.metadata or {})
                 assert "dagster-rocky/source_id" in metadata
                 assert "dagster-rocky/source_type" in metadata
+
+
+# ---------------------------------------------------------------------------
+# Governance surfaces (surface_compliance + surface_retention_status)
+# ---------------------------------------------------------------------------
+
+
+def _build_defs_with_flags(
+    discover_json: str,
+    tmp_path: Path,
+    *,
+    surface_compliance: bool = False,
+    surface_retention_status: bool = False,
+) -> dg.Definitions:
+    """Same as ``_build_defs`` but with governance opt-ins on the component."""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": json.loads(discover_json)}))
+    component = RockyComponent(
+        config_path="rocky.toml",
+        surface_compliance=surface_compliance,
+        surface_retention_status=surface_retention_status,
+    )
+    return component.build_defs_from_state(context=None, state_path=state_file)
+
+
+def _materialize_with_governance(
+    defs: dg.Definitions,
+    run_result: RunResult,
+    selection: list[dg.AssetKey],
+    *,
+    compliance_json: str | None = None,
+    retention_status_json: str | None = None,
+):
+    """Materialize a subset with rocky.run + compliance/retention patched."""
+    from dagster_rocky.types import ComplianceOutput, RetentionStatusOutput
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+        patch.object(
+            RockyResource,
+            "compliance",
+            return_value=(
+                ComplianceOutput.model_validate_json(compliance_json)
+                if compliance_json is not None
+                else None
+            ),
+        ),
+        patch.object(
+            RockyResource,
+            "retention_status",
+            return_value=(
+                RetentionStatusOutput.model_validate_json(retention_status_json)
+                if retention_status_json is not None
+                else None
+            ),
+        ),
+    ):
+        return dg.materialize(
+            list(defs.assets or []),
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=selection,
+            raise_on_error=False,
+        )
+
+
+def test_compliance_check_spec_predeclared_when_opt_in(discover_json: str, tmp_path: Path):
+    """``surface_compliance=True`` pre-declares a ``compliance_exception``
+    spec per asset so it's visible in the UI before any run."""
+    defs = _build_defs_with_flags(discover_json, tmp_path, surface_compliance=True)
+    all_check_specs = []
+    for asset_def in defs.assets or []:
+        if isinstance(asset_def, dg.AssetsDefinition):
+            all_check_specs.extend(asset_def.check_specs)
+
+    compliance_specs = [cs for cs in all_check_specs if cs.name == "compliance_exception"]
+    result = DiscoverResult.model_validate_json(discover_json)
+    total_tables = sum(len(s.tables) for s in result.sources)
+    # One compliance spec per asset
+    assert len(compliance_specs) == total_tables
+
+
+def test_compliance_check_spec_absent_by_default(discover_json: str, tmp_path: Path):
+    """Default ``surface_compliance=False`` emits zero compliance specs —
+    zero behaviour change for existing deployments."""
+    defs = _build_defs_with_flags(discover_json, tmp_path)  # both flags off
+    for asset_def in defs.assets or []:
+        if isinstance(asset_def, dg.AssetsDefinition):
+            names = {cs.name for cs in asset_def.check_specs}
+            assert "compliance_exception" not in names
+
+
+def test_governance_events_emitted_when_both_flags_true(
+    discover_json: str,
+    run_json: str,
+    compliance_json: str,
+    retention_status_json: str,
+    tmp_path: Path,
+):
+    """End-to-end: both opt-ins emit the expected extra events alongside
+    the existing drift + anomaly + materialization events.
+
+    The scenario's compliance exceptions target ``payments`` (which
+    resolves to the payments asset key in the acme source) — so the
+    multi-asset must surface 2 compliance check results on top of the
+    existing drift observation and anomaly check the fixture already
+    produces for payments.
+    """
+    defs = _build_defs_with_flags(
+        discover_json,
+        tmp_path,
+        surface_compliance=True,
+        surface_retention_status=True,
+    )
+    run_result = RunResult.model_validate_json(run_json)
+    payments_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "payments"])
+
+    exec_result = _materialize_with_governance(
+        defs,
+        run_result,
+        [payments_key],
+        compliance_json=compliance_json,
+        retention_status_json=retention_status_json,
+    )
+    assert exec_result.success
+
+    check_evaluations = [
+        e for e in exec_result.all_events if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    ]
+    compliance_checks = [
+        e for e in check_evaluations if e.event_specific_data.check_name == "compliance_exception"
+    ]
+    # Both scenario exceptions target ``payments`` — they aggregate into a
+    # single WARN check result (Dagster rejects duplicate (key, name) pairs).
+    assert len(compliance_checks) == 1
+    eval_data = compliance_checks[0].event_specific_data
+    assert eval_data.passed is False
+    assert eval_data.severity == dg.AssetCheckSeverity.WARN
+    assert eval_data.metadata["rocky/compliance_exception_count"].value == 2
+    models = eval_data.metadata["rocky/compliance_models"].text
+    assert "payments.ssn (default)" in models
+    assert "payments.ssn (prod)" in models
+
+    # Retention observations: one per model row whose name resolves to a
+    # selected asset. Only ``payments`` is selected, and the scenario has
+    # ``payments`` declared — so exactly one retention observation.
+    observations = [e for e in exec_result.all_events if e.event_type_value == "ASSET_OBSERVATION"]
+    retention_obs = [
+        e
+        for e in observations
+        if "rocky/retention_model" in (e.event_specific_data.asset_observation.metadata or {})
+    ]
+    assert len(retention_obs) == 1
+    obs_metadata = retention_obs[0].event_specific_data.asset_observation.metadata
+    assert obs_metadata["rocky/retention_model"].text == "payments"
+    assert obs_metadata["rocky/retention_configured_days"].value == 90
+
+
+def test_governance_events_absent_when_flags_false(
+    discover_json: str,
+    run_json: str,
+    compliance_json: str,
+    retention_status_json: str,
+    tmp_path: Path,
+):
+    """Default flags off: zero governance events even if the mocked outputs
+    are non-empty. Proves the opt-in is honoured and no binary invocation
+    happens for users who haven't explicitly turned the surface on."""
+    defs = _build_defs_with_flags(discover_json, tmp_path)  # both False
+    run_result = RunResult.model_validate_json(run_json)
+    payments_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "payments"])
+
+    exec_result = _materialize_with_governance(
+        defs,
+        run_result,
+        [payments_key],
+        compliance_json=compliance_json,
+        retention_status_json=retention_status_json,
+    )
+    assert exec_result.success
+
+    check_evaluations = [
+        e for e in exec_result.all_events if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    ]
+    assert not any(
+        e.event_specific_data.check_name == "compliance_exception" for e in check_evaluations
+    )
+    observations = [e for e in exec_result.all_events if e.event_type_value == "ASSET_OBSERVATION"]
+    assert not any(
+        "rocky/retention_model" in (e.event_specific_data.asset_observation.metadata or {})
+        for e in observations
+    )
+
+
+def test_governance_compliance_drops_exceptions_for_unknown_models(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """Compliance exceptions targeting a model the component didn't declare
+    are dropped with a warning rather than crashing the materialization.
+
+    The sentinel ``_compliance`` asset key + exceptions for models outside
+    the current group's selection would otherwise raise
+    ``DagsterInvariantViolationError`` because no matching
+    ``AssetCheckSpec`` is pre-declared for those keys. The component
+    filter defends the invariant; this test pins the behaviour.
+    """
+    from dagster_rocky.types import ComplianceOutput
+
+    defs = _build_defs_with_flags(discover_json, tmp_path, surface_compliance=True)
+    run_result = RunResult.model_validate_json(run_json)
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    # Build a compliance scenario whose exceptions target a model that
+    # does NOT exist in the discover fixture's source tables. The model
+    # resolver will fail, the helper will fall back to the sentinel
+    # ``_compliance`` key, and the component must drop that result
+    # because no spec was declared against the sentinel.
+    unknown_compliance = {
+        "command": "compliance",
+        "version": "1.16.0",
+        "summary": {
+            "total_classified": 1,
+            "total_masked": 0,
+            "total_exceptions": 1,
+        },
+        "per_column": [],
+        "exceptions": [
+            {
+                "model": "totally_made_up_model",
+                "column": "secret",
+                "env": "prod",
+                "reason": "no masking strategy resolves for classification tag 'pii'",
+            },
+        ],
+    }
+    compliance_output = ComplianceOutput.model_validate(unknown_compliance)
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+        patch.object(RockyResource, "compliance", return_value=compliance_output),
+    ):
+        exec_result = dg.materialize(
+            list(defs.assets or []),
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[orders_key],
+            raise_on_error=False,
+        )
+
+    assert exec_result.success
+    # The sentinel-key result is dropped. Only the placeholder compliance
+    # check (passing) fires for the selected orders asset.
+    check_evaluations = [
+        e for e in exec_result.all_events if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    ]
+    compliance_checks = [
+        e for e in check_evaluations if e.event_specific_data.check_name == "compliance_exception"
+    ]
+    assert len(compliance_checks) == 1
+    # The one result is the placeholder against orders (declared key),
+    # not the sentinel — and it passes because no exception reached it.
+    check = compliance_checks[0]
+    assert check.event_specific_data.asset_key == orders_key
+    assert check.event_specific_data.passed is True
+
+
+def test_governance_compliance_failure_does_not_fail_materialization(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """If ``rocky compliance`` raises, the multi-asset logs a warning and
+    continues — the drift/anomaly path has the same tolerance."""
+    defs = _build_defs_with_flags(discover_json, tmp_path, surface_compliance=True)
+    run_result = RunResult.model_validate_json(run_json)
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+        patch.object(
+            RockyResource, "compliance", side_effect=RuntimeError("simulated binary crash")
+        ),
+    ):
+        exec_result = dg.materialize(
+            list(defs.assets or []),
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[orders_key],
+            raise_on_error=False,
+        )
+
+    # Materialization still succeeds — compliance error is swallowed.
+    assert exec_result.success
+    # The pre-declared ``compliance_exception`` spec still produces a
+    # placeholder (Dagster requires every declared spec to yield a
+    # result) — but the placeholder passes rather than propagating the
+    # binary crash as a WARN. That's the design: a transient governance
+    # read failure is a logged-and-skipped event, not a user-facing
+    # compliance violation.
+    check_evaluations = [
+        e for e in exec_result.all_events if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    ]
+    compliance_checks = [
+        e for e in check_evaluations if e.event_specific_data.check_name == "compliance_exception"
+    ]
+    # Exactly one placeholder result, and it must be passing (not WARN).
+    assert len(compliance_checks) == 1
+    eval_data = compliance_checks[0].event_specific_data
+    assert eval_data.passed is True

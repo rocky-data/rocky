@@ -579,3 +579,110 @@ DRIFT: dict[str, Any] = {
         },
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# compliance — governance Wave B rollup
+#
+# Two classified columns, one masked (``orders.email`` resolves a ``hash``
+# strategy in both default + prod envs) and one exception (``payments.ssn``
+# is classified ``pii`` but no masking strategy resolves, and ``pii`` is not
+# on the ``allow_unmasked`` advisory list). Summary counters match the
+# ``(model, column, env)`` triples expanded across the env enumeration.
+# ---------------------------------------------------------------------------
+
+COMPLIANCE: dict[str, Any] = {
+    "command": "compliance",
+    "version": "1.16.0",
+    "summary": {
+        "total_classified": 4,
+        "total_masked": 2,
+        "total_exceptions": 2,
+    },
+    "per_column": [
+        {
+            "model": "orders",
+            "column": "email",
+            "classification": "pii",
+            "envs": [
+                {
+                    "env": "default",
+                    "masking_strategy": "hash",
+                    "enforced": True,
+                },
+                {
+                    "env": "prod",
+                    "masking_strategy": "hash",
+                    "enforced": True,
+                },
+            ],
+        },
+        {
+            "model": "payments",
+            "column": "ssn",
+            "classification": "pii",
+            "envs": [
+                {
+                    "env": "default",
+                    "masking_strategy": "unresolved",
+                    "enforced": False,
+                },
+                {
+                    "env": "prod",
+                    "masking_strategy": "unresolved",
+                    "enforced": False,
+                },
+            ],
+        },
+    ],
+    "exceptions": [
+        {
+            "model": "payments",
+            "column": "ssn",
+            "env": "default",
+            "reason": "no masking strategy resolves for classification tag 'pii'",
+        },
+        {
+            "model": "payments",
+            "column": "ssn",
+            "env": "prod",
+            "reason": "no masking strategy resolves for classification tag 'pii'",
+        },
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# retention-status — governance Wave C-2 per-model rollup
+#
+# Three models: one with declared retention and no warehouse mismatch
+# (``in_sync=True``), one with declared retention whose warehouse probe
+# would eventually populate ``warehouse_days`` (``None`` in v1, so the
+# entry is reported as ``in_sync=True`` per the schema's contract), and
+# one with no declaration (both sides ``None``, ``in_sync=True``).
+# ---------------------------------------------------------------------------
+
+RETENTION_STATUS: dict[str, Any] = {
+    "command": "retention-status",
+    "version": "1.16.0",
+    "models": [
+        {
+            "model": "orders",
+            "configured_days": 30,
+            "warehouse_days": None,
+            "in_sync": True,
+        },
+        {
+            "model": "payments",
+            "configured_days": 90,
+            "warehouse_days": None,
+            "in_sync": True,
+        },
+        {
+            "model": "revenue_summary",
+            "configured_days": None,
+            "warehouse_days": None,
+            "in_sync": True,
+        },
+    ],
+}

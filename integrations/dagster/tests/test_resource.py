@@ -1358,3 +1358,70 @@ def test_doctor_with_check_kwarg_forwards_arbitrary_id():
         rocky.doctor(check="totally-made-up-id")
 
     assert captured[0] == ["doctor", "--check", "totally-made-up-id"]
+
+
+# ---------------------------------------------------------------------------
+# compliance() / retention_status() — governance Waves B + C-2 accessors
+# ---------------------------------------------------------------------------
+
+
+def test_compliance_builds_argv_without_env(compliance_json: str):
+    """Default ``compliance()`` call emits ``compliance --output json``."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return compliance_json
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.compliance()
+
+    assert captured[0] == ["compliance", "--output", "json"]
+    assert result.command == "compliance"
+    assert len(result.exceptions) == 2
+
+
+def test_compliance_forwards_env_flag(compliance_json: str):
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return compliance_json
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.compliance(env="prod")
+
+    assert captured[0] == ["compliance", "--output", "json", "--env", "prod"]
+
+
+def test_retention_status_builds_argv_without_env(retention_status_json: str):
+    """Default ``retention_status()`` call emits ``retention-status --output json``."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return retention_status_json
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.retention_status()
+
+    assert captured[0] == ["retention-status", "--output", "json"]
+    assert result.command == "retention-status"
+    assert len(result.models) == 3
+
+
+def test_retention_status_forwards_env_flag(retention_status_json: str):
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(args)
+        return retention_status_json
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        rocky.retention_status(env="prod")
+
+    assert captured[0] == ["retention-status", "--output", "json", "--env", "prod"]

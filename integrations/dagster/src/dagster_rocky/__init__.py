@@ -46,9 +46,14 @@ from .freshness import (
 from .health import HealthcheckResult, rocky_healthcheck, state_health
 from .observability import (
     ANOMALY_CHECK_NAME,
+    COMPLIANCE_CHECK_NAME,
+    COMPLIANCE_FALLBACK_ASSET_KEY,
+    RETENTION_OBSERVATION_NAME,
     anomaly_check_results,
+    compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
+    retention_observations,
 )
 from .partitions import (
     dagster_to_rocky_partition_key,
@@ -81,6 +86,9 @@ from .types import (
     ColumnDef,
     ColumnLineageResult,
     CompileResult,
+    ComplianceException,
+    ComplianceOutput,
+    ComplianceSummary,
     ConformanceResult,
     ContractResult,
     ContractViolation,
@@ -109,6 +117,7 @@ from .types import (
     ModelExecution,
     ModelHistoryResult,
     ModelLineageResult,
+    ModelRetentionStatus,
     ModelValidation,
     OptimizeResult,
     PartitionInfo,
@@ -119,6 +128,7 @@ from .types import (
     QualifiedColumn,
     QualityMetrics,
     QualitySnapshot,
+    RetentionStatusOutput,
     RunRecord,
     RunResult,
     Severity,
@@ -161,8 +171,13 @@ __all__ = [
     "build_rocky_schedule",
     # Observability (T4.1, T4.2, T4.4)
     "ANOMALY_CHECK_NAME",
+    "COMPLIANCE_CHECK_NAME",
+    "COMPLIANCE_FALLBACK_ASSET_KEY",
+    "RETENTION_OBSERVATION_NAME",
     "drift_observations",
     "anomaly_check_results",
+    "compliance_check_results",
+    "retention_observations",
     "optimize_metadata_for_keys",
     # Contracts (T4.3)
     "CONTRACT_REQUIRED_COLUMNS_CHECK",
@@ -284,4 +299,10 @@ __all__ = [
     "DriftTableResult",
     "DriftedColumn",
     "DriftActionKind",
+    # Governance (Waves B + C-2 — compliance + retention)
+    "ComplianceOutput",
+    "ComplianceException",
+    "ComplianceSummary",
+    "RetentionStatusOutput",
+    "ModelRetentionStatus",
 ]
