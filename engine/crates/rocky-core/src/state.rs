@@ -144,6 +144,12 @@ pub enum StateError {
     )]
     LockHeldByOther { path: String },
 
+    #[error(
+        "state store at {path} is busy — another rocky process (likely a long-running \
+         `rocky run` or a concurrent LSP read) is holding the database lock. Retry in a moment."
+    )]
+    Busy { path: String },
+
     #[error("i/o error opening state lock file at {path}: {source}")]
     LockIo {
         path: String,
@@ -189,11 +195,20 @@ impl StateStore {
 
     /// Opens an existing state store for **read-only** access.
     ///
-    /// Does NOT take the advisory write lock — multiple readers (and one
-    /// concurrent writer) can safely call this at the same time. Redb's own
-    /// MVCC guarantees consistent reads. Use this for inspection commands
-    /// (`rocky state`, `rocky history`, `rocky doctor`, `rocky metrics`,
-    /// `rocky optimize`, server APIs) so they don't block a live `rocky run`.
+    /// Skips Rocky's advisory write lock so two read-only opens from the same
+    /// host don't fight each other on the `.redb.lock` sentinel. Redb itself
+    /// still takes an exclusive `flock` on the database file (no `redb` 2.x
+    /// API bypasses it), so the underlying open call is briefly serialised
+    /// with any concurrent open — read or write. To smooth that race
+    /// `open_inner` retries the redb open up to 5 × 50ms via
+    /// [`open_redb_with_retry`]; after exhaustion the caller sees
+    /// [`StateError::Busy`] (a friendly "retry in a moment" error) rather
+    /// than the raw redb message. This is the right entry point for
+    /// inspection commands (`rocky state`, `rocky history`, `rocky doctor`,
+    /// `rocky metrics`, `rocky optimize`, LSP schema-cache reads, server
+    /// APIs) — they don't need exclusivity and the retry hides the
+    /// millisecond-scale collisions the LSP creates on every debounced
+    /// keystroke.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
         Self::open_inner(path, false)
     }
@@ -228,7 +243,7 @@ impl StateStore {
             None
         };
 
-        let db = Database::create(path)?;
+        let db = open_redb_with_retry(path)?;
 
         // Single write transaction: check/write schema version AND ensure all
         // tables exist. Committing them together means the version stamp and
@@ -519,6 +534,46 @@ impl StateStore {
         txn.commit()?;
         Ok(removed)
     }
+}
+
+/// Number of attempts (incl. the first) for [`open_redb_with_retry`].
+const REDB_OPEN_RETRY_ATTEMPTS: u32 = 5;
+/// Linear backoff between retry attempts.
+const REDB_OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Open the redb database file, retrying briefly on the transient
+/// [`redb::DatabaseError::DatabaseAlreadyOpen`] flock collision.
+///
+/// Redb 2.x takes an unconditional `flock(LOCK_EX | LOCK_NB)` in
+/// `FileBackend::new`, so any concurrent open from the same machine — even
+/// another reader — is briefly serialised. The LSP fires a schema-cache read
+/// ~300ms after every keystroke (`rocky-server::lsp::Server::did_change`),
+/// which races every CLI invocation the VS Code extension launches; without
+/// retry the user sees a raw "Database already open. Cannot acquire lock."
+/// error from redb.
+///
+/// Retries are bounded (5 × 50ms ≈ 250ms total) and only kick in for the
+/// flock collision. Other redb errors propagate immediately. After
+/// exhaustion the caller gets [`StateError::Busy`] with a friendly message.
+///
+/// This does NOT fix the writer-vs-CLI race during a long `rocky run`
+/// (the writer holds the lock for seconds-to-minutes); inspection commands
+/// will still hit `Busy` in that scenario, but with a clear next step.
+fn open_redb_with_retry(path: &Path) -> Result<Database, StateError> {
+    for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
+        match Database::create(path) {
+            Ok(db) => return Ok(db),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                if attempt + 1 < REDB_OPEN_RETRY_ATTEMPTS {
+                    std::thread::sleep(REDB_OPEN_RETRY_DELAY);
+                }
+            }
+            Err(e) => return Err(StateError::Database(e)),
+        }
+    }
+    Err(StateError::Busy {
+        path: path.display().to_string(),
+    })
 }
 
 /// Compose the redb key for a `PartitionRecord`.
@@ -3468,5 +3523,101 @@ mod tests {
                 "no models dir → no migration nudge"
             );
         });
+    }
+
+    // ---------- redb open retry / Busy mapping ----------
+
+    /// When another process briefly holds the redb flock, `open_read_only`
+    /// must retry and ultimately succeed instead of leaking the raw
+    /// `DatabaseAlreadyOpen` error. Coordinated with a barrier (no
+    /// time-based race), per the advisor's "no sleep-and-pray" rule.
+    #[test]
+    fn open_read_only_retries_and_succeeds_after_brief_hold() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+
+        // Seed the file so `open_read_only` has something to attach to.
+        StateStore::open(&path).unwrap();
+
+        let lock_acquired = Arc::new(Barrier::new(2));
+        let release_now = Arc::new(Barrier::new(2));
+
+        let path_holder = path.clone();
+        let lock_acquired_clone = Arc::clone(&lock_acquired);
+        let release_now_clone = Arc::clone(&release_now);
+        let holder = thread::spawn(move || {
+            let db = Database::create(&path_holder).unwrap();
+            lock_acquired_clone.wait();
+            // Hold for ~120ms — well within the 250ms retry budget but
+            // long enough that the first 1–2 retry attempts will fail.
+            thread::sleep(Duration::from_millis(120));
+            release_now_clone.wait();
+            drop(db);
+        });
+
+        lock_acquired.wait();
+        // Open while the holder is still mid-sleep. Retry should mask the
+        // collision and eventually succeed once the holder drops.
+        let opener_path = path.clone();
+        let opener = thread::spawn(move || StateStore::open_read_only(&opener_path));
+        // Tell the holder it can drop after a beat — the opener is now
+        // looping through its retries.
+        release_now.wait();
+
+        let result = opener.join().unwrap();
+        holder.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "open_read_only should retry past brief redb-lock contention, got error: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// When the redb flock is held longer than the retry budget,
+    /// `open_read_only` must surface [`StateError::Busy`] (the friendly
+    /// message) — not the raw redb `DatabaseAlreadyOpen` text.
+    #[test]
+    fn open_read_only_surfaces_busy_after_retry_exhaustion() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        StateStore::open(&path).unwrap();
+
+        let lock_acquired = Arc::new(Barrier::new(2));
+        let test_done = Arc::new(Barrier::new(2));
+
+        let path_holder = path.clone();
+        let lock_acquired_clone = Arc::clone(&lock_acquired);
+        let test_done_clone = Arc::clone(&test_done);
+        let holder = thread::spawn(move || {
+            let db = Database::create(&path_holder).unwrap();
+            lock_acquired_clone.wait();
+            // Hold past the retry budget (5 × 50ms = 250ms). 600ms gives
+            // CI plenty of slack so the test never flakes the other way.
+            thread::sleep(Duration::from_millis(600));
+            test_done_clone.wait();
+            drop(db);
+        });
+
+        lock_acquired.wait();
+        let result = StateStore::open_read_only(&path);
+        test_done.wait();
+        holder.join().unwrap();
+
+        match result {
+            Err(StateError::Busy { path: p }) => {
+                assert_eq!(p, path.display().to_string());
+            }
+            Err(other) => panic!("expected StateError::Busy, got: {other}"),
+            Ok(_) => panic!("expected StateError::Busy, got Ok"),
+        }
     }
 }
