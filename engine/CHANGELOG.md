@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `rocky run --governance-override` rejects `workspace_ids = []` without an explicit opt-in** (FR-009). The post-DAG workspace-binding reconciler shipped in engine 1.14.0 treats `workspace_ids` as declarative state — empty list = "revoke every binding on the target catalog." That's the right contract when the list is intentional, but it also means a misconfigured permission store or an off-by-one serializer can silently strip every workspace off the catalog.
+
+  `rocky run` now fails fast with a clear error before touching any catalog when the `--governance-override` payload contains `{"workspace_ids": []}` and the new `allow_empty_workspace_ids` opt-in is not set. The key semantics:
+
+  | Payload | Behaviour |
+  |---|---|
+  | key omitted | Skip binding reconciliation (unchanged) |
+  | `{"workspace_ids": [ids...]}` | Reconcile to exactly that set (unchanged) |
+  | `{"workspace_ids": []}` | **Error** — refuses the silent full revoke |
+  | `{"workspace_ids": [], "allow_empty_workspace_ids": true}` | Explicit full revoke (new path) |
+
+  **Migration.** Any pipeline that was relying on an empty `workspace_ids` list to drop every binding must add `"allow_empty_workspace_ids": true` to the override payload. Callers that pass `None` / omit the key / send a non-empty list are unaffected.
+
+  Types: `GovernanceOverride::workspace_ids` is now `Option<Vec<WorkspaceBindingConfig>>` (was `Vec<WorkspaceBindingConfig>` with `#[serde(default)]`). The option is what lets the engine distinguish "no override" (`None`) from "reconcile to empty" (`Some(vec![])`) — JSON `{}` and `{"workspace_ids": []}` were indistinguishable before. A new `allow_empty_workspace_ids: bool` field (default `false`, `#[serde(default)]`) carries the opt-in so the intent is auditable per-run via the `RunRecord` audit trail (`target_catalog`, `triggering_identity`) introduced in engine 1.16.0.
+
 ## [1.16.0] — 2026-04-23
 
 Ships the governance waveplan — column classification + masking, audit trail on every run, `rocky compliance` rollup, role-graph reconciliation, and data retention policies. Five Waveplan PRs on top of three FR-004 / state-path follow-ups. Eight PRs since v1.15.0.

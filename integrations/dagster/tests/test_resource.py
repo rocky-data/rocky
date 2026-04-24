@@ -26,6 +26,7 @@ from dagster_rocky.resource import (
     DEFAULT_TIMEOUT_SECONDS,
     MIN_ROCKY_VERSION,
     RockyResource,
+    _validate_governance_override,
 )
 
 # ---------------------------------------------------------------------------
@@ -168,6 +169,85 @@ def test_run_passes_governance_override_as_json():
     assert "--governance-override" in captured[0]
     idx = captured[0].index("--governance-override")
     assert '"workspace_ids"' in captured[0][idx + 1]
+
+
+# ---------------------------------------------------------------------------
+# FR-009 — governance_override.workspace_ids safety validator
+# ---------------------------------------------------------------------------
+
+
+class TestValidateGovernanceOverride:
+    """Parametrised coverage of the FR-009 payload -> validator outcome table.
+
+    See :func:`dagster_rocky.resource._validate_governance_override` and
+    the engine-side ``GovernanceOverride::validate_workspace_ids`` for
+    the authoritative semantics.
+    """
+
+    def test_none_is_noop(self):
+        # `governance_override=None` (the default): no reconciler runs,
+        # no validation needed, no error.
+        _validate_governance_override(None)
+
+    def test_key_absent_is_noop(self):
+        # `{}` omits `workspace_ids` entirely — engine interprets as
+        # "skip binding reconciliation"; validator must stay out of
+        # the way so callers can pass governance-only grants.
+        _validate_governance_override({})
+        _validate_governance_override({"grants": [{"principal": "p", "permissions": ["SELECT"]}]})
+
+    def test_non_empty_list_is_noop(self):
+        # Happy path: the caller supplied a non-empty workspace-binding
+        # set. Payload shape isn't structurally validated here (the
+        # engine deserializes the JSON) — we only guard the empty-list
+        # footgun.
+        _validate_governance_override(
+            {"workspace_ids": [{"id": 123, "binding_type": "READ_WRITE"}]}
+        )
+
+    def test_empty_list_without_flag_raises(self):
+        # The core footgun. `{"workspace_ids": []}` with no opt-in flag
+        # tells the reconciler to revoke every binding — refuse.
+        with pytest.raises(dg.Failure) as exc_info:
+            _validate_governance_override({"workspace_ids": []})
+        msg = exc_info.value.description or ""
+        assert "revoke every workspace binding" in msg
+        assert "allow_empty_workspace_ids" in msg
+
+    def test_empty_list_with_flag_is_noop(self):
+        # Explicit consent path — decommissioning flow.
+        _validate_governance_override({"workspace_ids": [], "allow_empty_workspace_ids": True})
+
+    def test_empty_list_with_false_flag_raises(self):
+        # Typo-safety: the flag must be truthy, not merely present.
+        with pytest.raises(dg.Failure):
+            _validate_governance_override({"workspace_ids": [], "allow_empty_workspace_ids": False})
+
+    def test_non_list_workspace_ids_raises(self):
+        # Type error — rejected before we reach the engine, which
+        # would also fail (but less clearly, after a subprocess hop).
+        with pytest.raises(dg.Failure, match="must be a list"):
+            _validate_governance_override({"workspace_ids": "not-a-list"})
+        with pytest.raises(dg.Failure, match="must be a list"):
+            _validate_governance_override({"workspace_ids": 42})
+
+    def test_non_dict_override_raises(self):
+        # Caller confusion: passed the list directly instead of
+        # wrapping it in a dict. Reject before it ever hits the CLI.
+        with pytest.raises(dg.Failure, match="must be a dict"):
+            _validate_governance_override([])  # type: ignore[arg-type]
+
+
+def test_run_rejects_empty_workspace_ids_before_subprocess():
+    """End-to-end: `rocky.run(...)` raises before `_run_rocky` is called."""
+    rocky = RockyResource()
+    with (
+        patch.object(RockyResource, "_run_rocky", autospec=True) as run_mock,
+        pytest.raises(dg.Failure, match="revoke every workspace binding"),
+    ):
+        rocky.run(filter="tenant=acme", governance_override={"workspace_ids": []})
+    # The validator must fire before any subprocess work.
+    run_mock.assert_not_called()
 
 
 def test_run_with_run_models_appends_models_and_all():

@@ -89,6 +89,74 @@ _JSON_ERROR_PREVIEW_BYTES = 500
 _TModel = TypeVar("_TModel", bound=BaseModel)
 
 
+def _validate_governance_override(override: dict | None) -> None:
+    """Pre-flight guard against the silent full-revoke footgun (FR-009).
+
+    Mirrors the engine-side check in ``rocky-core`` / ``rocky run`` so
+    dagster-rocky callers see the error as a :class:`dagster.Failure`
+    **before** the subprocess is spawned — faster feedback, a cleaner
+    stack trace, and no half-applied warehouse state on a catalog that
+    was only ever meant to be a no-op.
+
+    Semantics mirror the engine exactly:
+
+    * ``None`` / argument omitted → no-op (supported).
+    * ``workspace_ids`` key absent → no-op (caller doesn't want to touch
+      workspace bindings on this run — FR-005 reconciler is skipped).
+    * ``workspace_ids`` not a list → :class:`dagster.Failure` (type
+      error; the engine would reject it during JSON deserialization).
+    * ``workspace_ids = []`` without ``allow_empty_workspace_ids = True``
+      → :class:`dagster.Failure` (rejects the footgun; otherwise the
+      reconciler would revoke every existing workspace binding on the
+      target catalog).
+    * ``workspace_ids = []`` with ``allow_empty_workspace_ids = True``
+      → no-op (explicit consent to fully revoke).
+    * ``workspace_ids`` non-empty list → no-op (normal reconcile).
+
+    Args:
+        override: The ``governance_override`` dict (or ``None``) that
+            the caller passed to :meth:`RockyResource.run`,
+            :meth:`RockyResource.run_streaming`, or
+            :meth:`RockyResource.run_pipes`.
+
+    Raises:
+        dagster.Failure: When ``override`` is neither ``None`` nor a
+            dict, or when its ``workspace_ids`` shape would cause a
+            silent full revoke.
+    """
+    if override is None:
+        return
+    if not isinstance(override, dict):
+        raise dg.Failure(
+            description=(
+                "governance_override must be a dict (or None), got "
+                f"{type(override).__name__}. See RockyResource.run docs for the "
+                "expected shape."
+            )
+        )
+    if "workspace_ids" not in override:
+        # Key absent → engine treats as "skip binding reconciliation".
+        # Intentional and supported; validator stays out of the way.
+        return
+    ws_ids = override["workspace_ids"]
+    if not isinstance(ws_ids, list):
+        raise dg.Failure(
+            description=(
+                f"governance_override.workspace_ids must be a list, got {type(ws_ids).__name__}."
+            )
+        )
+    if not ws_ids and not override.get("allow_empty_workspace_ids"):
+        raise dg.Failure(
+            description=(
+                "governance_override.workspace_ids is empty. Rocky's binding "
+                "reconciler would revoke every workspace binding on the target "
+                "catalog. Pass allow_empty_workspace_ids=True if that's "
+                "intentional, or omit the workspace_ids key to skip binding "
+                "reconciliation."
+            )
+        )
+
+
 def _parse_rocky_json(output: str, model_cls: type[_TModel], *, command: str) -> _TModel:
     """Parse Rocky CLI JSON output into a Pydantic model with operator-friendly errors.
 
@@ -1192,6 +1260,7 @@ class RockyResource(dg.ConfigurableResource):
                 idempotency_key=idempotency_key,
             ),
         )
+        _validate_governance_override(resolved.get("governance_override"))
         args = self._build_run_args(
             filter,
             governance_override=resolved.get("governance_override"),
@@ -1280,6 +1349,7 @@ class RockyResource(dg.ConfigurableResource):
                 idempotency_key=idempotency_key,
             ),
         )
+        _validate_governance_override(resolved.get("governance_override"))
         args = self._build_run_args(
             filter,
             governance_override=resolved.get("governance_override"),
@@ -1457,6 +1527,7 @@ class RockyResource(dg.ConfigurableResource):
                 idempotency_key=idempotency_key,
             ),
         )
+        _validate_governance_override(resolved.get("governance_override"))
         args = self._build_run_args(
             filter,
             governance_override=resolved.get("governance_override"),
@@ -1987,6 +2058,10 @@ class RockyResource(dg.ConfigurableResource):
             filter: Optional filter expression.
             governance_override: Optional governance overrides.
         """
+        # FR-009 pre-flight: mirror the guard from :meth:`run` so a
+        # resumed run catches the empty-workspace_ids footgun in-process
+        # instead of paying a subprocess round-trip for the error.
+        _validate_governance_override(governance_override)
         args: list[str] = ["run"]
         if run_id is not None:
             args.extend(["--resume", run_id])

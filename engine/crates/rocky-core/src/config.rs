@@ -1136,14 +1136,97 @@ pub struct ClassificationsConfig {
 ///
 /// Passed via `--governance-override` CLI flag as JSON string or `@file.json`.
 /// Used for per-client workspace bindings and grants from external sources.
+///
+/// # `workspace_ids` semantics
+///
+/// `workspace_ids` is `Option<Vec<_>>` rather than `Vec<_>` so the engine
+/// can distinguish "key absent" from "empty list":
+///
+/// | Payload | Meaning |
+/// |---|---|
+/// | key absent (`None`) | Skip workspace-binding reconciliation for this run |
+/// | `Some(vec![])` without `allow_empty_workspace_ids` | Error — refuses to revoke every binding |
+/// | `Some(vec![])` with `allow_empty_workspace_ids = true` | Explicit full revoke |
+/// | `Some(non-empty)` | Reconcile bindings to exactly this set |
+///
+/// The empty-list guard protects callers from a footgun where a
+/// misconfigured permission store or off-by-one serializer silently
+/// strips every workspace binding from the target catalog.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceOverride {
+    /// Desired workspace-binding set for this run.
+    ///
+    /// See the struct-level docs for the `None` vs `Some(empty)` vs
+    /// `Some(non-empty)` behaviour. The `rocky run` reconciler rejects
+    /// `Some(empty)` unless [`Self::allow_empty_workspace_ids`] is
+    /// `true`.
     #[serde(default)]
-    pub workspace_ids: Vec<WorkspaceBindingConfig>,
+    pub workspace_ids: Option<Vec<WorkspaceBindingConfig>>,
+    /// Opt-in consent for a full workspace-binding revoke.
+    ///
+    /// Defaults to `false`. Set to `true` when `workspace_ids` is
+    /// intentionally `[]` — e.g. decommissioning a catalog. Kept on the
+    /// override (not as a CLI flag) so the intent is auditable per-run
+    /// via the `RunRecord` audit trail.
+    #[serde(default)]
+    pub allow_empty_workspace_ids: bool,
     #[serde(default)]
     pub grants: Vec<GrantConfig>,
     #[serde(default)]
     pub schema_grants: Vec<GrantConfig>,
+}
+
+/// Reasons why a [`GovernanceOverride`] fails the pre-run safety check.
+///
+/// Currently only fires for the empty-`workspace_ids` footgun; new
+/// variants are expected when FR-009's sibling checks ship (e.g. an
+/// empty `grants` list on a catalog that has existing grants).
+#[derive(Debug, thiserror::Error)]
+pub enum GovernanceOverrideError {
+    /// `workspace_ids = []` without `allow_empty_workspace_ids = true`.
+    ///
+    /// `catalogs` is the list of target catalogs the current run would
+    /// have reconciled; surfaced in the error message so operators
+    /// know which catalog the (accidental) full revoke would have hit.
+    #[error(
+        "governance_override.workspace_ids is empty — rocky run would revoke every workspace \
+         binding on {catalogs}. Set `allow_empty_workspace_ids = true` in the override to \
+         intentionally revoke all bindings, or omit the `workspace_ids` key entirely to skip \
+         binding reconciliation for this run."
+    )]
+    EmptyWorkspaceIds {
+        /// Comma-separated target catalogs, surfaced for operator
+        /// diagnostics. Empty string when the caller can't enumerate
+        /// catalogs up front (validators that run before config
+        /// resolution).
+        catalogs: String,
+    },
+}
+
+impl GovernanceOverride {
+    /// Fail fast when the override encodes a silent full-revoke.
+    ///
+    /// Called from `rocky run` before the reconciler fires. Returns
+    /// `Ok(())` for every safe shape (including `workspace_ids` absent
+    /// and `workspace_ids` non-empty); only `Some(vec![])` without the
+    /// opt-in flag errors out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceOverrideError::EmptyWorkspaceIds`] when
+    /// `workspace_ids = Some(empty)` and
+    /// `allow_empty_workspace_ids = false`.
+    pub fn validate_workspace_ids(&self, catalogs: &str) -> Result<(), GovernanceOverrideError> {
+        let Some(ws_ids) = self.workspace_ids.as_ref() else {
+            return Ok(());
+        };
+        if ws_ids.is_empty() && !self.allow_empty_workspace_ids {
+            return Err(GovernanceOverrideError::EmptyWorkspaceIds {
+                catalogs: catalogs.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Schema evolution configuration.
@@ -3737,9 +3820,73 @@ id = 12345
     fn test_governance_override_json_structured() {
         let json = r#"{"workspace_ids": [{"id": 12345, "binding_type": "READ_ONLY"}]}"#;
         let ov: GovernanceOverride = serde_json::from_str(json).unwrap();
-        assert_eq!(ov.workspace_ids.len(), 1);
-        assert_eq!(ov.workspace_ids[0].id, 12345);
-        assert_eq!(ov.workspace_ids[0].binding_type, BindingType::ReadOnly);
+        let ws_ids = ov.workspace_ids.expect("workspace_ids key was present");
+        assert_eq!(ws_ids.len(), 1);
+        assert_eq!(ws_ids[0].id, 12345);
+        assert_eq!(ws_ids[0].binding_type, BindingType::ReadOnly);
+        assert!(!ov.allow_empty_workspace_ids);
+    }
+
+    /// FR-009 — payload → `validate_workspace_ids` outcome table.
+    ///
+    /// Covers the five rows called out in the spec:
+    /// 1. `{}` — key absent → Ok (skip reconciliation).
+    /// 2. `null` override not exercised here (caller passes
+    ///    `Option<&GovernanceOverride>` and handles `None`).
+    /// 3. `{"workspace_ids": ["ws-a"]}` → Ok (reconcile to set).
+    /// 4. `{"workspace_ids": []}` → Err (silent full-revoke footgun).
+    /// 5. `{"workspace_ids": [], "allow_empty_workspace_ids": true}`
+    ///    → Ok (intentional full revoke).
+    #[test]
+    fn test_validate_workspace_ids_key_absent_is_ok() {
+        let ov: GovernanceOverride = serde_json::from_str("{}").unwrap();
+        assert!(ov.workspace_ids.is_none());
+        ov.validate_workspace_ids("cat_a")
+            .expect("key-absent is a safe no-op");
+    }
+
+    #[test]
+    fn test_validate_workspace_ids_non_empty_is_ok() {
+        let json = r#"{"workspace_ids": [{"id": 42, "binding_type": "READ_WRITE"}]}"#;
+        let ov: GovernanceOverride = serde_json::from_str(json).unwrap();
+        ov.validate_workspace_ids("cat_a")
+            .expect("non-empty reconcile is safe");
+    }
+
+    #[test]
+    fn test_validate_workspace_ids_empty_without_flag_errors() {
+        let ov: GovernanceOverride = serde_json::from_str(r#"{"workspace_ids": []}"#).unwrap();
+        let err = ov
+            .validate_workspace_ids("cat_a")
+            .expect_err("empty list without opt-in must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cat_a"),
+            "error should surface the target catalog, got {msg:?}"
+        );
+        assert!(
+            msg.contains("allow_empty_workspace_ids"),
+            "error should point at the escape hatch, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_workspace_ids_empty_with_flag_is_ok() {
+        let json = r#"{"workspace_ids": [], "allow_empty_workspace_ids": true}"#;
+        let ov: GovernanceOverride = serde_json::from_str(json).unwrap();
+        assert!(ov.allow_empty_workspace_ids);
+        ov.validate_workspace_ids("cat_a")
+            .expect("explicit opt-in authorises the full revoke");
+    }
+
+    /// Guard against a typo in the opt-in flag silently leaking through
+    /// — the flag must be `true`, not merely present.
+    #[test]
+    fn test_validate_workspace_ids_empty_with_false_flag_errors() {
+        let json = r#"{"workspace_ids": [], "allow_empty_workspace_ids": false}"#;
+        let ov: GovernanceOverride = serde_json::from_str(json).unwrap();
+        ov.validate_workspace_ids("cat_a")
+            .expect_err("allow_empty_workspace_ids=false is equivalent to absent");
     }
 
     #[test]
