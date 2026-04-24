@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import dagster as dg
+import pydantic
 import pytest
 
+from dagster_rocky import component as component_module
 from dagster_rocky.component import RockyComponent, _load_state
 from dagster_rocky.translator import RockyDagsterTranslator
-from dagster_rocky.types import DiscoverResult
+from dagster_rocky.types import (
+    DiscoverResult,
+    LineageEdge,
+    ModelLineageResult,
+    QualifiedColumn,
+)
 
 
 def _write_state(discover_json: str, tmp_path: Path, compile_json: str | None = None) -> Path:
@@ -226,3 +237,621 @@ def test_get_translator_invalid_dotted_path():
     component = RockyComponent(config_path="rocky.toml", translator_class="NoModule")
     with pytest.raises(ValueError, match="dotted module path"):
         component._get_translator()
+
+
+# ---------------------------------------------------------------------------
+# FR-012: write_state_to_path tolerates non-Failure exceptions per slot.
+# ---------------------------------------------------------------------------
+
+
+class _StubResource:
+    """Minimal RockyResource stub. Each method either returns a Pydantic
+    output or raises a configured exception."""
+
+    def __init__(
+        self,
+        *,
+        discover_result: Any | Exception,
+        compile_result: Any | Exception | None = None,
+        optimize_result: Any | Exception | None = None,
+        dag_result: Any | Exception | None = None,
+        lineage_results: dict[str, Any | Exception] | None = None,
+    ):
+        self._discover = discover_result
+        self._compile = compile_result
+        self._optimize = optimize_result
+        self._dag = dag_result
+        self._lineage = lineage_results or {}
+
+    def _ret(self, value: Any | Exception):
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def discover(self):
+        return self._ret(self._discover)
+
+    def compile(self):
+        return self._ret(self._compile)
+
+    def optimize(self):
+        return self._ret(self._optimize)
+
+    def dag(self, *, column_lineage: bool = False):
+        return self._ret(self._dag)
+
+    def lineage(self, target: str, column: str | None = None):
+        if target not in self._lineage:
+            raise RuntimeError(f"unknown model: {target}")
+        return self._ret(self._lineage[target])
+
+
+def _install_stub_resource(monkeypatch: pytest.MonkeyPatch, stub: _StubResource) -> None:
+    monkeypatch.setattr(RockyComponent, "_get_rocky_resource", lambda self: stub)
+
+
+def _discover_payload() -> dict:
+    return {
+        "version": "0.0.0",
+        "command": "discover",
+        "sources": [],
+        "checks": {"freshness": None},
+    }
+
+
+def _make_discover_result() -> DiscoverResult:
+    return DiscoverResult.model_validate(_discover_payload())
+
+
+def _existing_models_dir(tmp_path: Path) -> str:
+    """Real on-disk models directory so ``_compile_payload`` reaches the
+    ``rocky.compile()`` call. Use the stub's compile_result to control
+    success / failure."""
+    d = tmp_path / "models-real"
+    d.mkdir(exist_ok=True)
+    return str(d)
+
+
+def _missing_models_dir(tmp_path: Path) -> str:
+    """Path that doesn't exist — ``_compile_payload`` short-circuits before
+    touching the resource."""
+    return str(tmp_path / "no-models-here")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(cmd="rocky", timeout=1),
+        MemoryError("oom on dump"),
+        json.JSONDecodeError("bad", "doc", 0),
+        pydantic.ValidationError.from_exception_data("X", []),
+        RuntimeError("transient state-store error"),
+    ],
+)
+def test_write_state_compile_slot_tolerates_non_failure_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: BaseException,
+):
+    """``_compile_payload`` must swallow non-``dg.Failure`` exceptions and omit
+    the slot rather than aborting the whole write."""
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover, compile_result=exc)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)  # must not raise
+
+    state = json.loads(state_path.read_text())
+    assert "discover" in state
+    assert "compile" not in state  # slot omitted, write succeeded
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(cmd="rocky", timeout=1),
+        MemoryError("oom on dump"),
+        json.JSONDecodeError("bad", "doc", 0),
+        RuntimeError("S3 outage"),
+    ],
+)
+def test_write_state_optimize_slot_tolerates_non_failure_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: BaseException,
+):
+    """Same widening for ``_optimize_payload`` — slot omitted on failure."""
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover, optimize_result=exc)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),  # skip compile
+        surface_optimize_metadata=True,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)
+
+    state = json.loads(state_path.read_text())
+    assert "discover" in state
+    assert "optimize" not in state
+
+
+def test_write_state_discover_failure_writes_empty_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """A non-``Failure`` exception out of discover falls back to the empty envelope."""
+    stub = _StubResource(discover_result=RuntimeError("binary missing"))
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)
+
+    state = json.loads(state_path.read_text())
+    assert state["discover"]["sources"] == []
+    assert state["discover"]["command"] == "discover"
+
+
+def test_write_state_creates_parent_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """``write_state_to_path`` materializes intermediate directories.
+
+    Local-filesystem state management writes under ``{project_root}/.dagster/...``
+    which may not exist on a fresh pod — the framework's
+    ``_store_local_filesystem_state`` shutil-rmtrees the dir before
+    calling write, so a missing parent is the expected normal case.
+    """
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "nested" / "deeper" / "state"
+
+    component.write_state_to_path(state_path)
+    assert state_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# FR-011: surface_column_lineage walks models_dir and attaches metadata.
+# ---------------------------------------------------------------------------
+
+
+def _model_lineage(model: str, *upstream: tuple[str, str, str]) -> ModelLineageResult:
+    """Build a tiny ``ModelLineageResult`` with one edge per upstream tuple
+    ``(source_model, source_column, target_column)``."""
+    return ModelLineageResult(
+        version="0.0.0",
+        command="lineage",
+        model=model,
+        columns=[],
+        upstream=[],
+        downstream=[],
+        edges=[
+            LineageEdge(
+                source=QualifiedColumn(model=src_model, column=src_col),
+                target=QualifiedColumn(model=model, column=tgt_col),
+                transform="direct",
+            )
+            for (src_model, src_col, tgt_col) in upstream
+        ],
+    )
+
+
+def _make_models_dir(tmp_path: Path, model_names: list[str]) -> Path:
+    """Create a tmp models_dir with one .toml per name. Adds a noise
+    ``_defaults.toml`` and a ``foo.contract.toml`` to verify the skip
+    predicate."""
+    d = tmp_path / "models"
+    d.mkdir()
+    (d / "_defaults.toml").write_text("# defaults — should be skipped\n")
+    (d / "foo.contract.toml").write_text("# contract — should be skipped\n")
+    for name in model_names:
+        (d / f"{name}.toml").write_text(f"name = '{name}'\n")
+    return d
+
+
+def test_surface_column_lineage_off_passes_defs_through_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Flag off → ``build_defs`` skips the attach branch entirely.
+
+    Verified by stubbing super().build_defs to return a known
+    ``Definitions`` and asserting the returned object passes through
+    without ``dagster/column_lineage`` metadata, even though
+    ``models_dir`` would yield a matching model name.
+    """
+    models_dir = _make_models_dir(tmp_path, ["orders"])
+    sentinel_lineage_calls: list[str] = []
+
+    class _Trace(_StubResource):
+        def lineage(self, target: str, column: str | None = None):
+            sentinel_lineage_calls.append(target)
+            return _model_lineage(target, ("u", "c", "c"))
+
+    stub = _Trace(discover_result=_make_discover_result())
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(models_dir),
+        # flag defaults to False
+    )
+
+    expected_defs = dg.Definitions(assets=[dg.AssetSpec(key=dg.AssetKey(["raw", "orders"]))])
+    monkeypatch.setattr(
+        "dagster.components.component.state_backed_component.StateBackedComponent.build_defs",
+        lambda self_, ctx: expected_defs,
+    )
+
+    out = component.build_defs(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert sentinel_lineage_calls == []  # _attach_column_lineage not called
+    out_spec = next(iter(out.assets or []))
+    assert "dagster/column_lineage" not in out_spec.metadata
+
+
+def test_surface_column_lineage_attaches_metadata_for_matching_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """With the flag on and a matching leaf, ``dagster/column_lineage`` lands in
+    spec metadata."""
+    models_dir = _make_models_dir(tmp_path, ["orders", "customers"])
+    stub = _StubResource(
+        discover_result=_make_discover_result(),
+        lineage_results={
+            "orders": _model_lineage("orders", ("raw_orders", "id", "id")),
+            "customers": _model_lineage("customers", ("raw_customers", "email", "email")),
+        },
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(models_dir),
+        surface_column_lineage=True,
+    )
+    defs = dg.Definitions(
+        assets=[
+            dg.AssetSpec(key=dg.AssetKey(["raw", "orders"])),
+            dg.AssetSpec(key=dg.AssetKey(["raw", "customers"])),
+            dg.AssetSpec(key=dg.AssetKey(["raw", "untouched"])),
+        ]
+    )
+
+    out = component._attach_column_lineage(defs)
+
+    by_key = {tuple(spec.key.path): spec for spec in (out.assets or [])}
+    assert "dagster/column_lineage" in by_key[("raw", "orders")].metadata
+    assert "dagster/column_lineage" in by_key[("raw", "customers")].metadata
+    assert "dagster/column_lineage" not in by_key[("raw", "untouched")].metadata
+
+
+def test_surface_column_lineage_per_model_failure_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """One failing model is skipped; others land."""
+    models_dir = _make_models_dir(tmp_path, ["good", "bad"])
+    stub = _StubResource(
+        discover_result=_make_discover_result(),
+        lineage_results={
+            "good": _model_lineage("good", ("upstream", "x", "x")),
+            "bad": RuntimeError("compile error"),
+        },
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(models_dir),
+        surface_column_lineage=True,
+    )
+    defs = dg.Definitions(
+        assets=[
+            dg.AssetSpec(key=dg.AssetKey(["raw", "good"])),
+            dg.AssetSpec(key=dg.AssetKey(["raw", "bad"])),
+        ]
+    )
+
+    out = component._attach_column_lineage(defs)
+
+    by_key = {tuple(spec.key.path): spec for spec in (out.assets or [])}
+    assert "dagster/column_lineage" in by_key[("raw", "good")].metadata
+    assert "dagster/column_lineage" not in by_key[("raw", "bad")].metadata
+
+
+def test_surface_column_lineage_missing_models_dir_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """No ``models_dir`` on disk → returns ``defs`` unchanged."""
+    stub = _StubResource(discover_result=_make_discover_result())
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(tmp_path / "does-not-exist"),
+        surface_column_lineage=True,
+    )
+    spec = dg.AssetSpec(key=dg.AssetKey(["raw", "orders"]))
+    defs = dg.Definitions(assets=[spec])
+
+    out = component._attach_column_lineage(defs)
+
+    out_spec = next(iter(out.assets or []))
+    assert "dagster/column_lineage" not in out_spec.metadata
+
+
+def test_surface_column_lineage_skips_underscore_and_contract_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """``_*.toml`` and ``*.contract.toml`` must not be considered models."""
+    models_dir = _make_models_dir(tmp_path, ["only_model"])
+    targets_seen: list[str] = []
+
+    class _Capture(_StubResource):
+        def lineage(self, target: str, column: str | None = None):
+            targets_seen.append(target)
+            return _model_lineage(target, ("u", "c", "c"))
+
+    stub = _Capture(discover_result=_make_discover_result())
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(models_dir),
+        surface_column_lineage=True,
+    )
+    component._attach_column_lineage(dg.Definitions(assets=[]))
+
+    assert targets_seen == ["only_model"]
+
+
+# ---------------------------------------------------------------------------
+# FR-010: cold-start fallback discover.
+# ---------------------------------------------------------------------------
+
+
+def _patch_state_path(
+    monkeypatch: pytest.MonkeyPatch,
+    state_path: Path,
+    *,
+    is_dev: bool = False,
+) -> None:
+    monkeypatch.setattr(
+        component_module,
+        "get_local_state_path",
+        lambda key, project_root: state_path,
+    )
+    monkeypatch.setattr(component_module, "using_dagster_dev", lambda: is_dev)
+
+
+def test_cold_start_fallback_fires_when_state_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Missing state + flag on + non-dev → ``write_state_to_path`` is called."""
+    state_path = tmp_path / "missing-state"
+    assert not state_path.exists()
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+    )
+
+    calls: list[Path] = []
+
+    def fake_write(self_, p: Path) -> None:
+        calls.append(p)
+        p.write_text("{}")
+
+    monkeypatch.setattr(RockyComponent, "write_state_to_path", fake_write)
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    fake_context = SimpleNamespace(project_root=tmp_path)
+    component._maybe_cold_start_discover(fake_context)  # type: ignore[arg-type]
+
+    assert calls == [state_path]
+    assert state_path.exists()
+
+
+def test_cold_start_fallback_skipped_under_dev(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Dev mode short-circuits the fallback even with flag on + missing state."""
+    state_path = tmp_path / "missing-state"
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+    )
+
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        RockyComponent,
+        "write_state_to_path",
+        lambda self_, p: calls.append(p),
+    )
+    _patch_state_path(monkeypatch, state_path, is_dev=True)
+
+    component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert calls == []
+
+
+def test_cold_start_fallback_skipped_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Default behaviour (flag off): never fires."""
+    state_path = tmp_path / "missing-state"
+
+    component = RockyComponent(config_path="rocky.toml")  # flag defaults to False
+
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        RockyComponent,
+        "write_state_to_path",
+        lambda self_, p: calls.append(p),
+    )
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert calls == []
+
+
+def test_cold_start_fallback_skipped_when_state_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Existing state file → fallback is a no-op even with flag on."""
+    state_path = tmp_path / "state"
+    state_path.write_text("{}")  # pre-existing
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+    )
+
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        RockyComponent,
+        "write_state_to_path",
+        lambda self_, p: calls.append(p),
+    )
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert calls == []
+
+
+def test_cold_start_fallback_swallows_write_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A failing ``write_state_to_path`` must not raise out of ``build_defs``."""
+    state_path = tmp_path / "missing-state"
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+    )
+
+    def raises(self_, p):
+        raise RuntimeError("S3 + state-store both down")
+
+    monkeypatch.setattr(RockyComponent, "write_state_to_path", raises)
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    with caplog.at_level("WARNING", logger="dagster_rocky.component"):
+        # Must not raise.
+        component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert any("fallback discover failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# FR-010: post_state_write_hook fires after every successful write.
+# ---------------------------------------------------------------------------
+
+
+def test_post_state_write_hook_fires_after_successful_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """The hook is invoked with the state-file path after a successful write."""
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    hook_calls: list[Path] = []
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+        post_state_write_hook=hook_calls.append,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)
+
+    assert hook_calls == [state_path]
+    assert state_path.exists()
+
+
+def test_post_state_write_hook_exception_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A failing hook must not raise out of ``write_state_to_path`` —
+    the file is already on disk by the time the hook fires."""
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    def boom(p: Path) -> None:
+        raise RuntimeError("S3 upload failed")
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+        post_state_write_hook=boom,
+    )
+    state_path = tmp_path / "state"
+
+    with caplog.at_level("WARNING", logger="dagster_rocky.component"):
+        component.write_state_to_path(state_path)  # must not raise
+
+    assert state_path.exists()
+    assert any("post_state_write_hook failed" in r.message for r in caplog.records)
+
+
+def test_post_state_write_hook_default_none_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """No hook configured → write completes normally with no extra side-effects."""
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    assert component.post_state_write_hook is None
+
+    state_path = tmp_path / "state"
+    component.write_state_to_path(state_path)
+    assert state_path.exists()
