@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-04-24
+
+Patch release. Fixes the "Show Lineage" command producing an error webview complaining about character `{` (#260). The extension now passes `-o table` alongside `--format dot` so it works against the already-shipped `rocky 1.17.0` binary without waiting for the engine patch (engine 1.17.1 fixes the same bug at the CLI layer for terminal users).
+
 ## [1.9.0] — 2026-04-24
 
 Tracks engine 1.17.0 (governance-waveplan polish wave). Regenerated TypeScript bindings for the expanded `PlanOutput` surface; no extension feature changes.

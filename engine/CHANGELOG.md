@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.1] — 2026-04-24
+
+Patch release. `rocky lineage <model> --format dot` now actually emits DOT when the global `--output` is left at its `json` default (#260). Previously the CLI's `--output json` default took precedence over the lineage-local `--format dot`, so the flag was silently ignored and stdout was a JSON blob. `--format dot` now wins inside the lineage command; `rocky lineage foo` without `--format` is still JSON by default. The VS Code extension's "Show Lineage" webview was the primary casualty — it fed the JSON to viz.js and rendered as an error complaining about character `{`.
+
 ## [1.17.0] — 2026-04-24
 
 Governance waveplan polish wave. Five follow-ups on top of v1.16.0 plus one breaking data-integrity guardrail. Highlights: `rocky run --governance-override` now rejects `workspace_ids = []` without an explicit opt-in (breaking; set `allow_empty_workspace_ids: true` to keep the old "revoke everything" behaviour); `rocky run` + `rocky plan` accept `--env <name>` and plumb it into the masking resolver; `rocky plan` previews classification / mask / retention actions alongside SQL statements; `rocky compile` emits `W004` for classification tags that don't resolve to any masking strategy; Databricks role-graph reconciliation goes from log-only to real — SCIM group creation + per-catalog GRANT emission; `rocky retention-status --drift` now probes the warehouse (Databricks + Snowflake) instead of always returning `warehouse_days = null`.
