@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pluggable per-call kwarg resolvers on `RockyResource`** — three optional callable fields (`shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`) that fire per `run` / `run_streaming` / `run_pipes` invocation to inject kwargs derived from the Dagster run context. Motivated by deployments that need to compute `shadow_suffix` / `governance_override` / `idempotency_key` from the Dagster run context on every call and were previously forced to hand-roll a composition wrapper around the resource.
+
+  Design points (pinned by tests):
+  - **Caller-wins.** A resolver fires only when the kwarg is absent from the call; caller-supplied values always win.
+  - **`None` is a no-op.** Resolvers can return `None` to opt out conditionally (e.g. outside a branch deploy).
+  - **`ResolverContext` is frozen.** Each resolver receives a frozen Pydantic snapshot of the Dagster context, the `filter`, the invoking method, and the caller-supplied kwargs.
+  - **`run()` passes `context=None`** (it has no context parameter); `run_streaming()` and `run_pipes()` pass the positional Dagster context.
+  - **Resolver exceptions surface as `dg.Failure`** with the resolver's `__qualname__` in the description. A resolver that raises `dg.Failure` directly has its original description preserved.
+
+- **`shadow_suffix_resolver()` convenience factory** in `dagster_rocky.branch_deploy` — returns a `Resolver` closure that calls `branch_deploy_shadow_suffix()` ignoring its context. Wire it into `RockyResource(shadow_suffix_fn=shadow_suffix_resolver())` to auto-inject the branch-deploy suffix on every run method without conditional caller code.
+
+- **New top-level re-exports**: `ResolverContext`, `Resolver`, `shadow_suffix_resolver`.
+
 ## [1.12.0] — 2026-04-23
 
 Tracks engine 1.16.0 (governance waveplan). New `ComplianceOutput` + `RetentionStatusOutput` Pydantic models, extended `RockyOutput` union, regenerated bindings for classification / masking / role-graph / retention config surfaces.

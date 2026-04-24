@@ -7,6 +7,7 @@ from .branch_deploy import (
     branch_deploy_shadow_suffix,
     branch_deployment_info,
     is_branch_deployment,
+    shadow_suffix_resolver,
 )
 from .checks import (
     check_metadata,
@@ -57,7 +58,7 @@ from .partitions import (
     partitions_def_for_time_interval,
     rocky_to_dagster_partition_key,
 )
-from .resource import MIN_ROCKY_VERSION, RockyResource
+from .resource import MIN_ROCKY_VERSION, Resolver, ResolverContext, RockyResource
 from .scaffold import init_rocky_project
 from .schedules import build_rocky_schedule
 from .sensor import rocky_source_sensor
@@ -140,6 +141,8 @@ __all__ = [
     "RockyTableProps",
     "RockyResource",
     "MIN_ROCKY_VERSION",
+    "Resolver",
+    "ResolverContext",
     "RockyDagsterTranslator",
     "load_rocky_assets",
     "emit_check_results",
@@ -206,6 +209,7 @@ __all__ = [
     "is_branch_deployment",
     "branch_deployment_info",
     "branch_deploy_shadow_suffix",
+    "shadow_suffix_resolver",
     # Discover
     "SourceInfo",
     "TableInfo",
