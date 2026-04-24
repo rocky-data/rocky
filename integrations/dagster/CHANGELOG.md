@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+`RockyComponent` genericity wave — three behaviours that every adopter
+was reimplementing in a subclass move into the framework. All three
+default off so existing components see no change.
+
+### Added
+
+- **`RockyComponent.discover_on_missing_state: bool = False`** — when
+  on, `build_defs` runs `write_state_to_path()` synchronously if the
+  local state file is absent at code-server load. Skipped under
+  `using_dagster_dev()` (dev relies on the CLI workflow) and for
+  non-local-filesystem state management. Failures are logged and
+  swallowed so the code server still boots — the status quo for
+  missing state is "no Rocky assets" anyway, so the fallback is
+  strictly an improvement. Closes the cold-start window where a fresh
+  ephemeral pod with no pre-seeded state would yield an empty
+  `Definitions` until the next out-of-band sensor tick.
+
+- **`RockyComponent.post_state_write_hook: Callable[[Path], None] | None = None`**
+  — optional callback invoked with the state-file path immediately
+  after `write_state_to_path()` succeeds. Fires on every successful
+  write (cold-start fallback, `dg defs state refresh`, framework
+  state-refresh paths). Hook exceptions are logged and swallowed so
+  a failing side-effect (typically an S3 / Valkey push of the
+  freshly-written cache) cannot block code-server boot. Set
+  programmatically in a subclass; YAML resolution of arbitrary
+  callables is left to adopters.
+
+- **`RockyComponent.surface_column_lineage: bool = False`** — when on,
+  `build_defs` walks `models_dir/*.toml` (skipping `_*.toml` and
+  `*.contract.toml`), calls `rocky lineage` per model, and merges the
+  resulting `dagster.TableColumnLineage` into each matching
+  `AssetSpec`'s `metadata["dagster/column_lineage"]` slot. Match is by
+  leaf segment of the asset key — the stock translator and most
+  custom translators preserve the model name there. Per-model
+  failures (binary missing, lineage compile error, malformed SQL) log
+  and skip that entry; a missing `models_dir` is a no-op. Pairs with
+  the existing `build_column_lineage()` helper, which has been the
+  building block but had no automatic surfacing path.
+
+### Changed
+
+- **Per-slot exception scope in `write_state_to_path` widened from
+  `dg.Failure` to `Exception`.** `_compile_payload`, `_optimize_payload`,
+  `_dag_payload`, and the discover try/except now log via
+  `_log.warning(..., exc_info=True)` and omit the slot on any
+  exception. The narrower predicate let real production failures
+  (subprocess timeouts, `MemoryError` on large discover dumps,
+  transient state-store I/O errors, malformed JSON, future-engine
+  `pydantic.ValidationError`) abort the whole write *after* a
+  successful discover, throwing away usable state. Same slot-omit
+  semantics as before — just robust against the actual exception
+  surface.
+
+- **`write_state_to_path` materializes intermediate directories**
+  before writing. The framework's local-filesystem path
+  (`_store_local_filesystem_state`) `shutil.rmtree`s the state dir
+  before calling write, so a missing parent is the expected normal
+  case. Previously relied on the dir already existing.
+
 ## [1.13.0] — 2026-04-24
 
 Tracks engine 1.17.0 (governance-waveplan polish wave). Three new `RockyResource` / `RockyComponent` surfaces plus a breaking pre-flight validator on the `governance_override` payload:

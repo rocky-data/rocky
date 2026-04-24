@@ -23,22 +23,28 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import dagster as dg
 from dagster._core.definitions.metadata.metadata_set import NamespacedMetadataSet
+from dagster._utils.env import using_dagster_dev
 from dagster.components.component.state_backed_component import StateBackedComponent
 from dagster.components.utils.defs_state import (
     DefsStateConfig,
     DefsStateConfigArgs,
     ResolvedDefsStateConfig,
 )
+from dagster.components.utils.project_paths import get_local_state_path
 from dagster.components.utils.translation import TranslationFn, TranslationFnResolver
+from dagster_shared.serdes.objects.models.defs_state_info import DefsStateManagementType
 
 from .checks import check_metadata
+from .column_lineage import build_column_lineage
 from .contracts import (
     ContractRules,
     contract_check_results_from_diagnostics,
@@ -68,6 +74,7 @@ from .types import (
     DagResult,
     Diagnostic,
     DiscoverResult,
+    ModelLineageResult,
     OptimizeResult,
     RunResult,
     Severity,
@@ -75,8 +82,10 @@ from .types import (
     TableInfo,
 )
 
+_log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Iterator
 
 #: Built-in Rocky check names. Pre-declared as ``AssetCheckSpec`` so the
 #: Dagster UI knows about them before any execution happens. The
@@ -327,6 +336,41 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: a change to surface on the timeline rather than a pass/fail.
     #: Default ``False`` preserves zero behaviour change.
     surface_retention_status: bool = False
+    #: When ``True``, ``build_defs`` runs :meth:`write_state_to_path`
+    #: synchronously if the local state file is missing at code-server
+    #: load. Skipped under :func:`using_dagster_dev` because dev relies
+    #: on the local CLI workflow (``dg dev`` + sensor-driven refresh)
+    #: rather than cold-start behaviour. Only applies when state
+    #: management is local-filesystem (versioned / code-server modes
+    #: handle missing state through their own paths). Failures are
+    #: logged and swallowed so the code server still boots — the
+    #: status quo for missing state is "no Rocky assets" anyway, so
+    #: the fallback is strictly an improvement.
+    discover_on_missing_state: bool = False
+    #: Optional callable invoked with the state-file path immediately
+    #: after :meth:`write_state_to_path` succeeds (whether triggered
+    #: by the cold-start fallback, an explicit ``dg defs state refresh``,
+    #: or the framework's own state-refresh paths). Hook exceptions
+    #: are logged and swallowed — the hook must not block code-server
+    #: boot. Typical use: push the freshly-written state to a durable
+    #: store (S3, Valkey, etc.) so the next ephemeral pod boots with
+    #: the cache pre-warmed. Set programmatically in a subclass — YAML
+    #: resolution of arbitrary callables is left to adopters
+    #: (a Jinja ``{{ load_module_attr('pkg.mod:fn') }}`` template
+    #: works for components that ship one).
+    post_state_write_hook: Callable[[Path], None] | None = None
+    #: When ``True``, ``build_defs`` calls ``rocky lineage`` per derived
+    #: model at component-load time and merges the resulting
+    #: :class:`dagster.TableColumnLineage` into each matching
+    #: ``AssetSpec``'s ``metadata["dagster/column_lineage"]`` slot.
+    #: Per-model failures (binary missing, lineage compile error,
+    #: malformed SQL) are logged and the lineage entry is skipped —
+    #: never blocks the component load. Match is by leaf segment of
+    #: the asset key, so it works with the stock translator and any
+    #: translator that preserves the model name as the last key
+    #: segment. Default ``False`` because N derived models = N CLI
+    #: invocations on every code-server load.
+    surface_column_lineage: bool = False
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -375,16 +419,30 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         diagnostics as asset checks and merge optimize recommendations into
         ``AssetSpec.metadata``. Compile and optimize are best-effort: if either
         fails, discovery state is still written and the slot is left empty.
+
+        Per-slot exception handling catches :class:`Exception` (not just
+        :class:`dg.Failure`). The resource methods raise ``dg.Failure`` for
+        expected failures, but subprocess timeouts, ``MemoryError`` from
+        large discover dumps, transient state-store I/O errors, malformed
+        JSON, and Pydantic validation errors against future engine versions
+        all surface as non-``Failure`` exceptions. Without the broader
+        catch any of these would abort the write *after* a successful
+        discover, throwing away usable state.
         """
         rocky = self._get_rocky_resource()
 
         try:
             discover_payload = json.loads(rocky.discover().model_dump_json())
-        except dg.Failure:
+        except Exception:
             # Discover can fail on multi-pipeline configs without a pipeline
             # arg, or when no replication pipeline exists. In dag_mode the
             # DAG output is the primary data source, so an empty discover
-            # envelope is acceptable.
+            # envelope is acceptable. Log so operators can triage the
+            # underlying cause.
+            _log.warning(
+                "rocky discover failed during state write — writing empty discover envelope",
+                exc_info=True,
+            )
             discover_payload = {
                 "version": "0.0.0",
                 "command": "discover",
@@ -410,7 +468,20 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             if dag_payload is not None:
                 state["dag"] = dag_payload
 
+        state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+        if self.post_state_write_hook is not None:
+            try:
+                self.post_state_write_hook(state_path)
+            except Exception:
+                # Hook is a side-effect channel (typically pushing the
+                # written state to a durable store). A failing hook must
+                # not abort the write — the file is already on disk.
+                _log.warning(
+                    "post_state_write_hook failed — state on disk is intact",
+                    exc_info=True,
+                )
 
     def _compile_payload(self, rocky: RockyResource) -> dict | None:
         """Return compile JSON, or ``None`` if compile cannot/should not run."""
@@ -418,11 +489,16 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             return None
         try:
             return json.loads(rocky.compile().model_dump_json())
-        except dg.Failure:
-            # Compile is best-effort: missing binary, partial errors and
-            # config issues should not block discovery state from being
-            # written. The diagnostics surfaced through `rocky compile`
-            # already cover the user-facing errors when it does run.
+        except Exception:
+            # Compile is best-effort: missing binary, partial errors,
+            # subprocess timeouts, OOM during large dumps, and malformed
+            # JSON should not block discovery state from being written.
+            # The diagnostics surfaced through `rocky compile` already
+            # cover the user-facing errors when it does run.
+            _log.warning(
+                "rocky compile failed during state write — slot omitted",
+                exc_info=True,
+            )
             return None
 
     def _optimize_payload(self, rocky: RockyResource) -> dict | None:
@@ -434,7 +510,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         """
         try:
             return json.loads(rocky.optimize().model_dump_json())
-        except dg.Failure:
+        except Exception:
+            _log.warning(
+                "rocky optimize failed during state write — slot omitted",
+                exc_info=True,
+            )
             return None
 
     def _dag_payload(self, rocky: RockyResource) -> dict | None:
@@ -445,7 +525,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         """
         try:
             return json.loads(rocky.dag(column_lineage=True).model_dump_json(by_alias=True))
-        except dg.Failure:
+        except Exception:
+            _log.warning(
+                "rocky dag failed during state write — slot omitted",
+                exc_info=True,
+            )
             return None
 
     def _build_defs_from_dag(
@@ -488,6 +572,122 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     # ------------------------------------------------------------------ #
     # Definition building                                                #
     # ------------------------------------------------------------------ #
+
+    def build_defs(self, context: dg.ComponentLoadContext) -> dg.Definitions:
+        """Override to add cold-start fallback discover and column-lineage surfacing.
+
+        Both behaviours are opt-in (``discover_on_missing_state`` and
+        ``surface_column_lineage``) and default to off, so the fast path
+        is unchanged from :meth:`StateBackedComponent.build_defs`.
+        """
+        self._maybe_cold_start_discover(context)
+        defs = super().build_defs(context)
+        if self.surface_column_lineage:
+            defs = self._attach_column_lineage(defs)
+        return defs
+
+    def _maybe_cold_start_discover(self, context: dg.ComponentLoadContext) -> None:
+        """Run :meth:`write_state_to_path` synchronously when state is absent.
+
+        Skipped when ``discover_on_missing_state`` is off, under
+        :func:`using_dagster_dev` (dev relies on the CLI workflow), and
+        for non-local-filesystem state management (those modes own
+        missing-state recovery through their own paths). Failures are
+        logged and swallowed — the component falls through to its normal
+        empty-state behaviour, same as if the fallback had not been
+        configured.
+        """
+        if not self.discover_on_missing_state:
+            return
+        if using_dagster_dev():
+            return
+        if self.defs_state_config.management_type != DefsStateManagementType.LOCAL_FILESYSTEM:
+            return
+        state_path = get_local_state_path(self.defs_state_config.key, context.project_root)
+        if state_path.exists():
+            return
+        try:
+            self.write_state_to_path(state_path)
+        except Exception:
+            _log.warning(
+                "RockyComponent fallback discover failed — component will load with no assets",
+                exc_info=True,
+            )
+
+    def _attach_column_lineage(self, defs: dg.Definitions) -> dg.Definitions:
+        """Walk ``models_dir``, run ``rocky lineage`` per model, attach to specs.
+
+        Best-effort: a missing ``models_dir`` is a no-op, per-model
+        failures are logged and skipped, and an empty result returns
+        ``defs`` unchanged. Match is by leaf segment of the asset key,
+        which lines up with the stock translator's
+        ``[source_type, *components, table]`` shape.
+        """
+        models_dir = Path(self.models_dir)
+        if not models_dir.is_dir():
+            return defs
+
+        rocky = self._get_rocky_resource()
+        lineage_by_model = self._collect_lineage(rocky, models_dir)
+        if not lineage_by_model:
+            return defs
+
+        def _merge(spec: dg.AssetSpec) -> dg.AssetSpec:
+            leaf = spec.key.path[-1] if spec.key.path else ""
+            lineage = lineage_by_model.get(leaf)
+            if lineage is None:
+                return spec
+            merged = dict(spec.metadata or {})
+            merged["dagster/column_lineage"] = lineage
+            return spec.replace_attributes(metadata=merged)
+
+        return defs.map_asset_specs(func=_merge)
+
+    @staticmethod
+    def _collect_lineage(
+        rocky: RockyResource,
+        models_dir: Path,
+    ) -> dict[str, dg.TableColumnLineage]:
+        """Return ``{model_name: TableColumnLineage}`` for every model in ``models_dir``.
+
+        Walks ``models_dir/*.toml``, skipping ``_*.toml`` (directory-level
+        defaults) and ``*.contract.toml`` (contract files) — same predicate
+        the framework uses elsewhere to decide "what's a model." Calls
+        ``rocky lineage --target <model>`` once per model; failures (binary
+        missing, lineage compile error, malformed SQL) log and skip that
+        entry.
+        """
+        model_names = sorted(
+            p.stem
+            for p in models_dir.rglob("*.toml")
+            if not p.name.startswith("_") and not p.name.endswith(".contract.toml")
+        )
+
+        out: dict[str, dg.TableColumnLineage] = {}
+        for model_name in model_names:
+            try:
+                lineage = rocky.lineage(target=model_name)
+            except Exception:
+                _log.warning(
+                    "rocky lineage %s failed during column-lineage attach — skipping",
+                    model_name,
+                    exc_info=True,
+                )
+                continue
+            if not isinstance(lineage, ModelLineageResult):
+                # Defensive: ``lineage(target=...)`` without a column always
+                # returns ``ModelLineageResult``; the column-level shape
+                # would not fit ``TableColumnLineage`` anyway.
+                continue
+            try:
+                out[model_name] = build_column_lineage(lineage)
+            except Exception:
+                _log.warning(
+                    "build_column_lineage(%s) failed — skipping",
+                    model_name,
+                    exc_info=True,
+                )
+        return out
 
     def build_defs_from_state(
         self,
