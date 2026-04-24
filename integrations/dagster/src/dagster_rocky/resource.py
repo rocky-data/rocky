@@ -29,13 +29,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import IO, TYPE_CHECKING, TypeVar
+from collections.abc import Callable
+from typing import IO, TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 import dagster as dg
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
 from .types import (
     AiExplainResult,
@@ -390,6 +391,80 @@ def _kill_process_group(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def _collect_supplied_run_kwargs(
+    *,
+    filter: str,
+    shadow_suffix: str | None,
+    governance_override: dict | None,
+    idempotency_key: str | None,
+) -> dict[str, Any]:
+    """Build the ``kwargs`` dict handed to :meth:`RockyResource._apply_resolvers`.
+
+    The three resolver-eligible kwargs (``shadow_suffix``,
+    ``governance_override``, ``idempotency_key``) have typed signatures on
+    the public run methods, so at runtime we can't distinguish "caller
+    passed ``None``" from "caller didn't pass anything". We follow the
+    spec's caller-wins rule by treating **only non-``None`` values as
+    supplied** — explicit ``None`` and omission both let the resolver
+    fire. The tradeoff is documented on each public run method.
+
+    ``filter`` is always included because :class:`ResolverContext` exposes
+    it to resolvers for disambiguation (e.g. governance-override lookup
+    keyed on the filter value).
+    """
+    kwargs: dict[str, Any] = {"filter": filter}
+    if shadow_suffix is not None:
+        kwargs["shadow_suffix"] = shadow_suffix
+    if governance_override is not None:
+        kwargs["governance_override"] = governance_override
+    if idempotency_key is not None:
+        kwargs["idempotency_key"] = idempotency_key
+    return kwargs
+
+
+class ResolverContext(BaseModel):
+    """Read-only snapshot handed to each per-call kwarg resolver.
+
+    Resolvers are closures users register on :class:`RockyResource` to inject
+    kwargs derived from Dagster run context on every ``run`` / ``run_streaming``
+    / ``run_pipes`` call. The context is **frozen** — signature stability
+    matters because resolvers are user-authored closures imported across
+    module boundaries.
+
+    Attributes:
+        context: The Dagster execution context for the call. ``None`` when
+            the resolver fires from :meth:`RockyResource.run` (which doesn't
+            accept a context param). Resolvers that need a context must
+            handle ``None`` (typically by returning ``None`` to no-op).
+        filter: The positional ``filter`` kwarg passed to the run method.
+        method: Which run method triggered the resolver.
+        supplied_kwargs: Snapshot of the kwargs the caller explicitly
+            supplied. Lets resolvers bail early when the caller already set
+            a value (though ``_apply_resolvers`` already skips resolution
+            for present kwargs — this field is for resolvers that want to
+            branch on *other* caller-supplied kwargs).
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    # Typed as ``Any`` rather than ``AssetExecutionContext | OpExecutionContext``
+    # because Pydantic's is-instance validation would reject test doubles
+    # (MagicMock) — and because Dagster occasionally hands callers wrapper
+    # context objects that aren't instance-of the public classes. Resolvers
+    # should treat ``context`` as a duck-typed Dagster context and only reach
+    # for attributes the Dagster docs promise (run, tags, log, ...).
+    context: Any = None
+    filter: str | None = None
+    method: Literal["run", "run_streaming", "run_pipes"]
+    supplied_kwargs: dict[str, Any]
+
+
+#: Type alias for user-authored per-call kwarg resolvers. Each resolver is a
+#: callable taking a :class:`ResolverContext` and returning either a value
+#: for the target kwarg or ``None`` to leave it unset.
+Resolver = Callable[[ResolverContext], Any]
+
+
 class RockyResource(dg.ConfigurableResource):
     """Dagster resource that invokes the Rocky CLI binary.
 
@@ -404,6 +479,13 @@ class RockyResource(dg.ConfigurableResource):
             ``compile()``, ``lineage()`` and ``metrics()`` use the HTTP API instead
             of a subprocess.
         timeout_seconds: Subprocess timeout for any one CLI invocation.
+        shadow_suffix_fn: Optional resolver that produces ``shadow_suffix`` per
+            call when the caller doesn't supply one. See :class:`ResolverContext`
+            for the closure signature. Returning ``None`` is a no-op.
+        governance_override_fn: Optional resolver for ``governance_override``.
+            Same semantics as ``shadow_suffix_fn``.
+        idempotency_key_fn: Optional resolver for ``idempotency_key``.
+            Same semantics as ``shadow_suffix_fn``.
     """
 
     binary_path: str = "rocky"
@@ -435,8 +517,107 @@ class RockyResource(dg.ConfigurableResource):
     #: rather than producing a mid-run error.
     strict_doctor_checks: list[str] = []
 
+    #: Optional resolver that produces a ``shadow_suffix`` per ``run`` /
+    #: ``run_streaming`` / ``run_pipes`` call. Fires only when the caller
+    #: didn't supply ``shadow_suffix`` (or supplied ``None``). See
+    #: :class:`ResolverContext` for the closure signature. Returning ``None``
+    #: leaves the kwarg unset. Pair with
+    #: :func:`.branch_deploy.shadow_suffix_resolver` for the common branch-
+    #: deploy case.
+    # Callable fields aren't valid Dagster config schema entries, so we
+    # mark them as ``resource_dependency`` via ``typing.Annotated`` —
+    # Dagster's canonical escape hatch for non-config resource attrs
+    # (see ``_is_annotated_as_resource_type`` in
+    # ``dagster/_config/pythonic_config/resource.py``). Using the
+    # literal string marker instead of ``dg.ResourceDependency[...]``
+    # keeps the annotation robust under ``from __future__ import annotations``,
+    # where the generic-alias form fails Pydantic validation because
+    # the string annotation isn't resolved back to the marker type.
+    #
+    # This also ensures the resolver closures survive Dagster's resource
+    # lifecycle: at execution time Dagster rebuilds the resource via
+    # ``self.__class__(**public_field_values)`` (see
+    # ``ConfigurableResourceFactory._with_updated_values``). ``Annotated``
+    # resource-dependency fields participate in that rebuild as public
+    # fields, so the registered resolvers carry through to the per-asset
+    # call. ``PrivateAttr``-backed fields did *not* survive that rebuild
+    # and would silently drop resolvers mid-materialize — the end-to-end
+    # test ``test_resolvers_survive_dagster_materialize_lifecycle`` pins
+    # this regression.
+    shadow_suffix_fn: Annotated[Resolver | None, "resource_dependency"] = None
+    governance_override_fn: Annotated[Resolver | None, "resource_dependency"] = None
+    idempotency_key_fn: Annotated[Resolver | None, "resource_dependency"] = None
+
     # Instance-level cache for the version check (not a Dagster config field).
     _version_checked: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Per-call kwarg resolvers                                           #
+    # ------------------------------------------------------------------ #
+
+    def _apply_resolvers(
+        self,
+        context: dg.AssetExecutionContext | dg.OpExecutionContext | None,
+        method: Literal["run", "run_streaming", "run_pipes"],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Inject resolver-produced values into ``kwargs`` in place.
+
+        For each ``(kwarg_name, resolver_fn)`` pair, fire the resolver only
+        when the caller didn't supply the kwarg (i.e. it's absent from
+        ``kwargs``). Caller-supplied values always win. Resolvers that
+        return ``None`` are treated as a no-op so they can conditionally
+        opt in (e.g. :func:`branch_deploy_shadow_suffix` returns ``None``
+        outside a branch deploy).
+
+        Exceptions raised by a resolver propagate as :class:`dg.Failure`
+        with the resolver's ``__qualname__`` in the description. A
+        ``dg.Failure`` raised directly by a resolver is preserved so the
+        resolver can surface its own operator-friendly error.
+
+        Args:
+            context: Dagster execution context for the call, or ``None``
+                for :meth:`run` (which has no context param).
+            method: Which run method triggered this resolver invocation.
+                Passed into the :class:`ResolverContext` so resolvers can
+                specialize behaviour per method.
+            kwargs: The mutable kwargs dict being assembled for
+                :meth:`_build_run_args`. This function mutates the dict
+                in place and also returns it for convenience.
+
+        Returns:
+            The same ``kwargs`` dict, with resolver-produced values added
+            for any absent keys whose resolver returned a non-``None``
+            value.
+        """
+        rc = ResolverContext(
+            context=context,
+            filter=kwargs.get("filter"),
+            method=method,
+            supplied_kwargs=dict(kwargs),
+        )
+        for kw, fn in (
+            ("shadow_suffix", self.shadow_suffix_fn),
+            ("governance_override", self.governance_override_fn),
+            ("idempotency_key", self.idempotency_key_fn),
+        ):
+            if fn is None or kw in kwargs:
+                continue
+            try:
+                value = fn(rc)
+            except dg.Failure:
+                # Preserve resolver-raised dg.Failure so the resolver can
+                # surface its own operator-friendly message (e.g.
+                # "Could not determine target client ...").
+                raise
+            except Exception as exc:
+                qualname = getattr(fn, "__qualname__", repr(fn))
+                raise dg.Failure(
+                    description=(f"resolver {qualname!r} for {kw!r} raised: {exc}"),
+                ) from exc
+            if value is not None:
+                kwargs[kw] = value
+        return kwargs
 
     # ------------------------------------------------------------------ #
     # Startup hook — opt-in strict rocky doctor gate                     #
@@ -989,10 +1170,29 @@ class RockyResource(dg.ConfigurableResource):
 
                 ⚠️ Keys are stored verbatim in the state store; do NOT put
                 secrets in idempotency keys.
+
+        Note on resolver interaction:
+            Per-call resolvers registered on the resource (``shadow_suffix_fn``,
+            ``governance_override_fn``, ``idempotency_key_fn``) fire for the
+            matching kwarg only when that kwarg is **absent** from the call.
+            Because Python can't distinguish "caller explicitly passed
+            ``None``" from "caller didn't pass anything", an explicit
+            ``None`` is treated as absent and resolvers fire. Pass the
+            non-``None`` value you want to win against the resolver.
         """
+        resolved = self._apply_resolvers(
+            context=None,
+            method="run",
+            kwargs=_collect_supplied_run_kwargs(
+                filter=filter,
+                shadow_suffix=shadow_suffix,
+                governance_override=governance_override,
+                idempotency_key=idempotency_key,
+            ),
+        )
         args = self._build_run_args(
             filter,
-            governance_override=governance_override,
+            governance_override=resolved.get("governance_override"),
             pipeline=pipeline,
             run_models=run_models,
             partition=partition,
@@ -1002,8 +1202,8 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
-            shadow_suffix=shadow_suffix,
-            idempotency_key=idempotency_key,
+            shadow_suffix=resolved.get("shadow_suffix"),
+            idempotency_key=resolved.get("idempotency_key"),
         )
         return _parse_rocky_json(
             self._run_rocky(args, allow_partial=True), RunResult, command="run"
@@ -1068,9 +1268,19 @@ class RockyResource(dg.ConfigurableResource):
             The parsed :class:`RunResult` from stdout after the
             subprocess exits.
         """
+        resolved = self._apply_resolvers(
+            context=context,
+            method="run_streaming",
+            kwargs=_collect_supplied_run_kwargs(
+                filter=filter,
+                shadow_suffix=shadow_suffix,
+                governance_override=governance_override,
+                idempotency_key=idempotency_key,
+            ),
+        )
         args = self._build_run_args(
             filter,
-            governance_override=governance_override,
+            governance_override=resolved.get("governance_override"),
             run_models=run_models,
             partition=partition,
             partition_from=partition_from,
@@ -1079,8 +1289,8 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
-            shadow_suffix=shadow_suffix,
-            idempotency_key=idempotency_key,
+            shadow_suffix=resolved.get("shadow_suffix"),
+            idempotency_key=resolved.get("idempotency_key"),
         )
         return _parse_rocky_json(
             self._run_rocky_streaming(args, context, allow_partial=True),
@@ -1235,9 +1445,19 @@ class RockyResource(dg.ConfigurableResource):
                 propagates a Failure when the subprocess crashes
                 without sending a Pipes ``closed`` message.
         """
+        resolved = self._apply_resolvers(
+            context=context,
+            method="run_pipes",
+            kwargs=_collect_supplied_run_kwargs(
+                filter=filter,
+                shadow_suffix=shadow_suffix,
+                governance_override=governance_override,
+                idempotency_key=idempotency_key,
+            ),
+        )
         args = self._build_run_args(
             filter,
-            governance_override=governance_override,
+            governance_override=resolved.get("governance_override"),
             run_models=run_models,
             partition=partition,
             partition_from=partition_from,
@@ -1246,8 +1466,8 @@ class RockyResource(dg.ConfigurableResource):
             missing=missing,
             lookback=lookback,
             parallel=parallel,
-            shadow_suffix=shadow_suffix,
-            idempotency_key=idempotency_key,
+            shadow_suffix=resolved.get("shadow_suffix"),
+            idempotency_key=resolved.get("idempotency_key"),
         )
         if pipes_client is not None:
             client = pipes_client

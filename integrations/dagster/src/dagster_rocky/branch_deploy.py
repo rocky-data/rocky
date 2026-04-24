@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .resource import Resolver, ResolverContext  # noqa: F401 — used in annotations
 
 #: Standard Dagster+ env var that's ``"true"`` (string) inside a branch
 #: deployment, unset elsewhere.
@@ -146,3 +150,33 @@ def branch_deploy_shadow_suffix(
         safe = "".join(c if c.isalnum() else "_" for c in info.deployment_name)
         return f"_dagster_{safe}"
     return "_dagster_branch"
+
+
+def shadow_suffix_resolver() -> Resolver:
+    """Return a :class:`~.resource.Resolver` that injects the branch-deploy shadow suffix.
+
+    The returned closure calls :func:`branch_deploy_shadow_suffix` and
+    ignores its :class:`~.resource.ResolverContext` argument — the
+    suffix is derived purely from Dagster+ env vars, not from the
+    Dagster run context.
+
+    Wire it into :class:`~.resource.RockyResource` to make every run
+    method auto-inject the branch-deploy shadow suffix::
+
+        from dagster_rocky import RockyResource, shadow_suffix_resolver
+
+        resource = RockyResource(
+            binary_path="rocky",
+            config_path="rocky.toml",
+            shadow_suffix_fn=shadow_suffix_resolver(),
+        )
+
+    Outside a branch deployment the suffix resolves to ``None``, which
+    the resolver machinery treats as a no-op — so production runs are
+    unaffected.
+    """
+
+    def _resolve(_rc: ResolverContext) -> str | None:
+        return branch_deploy_shadow_suffix()
+
+    return _resolve
