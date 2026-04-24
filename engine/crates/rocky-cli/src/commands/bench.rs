@@ -267,6 +267,7 @@ fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let times = measure(iterations, || {

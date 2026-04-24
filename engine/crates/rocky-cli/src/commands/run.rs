@@ -2805,6 +2805,12 @@ pub async fn run(
                     contracts_dir: None,
                     source_schemas: std::collections::HashMap::new(),
                     source_column_info: std::collections::HashMap::new(),
+                    // W004 completeness check: surface classification tags
+                    // that aren't mapped to a masking strategy as warnings
+                    // on the governance compile path too — cheap, and
+                    // keeps parity with `rocky compile`'s diagnostic set.
+                    mask: rocky_cfg.mask.clone(),
+                    allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
                 },
             );
             if let Ok(gov_compile) = governance_compile {
@@ -3265,6 +3271,11 @@ pub(crate) async fn execute_models(
         contracts_dir: None,
         source_schemas,
         source_column_info: std::collections::HashMap::new(),
+        // W004 wiring happens on the governance compile path later in
+        // this function (it already holds the loaded `RockyConfig`).
+        // This pre-execution compile stays scoped to typecheck +
+        // contract diagnostics to avoid broadening its signature.
+        ..Default::default()
     };
 
     let compile_result = match rocky_compiler::compile::compile(&compile_config) {

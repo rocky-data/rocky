@@ -179,6 +179,7 @@ fn bench_cold_compile(c: &mut Criterion) {
             contracts_dir: None,
             source_schemas: HashMap::new(),
             source_column_info: HashMap::new(),
+            ..Default::default()
         };
 
         group.bench_with_input(BenchmarkId::new("models", size), &config, |b, config| {
@@ -461,6 +462,7 @@ fn bench_sub_second_compile(c: &mut Criterion) {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     group.bench_function("500_models_4_layers", |b| {
@@ -513,6 +515,7 @@ fn bench_single_file_change(c: &mut Criterion) {
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     // Seed the incremental cache with a full cold compile.

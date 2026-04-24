@@ -58,6 +58,7 @@ pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult>
         contracts_dir: None,
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        ..Default::default()
     };
 
     let compile_result = rocky_compiler::compile::compile(&config)?;

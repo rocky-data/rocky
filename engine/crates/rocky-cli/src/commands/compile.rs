@@ -63,11 +63,25 @@ pub fn run_compile(
         HashMap::new()
     };
 
+    // Load `[mask]` + `[classifications.allow_unmasked]` for the W004
+    // classification-tag completeness check. No rocky.toml (standalone
+    // `rocky compile --models models/`) means both come through empty —
+    // W004 never fires, matching the pre-check behaviour.
+    let (mask, allow_unmasked) = match config_path {
+        Some(path) => match rocky_config::load_rocky_config(path) {
+            Ok(cfg) => (cfg.mask.clone(), cfg.classifications.allow_unmasked.clone()),
+            Err(_) => (std::collections::BTreeMap::new(), Vec::new()),
+        },
+        None => (std::collections::BTreeMap::new(), Vec::new()),
+    };
+
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
         source_schemas,
         source_column_info: HashMap::new(),
+        mask,
+        allow_unmasked,
     };
 
     let mut result = compile::compile(&config)?;
