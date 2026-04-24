@@ -5,9 +5,9 @@
     {
       "model_name": "orders",
       "current_strategy": "table",
-      "recommended_strategy": "ephemeral",
+      "recommended_strategy": "table",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "fast execution (0.0s) with 0 downstream consumer(s); inline into consumer query to eliminate materialization overhead",
+      "reasoning": "insufficient history: 2 runs (need 5)",
       "compute_cost_per_run": 0.0,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 0
