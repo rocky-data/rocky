@@ -7,6 +7,7 @@ pub mod dialect;
 pub mod governance;
 pub mod loader;
 pub mod permissions;
+pub mod scim;
 pub mod throttle;
 pub mod types;
 pub mod workspace;
