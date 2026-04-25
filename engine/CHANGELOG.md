@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.3] — 2026-04-25
+
+Patch release. Fixes the `redis::Client::open("rediss://...")` → `valkey error: can't connect with TLS, the feature is not enabled - InvalidClientConfig` failure that hit any deployment pointing Rocky's Valkey/Redis state-sync or cache at a TLS-required endpoint (e.g. AWS ElastiCache with in-transit encryption). The prebuilt 1.17.2 binary's `redis` crate was compiled without any TLS feature — `rocky-core`'s sync state/idempotency client and `rocky-cache`'s async `ConnectionManager` both rejected the `rediss://` scheme at parse time.
+
+### Fixed
+
+- **TLS support enabled in the bundled `redis` crate.** `rocky-core` now pulls `redis` with `tls-rustls` + `tls-rustls-webpki-roots`, and `rocky-cache` adds `tokio-rustls-comp` + `tls-rustls-webpki-roots` on top of the existing `tokio-comp` + `connection-manager` features. Matches the workspace's existing rustls-only stance (`reqwest` already uses `rustls-tls`); no OpenSSL or system-cert dependency is introduced. `webpki-roots` bundles Mozilla's CA set so the static Linux binary works inside minimal containers without a populated `/etc/ssl/certs`. `redis://` URLs are unchanged. Both sync paths (`StateSync::Valkey` in `rocky-core/src/state_sync.rs`, idempotency keys in `rocky-core/src/idempotency.rs`) and the async `ValkeyCache::connect` in `rocky-cache/src/valkey.rs` now accept `rediss://`.
+
 ## [1.17.2] — 2026-04-25
 
 Patch release. Two LSP-vs-CLI concurrency fixes that surface as a better VS Code extension experience: the extension's commands no longer randomly fail with a raw `Database already open. Cannot acquire lock.` error from redb, and the LSP no longer briefly stalls on every keystroke when a CLI process is running against the same state file.
