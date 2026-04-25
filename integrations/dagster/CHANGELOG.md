@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`RockyComponent` YAML schema derivation regression (FR-013).** The
+  `post_state_write_hook` field added in 1.14.0 had a bare
+  `Callable[[Path], None] | None` annotation, which made
+  `derive_model_type(RockyComponent)` raise `ResolutionException`
+  with no resolver registered. Any YAML-driven load
+  (`load_from_defs_folder`, `dg dev`, anything that resolves a
+  `defs.yaml` whose `type:` points at `RockyComponent` or a subclass)
+  crashed during model derivation regardless of whether the project
+  set the hook field. The field now carries a `dg.Resolver` with
+  `model_field_type=type(None)`: callables remain settable from
+  Python kwargs, but YAML cannot configure the hook (attempting to do
+  so raises `ResolutionException` instead of silently dropping the
+  value). Pre-existing dagster-rocky tests instantiated the component
+  programmatically and bypassed the schema resolver, so the regression
+  slipped through 1.14.0 — `tests/test_component.py` now pins
+  `derive_model_type` directly and parametrizes over the bool toggles
+  released in the same wave.
+
 ## [1.14.0] — 2026-04-25
 
 `RockyComponent` genericity wave ([#264](https://github.com/rocky-data/rocky/pull/264)) — three behaviours that every adopter was reimplementing in a subclass move into the framework. All three default off so existing components see no change.

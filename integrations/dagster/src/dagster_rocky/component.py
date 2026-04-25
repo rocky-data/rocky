@@ -199,6 +199,17 @@ class _CompileState:
 # ---------------------------------------------------------------------------
 
 
+def _reject_post_state_write_hook_in_yaml(value: object) -> None:
+    if value is not None:
+        raise dg.DagsterInvalidConfigError(
+            "post_state_write_hook cannot be set from YAML — set it programmatically "
+            "on a RockyComponent subclass instead.",
+            errors=[],
+            config_value=value,
+        )
+    return None
+
+
 class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     """Loads Rocky-managed tables as materializable Dagster assets.
 
@@ -354,11 +365,22 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: are logged and swallowed — the hook must not block code-server
     #: boot. Typical use: push the freshly-written state to a durable
     #: store (S3, Valkey, etc.) so the next ephemeral pod boots with
-    #: the cache pre-warmed. Set programmatically in a subclass — YAML
-    #: resolution of arbitrary callables is left to adopters
-    #: (a Jinja ``{{ load_module_attr('pkg.mod:fn') }}`` template
-    #: works for components that ship one).
-    post_state_write_hook: Callable[[Path], None] | None = None
+    #: the cache pre-warmed. Set programmatically in a subclass —
+    #: callables are not YAML-resolvable, so the YAML schema for this
+    #: field accepts only ``null`` and any non-null YAML value raises
+    #: ``ResolutionException`` (see ``_reject_post_state_write_hook_in_yaml``).
+    post_state_write_hook: Annotated[
+        Callable[[Path], None] | None,
+        dg.Resolver(
+            lambda _ctx, _val: _reject_post_state_write_hook_in_yaml(_val),
+            model_field_type=type(None),
+            description=(
+                "Reserved — set programmatically in a subclass. Cannot be "
+                "configured from YAML; arbitrary callables are not "
+                "YAML-resolvable."
+            ),
+        ),
+    ] = None
     #: When ``True``, ``build_defs`` calls ``rocky lineage`` per derived
     #: model at component-load time and merges the resulting
     #: :class:`dagster.TableColumnLineage` into each matching
