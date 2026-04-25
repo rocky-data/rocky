@@ -1,6 +1,6 @@
 [package]
 name = "rocky-compiler"
-version = "1.17.2"
+version = "1.17.3"
 description = "Rocky SQL compiler: dependency resolution, semantic analysis, type checking, contracts"
 edition.workspace = true
 license.workspace = true
