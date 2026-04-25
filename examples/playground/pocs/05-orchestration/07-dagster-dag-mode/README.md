@@ -3,7 +3,7 @@
 > **Category:** 05-orchestration
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s
-> **Rocky features:** rocky dag, dag_mode, dagster-rocky, lineage
+> **Rocky features:** rocky dag, dag_mode, dagster-rocky, lineage, surface_column_lineage
 
 ## What it shows
 
@@ -55,7 +55,8 @@ uv sync && uv run dg dev
 Open http://localhost:3000 and verify:
 1. Asset graph shows `source:ingest` → `load:ingest` → `stg_orders` → `fct_customer_revenue`
 2. Click any node to see upstream/downstream dependencies
-3. "Materialize all" executes the full pipeline
+3. Open `fct_customer_revenue` → the **Column lineage** tab shows per-column upstream edges back to `stg_orders` (surfaced via `surface_column_lineage: true` in `defs.yaml`)
+4. "Materialize all" executes the full pipeline
 
 ## Expected output
 
@@ -91,7 +92,7 @@ Open http://localhost:3000 and verify:
 2. `rocky run` replicates the source table via the `ingest` pipeline
 3. `rocky dag` produces the full unified DAG: 4 nodes, 3 edges, 4 execution layers
 4. `rocky compile` verifies model dependencies (`fct_customer_revenue` depends on `stg_orders`)
-5. `definitions.py` uses `RockyComponent(dag_mode=True)` — Dagster reads the cached DAG and builds a connected asset graph automatically
+5. `definitions.py` uses `RockyComponent(dag_mode=True, surface_column_lineage=True)` — Dagster reads the cached DAG and builds a connected asset graph automatically; at component-load time it also calls `rocky lineage` per derived model and merges `TableColumnLineage` into each `AssetSpec`'s `metadata["dagster/column_lineage"]` slot, so the Dagster UI's Column lineage tab renders without any hand-written wiring
 
 ## Related
 

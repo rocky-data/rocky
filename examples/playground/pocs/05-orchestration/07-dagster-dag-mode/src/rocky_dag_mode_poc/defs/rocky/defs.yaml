@@ -4,5 +4,11 @@ attributes:
   config_path: rocky.toml
   models_dir: models
   dag_mode: true
+  # surface_column_lineage (dagster-rocky 1.14.0+) walks models/*.toml, calls
+  # `rocky lineage` per model, and merges TableColumnLineage into each
+  # AssetSpec's metadata["dagster/column_lineage"] slot. With two models
+  # in this POC (stg_orders, fct_customer_revenue) the Dagster asset graph
+  # surfaces per-column upstream/downstream edges, not just table-level ones.
+  surface_column_lineage: true
   defs_state:
     management_type: LOCAL_FILESYSTEM
