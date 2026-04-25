@@ -855,3 +855,94 @@ def test_post_state_write_hook_default_none_is_noop(
     state_path = tmp_path / "state"
     component.write_state_to_path(state_path)
     assert state_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# YAML schema derivation regression (FR-013)
+# ---------------------------------------------------------------------------
+#
+# `post_state_write_hook: Callable[[Path], None] | None` was added in 1.14.0
+# without a Resolver, which made `derive_model_type(RockyComponent)` crash with
+# `ResolutionException` on `_get_resolver`. Any YAML-driven load
+# (`load_from_defs_folder`, `dg dev`, …) walks every component's MRO through
+# `derive_model_type`, so the parent class crashing took down every subclass too
+# — even subclasses that only set the hook in `__init__`.
+#
+# These tests pin the schema-derivation path directly so the regression can't
+# recur, parametrized over the bool toggles released in the same PR (#264) to
+# also catch any future Callable-typed field that lands without a Resolver.
+
+
+@pytest.mark.parametrize("surface_column_lineage", [False, True])
+@pytest.mark.parametrize("discover_on_missing_state", [False, True])
+def test_rocky_component_yaml_schema_derives_without_callable_field_crash(
+    surface_column_lineage: bool,
+    discover_on_missing_state: bool,
+):
+    """Regression: derive_model_type must not crash on the Callable hook field.
+
+    Reproduces the 1.14.0 crash filed in FR-013. Toggles do not change the
+    schema-derivation path but are parametrized to retroactively cover any new
+    Callable-typed field added without a Resolver.
+    """
+    from dagster.components.resolved.base import derive_model_type
+
+    model = derive_model_type(RockyComponent)
+    # The hook field exists on the derived model but with a YAML-safe field
+    # type (None | str after dagster's str-injection wrapping); the actual
+    # callable annotation is hidden from the YAML schema.
+    assert "post_state_write_hook" in model.model_fields
+
+    # Subclasses must derive too — the original crash fired on the *parent*
+    # schema even when subclasses overrode behavior in `__init__`.
+    class _Sub(RockyComponent):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs.setdefault("surface_column_lineage", surface_column_lineage)
+            kwargs.setdefault("discover_on_missing_state", discover_on_missing_state)
+            super().__init__(**kwargs)
+
+    derive_model_type(_Sub)
+
+
+def test_rocky_component_yaml_resolves_without_post_state_write_hook(tmp_path: Path):
+    """YAML payloads that omit `post_state_write_hook` resolve cleanly to None.
+
+    This is the path `load_from_defs_folder` exercises when a `defs.yaml`
+    points at `RockyComponent`. The pre-fix crash was upstream of YAML parsing
+    (in `derive_model_type`), so this confirms the post-fix YAML round trip.
+    """
+    yaml_payload = "config_path: rocky.toml\nbinary_path: rocky\n"
+    component = RockyComponent.resolve_from_yaml(yaml_payload)
+    assert component.post_state_write_hook is None
+    assert component.config_path == "rocky.toml"
+
+
+def test_rocky_component_yaml_rejects_post_state_write_hook_value():
+    """Setting `post_state_write_hook` from YAML is rejected, not silently dropped.
+
+    The Resolver's `model_field_type=type(None)` plus dagster's str-injection
+    wrapping means YAML technically accepts a string here, but the resolver
+    raises so misuse surfaces loudly instead of silently leaving the hook unset.
+    """
+    from dagster.components.resolved.errors import ResolutionException
+
+    with pytest.raises(ResolutionException):
+        RockyComponent.resolve_from_yaml(
+            "config_path: rocky.toml\npost_state_write_hook: some_value\n"
+        )
+
+
+def test_rocky_component_python_kwarg_post_state_write_hook_preserved(tmp_path: Path):
+    """The Python kwarg API still accepts a callable — only the YAML path is gated."""
+    calls: list[Path] = []
+
+    def hook(p: Path) -> None:
+        calls.append(p)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        post_state_write_hook=hook,
+    )
+    assert callable(component.post_state_write_hook)
+    component.post_state_write_hook(tmp_path)
+    assert calls == [tmp_path]
