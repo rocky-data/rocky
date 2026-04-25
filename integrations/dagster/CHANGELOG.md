@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.1] — 2026-04-25
+
 ### Fixed
 
 - **`RockyComponent` YAML schema derivation regression (FR-013).** The
