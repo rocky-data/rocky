@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-`RockyComponent` genericity wave — three behaviours that every adopter
-was reimplementing in a subclass move into the framework. All three
-default off so existing components see no change.
+## [1.14.0] — 2026-04-25
+
+`RockyComponent` genericity wave ([#264](https://github.com/rocky-data/rocky/pull/264)) — three behaviours that every adopter was reimplementing in a subclass move into the framework. All three default off so existing components see no change.
 
 ### Added
 
