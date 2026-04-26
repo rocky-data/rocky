@@ -29,8 +29,8 @@ pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use manifest::{AdapterCapabilities, AdapterManifest};
 pub use traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, ColumnInfo, ColumnSelection,
-    DiscoveredConnector, DiscoveredTable, DiscoveryAdapter, FileFormat, FreshnessResult,
-    GovernanceAdapter, Grant, GrantTarget, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
-    MetadataColumn, Permission, QueryResult, RowCountResult, SqlDialect, TableRef, TagTarget,
-    TypeMapper, WarehouseAdapter, is_cloud_uri,
+    DiscoveredConnector, DiscoveredTable, DiscoveryAdapter, DiscoveryResult, FailedSource,
+    FailedSourceErrorClass, FileFormat, FreshnessResult, GovernanceAdapter, Grant, GrantTarget,
+    LoadOptions, LoadResult, LoadSource, LoaderAdapter, MetadataColumn, Permission, QueryResult,
+    RowCountResult, SqlDialect, TableRef, TagTarget, TypeMapper, WarehouseAdapter, is_cloud_uri,
 };

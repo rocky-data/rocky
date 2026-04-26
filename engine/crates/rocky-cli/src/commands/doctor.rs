@@ -512,8 +512,7 @@ mod tests {
         async fn discover(
             &self,
             _schema_prefix: &str,
-        ) -> rocky_core::traits::AdapterResult<Vec<rocky_core::source::DiscoveredConnector>>
-        {
+        ) -> rocky_core::traits::AdapterResult<rocky_core::source::DiscoveryResult> {
             Err(rocky_core::traits::AdapterError::msg("unauthorized"))
         }
     }

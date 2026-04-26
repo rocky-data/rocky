@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, conint
+from pydantic import AwareDatetime, BaseModel, Field, conint
 
 
 class ExcludedTableOutput(BaseModel):
@@ -28,6 +28,35 @@ class ExcludedTableOutput(BaseModel):
     table_name: str
     """
     Bare table name as reported by the discovery adapter.
+    """
+
+
+class FailedSourceOutput(BaseModel):
+    """
+    A source the discovery adapter attempted to fetch metadata for and failed.
+
+    Surfaced on `DiscoverOutput.failed_sources` so downstream consumers can distinguish a transient fetch failure from a deletion when diffing successive discover snapshots (FR-014).
+    """
+
+    error_class: str
+    """
+    Coarse error class so consumers can branch without parsing the `message`. One of `"transient"` / `"timeout"` / `"rate_limit"` / `"auth"` / `"unknown"`.
+    """
+    id: str
+    """
+    Adapter-side identifier for the source (e.g. Fivetran connector_id).
+    """
+    message: str
+    """
+    Human-readable error from the adapter — for logs / debugging only. Don't pattern-match on this; use `error_class` for branching.
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    Source schema name the adapter would have written into.
+    """
+    source_type: str
+    """
+    Adapter type (`"fivetran"`, `"airbyte"`, `"iceberg"`, ...).
     """
 
 
@@ -92,6 +121,10 @@ class DiscoverOutput(BaseModel):
     excluded_tables: list[ExcludedTableOutput]
     """
     Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.
+    """
+    failed_sources: list[FailedSourceOutput] | None = None
+    """
+    Sources the discovery adapter attempted to fetch metadata for and failed (transient HTTP error, timeout, rate-limit budget exhausted, auth blip). Their absence from `sources` does NOT mean they were removed upstream — consumers diffing against a prior run must treat failed sources as "unknown state, do not delete." Empty when discovery completed cleanly. See FR-014.
     """
     schemas_cached: conint(ge=0) | None = None
     """

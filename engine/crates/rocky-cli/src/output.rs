@@ -86,6 +86,14 @@ pub struct DiscoverOutput {
     /// parser. Empty when nothing was filtered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_tables: Vec<ExcludedTableOutput>,
+    /// Sources the discovery adapter attempted to fetch metadata for and
+    /// failed (transient HTTP error, timeout, rate-limit budget exhausted,
+    /// auth blip). Their absence from `sources` does NOT mean they were
+    /// removed upstream — consumers diffing against a prior run must treat
+    /// failed sources as "unknown state, do not delete." Empty when
+    /// discovery completed cleanly. See FR-014.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_sources: Vec<FailedSourceOutput>,
     /// Number of schema-cache entries written by this invocation.
     ///
     /// Populated by `rocky discover --with-schemas` — the explicit
@@ -353,6 +361,41 @@ pub struct ExcludedTableOutput {
     /// causes (disabled, sync_paused, ...) can be added without a
     /// schema break.
     pub reason: String,
+}
+
+/// A source the discovery adapter attempted to fetch metadata for and failed.
+///
+/// Surfaced on `DiscoverOutput.failed_sources` so downstream consumers can
+/// distinguish a transient fetch failure from a deletion when diffing
+/// successive discover snapshots (FR-014).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FailedSourceOutput {
+    /// Adapter-side identifier for the source (e.g. Fivetran connector_id).
+    pub id: String,
+    /// Source schema name the adapter would have written into.
+    pub schema: String,
+    /// Adapter type (`"fivetran"`, `"airbyte"`, `"iceberg"`, ...).
+    pub source_type: String,
+    /// Coarse error class so consumers can branch without parsing the
+    /// `message`. One of `"transient"` / `"timeout"` / `"rate_limit"` /
+    /// `"auth"` / `"unknown"`.
+    pub error_class: String,
+    /// Human-readable error from the adapter — for logs / debugging only.
+    /// Don't pattern-match on this; use `error_class` for branching.
+    pub message: String,
+}
+
+impl FailedSourceOutput {
+    /// Project a `rocky_core` `FailedSource` into the wire shape.
+    pub fn from_engine(failed: rocky_core::source::FailedSource) -> Self {
+        Self {
+            id: failed.id,
+            schema: failed.schema,
+            source_type: failed.source_type,
+            error_class: failed.error_class.to_string(),
+            message: failed.message,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1984,6 +2027,7 @@ impl DiscoverOutput {
             sources,
             checks: None,
             excluded_tables: vec![],
+            failed_sources: vec![],
             schemas_cached: 0,
         }
     }
@@ -1999,6 +2043,13 @@ impl DiscoverOutput {
     #[must_use]
     pub fn with_excluded_tables(mut self, excluded: Vec<ExcludedTableOutput>) -> Self {
         self.excluded_tables = excluded;
+        self
+    }
+
+    /// Attach the list of sources whose discovery fetch failed and return self.
+    #[must_use]
+    pub fn with_failed_sources(mut self, failed: Vec<FailedSourceOutput>) -> Self {
+        self.failed_sources = failed;
         self
     }
 

@@ -141,6 +141,57 @@ pub struct DiscoveredTable {
     pub row_count: Option<u64>,
 }
 
+/// A source the discovery adapter attempted to fetch metadata for and failed.
+///
+/// Distinct from "removed upstream" — distinguishing the two is the contract
+/// that lets downstream consumers safely diff one discover result against
+/// the next without misinterpreting a transient fetch failure as a deletion
+/// (FR-014).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedSource {
+    pub id: String,
+    pub schema: String,
+    pub source_type: String,
+    pub error_class: FailedSourceErrorClass,
+    pub message: String,
+}
+
+/// Coarse classification of why a discovery fetch failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedSourceErrorClass {
+    Transient,
+    Timeout,
+    RateLimit,
+    Auth,
+    Unknown,
+}
+
+/// Result of a discovery operation: successful connectors plus any sources
+/// the adapter attempted to fetch metadata for and failed on.
+///
+/// Implementors of [`DiscoveryAdapter`] MUST surface per-source failures via
+/// `failed` instead of silently dropping them — this is what lets downstream
+/// consumers distinguish "fetch failed transiently" from "removed upstream"
+/// when diffing snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryResult {
+    pub connectors: Vec<DiscoveredConnector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FailedSource>,
+}
+
+impl DiscoveryResult {
+    /// Build a clean result with no failures — convenience for adapters
+    /// whose discovery surface is single-shot (no per-source fan-out).
+    pub fn ok(connectors: Vec<DiscoveredConnector>) -> Self {
+        Self {
+            connectors,
+            failed: Vec::new(),
+        }
+    }
+}
+
 /// Target for a tag operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TagTarget {
@@ -333,7 +384,13 @@ pub trait SqlDialect: Send + Sync {
 #[async_trait]
 pub trait DiscoveryAdapter: Send + Sync {
     /// Discover connectors/schemas matching the given prefix.
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>>;
+    ///
+    /// Returns a [`DiscoveryResult`] with both successfully fetched
+    /// `connectors` and any `failed` sources. Adapters MUST NOT silently
+    /// drop a source on transient per-source failure — the distinction
+    /// between "removed upstream" and "tried and failed" is the contract
+    /// downstream consumers depend on (FR-014).
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult>;
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,85 @@ pub struct DiscoveredTable {
     pub row_count: Option<u64>,
 }
 
+/// A source the discovery adapter attempted to fetch metadata for and failed.
+///
+/// Distinct from "removed upstream" — distinguishing the two is the contract
+/// that lets downstream consumers safely diff one discover result against the
+/// next without misinterpreting a transient fetch failure as a deletion.
+///
+/// A connector that is **absent from `connectors`** AND **absent from `failed`**
+/// was removed upstream. **Absent from `connectors`** but **present in `failed`**
+/// is unknown state — consumers must not delete derived assets for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedSource {
+    pub id: String,
+    pub schema: String,
+    pub source_type: String,
+    pub error_class: FailedSourceErrorClass,
+    pub message: String,
+}
+
+/// Coarse classification of why a discovery fetch failed.
+///
+/// Adapters that wrap an HTTP-shaped API map their concrete errors onto this
+/// enum so downstream consumers can branch on operating-mode without knowing
+/// the adapter's own error type. A `Transient` or `Timeout` outcome is
+/// expected to clear on the next discover tick; `RateLimit` clears once
+/// upstream throttling expires; `Auth` requires a credentials rotation;
+/// `Unknown` is the catch-all for anything else (malformed response, JSON
+/// decode failure, adapter-specific shapes that don't fit the other
+/// classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedSourceErrorClass {
+    Transient,
+    Timeout,
+    RateLimit,
+    Auth,
+    Unknown,
+}
+
+impl std::fmt::Display for FailedSourceErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FailedSourceErrorClass::Transient => "transient",
+            FailedSourceErrorClass::Timeout => "timeout",
+            FailedSourceErrorClass::RateLimit => "rate_limit",
+            FailedSourceErrorClass::Auth => "auth",
+            FailedSourceErrorClass::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Result of a discovery operation: successful connectors plus any sources
+/// the adapter attempted to fetch metadata for and failed on.
+///
+/// `failed` is empty when discovery completed cleanly. A non-empty `failed`
+/// list signals "degraded but useful" — the consumer may still act on
+/// `connectors`, but must NOT treat sources missing from this snapshot
+/// (relative to a prior one) as deletions until they're absent from both
+/// fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryResult {
+    pub connectors: Vec<DiscoveredConnector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FailedSource>,
+}
+
+impl DiscoveryResult {
+    /// Build a clean result with no failures — convenience for adapters
+    /// whose discovery surface is single-shot (Airbyte's `list_connections`,
+    /// DuckDB's `information_schema` query) and therefore can't surface a
+    /// per-source failure on top of an overall success.
+    pub fn ok(connectors: Vec<DiscoveredConnector>) -> Self {
+        Self {
+            connectors,
+            failed: Vec::new(),
+        }
+    }
+}
+
 /// Source configuration that can be deserialized from rocky.toml.
 ///
 /// The `type` field determines which adapter to use:

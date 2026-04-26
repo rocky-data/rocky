@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
+use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
 use crate::DuckDbConnector;
@@ -29,7 +29,7 @@ impl DuckDbDiscoveryAdapter {
 
 #[async_trait]
 impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>> {
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult> {
         let conn = self
             .connector
             .lock()
@@ -81,7 +81,9 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             });
         }
 
-        Ok(connectors)
+        // DuckDB discovery is a single-shot information_schema query — there
+        // is no per-source metadata fetch that could partially fail.
+        Ok(DiscoveryResult::ok(connectors))
     }
 }
 
@@ -94,7 +96,8 @@ mod tests {
         let connector = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
         let adapter = DuckDbDiscoveryAdapter::new(connector);
         let result = adapter.discover("raw__").await.unwrap();
-        assert_eq!(result.len(), 0);
+        assert_eq!(result.connectors.len(), 0);
+        assert!(result.failed.is_empty());
     }
 
     #[tokio::test]
@@ -118,14 +121,20 @@ mod tests {
 
         let adapter = DuckDbDiscoveryAdapter::new(connector);
         let result = adapter.discover("raw__").await.unwrap();
-        assert_eq!(result.len(), 2, "expected 2 raw__ schemas");
+        assert_eq!(result.connectors.len(), 2, "expected 2 raw__ schemas");
+        assert!(result.failed.is_empty());
 
-        let orders = result.iter().find(|c| c.schema == "raw__orders").unwrap();
+        let orders = result
+            .connectors
+            .iter()
+            .find(|c| c.schema == "raw__orders")
+            .unwrap();
         assert_eq!(orders.tables.len(), 2);
         assert!(orders.tables.iter().any(|t| t.name == "orders"));
         assert!(orders.tables.iter().any(|t| t.name == "line_items"));
 
         let customers = result
+            .connectors
             .iter()
             .find(|c| c.schema == "raw__customers")
             .unwrap();

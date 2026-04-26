@@ -44,7 +44,7 @@ pub async fn discover(
 
     let adapter_registry = registry::AdapterRegistry::from_config(&rocky_cfg)?;
 
-    let connectors = if let Some(ref disc) = pipeline.source.discovery {
+    let discovery_result = if let Some(ref disc) = pipeline.source.discovery {
         let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
         discovery_adapter
             .discover(&pattern.prefix)
@@ -54,16 +54,31 @@ pub async fn discover(
         anyhow::bail!("no discovery adapter configured for this pipeline")
     };
 
+    let connectors = &discovery_result.connectors;
+    let failed_sources: Vec<FailedSourceOutput> = discovery_result
+        .failed
+        .iter()
+        .cloned()
+        .map(FailedSourceOutput::from_engine)
+        .collect();
+    if !failed_sources.is_empty() {
+        warn!(
+            count = failed_sources.len(),
+            "discover: source(s) failed metadata fetch — surfacing in `failed_sources`; \
+             downstream consumers must NOT treat them as deletions"
+        );
+    }
+
     // Source-existence filter: exclude tables that the discovery adapter
     // reports (e.g. Fivetran "enabled") but that don't actually exist in
     // the source warehouse. This keeps the discover output accurate so
     // downstream orchestrators (Dagster) don't plan assets for ghost tables.
     let source_table_sets =
-        build_source_table_sets(&adapter_registry, &pipeline.source, &connectors).await;
+        build_source_table_sets(&adapter_registry, &pipeline.source, connectors).await;
 
     let mut output_sources = Vec::new();
     let mut excluded_tables: Vec<ExcludedTableOutput> = Vec::new();
-    for conn in &connectors {
+    for conn in connectors {
         let parsed = match pattern.parse(&conn.schema) {
             Ok(p) => p,
             Err(e) => {
@@ -151,7 +166,7 @@ pub async fn discover(
     // at the top of this function. Errors inside the warm-up are logged and
     // counted as misses — a bad source shouldn't abort the whole discovery.
     let schemas_cached = if with_schemas {
-        warm_schema_cache(&adapter_registry, &pipeline.source, &connectors, state_path).await?
+        warm_schema_cache(&adapter_registry, &pipeline.source, connectors, state_path).await?
     } else {
         0
     };
@@ -160,6 +175,7 @@ pub async fn discover(
     let output = DiscoverOutput::new(output_sources)
         .with_checks(checks_output)
         .with_excluded_tables(excluded_tables)
+        .with_failed_sources(failed_sources)
         .with_schemas_cached(schemas_cached);
     if output_json {
         print_json(&output)?;

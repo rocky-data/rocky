@@ -8,10 +8,12 @@ use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use tracing::warn;
 
-use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
+use rocky_core::source::{
+    DiscoveredConnector, DiscoveredTable, DiscoveryResult, FailedSource, FailedSourceErrorClass,
+};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
-use crate::client::FivetranClient;
+use crate::client::{FivetranClient, FivetranError};
 use crate::connector::{self as ft_connector, Connector};
 use crate::schema as ft_schema;
 
@@ -35,7 +37,7 @@ impl FivetranDiscoveryAdapter {
 
 #[async_trait]
 impl DiscoveryAdapter for FivetranDiscoveryAdapter {
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>> {
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult> {
         let connectors =
             ft_connector::discover_connectors(&self.client, &self.destination_id, schema_prefix)
                 .await
@@ -43,50 +45,123 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
 
         let discover_concurrency = 10;
 
-        let result: Vec<DiscoveredConnector> = stream::iter(connectors)
-            .map(|conn| {
-                let client = &self.client;
-                async move {
-                    let schema_result = ft_schema::get_schema_config(client, &conn.id).await;
-                    (conn, schema_result)
-                }
-            })
-            .buffer_unordered(discover_concurrency)
-            .filter_map(|(conn, schema_result)| async move {
-                match schema_result {
-                    Ok(schema_config) => {
-                        let tables = schema_config
-                            .enabled_tables()
-                            .iter()
-                            .map(|t| DiscoveredTable {
-                                name: t.table_name.clone(),
-                                row_count: None,
-                            })
-                            .collect();
-                        let metadata = metadata_from_connector(&conn);
-                        Some(DiscoveredConnector {
-                            id: conn.id,
-                            schema: conn.schema,
-                            source_type: conn.service,
-                            last_sync_at: conn.succeeded_at,
-                            tables,
-                            metadata,
-                        })
+        let fetched: Vec<(Connector, Result<ft_schema::SchemaConfig, FivetranError>)> =
+            stream::iter(connectors)
+                .map(|conn| {
+                    let client = &self.client;
+                    async move {
+                        let schema_result = ft_schema::get_schema_config(client, &conn.id).await;
+                        (conn, schema_result)
                     }
-                    Err(e) => {
-                        warn!(
-                            connector = conn.id,
-                            error = %e,
-                            "failed to fetch schema config, skipping"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect()
-            .await;
+                })
+                .buffer_unordered(discover_concurrency)
+                .collect()
+                .await;
 
-        Ok(result)
+        let mut connectors = Vec::new();
+        let mut failed = Vec::new();
+        for (conn, schema_result) in fetched {
+            match schema_result {
+                Ok(schema_config) => {
+                    let tables = schema_config
+                        .enabled_tables()
+                        .iter()
+                        .map(|t| DiscoveredTable {
+                            name: t.table_name.clone(),
+                            row_count: None,
+                        })
+                        .collect();
+                    let metadata = metadata_from_connector(&conn);
+                    connectors.push(DiscoveredConnector {
+                        id: conn.id,
+                        schema: conn.schema,
+                        source_type: conn.service,
+                        last_sync_at: conn.succeeded_at,
+                        tables,
+                        metadata,
+                    });
+                }
+                Err(e) => {
+                    let error_class = classify_fivetran_error(&e);
+                    warn!(
+                        connector = conn.id.as_str(),
+                        error = %e,
+                        error_class = %error_class,
+                        "schema fetch failed, surfacing as failed source"
+                    );
+                    failed.push(FailedSource {
+                        id: conn.id,
+                        schema: conn.schema,
+                        source_type: conn.service,
+                        error_class,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(DiscoveryResult { connectors, failed })
+    }
+}
+
+/// Map a [`FivetranError`] onto the coarse [`FailedSourceErrorClass`].
+///
+/// The classes are operating-mode signals for downstream consumers, not a
+/// faithful taxonomy of the underlying transport. The `RetryBudgetExhausted`
+/// variant maps to `Transient` because the budget is per-run — a fresh
+/// discover invocation gets a new budget.
+fn classify_fivetran_error(err: &FivetranError) -> FailedSourceErrorClass {
+    match err {
+        FivetranError::RateLimited => FailedSourceErrorClass::RateLimit,
+        FivetranError::RetryBudgetExhausted { .. } => FailedSourceErrorClass::Transient,
+        FivetranError::UnexpectedResponse(_) => FailedSourceErrorClass::Unknown,
+        // `code` here is either the raw HTTP status display (e.g. "503
+        // Service Unavailable") from `client::get`, or the API envelope's
+        // `code` field (e.g. "Unauthorized"). Lead-digit + canonical-reason
+        // matching covers both.
+        FivetranError::Api { code, .. } => classify_api_code(code),
+        FivetranError::Http(reqwest_err) => {
+            if reqwest_err.is_timeout() {
+                FailedSourceErrorClass::Timeout
+            } else if reqwest_err.is_connect() {
+                FailedSourceErrorClass::Transient
+            } else if let Some(status) = reqwest_err.status() {
+                classify_status_code(status.as_u16())
+            } else {
+                FailedSourceErrorClass::Unknown
+            }
+        }
+    }
+}
+
+fn classify_api_code(code: &str) -> FailedSourceErrorClass {
+    let trimmed = code.trim();
+    // Lead numeric prefix: "503 Service Unavailable" → 503.
+    if let Some(num) = trimmed
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        return classify_status_code(num);
+    }
+    // Envelope codes are alphanumeric tokens like "Unauthorized" or
+    // "RateLimited" — the upstream Fivetran API sends these for non-success
+    // envelopes wrapped in HTTP 200. Match the documented vocabulary and
+    // leave anything else as Unknown.
+    match trimmed {
+        "Unauthorized" | "Forbidden" | "AuthFailed" => FailedSourceErrorClass::Auth,
+        "RateLimited" | "TooManyRequests" => FailedSourceErrorClass::RateLimit,
+        _ => FailedSourceErrorClass::Unknown,
+    }
+}
+
+fn classify_status_code(status: u16) -> FailedSourceErrorClass {
+    match status {
+        401 | 403 => FailedSourceErrorClass::Auth,
+        408 => FailedSourceErrorClass::Timeout,
+        429 => FailedSourceErrorClass::RateLimit,
+        500..=599 => FailedSourceErrorClass::Transient,
+        _ => FailedSourceErrorClass::Unknown,
     }
 }
 

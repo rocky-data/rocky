@@ -1036,7 +1036,7 @@ pub async fn run(
     ))?;
 
     // Discover sources
-    let connectors = async {
+    let discovery_result = async {
         if let Some(ref disc) = pipeline.source.discovery {
             let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
             discovery_adapter
@@ -1049,6 +1049,17 @@ pub async fn run(
     }
     .instrument(info_span!("discover_sources"))
     .await?;
+    if !discovery_result.failed.is_empty() {
+        // FR-014: a failed-source list at run time means the run will
+        // execute the healthy subset, but the consumer should know that
+        // missing materializations are not the same as deletions.
+        warn!(
+            count = discovery_result.failed.len(),
+            "run: source(s) failed metadata fetch — these will be absent from \
+             materializations but were NOT removed upstream"
+        );
+    }
+    let connectors = discovery_result.connectors;
 
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
@@ -3438,11 +3449,28 @@ pub(crate) async fn execute_models(
                 statements = exec_stmts.len(),
                 "executing model"
             );
+            // Capture per-statement stats so derived models report the
+            // same `bytes_scanned` / `bytes_written` shape that replication
+            // tables already have (Arc 2 wave 3 residual: plain
+            // transformation models were calling `execute_statement` and
+            // dropping the `ExecutionStats` reported by stats-aware
+            // adapters like BigQuery).
+            let model_started_at = Utc::now();
             let mut exec_error: Option<anyhow::Error> = None;
+            let mut bytes_scanned_acc: Option<u64> = None;
+            let mut bytes_written_acc: Option<u64> = None;
             for exec_sql in &exec_stmts {
-                if let Err(e) = warehouse.execute_statement(exec_sql).await {
-                    exec_error = Some(anyhow::anyhow!("model '{model_name}' failed: {e}"));
-                    break;
+                match warehouse.execute_statement_with_stats(exec_sql).await {
+                    Ok(stats) => {
+                        bytes_scanned_acc =
+                            accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+                        bytes_written_acc =
+                            accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    }
+                    Err(e) => {
+                        exec_error = Some(anyhow::anyhow!("model '{model_name}' failed: {e}"));
+                        break;
+                    }
                 }
             }
             if let Some(e) = exec_error {
@@ -3458,13 +3486,45 @@ pub(crate) async fn execute_models(
                 }
                 return Err(e);
             }
+            // Push a MaterializationOutput so `rocky cost` and downstream
+            // consumers see derived models in the run output instead of
+            // having to infer them from check / drift records. Mirrors
+            // the time_interval and replication paths.
+            let model_duration_ms = model_start.elapsed().as_millis() as u64;
+            let target_table_full_name = format!(
+                "{}.{}.{}",
+                plan.target.catalog, plan.target.schema, plan.target.table
+            );
+            let asset_key = vec![
+                plan.target.catalog.clone(),
+                plan.target.schema.clone(),
+                plan.target.table.clone(),
+            ];
+            output.materializations.push(MaterializationOutput {
+                asset_key,
+                rows_copied: None,
+                duration_ms: model_duration_ms,
+                started_at: model_started_at,
+                metadata: MaterializationMetadata {
+                    strategy: transformation_strategy_name(&plan.strategy).to_string(),
+                    watermark: None,
+                    target_table_full_name: Some(target_table_full_name),
+                    sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
+                    column_count: exec_ctx.column_count_for(model_name),
+                    compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
+                },
+                partition: None,
+                cost_usd: None,
+                bytes_scanned: bytes_scanned_acc,
+                bytes_written: bytes_written_acc,
+            });
             if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                 let _ = reg
                     .fire(&HookContext::after_model_run(
                         run_id,
                         pipe,
                         model_name,
-                        model_start.elapsed().as_millis() as u64,
+                        model_duration_ms,
                     ))
                     .await;
             }
@@ -3474,6 +3534,23 @@ pub(crate) async fn execute_models(
 
     info!(models = models_executed, "model execution complete");
     Ok(())
+}
+
+/// Map a `MaterializationStrategy` (post-`to_plan()`) onto the string used
+/// in `MaterializationMetadata.strategy`. Mirrors the names used elsewhere
+/// in `run.rs` (replication path lines ~4024-4076).
+fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static str {
+    match strategy {
+        MaterializationStrategy::FullRefresh => "full_refresh",
+        MaterializationStrategy::Incremental { .. } => "incremental",
+        MaterializationStrategy::Merge { .. } => "merge",
+        MaterializationStrategy::MaterializedView => "materialized_view",
+        MaterializationStrategy::DynamicTable { .. } => "dynamic_table",
+        MaterializationStrategy::TimeInterval { .. } => "time_interval",
+        MaterializationStrategy::Ephemeral => "ephemeral",
+        MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
+        MaterializationStrategy::Microbatch { .. } => "microbatch",
+    }
 }
 
 /// Execute a `time_interval` model: plan partitions, execute each, record

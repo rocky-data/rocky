@@ -19,6 +19,10 @@ export interface DiscoverOutput {
    */
   excluded_tables: ExcludedTableOutput[];
   /**
+   * Sources the discovery adapter attempted to fetch metadata for and failed (transient HTTP error, timeout, rate-limit budget exhausted, auth blip). Their absence from `sources` does NOT mean they were removed upstream — consumers diffing against a prior run must treat failed sources as "unknown state, do not delete." Empty when discovery completed cleanly. See FR-014.
+   */
+  failed_sources?: FailedSourceOutput[];
+  /**
    * Number of schema-cache entries written by this invocation.
    *
    * Populated by `rocky discover --with-schemas` — the explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache (design doc §4.2 route B at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md`). Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
@@ -66,6 +70,34 @@ export interface ExcludedTableOutput {
    * Bare table name as reported by the discovery adapter.
    */
   table_name: string;
+  [k: string]: unknown;
+}
+/**
+ * A source the discovery adapter attempted to fetch metadata for and failed.
+ *
+ * Surfaced on `DiscoverOutput.failed_sources` so downstream consumers can distinguish a transient fetch failure from a deletion when diffing successive discover snapshots (FR-014).
+ */
+export interface FailedSourceOutput {
+  /**
+   * Coarse error class so consumers can branch without parsing the `message`. One of `"transient"` / `"timeout"` / `"rate_limit"` / `"auth"` / `"unknown"`.
+   */
+  error_class: string;
+  /**
+   * Adapter-side identifier for the source (e.g. Fivetran connector_id).
+   */
+  id: string;
+  /**
+   * Human-readable error from the adapter — for logs / debugging only. Don't pattern-match on this; use `error_class` for branching.
+   */
+  message: string;
+  /**
+   * Source schema name the adapter would have written into.
+   */
+  schema: string;
+  /**
+   * Adapter type (`"fivetran"`, `"airbyte"`, `"iceberg"`, ...).
+   */
+  source_type: string;
   [k: string]: unknown;
 }
 /**

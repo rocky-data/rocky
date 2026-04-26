@@ -20,7 +20,7 @@ use schemars::JsonSchema;
 
 use crate::ir::{ColumnInfo, ColumnSelection, Grant, GrantTarget, MetadataColumn, TableRef};
 use crate::retention::RetentionPolicy;
-use crate::source::DiscoveredConnector;
+use crate::source::DiscoveryResult;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -154,7 +154,15 @@ pub struct ExecutionStats {
 #[async_trait]
 pub trait DiscoveryAdapter: Send + Sync {
     /// Discover connectors/schemas matching the given prefix.
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>>;
+    ///
+    /// Returns a [`DiscoveryResult`] with both successfully fetched
+    /// `connectors` and any `failed` sources (transient API errors,
+    /// rate-limit budget exhausted, auth blip). Adapters MUST NOT silently
+    /// drop a source on transient per-source failure — the distinction
+    /// between "removed upstream" and "tried and failed" is the contract
+    /// downstream consumers depend on to avoid mistaking a fetch failure
+    /// for a deletion (FR-014).
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult>;
 
     /// Cheap connectivity check for the discovery API.
     ///

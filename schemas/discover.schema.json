@@ -48,6 +48,39 @@
       ],
       "type": "object"
     },
+    "FailedSourceOutput": {
+      "description": "A source the discovery adapter attempted to fetch metadata for and failed.\n\nSurfaced on `DiscoverOutput.failed_sources` so downstream consumers can distinguish a transient fetch failure from a deletion when diffing successive discover snapshots (FR-014).",
+      "properties": {
+        "error_class": {
+          "description": "Coarse error class so consumers can branch without parsing the `message`. One of `\"transient\"` / `\"timeout\"` / `\"rate_limit\"` / `\"auth\"` / `\"unknown\"`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Adapter-side identifier for the source (e.g. Fivetran connector_id).",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable error from the adapter — for logs / debugging only. Don't pattern-match on this; use `error_class` for branching.",
+          "type": "string"
+        },
+        "schema": {
+          "description": "Source schema name the adapter would have written into.",
+          "type": "string"
+        },
+        "source_type": {
+          "description": "Adapter type (`\"fivetran\"`, `\"airbyte\"`, `\"iceberg\"`, ...).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "error_class",
+        "id",
+        "message",
+        "schema",
+        "source_type"
+      ],
+      "type": "object"
+    },
     "FreshnessConfigOutput": {
       "description": "Freshness check configuration projected into the discover output.\n\nPer-schema `overrides` from `rocky_core::config::FreshnessConfig` are intentionally not exposed yet — the override-key semantics need to be nailed down before integrations can rely on them.",
       "properties": {
@@ -143,6 +176,13 @@
       "description": "Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.",
       "items": {
         "$ref": "#/definitions/ExcludedTableOutput"
+      },
+      "type": "array"
+    },
+    "failed_sources": {
+      "description": "Sources the discovery adapter attempted to fetch metadata for and failed (transient HTTP error, timeout, rate-limit budget exhausted, auth blip). Their absence from `sources` does NOT mean they were removed upstream — consumers diffing against a prior run must treat failed sources as \"unknown state, do not delete.\" Empty when discovery completed cleanly. See FR-014.",
+      "items": {
+        "$ref": "#/definitions/FailedSourceOutput"
       },
       "type": "array"
     },
