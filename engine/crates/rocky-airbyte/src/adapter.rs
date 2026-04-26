@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
+use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
 use crate::client::{AirbyteClient, Connection, ConnectionStatus};
@@ -29,14 +29,14 @@ impl AirbyteDiscoveryAdapter {
 
 #[async_trait]
 impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>> {
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult> {
         let connections = self
             .client
             .list_connections()
             .await
             .map_err(AdapterError::new)?;
 
-        let result: Vec<DiscoveredConnector> = connections
+        let connectors: Vec<DiscoveredConnector> = connections
             .into_iter()
             .filter(|c| c.status == ConnectionStatus::Active)
             .filter(|c| matches_prefix(c, schema_prefix))
@@ -45,11 +45,15 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
 
         debug!(
             prefix = schema_prefix,
-            count = result.len(),
+            count = connectors.len(),
             "discovered Airbyte connections"
         );
 
-        Ok(result)
+        // Airbyte's discovery surface is a single `list_connections` call —
+        // there is no per-source metadata fetch that could partially fail
+        // the way Fivetran's per-connector schema fetch can. Either the list
+        // call succeeds (no `failed`) or the whole call errors out.
+        Ok(DiscoveryResult::ok(connectors))
     }
 
     async fn ping(&self) -> AdapterResult<()> {

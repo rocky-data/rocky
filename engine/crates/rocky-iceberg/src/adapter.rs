@@ -7,7 +7,9 @@
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
+use rocky_core::source::{
+    DiscoveredConnector, DiscoveredTable, DiscoveryResult, FailedSource, FailedSourceErrorClass,
+};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
 use crate::client::IcebergCatalogClient;
@@ -33,7 +35,7 @@ impl IcebergDiscoveryAdapter {
 
 #[async_trait]
 impl DiscoveryAdapter for IcebergDiscoveryAdapter {
-    async fn discover(&self, schema_prefix: &str) -> AdapterResult<Vec<DiscoveredConnector>> {
+    async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult> {
         let namespaces = self
             .client
             .list_namespaces()
@@ -53,6 +55,7 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
         );
 
         let mut connectors = Vec::with_capacity(matching.len());
+        let mut failed = Vec::new();
 
         for ns in matching {
             match self.client.list_tables(ns).await {
@@ -78,8 +81,19 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
                     warn!(
                         namespace = ns.as_str(),
                         error = %e,
-                        "failed to list tables in namespace, skipping"
+                        "list_tables failed, surfacing as failed source"
                     );
+                    failed.push(FailedSource {
+                        id: ns.clone(),
+                        schema: ns.clone(),
+                        source_type: "iceberg".to_string(),
+                        // The Iceberg REST client doesn't differentiate
+                        // transport-shape errors today; treat everything as
+                        // Unknown until it does. Future: classify on
+                        // `IcebergError` variants.
+                        error_class: FailedSourceErrorClass::Unknown,
+                        message: e.to_string(),
+                    });
                 }
             }
         }
@@ -87,10 +101,11 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
         debug!(
             prefix = schema_prefix,
             count = connectors.len(),
+            failed = failed.len(),
             "discovered Iceberg connectors"
         );
 
-        Ok(connectors)
+        Ok(DiscoveryResult { connectors, failed })
     }
 
     async fn ping(&self) -> AdapterResult<()> {

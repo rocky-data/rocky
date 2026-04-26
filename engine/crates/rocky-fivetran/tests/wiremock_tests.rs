@@ -409,10 +409,11 @@ async fn test_discover_projects_namespaced_metadata() {
 
     let client = test_client(&server);
     let adapter = FivetranDiscoveryAdapter::new(client, "dest_meta".into());
-    let connectors = adapter.discover("src__").await.unwrap();
+    let result = adapter.discover("src__").await.unwrap();
 
-    assert_eq!(connectors.len(), 1);
-    let conn = &connectors[0];
+    assert_eq!(result.connectors.len(), 1);
+    assert!(result.failed.is_empty());
+    let conn = &result.connectors[0];
     assert_eq!(conn.id, "conn_ads");
     assert_eq!(conn.source_type, "facebook_ads");
     // Core identity is always stamped.
@@ -473,13 +474,168 @@ async fn test_discover_without_config_still_stamps_identity() {
 
     let client = test_client(&server);
     let adapter = FivetranDiscoveryAdapter::new(client, "dest_noconfig".into());
-    let connectors = adapter.discover("src__").await.unwrap();
+    let result = adapter.discover("src__").await.unwrap();
 
-    assert_eq!(connectors.len(), 1);
-    let conn = &connectors[0];
+    assert_eq!(result.connectors.len(), 1);
+    assert!(result.failed.is_empty());
+    let conn = &result.connectors[0];
     assert_eq!(conn.metadata["fivetran.service"], "stripe");
     assert_eq!(conn.metadata["fivetran.connector_id"], "conn_bare");
     // No service-specific keys since `config` was absent.
     assert!(!conn.metadata.contains_key("fivetran.custom_reports"));
     assert!(!conn.metadata.contains_key("fivetran.schema_prefix"));
+}
+
+/// FR-014 — when one connector's schema fetch returns a sustained 503,
+/// the connector must surface in `result.failed` (classified `Transient`)
+/// rather than being silently dropped from `result.connectors`. This is
+/// the exact failure mode that caused the asset-graph-shrinkage bug Gold
+/// patched on the dbt path (Gold commit `c43394d`).
+#[tokio::test]
+async fn test_discover_surfaces_transient_503_in_failed_sources() {
+    let server = MockServer::start().await;
+
+    // Two connectors, both pass the connectors list step.
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_partial/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_ok",
+                        "group_id": "dest_partial",
+                        "service": "shopify",
+                        "schema": "src__acme__na__shopify",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "succeeded_at": "2026-04-25T10:00:00Z",
+                        "failed_at": null
+                    },
+                    {
+                        "id": "conn_flaky",
+                        "group_id": "dest_partial",
+                        "service": "stripe",
+                        "schema": "src__acme__na__stripe",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "succeeded_at": "2026-04-25T10:00:00Z",
+                        "failed_at": null
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // conn_ok's schema fetch succeeds.
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_ok/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "schemas": {
+                    "src__acme__na__shopify": {
+                        "enabled": true,
+                        "tables": {
+                            "orders": {
+                                "enabled": true,
+                                "sync_mode": "SOFT_DELETE",
+                                "columns": {}
+                            }
+                        }
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // conn_flaky's schema fetch returns 503 (server-error). Test client
+    // has `max_retries = 0`, so this surfaces immediately to the adapter.
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_flaky/schemas"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let adapter = FivetranDiscoveryAdapter::new(client, "dest_partial".into());
+    let result = adapter.discover("src__").await.unwrap();
+
+    // The healthy connector still came through.
+    assert_eq!(result.connectors.len(), 1, "expected conn_ok in connectors");
+    assert_eq!(result.connectors[0].id, "conn_ok");
+
+    // The flaky connector is NOT silently dropped — it's reported as a
+    // failed source so downstream consumers can distinguish "tried and
+    // failed" from "removed upstream."
+    assert_eq!(
+        result.failed.len(),
+        1,
+        "expected conn_flaky in failed_sources, not silently dropped"
+    );
+    let failed = &result.failed[0];
+    assert_eq!(failed.id, "conn_flaky");
+    assert_eq!(failed.schema, "src__acme__na__stripe");
+    assert_eq!(failed.source_type, "stripe");
+    assert_eq!(
+        failed.error_class,
+        rocky_core::source::FailedSourceErrorClass::Transient,
+        "503 should classify as Transient"
+    );
+    assert!(
+        !failed.message.is_empty(),
+        "failed source must carry a non-empty message for debugging"
+    );
+}
+
+/// FR-014 — auth failures classify as `Auth` so consumers can route them
+/// to alerting / credentials-rotation paths instead of silently retrying.
+#[tokio::test]
+async fn test_discover_classifies_401_as_auth() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_auth/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_no_auth",
+                        "group_id": "dest_auth",
+                        "service": "stripe",
+                        "schema": "src__acme__na__stripe",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "succeeded_at": null,
+                        "failed_at": null
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_no_auth/schemas"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let adapter = FivetranDiscoveryAdapter::new(client, "dest_auth".into());
+    let result = adapter.discover("src__").await.unwrap();
+
+    assert!(result.connectors.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(
+        result.failed[0].error_class,
+        rocky_core::source::FailedSourceErrorClass::Auth
+    );
 }

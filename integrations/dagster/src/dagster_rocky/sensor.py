@@ -96,6 +96,20 @@ def rocky_source_sensor(
         cursor_data: dict[str, str] = json.loads(context.cursor) if context.cursor else {}
         result = rocky_resource.discover()
 
+        # FR-014: distinguish "tried-and-failed" from "removed upstream."
+        # If discover surfaced any `failed_sources`, log them so the
+        # consumer can investigate, and leave the cursor entries for those
+        # ids untouched — a missing entry on the next tick MUST NOT be
+        # treated as a deletion when its prior fetch failed transiently.
+        failed_sources = getattr(result, "failed_sources", None) or []
+        if failed_sources:
+            failed_ids = [fs.id for fs in failed_sources]
+            context.log.warning(
+                f"rocky_source_sensor: rocky discover reported {len(failed_sources)} "
+                f"failed source(s) — these are NOT deletions, do not reconcile "
+                f"missing-asset state for them: {failed_ids}"
+            )
+
         triggered: list[SourceInfo] = []
         new_cursor = dict(cursor_data)
         for source in result.sources:

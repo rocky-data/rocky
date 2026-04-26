@@ -43,6 +43,7 @@ pub async fn plan(
             .discover(&pattern.prefix)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?
+            .connectors
     } else {
         anyhow::bail!("no discovery adapter configured for this pipeline")
     };

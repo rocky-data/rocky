@@ -497,7 +497,8 @@ async fn resolve_replication_managed_tables(
     let connectors = discovery_adapter
         .discover(&pattern.prefix)
         .await
-        .map_err(|e| anyhow!("discovery failed: {e}"))?;
+        .map_err(|e| anyhow!("discovery failed: {e}"))?
+        .connectors;
 
     let target_sep = repl
         .target
