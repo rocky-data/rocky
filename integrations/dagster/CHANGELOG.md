@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.2] — 2026-04-26
+
+Companion release to engine `v1.17.4`. Picks up the regenerated Pydantic models for the new `DiscoverOutput.failed_sources` wire field, and threads a sensor-side warning through so projects using `rocky_source_sensor` learn about transient discover failures without misreading them as deletions.
+
+### Added
+
+- **`rocky_source_sensor` warns on `failed_sources` and skips cursor advance for failed ids** ([#270](https://github.com/rocky-data/rocky/pull/270)). When `rocky discover` (now `engine ≥ 1.17.4`) reports any sources that failed metadata fetch, the sensor logs a warning naming the failed ids and leaves their cursor entries untouched so the next tick can re-evaluate them — preventing the asset-graph-shrinkage failure mode where a transient adapter failure looked indistinguishable from a deletion. Sensor still emits run requests for the healthy subset.
+- **`DiscoverOutput.failed_sources` Pydantic field** ([#270](https://github.com/rocky-data/rocky/pull/270)). Regenerated `types_generated/discover_schema.py` from the engine's updated JSON schema. Each entry is a `FailedSourceOutput` with `id` / `schema` / `source_type` / `error_class` / `message`. Older engines without the field continue to parse — `failed_sources` defaults to `None` / empty.
+
+### Notes
+
+- Requires engine `≥ 1.17.4` to actually receive `failed_sources` from `rocky discover`. Earlier engines simply omit the field, which the sensor handles gracefully (it treats the absence as "no failures reported").
+
 ## [1.14.1] — 2026-04-25
 
 ### Fixed
