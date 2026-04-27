@@ -63,6 +63,15 @@ Returns all discovered sources and their tables.
       ]
     }
   ],
+  "failed_sources": [
+    {
+      "id": "connector_flaky456",
+      "schema": "src__acme__us_west__hubspot",
+      "source_type": "fivetran",
+      "error_class": "transient",
+      "message": "schema fetch failed: 503 Service Unavailable"
+    }
+  ],
   "checks": {
     "freshness": { "threshold_seconds": 86400 }
   }
@@ -80,8 +89,16 @@ Returns all discovered sources and their tables.
 | `sources[].tables` | array | List of tables in this source. |
 | `sources[].tables[].name` | string | Table name. |
 | `sources[].tables[].row_count` | integer or null | Row count if available, otherwise null. |
+| `failed_sources` | array or absent | Sources the adapter attempted to fetch metadata for and failed on. Absent when empty. Distinct from `sources` (succeeded) and `excluded_tables` (filtered post-success). |
+| `failed_sources[].id` | string | Connector or namespace identifier. |
+| `failed_sources[].schema` | string | Source schema string (when known). |
+| `failed_sources[].source_type` | string | Source type (`"fivetran"`, `"iceberg"`, etc.). |
+| `failed_sources[].error_class` | string | One of `"transient"`, `"timeout"`, `"rate_limit"`, `"auth"`, `"unknown"`. Lets consumers branch on operating-mode without parsing `message`. |
+| `failed_sources[].message` | string | Free-form error detail for human inspection. |
 | `checks` | object or absent | Pipeline-level check configuration, when `[checks]` is declared in `rocky.toml`. |
 | `checks.freshness.threshold_seconds` | integer | Freshness threshold in seconds. |
+
+Consumers diffing successive discover snapshots **must** treat ids that appear in `failed_sources` but not in `sources` as "unknown state, do not delete" — that's the contract that distinguishes a fetch failure from a deletion. Available since engine `1.17.4`.
 
 ---
 
