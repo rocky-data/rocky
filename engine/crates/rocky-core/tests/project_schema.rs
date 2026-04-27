@@ -152,7 +152,7 @@ fn every_committed_poc_adapter_block_matches_generated_schema() {
             total_blocks += 1;
             let errs: Vec<String> = validator
                 .iter_errors(&value)
-                .map(|e| format!("  {section}: {e} at {}", e.instance_path))
+                .map(|e| format!("  {section}: {e} at {}", e.instance_path()))
                 .collect();
             if !errs.is_empty() {
                 failures.entry(rel.clone()).or_default().extend(errs);
@@ -229,7 +229,7 @@ fn every_committed_poc_matches_project_schema() {
 
         let errs: Vec<String> = validator
             .iter_errors(&json)
-            .map(|e| format!("  {e} at {}", e.instance_path))
+            .map(|e| format!("  {e} at {}", e.instance_path()))
             .collect();
         if !errs.is_empty() {
             failures.entry(rel).or_default().extend(errs);
