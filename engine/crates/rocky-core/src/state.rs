@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
@@ -229,15 +229,15 @@ impl StateStore {
                     path: lock_path.display().to_string(),
                     source: e,
                 })?;
-            FileExt::try_lock_exclusive(&file)
-                .map_err(|e| StateError::LockIo {
-                    path: lock_path.display().to_string(),
-                    source: e,
-                })?
-                .then_some(())
-                .ok_or_else(|| StateError::LockHeldByOther {
+            FileExt::try_lock(&file).map_err(|e| match e {
+                fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
                     path: path.display().to_string(),
-                })?;
+                },
+                fs4::TryLockError::Error(source) => StateError::LockIo {
+                    path: lock_path.display().to_string(),
+                    source,
+                },
+            })?;
             Some(file)
         } else {
             None

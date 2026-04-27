@@ -12,7 +12,7 @@
 
 use std::fs::OpenOptions;
 
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use rocky_core::state::{StateError, StateStore};
 use tempfile::TempDir;
 
@@ -31,11 +31,8 @@ fn second_writer_fails_when_lock_held_externally() {
         .write(true)
         .open(&lock_path)
         .unwrap();
-    let acquired = FileExt::try_lock_exclusive(&external_lock).unwrap();
-    assert!(
-        acquired,
-        "external lock should be acquired in a clean temp dir"
-    );
+    FileExt::try_lock(&external_lock)
+        .expect("external lock should be acquired in a clean temp dir");
 
     match StateStore::open(&path) {
         Err(StateError::LockHeldByOther { .. }) => {}
@@ -62,11 +59,8 @@ fn lock_released_on_drop() {
         .write(true)
         .open(&lock_path)
         .unwrap();
-    let acquired = FileExt::try_lock_exclusive(&external_lock).unwrap();
-    assert!(
-        acquired,
-        "advisory lock should be free after the StateStore was dropped"
-    );
+    FileExt::try_lock(&external_lock)
+        .expect("advisory lock should be free after the StateStore was dropped");
 }
 
 #[test]
@@ -87,8 +81,7 @@ fn open_read_only_ignores_write_lock() {
         .write(true)
         .open(&lock_path)
         .unwrap();
-    let acquired = FileExt::try_lock_exclusive(&external_lock).unwrap();
-    assert!(acquired);
+    FileExt::try_lock(&external_lock).expect("external lock should be acquired");
 
     // A read-only open must still succeed despite the external write lock:
     // inspection commands (`rocky state`, `rocky history`, ...) should never
