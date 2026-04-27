@@ -45,7 +45,18 @@ The sensor:
 1. Calls `rocky.discover()` on each tick.
 2. Compares each source's `last_sync_at` timestamp to a per-source cursor.
 3. Emits a `RunRequest` for any source whose latest sync is newer than the cursor.
-4. Advances the cursor.
+4. Advances the cursor for the sources it processed.
+5. Logs a warning naming any ids the engine reported in `failed_sources`, and **does not** advance their cursor — so the next tick re-evaluates them.
+
+## Transient discover failures
+
+Source adapters can partially fail — a Fivetran 5xx or rate-limit window on a single connector, an Iceberg `list_tables` error on one namespace. From engine `1.17.4` onward, `rocky discover` surfaces these as `failed_sources` rather than silently dropping the connector from the output.
+
+The sensor relies on this signal to avoid the asset-graph-shrinkage failure mode where a transient adapter error looks indistinguishable from "removed upstream" to a diff-based reconciler. By skipping cursor advance for failed ids, the sensor guarantees that a flapping connector keeps reappearing for evaluation until it either succeeds (cursor advances normally) or is genuinely removed upstream (drops out of both `sources` and `failed_sources`).
+
+Healthy sources in the same tick still produce `RunRequest`s — partial failure does not block the run.
+
+Requires engine `≥ 1.17.4`. Older engines omit the field; the sensor treats absence as "no failures reported".
 
 ## Granularity
 

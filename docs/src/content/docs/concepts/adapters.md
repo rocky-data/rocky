@@ -58,10 +58,12 @@ pub trait SqlDialect {
 
 | Trait | Capability | Methods |
 |-------|-----------|---------|
-| `DiscoveryAdapter` | Discover connectors/tables | `discover()` |
+| `DiscoveryAdapter` | Discover connectors/tables | `discover() -> DiscoveryResult` |
 | `GovernanceAdapter` | Tags, grants, bindings | `set_tags()`, `get_grants()`, `apply_grants()`, `revoke_grants()` |
 | `BatchCheckAdapter` | Batched quality checks | `batch_row_counts()`, `batch_freshness()` |
 | `TypeMapper` | Type normalization | `normalize_type()`, `types_compatible()` |
+
+`DiscoveryAdapter::discover` returns `DiscoveryResult { connectors, failed }` so adapters that fan out per-source metadata fetches (per-connector REST calls, per-namespace `list_tables`) can surface partial failures instead of silently dropping them — protecting downstream diff-based reconcilers from misreading a transient fetch failure as "removed upstream". Adapters that complete in a single shot return `DiscoveryResult::ok(connectors)`. Each `FailedSource` carries an `error_class` (`transient` / `timeout` / `rate_limit` / `auth` / `unknown`) so consumers can branch on operating-mode without parsing free-form messages.
 
 ## AdapterManifest
 
