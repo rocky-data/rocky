@@ -92,7 +92,7 @@ futures = "0.3"
 redis = "1.2"
 
 # Cloud object store (unified S3/GCS/Azure backend for state sync + loaders)
-object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 bytes = "1"
 url = "2"
 
