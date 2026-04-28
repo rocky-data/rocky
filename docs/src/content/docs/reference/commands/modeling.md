@@ -470,3 +470,113 @@ The `markdown` field holds a ready-to-post report; in a GitHub Actions workflow 
 
 - [`rocky ci`](#rocky-ci) -- full compile + test for CI
 - [`rocky compile`](#rocky-compile) -- compile a single branch without diffing
+- [`rocky preview`](#rocky-preview) -- pruned re-run + sampled data diff + cost delta on top of `ci-diff`'s structural diff
+
+---
+
+## `rocky preview`
+
+Run a PR-time preview of model changes: prune-and-copy substrate that re-executes only changed models and their downstream column lineage on a per-PR branch, copying everything else from the base ref. Three subcommands compose into a single review artifact: `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta vs. base.
+
+For the design — why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is — see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
+
+```bash
+rocky preview create --base <ref> [--name <branch_name>]
+rocky preview diff   --name <branch_name> [--base <ref>] [--sample-size <N>]
+rocky preview cost   --name <branch_name> [--base <ref>]
+```
+
+All three subcommands accept `--output json|markdown`. The Markdown form is pre-rendered for posting to a PR comment; the JSON form embeds the same Markdown in a top-level `markdown` field for orchestrator use.
+
+### `rocky preview create`
+
+Compute the prune set, copy the rest from the base schema, run only the prune set against a per-PR branch.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--base <REF>` | `string` | `main` | Git ref the change-set is computed against. Rocky shells out to `git diff --name-only <base>...HEAD` against the models directory. |
+| `--name <NAME>` | `string` | derived from current branch | Branch name to register in the state store. The branch's `schema_prefix` becomes `branch__<name>` and is the target schema for the pruned run. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+
+**Example.** Diff against `main` and create a preview branch:
+
+```bash
+rocky preview create --base main
+```
+
+```json
+{
+  "version": "1.18.0",
+  "command": "preview-create",
+  "branch_name": "preview-fix-price",
+  "branch_schema": "branch__preview-fix-price",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "prune_set": [
+    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": ["amount_cents"] },
+    { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
+  ],
+  "copy_set": [
+    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
+    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
+  ],
+  "skipped_set": [],
+  "run_id": "run-20260428-141033-002",
+  "run_status": "succeeded",
+  "duration_ms": 4321
+}
+```
+
+`copy_strategy` is `"ctas"` in Phase 1. Warehouse-native clones (`"shallow_clone"` on Databricks, `"zero_copy_clone"` on Snowflake) are a planned follow-up.
+
+### `rocky preview diff`
+
+Sampled row-level diff plus structural (column-level) diff for every model in the prune set.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
+| `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
+| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#sampling-correctness-ceiling). |
+
+**Example.** Render a Markdown report ready to post on a PR:
+
+```bash
+rocky preview diff --name preview-fix-price --output markdown
+```
+
+The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`. The `markdown` field embeds the rendered report verbatim — `rocky preview diff --output json | jq -r .markdown` is equivalent to `--output markdown`.
+
+### `rocky preview cost`
+
+Per-model cost delta between the branch run and the latest base-schema `RunRecord`.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
+| `--base <REF>` | `string` | `main` | Git ref the base run is identified by. |
+
+**Example.**
+
+```bash
+rocky preview cost --name preview-fix-price --output markdown
+```
+
+The JSON shape (`PreviewCostOutput`) reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+
+### Output shapes
+
+Wire contracts for all three subcommands are exported by `rocky export-schemas`:
+
+- `schemas/preview_create.schema.json`
+- `schemas/preview_diff.schema.json`
+- `schemas/preview_cost.schema.json`
+
+These back the autogenerated Pydantic and TypeScript bindings — see [JSON Output](/reference/json-output/) for the codegen pipeline and version compatibility contract.
+
+### Related Commands
+
+- [`rocky ci-diff`](#rocky-ci-diff) -- structural diff alone, without the pruned re-run or row-level sampling
+- [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) -- the schema-prefix branches `preview create` registers
+- [`rocky cost`](/reference/commands/administration/#rocky-cost) -- the per-run cost rollup `preview cost` diffs across base and branch
+- [`rocky compare`](/reference/cli/#rocky-compare) -- ad-hoc shadow comparison; `preview diff` extends the same kernel with sampled row-level diffing

@@ -1,0 +1,20 @@
+# 10-pr-preview-and-data-diff — Trust arc 1 ∩ arc 2: PR preview workflow
+#
+# Transformation pipeline (NOT replication) so the POC exercises the
+# preview prune-and-copy substrate end-to-end on a 5-model DAG.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+# Transformation pipelines use per-model `[target]` (catalog/schema) in
+# sidecar TOML files (see models/_defaults.toml). Only `adapter` and
+# `governance` are valid here.
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
