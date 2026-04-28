@@ -23,8 +23,9 @@ use crate::output::{
     CompileOutput, ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput,
     DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
     LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
-    ProfileStorageOutput, ReplayOutput, RetentionStatusOutput, RunOutput, SeedOutput, StateOutput,
-    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, ProfileStorageOutput, ReplayOutput,
+    RetentionStatusOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
+    TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -88,6 +89,9 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ReplayOutput>("replay"),
         entry::<TraceOutput>("trace"),
         entry::<CostOutput>("cost"),
+        entry::<PreviewCreateOutput>("preview_create"),
+        entry::<PreviewDiffOutput>("preview_diff"),
+        entry::<PreviewCostOutput>("preview_cost"),
         entry::<ComplianceOutput>("compliance"),
         entry::<RetentionStatusOutput>("retention_status"),
         // Config types feeding the VS Code project schema. Not CLI command

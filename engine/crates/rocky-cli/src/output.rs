@@ -3429,3 +3429,341 @@ impl RetentionStatusOutput {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `rocky preview` — PR preview workflow (Arc 1 ∩ Arc 2 user-facing surface)
+//
+// Three subcommands compose into a single PR comment:
+//   * `preview create` — pruned re-run on a per-PR branch with copy-from-base
+//                        for unchanged upstream
+//   * `preview diff`   — structural + sampled row-level diff vs. base
+//   * `preview cost`   — per-model bytes/duration/USD delta vs. base
+//
+// The shapes below are stable wire contracts: changing them requires
+// regenerating dagster Pydantic + vscode TypeScript bindings via
+// `just codegen` (see `engine/CLAUDE.md`).
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky preview create`.
+///
+/// Records the prune-and-copy decision plus the run summary for the branch
+/// execution. The `prune_set` lists models that re-executed; the `copy_set`
+/// lists models pre-populated from the base schema instead of being
+/// re-run. `skipped_set` is the empty-cost residue — neither changed
+/// nor downstream of a change.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewCreateOutput {
+    pub version: String,
+    pub command: String,
+    /// Branch name registered in the state store. Mirrors the `name`
+    /// from `rocky branch create`.
+    pub branch_name: String,
+    /// Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    pub branch_schema: String,
+    /// Git ref the change set was computed against. Mirrors `--base`.
+    pub base_ref: String,
+    /// Git SHA the diff was computed from (typically `HEAD`).
+    pub head_ref: String,
+    /// Models that re-executed against the branch.
+    pub prune_set: Vec<PreviewPrunedModel>,
+    /// Models pre-populated from the base schema instead of re-running.
+    /// Empty in Phase 1 if no models could be safely copied.
+    pub copy_set: Vec<PreviewCopiedModel>,
+    /// Models neither in the prune set nor copied — the column-level
+    /// pruner determined they are unaffected and not depended on by any
+    /// pruned model. Names only; rationale lives in the diff layer.
+    pub skipped_set: Vec<String>,
+    /// `RunRecord` id for the branch execution. Empty when no models
+    /// re-executed (a no-op preview where every changed model pruned
+    /// to zero downstream).
+    pub run_id: String,
+    /// `succeeded`, `partial`, or `failed` — mirrors `RunRecord.status`.
+    pub run_status: String,
+    pub duration_ms: u64,
+}
+
+/// One entry in [`PreviewCreateOutput::prune_set`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewPrunedModel {
+    pub model_name: String,
+    /// `"changed"` for models the diff identified directly, or
+    /// `"downstream_of_changed"` for models pulled in by column-level
+    /// lineage from a changed model.
+    pub reason: String,
+    /// Columns the diff reports as changed on this model. Only
+    /// populated when `reason = "changed"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed_columns: Vec<String>,
+}
+
+/// One entry in [`PreviewCreateOutput::copy_set`].
+///
+/// `copy_strategy` is `"ctas"` in Phase 1 (DuckDB CTAS or generic
+/// `CREATE TABLE AS SELECT *`); Phase 5 lifts this to `"shallow_clone"`
+/// (Databricks Delta) and `"zero_copy_clone"` (Snowflake) per the
+/// adapter's clone capability.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewCopiedModel {
+    pub model_name: String,
+    pub source_schema: String,
+    pub target_schema: String,
+    pub copy_strategy: String,
+}
+
+/// JSON output for `rocky preview diff`.
+///
+/// Combines the structural diff (column added/removed/type-changed) from
+/// the existing `rocky_core::ci_diff` machinery with a sampled row-level
+/// diff that extends the `rocky_core::compare`/`shadow` kernel.
+///
+/// **Sampling correctness ceiling.** Phase 2 sampling reads `LIMIT N`
+/// rows ordered by primary key (or first column). Changes outside that
+/// window appear as no-change unless the row count itself differs.
+/// `sampling_window.coverage_warning = true` flags this risk on the
+/// per-model level so reviewers don't infer false coverage. A
+/// checksum-bisection exhaustive diff is the Phase 2.5 lift.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewDiffOutput {
+    pub version: String,
+    pub command: String,
+    pub branch_name: String,
+    pub base_ref: String,
+    pub summary: PreviewDiffSummary,
+    pub models: Vec<PreviewModelDiff>,
+    /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
+    pub markdown: String,
+}
+
+/// Aggregate diff counts for [`PreviewDiffOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewDiffSummary {
+    pub models_with_changes: usize,
+    pub models_unchanged: usize,
+    pub total_rows_added: u64,
+    pub total_rows_removed: u64,
+    pub total_rows_changed: u64,
+    /// `true` if **any** per-model diff carries
+    /// `sampling_window.coverage_warning = true`.
+    pub any_coverage_warning: bool,
+}
+
+/// Per-model diff. Combines structural (column-level) and sampled
+/// (row-level) findings.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewModelDiff {
+    pub model_name: String,
+    pub structural: PreviewStructuralDiff,
+    pub sampled: PreviewSampledRowDiff,
+    pub sampling_window: PreviewSamplingWindow,
+}
+
+/// Column-level structural diff. Mirrors the shape produced by
+/// `rocky ci-diff` at the column granularity.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewStructuralDiff {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub added_columns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_columns: Vec<String>,
+    /// One entry per column whose type changed. Each carries `name`,
+    /// `from`, `to`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub type_changes: Vec<PreviewColumnTypeChange>,
+}
+
+/// One column-type change entry.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewColumnTypeChange {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Sampled row-level diff. All counts are over the sampling window.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewSampledRowDiff {
+    pub rows_added: u64,
+    pub rows_removed: u64,
+    pub rows_changed: u64,
+    /// Up to `--max-samples` (default 5) representative changed rows
+    /// for human review. Pure noise when sampling found no change.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<PreviewRowSample>,
+}
+
+/// One representative changed row in [`PreviewSampledRowDiff::samples`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewRowSample {
+    pub primary_key: String,
+    /// Pairs of `(column_name, base_value, branch_value)` for every
+    /// column that differs on this row.
+    pub changes: Vec<PreviewRowSampleChange>,
+}
+
+/// One `(column, base, branch)` triple in [`PreviewRowSample::changes`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewRowSampleChange {
+    pub column: String,
+    pub base_value: String,
+    pub branch_value: String,
+}
+
+/// Sampling-window metadata surfaced verbatim in the PR comment.
+///
+/// `coverage_warning = true` flags that the row count outside the
+/// sampling window is non-trivial; reviewers should not infer "no
+/// change" from a clean sample if this flag is set.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewSamplingWindow {
+    pub ordered_by: String,
+    pub limit: usize,
+    /// One of `"first_n_by_order"` (Phase 2) or `"checksum_bisection"`
+    /// (Phase 2.5 lift, not yet shipped).
+    pub coverage: String,
+    pub coverage_warning: bool,
+}
+
+/// JSON output for `rocky preview cost`.
+///
+/// Diff layer over `rocky cost latest`'s machinery. Per-model deltas
+/// are computed by looking up the latest base-schema `RunRecord` and
+/// the branch run's `RunRecord` and subtracting field-by-field.
+///
+/// `models_skipped_via_copy` is the prune-set complement: copied
+/// models did not run on the branch, so their delta is `None` and
+/// their savings accrue to `savings_from_copy_usd`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewCostOutput {
+    pub version: String,
+    pub command: String,
+    pub branch_name: String,
+    /// `RunRecord` id for the latest base-schema run that the branch
+    /// is being compared against. `None` when no base run exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_run_id: Option<String>,
+    /// `RunRecord` id for the branch execution. Empty when the branch
+    /// run was a no-op (every changed model pruned to zero downstream).
+    pub branch_run_id: String,
+    pub summary: PreviewCostSummary,
+    pub per_model: Vec<PreviewModelCostDelta>,
+    pub markdown: String,
+}
+
+/// Aggregate cost rollup for [`PreviewCostOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewCostSummary {
+    /// Sum of every per-model `branch_cost_usd` that produced a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_branch_cost_usd: Option<f64>,
+    /// Sum of every per-model `base_cost_usd` (limited to models in
+    /// the prune set — copied models contribute 0 here, accounted for
+    /// in `savings_from_copy_usd`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_base_cost_usd: Option<f64>,
+    /// `total_branch_cost_usd - total_base_cost_usd`. Positive = the
+    /// PR costs more to run than `main`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_usd: Option<f64>,
+    /// Number of models that did not run on the branch because they
+    /// were copied from base. Their savings show up below.
+    pub models_skipped_via_copy: usize,
+    /// Sum of `base_cost_usd` for every copied model — the cost the
+    /// PR avoided by copying instead of re-running. `None` when no
+    /// base costs are available for the copied models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub savings_from_copy_usd: Option<f64>,
+}
+
+/// Per-model cost delta.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewModelCostDelta {
+    pub model_name: String,
+    /// `true` if this model was copied from base instead of re-run.
+    /// When true, `branch_*` fields are `None` / `0` and the savings
+    /// for this row roll into [`PreviewCostSummary::savings_from_copy_usd`].
+    pub skipped_via_copy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_usd: Option<f64>,
+    pub branch_duration_ms: u64,
+    pub base_duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_bytes_scanned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_bytes_scanned: Option<u64>,
+}
+
+impl PreviewCreateOutput {
+    pub fn new(
+        branch_name: String,
+        branch_schema: String,
+        base_ref: String,
+        head_ref: String,
+        prune_set: Vec<PreviewPrunedModel>,
+        copy_set: Vec<PreviewCopiedModel>,
+        skipped_set: Vec<String>,
+        run_id: String,
+        run_status: String,
+        duration_ms: u64,
+    ) -> Self {
+        PreviewCreateOutput {
+            version: VERSION.to_string(),
+            command: "preview-create".to_string(),
+            branch_name,
+            branch_schema,
+            base_ref,
+            head_ref,
+            prune_set,
+            copy_set,
+            skipped_set,
+            run_id,
+            run_status,
+            duration_ms,
+        }
+    }
+}
+
+impl PreviewDiffOutput {
+    pub fn new(
+        branch_name: String,
+        base_ref: String,
+        summary: PreviewDiffSummary,
+        models: Vec<PreviewModelDiff>,
+        markdown: String,
+    ) -> Self {
+        PreviewDiffOutput {
+            version: VERSION.to_string(),
+            command: "preview-diff".to_string(),
+            branch_name,
+            base_ref,
+            summary,
+            models,
+            markdown,
+        }
+    }
+}
+
+impl PreviewCostOutput {
+    pub fn new(
+        branch_name: String,
+        base_run_id: Option<String>,
+        branch_run_id: String,
+        summary: PreviewCostSummary,
+        per_model: Vec<PreviewModelCostDelta>,
+        markdown: String,
+    ) -> Self {
+        PreviewCostOutput {
+            version: VERSION.to_string(),
+            command: "preview-cost".to_string(),
+            branch_name,
+            base_run_id,
+            branch_run_id,
+            summary,
+            per_model,
+            markdown,
+        }
+    }
+}
