@@ -8,6 +8,7 @@ import { history, metrics } from "./inspect";
 import { showLineage } from "./lineage";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
+import { previewCost, previewCreate, previewDiff } from "./preview";
 import { compare, discover, plan, run } from "./run";
 import { archive, compact, profileStorage } from "./storage";
 import { test } from "./test";
@@ -68,5 +69,10 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     // Health & analysis
     vscode.commands.registerCommand("rocky.doctor", doctor),
     vscode.commands.registerCommand("rocky.optimize", optimize),
+
+    // Preview (PR-bundle)
+    vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
+    vscode.commands.registerCommand("rocky.previewDiff", previewDiff),
+    vscode.commands.registerCommand("rocky.previewCost", previewCost),
   );
 }

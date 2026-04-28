@@ -3697,6 +3697,7 @@ pub struct PreviewModelCostDelta {
 }
 
 impl PreviewCreateOutput {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         branch_name: String,
         branch_schema: String,

@@ -2,8 +2,8 @@
 //!
 //! Three subcommands compose into a single PR comment:
 //!
-//! * `preview create` — pruned re-run on a per-PR branch with copy-from-base
-//!                      for unchanged upstream
+//! * `preview create` — pruned re-run on a per-PR branch with
+//!   copy-from-base for unchanged upstream
 //! * `preview diff`   — structural + sampled row-level diff vs. base
 //! * `preview cost`   — per-model bytes/duration/USD delta vs. base
 //!
@@ -130,12 +130,15 @@ pub async fn run_preview_create(
     // Step 6+7: register branch in state store. Idempotent — if the branch
     // already exists, surface a crisp error directing the user to
     // `rocky branch list`.
-    crate::commands::run_branch_create(state_path, &resolved_branch_name, None, /*json=*/ false)
-        .with_context(|| {
-            format!(
-                "failed to register preview branch '{resolved_branch_name}' in the state store"
-            )
-        })?;
+    crate::commands::run_branch_create(
+        state_path,
+        &resolved_branch_name,
+        None,
+        /*json=*/ false,
+    )
+    .with_context(|| {
+        format!("failed to register preview branch '{resolved_branch_name}' in the state store")
+    })?;
 
     let branch_schema = format!("branch__{resolved_branch_name}");
 
@@ -308,7 +311,13 @@ fn default_branch_name_from_git() -> Result<String> {
         // Slug: replace `/` and other path-unfriendly chars with `_`.
         let slug: String = raw
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         Ok(format!("pr-preview-{slug}"))
     }
@@ -547,8 +556,8 @@ impl ModelDag {
 /// malformed files — returns empty deps rather than failing the whole
 /// preview.
 fn read_depends_on(path: &Path) -> Result<Vec<String>> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading sidecar {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("reading sidecar {}", path.display()))?;
     let value: toml::Value = match toml::from_str(&text) {
         Ok(v) => v,
         Err(_) => return Ok(Vec::new()),
@@ -558,7 +567,7 @@ fn read_depends_on(path: &Path) -> Result<Vec<String>> {
     };
     Ok(arr
         .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .filter_map(|v| v.as_str().map(str::to_string))
         .collect())
 }
 

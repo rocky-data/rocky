@@ -173,3 +173,26 @@ export type {
   ComplianceSummary,
   EnvMaskingStatus,
 } from "./compliance";
+
+// Preview (PR-bundle: create branch, diff base vs branch, cost delta)
+export type {
+  PreviewCopiedModel,
+  PreviewCreateOutput,
+  PreviewPrunedModel,
+} from "./preview_create";
+export type {
+  PreviewColumnTypeChange,
+  PreviewDiffOutput,
+  PreviewDiffSummary,
+  PreviewModelDiff,
+  PreviewRowSample,
+  PreviewRowSampleChange,
+  PreviewSampledRowDiff,
+  PreviewSamplingWindow,
+  PreviewStructuralDiff,
+} from "./preview_diff";
+export type {
+  PreviewCostOutput,
+  PreviewCostSummary,
+  PreviewModelCostDelta,
+} from "./preview_cost";
