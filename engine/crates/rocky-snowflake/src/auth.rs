@@ -28,6 +28,40 @@ const JWT_TTL_SECS: u64 = 59 * 60;
 /// wasteful.
 const REFRESH_SLACK: Duration = Duration::from_secs(60);
 
+/// Snowflake auth token kind, used by the connector to set the
+/// `X-Snowflake-Authorization-Token-Type` header on REST API calls.
+///
+/// Snowflake's SQL API v2 documents three values today:
+/// - `KEYPAIR_JWT` for RS256 JWT signed with a private RSA key
+/// - `OAUTH` for OAuth access tokens (caller-supplied or IdP-issued)
+/// - no header at all when authenticating with a session token from
+///   the `/session/v1/login-request` endpoint — the server sniffs the
+///   token type from the token itself.
+///
+/// See <https://docs.snowflake.com/en/developer-guide/sql-api/authenticating>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenType {
+    /// RS256 key-pair JWT — sets `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`.
+    KeypairJwt,
+    /// OAuth access token — sets `X-Snowflake-Authorization-Token-Type: OAUTH`.
+    OAuth,
+    /// Session token from username/password login — no token-type header.
+    SessionToken,
+}
+
+impl TokenType {
+    /// Returns the `X-Snowflake-Authorization-Token-Type` header value for
+    /// this token kind, or `None` if no token-type header should be sent.
+    #[must_use]
+    pub fn header_value(self) -> Option<&'static str> {
+        match self {
+            TokenType::KeypairJwt => Some("KEYPAIR_JWT"),
+            TokenType::OAuth => Some("OAUTH"),
+            TokenType::SessionToken => None,
+        }
+    }
+}
+
 /// Errors from Snowflake authentication.
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -176,6 +210,18 @@ impl Auth {
                 },
             }),
             _ => Err(AuthError::NoAuthConfigured),
+        }
+    }
+
+    /// Returns the [`TokenType`] for this auth handle, used by the
+    /// connector to set the `X-Snowflake-Authorization-Token-Type`
+    /// header per Snowflake's SQL API v2 spec.
+    #[must_use]
+    pub fn token_type(&self) -> TokenType {
+        match &self.inner {
+            AuthInner::OAuth { .. } => TokenType::OAuth,
+            AuthInner::KeyPair { .. } => TokenType::KeypairJwt,
+            AuthInner::Password { .. } => TokenType::SessionToken,
         }
     }
 
@@ -373,8 +419,14 @@ impl Auth {
         }
     }
 
-    #[cfg(test)]
-    async fn prime_cache_with(&self, token: &str, ttl: Duration) {
+    /// Test-only helper: pre-populate the session/JWT cache with a
+    /// caller-supplied token. Lets integration tests (under
+    /// `feature = "test-support"`) skip the (expensive, fixture-heavy)
+    /// JWT-mint or login-request roundtrips and still exercise the
+    /// connector's per-mode header logic. No-op for OAuth, which has
+    /// no cache.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn prime_cache_with(&self, token: &str, ttl: Duration) {
         let new_cached = CachedToken {
             token: RedactedString::new(token.to_string()),
             expires_at: Instant::now() + ttl,
