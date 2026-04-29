@@ -1,6 +1,19 @@
 use std::time::Duration;
 
 use reqwest::Client;
+
+/// Build the shared `reqwest::Client` used for every Fivetran API call.
+/// `Client::new()` previously left both connect and request timeouts
+/// unset — a stalled connection would block `rocky run` forever. The
+/// 10s/120s pair matches the per-adapter `timeout_secs` default and the
+/// other engine adapters' bounds.
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("reqwest client builder is infallible with these options")
+}
 use rocky_core::config::RetryConfig;
 use rocky_core::redacted::RedactedString;
 use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
@@ -62,7 +75,7 @@ impl FivetranClient {
         let retry_budget =
             rocky_core::retry_budget::RetryBudget::from_config(retry.max_retries_per_run);
         FivetranClient {
-            client: Client::new(),
+            client: build_http_client(),
             base_url: "https://api.fivetran.com".to_string(),
             api_key: RedactedString::new(api_key),
             api_secret: RedactedString::new(api_secret),
@@ -83,7 +96,7 @@ impl FivetranClient {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_base_url(api_key: String, api_secret: String, base_url: String) -> Self {
         FivetranClient {
-            client: Client::new(),
+            client: build_http_client(),
             base_url,
             api_key: RedactedString::new(api_key),
             api_secret: RedactedString::new(api_secret),

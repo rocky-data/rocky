@@ -3,7 +3,7 @@
 //! Creates isolated branches for testing model changes without
 //! affecting production data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -61,14 +61,19 @@ pub fn diff_branch(
         let main_cols: Vec<String> = main_schemas.get(model).cloned().unwrap_or_default();
         let branch_cols: Vec<String> = branch_schemas.get(model).cloned().unwrap_or_default();
 
+        // Set membership probes are O(1) — replaces a quadratic
+        // `Vec::contains` scan that became measurable on wide tables.
+        let main_set: HashSet<&String> = main_cols.iter().collect();
+        let branch_set: HashSet<&String> = branch_cols.iter().collect();
+
         let added: Vec<String> = branch_cols
             .iter()
-            .filter(|c| !main_cols.contains(c))
+            .filter(|c| !main_set.contains(c))
             .cloned()
             .collect();
         let removed: Vec<String> = main_cols
             .iter()
-            .filter(|c| !branch_cols.contains(c))
+            .filter(|c| !branch_set.contains(c))
             .cloned()
             .collect();
 
