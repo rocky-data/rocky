@@ -987,7 +987,10 @@ from .types_generated import (  # noqa: E402, F401
     FailedSourceOutput,
     FreshnessConfigOutput,
     HistoryOutput,
+    LineageColumnChange,
     LineageColumnDef,
+    LineageDiffOutput,
+    LineageDiffResult,
     LineageEdgeRecord,
     LineageOutput,
     LineageQualifiedColumn,
@@ -1064,6 +1067,7 @@ RockyOutput = (
     | TestResult
     | CiResult
     | CiDiffOutput
+    | LineageDiffOutput
     | HistoryResult
     | ModelHistoryResult
     | MetricsResult
@@ -1096,6 +1100,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "test": TestResult,
     "ci": CiResult,
     "ci-diff": CiDiffOutput,
+    "lineage-diff": LineageDiffOutput,
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
     "cost": CostOutput,

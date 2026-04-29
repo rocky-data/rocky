@@ -22,10 +22,10 @@ use crate::output::{
     ClearSchemaCacheOutput, ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput,
     CompileOutput, ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput,
     DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
-    LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
-    PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, ProfileStorageOutput, ReplayOutput,
-    RetentionStatusOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
-    TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput,
+    OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
+    ProfileStorageOutput, ReplayOutput, RetentionStatusOutput, RunOutput, SeedOutput, StateOutput,
+    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -68,6 +68,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<AiTestOutput>("ai_test"),
         entry::<LineageOutput>("lineage"),
         entry::<ColumnLineageOutput>("column_lineage"),
+        entry::<LineageDiffOutput>("lineage_diff"),
         entry::<CompareOutput>("compare"),
         entry::<CompactOutput>("compact"),
         entry::<CompactDedupOutput>("compact_dedup"),

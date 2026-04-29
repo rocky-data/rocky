@@ -35,6 +35,13 @@ export type { CiOutput } from "./ci";
 // CI Diff
 export type { CiDiffOutput, DiffResult, DiffSummary } from "./ci_diff";
 
+// Lineage Diff (per-changed-column downstream blast-radius for PR review)
+export type {
+  LineageColumnChange,
+  LineageDiffOutput,
+  LineageDiffResult,
+} from "./lineage_diff";
+
 // Column lineage (per-column shape of `rocky lineage --column <col>`)
 export type { ColumnLineageOutput } from "./column_lineage";
 

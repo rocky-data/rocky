@@ -161,27 +161,16 @@ fn classify_model_changes(files: &[ChangedFile]) -> HashMap<String, ModelDiffSta
 
 /// Typed column from the compiler's type-check output.
 #[derive(Debug, Clone)]
-struct TypedColumn {
-    name: String,
-    data_type: String,
+pub(crate) struct TypedColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
 }
 
-/// Compile the models directory and extract per-model column schemas.
-fn compile_and_extract_schemas(
-    models_dir: &Path,
-    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
-) -> Result<HashMap<String, Vec<TypedColumn>>> {
-    let config = CompilerConfig {
-        models_dir: models_dir.to_path_buf(),
-        contracts_dir: None,
-        source_schemas,
-        source_column_info: HashMap::new(),
-        ..Default::default()
-    };
-
-    let result = compile::compile(&config)
-        .context("failed to compile models in the current working tree")?;
-
+/// Project the compiler's `typed_models` map into the local `TypedColumn` shape
+/// used by [`diff_columns`].
+fn typed_columns_from_compile(
+    result: &rocky_compiler::compile::CompileResult,
+) -> HashMap<String, Vec<TypedColumn>> {
     let mut schemas = HashMap::new();
     for (model_name, typed_cols) in &result.type_check.typed_models {
         let cols: Vec<TypedColumn> = typed_cols
@@ -193,8 +182,27 @@ fn compile_and_extract_schemas(
             .collect();
         schemas.insert(model_name.clone(), cols);
     }
+    schemas
+}
 
-    Ok(schemas)
+/// Compile the models directory and return the full compile result.
+///
+/// `lineage-diff` needs the result's `semantic_graph` to compute downstream
+/// traces; `ci-diff` only needs the per-model column schemas, which are
+/// projected via [`typed_columns_from_compile`].
+fn compile_head(
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> Result<rocky_compiler::compile::CompileResult> {
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas,
+        source_column_info: HashMap::new(),
+        ..Default::default()
+    };
+
+    compile::compile(&config).context("failed to compile models in the current working tree")
 }
 
 /// Try to extract schemas from the base ref by checking out model files to a temp dir.
@@ -455,6 +463,119 @@ fn build_diff_results(
 }
 
 // ---------------------------------------------------------------------------
+// Shared diff computation
+// ---------------------------------------------------------------------------
+
+/// Result of computing a CI diff.
+///
+/// `head_compile` is `None` when the models directory is missing or the
+/// HEAD compile fails — callers (e.g. `rocky lineage-diff`) that need the
+/// `semantic_graph` for downstream traces must handle that gracefully.
+pub(crate) struct CiDiffData {
+    pub(crate) summary: DiffSummary,
+    pub(crate) results: Vec<DiffResult>,
+    pub(crate) head_compile: Option<rocky_compiler::compile::CompileResult>,
+    /// Total count of files git reported as changed between `base_ref` and
+    /// HEAD (any extension, before the model-file filter). Lets callers
+    /// distinguish "PR is empty" from "PR is non-empty but only touches
+    /// non-model files".
+    pub(crate) changed_file_count: usize,
+}
+
+/// Compute the CI diff between `base_ref` and HEAD without printing.
+///
+/// Shared between `run_ci_diff` and `run_lineage_diff` so the lineage-diff
+/// command can enrich the per-column diff with downstream traces from
+/// HEAD's `semantic_graph` without rerunning git or the compiler.
+pub(crate) fn compute_ci_diff(
+    config_path: &Path,
+    state_path: &Path,
+    base_ref: &str,
+    models_dir: &Path,
+    cache_ttl_override: Option<u64>,
+) -> Result<CiDiffData> {
+    // Wave-2 of Arc 7 wave 2: load cached source schemas once and seed
+    // both compiles (current tree + base ref) with the same map so the
+    // resulting per-model type diffs measure real schema drift rather
+    // than `Unknown`-vs-`Unknown` noise. Degrades to empty when the
+    // cache is cold or `[cache.schemas] enabled = false`.
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
+        }
+        Err(_) => HashMap::new(),
+    };
+
+    let changed_files = git_changed_files(base_ref)?;
+    let changed_file_count = changed_files.len();
+    if changed_files.is_empty() {
+        return Ok(CiDiffData {
+            summary: DiffSummary {
+                total_models: 0,
+                unchanged: 0,
+                modified: 0,
+                added: 0,
+                removed: 0,
+            },
+            results: vec![],
+            head_compile: None,
+            changed_file_count,
+        });
+    }
+
+    let model_changes = classify_model_changes(&changed_files);
+    if model_changes.is_empty() {
+        return Ok(CiDiffData {
+            summary: DiffSummary {
+                total_models: 0,
+                unchanged: 0,
+                modified: 0,
+                added: 0,
+                removed: 0,
+            },
+            results: vec![],
+            head_compile: None,
+            changed_file_count,
+        });
+    }
+
+    // Compile HEAD: keep the full result so callers can reach into
+    // `semantic_graph`. Schema extraction below is a cheap projection.
+    let head_compile = if models_dir.is_dir() {
+        match compile_head(models_dir, source_schemas.clone()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                debug!("HEAD compilation failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let head_schemas = head_compile
+        .as_ref()
+        .map(typed_columns_from_compile)
+        .unwrap_or_default();
+
+    let base_schemas = if models_dir.is_dir() {
+        extract_base_schemas(base_ref, models_dir, source_schemas)
+    } else {
+        HashMap::new()
+    };
+
+    let results = build_diff_results(&model_changes, &head_schemas, &base_schemas);
+    let summary = DiffSummary::from_results(&results);
+
+    Ok(CiDiffData {
+        summary,
+        results,
+        head_compile,
+        changed_file_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Public command entry point
 // ---------------------------------------------------------------------------
 
@@ -467,103 +588,53 @@ pub fn run_ci_diff(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    // Wave-2 of Arc 7 wave 2: load cached source schemas once and seed
-    // both compiles (current tree + base ref) with the same map so the
-    // resulting per-model type diffs measure real schema drift rather
-    // than `Unknown`-vs-`Unknown` noise. Degrades to empty when the
-    // cache is cold or `[cache.schemas] enabled = false`.
-    // `cache_ttl_override` is the CLI `--cache-ttl` value (PR 4).
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        }
-        Err(_) => HashMap::new(),
-    };
-    // 1. Find changed files between base_ref and HEAD
-    let changed_files = git_changed_files(base_ref)?;
+    let data = compute_ci_diff(
+        config_path,
+        state_path,
+        base_ref,
+        models_dir,
+        cache_ttl_override,
+    )?;
 
-    if changed_files.is_empty() {
+    if data.results.is_empty() && data.summary.total_models == 0 {
+        // No model-level diff — distinguish "PR is empty" from "PR touched
+        // non-model files only" the same way `rocky ci-diff` did before
+        // the `compute_ci_diff` extraction.
         if output_json {
             let output = CiDiffOutput::new(
                 base_ref.to_string(),
                 "HEAD".to_string(),
-                DiffSummary {
-                    total_models: 0,
-                    unchanged: 0,
-                    modified: 0,
-                    added: 0,
-                    removed: 0,
-                },
+                data.summary,
                 vec![],
             );
             print_json(&output)?;
-        } else {
+        } else if data.changed_file_count == 0 {
             println!("Rocky CI Diff ({base_ref}...HEAD)\n");
             println!("No changed model files detected.");
-        }
-        return Ok(());
-    }
-
-    // 2. Classify model changes
-    let model_changes = classify_model_changes(&changed_files);
-
-    if model_changes.is_empty() {
-        if output_json {
-            let output = CiDiffOutput::new(
-                base_ref.to_string(),
-                "HEAD".to_string(),
-                DiffSummary {
-                    total_models: 0,
-                    unchanged: 0,
-                    modified: 0,
-                    added: 0,
-                    removed: 0,
-                },
-                vec![],
-            );
-            print_json(&output)?;
         } else {
             println!("Rocky CI Diff ({base_ref}...HEAD)\n");
             println!(
                 "{} file(s) changed, but no model files (.sql, .rocky) were affected.",
-                changed_files.len()
+                data.changed_file_count,
             );
         }
         return Ok(());
     }
 
-    // 3. Compile current working tree
-    let head_schemas = if models_dir.is_dir() {
-        compile_and_extract_schemas(models_dir, source_schemas.clone()).unwrap_or_else(|e| {
-            debug!("HEAD compilation failed: {e}");
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    };
-
-    // 4. Extract base schemas (best-effort)
-    let base_schemas = if models_dir.is_dir() {
-        extract_base_schemas(base_ref, models_dir, source_schemas)
-    } else {
-        HashMap::new()
-    };
-
-    // 5. Build diff results
-    let results = build_diff_results(&model_changes, &head_schemas, &base_schemas);
-    let summary = DiffSummary::from_results(&results);
-
-    // 6. Output
     if output_json {
-        let output = CiDiffOutput::new(base_ref.to_string(), "HEAD".to_string(), summary, results);
+        let output = CiDiffOutput::new(
+            base_ref.to_string(),
+            "HEAD".to_string(),
+            data.summary,
+            data.results,
+        );
         print_json(&output)?;
     } else {
         println!("Rocky CI Diff ({base_ref}...HEAD)\n");
-        print!("{}", format_diff_table(&results));
+        print!("{}", format_diff_table(&data.results));
         println!();
         println!("--- Markdown (for PR comment) ---\n");
-        print!("{}", format_diff_markdown(&results));
+        print!("{}", format_diff_markdown(&data.results));
     }
 
     Ok(())

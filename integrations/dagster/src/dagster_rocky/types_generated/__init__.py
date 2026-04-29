@@ -108,6 +108,13 @@ from .lineage_schema import (
     LineageQualifiedColumn,
 )
 
+# LineageDiff (per-changed-column downstream blast-radius for PR review)
+from .lineage_diff_schema import (
+    LineageColumnChange,
+    LineageDiffOutput,
+    LineageDiffResult,
+)
+
 # Metrics command
 from .metrics_schema import (
     ColumnTrendPoint,
