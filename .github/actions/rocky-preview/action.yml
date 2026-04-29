@@ -50,10 +50,10 @@ inputs:
     default: 'false'
   github_token:
     description: >-
-      Token used to read the PR and upsert the comment. Pass
-      `${{ github.token }}` (or a PAT for cross-repo permissions) from
-      the workflow. Required because composite actions cannot reference
-      `${{ github.token }}` in input defaults.
+      Token used to read the PR and upsert the comment. Pass the
+      workflow's github.token (or a PAT for cross-repo permissions).
+      Required because composite actions cannot reference the github
+      context in input defaults.
     required: true
 
 outputs:
