@@ -1,0 +1,36 @@
+# Forward-looking config sketch — a real out-of-tree adapter is not yet
+# wired through the engine's adapter registry, so the skeleton in
+# adapter/ is exercised by `cargo run --example demo` instead of by
+# `rocky run`. This block shows what the config WILL look like once
+# dynamic registration lands.
+#
+# [adapter.skeleton]
+# type           = "skeleton"                 # Matches AdapterManifest.name
+# host           = "${SKELETON_HOST}"
+# database       = "default"
+# timeout_secs   = 30
+#
+# [pipeline.demo]
+# strategy = "incremental"
+#
+# [pipeline.demo.target]
+# adapter          = "skeleton"
+# catalog_template = "rocky"
+# schema_template  = "raw__{source}"
+
+# Until then, every credential-free POC needs SOMETHING here so
+# `rocky validate` is happy — fall back to DuckDB.
+[adapter]
+type = "duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "demo"

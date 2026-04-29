@@ -39,6 +39,16 @@ for run in pocs/*/*/run.sh; do
         continue
     fi
 
+    # Skip POCs that require a Rust toolchain — a cold cargo build of a
+    # standalone POC crate (resolving deps from crates.io and compiling
+    # tokio/serde/etc.) consistently exceeds the 60s smoke timeout. These
+    # POCs are still verified by their own `cargo test` invocation.
+    if grep -qE 'cargo\s+(check|build|test|run)' "$run" 2>/dev/null; then
+        echo "--- SKIP $poc_dir (Rust toolchain — cold cargo build exceeds smoke timeout)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
     echo "=== RUN $poc_dir"
     if (cd "$poc_dir" && run_with_timeout bash run.sh > /tmp/poc-output.log 2>&1); then
         echo "    PASS"

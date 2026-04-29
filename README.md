@@ -124,6 +124,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#releases) for the full release flow.
 
 Full documentation: **[rocky-data.dev](https://rocky-data.dev)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
 
+Building a warehouse adapter Rocky doesn't ship in-tree (ClickHouse, Trino, Redshift, ...)? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [Rust-native skeleton POC](examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton/).
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Before opening a PR, please read the cross-project change guidance — schema and DSL changes must update consumers atomically.

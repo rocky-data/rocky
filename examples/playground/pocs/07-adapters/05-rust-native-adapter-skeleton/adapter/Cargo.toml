@@ -1,0 +1,28 @@
+[package]
+name = "rocky-adapter-skeleton"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "ClickHouse-shaped Rocky adapter skeleton — copy-and-edit starter"
+
+# Standalone crate (NOT a workspace member) so out-of-tree consumers can
+# see exactly what they need. Path-dep to the SDK because rocky-adapter-sdk
+# is not yet on crates.io; once it ships, replace this with a version dep.
+[dependencies]
+rocky-adapter-sdk = { path = "../../../../../../engine/crates/rocky-adapter-sdk" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+# Detach this crate from the rocky workspace at engine/Cargo.toml.
+# Without this, `cargo` walks up to engine/Cargo.toml and refuses because
+# this crate isn't in `members`.
+[workspace]
