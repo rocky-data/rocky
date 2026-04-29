@@ -6,9 +6,6 @@
 //!   copy-from-base for unchanged upstream
 //! * `preview diff`   — structural + sampled row-level diff vs. base
 //! * `preview cost`   — per-model bytes/duration/USD delta vs. base
-//!
-//! See `~/Developer/rocky-plans/plans/rocky-pr-preview-and-data-diff.md` for
-//! the design and the comparison to Fivetran's Smart Run.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
