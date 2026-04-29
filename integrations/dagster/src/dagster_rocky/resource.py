@@ -894,8 +894,16 @@ class RockyResource(dg.ConfigurableResource):
             object.__setattr__(self, "_version_checked", True)
             return
 
+        # Strip pre-release / build suffix before semver compare so dev
+        # builds like ``1.17.4-dev``, ``1.17.4-pre``, ``1.17.4-rc.2`` and
+        # ``1.17.4+sha.abc`` all gate against the matching release. Without
+        # this, ``int("4-dev")`` fails the parse and the version check
+        # silently skips — which is exactly how a too-old dev build slips
+        # past the gate.
+        core_version = version_str.split("-", 1)[0].split("+", 1)[0]
+
         try:
-            detected = tuple(int(p) for p in version_str.split(".")[:3])
+            detected = tuple(int(p) for p in core_version.split(".")[:3])
             required = tuple(int(p) for p in MIN_ROCKY_VERSION.split(".")[:3])
         except ValueError:
             # Non-semver output — skip check

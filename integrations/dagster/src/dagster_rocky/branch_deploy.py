@@ -117,6 +117,24 @@ def branch_deployment_info(env: dict[str, str] | None = None) -> BranchDeploymen
     )
 
 
+def _is_safe_pr_number(raw: str) -> bool:
+    """Return ``True`` when ``raw`` is a positive integer in string form.
+
+    The PR number is sourced from ``DAGSTER_CLOUD_PULL_REQUEST_ID`` and
+    flows verbatim into a SQL identifier suffix. Dagster+ controls the
+    env var in production, but mirroring or webhook-driven deployments
+    can place untrusted strings in front of it. Anything that isn't a
+    positive integer is rejected — the caller falls through to the
+    sanitized ``deployment_name`` branch instead, so a branch deployment
+    still gets a shadow suffix, just not one carrying the malformed
+    input.
+    """
+    if not raw or not raw.isdigit():
+        return False
+    # `isdigit()` guarantees ascii digits only; ``int`` parse won't raise.
+    return int(raw) > 0
+
+
 def branch_deploy_shadow_suffix(
     info: BranchDeploymentInfo | None = None,
 ) -> str | None:
@@ -130,8 +148,13 @@ def branch_deploy_shadow_suffix(
     The suffix is namespaced to keep parallel PRs isolated and to avoid
     collisions with manual ``rocky run --shadow`` invocations:
 
-      - PR-driven branch deploy: ``"_dagster_pr_<pr_number>"``
+      - PR-driven branch deploy with a *valid* numeric PR id:
+        ``"_dagster_pr_<pr_number>"``
+      - PR-driven branch deploy with an unparseable / non-numeric PR id:
+        falls through to the deployment-name branch (rejected: never
+        interpolated raw)
       - API-driven branch deploy: ``"_dagster_<deployment_name>"``
+        (with non-alphanumeric chars collapsed to underscores)
       - Anything else (production / non-Dagster+): ``None``
 
     Args:
@@ -141,7 +164,7 @@ def branch_deploy_shadow_suffix(
     info = info if info is not None else branch_deployment_info()
     if not info.is_branch_deployment:
         return None
-    if info.pr_number:
+    if info.pr_number and _is_safe_pr_number(info.pr_number):
         return f"_dagster_pr_{info.pr_number}"
     if info.deployment_name:
         # Sanitize: replace any character that isn't safe in a SQL

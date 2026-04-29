@@ -135,3 +135,95 @@ def test_shadow_suffix_fallback_when_no_pr_no_name():
         git_sha=None,
     )
     assert branch_deploy_shadow_suffix(info) == "_dagster_branch"
+
+
+# ---------------------------------------------------------------------------
+# pr_number sanitization (P1.3)
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_suffix_rejects_non_numeric_pr_number_falls_back_to_deployment_name():
+    """A non-numeric ``pr_number`` (the env var is webhook-controlled in
+    some setups) must never be interpolated raw into a SQL identifier
+    suffix. Instead, fall through to the sanitized ``deployment_name``
+    branch so the branch deployment still gets a stable shadow suffix."""
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="branch-deploy",
+        pr_number="42; DROP TABLE users",
+        git_sha=None,
+    )
+    suffix = branch_deploy_shadow_suffix(info)
+    # Falls through to deployment_name (sanitized), not the raw pr_number
+    assert suffix == "_dagster_branch_deploy"
+    assert "DROP" not in (suffix or "")
+    assert ";" not in (suffix or "")
+
+
+def test_shadow_suffix_rejects_pr_number_with_quotes():
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="x",
+        pr_number="42'--",
+        git_sha=None,
+    )
+    suffix = branch_deploy_shadow_suffix(info)
+    assert suffix == "_dagster_x"
+
+
+def test_shadow_suffix_rejects_negative_pr_number():
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="x",
+        pr_number="-1",
+        git_sha=None,
+    )
+    suffix = branch_deploy_shadow_suffix(info)
+    assert suffix == "_dagster_x"
+
+
+def test_shadow_suffix_rejects_zero_pr_number():
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="x",
+        pr_number="0",
+        git_sha=None,
+    )
+    suffix = branch_deploy_shadow_suffix(info)
+    assert suffix == "_dagster_x"
+
+
+def test_shadow_suffix_rejects_pr_number_with_whitespace():
+    """Leading/trailing spaces should be rejected — `isdigit()` already
+    handles this, but pin it as an explicit case."""
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="x",
+        pr_number=" 42 ",
+        git_sha=None,
+    )
+    suffix = branch_deploy_shadow_suffix(info)
+    assert suffix == "_dagster_x"
+
+
+def test_shadow_suffix_rejects_non_numeric_pr_number_no_deployment_name():
+    """When the pr_number is rejected and there's no deployment_name to
+    fall through to, the generic branch suffix wins."""
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name=None,
+        pr_number="not-a-number",
+        git_sha=None,
+    )
+    assert branch_deploy_shadow_suffix(info) == "_dagster_branch"
+
+
+def test_shadow_suffix_accepts_large_numeric_pr_number():
+    """Large but valid PR numbers still work."""
+    info = BranchDeploymentInfo(
+        is_branch_deployment=True,
+        deployment_name="x",
+        pr_number="999999",
+        git_sha=None,
+    )
+    assert branch_deploy_shadow_suffix(info) == "_dagster_pr_999999"
