@@ -84,6 +84,7 @@ from .compile_schema import (
 from .discover_schema import (
     ChecksConfigOutput,
     DiscoverOutput,
+    FailedSourceOutput,
     FreshnessConfigOutput,
     SourceOutput,
     TableOutput,
@@ -249,6 +250,7 @@ __all__ = [
     # discover
     "ChecksConfigOutput",
     "DiscoverOutput",
+    "FailedSourceOutput",
     "FreshnessConfigOutput",
     "SourceOutput",
     "TableOutput",

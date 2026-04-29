@@ -10,6 +10,7 @@ import dagster as dg
 
 from dagster_rocky import (
     DiscoverResult,
+    FailedSourceOutput,
     RockyResource,
     SourceInfo,
     TableInfo,
@@ -243,4 +244,86 @@ def test_cursor_handles_mixed_timezone_offsets():
         result = sensor(dg.build_sensor_context(cursor=cursor))
 
     # Sync (10:30 UTC) is later than cursor (10:00 UTC despite -02:00 offset)
+    assert len(result.run_requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# FR-014 — failed_sources plumbing through the codegen soft-swap
+# ---------------------------------------------------------------------------
+
+
+def _failed(source_id: str, *, error_class: str = "transient") -> FailedSourceOutput:
+    """Build a `FailedSourceOutput` matching the engine's wire shape.
+
+    The generated model uses ``schema_`` because ``schema`` collides with
+    pydantic's own attribute namespace; the alias ``"schema"`` is what
+    the engine actually emits over the wire. We construct via the alias
+    here for parity with the live JSON path the sensor exercises.
+    """
+    return FailedSourceOutput.model_validate(
+        {
+            "id": source_id,
+            "schema": f"{source_id}_schema",
+            "source_type": "fivetran",
+            "error_class": error_class,
+            "message": "fetch failed",
+        }
+    )
+
+
+def test_sensor_logs_failed_sources_warning_and_does_not_treat_as_deletion():
+    """FR-014: when discover surfaces ``failed_sources``, the sensor must
+    warn (so the operator notices) and must NOT advance / drop the cursor
+    entry for the failed id — a missing source on the next tick whose
+    prior fetch failed is "unknown state", not a deletion.
+    """
+    rocky = RockyResource()
+    # `s1` synced cleanly; `s2` failed. Cursor already knows about both
+    # so we can prove the failed-id cursor entry survives the tick.
+    cursor = json.dumps(
+        {
+            "s1": _ts(2026, 4, 8, 9).isoformat(),
+            "s2": _ts(2026, 4, 8, 9).isoformat(),
+        }
+    )
+    discover = DiscoverResult(
+        version="0.3.0",
+        command="discover",
+        sources=[_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10))],
+        failed_sources=[_failed("s2", error_class="timeout")],
+    )
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _build_sensor(rocky)
+        ctx = dg.build_sensor_context(cursor=cursor)
+        result = sensor(ctx)
+
+    # `s1` triggered as usual…
+    assert result.run_requests is not None
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+
+    # …and the cursor entry for the failed `s2` is preserved untouched
+    # so the next tick can re-evaluate it without losing state.
+    new_cursor = json.loads(result.cursor)
+    assert "s2" in new_cursor
+    assert new_cursor["s2"] == _ts(2026, 4, 8, 9).isoformat()
+
+
+def test_sensor_handles_empty_failed_sources_cleanly():
+    """The default-empty branch of the new field — sanity-check that a
+    `DiscoverResult` without `failed_sources` (legacy or clean run)
+    behaves exactly like the pre-FR-014 path."""
+    rocky = RockyResource()
+    discover = _discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)),
+    )
+    # No `failed_sources` provided — defaults to [].
+    assert discover.failed_sources == []
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _build_sensor(rocky)
+        result = sensor(dg.build_sensor_context(cursor=None))
+
+    assert result.run_requests is not None
     assert len(result.run_requests) == 1

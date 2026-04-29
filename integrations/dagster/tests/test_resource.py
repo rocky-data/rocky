@@ -26,6 +26,8 @@ from dagster_rocky.resource import (
     DEFAULT_TIMEOUT_SECONDS,
     MIN_ROCKY_VERSION,
     RockyResource,
+    _redact_argv,
+    _truncate_stderr_for_metadata,
     _validate_governance_override,
 )
 
@@ -1505,3 +1507,145 @@ def test_retention_status_forwards_env_flag(retention_status_json: str):
         rocky.retention_status(env="prod")
 
     assert captured[0] == ["retention-status", "--output", "json", "--env", "prod"]
+
+
+# ---------------------------------------------------------------------------
+# Argv redaction + stderr truncation (security hardening)
+# ---------------------------------------------------------------------------
+
+
+class TestRedactArgv:
+    """``_redact_argv`` masks the value of credential-bearing flags only.
+
+    The subprocess still receives the unredacted argv — only the *log
+    line* changes. Tests pin both that the value is masked and that
+    nothing else gets touched.
+    """
+
+    def test_idempotency_key_value_is_masked(self):
+        argv = [
+            "rocky",
+            "--config",
+            "rocky.toml",
+            "run",
+            "--filter",
+            "tenant=acme",
+            "--idempotency-key",
+            "abcd-secret-token",
+        ]
+        redacted = _redact_argv(argv)
+
+        # The flag itself stays intact so the log line still says what
+        # was passed; only the *next* token is replaced.
+        assert "--idempotency-key" in redacted
+        assert "***" in redacted
+        # The actual key MUST NOT survive into the redacted form.
+        assert "abcd-secret-token" not in redacted
+        # The flag's index is preserved and the redacted token sits
+        # immediately after it, matching the original positional shape.
+        idx = redacted.index("--idempotency-key")
+        assert redacted[idx + 1] == "***"
+
+    def test_governance_override_json_payload_is_masked(self):
+        # The governance-override value carries a JSON blob containing
+        # workspace IDs and grant principals — sensitive payload.
+        argv = [
+            "rocky",
+            "run",
+            "--governance-override",
+            '{"workspace_ids":[42],"grants":[{"principal":"svc-acct"}]}',
+        ]
+        redacted = _redact_argv(argv)
+        assert "--governance-override" in redacted
+        assert "***" in redacted
+        # No fragment of the JSON payload may leak.
+        assert "workspace_ids" not in " ".join(redacted)
+        assert "svc-acct" not in " ".join(redacted)
+
+    def test_non_sensitive_flags_pass_through(self):
+        # Non-sensitive flags (filter, partition, etc.) keep their values
+        # so debugging ``--filter tenant=acme`` stays informative.
+        argv = ["rocky", "run", "--filter", "tenant=acme", "--parallel", "4"]
+        redacted = _redact_argv(argv)
+        assert redacted == argv  # no changes
+
+    def test_multiple_sensitive_flags_each_redacted(self):
+        argv = [
+            "rocky",
+            "run",
+            "--governance-override",
+            '{"workspace_ids":[1]}',
+            "--filter",
+            "tenant=acme",
+            "--idempotency-key",
+            "key-2026-04-29",
+        ]
+        redacted = _redact_argv(argv)
+        # Both sensitive values masked; non-sensitive filter survives.
+        assert redacted.count("***") == 2
+        assert "tenant=acme" in redacted
+        assert "key-2026-04-29" not in redacted
+
+    def test_redaction_does_not_mutate_input(self):
+        # The redacted form is a *copy* — the subprocess argv must stay
+        # untouched so the real values still reach rocky.
+        argv = ["rocky", "--idempotency-key", "real-key"]
+        original = list(argv)
+        _redact_argv(argv)
+        assert argv == original
+
+
+class TestTruncateStderrForMetadata:
+    """``_truncate_stderr_for_metadata`` caps ``dg.Failure.metadata`` size."""
+
+    def test_short_input_unchanged(self):
+        stderr = "short error message"
+        assert _truncate_stderr_for_metadata(stderr) == stderr
+
+    def test_input_at_cap_unchanged(self):
+        # Exactly 8192 bytes — boundary case, must NOT add the marker.
+        stderr = "x" * 8192
+        out = _truncate_stderr_for_metadata(stderr)
+        assert out == stderr
+        assert "truncated" not in out
+
+    def test_oversize_input_truncated_with_marker(self):
+        # 20KB of stderr — well above the 8KB cap.
+        stderr = "x" * 20_000
+        out = _truncate_stderr_for_metadata(stderr)
+
+        # The output is bounded — the prefix is exactly ``cap`` bytes
+        # plus a single ~40-byte marker advertising the original size.
+        # 8KB + a generous marker headroom keeps the cap operator-friendly.
+        assert len(out) <= 8300
+        assert "truncated" in out
+        assert "20000 bytes" in out
+
+    def test_marker_advertises_correct_original_size(self):
+        # The marker must report the *input* length so operators know
+        # how much was clipped, not just that clipping happened.
+        stderr = "y" * 50_000
+        out = _truncate_stderr_for_metadata(stderr)
+        assert "50000 bytes" in out
+
+
+def test_run_rocky_failure_truncates_oversize_stderr_in_metadata():
+    """End-to-end: a Rocky failure with multi-KB stderr surfaces a
+    truncated string in ``dg.Failure.metadata``, not the raw blob.
+
+    Pins both the SEC fix (no unbounded blob in the Dagster UI) and the
+    operator-debugging path (the marker tells them how much was clipped).
+    """
+    rocky = RockyResource()
+    huge_stderr = "ERR " * 5000  # 20KB of stderr noise
+    with (
+        _patched_run(return_value=_completed(stdout="", stderr=huge_stderr, returncode=2)),
+        pytest.raises(dg.Failure) as excinfo,
+    ):
+        rocky._run_rocky(["discover"])
+
+    metadata = excinfo.value.metadata
+    assert "stderr" in metadata
+    text = metadata["stderr"].text
+    assert len(text) <= 8300
+    assert "truncated" in text
