@@ -1363,9 +1363,7 @@ impl BudgetConfig {
     /// True when no limit is configured — skip budget checking entirely.
     #[must_use]
     pub fn is_unset(&self) -> bool {
-        self.max_usd.is_none()
-            && self.max_duration_ms.is_none()
-            && self.max_bytes_scanned.is_none()
+        self.max_usd.is_none() && self.max_duration_ms.is_none() && self.max_bytes_scanned.is_none()
     }
 
     /// Compare observed totals against each configured limit.

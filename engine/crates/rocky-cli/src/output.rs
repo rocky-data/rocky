@@ -2803,7 +2803,9 @@ mod cost_finalize_tests {
         out.materializations.push(m2);
         out.populate_cost_summary("bigquery", &CostSection::default());
         assert_eq!(
-            out.cost_summary.as_ref().and_then(|s| s.total_bytes_scanned),
+            out.cost_summary
+                .as_ref()
+                .and_then(|s| s.total_bytes_scanned),
             Some(2_000_000),
         );
 
