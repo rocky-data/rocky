@@ -124,7 +124,10 @@ pub async fn get_schema_config(
     client: &crate::client::FivetranClient,
     connector_id: &str,
 ) -> Result<SchemaConfig, crate::client::FivetranError> {
-    let path = format!("/v1/connectors/{connector_id}/schemas");
+    let path = format!(
+        "/v1/connectors/{}/schemas",
+        crate::client::encode_path_segment(connector_id)
+    );
     client.get(&path).await
 }
 

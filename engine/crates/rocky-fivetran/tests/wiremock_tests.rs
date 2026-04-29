@@ -639,3 +639,95 @@ async fn test_discover_classifies_401_as_auth() {
         rocky_core::source::FailedSourceErrorClass::Auth
     );
 }
+
+/// Path-injection guard: user-supplied IDs must be percent-encoded before
+/// being interpolated into the URL path. The mock server is configured to
+/// match only on the encoded path, so a regression that drops encoding
+/// would surface as a 404-shaped error instead of the expected success.
+#[tokio::test]
+async fn test_list_connectors_percent_encodes_group_id() {
+    let server = MockServer::start().await;
+
+    // Caller passes a group_id that contains every metacharacter we care
+    // about: `/`, `?`, `#`, `..`, and `%`. The wire format must encode
+    // each of them so the server sees a single path segment.
+    let raw_group_id = "../evil/group?x=1#frag%2F";
+    let encoded = "%2E%2E%2Fevil%2Fgroup%3Fx%3D1%23frag%252F";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/groups/{encoded}/connectors")))
+        .and(query_param("limit", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": { "items": [], "next_cursor": null }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let result = connector::list_connectors(&client, raw_group_id)
+        .await
+        .expect("encoded request should succeed");
+    assert!(result.is_empty());
+}
+
+/// Same guard for `GET /v1/connectors/{id}` — single-connector lookups
+/// are the most exposed path because `connector_id` is the most common
+/// caller-controlled value in the discovery flow.
+#[tokio::test]
+async fn test_get_connector_percent_encodes_connector_id() {
+    let server = MockServer::start().await;
+
+    let raw_id = "conn/../admin?token=x";
+    let encoded = "conn%2F%2E%2E%2Fadmin%3Ftoken%3Dx";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/connectors/{encoded}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "id": "conn_safe",
+                "group_id": "g",
+                "service": "stripe",
+                "schema": "src__a__b__stripe",
+                "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                "succeeded_at": null,
+                "failed_at": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let conn = connector::get_connector(&client, raw_id)
+        .await
+        .expect("encoded request should succeed");
+    assert_eq!(conn.id, "conn_safe");
+}
+
+/// Same guard for `GET /v1/connectors/{id}/schemas`.
+#[tokio::test]
+async fn test_get_schema_config_percent_encodes_connector_id() {
+    let server = MockServer::start().await;
+
+    let raw_id = "id with space/and?slash";
+    let encoded = "id%20with%20space%2Fand%3Fslash";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/connectors/{encoded}/schemas")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": { "schemas": {} }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let cfg = schema::get_schema_config(&client, raw_id)
+        .await
+        .expect("encoded request should succeed");
+    assert!(cfg.schemas.is_empty());
+}

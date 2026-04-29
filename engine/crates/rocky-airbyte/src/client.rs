@@ -6,7 +6,20 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
+
+/// Percent-encode a user-supplied URL path component.
+///
+/// Uses RFC 3986 unreserved chars minus `.` — `-`, `_`, `~`, and ASCII
+/// alphanumerics pass through; `.` stays encoded so `..` cannot traverse
+/// out of the parent path. Every other byte (`/`, `?`, `#`, `%`, spaces,
+/// etc.) is percent-encoded. Apply at every interpolation site that takes
+/// caller-controlled input (connection IDs, etc.).
+fn encode_path_segment(segment: &str) -> String {
+    const PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
+    utf8_percent_encode(segment, PATH_SAFE).to_string()
+}
 
 /// Build the shared `reqwest::Client` used for every Airbyte API call.
 /// `Client::new()` left both connect and request timeouts unset — a
@@ -164,8 +177,16 @@ impl AirbyteClient {
     }
 
     /// Fetch a single connection by ID.
+    ///
+    /// `id` is percent-encoded before being interpolated into the URL path,
+    /// so caller-supplied IDs containing `/`, `?`, `#`, `..`, or `%` cannot
+    /// escape the `/v1/connections/` prefix.
     pub async fn get_connection(&self, id: &str) -> Result<Connection, AirbyteError> {
-        let url = format!("{}/v1/connections/{}", self.base_url, id);
+        let url = format!(
+            "{}/v1/connections/{}",
+            self.base_url,
+            encode_path_segment(id)
+        );
         self.get(&url).await
     }
 
@@ -287,6 +308,50 @@ mod tests {
     fn test_base_url_trailing_slash_stripped() {
         let client = AirbyteClient::new("https://api.airbyte.com/", None);
         assert_eq!(client.base_url, "https://api.airbyte.com");
+    }
+
+    #[test]
+    fn test_encode_path_segment_alphanumeric_passthrough() {
+        // Plain IDs are unchanged.
+        assert_eq!(encode_path_segment("conn_abc123"), "conn_abc123");
+    }
+
+    #[test]
+    fn test_encode_path_segment_unsafe_chars() {
+        // `.` is encoded so `..` cannot traverse out of `/v1/connections/`.
+        assert_eq!(encode_path_segment(".."), "%2E%2E");
+        // `/` is encoded so callers cannot forge a different path.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        // Query-injection vectors (`?`, `#`) are encoded.
+        assert_eq!(encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(encode_path_segment("a#b"), "a%23b");
+        // Pre-encoded payloads have their literal `%` re-encoded so the
+        // server sees the original byte stream.
+        assert_eq!(encode_path_segment("%2F"), "%252F");
+    }
+
+    /// Regression guard: the URL `get_connection` builds for a hostile
+    /// `id` must percent-encode every metacharacter so the server sees a
+    /// single path segment under `/v1/connections/` rather than a forged
+    /// path or a query-string injection.
+    #[test]
+    fn test_get_connection_url_encodes_id() {
+        let raw_id = "conn/../admin?x=1#frag%2F";
+        let encoded = encode_path_segment(raw_id);
+        let url = format!("https://api.airbyte.com/v1/connections/{encoded}");
+
+        let suffix = url
+            .strip_prefix("https://api.airbyte.com/v1/connections/")
+            .unwrap();
+
+        // The encoded segment is what the server actually receives.
+        assert_eq!(suffix, "conn%2F%2E%2E%2Fadmin%3Fx%3D1%23frag%252F");
+
+        // Defensive: ensure no raw metacharacter survived the encoding.
+        for c in ['/', '?', '#'] {
+            assert!(!suffix.contains(c), "raw {c:?} leaked into URL: {suffix}");
+        }
+        assert!(!suffix.contains(".."), "raw `..` leaked into URL: {suffix}");
     }
 
     #[test]

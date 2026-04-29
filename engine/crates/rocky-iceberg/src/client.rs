@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
 
 /// Build the shared `reqwest::Client` used for every Iceberg REST
@@ -244,11 +245,23 @@ impl IcebergCatalogClient {
 
 /// Encode a dot-separated namespace for the URL path.
 ///
-/// The Iceberg REST spec uses `%1F` (unit separator) to encode
-/// multi-level namespaces in URL paths. Single-level namespaces
-/// are passed through as-is.
+/// The Iceberg REST spec uses `%1F` (unit separator) to encode multi-level
+/// namespaces in URL paths. Each level is also percent-encoded so
+/// caller-supplied namespace parts cannot inject `/`, `?`, `#`, `..`, or
+/// other path-altering bytes into the URL. The encoding allows RFC 3986
+/// unreserved chars (`-`, `_`, `~`, alphanumerics) but explicitly encodes
+/// `.` so `..` traversal cannot escape the catalog prefix.
+///
+/// Order matters: split on `.`, percent-encode each part, then join with
+/// the literal `%1F` separator. Encoding after the join would re-encode
+/// the `%` of `%1F` to `%25` and break the spec-required separator.
 fn encode_namespace(namespace: &str) -> String {
-    namespace.replace('.', "%1F")
+    const PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
+    namespace
+        .split('.')
+        .map(|part| utf8_percent_encode(part, PATH_SAFE).to_string())
+        .collect::<Vec<_>>()
+        .join("%1F")
 }
 
 /// Computes exponential backoff from RetryConfig.
@@ -308,6 +321,58 @@ mod tests {
     #[test]
     fn test_encode_namespace_multi_level() {
         assert_eq!(encode_namespace("a.b.c"), "a%1Fb%1Fc");
+    }
+
+    #[test]
+    fn test_encode_namespace_unsafe_chars_in_part() {
+        // Each namespace part is percent-encoded so a hostile caller cannot
+        // inject `/`, `?`, `#`, or other path-altering bytes via a name.
+        // (Path-traversal via `..` is defused at the split: the input `..`
+        // becomes two empty parts joined by the `%1F` separator, so the
+        // server sees an empty-namespace-segment, not a parent traversal.)
+        assert_eq!(
+            encode_namespace("a/b"),
+            "a%2Fb",
+            "raw `/` would forge a different REST endpoint"
+        );
+        assert_eq!(
+            encode_namespace("ns?x=1"),
+            "ns%3Fx%3D1",
+            "`?` would graft a query string onto the URL"
+        );
+        assert_eq!(
+            encode_namespace("ns#frag"),
+            "ns%23frag",
+            "`#` would terminate the path on the server side"
+        );
+        assert_eq!(
+            encode_namespace("a%2F"),
+            "a%252F",
+            "literal `%` round-trips so the server sees the original byte"
+        );
+    }
+
+    #[test]
+    fn test_encode_namespace_dot_split_neutralises_traversal() {
+        // `.` is the spec-defined level separator. Splitting on `.` first
+        // means `..` decomposes into empty parts joined by `%1F`, so the
+        // result cannot represent a parent-directory traversal at the URL
+        // path level — `/v1/namespaces/%1F%1Fns/tables` is just an
+        // invalid namespace, not `/v1/namespaces/../ns/tables`.
+        assert_eq!(encode_namespace(".."), "%1F%1F");
+        assert_eq!(encode_namespace("..ns"), "%1F%1Fns");
+    }
+
+    #[test]
+    fn test_encode_namespace_multi_level_unsafe_each_part_encoded() {
+        // Order matters: each part is encoded individually before joining
+        // with the literal `%1F` separator. Encoding after the join would
+        // re-encode the `%` and break the Iceberg spec separator.
+        assert_eq!(
+            encode_namespace("a/x.b?y"),
+            "a%2Fx%1Fb%3Fy",
+            "each part must be encoded; `%1F` separator must remain literal"
+        );
     }
 
     #[test]
