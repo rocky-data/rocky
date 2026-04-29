@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-    "dagster>=1.13.0",
+    "dagster>=1.13.2",
     "pydantic>=2.0",
     "pygments>=2.20.0",
 ]
