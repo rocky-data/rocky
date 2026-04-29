@@ -77,6 +77,16 @@ class DiscoverResult(BaseModel):
     #: (defined further down with the run-output classes) resolves
     #: without explicit string quotes.
     excluded_tables: list[ExcludedTable] = []
+    #: Sources the discovery adapter attempted to fetch metadata for and
+    #: failed (transient HTTP error, timeout, rate-limit budget exhausted,
+    #: auth blip). Their absence from :attr:`sources` does NOT mean they
+    #: were removed upstream — consumers diffing against a prior run must
+    #: treat failed sources as "unknown state, do not delete." Empty when
+    #: discovery completed cleanly. See FR-014. Forward-references the
+    #: codegen-generated :class:`FailedSourceOutput` re-exported in the
+    #: round 9 bridge block below — ``from __future__ import annotations``
+    #: defers evaluation so the forward reference resolves at runtime.
+    failed_sources: list[FailedSourceOutput] = []
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +984,7 @@ from .types_generated import (  # noqa: E402, F401
     DriftOutput,
     DriftSummary,
     EnvMaskingStatus,
+    FailedSourceOutput,
     FreshnessConfigOutput,
     HistoryOutput,
     LineageColumnDef,

@@ -105,6 +105,7 @@ from .types import (
     DriftInfo,
     DriftTableResult,
     ExecutionSummary,
+    FailedSourceOutput,
     FreshnessConfig,
     HealthCheck,
     HealthStatus,
@@ -234,6 +235,7 @@ __all__ = [
     "DiscoverResult",
     "ChecksConfig",
     "FreshnessConfig",
+    "FailedSourceOutput",
     # Run
     "RunResult",
     "MaterializationInfo",

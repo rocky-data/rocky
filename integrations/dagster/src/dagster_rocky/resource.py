@@ -86,7 +86,72 @@ MIN_ROCKY_VERSION = "1.0.0"
 # tracing line or truncated blob without dumping potentially MB of noise.
 _JSON_ERROR_PREVIEW_BYTES = 500
 
+# Maximum bytes of stderr embedded into ``dg.Failure.metadata`` when a Rocky
+# subprocess fails. Rocky's tracing layer can emit megabytes of context for a
+# pathological run; the Dagster UI renders metadata inline and isn't designed
+# to host blobs that large, so we clip and append a marker advertising the
+# original byte count for operators who need the full payload.
+_STDERR_METADATA_CAP_BYTES = 8192
+
+# Argv flags whose immediately-following positional value is credential-bearing
+# or otherwise sensitive. When we log the constructed argv (e.g. for live
+# debugging in :meth:`_run_rocky_streaming`) we replace the value of any
+# matching flag with ``"***"`` so credentials don't leak into Dagster logs or
+# the operator's terminal. The subprocess itself still receives the real
+# value — only the *log line* is redacted.
+_REDACTED_ARGV_FLAGS = frozenset(
+    {
+        # `--governance-override <json>` carries a JSON blob with workspace IDs
+        # and grant tuples. Not strictly a "credential" but treated as
+        # sensitive so it never appears in shared logs or screenshots.
+        "--governance-override",
+        # `--idempotency-key <opaque>` is a caller-chosen token used to dedup
+        # runs. Treat as opaque secret material.
+        "--idempotency-key",
+    }
+)
+
 _TModel = TypeVar("_TModel", bound=BaseModel)
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Return a copy of ``argv`` with credential-bearing flag values masked.
+
+    Walks the list left-to-right; whenever a token equals one of
+    :data:`_REDACTED_ARGV_FLAGS`, the *next* token (the value) is replaced
+    with ``"***"``. The flag itself is kept verbatim so log lines stay
+    diagnostic ("we passed ``--idempotency-key ***``"). Useful for log
+    output only — never for the argv handed to the subprocess.
+    """
+    out: list[str] = []
+    redact_next = False
+    for token in argv:
+        if redact_next:
+            out.append("***")
+            redact_next = False
+            continue
+        out.append(token)
+        if token in _REDACTED_ARGV_FLAGS:
+            redact_next = True
+    return out
+
+
+def _truncate_stderr_for_metadata(stderr: str) -> str:
+    """Cap ``stderr`` at :data:`_STDERR_METADATA_CAP_BYTES` for ``dg.Failure``.
+
+    The Dagster UI renders ``dg.Failure.metadata`` inline; a multi-megabyte
+    stderr blob would overwhelm both the renderer and the database row.
+    When the input exceeds the cap, the prefix is preserved and a single
+    marker line is appended advertising the original size so operators who
+    need the full payload know to look in the Dagster compute logs / their
+    own subprocess capture instead.
+    """
+    if len(stderr) <= _STDERR_METADATA_CAP_BYTES:
+        return stderr
+    original_bytes = len(stderr)
+    return stderr[:_STDERR_METADATA_CAP_BYTES] + (
+        f"\n... [truncated, original {original_bytes} bytes]"
+    )
 
 
 def _validate_governance_override(override: dict | None) -> None:
@@ -899,7 +964,9 @@ class RockyResource(dg.ConfigurableResource):
 
         raise dg.Failure(
             description=f"Rocky command failed (exit {result.returncode})",
-            metadata={"stderr": dg.MetadataValue.text(result.stderr)},
+            metadata={
+                "stderr": dg.MetadataValue.text(_truncate_stderr_for_metadata(result.stderr)),
+            },
         )
 
     def _build_cmd(self, args: list[str]) -> list[str]:
@@ -1019,7 +1086,11 @@ class RockyResource(dg.ConfigurableResource):
             "rocky subprocess started: pid=%s timeout_s=%s cmd=%s",
             proc.pid,
             self.timeout_seconds,
-            " ".join(cmd),
+            # Redact credential-bearing argv values before they hit the log.
+            # The subprocess itself was already spawned with the real ``cmd``;
+            # this only sanitises what gets written into Dagster logs / the
+            # operator's terminal. See :func:`_redact_argv`.
+            " ".join(_redact_argv(cmd)),
         )
 
         # Sole-reader threads for the two pipes. Must be started before
@@ -1112,7 +1183,9 @@ class RockyResource(dg.ConfigurableResource):
                     f"Rocky command timed out after {self.timeout_seconds}s (watchdog-killed)"
                 ),
                 metadata={
-                    "stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:])),
+                    "stderr_tail": dg.MetadataValue.text(
+                        _truncate_stderr_for_metadata("\n".join(stderr_lines[-20:]))
+                    ),
                     "duration_ms": dg.MetadataValue.int(duration_ms),
                     "pid": dg.MetadataValue.int(proc.pid),
                 },
@@ -1128,7 +1201,9 @@ class RockyResource(dg.ConfigurableResource):
         raise dg.Failure(
             description=f"Rocky command failed (exit {proc.returncode})",
             metadata={
-                "stderr_tail": dg.MetadataValue.text("\n".join(stderr_lines[-20:])),
+                "stderr_tail": dg.MetadataValue.text(
+                    _truncate_stderr_for_metadata("\n".join(stderr_lines[-20:]))
+                ),
                 "duration_ms": dg.MetadataValue.int(duration_ms),
             },
         )
