@@ -21,7 +21,7 @@ No Jinja. No manifest. No parse step.
 
 ## The seven trust dimensions
 
-1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Git-grade workflow on a warehouse.
+1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
 2. **Cost attribution + budgets** — per-model cost on every run; `[budget]` block in `rocky.toml`; `budget_breach` hook event.
 3. **Resume + circuit breakers** — three-state `CircuitBreaker`, checkpointed run state, deploy safety.
 4. **Observability** — `rocky trace` Gantt output, OpenTelemetry OTLP export (feature-gated).
