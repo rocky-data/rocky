@@ -1,0 +1,378 @@
+name: 'Rocky Preview'
+description: >-
+  Run rocky preview create + diff + cost against a pull request and post a
+  single Markdown comment summarising the prune set, structural diff, and
+  cost delta. Idempotent across pushes via comment upsert.
+
+inputs:
+  base_ref:
+    description: 'Git ref to compare against (e.g. main, the PR base branch).'
+    required: true
+  branch_name:
+    description: >-
+      Preview branch name passed to `rocky preview` as `--name`. Defaults to
+      the PR head ref slugged for warehouse-schema safety. Pre-slug if you
+      pass it explicitly: only `[A-Za-z0-9_-]` are preserved, everything else
+      becomes `_`.
+    required: false
+    default: ''
+  models_dir:
+    description: 'Directory containing the model files. Passed to `rocky preview create --models`.'
+    required: false
+    default: 'models'
+  working_directory:
+    description: >-
+      Directory containing `rocky.toml`. The action cd's here before invoking
+      every rocky subcommand, so users with a non-root pipeline can point at
+      a subpath without restructuring the repo.
+    required: false
+    default: '.'
+  rocky_version:
+    description: >-
+      Engine version to install. `latest` (default) resolves the highest
+      `engine-v*` tag; otherwise pass a bare version like `1.17.4` or a full
+      tag like `engine-v1.17.4`.
+    required: false
+    default: 'latest'
+  comment_marker:
+    description: >-
+      HTML-comment magic string used to find and edit the existing PR
+      comment. Override only if you run multiple Rocky preview workflows on
+      the same PR and need to disambiguate them.
+    required: false
+    default: '<!-- rocky-preview -->'
+  fail_on_preview_error:
+    description: >-
+      When `true`, exit non-zero if any `rocky preview` subcommand fails. The
+      default (`false`) posts a failure section in the PR comment but lets
+      the PR check pass — preview is advisory.
+    required: false
+    default: 'false'
+  github_token:
+    description: >-
+      Token used to read the PR and upsert the comment. Pass the
+      workflow's github.token (or a PAT for cross-repo permissions).
+      Required because composite actions cannot reference the github
+      context in input defaults.
+    required: true
+
+outputs:
+  comment_url:
+    description: 'HTML URL of the upserted PR comment.'
+    value: ${{ steps.upsert-comment.outputs.comment_url }}
+  prune_set_size:
+    description: 'Number of models in the prune set (changed + downstream-of-changed).'
+    value: ${{ steps.run-preview.outputs.prune_set_size }}
+  delta_usd:
+    description: >-
+      Total branch-vs-base USD cost delta. Empty string when no paired runs
+      exist in the state store yet (e.g. before Phase 1.5 lands actual
+      branch-run execution, or on first preview against an unpopulated
+      base).
+    value: ${{ steps.run-preview.outputs.delta_usd }}
+
+runs:
+  using: 'composite'
+  steps:
+    # --- Step 1: install rocky ----------------------------------------------
+    #
+    # Use the engine's official install.sh on Linux/macOS and install.ps1 on
+    # Windows. Both scripts already filter to the `engine-v*` tag prefix and
+    # verify the SHA256 against the published checksums.txt — no caching is
+    # added because the scripts are fast (≈3-5s) and caching adds a failure
+    # mode (stale binary, key churn) that doesn't pay for itself yet.
+    - name: Install rocky (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        export ROCKY_INSTALL_DIR="$HOME/.local/bin"
+        mkdir -p "$ROCKY_INSTALL_DIR"
+        if [ "${{ inputs.rocky_version }}" = "latest" ]; then
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+        else
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "${{ inputs.rocky_version }}"
+        fi
+        echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Install rocky (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if ('${{ inputs.rocky_version }}' -ne 'latest') {
+          $env:ROCKY_VERSION = '${{ inputs.rocky_version }}'
+        }
+        irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
+        Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
+
+    # --- Step 2: run the three preview commands -----------------------------
+    #
+    # Each subcommand runs with `set +e` so a non-zero exit doesn't abort
+    # the script — the action always wants to post something to the PR even
+    # if one stage failed. Failures are collected into `_err` files that the
+    # comment-rendering step reads to compose a failure section.
+    #
+    # The `markdown` field lives inside the JSON output for diff and cost
+    # (no `--output markdown` flag exists). Create has no markdown field, so
+    # the action synthesises a one-liner from the structured prune/copy/run
+    # fields below.
+    - name: Run rocky preview
+      id: run-preview
+      shell: bash
+      env:
+        ROCKY_PREVIEW_BASE_REF: ${{ inputs.base_ref }}
+        ROCKY_PREVIEW_BRANCH_RAW: ${{ inputs.branch_name }}
+        ROCKY_PREVIEW_MODELS_DIR: ${{ inputs.models_dir }}
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.working_directory }}"
+
+        # Resolve the branch name. If the caller passed one, slug it for
+        # warehouse-schema safety (only [A-Za-z0-9_-]). Otherwise default
+        # from the PR head ref or git HEAD.
+        slug() {
+          printf '%s' "$1" | tr -c 'A-Za-z0-9-' '_' | sed 's/__*/_/g; s/^_//; s/_$//'
+        }
+        if [ -n "${ROCKY_PREVIEW_BRANCH_RAW}" ]; then
+          BRANCH_NAME="$(slug "${ROCKY_PREVIEW_BRANCH_RAW}")"
+        else
+          # Fallback: the head ref env var GitHub sets on pull_request
+          # events, slugged. Detached-HEAD safety is delegated to the CLI.
+          if [ -n "${GITHUB_HEAD_REF:-}" ]; then
+            BRANCH_NAME="pr-preview-$(slug "$GITHUB_HEAD_REF")"
+          else
+            BRANCH_NAME=""
+          fi
+        fi
+
+        WORK="$RUNNER_TEMP/rocky-preview"
+        mkdir -p "$WORK"
+
+        # ---- preview create ----
+        CREATE_ARGS=(preview create --base "$ROCKY_PREVIEW_BASE_REF" --models "$ROCKY_PREVIEW_MODELS_DIR")
+        if [ -n "$BRANCH_NAME" ]; then
+          CREATE_ARGS+=(--name "$BRANCH_NAME")
+        fi
+        if rocky "${CREATE_ARGS[@]}" > "$WORK/create.json" 2> "$WORK/create.err"; then
+          : > "$WORK/create_failed"
+        else
+          echo failed > "$WORK/create_failed"
+        fi
+
+        # If `branch_name` was empty and the CLI defaulted, recover the
+        # actual name from the create output so diff/cost target the right
+        # branch. Empty fallback covers the unlikely case where create
+        # failed before emitting JSON.
+        if [ -z "$BRANCH_NAME" ] && [ -s "$WORK/create.json" ]; then
+          BRANCH_NAME="$(jq -r '.branch_name // ""' "$WORK/create.json" 2>/dev/null || true)"
+        fi
+
+        # ---- preview diff ----
+        : > "$WORK/diff.json"
+        if [ -n "$BRANCH_NAME" ]; then
+          if rocky preview diff --name "$BRANCH_NAME" --base "$ROCKY_PREVIEW_BASE_REF" \
+              > "$WORK/diff.json" 2> "$WORK/diff.err"; then
+            : > "$WORK/diff_failed"
+          else
+            echo failed > "$WORK/diff_failed"
+          fi
+        else
+          echo failed > "$WORK/diff_failed"
+          echo "branch name unresolved (preview create did not emit one)" > "$WORK/diff.err"
+        fi
+
+        # ---- preview cost ----
+        : > "$WORK/cost.json"
+        if [ -n "$BRANCH_NAME" ]; then
+          if rocky preview cost --name "$BRANCH_NAME" \
+              > "$WORK/cost.json" 2> "$WORK/cost.err"; then
+            : > "$WORK/cost_failed"
+          else
+            echo failed > "$WORK/cost_failed"
+          fi
+        else
+          echo failed > "$WORK/cost_failed"
+          echo "branch name unresolved (preview create did not emit one)" > "$WORK/cost.err"
+        fi
+
+        # ---- expose downstream outputs ----
+        PRUNE_SIZE="$(jq -r '.prune_set | length' "$WORK/create.json" 2>/dev/null || echo 0)"
+        DELTA_USD="$(jq -r '.summary.delta_usd // empty' "$WORK/cost.json" 2>/dev/null || true)"
+        echo "prune_set_size=$PRUNE_SIZE" >> "$GITHUB_OUTPUT"
+        echo "delta_usd=$DELTA_USD" >> "$GITHUB_OUTPUT"
+        echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+        echo "work_dir=$WORK" >> "$GITHUB_OUTPUT"
+
+    # --- Step 3: assemble the Markdown comment body -------------------------
+    #
+    # Concatenates a synthesised Create section with the diff and cost
+    # `markdown` fields, plus a fenced failure section per failed stage.
+    # No HTML escaping needed — diff/cost markdown is engine-rendered and
+    # deterministic; failure sections quote stderr in a fenced block.
+    - name: Render PR comment body
+      id: render
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.run-preview.outputs.work_dir }}
+        BRANCH_NAME: ${{ steps.run-preview.outputs.branch_name }}
+        BASE_REF: ${{ inputs.base_ref }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+      run: |
+        set -euo pipefail
+        BODY="$RUNNER_TEMP/rocky-preview-body.md"
+        : > "$BODY"
+
+        printf '%s\n' "$COMMENT_MARKER" >> "$BODY"
+        printf '## Rocky preview — `%s` vs `%s`\n\n' "${BRANCH_NAME:-?}" "$BASE_REF" >> "$BODY"
+
+        # ---- create section ----
+        if [ ! -s "$WORK_DIR/create_failed" ] && [ -s "$WORK_DIR/create.json" ]; then
+          PRUNE="$(jq -r '.prune_set | length' "$WORK_DIR/create.json")"
+          COPY="$(jq -r '.copy_set | length' "$WORK_DIR/create.json")"
+          SKIPPED="$(jq -r '.skipped_set | length' "$WORK_DIR/create.json")"
+          STATUS="$(jq -r '.run_status' "$WORK_DIR/create.json")"
+          RUN_ID="$(jq -r '.run_id // ""' "$WORK_DIR/create.json")"
+          # An empty prune set means no model files actually changed in
+          # this PR (whitespace-only edits, doc tweaks under models/, etc).
+          # Copy set is the inverse — all N working-DAG models. Use prune
+          # alone as the no-op signal; copy will be non-zero whenever the
+          # project has any models at all.
+          if [ "$PRUNE" = "0" ]; then
+            printf '_This PR does not change any pipeline models._\n\n' >> "$BODY"
+          else
+            printf '**Plan** — pruned: %s • copied: %s • skipped: %s • status: `%s`%s\n\n' \
+              "$PRUNE" "$COPY" "$SKIPPED" "$STATUS" \
+              "$([ -n "$RUN_ID" ] && printf ' • run_id: `%s`' "$RUN_ID" || true)" \
+              >> "$BODY"
+          fi
+        else
+          printf '### :x: `rocky preview create` failed\n\n```\n' >> "$BODY"
+          if [ -s "$WORK_DIR/create.err" ]; then
+            head -c 8192 "$WORK_DIR/create.err" >> "$BODY"
+          else
+            printf '(no stderr captured)' >> "$BODY"
+          fi
+          printf '\n```\n\n' >> "$BODY"
+          if grep -q 'unknown revision\|bad revision\|not found' "$WORK_DIR/create.err" 2>/dev/null; then
+            printf "> :information_source: Couldn't compute base — was the base branch fetched? Set \`fetch-depth: 0\` on \`actions/checkout\`.\n\n" >> "$BODY"
+          fi
+        fi
+
+        # ---- diff section ----
+        printf -- '---\n\n' >> "$BODY"
+        if [ ! -s "$WORK_DIR/diff_failed" ] && [ -s "$WORK_DIR/diff.json" ]; then
+          MD="$(jq -r '.markdown // ""' "$WORK_DIR/diff.json")"
+          if [ -n "$MD" ]; then
+            printf '%s\n\n' "$MD" >> "$BODY"
+          else
+            printf '_No diff payload._\n\n' >> "$BODY"
+          fi
+        else
+          printf '### :x: `rocky preview diff` failed\n\n```\n' >> "$BODY"
+          if [ -s "$WORK_DIR/diff.err" ]; then
+            head -c 8192 "$WORK_DIR/diff.err" >> "$BODY"
+          else
+            printf '(no stderr captured)' >> "$BODY"
+          fi
+          printf '\n```\n\n' >> "$BODY"
+        fi
+
+        # ---- cost section ----
+        printf -- '---\n\n' >> "$BODY"
+        if [ ! -s "$WORK_DIR/cost_failed" ] && [ -s "$WORK_DIR/cost.json" ]; then
+          MD="$(jq -r '.markdown // ""' "$WORK_DIR/cost.json")"
+          if [ -n "$MD" ]; then
+            printf '%s\n\n' "$MD" >> "$BODY"
+          else
+            printf '_No cost payload._\n\n' >> "$BODY"
+          fi
+        else
+          printf '### :x: `rocky preview cost` failed\n\n```\n' >> "$BODY"
+          if [ -s "$WORK_DIR/cost.err" ]; then
+            head -c 8192 "$WORK_DIR/cost.err" >> "$BODY"
+          else
+            printf '(no stderr captured)' >> "$BODY"
+          fi
+          printf '\n```\n\n' >> "$BODY"
+        fi
+
+        printf -- '---\n\n_Posted by `.github/actions/rocky-preview`._\n' >> "$BODY"
+
+        echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
+
+    # --- Step 4: upsert the PR comment --------------------------------------
+    #
+    # Skipped on non-PR triggers (the action gracefully no-ops when there's
+    # no PR context). Uses actions/github-script — already a transitive
+    # dependency of the GitHub-hosted runner image, no marketplace
+    # dependency added. Body is read from disk so multi-kilobyte payloads
+    # don't blow the env-var size limit.
+    - name: Upsert PR comment
+      id: upsert-comment
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        BODY_PATH: ${{ steps.render.outputs.body_path }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const body = fs.readFileSync(process.env.BODY_PATH, 'utf8');
+          const marker = process.env.COMMENT_MARKER;
+          const issue_number = context.payload.pull_request.number;
+          const { owner, repo } = context.repo;
+
+          // Find an existing comment carrying our marker. Iterate via the
+          // paginate helper so PRs with hundreds of comments still land on
+          // the right one.
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number,
+            per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+          let url;
+          if (existing) {
+            const { data } = await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existing.id,
+              body,
+            });
+            url = data.html_url;
+          } else {
+            const { data } = await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+            url = data.html_url;
+          }
+          core.setOutput('comment_url', url);
+
+    # --- Step 5: optional fail-the-check propagation ------------------------
+    - name: Propagate preview failure
+      if: ${{ inputs.fail_on_preview_error == 'true' }}
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.run-preview.outputs.work_dir }}
+      run: |
+        set -e
+        FAILED=0
+        for f in create_failed diff_failed cost_failed; do
+          if [ -s "$WORK_DIR/$f" ]; then
+            echo "::error::rocky preview ${f%_failed} failed"
+            FAILED=1
+          fi
+        done
+        if [ "$FAILED" = "1" ]; then
+          exit 1
+        fi
+
+branding:
+  icon: 'git-pull-request'
+  color: 'blue'

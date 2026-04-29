@@ -137,6 +137,70 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op
 
 ## Posting to a PR
 
-For now, `rocky preview` is a local CLI workflow. You run the three commands, copy the Markdown into your PR description by hand (or pipe it via your shell), and the reviewer sees the same artifacts you do.
+`rocky preview` ships a composite GitHub Action that runs all three commands on every push to a pull request and upserts a single Markdown comment with the prune/copy/skip plan, the structural diff, and the cost delta. The action lives at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview) and is drop-in for any repo with a `rocky.toml` and a `models/` directory.
 
-A composite GitHub Action that runs all three and upserts a single PR comment is on the roadmap as a follow-up. When it lands, it will live at `.github/actions/rocky-preview/` and be drop-in for any repo. Until then, the [CI/CD Integration guide](/guides/ci-cd/) covers the existing patterns for posting Rocky output to PR comments — `rocky preview` plugs into the same `gh pr comment --body-file` pattern.
+### Setting up the GitHub Action
+
+Add the workflow below to `.github/workflows/preview.yml` in your own repo:
+
+```yaml
+name: rocky-preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # required for git diff against the base branch
+
+      - uses: rocky-data/rocky/.github/actions/rocky-preview@main
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          branch_name: ${{ github.event.pull_request.head.ref }}
+          github_token: ${{ github.token }}
+          # working_directory: my-pipeline   # if rocky.toml lives in a subdir
+          # models_dir: models               # default
+          # rocky_version: latest            # or 1.17.4 / engine-v1.17.4
+```
+
+The first PR after wiring this in will install Rocky and post a comment with the plan, the diff, and the cost delta. Subsequent pushes update that same comment in place via the `<!-- rocky-preview -->` marker — no PR-comment spam.
+
+### Action inputs
+
+| Input | Default | Description |
+|---|---|---|
+| `base_ref` | (required) | Git ref to compare against. Typically `${{ github.event.pull_request.base.ref }}`. |
+| `branch_name` | PR head ref, slugged | Preview branch name passed to `rocky preview --name`. Pre-slug if you pass it explicitly: only `[A-Za-z0-9_-]` are preserved. |
+| `models_dir` | `models` | Directory containing model files. Passed to `rocky preview create --models`. |
+| `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
+| `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.17.4` or `engine-v1.17.4`. |
+| `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
+| `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory — failures still post a section in the comment. |
+| `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |
+
+### Action outputs
+
+| Output | Description |
+|---|---|
+| `comment_url` | HTML URL of the upserted PR comment. |
+| `prune_set_size` | Number of models in the prune set (changed + downstream-of-changed). |
+| `delta_usd` | Total branch-vs-base USD cost delta. Empty when no paired runs exist yet (e.g. first preview against an unpopulated base). |
+
+### Failure modes
+
+The action is designed to never block a PR by default:
+
+- A `rocky preview <subcommand>` failure surfaces as an `:x:` section in the comment with the captured stderr.
+- A missing or unfetched base ref produces a hint to add `fetch-depth: 0` to `actions/checkout`.
+- A PR that touches no model files renders a tight one-liner (`This PR does not change any pipeline models.`) instead of empty diff/cost tables.
+
+Set `fail_on_preview_error: true` to turn any of those into a hard PR-check failure.

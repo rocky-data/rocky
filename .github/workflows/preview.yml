@@ -1,0 +1,51 @@
+name: rocky-preview
+
+# Self-test for the `.github/actions/rocky-preview` composite action.
+#
+# Triggers on PRs that touch any model under the playground POCs so the
+# action is exercised end-to-end on real (toy) pipelines without paying for
+# warehouse credits — the playground POCs run on DuckDB.
+#
+# This is also the canonical reference for users wiring the action into
+# their own repos: copy the snippet under `Setting up the GitHub Action` in
+# `docs/src/content/docs/guides/preview-a-pr.md` and adjust the path filter
+# to match where your `models/` directory lives.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      # Narrow to the specific POC the action targets — broader POC paths
+      # would still trigger the workflow but have nothing to diff at the
+      # configured `working_directory`. Widen in lockstep with the action's
+      # working_directory if the self-test ever points at another POC.
+      - 'examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff/models/**'
+      - '.github/actions/rocky-preview/**'
+      - '.github/workflows/preview.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    name: Rocky preview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Required for `git diff <base_ref>...HEAD` inside the action.
+          fetch-depth: 0
+
+      - name: Run rocky preview
+        uses: ./.github/actions/rocky-preview
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          branch_name: ${{ github.event.pull_request.head.ref }}
+          # The playground POC at `06-developer-experience/10-pr-preview-and-data-diff`
+          # is the canonical Phase-4 self-test fixture. Other POCs are
+          # path-filtered into the trigger but the action itself only acts
+          # on what lives at `working_directory/models_dir`.
+          working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
+          models_dir: models
+          github_token: ${{ github.token }}
