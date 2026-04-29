@@ -664,6 +664,23 @@ enum Command {
         models: PathBuf,
     },
 
+    /// Per-changed-column downstream impact, formatted for PR review
+    ///
+    /// Combines the structural diff from `rocky ci-diff` (added / removed /
+    /// type-changed columns between two git refs) with the downstream
+    /// blast-radius from `rocky lineage --downstream` (consumers of each
+    /// changed column on HEAD's compile). Outputs JSON (for CI pipelines)
+    /// and Markdown (drop into a GitHub PR comment) so reviewers see in
+    /// one command which downstream columns each PR change reaches.
+    LineageDiff {
+        /// Git ref to compare against (default: main)
+        #[arg(default_value = "main")]
+        base_ref: String,
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+
     /// Scaffold a new warehouse adapter crate
     InitAdapter {
         /// Adapter name (e.g., "bigquery", "redshift")
@@ -1654,6 +1671,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
         }
         Command::CiDiff { base_ref, models } => rocky_cli::commands::run_ci_diff(
+            &cli.config,
+            &state_path,
+            &base_ref,
+            &models,
+            json,
+            cli.cache_ttl,
+        ),
+        Command::LineageDiff { base_ref, models } => rocky_cli::commands::run_lineage_diff(
             &cli.config,
             &state_path,
             &base_ref,

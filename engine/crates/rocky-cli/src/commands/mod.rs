@@ -25,6 +25,7 @@ mod import_dbt;
 mod init;
 mod init_adapter;
 mod lineage;
+mod lineage_diff;
 mod list;
 mod load;
 mod lsp;
@@ -81,6 +82,7 @@ pub use import_dbt::run_import_dbt;
 pub use init::init;
 pub use init_adapter::run_init_adapter;
 pub use lineage::run_lineage;
+pub use lineage_diff::run_lineage_diff;
 pub use list::{
     list_adapters, list_consumers, list_deps, list_models, list_pipelines, list_sources,
 };

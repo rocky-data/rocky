@@ -1,0 +1,217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ColumnChangeType": {
+      "description": "The kind of change observed for a single column.",
+      "oneOf": [
+        {
+          "description": "Column was added in the incoming side.",
+          "enum": [
+            "added"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Column was removed (present on base, absent on incoming).",
+          "enum": [
+            "removed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Column data type changed between base and incoming.",
+          "enum": [
+            "type_changed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "DiffSummary": {
+      "description": "High-level summary across all models in a diff run.",
+      "properties": {
+        "added": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "modified": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "removed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_models": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unchanged": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "added",
+        "modified",
+        "removed",
+        "total_models",
+        "unchanged"
+      ],
+      "type": "object"
+    },
+    "LineageColumnChange": {
+      "description": "Per-column structural change augmented with downstream consumers.",
+      "properties": {
+        "change_type": {
+          "$ref": "#/definitions/ColumnChangeType"
+        },
+        "column_name": {
+          "type": "string"
+        },
+        "downstream_consumers": {
+          "description": "Columns reached by walking the lineage graph downstream from `(model_name, column_name)` on HEAD's compile. Empty when the column no longer exists on HEAD (e.g. for removed columns) or when the trace finds no consumers.",
+          "items": {
+            "$ref": "#/definitions/LineageQualifiedColumn"
+          },
+          "type": "array"
+        },
+        "new_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "old_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "change_type",
+        "column_name"
+      ],
+      "type": "object"
+    },
+    "LineageDiffResult": {
+      "description": "One model's worth of structural + lineage diff.",
+      "properties": {
+        "column_changes": {
+          "items": {
+            "$ref": "#/definitions/LineageColumnChange"
+          },
+          "type": "array"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/ModelDiffStatus"
+        }
+      },
+      "required": [
+        "column_changes",
+        "model_name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "LineageQualifiedColumn": {
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "model"
+      ],
+      "type": "object"
+    },
+    "ModelDiffStatus": {
+      "description": "Status of a single model in the diff.",
+      "oneOf": [
+        {
+          "description": "Model output is identical across both sides.",
+          "enum": [
+            "unchanged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists on both sides but output differs.",
+          "enum": [
+            "modified"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists only on the incoming (PR) side.",
+          "enum": [
+            "added"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Model exists only on the base (target branch) side.",
+          "enum": [
+            "removed"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky lineage-diff <base_ref>`.\n\nCombines the structural per-column diff produced by `rocky ci-diff` (added/removed/type-changed columns between two git refs) with the downstream blast-radius from `rocky lineage --downstream` (consumers of each changed column, traced through HEAD's semantic graph).\n\nThe markdown payload is rendered server-side and ready to drop into a PR comment — answers \"what does this PR change downstream?\" in one command.\n\nTrace direction is fixed to **downstream from HEAD only** in v1. Removed columns therefore report an empty consumer set (the column no longer exists on HEAD's compile, so its downstream reach can't be walked); the structural diff still surfaces the removal.",
+  "properties": {
+    "base_ref": {
+      "description": "Git ref used as the comparison base (e.g. `main`).",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "head_ref": {
+      "description": "Git ref for the incoming changes (typically `HEAD`).",
+      "type": "string"
+    },
+    "markdown": {
+      "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
+      "type": "string"
+    },
+    "results": {
+      "description": "Per-changed-model entries, each with per-column downstream traces.",
+      "items": {
+        "$ref": "#/definitions/LineageDiffResult"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "$ref": "#/definitions/DiffSummary"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "base_ref",
+    "command",
+    "head_ref",
+    "markdown",
+    "results",
+    "summary",
+    "version"
+  ],
+  "title": "LineageDiffOutput",
+  "type": "object"
+}

@@ -30,6 +30,7 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 | `rocky history [--model <name>]` | Recent run history + trends |
 | `rocky metrics <model>` | Quality snapshots, alerts, column trends |
 | `rocky lineage <model> [--column <col>]` | Model/column lineage |
+| `rocky lineage-diff [<base_ref>]` | Per-changed-column downstream impact between two git refs (PR-comment Markdown) |
 | `rocky doctor -c rocky.toml` | Aggregate health checks (config, state, adapters, pipelines, state_sync) |
 | `rocky drift -c rocky.toml` | Schema drift report |
 | `rocky optimize -c rocky.toml` | Cost model + materialization-strategy recommendations |
