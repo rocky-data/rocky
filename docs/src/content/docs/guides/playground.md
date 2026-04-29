@@ -380,9 +380,9 @@ Exit code 0 means all checks passed. A non-zero exit code fails the CI job.
 
 ## 8. Explore the POC Catalog
 
-The playground includes a curated catalog of 28 POCs that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
+The playground includes a curated catalog of 58 POCs that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
 
-### Foundations (5 POCs)
+### Foundations (7 POCs)
 
 | POC | Feature |
 |---|---|
@@ -391,8 +391,10 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-null-safe-operators` | `!=` lowering to `IS DISTINCT FROM` |
 | `03-date-literals-and-match` | `@2025-01-01` date literals and `match { ... }` pattern matching |
 | `04-window-functions` | DSL window syntax with partition + sort + frame |
+| `05-generic-adapter-exercise` | Full generic-adapter trait surface against DuckDB |
+| `06-branches-replay-lineage` | Trust arc 1: branches + replay + column lineage end-to-end |
 
-### Quality (4 POCs)
+### Quality (6 POCs)
 
 | POC | Feature |
 |---|---|
@@ -400,8 +402,10 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-inline-checks` | Built-in checks (row_count, column_match, freshness, null_rate) |
 | `03-anomaly-detection` | `rocky history` + `rocky metrics --alerts` driven by row count anomalies |
 | `04-local-test-with-duckdb` | `rocky test` with passing and failing assertions |
+| `05-snapshot-scd2` | Snapshot pipeline with SCD Type 2 history |
+| `06-quality-pipeline-standalone` | Standalone `pipeline.type = "quality"` (checks-only run) |
 
-### Performance (6 POCs)
+### Performance (10 POCs)
 
 | POC | Feature |
 |---|---|
@@ -411,8 +415,12 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `04-column-propagation` | Column-level lineage pruning -- skip unchanged downstream models |
 | `05-optimize-recommendations` | `rocky optimize` + `profile-storage` + `compact --dry-run` |
 | `06-schema-drift-recover` | Drift detection, auto-widening, DROP+RECREATE |
+| `07-ephemeral-cte` | `materialization = "ephemeral"` CTE inlining |
+| `08-delete-insert-partitioned` | Partitioned `delete+insert` strategy |
+| `09-adaptive-concurrency` | AIMD dynamic parallelism via the throttle module |
+| `10-cost-budgets` | Trust arc 2: per-run cost summary + `[budget]` breach |
 
-### AI (4 POCs, `ANTHROPIC_API_KEY` required)
+### AI (5 POCs, `ANTHROPIC_API_KEY` required)
 
 | POC | Feature |
 |---|---|
@@ -420,8 +428,9 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-ai-explain-bootstrap` | `rocky ai-explain --all --save` reverse-engineers intent |
 | `03-ai-sync-schema-evolution` | `rocky ai-sync` proposes downstream updates |
 | `04-ai-test-generation` | `rocky ai-test --all --save` generates SQL assertions |
+| `05-schema-grounded-validation` | Trust arc 5: AI output is compiler-gated against the schema |
 
-### Governance (4 POCs, Databricks required)
+### Governance (6 POCs, Databricks required)
 
 | POC | Feature |
 |---|---|
@@ -429,8 +438,10 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-schema-patterns-multi-tenant` | Schema patterns with variadic `regions...` routing |
 | `03-workspace-isolation` | Workspace bindings + ISOLATED catalog mode |
 | `04-tagging-lifecycle` | Tags propagated via `ALTER ... SET TAGS` |
+| `05-classification-masking-compliance` | `[classification]` + `[mask]` + `rocky compliance` |
+| `06-retention-policies` | Declarative `retention = "<N>[dy]"` + `rocky retention-status --drift` |
 
-### Orchestration (4 POCs)
+### Orchestration (9 POCs)
 
 | POC | Feature |
 |---|---|
@@ -438,8 +449,13 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-webhook-slack-preset` | Webhook presets (Slack, PagerDuty, Datadog, Teams) |
 | `03-remote-state-s3` | S3 state backend via MinIO docker-compose |
 | `04-checkpoint-resume` | `rocky run --resume-latest` after mid-pipeline failure |
+| `05-webhook-presets-multi` | Multiple webhook presets composed on the same run |
+| `06-valkey-distributed-cache` | Distributed cache + tiered state via Valkey/Redis |
+| `07-dagster-dag-mode` | Full asset-graph rendering from Rocky's unified DAG |
+| `08-circuit-breaker` | Trust arc 3: retry policy + three-state circuit breaker |
+| `09-idempotency-key` | `rocky run --idempotency-key` dedup + skip semantics |
 
-### Developer Experience (5 POCs)
+### Developer Experience (10 POCs)
 
 | POC | Feature |
 |---|---|
@@ -448,8 +464,13 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `03-import-dbt-validate` | `rocky import-dbt` + `rocky validate-migration` |
 | `04-shadow-mode-compare` | `rocky compare` shadow vs production |
 | `05-doctor-and-ci` | `rocky doctor` + `rocky ci --output json` |
+| `06-hybrid-dbt-packages` | Rocky alongside dbt packages in the same repo |
+| `07-run-trace-gantt` | Trust arc 4: render a run as a Gantt timeline (`rocky trace`) |
+| `08-portability-lint` | Trust arc 6: compile-time portability gate via `[portability]` |
+| `09-sql-types-blast-radius` | Trust arc 7: SQL as first-class with typed blast-radius |
+| `10-pr-preview-and-data-diff` | `rocky preview create / diff / cost` end-to-end PR bundle |
 
-### Adapters (4 POCs)
+### Adapters (5 POCs)
 
 | POC | Feature |
 |---|---|
@@ -457,6 +478,7 @@ The playground includes a curated catalog of 28 POCs that showcase Rocky's disti
 | `02-databricks-materialized-view` | Materialized views on Databricks |
 | `03-fivetran-discover` | `rocky discover` against Fivetran REST API |
 | `04-custom-process-adapter` | Python adapter via JSON-RPC over stdio |
+| `05-bigquery-native-queries` | BigQuery adapter end-to-end with native query patterns |
 
 ### Running a POC
 
@@ -465,7 +487,7 @@ cd examples/playground
 ./pocs/02-performance/01-incremental-watermark/run.sh
 ```
 
-22 of 28 POCs run with no external credentials.
+Most POCs run with no external credentials. The exceptions: AI (`ANTHROPIC_API_KEY`), Governance (Databricks workspace), and the warehouse-specific adapter POCs (Snowflake / Databricks / Fivetran / BigQuery).
 
 ## 9. Benchmarks
 

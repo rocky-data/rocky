@@ -138,7 +138,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 ## CLI Commands (38+)
 
 ### Core Pipeline
-`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch`
+`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch` · `preview create` · `preview diff` · `preview cost`
 
 ### Modeling & Compilation
 `compile` · `lineage` · `test` · `ci` · `ci-diff` · `export-schemas`
@@ -159,7 +159,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 - **`rocky replay <run_id|latest>`** — flat per-model dump of SQL hashes, row counts, bytes, and timings captured at execution time.
 - **Timed half-open circuit breaker** — three-state (`Closed` / `Open` / `HalfOpen`) breaker shared across Databricks + Snowflake adapters. Fires `circuit_breaker_tripped` / `circuit_breaker_recovered` events.
 - **OTLP metrics export** (feature-gated via `--features otel`) — `rocky run` exports in-process counters and histograms to any OTLP-compatible collector.
-- **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` with `on_breach = "warn" | "error"`; fires `budget_breach` events. See [`[budget]`](/reference/configuration/#budget).
+- **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` + `max_bytes_scanned` with `on_breach = "warn" | "error"`; any single dimension breach fires the `budget_breach` event. See [`[budget]`](/reference/configuration/#budget).
 - **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
 - **`rocky cost <run_id|latest>`** — historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
 

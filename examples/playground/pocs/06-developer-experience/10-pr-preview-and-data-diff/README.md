@@ -103,18 +103,15 @@ run` for both DSL and SQL surfaces.
 
 ## Status
 
-`rocky preview {create,diff,cost}` are scaffolded today; their
-implementations land in Phases 1–3 of the
-[`rocky-pr-preview-and-data-diff`](../../../../../) plan. This POC ships
-the integration-test baseline:
+Production path as of **engine-v1.18.0** (Phases 1, 1.5, 2, 3 all merged).
+Earlier revisions of `run.sh` wrapped each preview call in a
+stub-tolerating helper while the engine handlers were still scaffolding;
+that scaffolding is gone — the script now treats `preview create / diff /
+cost` like any other production CLI command (`set -e` enforces failure).
 
-- `run.sh` exits **0** today by capturing each preview-stub error and
-  surfacing it without sinking the run.
-- The `expected/preview_*.example.json` files are the **aspirational
-  target shapes** the Phase 1+ implementation must match — values are
-  illustrative, the keys / types / reason strings are the contract.
-- When Phase 1 lands, the stub `.err` sidecars disappear and the JSON
-  files in `expected/` become real golden fixtures.
+The `expected/preview_*.example.json` files remain as the shape contract
+that the live `expected/preview_*.json` outputs should match modulo
+non-deterministic fields (timestamps, branch suffixes, hashes).
 
 ## Prerequisites
 
@@ -130,19 +127,21 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 
 `run.sh`:
 
-1. Cleans `.rocky-state.redb` and `poc.duckdb`.
+1. Cleans `.rocky-state.redb` (root + `models/`) and `poc.duckdb`.
 2. Runs `rocky compile` against the 5-model DAG.
 3. Seeds the raw tables into DuckDB.
 4. Runs the pipeline on `main` state.
 5. Captures the current git HEAD as the `--base` ref (or a sentinel
    string when not in a git checkout).
-6. Swaps `models/fct_revenue.rocky` for `fct_revenue.rocky.changed` —
-   adds a `where amount > 25` filter that should produce a real
-   row-level diff.
-7. Runs `rocky preview create --base <ref> --name pr-preview-poc-10`.
-   Today: bails with a Phase 1 stub message; `run.sh` keeps going.
-8. Runs `rocky preview diff` against the branch. Same.
-9. Runs `rocky preview cost` against the branch. Same.
+6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed` — adds a
+   `WHERE s.amount > 25` filter that produces a real row-level diff.
+7. `rocky preview create --base <ref> --name pr-preview-poc-10` —
+   materializes the per-PR branch schema and copies unchanged upstream
+   from the base via DuckDB CTAS.
+8. `rocky preview diff --name pr-preview-poc-10` — structural + sampled
+   row diff between branch and base.
+9. `rocky preview cost --name pr-preview-poc-10` — per-model bytes /
+   duration / USD delta vs. the latest base run.
 10. Reverts the synthetic change (`trap`-protected, idempotent).
 
 ## Related
@@ -153,6 +152,6 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 - Sibling POC: [`06-developer-experience/04-shadow-mode-compare/`](../04-shadow-mode-compare/)
   — the precursor `rocky compare` kernel that Phase 2's `preview diff`
   extends.
-- Engine source: `engine/crates/rocky-cli/src/commands/preview.rs`
-  (Phase 0 stubs), `engine/crates/rocky-cli/src/output.rs`
+- Engine source: `engine/crates/rocky-cli/src/commands/preview.rs`,
+  `engine/crates/rocky-cli/src/output.rs`
   (`PreviewCreateOutput`, `PreviewDiffOutput`, `PreviewCostOutput`).

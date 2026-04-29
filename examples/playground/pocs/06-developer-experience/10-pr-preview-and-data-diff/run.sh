@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# 10-pr-preview-and-data-diff — PR preview workflow on a 5-model DAG.
+# 10-pr-preview-and-data-diff — `rocky preview create / diff / cost` on a
+# 5-model DAG. Production path as of engine-v1.18.0 (Phases 1, 1.5, 2, 3
+# all merged). Earlier revisions of this script wrapped each preview call
+# in a stub-tolerating helper; that scaffolding is gone.
 #
-# Today (Phase 0): the engine handlers for `rocky preview {create,diff,cost}`
-# bail with a "Phase N implementation" message — that's expected. This POC is
-# the integration-test baseline that Phase 1+ will populate.
-#
-# Each preview step below is wrapped so the stub error is captured and the
-# script keeps going; non-stub steps (compile, test, run on main) must
-# succeed, otherwise we exit non-zero.
+# Flow:
+#   1. Compile + seed DuckDB.
+#   2. Run the pipeline on the base ref (populates `poc.demo.*`).
+#   3. Capture HEAD as the preview's `--base`.
+#   4. Apply a synthetic edit to `fct_revenue.sql` so the preview has
+#      something real to diff.
+#   5. `rocky preview create` materializes a per-PR branch schema by
+#      copying unchanged upstream from base via DuckDB CTAS, then
+#      re-running only the prune set.
+#   6. `rocky preview diff` produces a structural + sampled-row diff
+#      between branch and base for every model in the prune set.
+#   7. `rocky preview cost` produces a per-model bytes/duration/USD
+#      delta versus the latest base-schema run.
+#   8. The synthetic change is reverted via `trap`, idempotent on re-run.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# Prefer an explicitly-set binary, then the local feature-branch build
-# (which has `preview` wired), then `rocky` on PATH.
+# Prefer an explicitly-set binary, then the local feature-branch build,
+# then `rocky` on PATH.
 ROCKY_BIN="${ROCKY_BIN:-}"
 if [[ -z "$ROCKY_BIN" ]]; then
     REPO_ROOT="$(cd "$HERE/../../../../.." && pwd)"
@@ -33,9 +43,8 @@ CHANGED_VARIANT="models/fct_revenue.sql.changed"
 LIVE_FILE="models/fct_revenue.sql"
 BACKUP_FILE="models/fct_revenue.sql.orig"
 
-# Always restore the original fct_revenue on exit, even if the script fails
-# halfway through. Idempotent: re-running the POC must leave the working tree
-# byte-identical to the starting state.
+# Always restore the original fct_revenue on exit, even if the script
+# fails halfway through. Idempotent on re-run.
 revert_change() {
     if [[ -f "$BACKUP_FILE" ]]; then
         mv -f "$BACKUP_FILE" "$LIVE_FILE"
@@ -44,7 +53,8 @@ revert_change() {
 }
 trap revert_change EXIT
 
-rm -f .rocky-state.redb poc.duckdb
+rm -f .rocky-state.redb .rocky-state.redb.lock .rocky_state.redb.lock poc.duckdb
+rm -f models/.rocky-state.redb models/.rocky-state.redb.lock
 mkdir -p expected
 
 echo "==> 1. Compile the 5-model DAG (type-check, no warehouse)"
@@ -55,11 +65,9 @@ duckdb poc.duckdb < data/seed.sql
 
 echo "==> 3. Run the pipeline on 'main' state — populates poc.demo.*"
 "$ROCKY_BIN" -c rocky.toml -o json run > expected/run_main.json
-echo "    main run: ok"
 
-# Capture a 'before' marker. Prefer git HEAD; fall back to a sentinel string
-# when the POC is run outside of a git checkout (rare, but possible in CI
-# tarballs).
+# Capture a 'before' marker. Prefer git HEAD; fall back to a sentinel
+# string when the POC is run outside a git checkout.
 if BASE_REF=$(git rev-parse HEAD 2>/dev/null); then
     echo "==> 4. Captured base ref: $BASE_REF"
 else
@@ -71,59 +79,38 @@ echo "==> 5. Apply synthetic change to fct_revenue.sql (adds 'WHERE s.amount > 2
 cp "$LIVE_FILE" "$BACKUP_FILE"
 cp "$CHANGED_VARIANT" "$LIVE_FILE"
 
-# Helper: run a preview subcommand that is either a known Phase-N stub or
-# not yet wired in the binary on PATH. Capture stderr, surface a clear note,
-# and keep the script going. A real non-stub failure still aborts.
-run_stub() {
-    local label="$1"
-    local outfile="$2"
-    shift 2
-    echo "==> $label"
-    if "$@" > "$outfile" 2> "${outfile}.err"; then
-        echo "    $label: succeeded (Phase 1+ implementation has landed)"
-        return 0
-    fi
-    local exit_code=$?
-    local err_text
-    err_text="$(cat "${outfile}.err" 2>/dev/null || true)"
-    if grep -q "implementation lands in Phase" "${outfile}.err" 2>/dev/null; then
-        echo "    $label: stub (exit $exit_code) — Phase 1+ will populate this"
-        head -n 4 "${outfile}.err" | sed 's/^/      /'
-        return 0
-    fi
-    if echo "$err_text" | grep -qiE "unrecognized subcommand|invalid subcommand|unexpected argument|error:.*'preview'"; then
-        echo "    $label: 'preview' not wired in this rocky binary yet — Phase 0a engine PR not on PATH"
-        head -n 4 "${outfile}.err" | sed 's/^/      /'
-        return 0
-    fi
-    echo "    $label: FAILED with non-stub error (exit $exit_code)"
-    echo "$err_text" | sed 's/^/      /'
-    return $exit_code
-}
-
 PREVIEW_BRANCH="pr-preview-poc-10"
 
-run_stub "6. rocky preview create --base $BASE_REF" \
-    expected/preview_create.json \
-    "$ROCKY_BIN" -c rocky.toml -o json preview create \
-        --base "$BASE_REF" \
-        --name "$PREVIEW_BRANCH" \
-        --models models
+echo "==> 6. rocky preview create --base $BASE_REF"
+"$ROCKY_BIN" -c rocky.toml -o json preview create \
+    --base "$BASE_REF" \
+    --name "$PREVIEW_BRANCH" \
+    --models models \
+    > expected/preview_create.json
 
-run_stub "7. rocky preview diff --name $PREVIEW_BRANCH" \
-    expected/preview_diff.json \
-    "$ROCKY_BIN" -c rocky.toml -o json preview diff \
-        --name "$PREVIEW_BRANCH" \
-        --base "$BASE_REF"
+echo "==> 7. rocky preview diff --name $PREVIEW_BRANCH"
+"$ROCKY_BIN" -c rocky.toml -o json preview diff \
+    --name "$PREVIEW_BRANCH" \
+    --base "$BASE_REF" \
+    > expected/preview_diff.json
 
-run_stub "8. rocky preview cost --name $PREVIEW_BRANCH" \
-    expected/preview_cost.json \
-    "$ROCKY_BIN" -c rocky.toml -o json preview cost \
-        --name "$PREVIEW_BRANCH"
+echo "==> 8. rocky preview cost --name $PREVIEW_BRANCH"
+"$ROCKY_BIN" -c rocky.toml -o json preview cost \
+    --name "$PREVIEW_BRANCH" \
+    > expected/preview_cost.json
+
+# Quick non-empty sanity check; we don't pin the JSON shape here because
+# the example shapes already live in `expected/preview_*.example.json`.
+for f in expected/preview_create.json expected/preview_diff.json expected/preview_cost.json; do
+    if [[ ! -s "$f" ]]; then
+        echo "FAIL: $f is empty" >&2
+        exit 1
+    fi
+done
 
 # revert_change runs via trap.
 
 echo
-echo "POC complete: stubs exercised; expected/ holds Phase 1+ target shapes."
-echo "When Phase 1 lands, the .err sidecars disappear and the JSON files"
-echo "match expected/preview_*.example.json (the aspirational fixtures)."
+echo "POC complete: rocky preview create/diff/cost exercised end-to-end."
+echo "JSON output captured under expected/. Compare against the"
+echo "expected/preview_*.example.json fixtures for shape contract."
