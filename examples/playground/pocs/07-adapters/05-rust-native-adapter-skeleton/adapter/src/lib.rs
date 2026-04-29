@@ -342,16 +342,53 @@ fn validate_ident(ident: &str) -> AdapterResult<()> {
 /// `Arc<dyn Backend>` lets the same backend be shared with discovery /
 /// governance adapters in a fuller implementation. For warehouse-only
 /// scope, a plain `Box<dyn Backend>` is enough.
+///
+/// `config` and `auth` are stored verbatim from [`from_config`]. The
+/// skeleton's [`MockBackend`] does not consult them — they're carried
+/// here because a real adapter would need both inside `execute_*`
+/// (host for the URL, auth for the `Authorization` header). The
+/// `unused` prefixes silence dead-code warnings without hiding the
+/// shape from a copying contributor.
 pub struct SkeletonAdapter {
     backend: Arc<dyn Backend>,
     dialect: SkeletonDialect,
+    #[allow(dead_code)] // Read by a real backend impl; held by the skeleton to model the shape.
+    config: Option<SkeletonConfig>,
+    #[allow(dead_code)] // Same — consumed when the real backend builds its HTTP client.
+    auth: Option<AdapterAuth>,
 }
 
 impl SkeletonAdapter {
+    /// Construct an adapter directly from a backend handle. This is the
+    /// constructor tests reach for — it lets a [`MockBackend`] stand in
+    /// without going through `rocky.toml` parsing.
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
             dialect: SkeletonDialect,
+            config: None,
+            auth: None,
+        }
+    }
+
+    /// Production-style constructor: build from a parsed [`SkeletonConfig`]
+    /// and an [`AdapterAuth`], with the backend supplied by the caller
+    /// so tests can still substitute [`MockBackend`].
+    ///
+    /// In a real adapter this is where you'd construct the HTTP client
+    /// from `config.host` + `config.timeout_secs` + `auth`, wrap it in a
+    /// `Backend` impl, and store the rest. The skeleton keeps the
+    /// backend injectable because that's how its tests are wired.
+    pub fn from_config(
+        config: SkeletonConfig,
+        auth: AdapterAuth,
+        backend: Arc<dyn Backend>,
+    ) -> Self {
+        Self {
+            backend,
+            dialect: SkeletonDialect,
+            config: Some(config),
+            auth: Some(auth),
         }
     }
 
@@ -524,5 +561,55 @@ mod tests {
         assert_eq!(m.sdk_version, SDK_VERSION);
         assert!(m.capabilities.warehouse);
         assert!(!m.capabilities.merge);
+    }
+
+    /// Round-trips a minimal `[adapter.skeleton]` block through serde.
+    /// Pins the contract `SkeletonConfig` advertises via
+    /// [`SkeletonAdapter::manifest()`]'s `config_schema` field — if a
+    /// future edit drops or renames a field, this test catches it
+    /// before a community contributor copies the wrong shape.
+    #[test]
+    fn config_round_trips_through_serde() {
+        let raw = serde_json::json!({
+            "host": "https://my-cluster.example.com:8443",
+            "database": "rocky",
+            "timeout_secs": 60,
+        });
+        let cfg: SkeletonConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.host, "https://my-cluster.example.com:8443");
+        assert_eq!(cfg.database, "rocky");
+        assert_eq!(cfg.timeout_secs, 60);
+    }
+
+    #[test]
+    fn config_applies_default_timeout_when_omitted() {
+        let raw = serde_json::json!({
+            "host": "https://my-cluster.example.com:8443",
+            "database": "rocky",
+        });
+        let cfg: SkeletonConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.timeout_secs, 30);
+    }
+
+    /// Demonstrates the production-style constructor a real adapter
+    /// would call from its registry hook. Exercises `SkeletonConfig` +
+    /// `AdapterAuth` so they are not pure documentation-by-shape.
+    #[tokio::test]
+    async fn from_config_constructs_a_working_adapter() {
+        let cfg = SkeletonConfig {
+            host: "https://my-cluster.example.com:8443".into(),
+            database: "rocky".into(),
+            timeout_secs: 30,
+        };
+        let auth = AdapterAuth::Token("shh".into());
+        let backend = Arc::new(MockBackend::new());
+
+        let adapter = SkeletonAdapter::from_config(cfg, auth, backend.clone());
+        adapter
+            .execute_statement("SELECT 1")
+            .await
+            .unwrap();
+
+        assert_eq!(backend.statement_log().await.len(), 1);
     }
 }

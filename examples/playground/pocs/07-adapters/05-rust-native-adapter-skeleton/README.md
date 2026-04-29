@@ -33,7 +33,7 @@ See `docs/src/content/docs/guides/adapter-sdk.md` for the full walkthrough.
 ├── run.sh                    # Build + test + run demo
 └── adapter/
     ├── Cargo.toml            # Standalone crate, path-dep on rocky-adapter-sdk
-    ├── src/lib.rs            # SkeletonAdapter, SkeletonDialect, MockBackend (~320 lines)
+    ├── src/lib.rs            # SkeletonAdapter, SkeletonDialect, MockBackend, tests
     └── examples/demo.rs      # End-to-end driver — prints generated SQL
 ```
 
@@ -49,8 +49,8 @@ The `adapter/` crate is **not** a member of the rocky workspace. That is intenti
 
 ```
 === cargo check (skeleton compiles against published SDK) ===
-=== cargo test (8 unit tests) ===
-test result: ok. 8 passed; 0 failed; ...
+=== cargo test ===
+test result: ok. 11 passed; 0 failed; ...
 
 === cargo run --example demo (end-to-end against mock backend) ===
 manifest:

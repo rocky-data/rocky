@@ -23,10 +23,10 @@ If your warehouse already ships in-tree, use it directly via `[adapter]` in `roc
 
 Public traits live in `engine/crates/rocky-adapter-sdk/src/traits.rs`. The two you must implement for any warehouse adapter are `WarehouseAdapter` and `SqlDialect`. The rest are opt-in by capability.
 
-| Trait | Required? | What it does | Key methods |
+| Trait | Required? | What it does | Key methods (full surface in `rocky-adapter-sdk/src/traits.rs`) |
 |---|---|---|---|
-| `WarehouseAdapter` | yes | Execute SQL against the warehouse | `execute_statement`, `execute_query`, `describe_table`, `table_exists`, `close` |
-| `SqlDialect` | yes | Generate warehouse-specific SQL | `format_table_ref`, `create_table_as`, `insert_into`, `merge_into`, `watermark_where`, `insert_overwrite_partition`, `row_hash_expr` |
+| `WarehouseAdapter` | yes | Execute SQL against the warehouse | `dialect`, `execute_statement`, `execute_query`, `describe_table`, `table_exists`, `close` |
+| `SqlDialect` | yes | Generate warehouse-specific SQL | `name`, `format_table_ref`, `create_table_as`, `insert_into`, `merge_into`, `describe_table_sql`, `drop_table_sql`, `create_catalog_sql`, `create_schema_sql`, `row_hash_expr`, `tablesample_clause`, `select_clause`, `watermark_where`, `insert_overwrite_partition` |
 | `DiscoveryAdapter` | no | Enumerate connectors / tables in a source system | `discover` |
 | `GovernanceAdapter` | no | Tags, grants, catalog/schema lifecycle | `set_tags`, `get_grants`, `apply_grants`, `revoke_grants` |
 | `BatchCheckAdapter` | no | Batched data-quality queries | `batch_row_counts`, `batch_freshness` |
@@ -60,7 +60,7 @@ This runs `cargo check`, the unit tests, and a demo binary that prints the SQL t
 ```
 adapter/
 ├── Cargo.toml            # Path-dep on rocky-adapter-sdk; standalone (not in workspace)
-├── src/lib.rs            # ~320 lines: SkeletonAdapter, SkeletonDialect, MockBackend
+├── src/lib.rs            # SkeletonAdapter, SkeletonDialect, MockBackend, tests
 └── examples/demo.rs      # End-to-end driver
 ```
 

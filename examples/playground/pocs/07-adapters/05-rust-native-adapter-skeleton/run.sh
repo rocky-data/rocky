@@ -19,15 +19,15 @@ fi
 mkdir -p ../expected
 
 echo "=== cargo check (skeleton compiles against published SDK) ==="
-cargo check --tests --examples --quiet
+cargo check --tests --examples
 
 echo
-echo "=== cargo test (8 unit tests) ==="
-cargo test --quiet
+echo "=== cargo test ==="
+cargo test
 
 echo
 echo "=== cargo run --example demo (end-to-end against mock backend) ==="
-cargo run --example demo --quiet | tee ../expected/demo-transcript.txt
+cargo run --example demo | tee ../expected/demo-transcript.txt
 
 echo
 echo "POC complete: skeleton builds, tests pass, demo prints generated SQL."
