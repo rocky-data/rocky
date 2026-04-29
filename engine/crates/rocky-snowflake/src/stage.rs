@@ -16,6 +16,22 @@
 
 use rocky_adapter_sdk::{AdapterError, AdapterResult, FileFormat, LoadOptions};
 
+/// Reject string-literal payloads (URIs, local paths) that would break out of
+/// the surrounding `'...'` SQL literal. Snowflake interpolates these raw, so
+/// any embedded quote, backslash, or newline is unsafe — refuse to build the
+/// SQL rather than try to escape.
+fn validate_sql_string_literal(label: &str, value: &str) -> AdapterResult<()> {
+    if value.is_empty() {
+        return Err(AdapterError::msg(format!("{label} cannot be empty")));
+    }
+    if value.contains(['\'', '\n', '\r', '\\']) {
+        return Err(AdapterError::msg(format!(
+            "invalid {label} {value:?}: must not contain quotes, backslashes, or newlines"
+        )));
+    }
+    Ok(())
+}
+
 /// Snowflake stage reference. Prefixed with `@` when rendered in SQL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageName(String);
@@ -60,36 +76,43 @@ pub fn create_temporary_stage_sql(
     name: &StageName,
     format: FileFormat,
     options: &LoadOptions,
-) -> String {
-    format!(
+) -> AdapterResult<String> {
+    Ok(format!(
         "CREATE TEMPORARY STAGE {name} FILE_FORMAT = ({})",
-        file_format_clause(format, options)
-    )
+        file_format_clause(format, options)?
+    ))
 }
 
 /// Build the `CREATE TEMPORARY STAGE ... URL = '<uri>'` SQL for an external
 /// stage backed by cloud storage.
+///
+/// `uri` is interpolated inside a `'...'` string literal; we refuse to build
+/// the SQL if it contains characters that could break out of that literal.
 pub fn create_external_stage_sql(
     name: &StageName,
     uri: &str,
     format: FileFormat,
     options: &LoadOptions,
-) -> String {
-    format!(
+) -> AdapterResult<String> {
+    validate_sql_string_literal("cloud URI", uri)?;
+    Ok(format!(
         "CREATE TEMPORARY STAGE {name} URL = '{uri}' FILE_FORMAT = ({})",
-        file_format_clause(format, options)
-    )
+        file_format_clause(format, options)?
+    ))
 }
 
 /// Build the `PUT file://<path> @<stage>` SQL for uploading a local file.
 ///
 /// Snowflake's PUT automatically compresses files with gzip unless we turn
-/// that off; we keep the default for smaller network transfer.
-pub fn put_file_sql(local_path: &str, stage: &StageName) -> String {
-    format!(
+/// that off; we keep the default for smaller network transfer. The local
+/// path is interpolated inside a `'...'` literal — refuse to build the SQL
+/// if it contains characters that could break out of that literal.
+pub fn put_file_sql(local_path: &str, stage: &StageName) -> AdapterResult<String> {
+    validate_sql_string_literal("local file path", local_path)?;
+    Ok(format!(
         "PUT 'file://{local_path}' {stage_ref} OVERWRITE = TRUE",
         stage_ref = stage.reference()
-    )
+    ))
 }
 
 /// Build the `DROP STAGE IF EXISTS` SQL (defensive cleanup).
@@ -105,15 +128,33 @@ pub fn drop_stage_sql(name: &StageName) -> String {
 /// Snowflake expects `(TYPE = 'CSV', FIELD_DELIMITER = ',', SKIP_HEADER = 1)`
 /// or similar. This function emits only the inner key-value pairs so callers
 /// can wrap in `FILE_FORMAT = (...)` as needed.
-pub fn file_format_clause(format: FileFormat, options: &LoadOptions) -> String {
+///
+/// CSV delimiters are validated to keep the `'<delim>'` literal safe.
+pub fn file_format_clause(format: FileFormat, options: &LoadOptions) -> AdapterResult<String> {
     match format {
         FileFormat::Csv => {
             let skip = if options.csv_has_header { 1 } else { 0 };
-            let delim = options.csv_delimiter;
-            format!("TYPE = 'CSV', FIELD_DELIMITER = '{delim}', SKIP_HEADER = {skip}")
+            let delim = validate_csv_delimiter(options.csv_delimiter)?;
+            Ok(format!(
+                "TYPE = 'CSV', FIELD_DELIMITER = '{delim}', SKIP_HEADER = {skip}"
+            ))
         }
-        FileFormat::Parquet => "TYPE = 'PARQUET'".into(),
-        FileFormat::JsonLines => "TYPE = 'JSON'".into(),
+        FileFormat::Parquet => Ok("TYPE = 'PARQUET'".into()),
+        FileFormat::JsonLines => Ok("TYPE = 'JSON'".into()),
+    }
+}
+
+/// Reject CSV delimiters that would break out of the `'...'` SQL string
+/// literal. Allows printable ASCII plus tab; rejects quotes, backslash, and
+/// control characters.
+fn validate_csv_delimiter(c: char) -> AdapterResult<char> {
+    let ok = c == '\t' || (c.is_ascii() && !c.is_ascii_control() && c != '\'' && c != '\\');
+    if ok {
+        Ok(c)
+    } else {
+        Err(AdapterError::msg(format!(
+            "invalid CSV delimiter {c:?}: must be a printable ASCII char (or tab), not a quote, backslash, or control character"
+        )))
     }
 }
 
@@ -168,7 +209,8 @@ mod tests {
     #[test]
     fn test_create_temporary_stage_csv() {
         let name = StageName::new("tmp").unwrap();
-        let sql = create_temporary_stage_sql(&name, FileFormat::Csv, &LoadOptions::default());
+        let sql =
+            create_temporary_stage_sql(&name, FileFormat::Csv, &LoadOptions::default()).unwrap();
         assert!(sql.starts_with("CREATE TEMPORARY STAGE tmp"));
         assert!(sql.contains("TYPE = 'CSV'"));
         assert!(sql.contains("SKIP_HEADER = 1"));
@@ -182,16 +224,37 @@ mod tests {
             "s3://bucket/path",
             FileFormat::Parquet,
             &LoadOptions::default(),
-        );
+        )
+        .unwrap();
         assert!(sql.contains("URL = 's3://bucket/path'"));
         assert!(sql.contains("TYPE = 'PARQUET'"));
     }
 
     #[test]
+    fn test_create_external_stage_rejects_quote_in_uri() {
+        let name = StageName::new("ext").unwrap();
+        assert!(
+            create_external_stage_sql(
+                &name,
+                "s3://bucket/x'); DROP TABLE y; --",
+                FileFormat::Parquet,
+                &LoadOptions::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_put_file_sql() {
         let stage = StageName::new("stg").unwrap();
-        let sql = put_file_sql("/tmp/data.csv", &stage);
+        let sql = put_file_sql("/tmp/data.csv", &stage).unwrap();
         assert_eq!(sql, "PUT 'file:///tmp/data.csv' @stg OVERWRITE = TRUE");
+    }
+
+    #[test]
+    fn test_put_file_sql_rejects_quote() {
+        let stage = StageName::new("stg").unwrap();
+        assert!(put_file_sql("/tmp/data'.csv", &stage).is_err());
     }
 
     #[test]
@@ -216,15 +279,24 @@ mod tests {
             csv_delimiter: '|',
             ..Default::default()
         };
-        let c = file_format_clause(FileFormat::Csv, &opts);
+        let c = file_format_clause(FileFormat::Csv, &opts).unwrap();
         assert!(c.contains("FIELD_DELIMITER = '|'"));
         assert!(c.contains("SKIP_HEADER = 0"));
     }
 
     #[test]
+    fn test_file_format_clause_csv_rejects_quote_delimiter() {
+        let opts = LoadOptions {
+            csv_delimiter: '\'',
+            ..Default::default()
+        };
+        assert!(file_format_clause(FileFormat::Csv, &opts).is_err());
+    }
+
+    #[test]
     fn test_file_format_clause_parquet() {
         assert_eq!(
-            file_format_clause(FileFormat::Parquet, &LoadOptions::default()),
+            file_format_clause(FileFormat::Parquet, &LoadOptions::default()).unwrap(),
             "TYPE = 'PARQUET'"
         );
     }
@@ -232,7 +304,7 @@ mod tests {
     #[test]
     fn test_file_format_clause_json() {
         assert_eq!(
-            file_format_clause(FileFormat::JsonLines, &LoadOptions::default()),
+            file_format_clause(FileFormat::JsonLines, &LoadOptions::default()).unwrap(),
             "TYPE = 'JSON'"
         );
     }

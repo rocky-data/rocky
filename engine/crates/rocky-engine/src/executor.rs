@@ -8,6 +8,7 @@ use std::path::Path;
 
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
 use rocky_duckdb::DuckDbConnector;
+use rocky_sql::validation::validate_identifier;
 use tracing::info;
 
 /// Result of local execution.
@@ -32,7 +33,12 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
     for layer in &compile_result.project.layers {
         for model_name in layer {
             if let Some(model) = compile_result.project.model(model_name) {
-                // Wrap model SQL in CREATE TABLE AS for local execution
+                if let Err(e) = validate_identifier(model_name) {
+                    result.failed.push((model_name.clone(), e.to_string()));
+                    continue;
+                }
+                // Wrap model SQL in CREATE TABLE AS for local execution.
+                // `model_name` was validated above; `model.sql` is compiler-emitted SQL.
                 let exec_sql = format!("CREATE OR REPLACE TABLE {model_name} AS\n{}", model.sql);
 
                 match db.execute_statement(&exec_sql) {

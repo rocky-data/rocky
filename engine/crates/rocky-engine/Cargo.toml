@@ -10,6 +10,7 @@ rust-version.workspace = true
 rocky-compiler = { path = "../rocky-compiler" }
 rocky-core = { path = "../rocky-core" }
 rocky-duckdb = { path = "../rocky-duckdb", optional = true }
+rocky-sql = { path = "../rocky-sql" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

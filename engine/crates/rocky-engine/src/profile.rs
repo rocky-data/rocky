@@ -3,6 +3,7 @@
 //! Generates column-level statistics (null rates, cardinality, min/max, etc.)
 //! and diffs profiles between runs to detect data quality regressions.
 
+use rocky_sql::validation::{ValidationError, validate_identifier};
 use serde::{Deserialize, Serialize};
 
 /// Statistical profile for a single column.
@@ -215,16 +216,23 @@ pub fn diff_profiles(old: &ModelProfile, new: &ModelProfile) -> ProfileDiff {
 /// Generates profiling SQL for DuckDB.
 ///
 /// Produces a single query that computes column-level statistics for each
-/// column in the given table.
-pub fn generate_profile_sql(table_name: &str, columns: &[(String, String)]) -> String {
+/// column in the given table. The table name and every column name are
+/// validated as SQL identifiers; injection-bearing inputs are rejected
+/// rather than escaped.
+pub fn generate_profile_sql(
+    table_name: &str,
+    columns: &[(String, String)],
+) -> Result<String, ValidationError> {
+    validate_identifier(table_name)?;
     if columns.is_empty() {
-        return format!("SELECT COUNT(*) AS row_count FROM {table_name}");
+        return Ok(format!("SELECT COUNT(*) AS row_count FROM {table_name}"));
     }
 
     let mut parts = Vec::new();
     parts.push("SELECT COUNT(*) AS _row_count".to_string());
 
     for (col_name, col_type) in columns {
+        validate_identifier(col_name)?;
         let is_numeric = matches!(
             col_type.to_uppercase().as_str(),
             "INT"
@@ -263,7 +271,7 @@ pub fn generate_profile_sql(table_name: &str, columns: &[(String, String)]) -> S
         }
     }
 
-    format!("{}\nFROM {table_name}", parts.join(""))
+    Ok(format!("{}\nFROM {table_name}", parts.join("")))
 }
 
 #[cfg(test)]
@@ -416,7 +424,7 @@ mod tests {
             ("id".to_string(), "INTEGER".to_string()),
             ("name".to_string(), "VARCHAR".to_string()),
         ];
-        let sql = generate_profile_sql("orders", &cols);
+        let sql = generate_profile_sql("orders", &cols).unwrap();
         assert!(sql.contains("COUNT(*)"));
         assert!(sql.contains("COUNT(DISTINCT \"id\")"));
         assert!(sql.contains("\"id__distinct\""));
@@ -431,7 +439,14 @@ mod tests {
 
     #[test]
     fn test_generate_profile_sql_empty_columns() {
-        let sql = generate_profile_sql("empty_table", &[]);
+        let sql = generate_profile_sql("empty_table", &[]).unwrap();
         assert_eq!(sql, "SELECT COUNT(*) AS row_count FROM empty_table");
+    }
+
+    #[test]
+    fn test_generate_profile_sql_rejects_injection() {
+        assert!(generate_profile_sql("orders; DROP TABLE x", &[]).is_err());
+        let cols = vec![("col\"; DROP".to_string(), "INTEGER".to_string())];
+        assert!(generate_profile_sql("orders", &cols).is_err());
     }
 }

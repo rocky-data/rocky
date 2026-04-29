@@ -2,6 +2,20 @@
 //!
 //! Compiles the DSL AST into standard SQL. The key semantic improvement:
 //! `!=` compiles to `IS DISTINCT FROM` (NULL-safe), not SQL's `!=`.
+//!
+//! ## SQL injection safety
+//!
+//! Identifier-positioned strings (column names, function names, model names,
+//! aliases) are interpolated raw via `format!`. They are safe by construction:
+//! every such string flows from `Token::Ident`, whose lexer regex
+//! `[a-zA-Z_][a-zA-Z0-9_]*` (see `token.rs`) is strictly tighter than
+//! [`rocky_sql::validation::validate_identifier`]. A `Token::Ident` cannot
+//! contain quotes, semicolons, dots, spaces, or any other SQL metacharacter.
+//!
+//! String literals are escaped (`'` → `''`) at the `Expr::StringLit` site;
+//! number and date literals are grammar-constrained. No `validate_*` call is
+//! threaded through this module because there is no reachable path from the
+//! parser to a `format!` here that admits an unsafe identifier.
 
 #[cfg(test)]
 use std::sync::Arc;
