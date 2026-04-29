@@ -31,7 +31,7 @@ class BudgetBreachOutput(BaseModel):
     limit: float
     limit_type: str
     """
-    Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+    Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
     """
 
 
@@ -241,6 +241,10 @@ class RunCostSummary(BaseModel):
     per_model: list[ModelCostEntry]
     """
     Per-model cost attribution, ordered as in [`RunOutput::materializations`].
+    """
+    total_bytes_scanned: conint(ge=0) | None = None
+    """
+    Sum of every per-model `bytes_scanned` that produced a number. `None` when no materialization reported a byte count (the non-BigQuery adapters today, which still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Surfaced so consumers — and the `[budget]` `max_bytes_scanned` gate — can read scan volume without re-walking [`RunOutput::materializations`].
     """
     total_cost_usd: float | None = None
     """

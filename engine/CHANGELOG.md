@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`max_bytes_scanned` threshold on the `[budget]` block.** New optional `u64` field alongside `max_usd` and `max_duration_ms` that gates a run on the aggregate `bytes_scanned` summed across every materialization in `RunCostSummary`. Closes the post-launch user-feedback gap that "fail CI when this run scanned more than N TB" wasn't expressible — `max_usd` is correlated with scan volume but a regression that stops pruning partitions on a flat-rate warehouse can blow scan up without changing the dollar figure. Composes with the existing thresholds: any single dimension breach trips the `budget_breach` event, and (with `on_breach = "error"`) fails the run. New `BudgetLimitType::MaxBytesScanned` variant; the limit_type tag on each `BudgetBreach` / `BudgetBreachOutput` is `"max_bytes_scanned"`. `RunCostSummary` now carries `total_bytes_scanned: Option<u64>` so consumers can read the aggregate without re-walking `materializations`. Skipped (rather than treated as zero) when no adapter reports a byte count, matching `max_usd`.
+
 ## [1.17.4] — 2026-04-26
 
 Trust-system patch + minor data-cost fix. Closes a data-integrity hazard in `rocky discover` where a transient Fivetran 5xx or rate-limit window on a single connector could silently drop that connector from output, indistinguishable from "removed upstream" to downstream diff-based reconcilers (the asset-graph-shrinkage failure mode that took down a Dagster sensor in production with `DagsterInvalidSubsetError`). Same shape of bug Gold patched on the dbt path in commit `c43394d`. Bundled with an Arc 2 wave 3 residual: derived transformation models now report real `bytes_scanned` / `bytes_written` to `rocky cost` instead of dropping the warehouse-reported `ExecutionStats` on the floor.

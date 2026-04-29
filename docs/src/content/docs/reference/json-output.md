@@ -214,7 +214,7 @@ Returns a complete summary of the pipeline execution.
 | `anomalies` | array | Row count anomalies detected by historical baseline comparison. |
 | `partition_summaries` | array | Per-model partition execution summaries (present for `time_interval` models). |
 | `cost_summary` | object or absent | Per-run cost rollup: `total_usd` (float or null), `by_adapter` (map of adapter → USD). Present when at least one adapter reports cost data. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
-| `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
+| `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
 
 **`materializations[]`:**
 

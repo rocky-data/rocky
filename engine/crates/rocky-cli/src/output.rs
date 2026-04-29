@@ -276,6 +276,15 @@ pub struct RunCostSummary {
     /// governance overhead) so budget enforcement can target
     /// model-compute time specifically.
     pub total_duration_ms: u64,
+    /// Sum of every per-model `bytes_scanned` that produced a number.
+    /// `None` when no materialization reported a byte count (the
+    /// non-BigQuery adapters today, which still inherit the default
+    /// stub on `WarehouseAdapter::execute_statement_with_stats`).
+    /// Surfaced so consumers — and the `[budget]` `max_bytes_scanned`
+    /// gate — can read scan volume without re-walking
+    /// [`RunOutput::materializations`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes_scanned: Option<u64>,
     /// Per-model cost attribution, ordered as in
     /// [`RunOutput::materializations`].
     pub per_model: Vec<ModelCostEntry>,
@@ -293,7 +302,8 @@ pub struct RunCostSummary {
 /// `BudgetBreach` one-to-one.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct BudgetBreachOutput {
-    /// Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+    /// Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or
+    /// `"max_bytes_scanned"`.
     pub limit_type: String,
     pub limit: f64,
     pub actual: f64,
@@ -2195,6 +2205,8 @@ impl RunOutput {
         let mut any_cost_computed = false;
         let mut total_cost = 0.0;
         let mut total_duration_ms: u64 = 0;
+        let mut any_bytes_reported = false;
+        let mut total_bytes: u64 = 0;
 
         for mat in &mut self.materializations {
             // BigQuery: `mat.bytes_scanned` is populated by the adapter
@@ -2218,6 +2230,10 @@ impl RunOutput {
                 total_cost += c;
             }
             total_duration_ms = total_duration_ms.saturating_add(mat.duration_ms);
+            if let Some(b) = mat.bytes_scanned {
+                any_bytes_reported = true;
+                total_bytes = total_bytes.saturating_add(b);
+            }
             per_model.push(ModelCostEntry {
                 asset_key: mat.asset_key.clone(),
                 duration_ms: mat.duration_ms,
@@ -2230,10 +2246,16 @@ impl RunOutput {
         } else {
             None
         };
+        let total_bytes_scanned = if any_bytes_reported {
+            Some(total_bytes)
+        } else {
+            None
+        };
 
         self.cost_summary = Some(RunCostSummary {
             total_cost_usd,
             total_duration_ms,
+            total_bytes_scanned,
             per_model,
             adapter_type: adapter_type.to_string(),
         });
@@ -2264,7 +2286,11 @@ impl RunOutput {
         }
 
         let observed_cost = self.cost_summary.as_ref().and_then(|s| s.total_cost_usd);
-        let breaches = budget_cfg.check_breaches(observed_cost, self.duration_ms);
+        let observed_bytes = self
+            .cost_summary
+            .as_ref()
+            .and_then(|s| s.total_bytes_scanned);
+        let breaches = budget_cfg.check_breaches(observed_cost, self.duration_ms, observed_bytes);
         if breaches.is_empty() {
             return Ok(());
         }
@@ -2737,6 +2763,7 @@ mod cost_finalize_tests {
         let budget = BudgetConfig {
             max_usd: Some(5.0),
             max_duration_ms: Some(60_000),
+            max_bytes_scanned: None,
             on_breach: BudgetBreachAction::Warn,
         };
         assert!(out.check_and_record_budget(&budget, Some("run-1")).is_ok());
@@ -2751,12 +2778,64 @@ mod cost_finalize_tests {
         let budget = BudgetConfig {
             max_usd: None,
             max_duration_ms: Some(60_000),
+            max_bytes_scanned: None,
             on_breach: BudgetBreachAction::Error,
         };
         let result = out.check_and_record_budget(&budget, None);
         assert!(result.is_err(), "error mode must return Err on breach");
         assert_eq!(out.budget_breaches.len(), 1);
         assert_eq!(out.budget_breaches[0].limit_type, "max_duration_ms");
+    }
+
+    #[test]
+    fn check_and_record_budget_trips_on_max_bytes_scanned() {
+        // Synthetic run: two BigQuery-style materializations each
+        // reporting 1_000_000 bytes scanned. With
+        // `max_bytes_scanned = 1_000_000`, total of 2_000_000 must
+        // trip the breach and (because `on_breach = "error"`) return
+        // `Err`.
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        let mut m1 = mat(&["a"], 500);
+        m1.bytes_scanned = Some(1_000_000);
+        let mut m2 = mat(&["b"], 500);
+        m2.bytes_scanned = Some(1_000_000);
+        out.materializations.push(m1);
+        out.materializations.push(m2);
+        out.populate_cost_summary("bigquery", &CostSection::default());
+        assert_eq!(
+            out.cost_summary
+                .as_ref()
+                .and_then(|s| s.total_bytes_scanned),
+            Some(2_000_000),
+        );
+
+        let budget = BudgetConfig {
+            max_usd: None,
+            max_duration_ms: None,
+            max_bytes_scanned: Some(1_000_000),
+            on_breach: BudgetBreachAction::Error,
+        };
+        let result = out.check_and_record_budget(&budget, Some("run-bytes"));
+        assert!(result.is_err(), "scan-volume breach must return Err");
+        assert_eq!(out.budget_breaches.len(), 1);
+        assert_eq!(out.budget_breaches[0].limit_type, "max_bytes_scanned");
+        assert!((out.budget_breaches[0].limit - 1_000_000.0).abs() < f64::EPSILON);
+        assert!((out.budget_breaches[0].actual - 2_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn check_and_record_budget_no_breach_when_max_bytes_scanned_unset() {
+        // Same synthetic 2 MB run, but `max_bytes_scanned` defaults to
+        // `None` — no breach regardless of scan total.
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        let mut m = mat(&["a"], 500);
+        m.bytes_scanned = Some(2_000_000);
+        out.materializations.push(m);
+        out.populate_cost_summary("bigquery", &CostSection::default());
+
+        let budget = BudgetConfig::default();
+        assert!(out.check_and_record_budget(&budget, None).is_ok());
+        assert!(out.budget_breaches.is_empty());
     }
 }
 

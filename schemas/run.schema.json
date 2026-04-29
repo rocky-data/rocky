@@ -45,7 +45,7 @@
           "type": "number"
         },
         "limit_type": {
-          "description": "Which limit was breached: `\"max_usd\"` or `\"max_duration_ms\"`.",
+          "description": "Which limit was breached: `\"max_usd\"`, `\"max_duration_ms\"`, or `\"max_bytes_scanned\"`.",
           "type": "string"
         }
       },
@@ -754,6 +754,15 @@
             "$ref": "#/definitions/ModelCostEntry"
           },
           "type": "array"
+        },
+        "total_bytes_scanned": {
+          "description": "Sum of every per-model `bytes_scanned` that produced a number. `None` when no materialization reported a byte count (the non-BigQuery adapters today, which still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Surfaced so consumers — and the `[budget]` `max_bytes_scanned` gate — can read scan volume without re-walking [`RunOutput::materializations`].",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "total_cost_usd": {
           "description": "Sum of every per-model `cost_usd` that produced a number. `None` when no materialization produced a cost.",
