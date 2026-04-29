@@ -24,6 +24,7 @@ use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
+use rocky_sql::validation::validate_identifier;
 
 use crate::connector::{DatabricksConnector, QueryResult};
 
@@ -58,12 +59,20 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
     })
 }
 
-/// Render a Databricks target as `catalog.schema.table`.
-fn format_target(target: &TableRef) -> String {
+/// Render a Databricks target as `catalog.schema.table` after validating each
+/// identifier. Rejects anything that isn't `[A-Za-z0-9_]+` so the result is
+/// always safe to interpolate into SQL.
+fn format_target(target: &TableRef) -> AdapterResult<String> {
+    validate_identifier(&target.schema).map_err(AdapterError::new)?;
+    validate_identifier(&target.table).map_err(AdapterError::new)?;
     if target.catalog.is_empty() {
-        format!("{}.{}", target.schema, target.table)
+        Ok(format!("{}.{}", target.schema, target.table))
     } else {
-        format!("{}.{}.{}", target.catalog, target.schema, target.table)
+        validate_identifier(&target.catalog).map_err(AdapterError::new)?;
+        Ok(format!(
+            "{}.{}.{}",
+            target.catalog, target.schema, target.table
+        ))
     }
 }
 
@@ -77,7 +86,10 @@ fn file_format_clause(format: FileFormat) -> &'static str {
 }
 
 /// Render the FORMAT_OPTIONS clause (only CSV has tunables Databricks cares about).
-fn format_options_clause(format: FileFormat, options: &LoadOptions) -> Option<String> {
+fn format_options_clause(
+    format: FileFormat,
+    options: &LoadOptions,
+) -> AdapterResult<Option<String>> {
     match format {
         FileFormat::Csv => {
             let header = if options.csv_has_header {
@@ -85,13 +97,40 @@ fn format_options_clause(format: FileFormat, options: &LoadOptions) -> Option<St
             } else {
                 "false"
             };
-            let delim = options.csv_delimiter;
-            Some(format!(
+            let delim = validate_csv_delimiter(options.csv_delimiter)?;
+            Ok(Some(format!(
                 "FORMAT_OPTIONS ('header' = '{header}', 'delimiter' = '{delim}')"
-            ))
+            )))
         }
-        FileFormat::Parquet | FileFormat::JsonLines => None,
+        FileFormat::Parquet | FileFormat::JsonLines => Ok(None),
     }
+}
+
+/// Reject CSV delimiters that would break out of the `'...'` SQL string literal.
+/// Allows printable ASCII plus tab; rejects quotes, backslash, and newlines.
+fn validate_csv_delimiter(c: char) -> AdapterResult<char> {
+    let ok = c == '\t' || (c.is_ascii() && !c.is_ascii_control() && c != '\'' && c != '\\');
+    if ok {
+        Ok(c)
+    } else {
+        Err(AdapterError::msg(format!(
+            "invalid CSV delimiter {c:?}: must be a printable ASCII char (or tab), not a quote, backslash, or control character"
+        )))
+    }
+}
+
+/// Reject cloud URIs that would break out of the `'<uri>'` SQL string literal.
+/// Rocky never escapes embedded quotes — instead we refuse to build the SQL.
+fn validate_cloud_uri(uri: &str) -> AdapterResult<&str> {
+    if uri.is_empty() {
+        return Err(AdapterError::msg("cloud URI cannot be empty"));
+    }
+    if uri.contains(['\'', '\n', '\r', '\\']) {
+        return Err(AdapterError::msg(format!(
+            "invalid cloud URI {uri:?}: must not contain quotes, backslashes, or newlines"
+        )));
+    }
+    Ok(uri)
 }
 
 /// Extract the `num_affected_rows` count from a COPY INTO response.
@@ -122,14 +161,18 @@ fn extract_num_affected_rows(result: &QueryResult) -> Option<u64> {
 }
 
 /// Build the full `COPY INTO ... FROM '<uri>'` SQL statement.
+///
+/// The caller must pass a validated `target_ref` (use [`format_target`]) and a
+/// validated `uri` (use [`validate_cloud_uri`]) so the literal-context
+/// interpolation can't be broken out of.
 fn build_copy_into_sql(
     uri: &str,
     target_ref: &str,
     format: FileFormat,
     options: &LoadOptions,
-) -> String {
+) -> AdapterResult<String> {
     let fileformat = file_format_clause(format);
-    let format_opts = format_options_clause(format, options)
+    let format_opts = format_options_clause(format, options)?
         .map(|s| format!(" {s}"))
         .unwrap_or_default();
     // mergeSchema lets Databricks evolve the target schema when new columns
@@ -139,7 +182,9 @@ fn build_copy_into_sql(
     } else {
         ""
     };
-    format!("COPY INTO {target_ref} FROM '{uri}' FILEFORMAT = {fileformat}{format_opts}{copy_opts}")
+    Ok(format!(
+        "COPY INTO {target_ref} FROM '{uri}' FILEFORMAT = {fileformat}{format_opts}{copy_opts}"
+    ))
 }
 
 #[async_trait]
@@ -165,7 +210,8 @@ impl LoaderAdapter for DatabricksLoaderAdapter {
         };
 
         let format = resolve_format(source, options)?;
-        let target_ref = format_target(target);
+        let target_ref = format_target(target)?;
+        let uri = validate_cloud_uri(&uri)?.to_string();
 
         // `truncate_first` maps to a DELETE prior to COPY INTO. Databricks
         // supports DELETE FROM on managed tables.
@@ -178,7 +224,7 @@ impl LoaderAdapter for DatabricksLoaderAdapter {
                 .map_err(|e| AdapterError::msg(e.to_string()))?;
         }
 
-        let sql = build_copy_into_sql(&uri, &target_ref, format, options);
+        let sql = build_copy_into_sql(&uri, &target_ref, format, options)?;
         info!(sql = %sql, "databricks COPY INTO");
         let copy_result = self
             .connector
@@ -229,7 +275,9 @@ mod tests {
     #[test]
     fn test_format_options_csv_default() {
         let opts = LoadOptions::default();
-        let clause = format_options_clause(FileFormat::Csv, &opts).unwrap();
+        let clause = format_options_clause(FileFormat::Csv, &opts)
+            .unwrap()
+            .unwrap();
         assert!(clause.contains("'header' = 'true'"));
         assert!(clause.contains("'delimiter' = ','"));
     }
@@ -241,14 +289,29 @@ mod tests {
             csv_has_header: false,
             ..Default::default()
         };
-        let clause = format_options_clause(FileFormat::Csv, &opts).unwrap();
+        let clause = format_options_clause(FileFormat::Csv, &opts)
+            .unwrap()
+            .unwrap();
         assert!(clause.contains("'header' = 'false'"));
         assert!(clause.contains("'delimiter' = '\t'"));
     }
 
     #[test]
     fn test_format_options_parquet_none() {
-        assert!(format_options_clause(FileFormat::Parquet, &LoadOptions::default()).is_none());
+        assert!(
+            format_options_clause(FileFormat::Parquet, &LoadOptions::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_format_options_csv_rejects_quote_delimiter() {
+        let opts = LoadOptions {
+            csv_delimiter: '\'',
+            ..Default::default()
+        };
+        assert!(format_options_clause(FileFormat::Csv, &opts).is_err());
     }
 
     #[test]
@@ -258,7 +321,7 @@ mod tests {
             schema: "raw".into(),
             table: "orders".into(),
         };
-        assert_eq!(format_target(&t), "main.raw.orders");
+        assert_eq!(format_target(&t).unwrap(), "main.raw.orders");
     }
 
     #[test]
@@ -268,7 +331,25 @@ mod tests {
             schema: "raw".into(),
             table: "orders".into(),
         };
-        assert_eq!(format_target(&t), "raw.orders");
+        assert_eq!(format_target(&t).unwrap(), "raw.orders");
+    }
+
+    #[test]
+    fn test_format_target_rejects_injection() {
+        let t = TableRef {
+            catalog: "main; DROP TABLE x".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        };
+        assert!(format_target(&t).is_err());
+    }
+
+    #[test]
+    fn test_validate_cloud_uri_rejects_quote() {
+        assert!(validate_cloud_uri("s3://bucket/key").is_ok());
+        assert!(validate_cloud_uri("s3://bucket/key'; DROP --").is_err());
+        assert!(validate_cloud_uri("s3://bucket/\nfoo").is_err());
+        assert!(validate_cloud_uri("").is_err());
     }
 
     #[test]
@@ -279,7 +360,8 @@ mod tests {
             "main.raw.orders",
             FileFormat::Csv,
             &opts,
-        );
+        )
+        .unwrap();
         assert!(sql.starts_with("COPY INTO main.raw.orders"));
         assert!(sql.contains("FROM 's3://bucket/path/file.csv'"));
         assert!(sql.contains("FILEFORMAT = CSV"));
@@ -298,7 +380,8 @@ mod tests {
             "main.raw.orders",
             FileFormat::Parquet,
             &opts,
-        );
+        )
+        .unwrap();
         assert!(sql.contains("FILEFORMAT = PARQUET"));
         assert!(!sql.contains("mergeSchema"));
         assert!(!sql.contains("FORMAT_OPTIONS"));
@@ -312,7 +395,8 @@ mod tests {
             "main.raw.orders",
             FileFormat::JsonLines,
             &opts,
-        );
+        )
+        .unwrap();
         assert!(sql.contains("FILEFORMAT = JSON"));
         assert!(sql.contains("abfss://container@acct/data.jsonl"));
     }

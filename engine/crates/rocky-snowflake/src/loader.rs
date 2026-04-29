@@ -20,6 +20,7 @@ use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
+use rocky_sql::validation::validate_identifier;
 
 use crate::connector::{QueryResult, SnowflakeConnector};
 use crate::stage::{
@@ -78,12 +79,19 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
 }
 
 /// Render a Snowflake target as `db.schema.table` (Snowflake uses the same
-/// 3-part form as Databricks for fully-qualified references).
-fn format_target(target: &TableRef) -> String {
+/// 3-part form as Databricks for fully-qualified references). Each segment is
+/// validated as a SQL identifier so the result is safe to interpolate.
+fn format_target(target: &TableRef) -> AdapterResult<String> {
+    validate_identifier(&target.schema).map_err(AdapterError::new)?;
+    validate_identifier(&target.table).map_err(AdapterError::new)?;
     if target.catalog.is_empty() {
-        format!("{}.{}", target.schema, target.table)
+        Ok(format!("{}.{}", target.schema, target.table))
     } else {
-        format!("{}.{}.{}", target.catalog, target.schema, target.table)
+        validate_identifier(&target.catalog).map_err(AdapterError::new)?;
+        Ok(format!(
+            "{}.{}.{}",
+            target.catalog, target.schema, target.table
+        ))
     }
 }
 
@@ -97,7 +105,7 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
     ) -> AdapterResult<LoadResult> {
         let start = Instant::now();
         let format = resolve_format(source, options)?;
-        let target_ref = format_target(target);
+        let target_ref = format_target(target)?;
         let stage = generate_stage_name();
 
         // `truncate_first` → DELETE FROM before COPY INTO. Snowflake supports
@@ -113,7 +121,7 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
         let (rows_loaded, file_size) = match source {
             LoadSource::CloudUri(uri) => {
                 // External stage path: one CREATE, one COPY, one DROP.
-                let create_sql = create_external_stage_sql(&stage, uri, format, options);
+                let create_sql = create_external_stage_sql(&stage, uri, format, options)?;
                 debug!(sql = %create_sql, "creating external stage");
                 self.exec(&create_sql).await?;
 
@@ -132,12 +140,12 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
             }
             LoadSource::LocalFile(local_path) => {
                 // Internal stage path: CREATE, PUT, COPY, DROP.
-                let create_sql = create_temporary_stage_sql(&stage, format, options);
+                let create_sql = create_temporary_stage_sql(&stage, format, options)?;
                 debug!(sql = %create_sql, "creating internal stage");
                 self.exec(&create_sql).await?;
 
                 let local_str = local_path_str(local_path)?;
-                let put_sql = put_file_sql(&local_str, &stage);
+                let put_sql = put_file_sql(&local_str, &stage)?;
                 info!(sql = %put_sql, "snowflake PUT");
                 let put_result = self.exec(&put_sql).await;
 
@@ -256,7 +264,7 @@ mod tests {
             schema: "RAW".into(),
             table: "ORDERS".into(),
         };
-        assert_eq!(format_target(&t), "DB.RAW.ORDERS");
+        assert_eq!(format_target(&t).unwrap(), "DB.RAW.ORDERS");
     }
 
     #[test]
@@ -266,7 +274,17 @@ mod tests {
             schema: "RAW".into(),
             table: "ORDERS".into(),
         };
-        assert_eq!(format_target(&t), "RAW.ORDERS");
+        assert_eq!(format_target(&t).unwrap(), "RAW.ORDERS");
+    }
+
+    #[test]
+    fn test_format_target_rejects_injection() {
+        let t = TableRef {
+            catalog: "DB".into(),
+            schema: "RAW; DROP TABLE x; --".into(),
+            table: "ORDERS".into(),
+        };
+        assert!(format_target(&t).is_err());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
     AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
 };
+use rocky_sql::validation::validate_identifier;
 
 use crate::auth::BigQueryAuth;
 use crate::dialect::BigQueryDialect;
@@ -297,6 +298,11 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        // validate_identifier rejects `'` and other non-alphanumerics, so the
+        // `table_name = '...'` literal cannot be broken out of by `table.table`.
+        validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+        validate_identifier(&table.schema).map_err(AdapterError::new)?;
+        validate_identifier(&table.table).map_err(AdapterError::new)?;
         let sql = format!(
             "SELECT column_name, data_type, is_nullable \
              FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
@@ -326,6 +332,8 @@ impl WarehouseAdapter for BigQueryAdapter {
 
     async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
         // BigQuery: catalog = project, schema = dataset
+        validate_identifier(catalog).map_err(AdapterError::new)?;
+        validate_identifier(schema).map_err(AdapterError::new)?;
         let sql =
             format!("SELECT table_name FROM `{catalog}`.`{schema}`.INFORMATION_SCHEMA.TABLES");
         let result = self.execute_query(&sql).await?;
