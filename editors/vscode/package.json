@@ -225,6 +225,21 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.previewCreate",
+        "title": "Rocky: Preview Create (PR diff)",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.previewDiff",
+        "title": "Rocky: Preview Diff",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.previewCost",
+        "title": "Rocky: Preview Cost",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.refreshModels",
         "title": "Refresh Models",
         "category": "Rocky",

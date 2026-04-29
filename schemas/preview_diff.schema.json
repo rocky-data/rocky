@@ -1,0 +1,262 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PreviewColumnTypeChange": {
+      "description": "One column-type change entry.",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "name",
+        "to"
+      ],
+      "type": "object"
+    },
+    "PreviewDiffSummary": {
+      "description": "Aggregate diff counts for [`PreviewDiffOutput`].",
+      "properties": {
+        "any_coverage_warning": {
+          "description": "`true` if **any** per-model diff carries `sampling_window.coverage_warning = true`.",
+          "type": "boolean"
+        },
+        "models_unchanged": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "models_with_changes": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_rows_added": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_rows_changed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_rows_removed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "any_coverage_warning",
+        "models_unchanged",
+        "models_with_changes",
+        "total_rows_added",
+        "total_rows_changed",
+        "total_rows_removed"
+      ],
+      "type": "object"
+    },
+    "PreviewModelDiff": {
+      "description": "Per-model diff. Combines structural (column-level) and sampled (row-level) findings.",
+      "properties": {
+        "model_name": {
+          "type": "string"
+        },
+        "sampled": {
+          "$ref": "#/definitions/PreviewSampledRowDiff"
+        },
+        "sampling_window": {
+          "$ref": "#/definitions/PreviewSamplingWindow"
+        },
+        "structural": {
+          "$ref": "#/definitions/PreviewStructuralDiff"
+        }
+      },
+      "required": [
+        "model_name",
+        "sampled",
+        "sampling_window",
+        "structural"
+      ],
+      "type": "object"
+    },
+    "PreviewRowSample": {
+      "description": "One representative changed row in [`PreviewSampledRowDiff::samples`].",
+      "properties": {
+        "changes": {
+          "description": "Pairs of `(column_name, base_value, branch_value)` for every column that differs on this row.",
+          "items": {
+            "$ref": "#/definitions/PreviewRowSampleChange"
+          },
+          "type": "array"
+        },
+        "primary_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "changes",
+        "primary_key"
+      ],
+      "type": "object"
+    },
+    "PreviewRowSampleChange": {
+      "description": "One `(column, base, branch)` triple in [`PreviewRowSample::changes`].",
+      "properties": {
+        "base_value": {
+          "type": "string"
+        },
+        "branch_value": {
+          "type": "string"
+        },
+        "column": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "base_value",
+        "branch_value",
+        "column"
+      ],
+      "type": "object"
+    },
+    "PreviewSampledRowDiff": {
+      "description": "Sampled row-level diff. All counts are over the sampling window.",
+      "properties": {
+        "rows_added": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rows_changed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rows_removed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "samples": {
+          "description": "Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.",
+          "items": {
+            "$ref": "#/definitions/PreviewRowSample"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "rows_added",
+        "rows_changed",
+        "rows_removed",
+        "samples"
+      ],
+      "type": "object"
+    },
+    "PreviewSamplingWindow": {
+      "description": "Sampling-window metadata surfaced verbatim in the PR comment.\n\n`coverage_warning = true` flags that the row count outside the sampling window is non-trivial; reviewers should not infer \"no change\" from a clean sample if this flag is set.",
+      "properties": {
+        "coverage": {
+          "description": "One of `\"first_n_by_order\"` (Phase 2) or `\"checksum_bisection\"` (Phase 2.5 lift, not yet shipped).",
+          "type": "string"
+        },
+        "coverage_warning": {
+          "type": "boolean"
+        },
+        "limit": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ordered_by": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "coverage",
+        "coverage_warning",
+        "limit",
+        "ordered_by"
+      ],
+      "type": "object"
+    },
+    "PreviewStructuralDiff": {
+      "description": "Column-level structural diff. Mirrors the shape produced by `rocky ci-diff` at the column granularity.",
+      "properties": {
+        "added_columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed_columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type_changes": {
+          "description": "One entry per column whose type changed. Each carries `name`, `from`, `to`.",
+          "items": {
+            "$ref": "#/definitions/PreviewColumnTypeChange"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "added_columns",
+        "removed_columns",
+        "type_changes"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky preview diff`.\n\nCombines the structural diff (column added/removed/type-changed) from the existing `rocky_core::ci_diff` machinery with a sampled row-level diff that extends the `rocky_core::compare`/`shadow` kernel.\n\n**Sampling correctness ceiling.** Phase 2 sampling reads `LIMIT N` rows ordered by primary key (or first column). Changes outside that window appear as no-change unless the row count itself differs. `sampling_window.coverage_warning = true` flags this risk on the per-model level so reviewers don't infer false coverage. A checksum-bisection exhaustive diff is the Phase 2.5 lift.",
+  "properties": {
+    "base_ref": {
+      "type": "string"
+    },
+    "branch_name": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "markdown": {
+      "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
+      "type": "string"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/PreviewModelDiff"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "$ref": "#/definitions/PreviewDiffSummary"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "base_ref",
+    "branch_name",
+    "command",
+    "markdown",
+    "models",
+    "summary",
+    "version"
+  ],
+  "title": "PreviewDiffOutput",
+  "type": "object"
+}

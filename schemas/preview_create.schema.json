@@ -1,0 +1,129 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PreviewCopiedModel": {
+      "description": "One entry in [`PreviewCreateOutput::copy_set`].\n\n`copy_strategy` is `\"ctas\"` in Phase 1 (DuckDB CTAS or generic `CREATE TABLE AS SELECT *`); Phase 5 lifts this to `\"shallow_clone\"` (Databricks Delta) and `\"zero_copy_clone\"` (Snowflake) per the adapter's clone capability.",
+      "properties": {
+        "copy_strategy": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "source_schema": {
+          "type": "string"
+        },
+        "target_schema": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "copy_strategy",
+        "model_name",
+        "source_schema",
+        "target_schema"
+      ],
+      "type": "object"
+    },
+    "PreviewPrunedModel": {
+      "description": "One entry in [`PreviewCreateOutput::prune_set`].",
+      "properties": {
+        "changed_columns": {
+          "description": "Columns the diff reports as changed on this model. Only populated when `reason = \"changed\"`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "`\"changed\"` for models the diff identified directly, or `\"downstream_of_changed\"` for models pulled in by column-level lineage from a changed model.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "changed_columns",
+        "model_name",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky preview create`.\n\nRecords the prune-and-copy decision plus the run summary for the branch execution. The `prune_set` lists models that re-executed; the `copy_set` lists models pre-populated from the base schema instead of being re-run. `skipped_set` is the empty-cost residue — neither changed nor downstream of a change.",
+  "properties": {
+    "base_ref": {
+      "description": "Git ref the change set was computed against. Mirrors `--base`.",
+      "type": "string"
+    },
+    "branch_name": {
+      "description": "Branch name registered in the state store. Mirrors the `name` from `rocky branch create`.",
+      "type": "string"
+    },
+    "branch_schema": {
+      "description": "Schema prefix the branch run wrote into (e.g. `branch__fix-price`).",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "copy_set": {
+      "description": "Models pre-populated from the base schema instead of re-running. Empty in Phase 1 if no models could be safely copied.",
+      "items": {
+        "$ref": "#/definitions/PreviewCopiedModel"
+      },
+      "type": "array"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "head_ref": {
+      "description": "Git SHA the diff was computed from (typically `HEAD`).",
+      "type": "string"
+    },
+    "prune_set": {
+      "description": "Models that re-executed against the branch.",
+      "items": {
+        "$ref": "#/definitions/PreviewPrunedModel"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "description": "`RunRecord` id for the branch execution. Empty when no models re-executed (a no-op preview where every changed model pruned to zero downstream).",
+      "type": "string"
+    },
+    "run_status": {
+      "description": "`succeeded`, `partial`, or `failed` — mirrors `RunRecord.status`.",
+      "type": "string"
+    },
+    "skipped_set": {
+      "description": "Models neither in the prune set nor copied — the column-level pruner determined they are unaffected and not depended on by any pruned model. Names only; rationale lives in the diff layer.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "base_ref",
+    "branch_name",
+    "branch_schema",
+    "command",
+    "copy_set",
+    "duration_ms",
+    "head_ref",
+    "prune_set",
+    "run_id",
+    "run_status",
+    "skipped_set",
+    "version"
+  ],
+  "title": "PreviewCreateOutput",
+  "type": "object"
+}

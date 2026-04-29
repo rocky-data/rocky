@@ -823,6 +823,24 @@ enum Command {
         model: Option<String>,
     },
 
+    /// PR preview workflow — pruned re-run on a per-PR branch with
+    /// data + cost diff vs. the base ref.
+    ///
+    /// Three subcommands compose into a single PR comment:
+    ///
+    /// * `preview create` registers a branch, copies unchanged upstream
+    ///   from the base schema, and re-runs only changed models + their
+    ///   downstream;
+    /// * `preview diff` produces a structural + sampled row-level diff
+    ///   between branch and base;
+    /// * `preview cost` produces a per-model bytes/duration/USD delta.
+    ///
+    /// See `plans/rocky-pr-preview-and-data-diff.md` for the design.
+    Preview {
+        #[command(subcommand)]
+        action: PreviewAction,
+    },
+
     /// Report per-model data retention configuration.
     ///
     /// Walks the compiled model set and reports each model's declared
@@ -953,6 +971,45 @@ enum HooksAction {
     Test {
         /// Event name (e.g., on_pipeline_start, on_materialize_error)
         event: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PreviewAction {
+    /// Register a branch, copy unchanged upstream from the base schema,
+    /// and re-run only changed models + their downstream.
+    Create {
+        /// Git ref to compare against (default: main)
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Branch name. When omitted, derived from the current git
+        /// branch via `pr-preview/<branch>` so PRs that re-run inherit
+        /// the same branch entry.
+        #[arg(long)]
+        name: Option<String>,
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+    /// Produce a structural + sampled row-level diff between the preview
+    /// branch and the base schema for every model in the prune set.
+    Diff {
+        /// Branch name registered by `preview create`.
+        #[arg(long)]
+        name: String,
+        /// Git ref to compare data against (default: main)
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Maximum rows to sample per model (default: 1000)
+        #[arg(long, default_value_t = 1000)]
+        sample_size: usize,
+    },
+    /// Produce a per-model bytes/duration/USD delta between the preview
+    /// branch's run and the latest base-schema run.
+    Cost {
+        /// Branch name registered by `preview create`.
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -1711,6 +1768,37 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Cost { target, model } => {
             rocky_cli::commands::run_cost(&state_path, &cli.config, &target, model.as_deref(), json)
         }
+        Command::Preview { action } => match action {
+            PreviewAction::Create { base, name, models } => {
+                rocky_cli::commands::run_preview_create(
+                    &cli.config,
+                    &state_path,
+                    &models,
+                    &base,
+                    name.as_deref(),
+                    json,
+                )
+                .await
+            }
+            PreviewAction::Diff {
+                name,
+                base,
+                sample_size,
+            } => {
+                rocky_cli::commands::run_preview_diff(
+                    &cli.config,
+                    &state_path,
+                    &name,
+                    &base,
+                    sample_size,
+                    json,
+                )
+                .await
+            }
+            PreviewAction::Cost { name } => {
+                rocky_cli::commands::run_preview_cost(&cli.config, &state_path, &name, json).await
+            }
+        },
         Command::RetentionStatus {
             models,
             model,

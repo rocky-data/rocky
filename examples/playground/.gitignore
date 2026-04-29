@@ -1,5 +1,7 @@
 # Rocky runtime artifacts
 .rocky-state.redb
+.rocky_state
+.rocky_state.redb.lock
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp/
@@ -10,7 +12,10 @@ pocs/**/expected/*.dot
 pocs/**/expected/*.txt
 pocs/**/expected/*.jsonl
 pocs/**/expected/*.log
+pocs/**/expected/*.err
 !pocs/**/expected/.gitkeep
+# Aspirational target shapes for not-yet-implemented commands stay tracked.
+!pocs/**/expected/*.example.json
 
 # Python (benchmarks, dbt-migration POC)
 __pycache__/

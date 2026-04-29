@@ -8,7 +8,7 @@ sidebar:
 Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
 
 - **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `run`, `state`, `branch`
-- **Modeling**: `compile`, `lineage`, `test`, `ci`, `ci-diff`
+- **Modeling**: `compile`, `lineage`, `test`, `ci`, `ci-diff`, `preview`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `hooks`, `validate-migration`, `test-adapter`

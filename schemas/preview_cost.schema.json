@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PreviewCostSummary": {
+      "description": "Aggregate cost rollup for [`PreviewCostOutput`].",
+      "properties": {
+        "delta_usd": {
+          "description": "`total_branch_cost_usd - total_base_cost_usd`. Positive = the PR costs more to run than `main`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "models_skipped_via_copy": {
+          "description": "Number of models that did not run on the branch because they were copied from base. Their savings show up below.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "savings_from_copy_usd": {
+          "description": "Sum of `base_cost_usd` for every copied model — the cost the PR avoided by copying instead of re-running. `None` when no base costs are available for the copied models.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_base_cost_usd": {
+          "description": "Sum of every per-model `base_cost_usd` (limited to models in the prune set — copied models contribute 0 here, accounted for in `savings_from_copy_usd`).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_branch_cost_usd": {
+          "description": "Sum of every per-model `branch_cost_usd` that produced a number.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "models_skipped_via_copy"
+      ],
+      "type": "object"
+    },
+    "PreviewModelCostDelta": {
+      "description": "Per-model cost delta.",
+      "properties": {
+        "base_bytes_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "base_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "base_duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "branch_bytes_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "branch_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "branch_duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "delta_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "skipped_via_copy": {
+          "description": "`true` if this model was copied from base instead of re-run. When true, `branch_*` fields are `None` / `0` and the savings for this row roll into [`PreviewCostSummary::savings_from_copy_usd`].",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "base_duration_ms",
+        "branch_duration_ms",
+        "model_name",
+        "skipped_via_copy"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky preview cost`.\n\nDiff layer over `rocky cost latest`'s machinery. Per-model deltas are computed by looking up the latest base-schema `RunRecord` and the branch run's `RunRecord` and subtracting field-by-field.\n\n`models_skipped_via_copy` is the prune-set complement: copied models did not run on the branch, so their delta is `None` and their savings accrue to `savings_from_copy_usd`.",
+  "properties": {
+    "base_run_id": {
+      "description": "`RunRecord` id for the latest base-schema run that the branch is being compared against. `None` when no base run exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "branch_name": {
+      "type": "string"
+    },
+    "branch_run_id": {
+      "description": "`RunRecord` id for the branch execution. Empty when the branch run was a no-op (every changed model pruned to zero downstream).",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "markdown": {
+      "type": "string"
+    },
+    "per_model": {
+      "items": {
+        "$ref": "#/definitions/PreviewModelCostDelta"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "$ref": "#/definitions/PreviewCostSummary"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "branch_name",
+    "branch_run_id",
+    "command",
+    "markdown",
+    "per_model",
+    "summary",
+    "version"
+  ],
+  "title": "PreviewCostOutput",
+  "type": "object"
+}

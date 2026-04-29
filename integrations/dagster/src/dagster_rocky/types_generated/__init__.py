@@ -191,6 +191,29 @@ from .compliance_schema import (
 # Retention status (per-model data retention report)
 from .retention_status_schema import ModelRetentionStatus, RetentionStatusOutput
 
+# Preview (PR-bundle: create branch, diff base vs branch, cost delta)
+from .preview_create_schema import (
+    PreviewCopiedModel,
+    PreviewCreateOutput,
+    PreviewPrunedModel,
+)
+from .preview_diff_schema import (
+    PreviewColumnTypeChange,
+    PreviewDiffOutput,
+    PreviewDiffSummary,
+    PreviewModelDiff,
+    PreviewRowSample,
+    PreviewRowSampleChange,
+    PreviewSampledRowDiff,
+    PreviewSamplingWindow,
+    PreviewStructuralDiff,
+)
+from .preview_cost_schema import (
+    PreviewCostOutput,
+    PreviewCostSummary,
+    PreviewModelCostDelta,
+)
+
 __all__ = [
     # ai
     "AiGenerateOutput",
@@ -321,4 +344,20 @@ __all__ = [
     # retention status
     "RetentionStatusOutput",
     "ModelRetentionStatus",
+    # preview (PR-bundle)
+    "PreviewCreateOutput",
+    "PreviewCopiedModel",
+    "PreviewPrunedModel",
+    "PreviewDiffOutput",
+    "PreviewDiffSummary",
+    "PreviewModelDiff",
+    "PreviewRowSample",
+    "PreviewRowSampleChange",
+    "PreviewSampledRowDiff",
+    "PreviewSamplingWindow",
+    "PreviewStructuralDiff",
+    "PreviewColumnTypeChange",
+    "PreviewCostOutput",
+    "PreviewCostSummary",
+    "PreviewModelCostDelta",
 ]
