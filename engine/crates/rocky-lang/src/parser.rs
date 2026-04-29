@@ -8,6 +8,19 @@ use crate::ast::*;
 use crate::error::ParseError;
 use crate::token::Token;
 
+/// Maximum recursion depth for expression parsing.
+///
+/// The expression grammar is a chain of recursive-descent functions
+/// (`parse_or_expr → parse_and_expr → … → parse_primary`) plus self-recursive
+/// `parse_unary` (for `not not not …`) and `parse_primary → parse_expr`
+/// (for `((((…))))` and function arguments). Without a cap, adversarial
+/// inputs blow the call stack — particularly under WASM, which has a
+/// ~1 MiB stack by default.
+///
+/// 256 leaves headroom for legitimately nested expressions while bounding
+/// any single parse to a small, constant stack footprint.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
 /// Parse a Rocky DSL source string into an AST.
 pub fn parse(source: &str) -> Result<RockyFile, ParseError> {
     let mut parser = Parser::new(source);
@@ -17,6 +30,11 @@ pub fn parse(source: &str) -> Result<RockyFile, ParseError> {
 struct Parser {
     tokens: Vec<(Token, usize)>,
     pos: usize,
+    /// Current expression-parsing recursion depth. Bumped on entry to each
+    /// recursive expression function via [`Parser::with_depth`] and unwound
+    /// before the helper returns, so `?` early returns inside the wrapped
+    /// closure don't desync the counter.
+    depth: usize,
     /// Byte offsets of each `\n` character in the source, in ascending order.
     /// Used to convert a byte offset into a (line, column) pair via binary search.
     #[allow(dead_code)] // infrastructure for upcoming line:col error reporting
@@ -45,8 +63,35 @@ impl Parser {
         Parser {
             tokens,
             pos: 0,
+            depth: 0,
             newline_offsets,
         }
+    }
+
+    /// Run `f` with the recursion-depth counter incremented, returning
+    /// [`ParseError::TooDeeplyNested`] without invoking `f` when the
+    /// depth would exceed [`MAX_EXPR_DEPTH`].
+    ///
+    /// Wrap every recursive expression-parsing entry point with this
+    /// helper — see the recursion sites enumerated on [`MAX_EXPR_DEPTH`].
+    /// The counter is unwound before this returns regardless of whether
+    /// `f` returns `Ok` or `Err`, so `?` inside the closure can't desync
+    /// it.
+    fn with_depth<F, T>(&mut self, f: F) -> Result<T, ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, ParseError>,
+    {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(ParseError::TooDeeplyNested {
+                depth: self.depth + 1,
+                limit: MAX_EXPR_DEPTH,
+                offset: self.current_offset(),
+            });
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -696,38 +741,46 @@ impl Parser {
     // --- Expression parsing ---
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_or_expr()
+        self.with_depth(Self::parse_or_expr)
     }
 
     fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_and_expr()?;
-        while self.peek() == Some(&Token::Or) {
-            self.advance();
-            let right = self.parse_and_expr()?;
-            left = Expr::BinaryOp {
-                left: Arc::new(left),
-                op: BinOp::Or,
-                right: Arc::new(right),
-            };
-        }
-        Ok(left)
+        self.with_depth(|p| {
+            let mut left = p.parse_and_expr()?;
+            while p.peek() == Some(&Token::Or) {
+                p.advance();
+                let right = p.parse_and_expr()?;
+                left = Expr::BinaryOp {
+                    left: Arc::new(left),
+                    op: BinOp::Or,
+                    right: Arc::new(right),
+                };
+            }
+            Ok(left)
+        })
     }
 
     fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_comparison()?;
-        while self.peek() == Some(&Token::And) {
-            self.advance();
-            let right = self.parse_comparison()?;
-            left = Expr::BinaryOp {
-                left: Arc::new(left),
-                op: BinOp::And,
-                right: Arc::new(right),
-            };
-        }
-        Ok(left)
+        self.with_depth(|p| {
+            let mut left = p.parse_comparison()?;
+            while p.peek() == Some(&Token::And) {
+                p.advance();
+                let right = p.parse_comparison()?;
+                left = Expr::BinaryOp {
+                    left: Arc::new(left),
+                    op: BinOp::And,
+                    right: Arc::new(right),
+                };
+            }
+            Ok(left)
+        })
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        self.with_depth(Self::parse_comparison_inner)
+    }
+
+    fn parse_comparison_inner(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_additive()?;
 
         // IS NULL / IS NOT NULL
@@ -771,6 +824,10 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
+        self.with_depth(Self::parse_additive_inner)
+    }
+
+    fn parse_additive_inner(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
@@ -790,6 +847,10 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
+        self.with_depth(Self::parse_multiplicative_inner)
+    }
+
+    fn parse_multiplicative_inner(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -810,28 +871,32 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        match self.peek() {
+        self.with_depth(|p| match p.peek() {
             Some(Token::Not) => {
-                self.advance();
-                let expr = self.parse_unary()?;
+                p.advance();
+                let expr = p.parse_unary()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
                     expr: Arc::new(expr),
                 })
             }
             Some(Token::Minus) => {
-                self.advance();
-                let expr = self.parse_unary()?;
+                p.advance();
+                let expr = p.parse_unary()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
                     expr: Arc::new(expr),
                 })
             }
-            _ => self.parse_primary(),
-        }
+            _ => p.parse_primary(),
+        })
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        self.with_depth(Self::parse_primary_inner)
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         match self.peek().cloned() {
             Some(Token::StringLit(_)) => {
                 if let Some(Token::StringLit(s)) = self.advance() {
@@ -2559,5 +2624,113 @@ mod tests {
         let second_nl = input.find('\n').unwrap();
         let second_nl2 = input[second_nl + 1..].find('\n').unwrap() + second_nl + 1;
         assert_eq!(parser.newline_offsets[1], second_nl2);
+    }
+
+    // ==========================================
+    // Recursion-depth limit (adversarial input)
+    // ==========================================
+    //
+    // The expression grammar is recursive descent — `((((…))))` and
+    // `not not not …` would otherwise blow the stack on adversarial
+    // input. A bounded-depth check turns the failure mode into a
+    // structured `ParseError::TooDeeplyNested`.
+
+    #[test]
+    fn test_parse_deeply_nested_parens_is_structured_error() {
+        // 1000 nested parens around a literal: `(((…1…)))`.
+        let depth = 1000;
+        let mut input = String::from("from orders\nwhere ");
+        input.push_str(&"(".repeat(depth));
+        input.push('1');
+        input.push_str(&")".repeat(depth));
+
+        let err = parse(&input).expect_err("expected TooDeeplyNested");
+        assert!(
+            matches!(err, ParseError::TooDeeplyNested { .. }),
+            "expected TooDeeplyNested, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_deeply_chained_not_is_structured_error() {
+        // 1000 chained `not`s: `not not not … not true`.
+        let depth = 1000;
+        let mut input = String::from("from orders\nwhere ");
+        for _ in 0..depth {
+            input.push_str("not ");
+        }
+        input.push_str("true");
+
+        let err = parse(&input).expect_err("expected TooDeeplyNested");
+        assert!(
+            matches!(err, ParseError::TooDeeplyNested { .. }),
+            "expected TooDeeplyNested, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_deeply_chained_unary_minus_is_structured_error() {
+        // 1000 chained unary `-`s: `- - - … 1`.
+        let depth = 1000;
+        let mut input = String::from("from orders\nwhere x == ");
+        for _ in 0..depth {
+            input.push_str("- ");
+        }
+        input.push('1');
+
+        let err = parse(&input).expect_err("expected TooDeeplyNested");
+        assert!(
+            matches!(err, ParseError::TooDeeplyNested { .. }),
+            "expected TooDeeplyNested, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_reasonably_nested_parens_still_parses() {
+        // 10 nested parens — well below the limit. Must parse cleanly.
+        let depth = 10;
+        let mut expr = String::from("1");
+        for _ in 0..depth {
+            expr = format!("({expr})");
+        }
+        let input = format!("from orders\nwhere x == {expr}");
+
+        let file = parse(&input).expect("10-deep nesting should parse");
+        assert_eq!(file.pipeline.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_reasonably_chained_not_still_parses() {
+        // 10 chained `not`s — well below the limit. Must parse cleanly.
+        let depth = 10;
+        let mut input = String::from("from orders\nwhere ");
+        for _ in 0..depth {
+            input.push_str("not ");
+        }
+        input.push_str("active");
+
+        let file = parse(&input).expect("10 chained `not`s should parse");
+        assert_eq!(file.pipeline.len(), 2);
+    }
+
+    #[test]
+    fn test_too_deeply_nested_error_carries_limit() {
+        // The structured error should report the configured limit,
+        // not a random value, so callers can surface it to users.
+        let depth = 1000;
+        let input = format!(
+            "from orders\nwhere {}1{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        match parse(&input) {
+            Err(ParseError::TooDeeplyNested {
+                depth: d, limit, ..
+            }) => {
+                assert_eq!(limit, MAX_EXPR_DEPTH);
+                assert!(d > limit, "reported depth {d} should exceed limit {limit}");
+            }
+            other => panic!("expected TooDeeplyNested, got {other:?}"),
+        }
     }
 }
