@@ -97,7 +97,7 @@ pub use retention_status::run_retention_status;
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;
-pub use run::{Interrupted, PartitionRunOptions, run};
+pub use run::{Interrupted, PartialFailure, PartitionRunOptions, run};
 pub use run_dag_exec::run_with_dag;
 pub use seed::run_seed;
 pub use serve::run_serve;

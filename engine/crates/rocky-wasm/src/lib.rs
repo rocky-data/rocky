@@ -313,10 +313,19 @@ pub fn compile_rocky_model(source: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Convert a byte offset to 1-based line and column numbers.
+///
+/// The offset is clamped to `source.len()` and walked back to the
+/// nearest preceding char boundary so a multi-byte UTF-8 character at
+/// the end of the buffer (or a deliberately mid-char offset from
+/// adversarial LSP/WASM input) cannot panic the slice in `&source[..n]`.
 fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
-    let before = &source[..offset.min(source.len())];
-    let line = before.chars().filter(|c| *c == '\n').count() + 1;
-    let col = before.rfind('\n').map_or(offset, |pos| offset - pos - 1) + 1;
+    let mut clamped = offset.min(source.len());
+    while clamped > 0 && !source.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    let before = &source[..clamped];
+    let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+    let col = before.rfind('\n').map_or(clamped, |pos| clamped - pos - 1) + 1;
     (line, col)
 }
 
@@ -579,5 +588,39 @@ mod tests {
         assert!(parse_dialect("postgres").is_none());
         assert!(parse_dialect("mysql").is_none());
         assert!(parse_dialect("").is_none());
+    }
+
+    // ---- byte_offset_to_line_col regression coverage ----
+
+    #[test]
+    fn byte_offset_to_line_col_handles_offset_past_end() {
+        // Empty source, large offset: no panic, returns (1, 1).
+        assert_eq!(byte_offset_to_line_col("", 999), (1, 1));
+        // Non-empty source, offset past end: clamped to len, no panic.
+        let (line, _) = byte_offset_to_line_col("abc", 999);
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn byte_offset_to_line_col_handles_multibyte_at_eof() {
+        // `é` is two bytes in UTF-8. An offset that lands one byte past
+        // the end (or in the middle of the multi-byte char) used to
+        // panic via `&source[..offset]`. The clamped + char-boundary
+        // walk must keep this safe.
+        let src = "let a = \"é\""; // 12 bytes total
+        for offset in 0..=src.len() + 4 {
+            // Should never panic.
+            let _ = byte_offset_to_line_col(src, offset);
+        }
+    }
+
+    #[test]
+    fn byte_offset_to_line_col_handles_midchar_offset() {
+        // `日本語` = 9 bytes; an offset of 1 lands inside the first
+        // codepoint. We expect graceful walk-back to byte 0.
+        let src = "日本語";
+        let (line, col) = byte_offset_to_line_col(src, 1);
+        assert_eq!(line, 1);
+        assert_eq!(col, 1, "expected column 1 after walk-back to boundary");
     }
 }

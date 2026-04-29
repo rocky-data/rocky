@@ -90,6 +90,23 @@ struct TableError {
 #[error("run was interrupted by a shutdown signal")]
 pub struct Interrupted;
 
+/// Sentinel error signalling that `rocky run` completed with at least
+/// one successful materialization *and* at least one table failure
+/// (`RunStatus::PartialFailure`). The outer binary
+/// (`rocky/src/main.rs`) downcasts this off the `anyhow::Error` chain
+/// and maps it to exit code 2 so dagster's `allow_partial=True` can
+/// distinguish partial success from a total failure (exit 1) or an
+/// interrupt (exit 130). The full JSON `RunOutput` has already been
+/// emitted on stdout by the time this is returned.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
+)]
+pub struct PartialFailure {
+    pub count: usize,
+    pub run_id: String,
+}
+
 /// Arm a background watcher that hard-exits with code 130 on a *second*
 /// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
 /// `tokio::select!` branch — this watcher gives the user an out when
@@ -3103,6 +3120,25 @@ pub async fn run(
             .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
             .await;
         let _ = hook_registry.wait_async_webhooks().await;
+
+        // Branch the exit-code contract: a *partial* failure (at least
+        // one table copied + at least one failed) returns the
+        // `PartialFailure` sentinel so `rocky/src/main.rs` can map it
+        // to exit code 2. A total failure (no tables copied) keeps the
+        // existing exit-code-1 path. The valid JSON `RunOutput` has
+        // already been written to stdout above; dagster
+        // (`allow_partial=True`) reads stdout regardless of exit code
+        // for code 2.
+        if matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ) {
+            return Err(PartialFailure {
+                count,
+                run_id: run_id.clone(),
+            }
+            .into());
+        }
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
         );

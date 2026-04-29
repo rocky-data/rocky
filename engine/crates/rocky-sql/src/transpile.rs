@@ -92,22 +92,39 @@ pub fn transpile(sql: &str, from: Dialect, to: Dialect) -> TranspileResult {
     let mut warnings = Vec::new();
     let mut replacements = 0;
 
-    // Apply function name mappings
+    // Apply function name mappings.
+    //
+    // Function tokens already end in `(` (e.g. `NVL(`), so they're
+    // self-delimiting in code. The text-walk still skips inside string
+    // literals and comments to avoid corrupting `'NVL(...)'` or
+    // `-- NVL(...)` substrings.
     let mappings = get_function_mappings(from, to);
     for (from_fn, to_fn) in &mappings {
-        let count = result.matches(from_fn.as_str()).count();
+        let (next, count) = replace_outside_strings(&result, from_fn, to_fn, MatchKind::Literal);
         if count > 0 {
-            result = result.replace(from_fn.as_str(), to_fn.as_str());
+            result = next;
             replacements += count;
         }
     }
 
-    // Apply type name mappings
+    // Apply type name mappings.
+    //
+    // Type tokens are bare words (e.g. `INT`, `BIGINT`), so a naïve
+    // `replace` corrupts substrings (`INT` matches inside `BIGINT`) and
+    // string literals. Walk the body, skip strings/comments, and require
+    // ASCII word boundaries on either side of the match.
     let type_mappings = get_type_mappings(from, to);
     for (from_type, to_type) in &type_mappings {
-        let count = case_insensitive_count(&result, from_type);
+        let (next, count) = replace_outside_strings(
+            &result,
+            from_type,
+            to_type,
+            MatchKind::WordBoundary {
+                case_sensitive: false,
+            },
+        );
         if count > 0 {
-            result = case_insensitive_replace(&result, from_type, to_type);
+            result = next;
             replacements += count;
         }
     }
@@ -305,6 +322,179 @@ fn get_type_mappings(from: Dialect, to: Dialect) -> Vec<(String, String)> {
     mappings
 }
 
+/// How a candidate match must align with surrounding text to be replaced.
+#[derive(Debug, Clone, Copy)]
+enum MatchKind {
+    /// Exact, case-sensitive substring match. Used for function tokens
+    /// (`NVL(`) which end in `(` and are therefore self-delimiting.
+    Literal,
+    /// Case-insensitive match that requires an ASCII word boundary on
+    /// either side. Used for type tokens (`INT`, `BIGINT`) where a
+    /// naïve substring replace would corrupt `BIGINT` while looking for
+    /// `INT`.
+    WordBoundary { case_sensitive: bool },
+}
+
+/// Replace occurrences of `pattern` with `replacement` while skipping
+/// SQL string literals (`'...'`, `"..."`, `` `...` ``), line comments
+/// (`-- ...`), and block comments (`/* ... */`). Returns the rewritten
+/// string and the count of replacements applied.
+///
+/// This is *not* a full SQL parser — it only tracks quote/comment state
+/// well enough to avoid the most obvious corruptions a naïve
+/// `String::replace` causes:
+///
+/// - replacing inside string literals (`'NVL(a,b)'` mustn't change),
+/// - replacing inside comments (`-- LEN(x)`),
+/// - replacing identifier substrings (`INT` matching inside `BIGINT`).
+fn replace_outside_strings(
+    input: &str,
+    pattern: &str,
+    replacement: &str,
+    kind: MatchKind,
+) -> (String, usize) {
+    if pattern.is_empty() {
+        return (input.to_string(), 0);
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    let mut count = 0usize;
+
+    // Helper: advance `i` by one UTF-8 char starting at `start`,
+    // appending the raw byte slice to `out`. Keeps multi-byte chars
+    // intact (e.g. accented identifiers, emoji in comments).
+    let copy_one_char = |i: &mut usize, out: &mut String| {
+        let start = *i;
+        let step = utf8_char_len(bytes[start]);
+        let end = (start + step).min(bytes.len());
+        out.push_str(std::str::from_utf8(&bytes[start..end]).unwrap_or(""));
+        *i = end;
+    };
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // -- line comment
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                copy_one_char(&mut i, &mut out);
+            }
+            continue;
+        }
+
+        // /* block comment */
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            out.push_str("/*");
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    out.push_str("*/");
+                    i += 2;
+                    break;
+                }
+                copy_one_char(&mut i, &mut out);
+            }
+            continue;
+        }
+
+        // String literals / quoted identifiers.
+        if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                // SQL standard: doubled quote escapes the quote inside
+                // a literal/identifier. Pass both bytes through.
+                if c == quote && bytes.get(i + 1) == Some(&quote) {
+                    out.push(quote as char);
+                    out.push(quote as char);
+                    i += 2;
+                    continue;
+                }
+                if c == quote {
+                    out.push(quote as char);
+                    i += 1;
+                    break;
+                }
+                copy_one_char(&mut i, &mut out);
+            }
+            continue;
+        }
+
+        // Code region: try to match the pattern at `i`.
+        if pattern_matches_at(input, i, pattern, kind) {
+            out.push_str(replacement);
+            i += pattern.len();
+            count += 1;
+            continue;
+        }
+
+        copy_one_char(&mut i, &mut out);
+    }
+
+    (out, count)
+}
+
+/// Length (in bytes) of the UTF-8 character whose first byte is `b`.
+/// Falls back to 1 for invalid leading bytes so the walk always makes
+/// progress.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // continuation byte — shouldn't be a leading byte; advance by 1
+        // to avoid getting stuck.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Tests whether `pattern` matches the input at byte offset `start`
+/// under the rules of `kind`.
+fn pattern_matches_at(input: &str, start: usize, pattern: &str, kind: MatchKind) -> bool {
+    let bytes = input.as_bytes();
+    let p = pattern.as_bytes();
+    let end = start + p.len();
+    if end > bytes.len() {
+        return false;
+    }
+
+    let region = &bytes[start..end];
+
+    match kind {
+        MatchKind::Literal => region == p,
+        MatchKind::WordBoundary { case_sensitive } => {
+            let body_match = if case_sensitive {
+                region == p
+            } else {
+                region.eq_ignore_ascii_case(p)
+            };
+            if !body_match {
+                return false;
+            }
+            let left_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+            left_ok && right_ok
+        }
+    }
+}
+
+/// ASCII word byte: `[A-Za-z0-9_]`. Multi-byte UTF-8 leading bytes
+/// (>= 0x80) are intentionally treated as non-word here — type tokens
+/// in SQL are ASCII, and treating high bytes as boundaries avoids
+/// false negatives without enabling false positives.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Case-insensitive string replacement.
 fn case_insensitive_replace(input: &str, from: &str, to: &str) -> String {
     let lower_input = input.to_lowercase();
@@ -401,5 +591,103 @@ mod tests {
     fn test_display_dialect() {
         assert_eq!(format!("{}", Dialect::BigQuery), "BigQuery");
         assert_eq!(format!("{}", Dialect::Snowflake), "Snowflake");
+    }
+
+    // ---- replace_outside_strings + transpile correctness ----
+
+    #[test]
+    fn type_replace_respects_word_boundaries() {
+        // BigQuery → Databricks maps INT64 → BIGINT. Going the other way
+        // (Databricks → BigQuery) maps BIGINT → INT64; we need to ensure
+        // we don't hit `INT` matches inside `BIGINT` if any rule were to
+        // map `INT` independently.
+        //
+        // Here we exercise the helper directly to prove `INT` does not
+        // eat into `BIGINT`.
+        let (out, count) = replace_outside_strings(
+            "CAST(x AS INT), CAST(y AS BIGINT)",
+            "INT",
+            "INTEGER",
+            MatchKind::WordBoundary {
+                case_sensitive: false,
+            },
+        );
+        assert_eq!(count, 1, "expected exactly one replacement, got: {out}");
+        assert!(out.contains("AS INTEGER)"));
+        assert!(
+            out.contains("BIGINT"),
+            "BIGINT must be preserved, got: {out}"
+        );
+        assert!(
+            !out.contains("BIGINTEGER"),
+            "BIGINT was corrupted into BIGINTEGER, got: {out}"
+        );
+    }
+
+    #[test]
+    fn function_replace_skips_string_literals() {
+        // `NVL(` inside a string literal must not be rewritten to `IFNULL(`.
+        let sql = "SELECT NVL(a, b), '-- example NVL(a,b)' AS doc FROM t";
+        let result = transpile(sql, Dialect::Snowflake, Dialect::BigQuery);
+        // Real call site got transpiled.
+        assert!(
+            result.sql.contains("IFNULL(a, b)"),
+            "real call should be rewritten: {}",
+            result.sql
+        );
+        // String literal stayed verbatim.
+        assert!(
+            result.sql.contains("'-- example NVL(a,b)'"),
+            "string literal corrupted: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn function_replace_skips_line_comments() {
+        let sql = "SELECT NVL(a, b) -- legacy NVL(...) reference\nFROM t";
+        let result = transpile(sql, Dialect::Snowflake, Dialect::BigQuery);
+        assert!(result.sql.contains("IFNULL(a, b)"));
+        assert!(
+            result.sql.contains("-- legacy NVL(...) reference"),
+            "comment was rewritten: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn function_replace_skips_block_comments() {
+        let sql = "SELECT NVL(a, b) /* inline NVL(x) note */ FROM t";
+        let result = transpile(sql, Dialect::Snowflake, Dialect::BigQuery);
+        assert!(result.sql.contains("IFNULL(a, b)"));
+        assert!(
+            result.sql.contains("/* inline NVL(x) note */"),
+            "block comment was rewritten: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn type_replace_skips_string_literals() {
+        // `INT64` inside a quoted string must not be rewritten.
+        let sql = "SELECT CAST(x AS INT64), 'INT64 lives here' FROM t";
+        let result = transpile(sql, Dialect::BigQuery, Dialect::Snowflake);
+        assert!(result.sql.contains("AS BIGINT"));
+        assert!(
+            result.sql.contains("'INT64 lives here'"),
+            "INT64 in literal corrupted: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn doubled_quote_escape_in_literal_handled() {
+        // `'it''s NVL'` is a valid SQL string literal containing a quote.
+        // The inner `NVL` must not be rewritten and the literal must
+        // round-trip unchanged.
+        let sql = "SELECT 'it''s NVL', NVL(a, b) FROM t";
+        let result = transpile(sql, Dialect::Snowflake, Dialect::BigQuery);
+        assert!(result.sql.contains("'it''s NVL'"), "{}", result.sql);
+        assert!(result.sql.contains("IFNULL(a, b)"));
     }
 }

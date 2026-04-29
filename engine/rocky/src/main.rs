@@ -1880,6 +1880,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
     }
 
+    // Partial-success: map `commands::PartialFailure` to exit code 2.
+    // The valid `RunOutput` JSON has already been written to stdout in
+    // `run.rs` before the sentinel was returned, so dagster's
+    // `allow_partial=True` path can parse it and surface per-table
+    // results rather than treating the whole run as a hard failure.
+    // Total failure (no tables copied) keeps exit code 1 — that branch
+    // doesn't produce the partial-success sentinel.
+    if let Err(ref err) = result {
+        if err
+            .downcast_ref::<rocky_cli::commands::PartialFailure>()
+            .is_some()
+        {
+            std::process::exit(2);
+        }
+    }
+
     // In text mode, try to upgrade config errors to rich miette diagnostics
     // with source spans and suggestions. JSON mode returns structured errors
     // unchanged for orchestrators (e.g., Dagster).
