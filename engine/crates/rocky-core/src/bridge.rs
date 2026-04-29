@@ -310,6 +310,7 @@ mod tests {
             mask: Default::default(),
             classifications: Default::default(),
             roles: Default::default(),
+            ai: Default::default(),
         }
     }
 
