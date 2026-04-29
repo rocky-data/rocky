@@ -105,14 +105,20 @@ class BudgetBreachAction(StrEnum):
 
 class BudgetConfig(BaseModel):
     """
-    Declarative run-level budget for cost, duration, and (future) data volume. All limits are optional; when unset the dimension is not enforced.
+    Declarative run-level budget for cost, duration, and data volume. All limits are optional; when unset the dimension is not enforced.
 
-    A breach is detected at end of run by comparing [`BudgetConfig`] against the observed [`crate::cost::compute_observed_cost_usd`] total and the run wall clock. Per-model budgets are deferred to a later wave — the first iteration enforces run-level totals only.
+    A breach is detected at end of run by comparing [`BudgetConfig`] against the observed [`crate::cost::compute_observed_cost_usd`] total, the run wall clock, and the aggregate `bytes_scanned` summed across every materialization. Limits are independent and composed with all-OR — any single dimension breach trips the `budget_breach` event. Per-model budgets are deferred to a later wave; the first iteration enforces run-level totals only.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    max_bytes_scanned: conint(ge=0) | None = None
+    """
+    Maximum allowed total bytes scanned across every materialization in the run. Useful for CI gates that want to fail when a regression bloats scan volume even if the dollar cost stays within `max_usd` (e.g. a BigQuery query that suddenly stops pruning partitions).
+
+    Aggregated from per-model `bytes_scanned` figures the adapter reports — today that's BigQuery's `totalBytesBilled`; Databricks / Snowflake / DuckDB still inherit `None`, in which case the dimension is skipped rather than treated as zero (matching `max_usd`).
+    """
     max_duration_ms: conint(ge=0) | None = None
     """
     Maximum allowed run wall-clock duration in milliseconds.
@@ -2298,7 +2304,12 @@ class RockyConfig(BaseModel):
     Named adapter configurations (keyed by adapter name).
     """
     budget: BudgetConfig | None = Field(
-        {"max_duration_ms": None, "max_usd": None, "on_breach": "warn"},
+        {
+            "max_bytes_scanned": None,
+            "max_duration_ms": None,
+            "max_usd": None,
+            "on_breach": "warn",
+        },
         validate_default=True,
     )
     """

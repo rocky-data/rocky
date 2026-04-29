@@ -670,22 +670,26 @@ warehouse_size = "Medium"
 
 ## `[budget]`
 
-Declarative run-level cost and duration limits. When a run exceeds a configured limit, Rocky emits a `budget_breach` pipeline event and fires the `HookEvent::BudgetBreach` hook. With `on_breach = "error"` the run also exits non-zero. Unknown fields are rejected.
+Declarative run-level cost, duration, and scan-volume limits. When a run exceeds a configured limit, Rocky emits a `budget_breach` pipeline event and fires the `HookEvent::BudgetBreach` hook. With `on_breach = "error"` the run also exits non-zero. Unknown fields are rejected.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_usd` | float | | Maximum allowed run cost in USD. Cost is computed from per-materialization `cost_usd` values on `RunOutput.cost_summary`. `None` on runs where no adapter produced cost data (e.g. a BigQuery job with no bytes billed). |
 | `max_duration_ms` | integer | | Maximum allowed run wall time in milliseconds. |
+| `max_bytes_scanned` | integer | | Maximum allowed total bytes scanned across every materialization in the run. Useful for CI gates on scan volume even when the dollar cost stays inside `max_usd` (e.g. a BigQuery query that stops pruning partitions). Aggregated from the per-model `bytes_scanned` figures the adapter reports — today that's BigQuery's `totalBytesBilled`; Databricks / Snowflake / DuckDB still inherit `None` and skip the dimension rather than treating "no data" as zero. |
 | `on_breach` | string | `"warn"` | Either `"warn"` (fire the event, keep the run successful) or `"error"` (also fail the run). |
 
 ```toml
 [budget]
 max_usd = 25.0
-max_duration_ms = 900000   # 15 minutes
+max_duration_ms = 900000          # 15 minutes
+max_bytes_scanned = 1099511627776 # 1 TiB
 on_breach = "error"
 ```
 
-The limits are evaluated once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
+All three limits are independent and composed with all-OR — any single dimension breach trips the `budget_breach` event (and, with `on_breach = "error"`, fails the run). They evaluate once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
+
+Each [`BudgetBreachOutput`](./json-output) carries a `limit_type` tag — `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"` — so consumers can branch on the breached dimension without string-matching the human message.
 
 ---
 

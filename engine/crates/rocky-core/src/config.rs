@@ -1316,14 +1316,16 @@ pub enum BudgetBreachAction {
     Error,
 }
 
-/// Declarative run-level budget for cost, duration, and (future) data
-/// volume. All limits are optional; when unset the dimension is not
-/// enforced.
+/// Declarative run-level budget for cost, duration, and data volume.
+/// All limits are optional; when unset the dimension is not enforced.
 ///
 /// A breach is detected at end of run by comparing [`BudgetConfig`]
-/// against the observed [`crate::cost::compute_observed_cost_usd`] total
-/// and the run wall clock. Per-model budgets are deferred to a later
-/// wave — the first iteration enforces run-level totals only.
+/// against the observed [`crate::cost::compute_observed_cost_usd`]
+/// total, the run wall clock, and the aggregate `bytes_scanned` summed
+/// across every materialization. Limits are independent and composed
+/// with all-OR — any single dimension breach trips the
+/// `budget_breach` event. Per-model budgets are deferred to a later
+/// wave; the first iteration enforces run-level totals only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
@@ -1337,6 +1339,20 @@ pub struct BudgetConfig {
     #[serde(default)]
     pub max_duration_ms: Option<u64>,
 
+    /// Maximum allowed total bytes scanned across every materialization
+    /// in the run. Useful for CI gates that want to fail when a
+    /// regression bloats scan volume even if the dollar cost stays
+    /// within `max_usd` (e.g. a BigQuery query that suddenly stops
+    /// pruning partitions).
+    ///
+    /// Aggregated from per-model `bytes_scanned` figures the adapter
+    /// reports — today that's BigQuery's `totalBytesBilled`; Databricks
+    /// / Snowflake / DuckDB still inherit `None`, in which case the
+    /// dimension is skipped rather than treated as zero (matching
+    /// `max_usd`).
+    #[serde(default)]
+    pub max_bytes_scanned: Option<u64>,
+
     /// What to do when a limit is breached. Defaults to `warn` — fire the
     /// event, keep the run successful. Set to `error` to fail the run.
     #[serde(default)]
@@ -1347,7 +1363,9 @@ impl BudgetConfig {
     /// True when no limit is configured — skip budget checking entirely.
     #[must_use]
     pub fn is_unset(&self) -> bool {
-        self.max_usd.is_none() && self.max_duration_ms.is_none()
+        self.max_usd.is_none()
+            && self.max_duration_ms.is_none()
+            && self.max_bytes_scanned.is_none()
     }
 
     /// Compare observed totals against each configured limit.
@@ -1357,12 +1375,14 @@ impl BudgetConfig {
     /// `observed_cost_usd` is `None` when the adapters didn't produce
     /// enough data to compute a cost (e.g. BigQuery with no bytes
     /// reported); in that case the cost dimension is skipped rather
-    /// than treated as zero.
+    /// than treated as zero. `observed_bytes_scanned` follows the same
+    /// rule — `None` when no materialization reported a byte count.
     #[must_use]
     pub fn check_breaches(
         &self,
         observed_cost_usd: Option<f64>,
         observed_duration_ms: u64,
+        observed_bytes_scanned: Option<u64>,
     ) -> Vec<BudgetBreach> {
         let mut breaches = Vec::new();
 
@@ -1386,6 +1406,16 @@ impl BudgetConfig {
             });
         }
 
+        if let (Some(limit), Some(actual)) = (self.max_bytes_scanned, observed_bytes_scanned)
+            && actual > limit
+        {
+            breaches.push(BudgetBreach {
+                limit_type: BudgetLimitType::MaxBytesScanned,
+                limit: limit as f64,
+                actual: actual as f64,
+            });
+        }
+
         breaches
     }
 }
@@ -1397,6 +1427,7 @@ impl BudgetConfig {
 pub enum BudgetLimitType {
     MaxUsd,
     MaxDurationMs,
+    MaxBytesScanned,
 }
 
 impl BudgetLimitType {
@@ -1407,6 +1438,7 @@ impl BudgetLimitType {
         match self {
             BudgetLimitType::MaxUsd => "max_usd",
             BudgetLimitType::MaxDurationMs => "max_duration_ms",
+            BudgetLimitType::MaxBytesScanned => "max_bytes_scanned",
         }
     }
 }
@@ -5468,11 +5500,13 @@ concurrency = "turbo"
         let toml_str = r#"
 max_usd = 25.0
 max_duration_ms = 900000
+max_bytes_scanned = 1099511627776
 on_breach = "error"
 "#;
         let cfg: BudgetConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.max_usd, Some(25.0));
         assert_eq!(cfg.max_duration_ms, Some(900_000));
+        assert_eq!(cfg.max_bytes_scanned, Some(1_099_511_627_776));
         assert_eq!(cfg.on_breach, BudgetBreachAction::Error);
     }
 
@@ -5491,9 +5525,13 @@ max_rows = 1000000
         let cfg = BudgetConfig {
             max_usd: Some(10.0),
             max_duration_ms: Some(60_000),
+            max_bytes_scanned: Some(1_000_000),
             on_breach: BudgetBreachAction::Warn,
         };
-        assert!(cfg.check_breaches(Some(9.0), 30_000).is_empty());
+        assert!(
+            cfg.check_breaches(Some(9.0), 30_000, Some(500_000))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5501,9 +5539,10 @@ max_rows = 1000000
         let cfg = BudgetConfig {
             max_usd: Some(10.0),
             max_duration_ms: None,
+            max_bytes_scanned: None,
             on_breach: BudgetBreachAction::Error,
         };
-        let breaches = cfg.check_breaches(Some(15.0), 0);
+        let breaches = cfg.check_breaches(Some(15.0), 0, None);
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].limit_type, BudgetLimitType::MaxUsd);
         assert_eq!(breaches[0].limit, 10.0);
@@ -5515,9 +5554,10 @@ max_rows = 1000000
         let cfg = BudgetConfig {
             max_usd: None,
             max_duration_ms: Some(60_000),
+            max_bytes_scanned: None,
             on_breach: BudgetBreachAction::Warn,
         };
-        let breaches = cfg.check_breaches(None, 120_000);
+        let breaches = cfg.check_breaches(None, 120_000, None);
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].limit_type, BudgetLimitType::MaxDurationMs);
     }
@@ -5529,20 +5569,62 @@ max_rows = 1000000
         let cfg = BudgetConfig {
             max_usd: Some(10.0),
             max_duration_ms: None,
+            max_bytes_scanned: None,
             on_breach: BudgetBreachAction::Warn,
         };
-        assert!(cfg.check_breaches(None, 0).is_empty());
+        assert!(cfg.check_breaches(None, 0, None).is_empty());
     }
 
     #[test]
-    fn budget_check_breaches_handles_both_limits() {
+    fn budget_check_breaches_handles_all_limits() {
         let cfg = BudgetConfig {
             max_usd: Some(5.0),
             max_duration_ms: Some(60_000),
+            max_bytes_scanned: Some(1_000_000),
             on_breach: BudgetBreachAction::Warn,
         };
-        let breaches = cfg.check_breaches(Some(12.0), 90_000);
-        assert_eq!(breaches.len(), 2);
+        let breaches = cfg.check_breaches(Some(12.0), 90_000, Some(2_000_000));
+        assert_eq!(breaches.len(), 3);
+    }
+
+    #[test]
+    fn budget_check_breaches_flags_bytes_over() {
+        // HackerNews-driven feature: a CI gate that fails the run when
+        // total scan volume crosses a threshold (e.g. 1 TB).
+        let cfg = BudgetConfig {
+            max_usd: None,
+            max_duration_ms: None,
+            max_bytes_scanned: Some(1_000_000),
+            on_breach: BudgetBreachAction::Error,
+        };
+        let breaches = cfg.check_breaches(None, 0, Some(2_000_000));
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, BudgetLimitType::MaxBytesScanned);
+        assert!((breaches[0].limit - 1_000_000.0).abs() < f64::EPSILON);
+        assert!((breaches[0].actual - 2_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_check_breaches_skips_bytes_when_unknown() {
+        // Adapters that don't report `bytes_scanned` (Databricks /
+        // Snowflake / DuckDB today) skip the dimension rather than
+        // treating "no data" as zero.
+        let cfg = BudgetConfig {
+            max_usd: None,
+            max_duration_ms: None,
+            max_bytes_scanned: Some(1_000_000),
+            on_breach: BudgetBreachAction::Warn,
+        };
+        assert!(cfg.check_breaches(None, 0, None).is_empty());
+    }
+
+    #[test]
+    fn budget_check_breaches_no_breach_when_bytes_unset_default() {
+        // Default `BudgetConfig` (no `max_bytes_scanned`) never trips a
+        // bytes breach regardless of the observed scan volume.
+        let cfg = BudgetConfig::default();
+        let breaches = cfg.check_breaches(None, 0, Some(u64::MAX));
+        assert!(breaches.is_empty());
     }
 
     // -----------------------------------------------------------------------

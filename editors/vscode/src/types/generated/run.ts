@@ -157,7 +157,7 @@ export interface BudgetBreachOutput {
   actual: number;
   limit: number;
   /**
-   * Which limit was breached: `"max_usd"` or `"max_duration_ms"`.
+   * Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
    */
   limit_type: string;
   [k: string]: unknown;
@@ -181,6 +181,10 @@ export interface RunCostSummary {
    * Per-model cost attribution, ordered as in [`RunOutput::materializations`].
    */
   per_model: ModelCostEntry[];
+  /**
+   * Sum of every per-model `bytes_scanned` that produced a number. `None` when no materialization reported a byte count (the non-BigQuery adapters today, which still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Surfaced so consumers — and the `[budget]` `max_bytes_scanned` gate — can read scan volume without re-walking [`RunOutput::materializations`].
+   */
+  total_bytes_scanned?: number | null;
   /**
    * Sum of every per-model `cost_usd` that produced a number. `None` when no materialization produced a cost.
    */
