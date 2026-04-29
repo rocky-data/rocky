@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
@@ -189,6 +189,20 @@ impl SnowflakeConnector {
         self
     }
 
+    /// Applies Snowflake auth headers to a request: the `Authorization:
+    /// Bearer <token>` header and, for OAuth and key-pair JWT modes,
+    /// the matching `X-Snowflake-Authorization-Token-Type` header.
+    /// Password / session-token mode emits no token-type header per
+    /// Snowflake's SQL API v2 spec — the server sniffs the token kind
+    /// from the token itself.
+    fn apply_auth_headers(&self, builder: RequestBuilder, token: &str) -> RequestBuilder {
+        let builder = builder.bearer_auth(token);
+        match self.auth.token_type().header_value() {
+            Some(value) => builder.header("X-Snowflake-Authorization-Token-Type", value),
+            None => builder,
+        }
+    }
+
     /// Base URL for the Snowflake SQL REST API.
     fn base_url(&self) -> String {
         #[cfg(any(test, feature = "test-support"))]
@@ -335,16 +349,13 @@ impl SnowflakeConnector {
             timeout: self.config.timeout.as_secs(),
         };
 
-        let resp = self
+        let request = self
             .client
             .post(&url)
-            .bearer_auth(&token)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT")
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        let resp = self.apply_auth_headers(request, &token).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -387,13 +398,11 @@ impl SnowflakeConnector {
             );
 
             let token = self.auth.get_token().await?;
-            let poll_resp = self
+            let poll_request = self
                 .client
                 .get(&poll_url)
-                .bearer_auth(&token)
-                .header("Accept", "application/json")
-                .send()
-                .await?;
+                .header("Accept", "application/json");
+            let poll_resp = self.apply_auth_headers(poll_request, &token).send().await?;
 
             if !poll_resp.status().is_success() {
                 let status = poll_resp.status().as_u16();
@@ -417,10 +426,8 @@ impl SnowflakeConnector {
         let token = self.auth.get_token().await?;
         let url = format!("{}/{}/cancel", self.base_url(), handle);
 
-        self.client
-            .post(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
+        let request = self.client.post(&url).header("Accept", "application/json");
+        self.apply_auth_headers(request, &token)
             .send()
             .await?
             .error_for_status()
