@@ -1302,6 +1302,39 @@ def test_verify_version_skips_on_unparseable_output():
         rocky._verify_engine_version()
 
 
+@pytest.mark.parametrize(
+    "version_stdout",
+    [
+        f"rocky {MIN_ROCKY_VERSION}-dev",
+        f"rocky {MIN_ROCKY_VERSION}-pre",
+        f"rocky {MIN_ROCKY_VERSION}-rc.1",
+        f"rocky {MIN_ROCKY_VERSION}-alpha.2",
+        f"rocky {MIN_ROCKY_VERSION}+sha.abc123",
+        f"{MIN_ROCKY_VERSION}-dev",  # also handle the no-prefix case
+    ],
+)
+def test_verify_version_strips_pre_release_suffix(version_stdout: str):
+    """Pre-release / build suffixes (``-dev``, ``-pre``, ``-rc.N``,
+    ``+sha.<hash>``) must be stripped before comparison so a dev build
+    that matches the minimum version on the core triple is treated as
+    eligible. Without this, ``int("4-dev")`` fails the parse and the
+    check silently skips — which is exactly how a too-old dev build
+    used to slip past the gate."""
+    rocky = RockyResource()
+    with _patched_run(return_value=_version_completed(version_stdout)):
+        rocky._verify_engine_version()  # must not raise + must not silently skip
+
+
+def test_verify_version_dev_suffix_below_minimum_fails():
+    """A dev build whose core version is below the minimum still fails."""
+    rocky = RockyResource()
+    with (
+        _patched_run(return_value=_version_completed("rocky 0.99.99-dev")),
+        pytest.raises(dg.Failure, match="below the minimum"),
+    ):
+        rocky._verify_engine_version()
+
+
 def test_verify_version_caches_result():
     """After a successful check, subsequent calls don't invoke subprocess."""
     rocky = RockyResource()

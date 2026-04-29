@@ -324,7 +324,6 @@ def _missing_models_dir(tmp_path: Path) -> str:
         subprocess.TimeoutExpired(cmd="rocky", timeout=1),
         MemoryError("oom on dump"),
         json.JSONDecodeError("bad", "doc", 0),
-        pydantic.ValidationError.from_exception_data("X", []),
         RuntimeError("transient state-store error"),
     ],
 )
@@ -334,7 +333,12 @@ def test_write_state_compile_slot_tolerates_non_failure_exception(
     exc: BaseException,
 ):
     """``_compile_payload`` must swallow non-``dg.Failure`` exceptions and omit
-    the slot rather than aborting the whole write."""
+    the slot rather than aborting the whole write.
+
+    ``ValidationError`` is excluded — it signals an engine/dagster-rocky
+    version mismatch that must surface loudly. See
+    :func:`test_write_state_compile_slot_propagates_validation_error`.
+    """
     discover = _make_discover_result()
     stub = _StubResource(discover_result=discover, compile_result=exc)
     _install_stub_resource(monkeypatch, stub)
@@ -351,6 +355,60 @@ def test_write_state_compile_slot_tolerates_non_failure_exception(
     state = json.loads(state_path.read_text())
     assert "discover" in state
     assert "compile" not in state  # slot omitted, write succeeded
+
+
+def test_write_state_compile_slot_propagates_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """``_compile_payload`` must re-raise a Pydantic ``ValidationError`` as
+    ``dg.Failure`` so an engine schema break does not silently drop checks
+    and freshness from the cached state."""
+    discover = _make_discover_result()
+    stub = _StubResource(
+        discover_result=discover,
+        compile_result=pydantic.ValidationError.from_exception_data("X", []),
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+
+    with pytest.raises(dg.Failure) as excinfo:
+        component.write_state_to_path(state_path)
+
+    assert "schema mismatch" in (excinfo.value.description or "").lower()
+    assert "rocky --version" in (excinfo.value.description or "")
+    assert excinfo.value.metadata is not None
+    assert excinfo.value.metadata["command"].text == "compile"
+
+
+def test_write_state_compile_slot_propagates_dg_failure_caused_by_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """When ``rocky.compile()`` raises ``dg.Failure`` whose ``__cause__`` is
+    a ``ValidationError`` (i.e. ``_parse_rocky_json`` already wrapped it),
+    the slot helper still propagates rather than swallowing."""
+    discover = _make_discover_result()
+    inner = pydantic.ValidationError.from_exception_data("X", [])
+    wrapped = dg.Failure(description="rocky compile schema check failed")
+    wrapped.__cause__ = inner
+    stub = _StubResource(discover_result=discover, compile_result=wrapped)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+
+    with pytest.raises(dg.Failure):
+        component.write_state_to_path(tmp_path / "state")
 
 
 @pytest.mark.parametrize(
@@ -384,6 +442,33 @@ def test_write_state_optimize_slot_tolerates_non_failure_exception(
     state = json.loads(state_path.read_text())
     assert "discover" in state
     assert "optimize" not in state
+
+
+def test_write_state_optimize_slot_propagates_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """``_optimize_payload`` must re-raise a Pydantic ``ValidationError``
+    as ``dg.Failure`` — same engine/dagster-rocky version-mismatch
+    rationale as ``_compile_payload``."""
+    discover = _make_discover_result()
+    stub = _StubResource(
+        discover_result=discover,
+        optimize_result=pydantic.ValidationError.from_exception_data("X", []),
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),  # skip compile
+        surface_optimize_metadata=True,
+    )
+
+    with pytest.raises(dg.Failure) as excinfo:
+        component.write_state_to_path(tmp_path / "state")
+
+    assert excinfo.value.metadata is not None
+    assert excinfo.value.metadata["command"].text == "optimize"
 
 
 def test_write_state_discover_failure_writes_empty_envelope(
@@ -609,12 +694,16 @@ def test_surface_column_lineage_skips_underscore_and_contract_files(
     tmp_path: Path,
 ):
     """``_*.toml`` and ``*.contract.toml`` must not be considered models."""
+    import threading
+
     models_dir = _make_models_dir(tmp_path, ["only_model"])
     targets_seen: list[str] = []
+    targets_lock = threading.Lock()
 
     class _Capture(_StubResource):
         def lineage(self, target: str, column: str | None = None):
-            targets_seen.append(target)
+            with targets_lock:
+                targets_seen.append(target)
             return _model_lineage(target, ("u", "c", "c"))
 
     stub = _Capture(discover_result=_make_discover_result())
@@ -628,6 +717,55 @@ def test_surface_column_lineage_skips_underscore_and_contract_files(
     component._attach_column_lineage(dg.Definitions(assets=[]))
 
     assert targets_seen == ["only_model"]
+
+
+def test_surface_column_lineage_runs_in_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """``_collect_lineage`` fans out across a thread pool — two slow
+    lineage calls must overlap rather than running serially. This pins
+    the perf fix from P1.4: a code-server with N models pays roughly
+    one wall-clock latency, not N times it."""
+    import threading
+    import time
+
+    model_names = ["a", "b", "c", "d"]
+    models_dir = _make_models_dir(tmp_path, model_names)
+
+    inflight = 0
+    max_inflight = 0
+    inflight_lock = threading.Lock()
+
+    class _SlowResource(_StubResource):
+        def lineage(self, target: str, column: str | None = None):
+            nonlocal inflight, max_inflight
+            with inflight_lock:
+                inflight += 1
+                max_inflight = max(max_inflight, inflight)
+            try:
+                # Tiny sleep — long enough to guarantee overlap if the
+                # pool is parallel, short enough to keep the test fast.
+                time.sleep(0.05)
+                return _model_lineage(target, ("u", "c", "c"))
+            finally:
+                with inflight_lock:
+                    inflight -= 1
+
+    stub = _SlowResource(discover_result=_make_discover_result())
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=str(models_dir),
+        surface_column_lineage=True,
+    )
+    component._attach_column_lineage(dg.Definitions(assets=[]))
+
+    # Serial would mean max_inflight == 1. Parallel must observe overlap.
+    assert max_inflight > 1, (
+        f"expected parallel lineage fan-out, but observed max concurrent = {max_inflight}"
+    )
 
 
 # ---------------------------------------------------------------------------

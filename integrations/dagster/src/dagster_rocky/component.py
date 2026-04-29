@@ -26,6 +26,7 @@ import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -42,6 +43,7 @@ from dagster.components.utils.defs_state import (
 from dagster.components.utils.project_paths import get_local_state_path
 from dagster.components.utils.translation import TranslationFn, TranslationFnResolver
 from dagster_shared.serdes.objects.models.defs_state_info import DefsStateManagementType
+from pydantic import ValidationError
 
 from .checks import check_metadata
 from .column_lineage import build_column_lineage
@@ -83,6 +85,48 @@ from .types import (
 )
 
 _log = logging.getLogger(__name__)
+
+#: Maximum bytes of the Pydantic ``ValidationError`` payload surfaced in the
+#: schema-mismatch ``dg.Failure``. Engine schema breaks can produce hundreds of
+#: nested validation paths; a hard cap keeps the run-viewer message scannable
+#: without losing the leading errors that pinpoint the drifted field.
+_VALIDATION_ERROR_PREVIEW_BYTES: int = 1500
+
+#: Worker cap for the parallel ``rocky lineage`` fan-out in
+#: :meth:`RockyComponent._collect_lineage`. Each worker spawns a full
+#: ``rocky lineage`` subprocess that compiles every model in
+#: ``models_dir``, so memory grows linearly with worker count. Eight
+#: keeps cold-start fast (~Nx speedup vs. serial) without OOM-ing the
+#: code-server pod on large model trees.
+_COLUMN_LINEAGE_MAX_WORKERS: int = 8
+
+
+def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Failure:
+    """Build a ``dg.Failure`` for a Pydantic schema-mismatch on ``rocky <command>``.
+
+    A ``ValidationError`` from a CLI output parse almost always means the
+    installed ``rocky`` binary emits a JSON shape that ``dagster-rocky``
+    does not recognise — typically because the two were built from
+    different versions. Surface that as a structured failure so the
+    operator sees an actionable message instead of a missing
+    checks/freshness slot.
+    """
+    detail = str(exc)
+    if len(detail) > _VALIDATION_ERROR_PREVIEW_BYTES:
+        detail = detail[:_VALIDATION_ERROR_PREVIEW_BYTES] + " …(truncated)"
+    return dg.Failure(
+        description=(
+            f"Engine output schema mismatch on `rocky {command}` — `dagster-rocky` "
+            f"was built against a different `rocky` binary version. "
+            f"Run `rocky --version` to confirm the installed engine, then either "
+            f"upgrade the binary or pin `dagster-rocky` to the matching release."
+        ),
+        metadata={
+            "command": dg.MetadataValue.text(command),
+            "validation_error": dg.MetadataValue.text(detail),
+        },
+    )
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -506,11 +550,30 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 )
 
     def _compile_payload(self, rocky: RockyResource) -> dict | None:
-        """Return compile JSON, or ``None`` if compile cannot/should not run."""
+        """Return compile JSON, or ``None`` if compile cannot/should not run.
+
+        Schema-validation failures (Pydantic ``ValidationError``) are *not*
+        swallowed: they almost always mean ``dagster-rocky`` was built
+        against a different ``rocky`` binary version, and silently dropping
+        the compile slot would make checks/freshness vanish without any
+        operator-visible signal. Those re-raise as ``dg.Failure``. All
+        other failures (missing binary, subprocess timeout, malformed
+        JSON, OOM) remain best-effort: they log and omit the slot.
+        """
         if not Path(self.models_dir).is_dir():
             return None
         try:
             return json.loads(rocky.compile().model_dump_json())
+        except ValidationError as exc:
+            raise _engine_schema_mismatch_failure("compile", exc) from exc
+        except dg.Failure as exc:
+            if isinstance(exc.__cause__, ValidationError):
+                raise
+            _log.warning(
+                "rocky compile failed during state write — slot omitted",
+                exc_info=True,
+            )
+            return None
         except Exception:
             # Compile is best-effort: missing binary, partial errors,
             # subprocess timeouts, OOM during large dumps, and malformed
@@ -526,12 +589,23 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     def _optimize_payload(self, rocky: RockyResource) -> dict | None:
         """Return optimize JSON, or ``None`` if optimize cannot run.
 
-        Same best-effort semantics as ``_compile_payload``: a missing binary
-        or empty run history (no recommendations) does not block state
-        persistence.
+        Same best-effort semantics as ``_compile_payload`` for transport
+        errors (missing binary, empty run history, subprocess failure).
+        Schema-validation failures (``ValidationError``) propagate as
+        ``dg.Failure`` — see ``_compile_payload`` for the rationale.
         """
         try:
             return json.loads(rocky.optimize().model_dump_json())
+        except ValidationError as exc:
+            raise _engine_schema_mismatch_failure("optimize", exc) from exc
+        except dg.Failure as exc:
+            if isinstance(exc.__cause__, ValidationError):
+                raise
+            _log.warning(
+                "rocky optimize failed during state write — slot omitted",
+                exc_info=True,
+            )
+            return None
         except Exception:
             _log.warning(
                 "rocky optimize failed during state write — slot omitted",
@@ -678,15 +752,23 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         ``rocky lineage --target <model>`` once per model; failures (binary
         missing, lineage compile error, malformed SQL) log and skip that
         entry.
+
+        The per-model ``rocky lineage`` invocations are dispatched via a
+        bounded :class:`ThreadPoolExecutor` so a project with N models
+        does not pay N times the cold-start latency. Worker count is
+        capped at :data:`_COLUMN_LINEAGE_MAX_WORKERS` to avoid OOM-ing
+        the code-server pod — each worker spawns a full subprocess that
+        compiles ``models_dir``.
         """
         model_names = sorted(
             p.stem
             for p in models_dir.rglob("*.toml")
             if not p.name.startswith("_") and not p.name.endswith(".contract.toml")
         )
+        if not model_names:
+            return {}
 
-        out: dict[str, dg.TableColumnLineage] = {}
-        for model_name in model_names:
+        def _one(model_name: str) -> tuple[str, dg.TableColumnLineage | None]:
             try:
                 lineage = rocky.lineage(target=model_name)
             except Exception:
@@ -695,20 +777,31 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                     model_name,
                     exc_info=True,
                 )
-                continue
+                return model_name, None
             if not isinstance(lineage, ModelLineageResult):
                 # Defensive: ``lineage(target=...)`` without a column always
                 # returns ``ModelLineageResult``; the column-level shape
                 # would not fit ``TableColumnLineage`` anyway.
-                continue
+                return model_name, None
             try:
-                out[model_name] = build_column_lineage(lineage)
+                return model_name, build_column_lineage(lineage)
             except Exception:
                 _log.warning(
                     "build_column_lineage(%s) failed — skipping",
                     model_name,
                     exc_info=True,
                 )
+                return model_name, None
+
+        max_workers = min(_COLUMN_LINEAGE_MAX_WORKERS, len(model_names))
+        out: dict[str, dg.TableColumnLineage] = {}
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="rocky-lineage",
+        ) as pool:
+            for model_name, lineage in pool.map(_one, model_names):
+                if lineage is not None:
+                    out[model_name] = lineage
         return out
 
     def build_defs_from_state(
