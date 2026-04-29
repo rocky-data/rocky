@@ -23,6 +23,13 @@ pub struct ServerState {
     pub compile_result: RwLock<Option<CompileResult>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
+    /// Bearer token required by the HTTP API auth middleware. `None`
+    /// means "no auth"; in that mode [`crate::api::serve`] refuses to
+    /// bind a non-loopback host. See [`crate::auth::require_bearer_token`].
+    pub auth_token: Option<String>,
+    /// CORS allowlist passed to [`crate::auth::build_cors_layer`]. An
+    /// empty list means same-origin only.
+    pub allowed_origins: Vec<String>,
     /// Arc 7 wave 2 wave-2: per-session throttle for the "N sources hit"
     /// info log so it emits once per server start, not once per recompile.
     /// PR 2 will key it on `(document_uri, cache_version)` — the only LSP
@@ -32,10 +39,25 @@ pub struct ServerState {
 
 impl ServerState {
     /// Create new server state and perform initial compilation.
+    ///
+    /// Defaults to the LSP-style configuration (no token, empty CORS
+    /// allowlist). Use [`ServerState::with_auth`] to attach a Bearer
+    /// token + CORS allowlist before starting the HTTP server.
     pub fn new(
         models_dir: PathBuf,
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_auth(models_dir, contracts_dir, config_path, None, Vec::new())
+    }
+
+    /// Create new server state with explicit auth + CORS configuration.
+    pub fn with_auth(
+        models_dir: PathBuf,
+        contracts_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        auth_token: Option<String>,
+        allowed_origins: Vec<String>,
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
@@ -43,6 +65,8 @@ impl ServerState {
             config_path,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
+            auth_token,
+            allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
         });
 
@@ -79,7 +103,25 @@ impl ServerState {
             ..Default::default()
         };
 
-        match rocky_compiler::compile::compile(&config) {
+        // The compile pass walks the model directory, parses every
+        // `.rocky` / `.sql` file, and runs type-checking. On a non-trivial
+        // project this is hundreds of milliseconds of CPU-bound work; if
+        // we run it directly on the async runtime it stalls every other
+        // task on this worker thread (HTTP handlers, the file watcher,
+        // the LSP). Move it to the blocking pool. Mirrors the pattern at
+        // `lsp.rs:468` (PR #263).
+        let compile_result =
+            match tokio::task::spawn_blocking(move || rocky_compiler::compile::compile(&config))
+                .await
+            {
+                Ok(r) => r,
+                Err(join_err) => {
+                    warn!(error = %join_err, "compile task join failed");
+                    return;
+                }
+            };
+
+        match compile_result {
             Ok(result) => {
                 let model_count = result.project.model_count();
                 let diag_count = result.diagnostics.len();
@@ -130,22 +172,32 @@ impl ServerState {
             return HashMap::new();
         }
 
-        let store = match rocky_core::state::StateStore::open_read_only(&state_path) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(error = %e, "schema cache: state open failed in server path");
+        // Mirror the LSP path at `lsp.rs:468` (PR #263): the redb open +
+        // scan are sync work that can sleep up to ~250ms when contending
+        // with a CLI process for the state-file flock (see
+        // `StateStore::open_redb_with_retry`). Doing that on a Tokio
+        // worker would intermittently starve HTTP handlers; move it to
+        // the blocking pool.
+        let ttl = schema_cache_config.ttl();
+        let map = match tokio::task::spawn_blocking(move || {
+            let store = rocky_core::state::StateStore::open_read_only(&state_path)
+                .map_err(|e| ("state open", e.to_string()))?;
+            rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                &store,
+                chrono::Utc::now(),
+                ttl,
+            )
+            .map_err(|e| ("scan", e.to_string()))
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err((stage, e))) => {
+                debug!(error = %e, stage, "schema cache: {stage} failed in server path");
                 return HashMap::new();
             }
-        };
-
-        let map = match rocky_compiler::schema_cache::load_source_schemas_from_cache(
-            &store,
-            chrono::Utc::now(),
-            schema_cache_config.ttl(),
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(error = %e, "schema cache: scan failed in server path");
+            Err(join_err) => {
+                debug!(error = %join_err, "schema cache: blocking task join failed");
                 return HashMap::new();
             }
         };
