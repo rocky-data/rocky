@@ -197,16 +197,29 @@ pub async fn run_preview_create(
 // `rocky preview diff`
 // ---------------------------------------------------------------------------
 
-/// Sampled row-level + structural diff between branch and base for every
-/// model in the prune set. Extends the `rocky_core::compare` shadow kernel
-/// with a deterministic-ordering sampling layer.
+/// Structural + (deferred) sampled row-level diff between branch and base
+/// for every model that ran on both sides.
 ///
-/// **Phase 2 scope.** Implementation lands alongside Phase 2's compare-kernel
-/// extension. This function emits an empty-but-valid `PreviewDiffOutput`
-/// today so the JSON wire contract is testable end-to-end on the POC.
+/// **Phase 2 scope.** Ships the *structural* layer — for each model that
+/// has a `RunRecord` against both the branch run and the base run, surface
+/// the row-count delta + bytes-scanned/written deltas with a deterministic
+/// Markdown rendering. Each model carries a [`PreviewSamplingWindow`] with
+/// `coverage = "not_yet_sampled"` and `coverage_warning = true` — honest
+/// flag that row-level samples don't run yet. Phase 2.5 lifts to
+/// checksum-bisection exhaustive diff (datafold-style) over the
+/// `rocky_core::compare` shadow kernel; until then, structural deltas
+/// catch row-count and byte-volume regressions, which is the most common
+/// failure mode the PR-comment surface needs to flag.
+///
+/// **Why structural-only is useful.** `RunRecord` carries `rows_affected`
+/// and `bytes_scanned` per model from the live run path, so a
+/// branch-vs-base run-record diff already answers *"did this PR change
+/// how many rows the model produced?"* and *"did the cost change?"* —
+/// the two things a reviewer most needs to see. Sampled row content
+/// remains the gold standard but the structural layer ships today.
 pub async fn run_preview_diff(
     _config_path: &Path,
-    _state_path: &Path,
+    state_path: &Path,
     branch_name: &str,
     base_ref: &str,
     _sample_size: usize,
@@ -214,24 +227,199 @@ pub async fn run_preview_diff(
 ) -> Result<()> {
     use crate::output::PreviewDiffOutput;
 
-    let summary = empty_diff_summary();
+    let store = rocky_core::state::StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+
+    // Phase 2 substance: pull the latest two runs from the state store
+    // and pair them up by branch-name. The *latest* run keyed to the
+    // branch is "branch"; the most recent prior run *not* tagged to
+    // this branch is "base." Tighter branch-vs-main partitioning lands
+    // when `git_branch` is plumbed through the state-store branch
+    // record (today the audit trail records `git_branch` on the
+    // RunRecord directly).
+    let mut branch_run: Option<rocky_core::state::RunRecord> = None;
+    let mut base_run: Option<rocky_core::state::RunRecord> = None;
+    for record in store.list_runs(50)? {
+        if record.git_branch.as_deref() == Some(branch_name) {
+            if branch_run.is_none() {
+                branch_run = Some(record);
+            }
+        } else if base_run.is_none() {
+            base_run = Some(record);
+        }
+        if branch_run.is_some() && base_run.is_some() {
+            break;
+        }
+    }
+
+    let (summary, models) = match (branch_run.as_ref(), base_run.as_ref()) {
+        (Some(b), Some(p)) => build_preview_diff(b, p),
+        _ => (empty_diff_summary(), Vec::new()),
+    };
+    let markdown = render_preview_diff_markdown(branch_name, base_ref, &summary, &models);
+
     let out = PreviewDiffOutput::new(
         branch_name.to_string(),
         base_ref.to_string(),
         summary,
-        Vec::new(),
-        "_(no models in prune set — preview diff has nothing to report)_".to_string(),
+        models,
+        markdown,
     );
 
     if json {
         print_json(&out)?;
     } else {
         info!(
-            "preview diff '{branch_name}' vs {base_ref}: 0 models with changes \
-             (Phase 2 lands the row-level sampling)"
+            "preview diff '{branch_name}' vs {base_ref}: {} models with changes \
+             (sampling deferred to Phase 2.5)",
+            out.summary.models_with_changes
         );
     }
     Ok(())
+}
+
+/// Build the per-model + summary structural diff from a branch and base
+/// `RunRecord`. Pure: takes the two stored runs and produces deltas
+/// without warehouse touchpoints.
+///
+/// **Pairing semantics.** Models matched by name across the two runs.
+/// Models that ran on the branch but not on base are reported with a
+/// `rows_added` figure equal to the branch-side `rows_affected` (best
+/// proxy without sampled comparison). Models on base but not on branch
+/// are skipped here — `preview cost` reports those as
+/// `models_skipped_via_copy`. Both runs are forward-compatible: new
+/// fields don't change the diff shape.
+fn build_preview_diff(
+    branch: &rocky_core::state::RunRecord,
+    base: &rocky_core::state::RunRecord,
+) -> (
+    crate::output::PreviewDiffSummary,
+    Vec<crate::output::PreviewModelDiff>,
+) {
+    use crate::output::{
+        PreviewModelDiff, PreviewSampledRowDiff, PreviewSamplingWindow, PreviewStructuralDiff,
+    };
+
+    let mut models: Vec<PreviewModelDiff> = Vec::new();
+    let mut models_with_changes: usize = 0;
+    let mut total_rows_added: u64 = 0;
+    let mut total_rows_removed: u64 = 0;
+    let total_rows_changed: u64 = 0; // sampled-only; always 0 in Phase 2
+
+    // Index base executions by model name for O(N) pairing.
+    let base_by_name: BTreeMap<&str, &rocky_core::state::ModelExecution> = base
+        .models_executed
+        .iter()
+        .map(|m| (m.model_name.as_str(), m))
+        .collect();
+
+    for branch_exec in &branch.models_executed {
+        let base_exec = base_by_name.get(branch_exec.model_name.as_str()).copied();
+
+        // Row delta: signed difference of `rows_affected`. None on either
+        // side surfaces as zero — the sampled layer (Phase 2.5) catches
+        // unreported row changes.
+        let branch_rows = branch_exec.rows_affected.unwrap_or(0);
+        let base_rows = base_exec.and_then(|e| e.rows_affected).unwrap_or(0);
+        let (rows_added, rows_removed) = if branch_rows >= base_rows {
+            (branch_rows.saturating_sub(base_rows), 0_u64)
+        } else {
+            (0_u64, base_rows.saturating_sub(branch_rows))
+        };
+        if rows_added > 0 || rows_removed > 0 {
+            models_with_changes = models_with_changes.saturating_add(1);
+        }
+        total_rows_added = total_rows_added.saturating_add(rows_added);
+        total_rows_removed = total_rows_removed.saturating_add(rows_removed);
+
+        models.push(PreviewModelDiff {
+            model_name: branch_exec.model_name.clone(),
+            // Structural column-level delta is an open follow-up — the
+            // RunRecord doesn't persist column lists today, and the
+            // compiler-IR-driven path requires both runs to be
+            // re-compiled (heavy). Phase 2.5 wires this; until then,
+            // empty arrays make the absence explicit on the wire.
+            structural: PreviewStructuralDiff {
+                added_columns: Vec::new(),
+                removed_columns: Vec::new(),
+                type_changes: Vec::new(),
+            },
+            sampled: PreviewSampledRowDiff {
+                rows_added,
+                rows_removed,
+                rows_changed: 0,
+                samples: Vec::new(),
+            },
+            sampling_window: PreviewSamplingWindow {
+                ordered_by: String::new(),
+                limit: 0,
+                // `coverage_warning = true` is honest: row content
+                // changes that don't change row counts will not
+                // surface in this diff. The PR-comment surface
+                // renders this verbatim so reviewers don't infer
+                // false coverage.
+                coverage: "not_yet_sampled".to_string(),
+                coverage_warning: true,
+            },
+        });
+    }
+
+    let summary = crate::output::PreviewDiffSummary {
+        models_with_changes,
+        models_unchanged: models.len().saturating_sub(models_with_changes),
+        total_rows_added,
+        total_rows_removed,
+        total_rows_changed,
+        any_coverage_warning: !models.is_empty(),
+    };
+    (summary, models)
+}
+
+/// Render a `PreviewDiffOutput` summary into the Markdown the PR-comment
+/// surface posts verbatim. Format is stable: changing it requires
+/// updating fixtures.
+fn render_preview_diff_markdown(
+    branch_name: &str,
+    base_ref: &str,
+    summary: &crate::output::PreviewDiffSummary,
+    models: &[crate::output::PreviewModelDiff],
+) -> String {
+    if models.is_empty() {
+        return format!(
+            "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
+             _No paired runs in the state store. Run `rocky run --branch {branch_name}` \
+             on the prune set, then re-invoke `rocky preview diff`._\n"
+        );
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
+         {} model(s) with changes • {} unchanged • +{} / −{} rows\n\n",
+        summary.models_with_changes,
+        summary.models_unchanged,
+        summary.total_rows_added,
+        summary.total_rows_removed,
+    ));
+    out.push_str("| model | +rows | −rows | sampled? |\n|---|---:|---:|---|\n");
+    for m in models {
+        let sampled = if m.sampling_window.coverage_warning {
+            ":warning: not yet sampled"
+        } else {
+            ":white_check_mark: sampled"
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            m.model_name, m.sampled.rows_added, m.sampled.rows_removed, sampled,
+        ));
+    }
+    if summary.any_coverage_warning {
+        out.push_str(
+            "\n> :warning: Row-content changes that don't move row counts \
+             are not surfaced in this diff. Phase 2.5 lifts to \
+             checksum-bisection exhaustive sampling.\n",
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -242,37 +430,280 @@ pub async fn run_preview_diff(
 /// over `rocky cost latest`'s machinery — does not introduce new cost
 /// math.
 ///
-/// **Phase 3 scope.** Returns an empty-but-valid `PreviewCostOutput` today
-/// so the JSON wire contract is testable end-to-end on the POC.
+/// **Phase 3 scope.** Resolves the latest branch run and the most recent
+/// non-branch run from the state store, computes per-model deltas via
+/// `compute_observed_cost_usd` (the same formula `rocky cost` uses), and
+/// emits a `PreviewCostOutput`. Models on base but not on branch roll
+/// into `models_skipped_via_copy` + `savings_from_copy_usd`.
 pub async fn run_preview_cost(
-    _config_path: &Path,
-    _state_path: &Path,
+    config_path: &Path,
+    state_path: &Path,
     branch_name: &str,
     json: bool,
 ) -> Result<()> {
     use crate::output::PreviewCostOutput;
 
-    let summary = empty_cost_summary();
+    let store = rocky_core::state::StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+
+    // Branch run = newest run with `git_branch == branch_name`.
+    // Base run = newest run with a different (or absent) `git_branch`.
+    let mut branch_run: Option<rocky_core::state::RunRecord> = None;
+    let mut base_run: Option<rocky_core::state::RunRecord> = None;
+    for record in store.list_runs(50)? {
+        if record.git_branch.as_deref() == Some(branch_name) {
+            if branch_run.is_none() {
+                branch_run = Some(record);
+            }
+        } else if base_run.is_none() {
+            base_run = Some(record);
+        }
+        if branch_run.is_some() && base_run.is_some() {
+            break;
+        }
+    }
+
+    // Resolve adapter cost params best-effort (mirrors `run_cost`).
+    let cost_params: Option<(rocky_core::cost::WarehouseType, f64, f64)> =
+        match rocky_core::config::load_rocky_config(config_path) {
+            Ok(cfg) => {
+                let dbu_per_hour =
+                    rocky_core::cost::warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
+                let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+                cfg.adapters
+                    .get("default")
+                    .or_else(|| cfg.adapters.values().next())
+                    .and_then(|a| {
+                        rocky_core::cost::WarehouseType::from_adapter_type(&a.adapter_type)
+                    })
+                    .map(|wh| (wh, dbu_per_hour, cost_per_dbu))
+            }
+            Err(_) => None,
+        };
+
+    let (summary, per_model) = match (branch_run.as_ref(), base_run.as_ref()) {
+        (Some(b), Some(p)) => build_preview_cost_delta(b, p, cost_params.as_ref()),
+        _ => (empty_cost_summary(), Vec::new()),
+    };
+    let markdown = render_preview_cost_markdown(branch_name, &summary, &per_model);
+
     let out = PreviewCostOutput::new(
         branch_name.to_string(),
-        None,
-        String::new(),
+        base_run.as_ref().map(|r| r.run_id.clone()),
+        branch_run
+            .as_ref()
+            .map_or(String::new(), |r| r.run_id.clone()),
         summary,
-        Vec::new(),
-        "_(no branch run yet — run `rocky run --branch <name> --model <name>` \
-          for each prune-set model first)_"
-            .to_string(),
+        per_model,
+        markdown,
     );
 
     if json {
         print_json(&out)?;
     } else {
         info!(
-            "preview cost '{branch_name}': no branch run yet \
-             (Phase 3 lands the per-model delta math)"
+            "preview cost '{branch_name}': delta_usd={:?}",
+            out.summary.delta_usd
         );
     }
     Ok(())
+}
+
+/// Pure cost-delta builder. Computes per-model bytes/duration/USD deltas
+/// between two `RunRecord`s.
+///
+/// **Pairing semantics.**
+/// - Models in **both** runs → full delta with `skipped_via_copy = false`.
+/// - Models only on **branch** → delta vs. `0` (the model is new in the
+///   PR; full branch cost is the delta).
+/// - Models only on **base** → emitted with `skipped_via_copy = true`,
+///   `branch_*` zero/None, `base_*` populated. The base cost rolls into
+///   `savings_from_copy_usd` (the cost the PR avoided by copying).
+fn build_preview_cost_delta(
+    branch: &rocky_core::state::RunRecord,
+    base: &rocky_core::state::RunRecord,
+    cost_params: Option<&(rocky_core::cost::WarehouseType, f64, f64)>,
+) -> (
+    crate::output::PreviewCostSummary,
+    Vec<crate::output::PreviewModelCostDelta>,
+) {
+    use crate::output::PreviewModelCostDelta;
+
+    let cost_for = |bytes: Option<u64>, duration_ms: u64| -> Option<f64> {
+        let (wh, dbu_per_hour, cost_per_dbu) = cost_params?;
+        rocky_core::cost::compute_observed_cost_usd(
+            *wh,
+            bytes,
+            duration_ms,
+            *dbu_per_hour,
+            *cost_per_dbu,
+        )
+    };
+
+    let base_by_name: BTreeMap<&str, &rocky_core::state::ModelExecution> = base
+        .models_executed
+        .iter()
+        .map(|m| (m.model_name.as_str(), m))
+        .collect();
+    let branch_by_name: BTreeMap<&str, &rocky_core::state::ModelExecution> = branch
+        .models_executed
+        .iter()
+        .map(|m| (m.model_name.as_str(), m))
+        .collect();
+
+    // Stable union of model names, sorted alphabetically for
+    // deterministic Markdown output.
+    let mut all_names: BTreeSet<&str> = BTreeSet::new();
+    for m in &branch.models_executed {
+        all_names.insert(m.model_name.as_str());
+    }
+    for m in &base.models_executed {
+        all_names.insert(m.model_name.as_str());
+    }
+
+    let mut per_model = Vec::with_capacity(all_names.len());
+    let mut total_branch_cost: f64 = 0.0;
+    let mut any_branch_cost = false;
+    let mut total_base_cost: f64 = 0.0;
+    let mut any_base_cost = false;
+    let mut savings: f64 = 0.0;
+    let mut any_savings = false;
+    let mut models_skipped_via_copy: usize = 0;
+
+    for name in all_names {
+        let branch_exec = branch_by_name.get(name).copied();
+        let base_exec = base_by_name.get(name).copied();
+
+        let skipped_via_copy = branch_exec.is_none() && base_exec.is_some();
+        if skipped_via_copy {
+            models_skipped_via_copy = models_skipped_via_copy.saturating_add(1);
+        }
+
+        let branch_duration_ms = branch_exec.map(|e| e.duration_ms).unwrap_or(0);
+        let base_duration_ms = base_exec.map(|e| e.duration_ms).unwrap_or(0);
+        let branch_bytes_scanned = branch_exec.and_then(|e| e.bytes_scanned);
+        let base_bytes_scanned = base_exec.and_then(|e| e.bytes_scanned);
+
+        let branch_cost_usd = if branch_exec.is_some() {
+            let c = cost_for(branch_bytes_scanned, branch_duration_ms);
+            if let Some(c) = c {
+                total_branch_cost += c;
+                any_branch_cost = true;
+            }
+            c
+        } else {
+            None
+        };
+        let base_cost_usd = if base_exec.is_some() {
+            let c = cost_for(base_bytes_scanned, base_duration_ms);
+            if let Some(c) = c {
+                if !skipped_via_copy {
+                    // Only models that ran on both sides count toward
+                    // the comparable base-cost total — copied models'
+                    // base cost rolls into savings_from_copy_usd.
+                    total_base_cost += c;
+                    any_base_cost = true;
+                } else {
+                    savings += c;
+                    any_savings = true;
+                }
+            }
+            c
+        } else {
+            None
+        };
+        let delta_usd = match (branch_cost_usd, base_cost_usd) {
+            (Some(b), Some(p)) if !skipped_via_copy => Some(b - p),
+            // For models only on branch (new in PR), delta == branch cost.
+            (Some(b), None) => Some(b),
+            _ => None,
+        };
+
+        per_model.push(PreviewModelCostDelta {
+            model_name: name.to_string(),
+            skipped_via_copy,
+            branch_cost_usd,
+            base_cost_usd,
+            delta_usd,
+            branch_duration_ms,
+            base_duration_ms,
+            branch_bytes_scanned,
+            base_bytes_scanned,
+        });
+    }
+
+    let total_branch_cost_usd = if any_branch_cost {
+        Some(total_branch_cost)
+    } else {
+        None
+    };
+    let total_base_cost_usd = if any_base_cost {
+        Some(total_base_cost)
+    } else {
+        None
+    };
+    let delta_usd = match (total_branch_cost_usd, total_base_cost_usd) {
+        (Some(b), Some(p)) => Some(b - p),
+        _ => None,
+    };
+    let savings_from_copy_usd = if any_savings { Some(savings) } else { None };
+
+    let summary = crate::output::PreviewCostSummary {
+        total_branch_cost_usd,
+        total_base_cost_usd,
+        delta_usd,
+        models_skipped_via_copy,
+        savings_from_copy_usd,
+    };
+    (summary, per_model)
+}
+
+/// Render a `PreviewCostOutput` summary into the PR-comment Markdown.
+fn render_preview_cost_markdown(
+    branch_name: &str,
+    summary: &crate::output::PreviewCostSummary,
+    per_model: &[crate::output::PreviewModelCostDelta],
+) -> String {
+    if per_model.is_empty() {
+        return format!(
+            "**Preview cost** — branch `{branch_name}`\n\n\
+             _No branch run yet. Run `rocky run --branch {branch_name}` on the prune set, \
+             then re-invoke `rocky preview cost`._\n"
+        );
+    }
+    let fmt_usd = |v: Option<f64>| -> String {
+        v.map(|v| format!("${v:.6}")).unwrap_or_else(|| "—".into())
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "**Preview cost** — branch `{branch_name}`\n\n\
+         Δ vs base: {}  •  branch total: {}  •  base total: {}  •  copy-savings: {}\n\n",
+        fmt_usd(summary.delta_usd),
+        fmt_usd(summary.total_branch_cost_usd),
+        fmt_usd(summary.total_base_cost_usd),
+        fmt_usd(summary.savings_from_copy_usd),
+    ));
+    out.push_str(
+        "| model | branch $ | base $ | Δ $ | branch dur | base dur | copied |\n\
+         |---|---:|---:|---:|---:|---:|---|\n",
+    );
+    for m in per_model {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {}ms | {}ms | {} |\n",
+            m.model_name,
+            fmt_usd(m.branch_cost_usd),
+            fmt_usd(m.base_cost_usd),
+            fmt_usd(m.delta_usd),
+            m.branch_duration_ms,
+            m.base_duration_ms,
+            if m.skipped_via_copy { "✓" } else { "" },
+        ));
+    }
+    out.push_str(&format!(
+        "\n_{} model(s) skipped via copy._\n",
+        summary.models_skipped_via_copy,
+    ));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -893,5 +1324,292 @@ mod tests {
         let raw = b"foo.sql\n  bar.toml\n\nbaz\n";
         let out = parse_paths(raw);
         assert_eq!(out, vec!["foo.sql", "bar.toml", "baz"]);
+    }
+
+    // ---------------------- Phase 2 + Phase 3 substance ----------------------
+
+    use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource};
+
+    fn exec(name: &str, duration_ms: u64, rows: Option<u64>, bytes: Option<u64>) -> ModelExecution {
+        let now = chrono::Utc::now();
+        ModelExecution {
+            model_name: name.to_string(),
+            started_at: now,
+            finished_at: now + chrono::Duration::milliseconds(duration_ms as i64),
+            duration_ms,
+            rows_affected: rows,
+            status: "success".to_string(),
+            sql_hash: format!("hash_{name}"),
+            bytes_scanned: bytes,
+            bytes_written: None,
+        }
+    }
+
+    fn run_record(
+        run_id: &str,
+        models: Vec<ModelExecution>,
+        git_branch: Option<&str>,
+    ) -> RunRecord {
+        let now = chrono::Utc::now();
+        RunRecord {
+            run_id: run_id.to_string(),
+            started_at: now,
+            finished_at: now,
+            status: RunStatus::Success,
+            models_executed: models,
+            trigger: RunTrigger::Manual,
+            config_hash: "h".into(),
+            triggering_identity: None,
+            session_source: SessionSource::Cli,
+            git_commit: None,
+            git_branch: git_branch.map(str::to_string),
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test".into(),
+            rocky_version: "0.0.0-test".into(),
+        }
+    }
+
+    /// Branch row count > base → rows_added; reverse → rows_removed.
+    /// Both directions must surface as `models_with_changes` and roll
+    /// into the summary totals.
+    #[test]
+    fn diff_row_delta_signs_correctly() {
+        let branch = run_record(
+            "br",
+            vec![
+                exec("a", 100, Some(110), None),
+                exec("b", 100, Some(50), None),
+            ],
+            Some("feature_x"),
+        );
+        let base = run_record(
+            "ba",
+            vec![
+                exec("a", 100, Some(100), None),
+                exec("b", 100, Some(60), None),
+            ],
+            None,
+        );
+        let (summary, models) = build_preview_diff(&branch, &base);
+        assert_eq!(summary.models_with_changes, 2);
+        assert_eq!(summary.total_rows_added, 10); // a +10
+        assert_eq!(summary.total_rows_removed, 10); // b −10
+        assert!(summary.any_coverage_warning);
+        let by_name: HashMap<&str, &crate::output::PreviewModelDiff> =
+            models.iter().map(|m| (m.model_name.as_str(), m)).collect();
+        assert_eq!(by_name["a"].sampled.rows_added, 10);
+        assert_eq!(by_name["a"].sampled.rows_removed, 0);
+        assert_eq!(by_name["b"].sampled.rows_added, 0);
+        assert_eq!(by_name["b"].sampled.rows_removed, 10);
+    }
+
+    /// Identical row counts → no changes; coverage_warning still fires
+    /// because Phase 2 didn't sample contents.
+    #[test]
+    fn diff_no_change_still_warns_about_coverage() {
+        let branch = run_record("br", vec![exec("a", 100, Some(100), None)], Some("feature"));
+        let base = run_record("ba", vec![exec("a", 100, Some(100), None)], None);
+        let (summary, models) = build_preview_diff(&branch, &base);
+        assert_eq!(summary.models_with_changes, 0);
+        assert_eq!(summary.models_unchanged, 1);
+        assert!(summary.any_coverage_warning);
+        assert!(models[0].sampling_window.coverage_warning);
+        assert_eq!(models[0].sampling_window.coverage, "not_yet_sampled");
+    }
+
+    /// Cost delta on paired models: branch faster than base → negative
+    /// delta (savings); slower → positive delta.
+    #[test]
+    fn cost_delta_databricks_paired_models() {
+        let branch = run_record(
+            "br",
+            vec![exec("a", 60_000, Some(100), Some(1024))],
+            Some("feature"),
+        );
+        let base = run_record("ba", vec![exec("a", 120_000, Some(100), Some(1024))], None);
+        let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
+        assert_eq!(per_model.len(), 1);
+        let m = &per_model[0];
+        assert_eq!(m.model_name, "a");
+        assert!(!m.skipped_via_copy);
+        // Branch is half the duration, so cost is half. delta == branch - base < 0.
+        let bcost = m.branch_cost_usd.unwrap();
+        let pcost = m.base_cost_usd.unwrap();
+        assert!(bcost > 0.0);
+        assert!(pcost > bcost);
+        let delta = m.delta_usd.unwrap();
+        assert!(delta < 0.0);
+        assert!((delta - (bcost - pcost)).abs() < 1e-9);
+        assert_eq!(summary.models_skipped_via_copy, 0);
+    }
+
+    /// Models on base but not on branch → `skipped_via_copy = true` and
+    /// `savings_from_copy_usd` accumulates; per-model `delta_usd` is None
+    /// for the copied row (no comparison meaningful — the model didn't
+    /// run on the branch).
+    #[test]
+    fn cost_delta_skipped_via_copy_rolls_into_savings() {
+        let branch = run_record(
+            "br",
+            vec![exec("changed", 60_000, Some(50), Some(2048))],
+            Some("feature"),
+        );
+        let base = run_record(
+            "ba",
+            vec![
+                exec("changed", 80_000, Some(50), Some(2048)),
+                exec("upstream", 30_000, Some(1000), Some(4096)),
+            ],
+            None,
+        );
+        let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
+        let upstream = per_model
+            .iter()
+            .find(|m| m.model_name == "upstream")
+            .unwrap();
+        assert!(upstream.skipped_via_copy);
+        assert!(upstream.branch_cost_usd.is_none());
+        assert!(upstream.base_cost_usd.is_some());
+        assert!(upstream.delta_usd.is_none());
+        assert_eq!(summary.models_skipped_via_copy, 1);
+        // Savings == upstream's base cost.
+        assert!(summary.savings_from_copy_usd.is_some());
+        assert!(
+            (summary.savings_from_copy_usd.unwrap() - upstream.base_cost_usd.unwrap()).abs() < 1e-9
+        );
+        // Total comparable base cost only counts the paired model.
+        let changed = per_model
+            .iter()
+            .find(|m| m.model_name == "changed")
+            .unwrap();
+        assert!(
+            (summary.total_base_cost_usd.unwrap() - changed.base_cost_usd.unwrap()).abs() < 1e-9
+        );
+    }
+
+    /// Models on branch but not on base → new in PR; delta == branch
+    /// cost (since base cost is 0 / None).
+    #[test]
+    fn cost_delta_branch_only_model_delta_eq_branch_cost() {
+        let branch = run_record(
+            "br",
+            vec![exec("new_model", 30_000, Some(10), Some(512))],
+            Some("feature"),
+        );
+        let base = run_record("ba", vec![], None);
+        let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
+        assert_eq!(per_model.len(), 1);
+        let m = &per_model[0];
+        assert!(!m.skipped_via_copy);
+        assert!(m.base_cost_usd.is_none());
+        assert!(m.branch_cost_usd.is_some());
+        assert!((m.delta_usd.unwrap() - m.branch_cost_usd.unwrap()).abs() < 1e-9);
+        assert_eq!(summary.models_skipped_via_copy, 0);
+    }
+
+    /// Without cost params (config can't be loaded), every cost field
+    /// is None — the surface still emits durations + bytes so the diff
+    /// is non-empty.
+    #[test]
+    fn cost_delta_no_params_emits_durations_only() {
+        let branch = run_record(
+            "br",
+            vec![exec("a", 60_000, Some(100), Some(1024))],
+            Some("feature"),
+        );
+        let base = run_record("ba", vec![exec("a", 60_000, Some(100), Some(1024))], None);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, None);
+        assert_eq!(per_model.len(), 1);
+        let m = &per_model[0];
+        assert!(m.branch_cost_usd.is_none());
+        assert!(m.base_cost_usd.is_none());
+        assert!(m.delta_usd.is_none());
+        assert_eq!(m.branch_duration_ms, 60_000);
+        assert!(summary.delta_usd.is_none());
+    }
+
+    /// DuckDB cost is always 0 — delta should be 0, not None.
+    #[test]
+    fn cost_delta_duckdb_always_zero() {
+        let branch = run_record("br", vec![exec("a", 100, Some(50), None)], Some("feature"));
+        let base = run_record("ba", vec![exec("a", 100, Some(50), None)], None);
+        let params = (rocky_core::cost::WarehouseType::DuckDb, 0.0, 0.0);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
+        assert_eq!(per_model[0].branch_cost_usd, Some(0.0));
+        assert_eq!(per_model[0].base_cost_usd, Some(0.0));
+        assert_eq!(per_model[0].delta_usd, Some(0.0));
+        assert_eq!(summary.delta_usd, Some(0.0));
+    }
+
+    /// Markdown rendering is deterministic and includes the headline
+    /// metrics. Used by the Phase 4 GitHub Action.
+    #[test]
+    fn diff_markdown_renders_table() {
+        let branch = run_record(
+            "br",
+            vec![
+                exec("a", 100, Some(110), None),
+                exec("b", 100, Some(50), None),
+            ],
+            Some("feature_x"),
+        );
+        let base = run_record(
+            "ba",
+            vec![
+                exec("a", 100, Some(100), None),
+                exec("b", 100, Some(60), None),
+            ],
+            None,
+        );
+        let (summary, models) = build_preview_diff(&branch, &base);
+        let md = render_preview_diff_markdown("feature_x", "main", &summary, &models);
+        assert!(md.contains("**Preview diff**"));
+        assert!(md.contains("`feature_x`"));
+        assert!(md.contains("vs `main`"));
+        assert!(md.contains("| `a` |"));
+        assert!(md.contains("| `b` |"));
+        assert!(md.contains("not yet sampled"));
+        assert!(md.contains("Phase 2.5"));
+    }
+
+    /// Empty diff path produces a "no paired runs" hint, not an empty
+    /// markdown.
+    #[test]
+    fn diff_markdown_empty_path_explains_setup() {
+        let summary = empty_diff_summary();
+        let md = render_preview_diff_markdown("feature_x", "main", &summary, &[]);
+        assert!(md.contains("No paired runs"));
+        assert!(md.contains("rocky run --branch feature_x"));
+    }
+
+    /// Cost markdown includes the headline delta + per-model rows.
+    #[test]
+    fn cost_markdown_renders_table() {
+        let branch = run_record(
+            "br",
+            vec![exec("a", 60_000, Some(100), None)],
+            Some("feature"),
+        );
+        let base = run_record(
+            "ba",
+            vec![
+                exec("a", 120_000, Some(100), None),
+                exec("upstream", 30_000, Some(1000), None),
+            ],
+            None,
+        );
+        let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
+        let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
+        let md = render_preview_cost_markdown("feature", &summary, &per_model);
+        assert!(md.contains("**Preview cost**"));
+        assert!(md.contains("`feature`"));
+        assert!(md.contains("Δ vs base"));
+        assert!(md.contains("| `a` |"));
+        assert!(md.contains("| `upstream` |"));
+        assert!(md.contains("1 model(s) skipped via copy"));
     }
 }
