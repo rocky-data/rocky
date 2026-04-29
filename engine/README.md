@@ -90,7 +90,7 @@ Full reference: [CLI commands](https://rocky-data.dev/reference/cli/).
 | Warehouse | BigQuery | Beta | SQL execution via BigQuery connector |
 | Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
 
-Build a custom adapter in Rust or any language: [Adapter SDK](https://rocky-data.dev/concepts/adapters/).
+Build a custom adapter in Rust or any language: [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) — walks through a ClickHouse-shaped skeleton, the trait surface, auth, testing, and distribution. Concepts overview: [Adapter SDK](https://rocky-data.dev/concepts/adapters/).
 
 ## Installation
 
