@@ -576,20 +576,19 @@ async fn test_loader_missing_rows_loaded_column() {
     assert_eq!(result.rows_loaded, 0);
 }
 
-/// Bearer token is sent correctly in the Authorization header.
+/// Bearer token is sent correctly in the Authorization header for OAuth
+/// auth, and the matching `X-Snowflake-Authorization-Token-Type: OAUTH`
+/// header rides alongside it.
 #[tokio::test]
-async fn test_bearer_token_sent() {
+async fn test_oauth_auth_headers() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
         .and(header("Authorization", "Bearer test-sf-token"))
-        .and(header(
-            "X-Snowflake-Authorization-Token-Type",
-            "KEYPAIR_JWT",
-        ))
+        .and(header("X-Snowflake-Authorization-Token-Type", "OAUTH"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "statementHandle": "sf-auth",
+            "statementHandle": "sf-auth-oauth",
             "code": "00000",
             "message": "ok",
             "statementStatusUrl": "",
@@ -603,6 +602,149 @@ async fn test_bearer_token_sent() {
     let connector = test_connector(&server);
     connector.execute_statement("SELECT 1").await.unwrap();
     // If the headers didn't match, the mock would not have responded with 200
+}
+
+/// Key-pair auth sets `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`
+/// alongside the JWT in the Authorization header. Uses the `test-support`
+/// `prime_cache_with` to skip the (expensive, fixture-heavy) RS256 JWT
+/// minting path while still exercising the connector's header logic.
+#[tokio::test]
+async fn test_keypair_auth_headers() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(header("Authorization", "Bearer fake-jwt-token"))
+        .and(header(
+            "X-Snowflake-Authorization-Token-Type",
+            "KEYPAIR_JWT",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-auth-keypair",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = Auth::from_config(AuthConfig {
+        account: "test_account".into(),
+        username: Some("test_user".into()),
+        password: None,
+        oauth_token: None,
+        private_key_path: Some("/unused-because-cache-primed.pem".into()),
+    })
+    .unwrap();
+    auth.prime_cache_with("fake-jwt-token", Duration::from_secs(3540))
+        .await;
+
+    let config = ConnectorConfig {
+        account: "test_account".into(),
+        warehouse: "COMPUTE_WH".into(),
+        database: Some("TEST_DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("SYSADMIN".into()),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+    };
+    let connector = SnowflakeConnector::new(config, auth).with_base_url(server.uri());
+    connector.execute_statement("SELECT 1").await.unwrap();
+}
+
+/// Password / session-token auth sends the bearer token but **no**
+/// `X-Snowflake-Authorization-Token-Type` header — Snowflake's SQL API
+/// v2 spec lets the server sniff the token kind from the token itself,
+/// and emitting `KEYPAIR_JWT` here is what triggered the original
+/// 401-loop bug for non-keypair users.
+#[tokio::test]
+async fn test_password_auth_omits_token_type_header() {
+    let server = MockServer::start().await;
+
+    // Reject any request that *does* carry the token-type header — the
+    // mock only matches when the header is absent. Wiremock has no
+    // built-in "header-absent" matcher, so we set up a 500 fallback for
+    // any request carrying the header and assert it never fires.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(header(
+            "X-Snowflake-Authorization-Token-Type",
+            "KEYPAIR_JWT",
+        ))
+        .respond_with(ResponseTemplate::new(500).set_body_string(
+            "should not be reached: password auth must not emit token-type header",
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(header("X-Snowflake-Authorization-Token-Type", "OAUTH"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(
+            "should not be reached: password auth must not emit token-type header",
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(header("Authorization", "Bearer cached-session-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-auth-password",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = Auth::from_config(AuthConfig {
+        account: "test_account".into(),
+        username: Some("test_user".into()),
+        password: Some("test_pass".into()),
+        oauth_token: None,
+        private_key_path: None,
+    })
+    .unwrap();
+    // Skip the live login-request hit by priming the session-token cache.
+    auth.prime_cache_with("cached-session-token", Duration::from_secs(3600))
+        .await;
+
+    let config = ConnectorConfig {
+        account: "test_account".into(),
+        warehouse: "COMPUTE_WH".into(),
+        database: Some("TEST_DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("SYSADMIN".into()),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+    };
+    let connector = SnowflakeConnector::new(config, auth).with_base_url(server.uri());
+    connector.execute_statement("SELECT 1").await.unwrap();
+}
+
+/// Direct unit-style assertion on the [`TokenType`] -> header value
+/// mapping, kept alongside the wiremock cases so a regression in the
+/// mapping table surfaces with a sharper error than a 500 response.
+#[test]
+fn test_token_type_header_mapping() {
+    use rocky_snowflake::auth::TokenType;
+    assert_eq!(TokenType::OAuth.header_value(), Some("OAUTH"));
+    assert_eq!(TokenType::KeypairJwt.header_value(), Some("KEYPAIR_JWT"));
+    assert_eq!(TokenType::SessionToken.header_value(), None);
 }
 
 // ---------------------------------------------------------------------------

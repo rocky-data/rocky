@@ -618,6 +618,23 @@ Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backend
 
 ---
 
+## `[ai]`
+
+Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`). Unknown fields are rejected.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. The default preserves Rocky's pre-1.x hard-coded behaviour. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
+
+```toml
+[ai]
+max_tokens = 8192
+```
+
+The `[ai]` block is read by every `rocky ai*` command. The API key itself is **not** read from `rocky.toml` — it must come from the `ANTHROPIC_API_KEY` environment variable so it never lands on disk in a project file.
+
+---
+
 ## `[cache]`
 
 Project-level cache configuration. Today this is the schema cache

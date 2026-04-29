@@ -24,6 +24,17 @@ source ~/.zshrc
 
 Rocky uses `claude-sonnet-4-6` by default. No additional configuration is needed.
 
+### Token budget (optional)
+
+Each AI command runs a compile-verify retry loop (up to 3 attempts). To bound the worst-case spend when the LLM produces runaway responses, Rocky enforces a cumulative output-token budget across retries. Set the budget in `rocky.toml` if the default of `4096` is not enough for your project:
+
+```toml
+[ai]
+max_tokens = 8192
+```
+
+`max_tokens` doubles as the per-request cap on the Anthropic Messages API and as the cumulative output-token ceiling — when the running total of `output_tokens` across retry attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
+
 ### Verify the setup
 
 ```bash

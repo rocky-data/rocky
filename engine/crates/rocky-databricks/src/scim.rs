@@ -37,11 +37,25 @@
 //! SQL Statement Execution API uses — [`crate::auth::Auth`] handles
 //! both transparently. No separate SCIM auth path.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::auth::Auth;
+
+/// Build the shared `reqwest::Client` used for every SCIM call.
+/// `Client::new()` left both connect and request timeouts unset — a
+/// stalled connection would block any SCIM-using path (group sync,
+/// principal lookups) forever.
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("reqwest client builder is infallible with these options")
+}
 
 /// Errors from the Databricks SCIM API.
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +126,7 @@ impl ScimClient {
         ScimClient {
             host,
             auth,
-            client: Client::new(),
+            client: build_http_client(),
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }

@@ -1790,6 +1790,12 @@ pub struct RockyConfig {
     /// resolution semantics (DAG walk with cycle detection).
     #[serde(default, rename = "role", alias = "roles")]
     pub roles: std::collections::BTreeMap<String, RoleConfig>,
+
+    /// AI intent layer configuration. Currently scopes the per-request and
+    /// cumulative-retry token budget for `rocky ai` / `ai-explain` /
+    /// `ai-sync` / `ai-test`. See [`AiSection`].
+    #[serde(default)]
+    pub ai: AiSection,
 }
 
 impl RockyConfig {
@@ -1884,6 +1890,51 @@ pub struct RunRetryConfig {
     /// `retry.max_retries_per_run` still applies in isolation).
     #[serde(default)]
     pub max_retries_per_run: Option<u32>,
+}
+
+/// Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`,
+/// `rocky ai-sync`, `rocky ai-test`).
+///
+/// `max_tokens` doubles as:
+/// 1. The per-request `max_tokens` cap on the Anthropic Messages API.
+/// 2. The cumulative output-token budget across the compile-verify retry
+///    loop — when the running total exceeds this value, the loop fail-stops
+///    instead of issuing another retry. This bounds the worst-case spend
+///    when the LLM produces runaway responses that fail validation.
+///
+/// The default ([`DEFAULT_AI_MAX_TOKENS`]) preserves Rocky's pre-1.x
+/// hard-coded behaviour. Increase for projects that legitimately need
+/// longer generations (large model surfaces, verbose tests).
+///
+/// ```toml
+/// [ai]
+/// max_tokens = 8192
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiSection {
+    /// Per-request `max_tokens` and cumulative output-token budget across
+    /// retries. Default [`DEFAULT_AI_MAX_TOKENS`].
+    #[serde(default = "default_ai_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for AiSection {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_AI_MAX_TOKENS,
+        }
+    }
+}
+
+/// Default value for [`AiSection::max_tokens`]. Mirrors
+/// `rocky_ai::client::DEFAULT_MAX_TOKENS`; duplicated as a `const` here so
+/// the schema generator and TOML parser don't need to depend on the AI
+/// crate (which would invert the dependency graph).
+pub const DEFAULT_AI_MAX_TOKENS: u32 = 4096;
+
+fn default_ai_max_tokens() -> u32 {
+    DEFAULT_AI_MAX_TOKENS
 }
 
 /// Schema-only helper that mirrors the deserializer's acceptance of both

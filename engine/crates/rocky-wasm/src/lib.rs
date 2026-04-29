@@ -163,6 +163,15 @@ pub fn get_parse_errors(source: &str) -> String {
                 rocky_lang::ParseError::EmptyFile => {
                     (0, "pipeline step".to_string(), "empty file".to_string())
                 }
+                rocky_lang::ParseError::TooDeeplyNested {
+                    depth,
+                    limit,
+                    offset,
+                } => (
+                    *offset,
+                    format!("expression nested no deeper than {limit}"),
+                    format!("depth {depth}"),
+                ),
             };
 
             // Convert byte offset to line/column.
@@ -222,6 +231,15 @@ pub fn compile_rocky_model(source: &str) -> String {
                 rocky_lang::ParseError::EmptyFile => {
                     (0, "pipeline step".to_string(), "empty file".to_string())
                 }
+                rocky_lang::ParseError::TooDeeplyNested {
+                    depth,
+                    limit,
+                    offset,
+                } => (
+                    *offset,
+                    format!("expression nested no deeper than {limit}"),
+                    format!("depth {depth}"),
+                ),
             };
             let (line, col) = byte_offset_to_line_col(source, offset);
 

@@ -312,6 +312,10 @@ export interface RockyConfig {
    */
   adapter?: AdaptersFieldSchema;
   /**
+   * AI intent layer configuration. Currently scopes the per-request and cumulative-retry token budget for `rocky ai` / `ai-explain` / `ai-sync` / `ai-test`. See [`AiSection`].
+   */
+  ai?: AiSection;
+  /**
    * Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
    */
   budget?: BudgetConfig;
@@ -490,6 +494,21 @@ export interface RetryConfig {
    * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`).
+ *
+ * `max_tokens` doubles as: 1. The per-request `max_tokens` cap on the Anthropic Messages API. 2. The cumulative output-token budget across the compile-verify retry loop — when the running total exceeds this value, the loop fail-stops instead of issuing another retry. This bounds the worst-case spend when the LLM produces runaway responses that fail validation.
+ *
+ * The default ([`DEFAULT_AI_MAX_TOKENS`]) preserves Rocky's pre-1.x hard-coded behaviour. Increase for projects that legitimately need longer generations (large model surfaces, verbose tests).
+ *
+ * ```toml [ai] max_tokens = 8192 ```
+ */
+export interface AiSection {
+  /**
+   * Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
+   */
+  max_tokens?: number;
 }
 /**
  * Declarative run-level budget for cost, duration, and data volume. All limits are optional; when unset the dimension is not enforced.

@@ -7,6 +7,17 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+
+/// Build the shared `reqwest::Client` used for every Airbyte API call.
+/// `Client::new()` left both connect and request timeouts unset — a
+/// stalled connection would block `rocky run` forever.
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("reqwest client builder is infallible with these options")
+}
 use rocky_core::config::RetryConfig;
 use rocky_core::redacted::RedactedString;
 use serde::{Deserialize, Serialize};
@@ -122,7 +133,7 @@ impl AirbyteClient {
     pub fn with_retry(api_url: &str, auth_token: Option<String>, retry: RetryConfig) -> Self {
         let base_url = api_url.trim_end_matches('/').to_string();
         AirbyteClient {
-            client: Client::new(),
+            client: build_http_client(),
             base_url,
             auth_token: auth_token.map(RedactedString::new),
             retry,

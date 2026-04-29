@@ -70,7 +70,15 @@ jobs:
           files: editors/vscode/*.vsix
 
       - name: Publish to VS Code Marketplace
-        if: env.VSCE_PAT != ''
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npx @vscode/vsce publish --pat "$VSCE_PAT"
+        # `if: env.VSCE_PAT != ''` doesn't work — the `env` context isn't
+        # available in step-level `if:` evaluation. Guard inline instead so
+        # forks without the secret produce a soft no-op rather than a hard
+        # failure (matches the pattern documented in engine-wasm-release.yml).
+        run: |
+          if [ -z "$VSCE_PAT" ]; then
+            echo "VSCE_PAT not set — skipping marketplace publish (this is expected on forks)"
+            exit 0
+          fi
+          npx @vscode/vsce publish --pat "$VSCE_PAT"

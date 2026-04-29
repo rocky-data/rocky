@@ -48,6 +48,16 @@ pub struct ValidationContext<'a> {
 /// lenient on unresolved column references, so this is NOT a hard
 /// "no hallucinated columns" guarantee — the prompt grounding does most of
 /// that work, and warehouse execution catches the rest.
+///
+/// # Token budget
+///
+/// The retry loop tracks cumulative `output_tokens` returned by the LLM
+/// across attempts. When the running total exceeds the client's
+/// `max_tokens` (sourced from `[ai] max_tokens` in `rocky.toml`, default
+/// [`crate::client::DEFAULT_MAX_TOKENS`]), the loop fail-stops with
+/// [`AiError::TokenBudgetExceeded`] instead of issuing another retry.
+/// This bounds the worst-case spend when the LLM produces a runaway
+/// response that fails validation.
 pub async fn generate_model(
     intent: &str,
     model_schemas: &[(String, Vec<TypedColumn>)],
@@ -59,11 +69,19 @@ pub async fn generate_model(
 ) -> Result<GeneratedModel, AiError> {
     let system = prompt::build_system_prompt(model_schemas, source_tables, format);
     let mut error_context: Option<String> = None;
+    let token_budget: u64 = u64::from(client.max_tokens());
+    let mut consumed_output_tokens: u64 = 0;
 
     for attempt in 1..=max_attempts {
         let response = client
             .generate(&system, intent, error_context.as_deref())
             .await?;
+
+        // Track cumulative output tokens. The Anthropic API caps each
+        // individual response at `max_tokens`; this guard prevents a stuck
+        // retry loop from billing N × max_tokens before fail-stopping.
+        consumed_output_tokens =
+            consumed_output_tokens.saturating_add(response.output_tokens.unwrap_or(0));
 
         let source = extract_code(&response.content);
         let validation = validate_generated_code(&source, format, context);
@@ -79,6 +97,19 @@ pub async fn generate_model(
                 });
             }
             Err(errors) => {
+                if consumed_output_tokens > token_budget {
+                    tracing::warn!(
+                        attempt,
+                        consumed_output_tokens,
+                        budget = token_budget,
+                        "AI token budget exceeded; aborting compile-verify retry loop"
+                    );
+                    return Err(AiError::TokenBudgetExceeded {
+                        attempts: attempt,
+                        consumed_output_tokens,
+                        budget: client.max_tokens(),
+                    });
+                }
                 if attempt < max_attempts {
                     tracing::warn!(
                         attempt,

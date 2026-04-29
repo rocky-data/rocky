@@ -840,6 +840,11 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // SIGKILL the child if our `Child` handle is dropped — including when
+    // `tokio::time::timeout` cancels the `wait_with_output` future on
+    // expiry. Without this, a hook that runs past `timeout_ms` keeps
+    // executing after Rocky returns `HookError::Timeout`.
+    cmd.kill_on_drop(true);
 
     // Set extra environment variables
     for (k, v) in &hook.env {
@@ -881,8 +886,9 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
         }
         Ok(Err(e)) => Err(HookError::Io(e)),
         Err(_) => {
-            // Timeout — the child process is already dropped (and killed) when
-            // `wait_with_output` future is cancelled by the timeout.
+            // Timeout — `kill_on_drop(true)` on the `Command` ensures the
+            // OS process is SIGKILL'd when `wait_with_output`'s `Child`
+            // handle is dropped by the timeout cancellation.
             Err(HookError::Timeout {
                 command: hook.command.clone(),
                 timeout_ms: hook.timeout_ms,

@@ -327,6 +327,20 @@
         }
       ]
     },
+    "AiSection": {
+      "additionalProperties": false,
+      "description": "Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`).\n\n`max_tokens` doubles as: 1. The per-request `max_tokens` cap on the Anthropic Messages API. 2. The cumulative output-token budget across the compile-verify retry loop — when the running total exceeds this value, the loop fail-stops instead of issuing another retry. This bounds the worst-case spend when the LLM produces runaway responses that fail validation.\n\nThe default ([`DEFAULT_AI_MAX_TOKENS`]) preserves Rocky's pre-1.x hard-coded behaviour. Increase for projects that legitimately need longer generations (large model surfaces, verbose tests).\n\n```toml [ai] max_tokens = 8192 ```",
+      "properties": {
+        "max_tokens": {
+          "default": 4096,
+          "description": "Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "BindingType": {
       "description": "Workspace binding access level.",
       "enum": [
@@ -2772,6 +2786,17 @@
       ],
       "default": {},
       "description": "Named adapter configurations (keyed by adapter name)."
+    },
+    "ai": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AiSection"
+        }
+      ],
+      "default": {
+        "max_tokens": 4096
+      },
+      "description": "AI intent layer configuration. Currently scopes the per-request and cumulative-retry token budget for `rocky ai` / `ai-explain` / `ai-sync` / `ai-test`. See [`AiSection`]."
     },
     "budget": {
       "allOf": [
