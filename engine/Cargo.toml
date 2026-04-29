@@ -96,6 +96,11 @@ object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 bytes = "1"
 url = "2"
 
+# Percent-encoding for URL path components in source adapter HTTP clients
+# (Fivetran, Airbyte, Iceberg). Used to defend against path injection /
+# traversal when interpolating user-supplied IDs / namespaces.
+percent-encoding = "2"
+
 # DuckDB
 duckdb = { version = "1", features = ["bundled"] }
 

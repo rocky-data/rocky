@@ -1,6 +1,21 @@
 use std::time::Duration;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
+
+/// Percent-encode a single user-supplied URL path component.
+///
+/// Uses RFC 3986 unreserved chars minus `.` — `-`, `_`, `~`, and ASCII
+/// alphanumerics pass through; `.` stays encoded so a hostile `..` cannot
+/// climb out of the parent path. Every other byte (`/`, `?`, `#`, `%`,
+/// spaces, etc.) is percent-encoded. Always apply this when interpolating
+/// caller-controlled values (connector IDs, group IDs, table names) into a
+/// URL path; path-traversal and query-injection bugs in source-adapter
+/// HTTP clients begin and end here.
+pub(crate) fn encode_path_segment(segment: &str) -> String {
+    const PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
+    utf8_percent_encode(segment, PATH_SAFE).to_string()
+}
 
 /// Build the shared `reqwest::Client` used for every Fivetran API call.
 /// `Client::new()` previously left both connect and request timeouts
@@ -420,6 +435,38 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data.items.len(), 2);
         assert_eq!(data.next_cursor, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_encode_path_segment_alphanumeric_passthrough() {
+        // Plain alphanumeric IDs are unchanged.
+        assert_eq!(encode_path_segment("conn_abc123"), "conn_abc123");
+        assert_eq!(encode_path_segment("group_xyz"), "group_xyz");
+    }
+
+    #[test]
+    fn test_encode_path_segment_unsafe_chars() {
+        // Path-traversal: `..` is fully encoded so the path component cannot
+        // climb out of `/v1/connectors/`.
+        assert_eq!(encode_path_segment(".."), "%2E%2E");
+        // Path separator must not survive — otherwise `attacker/admin` could
+        // forge `/v1/connectors/attacker/admin` and hit a different endpoint.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        // Query-string injection: `?` and `#` are encoded.
+        assert_eq!(encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(encode_path_segment("a#b"), "a%23b");
+        // Pre-encoded payloads round-trip the literal `%` so the server sees
+        // the original byte rather than a re-decoded escape.
+        assert_eq!(encode_path_segment("%2F"), "%252F");
+        // Spaces and other ASCII whitespace must be encoded.
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn test_encode_path_segment_unreserved_passthrough() {
+        // RFC 3986 unreserved chars (minus `.`) survive untouched so that
+        // ordinary identifiers (`my_id-1~v2`) don't become noise URLs.
+        assert_eq!(encode_path_segment("my_id-1~v2"), "my_id-1~v2");
     }
 
     #[test]

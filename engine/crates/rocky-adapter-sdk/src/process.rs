@@ -102,6 +102,14 @@ pub struct ProcessAdapter {
     stdin: Mutex<BufWriter<ChildStdin>>,
     /// Buffered reader from the child's stdout.
     stdout: Mutex<BufReader<ChildStdout>>,
+    /// Serializes the request/response pair in [`ProcessAdapter::call`].
+    ///
+    /// The wire protocol is request-id-keyed in theory but the underlying
+    /// child process is single-threaded — it reads one request, writes one
+    /// response, then loops. Concurrent callers that interleave writes/reads
+    /// can therefore swap responses (caller A reads B's reply). Holding this
+    /// lock across the entire write→read pair makes `call` linearizable.
+    call_lock: Mutex<()>,
     /// Monotonically increasing request ID.
     next_id: AtomicU64,
     /// The adapter's manifest, received during initialization.
@@ -212,6 +220,7 @@ impl ProcessAdapter {
             child: Mutex::new(child),
             stdin,
             stdout,
+            call_lock: Mutex::new(()),
             next_id,
             manifest,
             dialect,
@@ -224,6 +233,15 @@ impl ProcessAdapter {
     }
 
     /// Send a JSON-RPC request and wait for the response.
+    ///
+    /// **Concurrency:** this method serializes concurrent callers. The
+    /// underlying child process is single-threaded — it reads one request
+    /// and writes one response per loop iteration — so two concurrent
+    /// `call`s would otherwise interleave on stdin/stdout and could swap
+    /// responses (caller A reads B's reply). [`Self::call_lock`] is held
+    /// across the entire write→read pair to keep the protocol
+    /// linearizable. If you need parallel adapter calls, spawn multiple
+    /// [`ProcessAdapter`] instances rather than sharing one.
     pub async fn call(
         &self,
         method: &str,
@@ -233,6 +251,13 @@ impl ProcessAdapter {
         let request = RpcRequest::new(id, method, params);
 
         let request_json = serde_json::to_string(&request).map_err(AdapterError::new)?;
+
+        // Hold `call_lock` across the entire write→read pair so concurrent
+        // callers cannot interleave on stdin/stdout. Without this, two
+        // overlapping calls can swap responses: caller A writes id=N,
+        // caller B writes id=M, then A reads M's reply and the existing
+        // id mismatch surfaces as a hard error rather than corruption.
+        let _guard = self.call_lock.lock().await;
 
         // Write request.
         {
@@ -270,7 +295,9 @@ impl ProcessAdapter {
         let response: RpcResponse = serde_json::from_str(line.trim())
             .map_err(|e| AdapterError::msg(format!("failed to parse adapter response: {e}")))?;
 
-        // Verify response ID matches request ID.
+        // Verify response ID matches request ID. With `call_lock` held this
+        // should be impossible to violate; the check stays as a defence
+        // against an adapter that emits a response with a wrong id.
         if response.id != id {
             return Err(AdapterError::msg(format!(
                 "response ID mismatch: expected {id}, got {}",
@@ -584,5 +611,91 @@ mod tests {
         let expr = d.row_hash_expr(&["col1".into(), "col2".into()]);
         assert!(expr.contains("MD5"));
         assert!(expr.contains("col1, col2"));
+    }
+
+    /// Spawn a tiny Python-based JSON-RPC echo adapter and fire two
+    /// `call`s concurrently. Without [`ProcessAdapter::call_lock`] the two
+    /// requests/responses can interleave on stdin/stdout and the per-call
+    /// id-mismatch guard turns the race into a hard error. With the lock
+    /// in place each caller deterministically reads its own response, so
+    /// both ids match.
+    ///
+    /// Unix-only because the test relies on `python3` being on `PATH`,
+    /// which is true for the engine CI matrix (ubuntu) but not Windows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_concurrent_calls_do_not_swap_ids() {
+        // The adapter:
+        //   1. on `initialize`, writes back a manifest.
+        //   2. on `echo`, sleeps to widen the race window, then echoes the
+        //      caller's `id` + a marker copied from `params.tag`.
+        let script = r#"
+import json, sys, time
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+manifest = {
+    "name": "echo", "version": "0.0.0", "sdk_version": "0.0.0",
+    "dialect": "echo",
+    "capabilities": {
+        "warehouse": True, "discovery": False, "governance": False,
+        "batch_checks": False, "create_catalog": False, "create_schema": False,
+        "merge": False, "tablesample": False, "file_load": False,
+    },
+    "auth_methods": [], "config_schema": {},
+}
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"manifest": manifest}})
+    elif method == "echo":
+        # Sleep to widen the race window so an unsynchronized
+        # implementation will reliably interleave.
+        time.sleep(0.05)
+        tag = req.get("params", {}).get("tag")
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"id_seen": rid, "tag": tag}})
+    elif method == "shutdown":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        break
+    else:
+        emit({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": "UNKNOWN_METHOD", "message": method or ""}})
+"#;
+        let adapter =
+            match ProcessAdapter::spawn("python3", &["-c", script], &serde_json::json!({})).await {
+                Ok(a) => a,
+                Err(e) => {
+                    // Skip silently if python3 isn't installed in this
+                    // environment — we don't want to fail CI on a missing
+                    // tool the test only uses to emulate an adapter.
+                    eprintln!("skipping: spawn failed (python3 unavailable?): {e}");
+                    return;
+                }
+            };
+
+        // Fire two calls concurrently. Each carries a distinct `tag` so we
+        // can assert each result was returned to the right caller.
+        let a = adapter.call("echo", serde_json::json!({"tag": "alpha"}));
+        let b = adapter.call("echo", serde_json::json!({"tag": "beta"}));
+        let (ra, rb) = tokio::join!(a, b);
+
+        let ra = ra.expect("call A succeeded");
+        let rb = rb.expect("call B succeeded");
+
+        assert_eq!(ra["tag"], "alpha", "call A must receive its own tag");
+        assert_eq!(rb["tag"], "beta", "call B must receive its own tag");
+
+        // The id_seen field round-trips the request id; assert each
+        // caller's response carries its own id, not the other caller's.
+        let ida = ra["id_seen"].as_u64().expect("id_seen on A");
+        let idb = rb["id_seen"].as_u64().expect("id_seen on B");
+        assert_ne!(ida, idb, "request ids must be distinct");
+
+        let _ = adapter.close().await;
     }
 }

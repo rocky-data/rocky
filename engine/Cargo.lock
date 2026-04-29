@@ -3362,6 +3362,7 @@ version = "1.17.4"
 dependencies = [
  "async-trait",
  "chrono",
+ "percent-encoding",
  "reqwest",
  "rocky-core",
  "serde",
@@ -3567,6 +3568,7 @@ dependencies = [
  "chrono",
  "futures",
  "indexmap",
+ "percent-encoding",
  "reqwest",
  "rocky-core",
  "rocky-observe",
@@ -3584,6 +3586,7 @@ version = "1.17.4"
 dependencies = [
  "async-trait",
  "chrono",
+ "percent-encoding",
  "reqwest",
  "rocky-core",
  "serde",

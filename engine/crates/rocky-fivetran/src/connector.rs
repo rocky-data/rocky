@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::client::{FivetranClient, FivetranError};
+use crate::client::{FivetranClient, FivetranError, encode_path_segment};
 
 /// A Fivetran connector as returned by the API.
 ///
@@ -53,7 +53,7 @@ pub async fn list_connectors(
     client: &FivetranClient,
     group_id: &str,
 ) -> Result<Vec<Connector>, FivetranError> {
-    let path = format!("/v1/groups/{group_id}/connectors");
+    let path = format!("/v1/groups/{}/connectors", encode_path_segment(group_id));
     let connectors: Vec<Connector> = client.get_all_pages(&path).await?;
     debug!(group_id, count = connectors.len(), "discovered connectors");
     Ok(connectors)
@@ -84,7 +84,7 @@ pub async fn get_connector(
     client: &FivetranClient,
     connector_id: &str,
 ) -> Result<Connector, FivetranError> {
-    let path = format!("/v1/connectors/{connector_id}");
+    let path = format!("/v1/connectors/{}", encode_path_segment(connector_id));
     client.get(&path).await
 }
 
