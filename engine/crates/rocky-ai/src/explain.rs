@@ -68,6 +68,14 @@ pub async fn explain_model(
 }
 
 /// Write intent to a model's TOML sidecar config file.
+///
+/// If the sidecar already exists but cannot be parsed as TOML, this
+/// function returns an error rather than silently overwriting the file
+/// with a fresh `intent = "..."` document — the original behavior would
+/// erase whatever the user was editing (e.g. mid-keystroke during an
+/// editor flush, or a hand-rolled TOML with a typo). The caller can
+/// surface the message to the user, who is expected to fix or remove
+/// the file before retrying.
 pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io::Error> {
     let toml_path = if model.file_path.ends_with(".rocky") {
         format!("{}.toml", model.file_path)
@@ -79,10 +87,21 @@ pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io:
 
     let path = std::path::Path::new(&toml_path);
 
-    // Read existing config or start fresh
+    // Read existing config or start fresh. Refuse to clobber a sidecar
+    // that exists but doesn't parse — overwriting it would delete the
+    // user's in-flight edits.
     let mut config: toml::Value = if path.exists() {
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new()))
+        match toml::from_str(&content) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to overwrite unparseable TOML at {}: {err}; \
+                     please fix the file first or remove it and rerun",
+                    path.display()
+                )));
+            }
+        }
     } else {
         toml::Value::Table(toml::map::Map::new())
     };
@@ -104,4 +123,104 @@ pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io:
     let toml_str = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
 
     std::fs::write(path, toml_str)
+}
+
+#[cfg(test)]
+mod save_intent_tests {
+    use super::*;
+    use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
+    use std::io::Write;
+
+    fn make_model(file_path: String) -> Model {
+        Model {
+            sql: String::new(),
+            file_path,
+            contract_path: None,
+            config: ModelConfig {
+                name: "test_model".to_string(),
+                depends_on: vec![],
+                strategy: StrategyConfig::default(),
+                target: TargetConfig {
+                    catalog: "c".into(),
+                    schema: "s".into(),
+                    table: "test_model".into(),
+                },
+                sources: vec![],
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: vec![],
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                retention: None,
+            },
+        }
+    }
+
+    #[test]
+    fn save_intent_refuses_to_overwrite_unparseable_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql_path = dir.path().join("model.sql");
+        let toml_path = dir.path().join("model.toml");
+
+        // Pre-populate a broken TOML sidecar.
+        let broken = "name = \"unfinished string\nintent = \"old\"\n";
+        let mut f = std::fs::File::create(&toml_path).unwrap();
+        f.write_all(broken.as_bytes()).unwrap();
+        drop(f);
+
+        let model = make_model(sql_path.to_string_lossy().to_string());
+        let result = save_intent_to_config(&model, "the new intent");
+
+        // Must return an error, not silently overwrite.
+        let err = result.expect_err("save should refuse to overwrite unparseable TOML");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing to overwrite unparseable TOML"),
+            "unexpected error message: {msg}"
+        );
+
+        // The original (broken) file must be untouched.
+        let on_disk = std::fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(
+            on_disk, broken,
+            "save_intent_to_config clobbered an unparseable file"
+        );
+    }
+
+    #[test]
+    fn save_intent_creates_fresh_toml_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql_path = dir.path().join("model.sql");
+        let model = make_model(sql_path.to_string_lossy().to_string());
+
+        save_intent_to_config(&model, "some intent").unwrap();
+
+        let toml_path = dir.path().join("model.toml");
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(content.contains("intent"));
+        assert!(content.contains("some intent"));
+        assert!(content.contains("test_model"));
+    }
+
+    #[test]
+    fn save_intent_merges_into_valid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql_path = dir.path().join("model.sql");
+        let toml_path = dir.path().join("model.toml");
+
+        std::fs::write(&toml_path, "name = \"existing_name\"\nowner = \"team\"\n").unwrap();
+
+        let model = make_model(sql_path.to_string_lossy().to_string());
+        save_intent_to_config(&model, "updated").unwrap();
+
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        // Pre-existing fields preserved.
+        assert!(content.contains("existing_name"));
+        assert!(content.contains("owner"));
+        assert!(content.contains("team"));
+        // New intent added.
+        assert!(content.contains("updated"));
+    }
 }
