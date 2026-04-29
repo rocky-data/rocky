@@ -29,13 +29,17 @@ use crate::output::{
 /// Orchestrate pruned planning on a per-PR branch with copy-from-base for
 /// unchanged upstream.
 ///
-/// **Phase 1 scope.** Plans the prune-and-copy decision against the working
-/// DAG, registers the branch in the state store, and executes copy-from-base
-/// for unchanged upstream models on DuckDB pipelines. Auto-invoking the
-/// actual run for the prune set is out of scope for Phase 1 — the user runs
-/// `rocky run --branch <name> --model <name>` for each prune-set model
-/// (or in Phase 4 the GitHub Action orchestrates). The output's
-/// `run_status` is `"planned"` to make this explicit.
+/// **Phase 1.5 scope.** Plans the prune-and-copy decision against the working
+/// DAG, registers the branch in the state store, and **executes** the
+/// copy-from-base step via `CREATE OR REPLACE TABLE ... AS SELECT *` against
+/// the configured warehouse adapter. Per-model `copy_strategy = "ctas"` on
+/// success, `"failed"` on a per-model error (the rest of the copy set still
+/// runs — partial-success surfaces in the output).
+///
+/// Auto-invoking the actual run for the prune set is intentionally still
+/// deferred (the GitHub Action in Phase 4 orchestrates). `run_status` is
+/// `"planned"` for the prune set; `"copied"` is implicit for the copy set
+/// via `copy_strategy = "ctas"`.
 ///
 /// Steps:
 ///
@@ -53,10 +57,12 @@ use crate::output::{
 ///    caller did not supply one.
 /// 7. Register the branch via the state store (mirrors `rocky branch
 ///    create`).
-/// 8. For DuckDB pipelines, execute `CREATE OR REPLACE TABLE
-///    <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>`
-///    for every copy-set model. Phase 5 lifts this to `SHALLOW CLONE` /
-///    zero-copy `CLONE` per adapter capability.
+/// 8. Build the adapter from `rocky.toml`, then for each copy-set model:
+///    resolve its source schema from the model sidecar (`target.schema`),
+///    issue `CREATE SCHEMA IF NOT EXISTS branch_schema` then
+///    `CREATE OR REPLACE TABLE branch_schema.model AS SELECT * FROM
+///    source_schema.model`. Phase 5 lifts this to native warehouse
+///    clones (`SHALLOW CLONE` / zero-copy `CLONE`).
 ///
 /// Returns a [`PreviewCreateOutput`] regardless of partial failures —
 /// the PR-comment surface needs to stay informative.
@@ -139,28 +145,36 @@ pub async fn run_preview_create(
 
     let branch_schema = format!("branch__{resolved_branch_name}");
 
-    // Step 8: planning-only in Phase 1 — emit `PreviewCopiedModel`
-    // entries with `copy_strategy = "planned"` so the wire contract is
-    // populated and downstream consumers (`preview diff`, the Phase 4
-    // GitHub Action) can render the plan. Phase 1.5 lifts this to
-    // adapter-driven execution: DuckDB CTAS, Databricks `SHALLOW CLONE`,
-    // Snowflake zero-copy `CLONE`, BigQuery table copy. Until then, the
-    // user populates the branch by running
-    // `rocky run --branch <name>` for the prune set themselves (the
-    // Phase 4 PR-comment automation orchestrates this).
-    //
-    // Treating Phase 1 as planning-only is honest about scope and keeps
-    // the surface CI-green-verifiable on the playground POC.
-    let copy_set: Vec<PreviewCopiedModel> = copy_names
-        .iter()
-        .map(|name| PreviewCopiedModel {
-            model_name: name.clone(),
-            source_schema: "<base>".to_string(),
-            target_schema: branch_schema.clone(),
-            copy_strategy: "planned".to_string(),
-        })
-        .collect();
-    let _ = config_path; // Phase 1.5 uses config_path to resolve adapter.
+    // Step 8 (Phase 1.5): execute copy-from-base via the configured
+    // warehouse adapter. Each entry in `copy_set` carries its
+    // resolved source schema + the SQL strategy actually used. On
+    // partial failure (model didn't exist in base, schema mismatch),
+    // the per-model `copy_strategy = "failed"` and the rest of the
+    // copy set still runs.
+    let copy_set = execute_copy_from_base(
+        config_path,
+        models_dir,
+        &branch_schema,
+        &copy_names,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        // A registry-build failure means we never even tried — surface
+        // the plan with `copy_strategy = "planning_only"` so the
+        // PR-comment surface still ships the prune-set decision.
+        tracing::warn!(
+            "preview create: copy-from-base step skipped — {e}. Falling back to planning-only output."
+        );
+        copy_names
+            .iter()
+            .map(|name| PreviewCopiedModel {
+                model_name: name.clone(),
+                source_schema: "<unresolved>".to_string(),
+                target_schema: branch_schema.clone(),
+                copy_strategy: "planning_only".to_string(),
+            })
+            .collect()
+    });
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1048,6 +1062,132 @@ pub fn empty_cost_summary() -> PreviewCostSummary {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1.5 — copy-from-base execution via the WarehouseAdapter trait
+// ---------------------------------------------------------------------------
+
+/// Execute the copy-from-base step against the configured adapter.
+///
+/// Builds the adapter registry from `rocky.toml`, resolves each
+/// copy-set model's source schema from its sidecar (`target.schema`),
+/// then issues:
+///
+/// 1. `CREATE SCHEMA IF NOT EXISTS branch_schema` (once per distinct schema).
+/// 2. For each model, `CREATE OR REPLACE TABLE branch_schema.<model> AS
+///    SELECT * FROM <source_schema>.<model>`.
+///
+/// Per-model failures are surfaced as `copy_strategy = "failed"` on the
+/// returned `PreviewCopiedModel` rather than aborting — the rest of the
+/// copy set still runs so the PR-comment surface is informative.
+///
+/// **DuckDB note.** DuckDB CTAS doesn't accept the catalog prefix on
+/// every dialect path; the SQL is written without catalog qualifier
+/// (just `schema.table`) which works for DuckDB and the cloud
+/// warehouses. Phase 5 lifts to native clones with adapter-aware DDL.
+///
+/// **Why this isn't a new trait method.** `WarehouseAdapter::execute_statement`
+/// already covers what we need; introducing `clone_table` on the trait
+/// today would block the Phase 5 native-clone landing on a wider
+/// refactor. When Phase 5 ships native clones, that's the moment to
+/// introduce a `clone_table_from(&self, src, dst)` adapter method with
+/// the CTAS as the default impl.
+async fn execute_copy_from_base(
+    config_path: &Path,
+    models_dir: &Path,
+    branch_schema: &str,
+    copy_names: &[String],
+) -> Result<Vec<PreviewCopiedModel>> {
+    if copy_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Load the config + build the adapter registry. A failure here is
+    // a hard skip: the caller's `unwrap_or_else` falls back to
+    // planning-only output.
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+
+    let registry = crate::registry::AdapterRegistry::from_config(&cfg)
+        .context("building adapter registry from config")?;
+
+    // Pick the warehouse adapter. Mirrors `rocky cost`'s resolution:
+    // prefer `default`; fall back to first-declared.
+    let adapter_names = registry.warehouse_adapter_names();
+    let adapter_name = if adapter_names.iter().any(|n| n == "default") {
+        "default".to_string()
+    } else {
+        adapter_names
+            .into_iter()
+            .next()
+            .context("no warehouse adapters configured for preview create")?
+    };
+    let adapter = registry.warehouse_adapter(&adapter_name)?;
+    let adapter_type = registry
+        .adapter_config(&adapter_name)
+        .map(|c| c.adapter_type.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Load the model sidecars to resolve each model's source schema.
+    let models = rocky_core::models::load_models_from_dir(models_dir)
+        .with_context(|| format!("loading models from {}", models_dir.display()))?;
+    let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
+        models.iter().map(|m| (m.config.name.clone(), m)).collect();
+
+    // Create the branch schema once (idempotent across both DuckDB and
+    // cloud warehouses).
+    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS \"{branch_schema}\"");
+    if let Err(e) = adapter.execute_statement(&create_schema_sql).await {
+        // A schema-create failure on a writeable adapter is unrecoverable
+        // for the copy step — bail to planning-only.
+        return Err(anyhow::anyhow!(
+            "creating branch schema '{branch_schema}' on adapter '{adapter_name}' ({adapter_type}): {e}"
+        ));
+    }
+
+    let mut results = Vec::with_capacity(copy_names.len());
+    for model_name in copy_names {
+        let Some(model) = model_by_name.get(model_name) else {
+            // Model doesn't exist in the working tree — planning-only
+            // entry so the prune set still ships.
+            results.push(PreviewCopiedModel {
+                model_name: model_name.clone(),
+                source_schema: "<unresolved>".to_string(),
+                target_schema: branch_schema.to_string(),
+                copy_strategy: "planning_only".to_string(),
+            });
+            continue;
+        };
+        let source_schema = model.config.target.schema.clone();
+        let table = model.config.target.table.clone();
+
+        let ctas = format!(
+            "CREATE OR REPLACE TABLE \"{branch_schema}\".\"{table}\" AS \
+             SELECT * FROM \"{source_schema}\".\"{table}\""
+        );
+        match adapter.execute_statement(&ctas).await {
+            Ok(()) => results.push(PreviewCopiedModel {
+                model_name: model_name.clone(),
+                source_schema,
+                target_schema: branch_schema.to_string(),
+                copy_strategy: "ctas".to_string(),
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    "preview create: copy-from-base failed for '{model_name}' \
+                     (likely missing in base schema '{source_schema}'): {e}"
+                );
+                results.push(PreviewCopiedModel {
+                    model_name: model_name.clone(),
+                    source_schema,
+                    target_schema: branch_schema.to_string(),
+                    copy_strategy: "failed".to_string(),
+                });
+            }
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,6 +1721,105 @@ mod tests {
         let md = render_preview_diff_markdown("feature_x", "main", &summary, &[]);
         assert!(md.contains("No paired runs"));
         assert!(md.contains("rocky run --branch feature_x"));
+    }
+
+    // ---------------------- Phase 1.5 — copy-step execution ----------------------
+
+    /// End-to-end smoke test for `execute_copy_from_base` on DuckDB. Drives
+    /// the kernel through `AdapterRegistry::from_config` exactly the way the
+    /// CLI does — proves the trait-driven CTAS works, the copy set lands in
+    /// the branch schema, and partial-success handles a missing-in-base model.
+    #[tokio::test]
+    async fn copy_from_base_executes_ctas_on_duckdb() {
+        use rocky_duckdb::DuckDbConnector;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("preview.duckdb");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+
+        // Set up a base schema with one materialised table + write a
+        // matching model sidecar so the loader resolves it.
+        {
+            let conn = DuckDbConnector::open(&db_path).unwrap();
+            conn.execute_statement(
+                "CREATE SCHEMA IF NOT EXISTS demo;\
+                 CREATE TABLE demo.raw_orders AS SELECT 1 AS id, 'a' AS name;",
+            )
+            .unwrap();
+        }
+
+        // Sidecar + .sql for a model whose source data exists in `demo`.
+        std::fs::write(
+            models_dir.join("raw_orders.sql"),
+            "SELECT * FROM source.orders",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("raw_orders.toml"),
+            "name = \"raw_orders\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"poc\"\nschema = \"demo\"\ntable = \"raw_orders\"\n",
+        )
+        .unwrap();
+        // Sidecar for a model whose source DOESN'T exist — Phase 1.5
+        // surfaces this as `copy_strategy = "failed"`, not a hard abort.
+        std::fs::write(
+            models_dir.join("missing_in_base.sql"),
+            "SELECT * FROM source.missing",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("missing_in_base.toml"),
+            "name = \"missing_in_base\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"poc\"\nschema = \"demo\"\ntable = \"missing_in_base\"\n",
+        )
+        .unwrap();
+
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.default]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.demo]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.demo.target]\nadapter = \"default\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let copy_names = vec!["raw_orders".to_string(), "missing_in_base".to_string()];
+        let result = execute_copy_from_base(&config_path, &models_dir, "branch__pr1", &copy_names)
+            .await
+            .expect("registry build + branch schema must succeed on DuckDB");
+        assert_eq!(result.len(), 2);
+
+        let by_name: HashMap<&str, &PreviewCopiedModel> =
+            result.iter().map(|m| (m.model_name.as_str(), m)).collect();
+        assert_eq!(by_name["raw_orders"].copy_strategy, "ctas");
+        assert_eq!(by_name["raw_orders"].source_schema, "demo");
+        assert_eq!(by_name["raw_orders"].target_schema, "branch__pr1");
+        assert_eq!(by_name["missing_in_base"].copy_strategy, "failed");
+
+        // Verify the actual table landed in the branch schema by
+        // reading it back through DuckDbConnector.
+        let conn = DuckDbConnector::open(&db_path).unwrap();
+        let q = conn
+            .execute_sql("SELECT id FROM branch__pr1.raw_orders")
+            .unwrap();
+        assert_eq!(q.rows.len(), 1);
+        // execute_sql normalises every cell to a JSON String — the
+        // numeric value `1` lands as `"1"`. Sufficient for "row exists".
+        assert!(!q.columns.is_empty());
+    }
+
+    /// Empty copy-set short-circuits without touching the adapter — important
+    /// for PRs where every working-DAG model is changed.
+    #[tokio::test]
+    async fn copy_from_base_empty_copy_set_short_circuits() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml"); // doesn't need to exist
+        let models_dir = tmp.path().join("models");
+        let result = execute_copy_from_base(&config_path, &models_dir, "branch__x", &[])
+            .await
+            .unwrap();
+        assert!(result.is_empty());
     }
 
     /// Cost markdown includes the headline delta + per-model rows.
