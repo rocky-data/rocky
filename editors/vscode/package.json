@@ -2,7 +2,7 @@
   "name": "rocky",
   "displayName": "Rocky",
   "description": "Language support for Rocky SQL transformation engine",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "publisher": "rocky-data",
   "license": "Apache-2.0",
   "repository": {

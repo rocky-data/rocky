@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-04-29
+
+Tracks engine `v1.18.0`. Regenerated TypeScript bindings for the new `rocky preview` command surface plus the additive `[budget].max_bytes_scanned` field on `RunOutput`. No extension feature changes.
+
+### Added
+
+- **TS interfaces for `rocky preview`** ([#279](https://github.com/rocky-data/rocky/pull/279), [#280](https://github.com/rocky-data/rocky/pull/280)). Regenerated `src/types/generated/preview_create.ts`, `preview_diff.ts`, `preview_cost.ts` from engine v1.18.0 schemas — full typed surface for any future webview / command that wants to consume `rocky preview`.
+
+### Changed
+
+- **Regenerated `src/types/generated/run.ts`** ([#288](https://github.com/rocky-data/rocky/pull/288)) for engine 1.18.0's `RunCostSummary.total_bytes_scanned` and the `MaxBytesScanned` `BudgetLimitType` variant. Both fields are optional / additive, so parsing a pre-1.18 `rocky run --output json` still round-trips cleanly.
+
 ## [1.9.1] — 2026-04-24
 
 Patch release. Fixes the "Show Lineage" command producing an error webview complaining about character `{` (#260). The extension now passes `-o table` alongside `--format dot` so it works against the already-shipped `rocky 1.17.0` binary without waiting for the engine patch (engine 1.17.1 fixes the same bug at the CLI layer for terminal users).

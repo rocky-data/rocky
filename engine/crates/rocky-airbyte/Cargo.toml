@@ -1,6 +1,6 @@
 [package]
 name = "rocky-airbyte"
-version = "1.17.4"
+version = "1.18.0"
 description = "Airbyte source adapter for Rocky"
 edition.workspace = true
 license.workspace = true

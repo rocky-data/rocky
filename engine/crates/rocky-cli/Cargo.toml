@@ -1,6 +1,6 @@
 [package]
 name = "rocky-cli"
-version = "1.17.4"
+version = "1.18.0"
 description = "CLI framework for Rocky"
 edition.workspace = true
 license.workspace = true
