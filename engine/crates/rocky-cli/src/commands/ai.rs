@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use rocky_ai::client::{AiConfig, LlmClient};
+use rocky_ai::client::{AiConfig, DEFAULT_MAX_TOKENS, LlmClient};
 use rocky_ai::generate;
 use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
 use rocky_compiler::types::TypedColumn;
+use rocky_core::redacted::RedactedString;
 
 use crate::output::{
     AiExplainOutput, AiExplanation, AiGenerateOutput, AiSyncOutput, AiSyncProposal,
@@ -17,17 +18,30 @@ use crate::output::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
-/// Create an LLM client from environment.
-fn make_client() -> Result<LlmClient> {
+/// Create an LLM client from environment + project config.
+///
+/// Reads `[ai] max_tokens` from `rocky.toml` when the config loads cleanly;
+/// falls back to [`DEFAULT_MAX_TOKENS`] if the config is missing or
+/// malformed (so `rocky ai` keeps working in greenfield projects without
+/// any `rocky.toml`).
+///
+/// `api_key` is wrapped in [`RedactedString`] so any future `?config` /
+/// `{:?}` formatting in trace output prints `***` instead of the secret.
+fn make_client(config_path: &Path) -> Result<LlmClient> {
     let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
         .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.")?;
+
+    let max_tokens = rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| cfg.ai.max_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let config = AiConfig {
         provider: "anthropic".to_string(),
         model: "claude-sonnet-4-6".to_string(),
-        api_key,
+        api_key: RedactedString::new(api_key),
         default_format: "rocky".to_string(),
         max_attempts: 3,
+        max_tokens,
     };
 
     LlmClient::new(config).map_err(|e| anyhow::anyhow!("{e}"))
@@ -111,7 +125,7 @@ pub async fn run_ai(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client()?;
+    let client = make_client(config_path)?;
     let fmt = format.unwrap_or("rocky");
 
     // Best-effort compile of the project to ground the prompt.
@@ -186,7 +200,7 @@ pub async fn run_ai_sync(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client()?;
+    let client = make_client(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     // For now, use the current compilation as both "previous" and "current".
@@ -289,7 +303,7 @@ pub async fn run_ai_explain(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client()?;
+    let client = make_client(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_explain: Vec<&rocky_core::models::Model> = result
@@ -359,7 +373,7 @@ pub async fn run_ai_test(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client()?;
+    let client = make_client(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_test: Vec<&rocky_core::models::Model> = result

@@ -83,6 +83,26 @@ class AggregateOp5(StrEnum):
     max = "max"
 
 
+class AiSection(BaseModel):
+    """
+    Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`).
+
+    `max_tokens` doubles as: 1. The per-request `max_tokens` cap on the Anthropic Messages API. 2. The cumulative output-token budget across the compile-verify retry loop — when the running total exceeds this value, the loop fail-stops instead of issuing another retry. This bounds the worst-case spend when the LLM produces runaway responses that fail validation.
+
+    The default ([`DEFAULT_AI_MAX_TOKENS`]) preserves Rocky's pre-1.x hard-coded behaviour. Increase for projects that legitimately need longer generations (large model surfaces, verbose tests).
+
+    ```toml [ai] max_tokens = 8192 ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_tokens: conint(ge=0) | None = 4096
+    """
+    Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
+    """
+
+
 class BindingType(StrEnum):
     """
     Workspace binding access level.
@@ -2296,6 +2316,10 @@ class RockyConfig(BaseModel):
     )
     """
     Named adapter configurations (keyed by adapter name).
+    """
+    ai: AiSection | None = Field({"max_tokens": 4096}, validate_default=True)
+    """
+    AI intent layer configuration. Currently scopes the per-request and cumulative-retry token budget for `rocky ai` / `ai-explain` / `ai-sync` / `ai-test`. See [`AiSection`].
     """
     budget: BudgetConfig | None = Field(
         {"max_duration_ms": None, "max_usd": None, "on_breach": "warn"},

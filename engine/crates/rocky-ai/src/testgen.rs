@@ -98,20 +98,68 @@ pub async fn generate_tests(
     Ok(assertions)
 }
 
+/// Validate an assertion / model name component before it's interpolated
+/// into a filesystem path.
+///
+/// The LLM controls `assertion.name` end-to-end — left unvalidated, model
+/// output can write `tests/../../etc/passwd.sql` via path traversal.
+/// `model_name` flows from project config rather than the LLM, but the
+/// same allow-list applies for defence-in-depth.
+///
+/// Allow-list: ASCII alphanumeric, `_`, and `-`. Rejects `..`, `.`, `/`,
+/// `\\`, leading dots, empty strings, and any non-ASCII / control chars.
+fn is_safe_path_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Save test assertions to SQL files in a tests directory.
+///
+/// Validates `assertion.name` against [`is_safe_path_component`] before
+/// constructing the output path to prevent the LLM from steering writes
+/// outside `tests_dir` via path traversal (`../../etc/passwd`,
+/// absolute paths, etc.). Rejected names produce a
+/// [`std::io::ErrorKind::InvalidInput`] error.
 pub fn save_tests(
     model_name: &str,
     assertions: &[TestAssertion],
     tests_dir: &std::path::Path,
 ) -> Result<(), std::io::Error> {
+    if !is_safe_path_component(model_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to save tests: model name {model_name:?} contains \
+                 disallowed characters (allow-list: alphanumeric, _, -)"
+            ),
+        ));
+    }
+
     std::fs::create_dir_all(tests_dir)?;
 
     for assertion in assertions {
-        let file_name = format!(
-            "{}_{}.sql",
-            model_name,
-            assertion.name.replace(' ', "_").to_lowercase()
-        );
+        // The previous behaviour silently lower-cased + space-collapsed the
+        // raw `assertion.name` into the filename. That is unsafe when the
+        // string is LLM-controlled — `..` and `/` slip straight through.
+        // Validate the raw name against a strict allow-list and reject
+        // anything that doesn't match.
+        if !is_safe_path_component(&assertion.name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to save test {model_name:?}/{:?}: \
+                     assertion name contains disallowed characters \
+                     (allow-list: alphanumeric, _, -). \
+                     This guards against LLM-driven path traversal.",
+                    assertion.name
+                ),
+            ));
+        }
+
+        let file_name = format!("{}_{}.sql", model_name, assertion.name.to_lowercase());
         let path = tests_dir.join(&file_name);
 
         let content = format!(
@@ -123,4 +171,121 @@ pub fn save_tests(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assertion(name: &str) -> TestAssertion {
+        TestAssertion {
+            name: name.to_string(),
+            sql: "SELECT 1 WHERE 0".to_string(),
+            description: "stub".to_string(),
+        }
+    }
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("rocky-ai-testgen-{label}-{pid}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn safe_path_component_accepts_allow_list() {
+        assert!(is_safe_path_component("grain_uniqueness"));
+        assert!(is_safe_path_component("revenue-positive"));
+        assert!(is_safe_path_component("test123"));
+    }
+
+    #[test]
+    fn safe_path_component_rejects_traversal_and_separators() {
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("../etc/passwd"));
+        assert!(!is_safe_path_component("..\\windows"));
+        assert!(!is_safe_path_component("foo/bar"));
+        assert!(!is_safe_path_component("foo\\bar"));
+        assert!(!is_safe_path_component(".hidden"));
+        assert!(!is_safe_path_component("name with space"));
+        assert!(!is_safe_path_component("name\0null"));
+        // Absolute Unix path
+        assert!(!is_safe_path_component("/etc/passwd"));
+    }
+
+    /// Issue 6b — direct path traversal regression test. The LLM-controlled
+    /// `assertion.name` must never reach `Path::join` unvalidated.
+    #[test]
+    fn save_tests_rejects_path_traversal_in_assertion_name() {
+        let dir = unique_dir("traversal");
+        let assertions = vec![assertion("../../../etc/passwd")];
+
+        let result = save_tests("model", &assertions, &dir);
+
+        let err = result.expect_err("path traversal must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("disallowed characters"),
+            "unexpected error message: {err}"
+        );
+
+        // The escaped target must NOT exist on disk.
+        assert!(
+            !std::path::Path::new("/etc/passwd_../../../etc/passwd.sql").exists(),
+            "writing to /etc/passwd via traversal would have succeeded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_tests_rejects_absolute_path_in_assertion_name() {
+        let dir = unique_dir("absolute");
+        let assertions = vec![assertion("/tmp/evil")];
+
+        let result = save_tests("model", &assertions, &dir);
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_tests_rejects_dotted_name() {
+        let dir = unique_dir("dotted");
+        let assertions = vec![assertion(".hidden")];
+
+        assert!(save_tests("model", &assertions, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_tests_rejects_unsafe_model_name() {
+        let dir = unique_dir("unsafe-model");
+        let assertions = vec![assertion("ok_name")];
+
+        assert!(save_tests("../escaped", &assertions, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_tests_writes_safe_assertion() {
+        let dir = unique_dir("happy");
+        let assertions = vec![assertion("Grain_Uniqueness")];
+
+        save_tests("orders", &assertions, &dir).expect("safe write should succeed");
+
+        let expected = dir.join("orders_grain_uniqueness.sql");
+        assert!(
+            expected.exists(),
+            "expected file to be written at {}",
+            expected.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
