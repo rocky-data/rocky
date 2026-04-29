@@ -166,6 +166,7 @@ jobs:
         with:
           base_ref: ${{ github.event.pull_request.base.ref }}
           branch_name: ${{ github.event.pull_request.head.ref }}
+          github_token: ${{ github.token }}
           # working_directory: my-pipeline   # if rocky.toml lives in a subdir
           # models_dir: models               # default
           # rocky_version: latest            # or 1.17.4 / engine-v1.17.4
@@ -184,7 +185,7 @@ The first PR after wiring this in will install Rocky and post a comment with the
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.17.4` or `engine-v1.17.4`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
 | `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory — failures still post a section in the comment. |
-| `github_token` | `${{ github.token }}` | Token used to read the PR and upsert the comment. Override for cross-repo permissions. |
+| `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |
 
 ### Action outputs
 

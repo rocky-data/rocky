@@ -50,11 +50,11 @@ inputs:
     default: 'false'
   github_token:
     description: >-
-      Token used to read the PR and upsert the comment. Defaults to the
-      workflow's `${{ github.token }}`; override if you need cross-repo
-      permissions.
-    required: false
-    default: ${{ github.token }}
+      Token used to read the PR and upsert the comment. Pass
+      `${{ github.token }}` (or a PAT for cross-repo permissions) from
+      the workflow. Required because composite actions cannot reference
+      `${{ github.token }}` in input defaults.
+    required: true
 
 outputs:
   comment_url:

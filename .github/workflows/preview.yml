@@ -48,3 +48,4 @@ jobs:
           # on what lives at `working_directory/models_dir`.
           working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
           models_dir: models
+          github_token: ${{ github.token }}
