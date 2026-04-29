@@ -153,20 +153,33 @@ Start an HTTP API server that exposes the compiler's semantic graph. Provides RE
 rocky serve [flags]
 ```
 
+### Security defaults
+
+`rocky serve` binds **`127.0.0.1` (loopback) by default**. Every endpoint except `/api/v1/health` requires a Bearer token. Two operating modes:
+
+- **Loopback only (default)** — bind stays on `127.0.0.1`. Authentication is still on, so external processes (LSP, dashboards) need the token, but a misconfigured network won't expose model SQL to the LAN.
+- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires `--token <secret>`** (or the `ROCKY_SERVE_TOKEN` env var). `rocky serve` refuses to start otherwise. This prevents the "I just wanted to try it from another machine" foot-gun shipping model SQL to the LAN unauthenticated.
+
+CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`.
+
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
+| `--token <SECRET>` | `String` | | Bearer token required by every API request except `/api/v1/health`. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback.** |
+| `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--watch` | `bool` | `false` | Watch for file changes and auto-recompile. |
 
 ### Examples
 
-Start the server with defaults:
+Start the server with defaults (loopback, token via env var):
 
 ```bash
+export ROCKY_SERVE_TOKEN=$(openssl rand -hex 32)
 rocky serve
 ```
 
@@ -180,16 +193,34 @@ Endpoints:
   GET /api/dag             - Full dependency graph
 ```
 
+Call an authenticated endpoint:
+
+```bash
+curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/models
+```
+
+`/api/v1/health` is exempt and reachable without the token.
+
 Start with file watching on a custom port:
 
 ```bash
-rocky serve --port 3000 --watch
+rocky serve --port 3000 --watch --token "$ROCKY_SERVE_TOKEN"
 ```
 
 ```
 Compiled 14 models in 42ms
 Watching models/ for changes...
 Listening on http://127.0.0.1:3000
+```
+
+Expose to the LAN with explicit token + origin allowlist:
+
+```bash
+rocky serve \
+  --host 0.0.0.0 \
+  --token "$ROCKY_SERVE_TOKEN" \
+  --allowed-origin https://dashboard.internal \
+  --port 9090
 ```
 
 Start with contracts:
