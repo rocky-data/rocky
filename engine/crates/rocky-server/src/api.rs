@@ -13,21 +13,50 @@
 //! GET  /api/v1/dag/status                      → latest DAG run status
 //! POST /api/v1/compile                         → trigger recompilation
 //! ```
+//!
+//! All routes except `/api/v1/health` require a Bearer token when one is
+//! configured on [`ServerState`]; see [`crate::auth`].
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tower_http::cors::CorsLayer;
 
+use crate::auth::{build_cors_layer, require_bearer_token};
 use crate::dashboard;
 use crate::state::ServerState;
 
+/// Bind config for [`serve`].
+///
+/// Defaults bind to `127.0.0.1:8080` (loopback only) — the LAN-leak class
+/// of bug doesn't reproduce unless the operator opts into a non-loopback
+/// host *and* configures a Bearer token.
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    /// Bind host. Defaults to `127.0.0.1`. A non-loopback host (e.g.
+    /// `0.0.0.0`) requires `auth_token` to be `Some`.
+    pub host: String,
+    /// Listen port.
+    pub port: u16,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+        }
+    }
+}
+
 /// Build the axum router with all API routes.
 pub fn router(state: Arc<ServerState>) -> Router {
+    let cors = build_cors_layer(&state.allowed_origins);
+
     Router::new()
         .route("/", get(dashboard::dashboard))
         .route("/dashboard", get(dashboard::dashboard))
@@ -44,7 +73,11 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/dag", get(full_dag))
         .route("/api/v1/dag/layers", get(dag_layers))
         .route("/api/v1/dag/status", get(dag_status))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -63,12 +96,40 @@ async fn dag_status(
 }
 
 /// Start the HTTP server.
-pub async fn serve(state: Arc<ServerState>, port: u16) -> anyhow::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - the bind host is non-loopback (e.g. `0.0.0.0`) and no Bearer token
+///   is configured on `state` — exposing the API on the LAN without
+///   auth would leak model SQL, file paths, and run history;
+/// - the listener fails to bind (port in use, permissions, etc.);
+/// - the axum runtime returns an error.
+pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Result<()> {
+    if !is_loopback(&config.host) && state.auth_token.is_none() {
+        anyhow::bail!(
+            "rocky serve refuses to bind {host} without a Bearer token. \
+             Pass --token <secret> (or set ROCKY_SERVE_TOKEN), or bind to \
+             127.0.0.1 (the default).",
+            host = config.host,
+        );
+    }
+
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    tracing::info!(port, "rocky serve listening");
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    tracing::info!(addr = %bind_addr, "rocky serve listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Returns `true` when `host` resolves to loopback only.
+///
+/// Accepts the textual forms we actually emit / accept on the CLI:
+/// `127.0.0.1`, `::1`, `localhost`. Anything else (including `0.0.0.0`
+/// and external addresses) is treated as non-loopback.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
 // --- Route handlers ---
@@ -231,12 +292,18 @@ async fn full_dag(
 async fn list_runs(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // The redb open + scan are sync work that can sleep on the state
+    // flock (see `StateStore::open_redb_with_retry`); move it off the
+    // async runtime. Mirrors the pattern at `lsp.rs:468` (PR #263).
     let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
-    let store = rocky_core::state::StateStore::open_read_only(&state_path)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let runs = store
-        .list_runs(50)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let runs = tokio::task::spawn_blocking(move || {
+        let store = rocky_core::state::StateStore::open_read_only(&state_path)
+            .map_err(|e| e.to_string())?;
+        store.list_runs(50).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let run_entries: Vec<serde_json::Value> = runs
         .iter()
@@ -263,11 +330,17 @@ async fn model_history(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
-    let store = rocky_core::state::StateStore::open_read_only(&state_path)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let history = store
-        .get_model_history(&name, 50)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let history_name = name.clone();
+    let history = tokio::task::spawn_blocking(move || {
+        let store = rocky_core::state::StateStore::open_read_only(&state_path)
+            .map_err(|e| e.to_string())?;
+        store
+            .get_model_history(&history_name, 50)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let entries: Vec<serde_json::Value> = history
         .iter()
@@ -296,11 +369,17 @@ async fn model_metrics(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let state_path = rocky_core::state::resolve_state_path(None, &state.models_dir).path;
-    let store = rocky_core::state::StateStore::open_read_only(&state_path)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let snapshots = store
-        .get_quality_trend(&name, 20)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let trend_name = name.clone();
+    let snapshots = tokio::task::spawn_blocking(move || {
+        let store = rocky_core::state::StateStore::open_read_only(&state_path)
+            .map_err(|e| e.to_string())?;
+        store
+            .get_quality_trend(&trend_name, 20)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let entries: Vec<serde_json::Value> = snapshots
         .iter()
@@ -456,5 +535,135 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["total_models"], 3);
         assert_eq!(body["layers"].as_array().unwrap().len(), 3);
+    }
+
+    fn test_state_with_token(token: &str) -> Arc<ServerState> {
+        let models_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+        ServerState::with_auth(models_dir, None, None, Some(token.to_string()), Vec::new())
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_request_without_token() {
+        let state = test_state_with_token("s3cret");
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/api/v1/models"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_request_with_wrong_token() {
+        let state = test_state_with_token("s3cret");
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/v1/models"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_accepts_request_with_correct_token() {
+        let state = test_state_with_token("s3cret");
+        state.recompile().await;
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/v1/models"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_is_auth_exempt() {
+        let state = test_state_with_token("s3cret");
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // No bearer token — health must still respond 200 so liveness
+        // probes work without provisioning the secret to the prober.
+        let resp = reqwest::get(format!("http://{addr}/api/v1/health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_non_loopback_without_token() {
+        let models_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+        let state = ServerState::with_auth(models_dir, None, None, None, Vec::new());
+        let result = serve(
+            state,
+            ServeConfig {
+                host: "0.0.0.0".to_string(),
+                port: 0,
+            },
+        )
+        .await;
+        let err = result.expect_err("expected 0.0.0.0 without token to be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("Bearer token"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn serve_allows_loopback_without_token() {
+        // Sanity check: the historical default (loopback, no token)
+        // must keep working — refusal applies only to non-loopback.
+        let models_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+        let state = ServerState::with_auth(models_dir, None, None, None, Vec::new());
+        // Bind on a random port; serve runs forever, so race a short
+        // timeout against it. We only need to confirm it didn't bail
+        // immediately on the loopback check.
+        let task = tokio::spawn(async move {
+            serve(
+                state,
+                ServeConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                },
+            )
+            .await
+        });
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut Box::pin(task)).await;
+        // Timeout = serve is happily running. An immediate Ok/Err would
+        // mean the loopback check fired; that would be the bug.
+        assert!(early.is_err(), "serve exited too quickly: {early:?}");
     }
 }

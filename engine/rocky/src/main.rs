@@ -585,12 +585,27 @@ enum Command {
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
+        /// Bind host. Defaults to loopback. Binding a non-loopback host
+        /// (e.g. `0.0.0.0`) requires `--token` so model SQL and run
+        /// history don't leak on the LAN.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// Port to listen on
         #[arg(long, default_value = "8080")]
         port: u16,
         /// Watch for file changes and auto-recompile
         #[arg(long)]
         watch: bool,
+        /// Bearer token required by every API request (except
+        /// `/api/v1/health`). Falls back to the `ROCKY_SERVE_TOKEN` env
+        /// var when omitted. Required when `--host` is non-loopback.
+        #[arg(long)]
+        token: Option<String>,
+        /// CORS allowlist. Repeat for each origin (e.g.
+        /// `--allowed-origin http://localhost:5173`). The default
+        /// allowlist is empty (same-origin only).
+        #[arg(long = "allowed-origin", value_name = "ORIGIN")]
+        allowed_origins: Vec<String>,
     },
 
     /// Start Language Server Protocol server for IDE integration
@@ -1589,15 +1604,28 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Serve {
             models,
             contracts,
+            host,
             port,
             watch,
+            token,
+            allowed_origins,
         } => {
             let config = if cli.config.exists() {
                 Some(cli.config.as_path())
             } else {
                 None
             };
-            rocky_cli::commands::run_serve(&models, contracts.as_deref(), config, port, watch).await
+            rocky_cli::commands::run_serve(
+                &models,
+                contracts.as_deref(),
+                config,
+                host,
+                port,
+                watch,
+                token,
+                allowed_origins,
+            )
+            .await
         }
         Command::Lsp { stdio: _ } => rocky_cli::commands::run_lsp().await,
         #[cfg(feature = "duckdb")]
