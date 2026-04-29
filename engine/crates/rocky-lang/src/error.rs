@@ -28,6 +28,13 @@ pub enum ParseError {
 
     #[error("empty file: no pipeline steps found")]
     EmptyFile,
+
+    #[error("expression nested too deeply: depth {depth} exceeds limit {limit} at offset {offset}")]
+    TooDeeplyNested {
+        depth: usize,
+        limit: usize,
+        offset: usize,
+    },
 }
 
 /// A Rocky DSL parse error enriched with the original source text and file
@@ -91,6 +98,22 @@ impl ParseError {
                 span: None,
                 help: Some(
                     "add a pipeline starting with `from <model>` or `select { ... }`".to_string(),
+                ),
+            },
+            ParseError::TooDeeplyNested {
+                depth,
+                limit,
+                offset,
+            } => RichParseError {
+                message: format!(
+                    "expression nested too deeply: depth {depth} exceeds limit {limit}"
+                ),
+                src: named,
+                span: Some(miette::SourceSpan::new((*offset).into(), 1)),
+                help: Some(
+                    "simplify the expression — extract sub-expressions into `let` \
+                     bindings or split the pipeline into smaller steps"
+                        .to_string(),
                 ),
             },
         }
