@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-04-29
+
+Companion release to engine `v1.18.0`. Picks up regenerated Pydantic models for the `rocky preview` command surface (`PreviewCreateOutput` / `PreviewDiffOutput` / `PreviewCostOutput`) and ships a P1 hardening cluster in the resource + component layer.
+
+### Added
+
+- **`PreviewCreateOutput` / `PreviewDiffOutput` / `PreviewCostOutput` Pydantic models** ([#279](https://github.com/rocky-data/rocky/pull/279), [#280](https://github.com/rocky-data/rocky/pull/280)). Regenerated from engine v1.18.0's JSON schemas. Resource / orchestration helpers can now parse `rocky preview <subcommand> --output json` end-to-end without dropping back to raw dicts.
+
+### Fixed
+
+- **`_compile_payload` / `_optimize_payload` propagate `ValidationError` as structured `dg.Failure`** ([#289](https://github.com/rocky-data/rocky/pull/289)). When the engine binary disagrees with the bundled Pydantic models on the JSON shape, the component now surfaces a `dg.Failure` with a "schema mismatch — built against a different rocky binary" message instead of swallowing the parse error and returning `None`. Other transport errors (timeout, missing binary, malformed JSON) remain best-effort.
+- **`_verify_engine_version` strips pre-release / build suffixes before semver compare** ([#289](https://github.com/rocky-data/rocky/pull/289)). Versions like `1.17.4-dev` / `1.17.4-rc.1` / `1.17.4+sha.abc123` no longer bypass the version check by failing to parse — the suffixes are stripped before the tuple compare. Closes the silent skip on dev / RC engine builds.
+- **`branch_deploy_shadow_suffix` validates `pr_number`** ([#289](https://github.com/rocky-data/rocky/pull/289)). Only positive integer strings are accepted; non-numeric input falls through to the (already-sanitized) `deployment_name` branch instead of being interpolated raw into a schema name.
+- **`_collect_lineage` parallelizes per-model `rocky lineage` calls** ([#289](https://github.com/rocky-data/rocky/pull/289)). Fan-out across a bounded `ThreadPoolExecutor` (cap 8 workers); per-PR projects with hundreds of models no longer wait serially through every `rocky lineage --target`.
+- **FR-014 `failed_sources` actually reaches `rocky_source_sensor`** ([#284](https://github.com/rocky-data/rocky/pull/284)). The defensive `getattr(result, "failed_sources", None) or []` in 1.14.2 was always returning `[]` because the hand-written `DiscoverResult` in `types.py` didn't declare the field — only the regenerated `DiscoverOutput` did. The sensor now consumes the generated type's field directly, so the warning fires and the silent-drop class of bug is actually covered on the orchestrator side.
+- **Argv + stderr redaction in subprocess errors** ([#284](https://github.com/rocky-data/rocky/pull/284)). `dg.Failure` payloads from `RockyResource.run` no longer leak credential-bearing argv (`--token`, env-passthrough secrets) or full stderr buffers into the Dagster UI / structured logs. Both surfaces now run through a shared redaction helper before they leave the process.
+
 ## [1.14.2] — 2026-04-26
 
 Companion release to engine `v1.17.4`. Picks up the regenerated Pydantic models for the new `DiscoverOutput.failed_sources` wire field, and threads a sensor-side warning through so projects using `rocky_source_sensor` learn about transient discover failures without misreading them as deletions.
