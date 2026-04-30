@@ -616,6 +616,95 @@ in_flight_ttl_hours = 24
 
 Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky run --idempotency-key`](/reference/cli/#rocky-run) for the three possible outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`).
 
+#### Bucket-native lifecycle for object-store backends
+
+Rocky's built-in sweep deletes idempotency stamps from `state.redb` after `retention_days`. On `s3` / `gcs` / `tiered` backends, the sweep is correct but pays a per-key delete during state upload. For projects that emit thousands of stamps per day, configuring a bucket-native lifecycle rule is faster, cheaper, and keeps GC running even when no Rocky process is active.
+
+Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The retention window should match — or be larger than — `[state.idempotency] retention_days` so Rocky's own sweep doesn't try to delete an object the bucket has already removed.
+
+**S3 — `s3api put-bucket-lifecycle-configuration` payload:**
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "rocky-idempotency-stamps-30d",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "rocky/state/" },
+      "Expiration": { "Days": 30 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$ROCKY_STATE_BUCKET" \
+  --lifecycle-configuration file://rocky-lifecycle.json
+```
+
+The same rule works for any object Rocky writes under `rocky/state/`, including state-store snapshots. If you want to retain snapshots longer than stamps, namespace them under separate prefixes via `state.s3_prefix` and configure two rules.
+
+**GCS — `gcloud storage buckets update` lifecycle JSON:**
+
+```json
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": { "type": "Delete" },
+        "condition": {
+          "age": 30,
+          "matchesPrefix": ["rocky/state/"]
+        }
+      }
+    ]
+  }
+}
+```
+
+```bash
+gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" \
+  --lifecycle-file=rocky-lifecycle.json
+```
+
+**Terraform equivalents:**
+
+```hcl
+# S3
+resource "aws_s3_bucket_lifecycle_configuration" "rocky_state" {
+  bucket = aws_s3_bucket.rocky_state.id
+
+  rule {
+    id     = "rocky-idempotency-stamps-30d"
+    status = "Enabled"
+
+    filter { prefix = "rocky/state/" }
+    expiration { days = 30 }
+  }
+}
+
+# GCS
+resource "google_storage_bucket" "rocky_state" {
+  name     = "rocky-state"
+  location = "US"
+
+  lifecycle_rule {
+    action    { type = "Delete" }
+    condition {
+      age            = 30
+      matches_prefix = ["rocky/state/"]
+    }
+  }
+}
+```
+
+**Operational notes:**
+
+- **Bucket lifecycle does not replace `[state.idempotency] retention_days`.** The local redb mirror on each pod still has its own copy of the stamp; Rocky's sweep is what evicts that. Bucket lifecycle handles the durable copy.
+- **In-flight claims (`InFlight`) are TTL-bounded by `in_flight_ttl_hours`, not by the lifecycle rule.** Don't set the lifecycle window shorter than `in_flight_ttl_hours` (default 24) or you risk reaping a live claim.
+- **Tiered backends already serve hits from Valkey first.** A bucket lifecycle that's slightly behind `retention_days` is harmless — Valkey's own TTL evicts the hot copy long before the cold S3/GCS copy expires.
+
 ---
 
 ## `[ai]`
