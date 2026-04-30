@@ -92,6 +92,29 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .map(|tables| tables.into_iter().map(|t| t.to_lowercase()).collect())
             .map_err(AdapterError::new)
     }
+
+    /// Override: emit `SHALLOW CLONE` instead of CTAS. Branch table lands in
+    /// `<source.catalog>.<branch_schema>.<source.table>` — same catalog as the
+    /// source, since the trait surface scopes branches by schema only.
+    async fn clone_table_for_branch(
+        &self,
+        source: &TableRef,
+        branch_schema: &str,
+    ) -> AdapterResult<()> {
+        rocky_sql::validation::validate_identifier(&source.catalog).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(&source.schema).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(&source.table).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(branch_schema).map_err(AdapterError::new)?;
+
+        let catalog = &source.catalog;
+        let src_schema = &source.schema;
+        let table = &source.table;
+        let sql = format!(
+            "CREATE OR REPLACE TABLE {catalog}.{branch_schema}.{table} \
+             SHALLOW CLONE {catalog}.{src_schema}.{table}"
+        );
+        self.execute_statement(&sql).await
+    }
 }
 
 // ---------------------------------------------------------------------------
