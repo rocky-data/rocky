@@ -26,9 +26,12 @@ from dagster_rocky import (
 rocky = RockyResource(config_path="rocky.toml")
 rocky_assets = load_rocky_assets(rocky)
 
-# Build a sensor that targets every Rocky asset
+# Build a sensor that targets every Rocky asset.
+# `rocky_resource` defaults to the resource key "rocky" — the sensor
+# resolves it through Dagster's required-resource injection at evaluation
+# time, so per-deployment overrides applied via `Definitions` reach the
+# sensor without needing to rebuild it.
 fivetran_sync_sensor = rocky_source_sensor(
-    rocky_resource=rocky,
     target=dg.AssetSelection.assets(*[s.key for s in rocky_assets]),
     minimum_interval_seconds=300,  # poll every 5 minutes
 )
@@ -109,6 +112,84 @@ Every `RunRequest` is tagged with:
 
 These show up in the Dagster run history view so you can audit which Fivetran
 sync triggered which materialization.
+
+## Resource injection
+
+`rocky_resource` accepts either form:
+
+- **String key** (default `"rocky"`) — Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply, mock substitution via `dg.build_sensor_context(resources={...})` works without wrapping, and the resource doesn't need to exist before the sensor is built.
+- **`RockyResource` instance** — the legacy form, closure-captured at sensor-build time. Still supported indefinitely so existing call sites don't break, but the keyed form is recommended for new code.
+
+```python
+# String-key form (recommended) — resolves "rocky" from context.resources
+sensor = rocky_source_sensor(target=...)
+
+# Custom resource key
+sensor = rocky_source_sensor(rocky_resource="my_rocky", target=...)
+
+# Instance form (legacy, still supported)
+sensor = rocky_source_sensor(rocky_resource=rocky, target=...)
+```
+
+## Backlog cap
+
+Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Useful when a hung downstream amplifies into a runaway queue — without back-pressure, a stuck run can pile up dozens of fresh `RunRequest`s tagged for the same client/tenant before anyone notices.
+
+```python
+from dagster_rocky import BacklogCap, rocky_source_sensor
+
+sensor = rocky_source_sensor(
+    target=...,
+    backlog_cap=BacklogCap(
+        tag_key="rocky/group",  # or "rocky/source_id" for per_source granularity
+        max_in_flight=5,
+    ),
+)
+```
+
+Before each emit, the sensor counts in-flight runs matching `tag_key=<value>` in the non-terminal statuses (`QUEUED`, `NOT_STARTED`, `STARTING`, `STARTED` by default — override via `BacklogCap.statuses`). If the count is at or above `max_in_flight`, the `RunRequest` is suppressed.
+
+**The cursor still advances on suppression** — the in-flight run picks up the latest data via Rocky's per-source state. Freezing the cursor would compound the failure: the next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drains below cap.
+
+`BacklogCap` is opt-in. Default behavior (no cap) is unchanged.
+
+## Lifecycle hooks
+
+Three optional best-effort callbacks let you attach metrics, alerts, or audit logs without subclassing or wrapping the sensor:
+
+```python
+from dagster_rocky import (
+    EmitContext,
+    FailedSourcesContext,
+    SkipContext,
+    rocky_source_sensor,
+)
+
+def record_emit(ec: EmitContext) -> None:
+    # ec.run_request, ec.sources, ec.granularity, ec.sensor_context
+    ...
+
+def alert_failed(fc: FailedSourcesContext) -> None:
+    # fc.failed_sources, fc.sensor_context
+    ...
+
+def gauge_idle(sc: SkipContext) -> None:
+    # sc.reason, sc.cursor_size, sc.sensor_context
+    ...
+
+sensor = rocky_source_sensor(
+    target=...,
+    on_run_request_emitted=record_emit,
+    on_failed_sources=alert_failed,
+    on_skip=gauge_idle,
+)
+```
+
+Hook contract:
+
+- **Best-effort.** Raised exceptions are caught and logged at WARN. A misbehaving hook never blocks an emit.
+- **Observability, not policy.** Hooks fire after the sensor decides what to do. Use `backlog_cap` (above) for emit-time policy.
+- **`on_run_request_emitted` fires per emit, after suppression.** It sees only the requests Dagster will be asked to launch.
 
 ## Defaults
 

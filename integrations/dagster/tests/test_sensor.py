@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import dagster as dg
 
 from dagster_rocky import (
+    BacklogCap,
     DiscoverResult,
+    EmitContext,
     FailedSourceOutput,
+    FailedSourcesContext,
     RockyResource,
+    SkipContext,
     SourceInfo,
     TableInfo,
     rocky_source_sensor,
@@ -326,4 +330,288 @@ def test_sensor_handles_empty_failed_sources_cleanly():
         result = sensor(dg.build_sensor_context(cursor=None))
 
     assert result.run_requests is not None
+    assert len(result.run_requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# FR-015 — per-tag-key backlog cap
+# ---------------------------------------------------------------------------
+
+
+def _mock_instance_with_run_count(count: int) -> MagicMock:
+    """Build a mock Dagster instance whose ``get_runs`` returns ``count`` rows.
+
+    The sensor calls ``len(context.instance.get_runs(...))``; the backlog-cap
+    branch only cares about how many rows come back, so the row contents
+    don't matter. ``MagicMock()`` placeholders satisfy ``len()``.
+
+    ``spec=DagsterInstance`` is required because ``build_sensor_context``
+    runs ``check.opt_inst_param(instance, "instance", DagsterInstance)``
+    on the argument and rejects raw ``MagicMock``.
+    """
+    instance = MagicMock(spec=dg.DagsterInstance)
+    instance.get_runs.return_value = [MagicMock() for _ in range(count)]
+    return instance
+
+
+def test_backlog_cap_none_is_unchanged_emit_path():
+    """No backlog_cap → emit path stays exactly as before (regression guard
+    against accidentally calling ``context.instance.get_runs`` when the
+    feature is opt-in)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    instance = _mock_instance_with_run_count(99)  # would suppress everything if consulted
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            # no backlog_cap
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert len(result.run_requests) == 1
+    instance.get_runs.assert_not_called()
+
+
+def test_backlog_cap_suppresses_when_in_flight_at_or_above_max():
+    """Two in-flight runs already share the tag value → cap=2 → suppress
+    the emit but advance the cursor so the in-flight run picks up the
+    fresh data on its own (no stuck-tick)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    instance = _mock_instance_with_run_count(2)
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=2),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # Emit suppressed
+    assert result.run_requests == []
+    # …but cursor still advances so we don't re-detect on the next tick
+    assert json.loads(result.cursor)["s1"] == "2026-04-08T10:00:00+00:00"
+    # And the cap was actually consulted with the correct filter shape
+    instance.get_runs.assert_called_once()
+    call = instance.get_runs.call_args
+    assert call.kwargs["filters"].tags == {"rocky/source_id": "s1"}
+    assert call.kwargs["limit"] == 3  # max_in_flight + 1
+
+
+def test_backlog_cap_below_max_emits_normally():
+    """Zero in-flight runs → emit normally even when a cap is set."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    instance = _mock_instance_with_run_count(0)
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=5),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+
+
+def test_backlog_cap_passes_through_when_tag_key_missing():
+    """RunRequests that don't carry the configured ``tag_key`` are not
+    counted by ``get_runs`` and pass through. Cap configured for a tag
+    that this sensor never sets → all emits accepted, ``get_runs``
+    never called."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    instance = _mock_instance_with_run_count(99)
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            # `per_source` granularity emits `rocky/source_id` and
+            # `rocky/sync_at` tags — `rocky/group` is only set in
+            # `per_group`, so this RunRequest has no value to count by.
+            backlog_cap=BacklogCap(tag_key="rocky/group", max_in_flight=1),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert len(result.run_requests) == 1
+    instance.get_runs.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FR-016 — lifecycle hooks (on_run_request_emitted / on_failed_sources / on_skip)
+# ---------------------------------------------------------------------------
+
+
+def test_on_run_request_emitted_fires_per_emitted_request():
+    rocky = RockyResource()
+    discover = _discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)),
+        _source("s2", "acme", ["invoices"], _ts(2026, 4, 8, 11)),
+    )
+
+    seen: list[EmitContext] = []
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            on_run_request_emitted=seen.append,
+        )
+        sensor(dg.build_sensor_context(cursor=None))
+
+    assert len(seen) == 2
+    # Each EmitContext carries the matching RunRequest + the source(s)
+    # that backed it (1 source per emit at per_source granularity).
+    for ec in seen:
+        assert ec.granularity == "per_source"
+        assert len(ec.sources) == 1
+        assert ec.run_request.tags["rocky/source_id"] == ec.sources[0].id
+
+
+def test_on_failed_sources_fires_when_discover_reports_failures():
+    rocky = RockyResource()
+    discover = DiscoverResult(
+        version="0.3.0",
+        command="discover",
+        sources=[_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10))],
+        failed_sources=[_failed("s2", error_class="timeout")],
+    )
+
+    seen: list[FailedSourcesContext] = []
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            on_failed_sources=seen.append,
+        )
+        sensor(dg.build_sensor_context(cursor=None))
+
+    assert len(seen) == 1
+    fc = seen[0]
+    assert len(fc.failed_sources) == 1
+    assert fc.failed_sources[0].id == "s2"
+
+
+def test_on_skip_fires_when_no_sources_advanced():
+    rocky = RockyResource()
+    # Source already at the cursor's last-seen timestamp → no advance.
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    starting_cursor = json.dumps({"s1": "2026-04-08T10:00:00+00:00"})
+
+    seen: list[SkipContext] = []
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            on_skip=seen.append,
+        )
+        sensor(dg.build_sensor_context(cursor=starting_cursor))
+
+    assert len(seen) == 1
+    sc = seen[0]
+    assert "No Rocky sources have synced" in sc.reason
+    assert sc.cursor_size == 1
+
+
+def test_hook_exceptions_are_caught_and_do_not_block_emit():
+    """A hook that raises must not break the sensor — exception is
+    caught + logged at WARN, emit goes through unchanged."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    def _boom(_ec: EmitContext) -> None:
+        raise RuntimeError("hook is broken")
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            on_run_request_emitted=_boom,
+        )
+        result = sensor(dg.build_sensor_context(cursor=None))
+
+    # Emit still happens despite the hook raising
+    assert len(result.run_requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# FR-017 — resource injection via string key (alongside the legacy instance form)
+# ---------------------------------------------------------------------------
+
+
+def test_keyed_resource_form_resolves_via_context_resources():
+    """Default ``rocky_resource="rocky"`` → sensor declares the resource
+    key as required and reads the resource off ``context.resources`` at
+    evaluation time, not closure-captured at build time."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            # rocky_resource defaults to "rocky"
+        )
+        # Sensor declares the key as required — late-bound, swap-safe.
+        assert sensor.required_resource_keys == {"rocky"}
+
+        # ConfigurableResource lifecycle requires the build_sensor_context
+        # context-manager scope when resources are provided.
+        with dg.build_sensor_context(cursor=None, resources={"rocky": rocky}) as ctx:
+            result = sensor(ctx)
+
+    assert result.run_requests is not None
+    assert len(result.run_requests) == 1
+
+
+def test_keyed_resource_form_supports_custom_key_name():
+    """Consumer using a non-conventional resource key passes the string
+    through; the sensor resolves it under the provided name."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource="my_custom_rocky",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+        )
+        assert sensor.required_resource_keys == {"my_custom_rocky"}
+
+        with dg.build_sensor_context(cursor=None, resources={"my_custom_rocky": rocky}) as ctx:
+            result = sensor(ctx)
+
+    assert len(result.run_requests) == 1
+
+
+def test_instance_resource_form_still_works_for_back_compat():
+    """Passing a ``RockyResource`` instance directly keeps the legacy
+    closure-capture path. No resource key is registered as required."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+        )
+        assert sensor.required_resource_keys == set()
+
+        # No `resources={}` needed — closure-captured.
+        result = sensor(dg.build_sensor_context(cursor=None))
+
     assert len(result.run_requests) == 1
