@@ -118,7 +118,12 @@ sha2 = "0.11"
 blake3 = "1"
 
 # JWT / RSA / Base64
-jsonwebtoken = "10"
+# `aws_lc_rs` matches reqwest's default crypto provider (rustls + aws-lc-rs).
+# `jsonwebtoken` 10.x requires picking a provider explicitly; without a
+# feature, the BigQuery service-account JWT signer panics at first use.
+# `pem` keeps `EncodingKey::from_rsa_pem` available for PEM-encoded
+# service-account keys.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.22"
 

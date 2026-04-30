@@ -12,7 +12,7 @@ use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
     AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
 };
-use rocky_sql::validation::validate_identifier;
+use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::auth::BigQueryAuth;
 use crate::dialect::BigQueryDialect;
@@ -300,7 +300,9 @@ impl WarehouseAdapter for BigQueryAdapter {
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
         // validate_identifier rejects `'` and other non-alphanumerics, so the
         // `table_name = '...'` literal cannot be broken out of by `table.table`.
-        validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+        // The catalog (= GCP project) needs the looser project-ID validator
+        // because GCP allows hyphens in project IDs (e.g. `my-project-id`).
+        validate_gcp_project_id(&table.catalog).map_err(AdapterError::new)?;
         validate_identifier(&table.schema).map_err(AdapterError::new)?;
         validate_identifier(&table.table).map_err(AdapterError::new)?;
         let sql = format!(
@@ -331,8 +333,8 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 
     async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
-        // BigQuery: catalog = project, schema = dataset
-        validate_identifier(catalog).map_err(AdapterError::new)?;
+        // BigQuery: catalog = project (allows hyphens), schema = dataset.
+        validate_gcp_project_id(catalog).map_err(AdapterError::new)?;
         validate_identifier(schema).map_err(AdapterError::new)?;
         let sql =
             format!("SELECT table_name FROM `{catalog}`.`{schema}`.INFORMATION_SCHEMA.TABLES");
@@ -362,7 +364,10 @@ impl WarehouseAdapter for BigQueryAdapter {
         source: &TableRef,
         branch_schema: &str,
     ) -> AdapterResult<()> {
-        validate_identifier(&source.catalog).map_err(AdapterError::new)?;
+        // GCP project IDs allow hyphens (`my-project-1`), so the catalog
+        // component takes the looser project-ID validator. Datasets and
+        // tables stay on the strict `[A-Za-z0-9_]+` rule.
+        validate_gcp_project_id(&source.catalog).map_err(AdapterError::new)?;
         validate_identifier(&source.schema).map_err(AdapterError::new)?;
         validate_identifier(&source.table).map_err(AdapterError::new)?;
         validate_identifier(branch_schema).map_err(AdapterError::new)?;

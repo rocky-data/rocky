@@ -10,8 +10,10 @@ pub struct BigQueryDialect;
 
 impl SqlDialect for BigQueryDialect {
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
-        // BigQuery uses project.dataset.table (three-part)
-        validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+        // BigQuery uses project.dataset.table (three-part). The project
+        // (catalog) component allows hyphens; dataset + table stay on
+        // the stricter SQL-identifier rule.
+        validation::validate_gcp_project_id(catalog).map_err(AdapterError::new)?;
         validation::validate_identifier(schema).map_err(AdapterError::new)?;
         validation::validate_identifier(table).map_err(AdapterError::new)?;
         Ok(format!("`{catalog}`.`{schema}`.`{table}`"))
@@ -121,9 +123,10 @@ impl SqlDialect for BigQueryDialect {
     }
 
     fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
-        // BigQuery: CREATE SCHEMA = CREATE DATASET
+        // BigQuery: CREATE SCHEMA = CREATE DATASET. Project (catalog)
+        // allows hyphens; dataset stays on the strict identifier rule.
         let validate = || -> AdapterResult<String> {
-            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+            validation::validate_gcp_project_id(catalog).map_err(AdapterError::new)?;
             validation::validate_identifier(schema).map_err(AdapterError::new)?;
             Ok(format!(
                 "CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`"
@@ -159,7 +162,8 @@ impl SqlDialect for BigQueryDialect {
         // BigQuery's INFORMATION_SCHEMA.TABLES lives per-dataset, so the
         // four-part `project.dataset.INFORMATION_SCHEMA.TABLES` form is
         // required. Backtick-quote project + dataset per BQ conventions.
-        rocky_sql::validation::validate_identifier(catalog)
+        // Project (catalog) allows hyphens; dataset stays strict.
+        rocky_sql::validation::validate_gcp_project_id(catalog)
             .map_err(rocky_core::traits::AdapterError::new)?;
         rocky_sql::validation::validate_identifier(schema)
             .map_err(rocky_core::traits::AdapterError::new)?;
