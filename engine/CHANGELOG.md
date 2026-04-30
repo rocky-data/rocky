@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] — 2026-04-30
+
+Patch release. Headline: **`clone_table_for_branch` warehouse-native overrides on Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`)** turn the per-PR branch substrate from a portable CTAS that re-scans bytes into a metadata-only operation that's effectively zero-cost at create time. Snowflake stays on the CTAS default (still correct, just slower) until a Snowflake consumer asks for the native `CLONE` path.
+
+### Added
+
+- **`WarehouseAdapter::clone_table_for_branch` trait method + DuckDB CTAS default** ([#303](https://github.com/rocky-data/rocky/pull/303)). New trait surface that `rocky preview create` uses to populate the per-PR branch schema for every model not in the prune set. Default impl is a portable `CREATE OR REPLACE TABLE "{branch}"."{table}" AS SELECT * FROM "{src_schema}"."{table}"` that works on DuckDB and any warehouse whose CTAS accepts the two-part `schema.table` form without a catalog prefix. Adapters with native zero-copy primitives override. Identifier-validation guard on every component via `rocky_sql::validation`.
+- **Databricks `SHALLOW CLONE` override of `clone_table_for_branch`** ([#305](https://github.com/rocky-data/rocky/pull/305)). Replaces the portable CTAS with `CREATE OR REPLACE TABLE … SHALLOW CLONE …` so the per-PR branch lands in `<source.catalog>.<branch_schema>.<source.table>` as a metadata-only reference to the source's underlying files. Live-verified end-to-end against a real Databricks workspace (~12s wall clock for the integration test).
+- **BigQuery `CREATE TABLE … COPY` override of `clone_table_for_branch`** ([#309](https://github.com/rocky-data/rocky/pull/309)). BigQuery's native metadata-only table copy primitive — strictly dominates the CTAS default, which would re-scan the source bytes. Three-part backtick quoting (`` `project`.`dataset`.`table` ``); branch table lands in the same GCP project as the source (BigQuery's `COPY` is single-project-scoped). Live-verified end-to-end against a real BigQuery sandbox (~12s wall clock).
+- **`rocky run --idempotency-key` env-var fallback** ([#307](https://github.com/rocky-data/rocky/pull/307)). The CLI flag now falls back to `ROCKY_IDEMPOTENCY_KEY` when not given. Useful for orchestrators that already plumb an idempotency key through env (cron wrappers, pod templates, ad-hoc CI scripts). Workspace `clap` features grew `["env"]`.
+- **`IcebergError` taxonomy on the discovery adapter's `failed_sources` classifier** ([#307](https://github.com/rocky-data/rocky/pull/307)). The classifier was hard-coded to `Unknown` pending wire-error classification; now mirrors the Fivetran taxonomy (`Transient | Timeout | RateLimit | Auth | Unknown`) keyed on `IcebergError` variants and HTTP status codes. Downstream consumers of `failed_sources` get the same back-pressure / alerting signals from Iceberg as they do from Fivetran. Three new wiremock integration tests cover `401 → Auth`, `403 → Auth`, and `404 → Unknown` paths.
+- **`rocky_sql::validation::validate_gcp_project_id`** ([#310](https://github.com/rocky-data/rocky/pull/310)). New validator honouring GCP's actual project-ID rules (`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`). The strict `validate_identifier` rejected hyphens, which made the BigQuery adapter unusable against any real GCP project.
+
+### Fixed
+
+- **`jsonwebtoken` 10.x crypto-provider panic on first JWT signing** ([#310](https://github.com/rocky-data/rocky/pull/310)). Workspace pin grew `["aws_lc_rs", "use_pem"]` features so the BigQuery service-account auth path doesn't panic with `CryptoProvider::install_default()` on its first call.
+- **BigQuery adapter rejects real GCP project IDs containing hyphens** ([#310](https://github.com/rocky-data/rocky/pull/310)). `BigQueryAdapter::{describe_table, list_tables, clone_table_for_branch}` and `BigQueryDialect::{format_table_ref, create_schema_sql, list_tables_sql}` now use `validate_gcp_project_id` for the project component. Dataset and table names stay on the strict identifier rule.
+
+### Changed
+
+- **Schema-cache doc-comment cleanup** ([#307](https://github.com/rocky-data/rocky/pull/307)). Internal task-tracking labels stripped from ~25 doc-comments and inline comments across the schema-cache codebase. Surrounding descriptive prose preserved. Description text on a few `JsonSchema`-deriving structs (`SchemaCacheConfig`, `CacheConfig`, `schemas_cached`) propagated through the codegen cascade — pure description-text drift, no field added / removed / renamed.
+
 ## [1.19.0] — 2026-04-30
 
 Feature release. Headline: **`rocky lineage-diff`** — a new top-level CLI verb that combines `rocky ci-diff`'s structural per-column diff with `rocky lineage --downstream`'s blast-radius walk, emitting a PR-comment-ready Markdown summary of which downstream columns each PR change reaches. Closes the launch-thread commitment to `xiaoher-c` ([HN item 47935246](https://news.ycombinator.com/item?id=47935246)).

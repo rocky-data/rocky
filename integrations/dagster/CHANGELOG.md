@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] — 2026-04-30
+
+Minor release. Headline: **three additive enhancements to `rocky_source_sensor`** driven by downstream-consumer operational learnings — backlog cap, lifecycle hooks, and resource-key injection. Companion to engine `v1.19.1` but doesn't require it; works against any engine `≥ 1.17.4`.
+
 ### Added
 
 - **`rocky_source_sensor` per-tag-key backlog cap (FR-015).** New opt-in `backlog_cap=BacklogCap(tag_key=..., max_in_flight=..., statuses=...)` argument that consults `context.instance.get_runs(...)` before each emit and suppresses the `RunRequest` when the in-flight count for the matched tag value is at or above the cap. The cursor still advances on suppression so the in-flight run picks up the latest data via Rocky's per-source state — avoiding the stuck-tick failure mode where freezing the cursor would re-detect the same sync forever. Default off; existing call sites unchanged. New `BacklogCap` NamedTuple is exported from the package root.
