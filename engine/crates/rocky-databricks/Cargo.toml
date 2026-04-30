@@ -28,6 +28,7 @@ name = "wiremock_tests"
 required-features = ["test-support"]
 
 [dev-dependencies]
+rocky-core = { path = "../rocky-core" }
 tokio = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }

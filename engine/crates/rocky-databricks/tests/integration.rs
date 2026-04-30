@@ -7,8 +7,11 @@
 //!
 //! Run with: cargo test -p rocky-databricks --test integration -- --ignored
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rocky_core::ir::TableRef;
+use rocky_core::traits::WarehouseAdapter;
+use rocky_databricks::adapter::DatabricksWarehouseAdapter;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
 
@@ -91,6 +94,93 @@ async fn test_execute_invalid_sql_fails() {
     let result = connector.execute_sql("SELECTT INVALID SYNTAX").await;
 
     assert!(result.is_err());
+}
+
+/// Verifies the Databricks `clone_table_for_branch` override emits a
+/// working `SHALLOW CLONE` statement: source schema + table created,
+/// clone produced in a sibling schema, row contents match. Both schemas
+/// are dropped (CASCADE) at the end regardless of test outcome.
+///
+/// Catalog is read from `DATABRICKS_TEST_CATALOG` (defaults to the value
+/// of `DATABRICKS_CATALOG_PREFIX`) so the test honors per-environment
+/// sandbox naming. Schemas use the `hc_phase5_` prefix.
+#[tokio::test]
+#[ignore]
+async fn test_clone_table_for_branch_shallow_clone() {
+    let connector = connector_from_env().expect("Databricks env vars not set");
+    let adapter = DatabricksWarehouseAdapter::new(connector);
+
+    let catalog = std::env::var("DATABRICKS_TEST_CATALOG")
+        .or_else(|_| std::env::var("DATABRICKS_CATALOG_PREFIX"))
+        .expect("DATABRICKS_TEST_CATALOG or DATABRICKS_CATALOG_PREFIX must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let src_schema = format!("hc_phase5_src_{suffix}");
+    let brn_schema = format!("hc_phase5_brn_{suffix}");
+    let table = "test_table";
+
+    // Setup: create the two schemas + a 2-row source table.
+    // The catalog is assumed to exist; operator is responsible for pre-creating it.
+    adapter
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {catalog}.{src_schema}"
+        ))
+        .await
+        .expect("create source schema");
+    adapter
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {catalog}.{brn_schema}"
+        ))
+        .await
+        .expect("create branch schema");
+    adapter
+        .execute_statement(&format!(
+            "CREATE OR REPLACE TABLE {catalog}.{src_schema}.{table} AS \
+             SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)"
+        ))
+        .await
+        .expect("create source table");
+
+    // Run the unit under test, capture the result so cleanup runs first.
+    let source = TableRef {
+        catalog: catalog.clone(),
+        schema: src_schema.clone(),
+        table: table.to_string(),
+    };
+    let clone_result = adapter.clone_table_for_branch(&source, &brn_schema).await;
+
+    let row_count = if clone_result.is_ok() {
+        let q = adapter
+            .execute_query(&format!(
+                "SELECT COUNT(*) AS n FROM {catalog}.{brn_schema}.{table}"
+            ))
+            .await
+            .ok();
+        q.and_then(|r| r.rows.first().and_then(|row| row.first().cloned()))
+    } else {
+        None
+    };
+
+    // Unconditional cleanup (best-effort; ignored on failure).
+    let _ = adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS {catalog}.{src_schema} CASCADE"
+        ))
+        .await;
+    let _ = adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS {catalog}.{brn_schema} CASCADE"
+        ))
+        .await;
+
+    clone_result.expect("clone_table_for_branch should succeed");
+    let n = row_count.expect("clone target should be queryable");
+    let n_str = n.as_str().or_else(|| n.as_str()).unwrap_or_default();
+    let n_num: i64 = n.as_i64().unwrap_or_else(|| n_str.parse().unwrap_or(-1));
+    assert_eq!(n_num, 2, "cloned table should have 2 rows, got {n:?}");
 }
 
 #[tokio::test]
