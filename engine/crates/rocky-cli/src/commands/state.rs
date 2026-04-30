@@ -40,10 +40,10 @@ pub fn state_show(state_path: &Path, output_json: bool) -> Result<()> {
 
 /// Execute `rocky state clear-schema-cache`.
 ///
-/// Arc 7 wave 2 wave-2 PR 4 — the explicit-flush path for the DESCRIBE
-/// cache. Counterpart to the TTL auto-eviction baked into the read path:
-/// users who want a cache refresh *now* (e.g. after a manual warehouse DDL
-/// change, or during strict-CI debugging) use this command.
+/// The explicit-flush path for the DESCRIBE cache. Counterpart to the
+/// TTL auto-eviction baked into the read path: users who want a cache
+/// refresh *now* (e.g. after a manual warehouse DDL change, or during
+/// strict-CI debugging) use this command.
 ///
 /// Behaviour:
 /// - No prompt (the cache is cheap to rebuild via the next `rocky run`

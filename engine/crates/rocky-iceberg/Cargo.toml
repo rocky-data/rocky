@@ -18,5 +18,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = { workspace = true }
 
+[dev-dependencies]
+wiremock = { workspace = true }
+
 [lints]
 workspace = true

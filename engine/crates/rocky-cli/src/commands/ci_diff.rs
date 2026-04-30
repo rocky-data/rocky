@@ -210,11 +210,11 @@ fn compile_head(
 /// This is best-effort: if the base ref doesn't have a complete models directory
 /// or compilation fails, we return an empty map rather than erroring.
 ///
-/// Arc 7 wave 2 wave-2 note: `source_schemas` seeds the compile from the
-/// *current* warehouse cache, not historical types. That's fine for diff
-/// purposes — typecheck on historical models with today's leaf types still
-/// detects the model-level schema drift that ci-diff is looking for, and
-/// there's no per-ref cache to restore from.
+/// `source_schemas` seeds the compile from the *current* warehouse
+/// cache, not historical types. That's fine for diff purposes —
+/// typecheck on historical models with today's leaf types still detects
+/// the model-level schema drift that ci-diff is looking for, and there's
+/// no per-ref cache to restore from.
 fn extract_base_schemas(
     base_ref: &str,
     models_dir: &Path,
@@ -494,11 +494,11 @@ pub(crate) fn compute_ci_diff(
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
 ) -> Result<CiDiffData> {
-    // Wave-2 of Arc 7 wave 2: load cached source schemas once and seed
-    // both compiles (current tree + base ref) with the same map so the
-    // resulting per-model type diffs measure real schema drift rather
-    // than `Unknown`-vs-`Unknown` noise. Degrades to empty when the
-    // cache is cold or `[cache.schemas] enabled = false`.
+    // Load cached source schemas once and seed both compiles (current
+    // tree + base ref) with the same map so the resulting per-model
+    // type diffs measure real schema drift rather than
+    // `Unknown`-vs-`Unknown` noise. Degrades to empty when the cache is
+    // cold or `[cache.schemas] enabled = false`.
     let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);

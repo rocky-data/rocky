@@ -350,10 +350,9 @@ pub struct RockyLsp {
     /// pass when the cached hash matches the current model SQL —
     /// editors call this hook on every scroll on large files.
     semantic_tokens_cache: SemanticTokensCache,
-    /// Arc 7 wave 2 wave-2: throttle the "N sources hit" info log so it
-    /// fires once per session per `models_dir` rather than per keystroke.
-    /// PR 2 will encode a cache version in the throttle key so the log
-    /// re-fires after a write tap bump. See `schema_cache_throttle.rs`.
+    /// Throttle the "N sources hit" info log so it fires once per
+    /// session per `models_dir` rather than per keystroke. See
+    /// `schema_cache_throttle.rs`.
     schema_cache_throttle: SchemaCacheThrottle,
 }
 
@@ -377,9 +376,9 @@ impl RockyLsp {
         let models_dir = self.models_dir.read().await;
         let Some(ref dir) = *models_dir else { return };
 
-        // Wave-2 of Arc 7 wave 2: plug cached warehouse schemas into the
-        // LSP typecheck so `FROM <schema>.<table>` inlay hints and hover
-        // types resolve against real columns instead of `Unknown`.
+        // Plug cached warehouse schemas into the LSP typecheck so
+        // `FROM <schema>.<table>` inlay hints and hover types resolve
+        // against real columns instead of `Unknown`.
         let dir_path = std::path::PathBuf::from(dir);
         let source_schemas = Self::load_cached_source_schemas(
             &dir_path,
@@ -413,11 +412,11 @@ impl RockyLsp {
         }
     }
 
-    /// Arc 7 wave 2 wave-2: load the persisted schema cache for use as
+    /// Load the persisted schema cache for use as
     /// `CompilerConfig.source_schemas`. Mirrors
     /// `rocky-cli::source_schemas::load_cached_source_schemas` but (a)
-    /// reuses the LSP's per-session throttle so the info log doesn't fire
-    /// on every recompile, and (b) resolves the state file via
+    /// reuses the LSP's per-session throttle so the info log doesn't
+    /// fire on every recompile, and (b) resolves the state file via
     /// [`rocky_core::state::resolve_state_path`] so the LSP observes the
     /// same file the CLI writes to — unified default
     /// `<models>/.rocky-state.redb` with the legacy CWD fallback for
@@ -860,9 +859,9 @@ impl LanguageServer for RockyLsp {
             let compile_result = self.compile_result.clone();
             let models_dir = self.models_dir.clone();
             let pending = self.recompile_pending.clone();
-            // Arc 7 wave 2 wave-2: share the throttle so the did_change
-            // debounced recompile doesn't re-emit the info log that
-            // `recompile()` already emitted for the same project.
+            // Share the throttle so the did_change debounced recompile
+            // doesn't re-emit the info log that `recompile()` already
+            // emitted for the same project.
             let schema_cache_throttle = self.schema_cache_throttle.clone();
 
             tokio::spawn(async move {
@@ -872,10 +871,10 @@ impl LanguageServer for RockyLsp {
                 let dir = models_dir.read().await;
                 let Some(ref dir) = *dir else { return };
 
-                // Wave-2 of Arc 7 wave 2: keep the per-keystroke typecheck
-                // grounded in real warehouse types when the cache is warm.
-                // Throttle guarantees the info log fires at most once per
-                // session per project.
+                // Keep the per-keystroke typecheck grounded in real
+                // warehouse types when the cache is warm. Throttle
+                // guarantees the info log fires at most once per session
+                // per project.
                 let dir_path = std::path::PathBuf::from(dir);
                 let source_schemas =
                     Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
@@ -3251,7 +3250,7 @@ mod tests {
         assert_eq!(encoded[2].delta_start, 10);
     }
 
-    // ---- Arc 7 wave 2 wave-2: LSP schema-cache loader ----
+    // ---- LSP schema-cache loader ----
 
     /// LSP must honour `[cache.schemas] enabled = false` from
     /// `<root>/rocky.toml` and NOT read cache entries even when the

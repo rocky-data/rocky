@@ -18,10 +18,6 @@
 //! multi-pipeline setup), the last one wins — this matches the behaviour
 //! a compiler operating without catalog awareness would see from a live
 //! `batch_describe_schema` call today.
-//!
-//! Arc 7 wave 2 wave-2 PR 1a: this module is ready to be called but has
-//! no callers yet. PR 1b replaces the 10 `HashMap::new()` callsites with
-//! `load_source_schemas_from_cache(...)` calls.
 
 use std::collections::HashMap;
 

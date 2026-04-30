@@ -23,8 +23,8 @@ sqlparser = { workspace = true }
 strsim = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-# Arc 7 wave 2 wave-2: schema-cache read-path needs `chrono::Utc::now()` +
-# `Duration` for TTL filtering. Reused via `rocky_compiler::schema_cache`.
+# Schema-cache read-path needs `chrono::Utc::now()` + `Duration` for TTL
+# filtering. Reused via `rocky_compiler::schema_cache`.
 chrono = { workspace = true }
 
 [dev-dependencies]

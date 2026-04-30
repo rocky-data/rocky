@@ -309,7 +309,12 @@ enum Command {
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
-        #[arg(long, value_name = "KEY")]
+        ///
+        /// Falls back to the `ROCKY_IDEMPOTENCY_KEY` environment variable
+        /// when the flag is not given. Useful for orchestrators that
+        /// already plumb an idempotency key through env (cron wrappers,
+        /// Airflow pod templates, ad-hoc CI bash scripts).
+        #[arg(long, value_name = "KEY", env = "ROCKY_IDEMPOTENCY_KEY")]
         idempotency_key: Option<String>,
 
         /// Scope the post-DAG governance reconcile to a specific
@@ -1983,5 +1988,69 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         ctrl_c.await.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::sync::Mutex;
+
+    /// Serialises every env-mutating test in this module so concurrent
+    /// `cargo test` threads don't race on the shared process env.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// SAFETY: callers MUST hold `ENV_LOCK` for the duration of any
+    /// `set_env` / `remove_env` call and any subsequent read that
+    /// depends on the value. Edition 2024 marked `std::env::set_var` /
+    /// `remove_var` unsafe because they race with reads in other
+    /// threads; the lock closes that hole for our tests.
+    fn set_env(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove_env(key: &str) {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn parse_run_idempotency_key(args: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(args).expect("parse should succeed");
+        match cli.command {
+            Command::Run {
+                idempotency_key, ..
+            } => idempotency_key,
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn idempotency_key_explicit_flag_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_env("ROCKY_IDEMPOTENCY_KEY", "from_env");
+        let key = parse_run_idempotency_key(&["rocky", "run", "--idempotency-key", "from_flag"]);
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        assert_eq!(key.as_deref(), Some("from_flag"));
+    }
+
+    #[test]
+    fn idempotency_key_falls_back_to_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_env("ROCKY_IDEMPOTENCY_KEY", "from_env");
+        let key = parse_run_idempotency_key(&["rocky", "run"]);
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        assert_eq!(key.as_deref(), Some("from_env"));
+    }
+
+    #[test]
+    fn idempotency_key_none_when_neither_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let key = parse_run_idempotency_key(&["rocky", "run"]);
+        assert!(key.is_none());
     }
 }

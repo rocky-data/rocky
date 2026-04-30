@@ -12,7 +12,7 @@ use rocky_core::source::{
 };
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
-use crate::client::IcebergCatalogClient;
+use crate::client::{IcebergCatalogClient, IcebergError};
 
 /// Iceberg source discovery adapter.
 ///
@@ -78,20 +78,18 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
                     });
                 }
                 Err(e) => {
+                    let error_class = classify_iceberg_error(&e);
                     warn!(
                         namespace = ns.as_str(),
                         error = %e,
+                        class = ?error_class,
                         "list_tables failed, surfacing as failed source"
                     );
                     failed.push(FailedSource {
                         id: ns.clone(),
                         schema: ns.clone(),
                         source_type: "iceberg".to_string(),
-                        // The Iceberg REST client doesn't differentiate
-                        // transport-shape errors today; treat everything as
-                        // Unknown until it does. Future: classify on
-                        // `IcebergError` variants.
-                        error_class: FailedSourceErrorClass::Unknown,
+                        error_class,
                         message: e.to_string(),
                     });
                 }
@@ -126,6 +124,41 @@ fn matches_prefix(namespace: &str, prefix: &str) -> bool {
         return true;
     }
     namespace.starts_with(prefix)
+}
+
+/// Map an [`IcebergError`] onto the coarse [`FailedSourceErrorClass`].
+///
+/// The classes are operating-mode signals for downstream consumers, not a
+/// faithful taxonomy of the underlying transport. Mirrors the Fivetran
+/// adapter's classifier so consumers see consistent semantics across
+/// adapters.
+fn classify_iceberg_error(err: &IcebergError) -> FailedSourceErrorClass {
+    match err {
+        IcebergError::RateLimited => FailedSourceErrorClass::RateLimit,
+        IcebergError::UnexpectedResponse(_) => FailedSourceErrorClass::Unknown,
+        IcebergError::Api { status, .. } => classify_status_code(*status),
+        IcebergError::Http(reqwest_err) => {
+            if reqwest_err.is_timeout() {
+                FailedSourceErrorClass::Timeout
+            } else if reqwest_err.is_connect() {
+                FailedSourceErrorClass::Transient
+            } else if let Some(status) = reqwest_err.status() {
+                classify_status_code(status.as_u16())
+            } else {
+                FailedSourceErrorClass::Unknown
+            }
+        }
+    }
+}
+
+fn classify_status_code(status: u16) -> FailedSourceErrorClass {
+    match status {
+        401 | 403 => FailedSourceErrorClass::Auth,
+        408 => FailedSourceErrorClass::Timeout,
+        429 => FailedSourceErrorClass::RateLimit,
+        500..=599 => FailedSourceErrorClass::Transient,
+        _ => FailedSourceErrorClass::Unknown,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,5 +280,49 @@ mod tests {
             metadata: Default::default(),
         };
         assert_eq!(connector.source_type, "iceberg");
+    }
+
+    // ---- error classifier ----
+
+    #[test]
+    fn classify_rate_limited_explicit() {
+        let err = IcebergError::RateLimited;
+        assert!(matches!(
+            classify_iceberg_error(&err),
+            FailedSourceErrorClass::RateLimit
+        ));
+    }
+
+    #[test]
+    fn classify_api_status_codes() {
+        for (status, expected) in [
+            (401, FailedSourceErrorClass::Auth),
+            (403, FailedSourceErrorClass::Auth),
+            (404, FailedSourceErrorClass::Unknown),
+            (408, FailedSourceErrorClass::Timeout),
+            (429, FailedSourceErrorClass::RateLimit),
+            (500, FailedSourceErrorClass::Transient),
+            (502, FailedSourceErrorClass::Transient),
+            (503, FailedSourceErrorClass::Transient),
+        ] {
+            let err = IcebergError::Api {
+                status,
+                message: format!("status {status}"),
+            };
+            assert_eq!(
+                classify_iceberg_error(&err),
+                expected,
+                "status {status} misclassified"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unexpected_response_is_unknown() {
+        let err = IcebergError::UnexpectedResponse("bad json".to_string());
+        assert!(matches!(
+            classify_iceberg_error(&err),
+            FailedSourceErrorClass::Unknown
+        ));
     }
 }

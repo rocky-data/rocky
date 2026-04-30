@@ -30,10 +30,9 @@ pub struct ServerState {
     /// CORS allowlist passed to [`crate::auth::build_cors_layer`]. An
     /// empty list means same-origin only.
     pub allowed_origins: Vec<String>,
-    /// Arc 7 wave 2 wave-2: per-session throttle for the "N sources hit"
-    /// info log so it emits once per server start, not once per recompile.
-    /// PR 2 will key it on `(document_uri, cache_version)` — the only LSP
-    /// analogue today is `models_dir`, which stays constant.
+    /// Per-session throttle for the "N sources hit" info log so it
+    /// emits once per server start, not once per recompile. Keyed on
+    /// `models_dir`, which stays constant.
     schema_cache_throttle: SchemaCacheThrottle,
 }
 
@@ -83,11 +82,11 @@ impl ServerState {
     pub async fn recompile(&self) {
         info!(models_dir = %self.models_dir.display(), "compiling project");
 
-        // Wave-2 of Arc 7 wave 2: load cached source schemas so the
-        // server's hover/inlay-hint surfaces typecheck against real
-        // warehouse types when the cache is warm. Degrades to empty on
-        // cold cache, missing state.redb, or `[cache.schemas] enabled =
-        // false`. See `rocky-cli::source_schemas` for the CLI equivalent.
+        // Load cached source schemas so the server's hover/inlay-hint
+        // surfaces typecheck against real warehouse types when the cache
+        // is warm. Degrades to empty on cold cache, missing state.redb,
+        // or `[cache.schemas] enabled = false`. See
+        // `rocky-cli::source_schemas` for the CLI equivalent.
         let source_schemas = self.load_cached_source_schemas().await;
 
         let config = CompilerConfig {

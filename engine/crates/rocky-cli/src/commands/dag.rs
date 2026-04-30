@@ -23,8 +23,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky dag`.
 ///
-/// `cache_ttl_override`: CLI `--cache-ttl` flag (Arc 7 wave 2 wave-2 PR 4).
-/// Only relevant when `include_column_lineage` drives a compile.
+/// `cache_ttl_override`: CLI `--cache-ttl` flag override for the
+/// `[cache.schemas] ttl_seconds` setting. Only relevant when
+/// `include_column_lineage` drives a compile.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dag(
     config_path: &Path,
@@ -273,11 +274,11 @@ fn build_column_lineage_from_models(
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),
-        // Wave-2 of Arc 7 wave 2: typed columns flow from the persisted
-        // schema cache (populated by `rocky run` / `rocky discover
-        // --with-schemas` in later PRs) straight into column lineage
-        // extraction, so downstream edges carry real types instead of
-        // `RockyType::Unknown`. `schema_cache_cfg` already has the
+        // Typed columns flow from the persisted schema cache (populated
+        // by `rocky run` / `rocky discover --with-schemas`) straight
+        // into column lineage extraction, so downstream edges carry
+        // real types instead of `RockyType::Unknown`.
+        // `schema_cache_cfg` already has the
         // `--cache-ttl` override applied by `run_dag`.
         source_schemas: crate::source_schemas::load_cached_source_schemas(
             schema_cache_cfg,

@@ -187,7 +187,7 @@
       "type": "array"
     },
     "schemas_cached": {
-      "description": "Number of schema-cache entries written by this invocation.\n\nPopulated by `rocky discover --with-schemas` — the explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.",
+      "description": "Number of schema-cache entries written by this invocation.\n\nPopulated by `rocky discover --with-schemas` — the explicit warm-up path for the schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.",
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"

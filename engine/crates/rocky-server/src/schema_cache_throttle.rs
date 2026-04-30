@@ -1,5 +1,4 @@
-//! Per-document throttle for Arc 7 wave 2 wave-2 schema-cache info logs in
-//! the LSP path.
+//! Per-document throttle for schema-cache info logs in the LSP path.
 //!
 //! The CLI emits a single info log per process when `load_source_schemas_from_cache`
 //! returns at least one entry. That pattern would turn into per-keystroke spam in

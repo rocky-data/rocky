@@ -25,7 +25,7 @@ export interface DiscoverOutput {
   /**
    * Number of schema-cache entries written by this invocation.
    *
-   * Populated by `rocky discover --with-schemas` — the explicit warm-up path for the Arc 7 wave 2 wave-2 schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
+   * Populated by `rocky discover --with-schemas` — the explicit warm-up path for the schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
    */
   schemas_cached?: number;
   sources: SourceOutput[];

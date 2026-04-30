@@ -1,17 +1,15 @@
 //! Persisted cache of warehouse `DESCRIBE TABLE` results.
 //!
-//! Arc 7 wave 2 wave-2 infrastructure. The cache is the mechanism that lets
-//! `rocky compile` / `rocky lsp` typecheck leaf models against real warehouse
-//! column types without paying a live `DESCRIBE` round-trip on every call.
-//! A `rocky run` or `rocky discover --with-schemas` writes here on success;
-//! the compiler loads a TTL-filtered snapshot on every subsequent compile.
+//! The cache is the mechanism that lets `rocky compile` / `rocky lsp`
+//! typecheck leaf models against real warehouse column types without
+//! paying a live `DESCRIBE` round-trip on every call. A `rocky run` or
+//! `rocky discover --with-schemas` writes here on success; the compiler
+//! loads a TTL-filtered snapshot on every subsequent compile.
 //!
 //! This module deliberately holds only the redb-persistable types. The
 //! `TypedColumn`-shaped loader lives in `rocky-compiler::schema_cache` —
 //! `rocky-core` does not depend on `rocky-compiler`, so the compiler-side
-//! wrapper owns the `ColumnInfo`/`TypedColumn` conversion. See the design
-//! doc at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md`
-//! section 4 for the full rationale.
+//! wrapper owns the `ColumnInfo`/`TypedColumn` conversion.
 //!
 //! Value shape in `state.redb`: `serde_json::to_vec(&SchemaCacheEntry)` —
 //! matches the encoding every other table in the state store uses
