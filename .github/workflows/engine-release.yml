@@ -77,6 +77,16 @@ jobs:
           workspaces: engine
           key: release-${{ matrix.target }}
 
+      # Windows: install NASM. `aws-lc-sys` (transitive dep of `jsonwebtoken`
+      # via the `aws_lc_rs` feature flag enabled in the workspace toml)
+      # builds AWS-LC's optimized crypto kernels from `.asm` sources on
+      # Windows and panics with "NASM command not found" without it. The
+      # macOS / Linux toolchains fall back to a YASM-equivalent assembler
+      # that ships with the runner image.
+      - name: Install NASM (Windows only)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       # Linux: free disk space and add swap (DuckDB C++ is memory-hungry)
       - name: Free disk space and add swap
         if: runner.os == 'Linux'
