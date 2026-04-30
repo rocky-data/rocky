@@ -10,7 +10,7 @@ class PreviewCopiedModel(BaseModel):
     """
     One entry in [`PreviewCreateOutput::copy_set`].
 
-    `copy_strategy` is `"ctas"` in Phase 1 (DuckDB CTAS or generic `CREATE TABLE AS SELECT *`); Phase 5 lifts this to `"shallow_clone"` (Databricks Delta) and `"zero_copy_clone"` (Snowflake) per the adapter's clone capability.
+    `copy_strategy` reports `"ctas"` for every successful copy regardless of which SQL primitive the adapter emitted under the hood. Databricks uses `SHALLOW CLONE` and BigQuery uses `CREATE TABLE ... COPY` (both metadata-only); DuckDB and Snowflake fall through to the portable CTAS default. Surfacing the per-adapter strategy in the wire output is a follow-up.
     """
 
     copy_strategy: str

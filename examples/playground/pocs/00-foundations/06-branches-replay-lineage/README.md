@@ -17,7 +17,10 @@ on a single 3-model DuckDB pipeline:
    land in a prefixed schema, leaving `main` untouched.
 2. **Branch-scoped runs** — `rocky run --branch fix-revenue` is the
    persistent analogue of `--shadow`. Warehouse-native zero-copy clones
-   (Delta `SHALLOW CLONE`, Snowflake `CLONE`) slot into the same API.
+   slot into the same API: Databricks emits `SHALLOW CLONE` and BigQuery
+   emits `CREATE TABLE … COPY` (both metadata-only) via the
+   `WarehouseAdapter::clone_table_for_branch` trait method. DuckDB and
+   Snowflake fall through to the portable CTAS default.
 3. **Replay** — `rocky replay latest` reads `RunRecord`s back from the
    state store: every model, SQL hash, row count, timings, per-model
    status. The reproducibility artefact for *"what exactly ran?"*.

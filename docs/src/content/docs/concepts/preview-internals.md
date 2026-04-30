@@ -21,9 +21,16 @@ sidebar:
 
 The final output ([`PreviewCreateOutput`](#output-shapes)) records `prune_set`, `copy_set`, and `skipped_set` so the decision is auditable from the JSON alone.
 
-### Copy substrate today and tomorrow
+### Copy substrate
 
-The Phase 1 copy substrate is `CREATE TABLE … AS SELECT *` (CTAS). It works on every Rocky-supported adapter without any adapter-specific work, but it copies bytes. Warehouse-native clones — Delta `SHALLOW CLONE` on Databricks, zero-copy `CLONE TABLE` on Snowflake, BigQuery's metadata-only `CREATE TABLE … COPY` — are a follow-up phase. They lift the copy step from a bytes-bearing CTAS to a metadata operation, which makes preview cheap enough to run on tables that would be uneconomic to CTAS today. The output's `copy_strategy` field is `"ctas"` until that phase lands.
+The copy substrate dispatches per-adapter via the `WarehouseAdapter::clone_table_for_branch` trait method:
+
+- **Databricks** — `CREATE OR REPLACE TABLE … SHALLOW CLONE …`. Metadata-only; the branch table references the source's underlying files until either side mutates.
+- **BigQuery** — `CREATE OR REPLACE TABLE … COPY …`. Metadata-only; same single-project scope as the source dataset.
+- **DuckDB** — `CREATE OR REPLACE TABLE … AS SELECT *` (CTAS). Bytes-copying but trivially portable; matches the trait's default impl, so the same code path works on any future adapter that doesn't override.
+- **Snowflake** — falls through to the CTAS default. Native zero-copy `CLONE TABLE` is a planned override; it'll switch in once a Snowflake consumer drives the integration test against a workspace.
+
+For the warehouses with native overrides (Databricks, BigQuery), `clone_table_for_branch` lifts the copy step from bytes-bearing CTAS to a metadata operation, which makes preview cheap enough to run on tables that would be uneconomic to CTAS today.
 
 ## Comparison to Fivetran's Smart Run
 
@@ -33,13 +40,12 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 |---|---|---|
 | Change detection | "Manifest-independent" — mechanism not specified in the article | git-diff plus compiler-IR type-equivalence (the compiler can tell that two textually different models produce identical column types and lineage) |
 | Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Column-level — derived from the compiler IR; a column added to an unused tail of a wide table prunes to zero downstream |
-| Copy substrate (today) | `COPY` ("the COPY command is free" per article) | CTAS — feature-parity in Phase 1 |
-| Copy substrate (planned) | — | Delta `SHALLOW CLONE` / Snowflake zero-copy `CLONE` (metadata-only) |
+| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` (both metadata-only), DuckDB CTAS, Snowflake CTAS pending native `CLONE` override |
 | Cost delta | Not surfaced in the article | First-class output ([`PreviewCostOutput`](#output-shapes)) |
 | Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
 | PR comment | Not described in the article | Pre-rendered Markdown in every output |
 
-The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages — column-level pruning, compile-time type-equivalence detection, native clones at the next phase — are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
+The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages — column-level pruning, compile-time type-equivalence detection, warehouse-native clones — are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
 
 ## Sampling correctness ceiling
 

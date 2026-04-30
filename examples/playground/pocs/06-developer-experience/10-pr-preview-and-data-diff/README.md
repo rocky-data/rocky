@@ -42,9 +42,13 @@ without rewriting dbt's compiler:
 - **Column-level pruning > model-level.** Compiler IR knows column-level
   dependencies. A column added to an unused tail of a wide table prunes
   to zero downstream — Smart Run has to re-run the whole subtree.
-- **Branches are the substrate.** Today schema-prefix branches; tomorrow
-  Delta `SHALLOW CLONE` / Snowflake zero-copy `CLONE` slot into the same
-  API at Phase 5 (strict dominance over `COPY` once that lands).
+- **Branches are the substrate.** Schema-prefix branches everywhere;
+  warehouse-native clones slot into the same API via the
+  `WarehouseAdapter::clone_table_for_branch` trait method — Databricks
+  `SHALLOW CLONE` and BigQuery `CREATE TABLE … COPY` (both metadata-only)
+  are live as of `engine-v1.19.1`. DuckDB and Snowflake use the portable
+  CTAS default; Snowflake's native `CLONE` lands when a Snowflake
+  consumer drives the integration test.
 - **Compile-time change detection > git-diff alone.** `rocky ci-diff`
   already does git-diff between refs and produces a structural diff;
   the next step — *"this textual change is type-equivalent and produces
@@ -61,11 +65,10 @@ Compare:
 | Property | Fivetran Smart Run | `rocky preview` |
 |---|---|---|
 | Pruning granularity | Model-level | Column-level (compiler IR) |
-| Copy substrate (Phase 1) | `COPY` | CTAS / `COPY` |
-| Copy substrate (Phase 5) | — | `SHALLOW CLONE` / zero-copy `CLONE` |
+| Copy substrate | `COPY` | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` (metadata-only); DuckDB / Snowflake CTAS |
 | Cost delta | Not surfaced | First-class output |
 | Data diff | Not surfaced | First-class output |
-| PR comment | Not described | First-class output (Phase 4) |
+| PR comment | Not described | First-class output |
 
 ## Layout
 

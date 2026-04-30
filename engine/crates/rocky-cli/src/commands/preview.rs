@@ -29,17 +29,20 @@ use crate::output::{
 /// Orchestrate pruned planning on a per-PR branch with copy-from-base for
 /// unchanged upstream.
 ///
-/// **Phase 1.5 scope.** Plans the prune-and-copy decision against the working
-/// DAG, registers the branch in the state store, and **executes** the
-/// copy-from-base step via `CREATE OR REPLACE TABLE ... AS SELECT *` against
-/// the configured warehouse adapter. Per-model `copy_strategy = "ctas"` on
-/// success, `"failed"` on a per-model error (the rest of the copy set still
-/// runs — partial-success surfaces in the output).
+/// Plans the prune-and-copy decision against the working DAG, registers
+/// the branch in the state store, and **executes** the copy-from-base
+/// step via the adapter's `clone_table_for_branch` trait method. The
+/// trait dispatches per adapter: Databricks uses `SHALLOW CLONE`,
+/// BigQuery uses `CREATE TABLE ... COPY` (both metadata-only); DuckDB
+/// and Snowflake fall through to the portable CTAS default. Per-model
+/// `copy_strategy = "ctas"` on success regardless of which underlying
+/// primitive ran, `"failed"` on a per-model error (the rest of the copy
+/// set still runs — partial-success surfaces in the output).
 ///
-/// Auto-invoking the actual run for the prune set is intentionally still
-/// deferred (the GitHub Action in Phase 4 orchestrates). `run_status` is
-/// `"planned"` for the prune set; `"copied"` is implicit for the copy set
-/// via `copy_strategy = "ctas"`.
+/// Auto-invoking the actual run for the prune set is intentionally
+/// still deferred (the GitHub Action orchestrates). `run_status` is
+/// `"planned"` for the prune set; `"copied"` is implicit for the copy
+/// set via `copy_strategy = "ctas"`.
 ///
 /// Steps:
 ///

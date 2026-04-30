@@ -527,7 +527,7 @@ rocky preview create --base main
 }
 ```
 
-`copy_strategy` is `"ctas"` in Phase 1. Warehouse-native clones (`"shallow_clone"` on Databricks, `"zero_copy_clone"` on Snowflake) are a planned follow-up.
+`copy_strategy` reports `"ctas"` for every successful copy regardless of which SQL primitive the adapter actually emitted. As of `engine-v1.19.1`, Databricks uses `SHALLOW CLONE` and BigQuery uses `CREATE TABLE … COPY` (both metadata-only) under the hood; DuckDB and Snowflake fall through to the portable CTAS default. Surfacing the per-adapter strategy in the wire output is a follow-up.
 
 ### `rocky preview diff`
 
