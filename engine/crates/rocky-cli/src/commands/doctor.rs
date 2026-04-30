@@ -141,16 +141,10 @@ pub async fn doctor(
             for (name, adapter) in &cfg.adapters {
                 if verbose {
                     details.push((format!("{name}.type"), adapter.adapter_type.clone()));
-                    let credential = if adapter.token.is_some() {
-                        "token"
-                    } else if adapter.client_id.is_some() {
-                        "oauth_client"
-                    } else if adapter.api_key.is_some() {
-                        "api_key"
-                    } else {
-                        "none"
-                    };
-                    details.push((format!("{name}.credential"), credential.into()));
+                    details.push((
+                        format!("{name}.credential"),
+                        credential_kind(adapter).into(),
+                    ));
                 }
                 match adapter.adapter_type.as_str() {
                     "databricks" => {
@@ -199,7 +193,10 @@ pub async fn doctor(
             let mut details = Vec::new();
             for (name, pipeline) in &cfg.pipelines {
                 if verbose {
-                    details.push((format!("pipeline.{name}"), "configured".into()));
+                    details.push((
+                        format!("pipeline.{name}"),
+                        pipeline.pipeline_type_str().into(),
+                    ));
                 }
                 // Check schema pattern is parseable (replication pipelines only)
                 if let Some(repl) = pipeline.as_replication() {
@@ -494,6 +491,29 @@ fn should_run(name: &str, filter: Option<&str>) -> bool {
     filter.is_none_or(|f| f == name)
 }
 
+/// Best-effort label for the credential shape an adapter is configured to use.
+///
+/// Surfaced in `rocky doctor --verbose` to help diagnose adapters that look
+/// healthy on a structural check but are wired to the wrong auth path. Order
+/// matches the auth precedence each adapter actually applies at connect time.
+fn credential_kind(adapter: &rocky_core::config::AdapterConfig) -> &'static str {
+    if adapter.token.is_some() {
+        "token"
+    } else if adapter.oauth_token.is_some() {
+        "oauth_token"
+    } else if adapter.private_key_path.is_some() {
+        "key_pair"
+    } else if adapter.client_id.is_some() {
+        "oauth_client"
+    } else if adapter.api_key.is_some() {
+        "api_key"
+    } else if adapter.password.is_some() {
+        "password"
+    } else {
+        "implicit"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +653,138 @@ mod tests {
 
         assert!(matches!(check.status, HealthStatus::Critical));
         assert!(check.message.contains("unauthorized"));
+    }
+
+    // -----------------------------------------------------------------------
+    // credential_kind — verbose adapter detail heuristic
+    // -----------------------------------------------------------------------
+
+    fn empty_adapter(adapter_type: &str) -> rocky_core::config::AdapterConfig {
+        rocky_core::config::AdapterConfig {
+            adapter_type: adapter_type.into(),
+            kind: None,
+            host: None,
+            http_path: None,
+            token: None,
+            client_id: None,
+            client_secret: None,
+            timeout_secs: None,
+            destination_id: None,
+            api_key: None,
+            api_secret: None,
+            account: None,
+            warehouse: None,
+            username: None,
+            password: None,
+            oauth_token: None,
+            private_key_path: None,
+            role: None,
+            database: None,
+            project_id: None,
+            location: None,
+            path: None,
+            retry: rocky_core::config::RetryConfig::default(),
+        }
+    }
+
+    #[test]
+    fn credential_kind_databricks_pat() {
+        let mut a = empty_adapter("databricks");
+        a.token = Some(rocky_core::redacted::RedactedString::new("dapi_x".into()));
+        assert_eq!(credential_kind(&a), "token");
+    }
+
+    #[test]
+    fn credential_kind_databricks_oauth_m2m() {
+        let mut a = empty_adapter("databricks");
+        a.client_id = Some("client_123".into());
+        a.client_secret = Some(rocky_core::redacted::RedactedString::new("secret".into()));
+        assert_eq!(credential_kind(&a), "oauth_client");
+    }
+
+    #[test]
+    fn credential_kind_snowflake_oauth() {
+        let mut a = empty_adapter("snowflake");
+        a.oauth_token = Some(rocky_core::redacted::RedactedString::new("oauth_x".into()));
+        assert_eq!(credential_kind(&a), "oauth_token");
+    }
+
+    #[test]
+    fn credential_kind_snowflake_keypair() {
+        let mut a = empty_adapter("snowflake");
+        a.private_key_path = Some("/etc/rocky/snowflake.pem".into());
+        assert_eq!(credential_kind(&a), "key_pair");
+    }
+
+    #[test]
+    fn credential_kind_snowflake_password() {
+        let mut a = empty_adapter("snowflake");
+        a.password = Some(rocky_core::redacted::RedactedString::new("pw".into()));
+        assert_eq!(credential_kind(&a), "password");
+    }
+
+    #[test]
+    fn credential_kind_fivetran_api_key() {
+        let mut a = empty_adapter("fivetran");
+        a.api_key = Some(rocky_core::redacted::RedactedString::new("key".into()));
+        assert_eq!(credential_kind(&a), "api_key");
+    }
+
+    /// BigQuery and DuckDB don't carry credentials in [adapter.*] — auth is
+    /// resolved from the environment (ADC, in-memory). "implicit" (rather
+    /// than "none") signals "not misconfigured, just env-based" and avoids
+    /// alarming a user whose adapter is actually fine.
+    #[test]
+    fn credential_kind_bigquery_implicit() {
+        let mut a = empty_adapter("bigquery");
+        a.project_id = Some("my-gcp-project".into());
+        a.location = Some("US".into());
+        assert_eq!(credential_kind(&a), "implicit");
+    }
+
+    /// Token wins when more than one credential field is set — matches the
+    /// auth precedence the Databricks adapter applies at connect time.
+    #[test]
+    fn credential_kind_token_precedence() {
+        let mut a = empty_adapter("databricks");
+        a.token = Some(rocky_core::redacted::RedactedString::new("t".into()));
+        a.client_id = Some("c".into());
+        a.password = Some(rocky_core::redacted::RedactedString::new("p".into()));
+        assert_eq!(credential_kind(&a), "token");
+    }
+
+    // -----------------------------------------------------------------------
+    // HealthCheck JSON contract — empty `details` must not appear in payloads
+    // (existing dagster fixtures depend on this; the field only materializes
+    // under `--verbose`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn health_check_json_omits_empty_details() {
+        let check = HealthCheck {
+            name: "config".into(),
+            status: HealthStatus::Healthy,
+            message: "ok".into(),
+            duration_ms: 0,
+            details: Vec::new(),
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(!json.contains("details"), "empty details leaked: {json}");
+    }
+
+    #[test]
+    fn health_check_json_emits_populated_details() {
+        let check = HealthCheck {
+            name: "config".into(),
+            status: HealthStatus::Healthy,
+            message: "ok".into(),
+            duration_ms: 0,
+            details: vec![("path".into(), "/etc/rocky.toml".into())],
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert!(
+            json.contains("\"details\":[[\"path\",\"/etc/rocky.toml\"]]"),
+            "{json}"
+        );
     }
 }
