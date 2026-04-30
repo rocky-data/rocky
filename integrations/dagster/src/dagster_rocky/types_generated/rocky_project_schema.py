@@ -691,7 +691,7 @@ class SchemaCacheConfig(BaseModel):
     """
     `[cache.schemas]` — schema cache configuration.
 
-    Controls the Arc 7 wave 2 wave-2 DESCRIBE-result cache. Defaults are chosen so the feature is useful out of the box: the cache is on, entries live for 24 hours, and nothing replicates off-machine until the user opts in. See the design doc at `~/Developer/rocky-plans/plans/rocky-arc7-wave2-wave2-design.md` (§4.3, §5.7) for the rationale.
+    Controls the DESCRIBE-result cache. Defaults are chosen so the feature is useful out of the box: the cache is on, entries live for 24 hours, and nothing replicates off-machine until the user opts in.
     """
 
     model_config = ConfigDict(
@@ -1029,7 +1029,7 @@ class CacheConfig(BaseModel):
         validate_default=True,
     )
     """
-    Schema cache (Arc 7 wave 2 wave-2). Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile.
+    Schema cache. Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile.
     """
 
 
@@ -2344,7 +2344,7 @@ class RockyConfig(BaseModel):
         validate_default=True,
     )
     """
-    Project-level cache configuration. Arc 7 wave 2 wave-2 introduces `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`].
+    Project-level cache configuration. Today this is just `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results); future cache surfaces live as sibling fields under [`CacheConfig`].
     """
     classifications: ClassificationsConfig | None = Field(
         {"allow_unmasked": []}, validate_default=True
