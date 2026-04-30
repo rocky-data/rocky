@@ -261,6 +261,54 @@ pub trait WarehouseAdapter: Send + Sync {
             "list_tables not supported by this adapter",
         ))
     }
+
+    /// Materialize `source` into `branch_schema` under the same table name.
+    ///
+    /// Used by `rocky preview create` to populate the per-PR branch schema
+    /// for every model not in the prune set, so the branch run only needs
+    /// to re-execute the changed-and-downstream slice. The default impl
+    /// is a portable `CREATE OR REPLACE TABLE "{branch}"."{table}" AS
+    /// SELECT * FROM "{src_schema}"."{table}"` that works on DuckDB and
+    /// any warehouse whose CTAS accepts the two-part `schema.table` form
+    /// without a catalog prefix. Adapters with native zero-copy primitives
+    /// (Databricks `SHALLOW CLONE`, Snowflake `CLONE`, BigQuery
+    /// `CREATE TABLE ... COPY`) override to swap CTAS for the cheaper
+    /// metadata-only operation.
+    ///
+    /// Lives on the in-tree `rocky-core` trait only — the SDK
+    /// `WarehouseAdapter` does not yet expose a clone primitive, and
+    /// `preview create` is already coupled to in-tree adapters via the
+    /// registry.
+    ///
+    /// `branch_schema` and `source.{schema,table}` are validated as SQL
+    /// identifiers before being interpolated into DDL; `source.catalog`
+    /// is ignored by the default impl so it stays portable to DuckDB
+    /// (which doesn't take a catalog prefix on CTAS in this shape).
+    /// Adapters that override are responsible for their own validation
+    /// and quoting.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any [`AdapterError`] from the underlying `execute_statement`
+    /// — most commonly "source table does not exist in base schema",
+    /// which `preview create` records as `copy_strategy = "failed"` so the
+    /// rest of the copy set still runs.
+    async fn clone_table_for_branch(
+        &self,
+        source: &TableRef,
+        branch_schema: &str,
+    ) -> AdapterResult<()> {
+        rocky_sql::validation::validate_identifier(branch_schema).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(&source.schema).map_err(AdapterError::new)?;
+        rocky_sql::validation::validate_identifier(&source.table).map_err(AdapterError::new)?;
+        let table = &source.table;
+        let src_schema = &source.schema;
+        let sql = format!(
+            "CREATE OR REPLACE TABLE \"{branch_schema}\".\"{table}\" AS \
+             SELECT * FROM \"{src_schema}\".\"{table}\""
+        );
+        self.execute_statement(&sql).await
+    }
 }
 
 // ---------------------------------------------------------------------------

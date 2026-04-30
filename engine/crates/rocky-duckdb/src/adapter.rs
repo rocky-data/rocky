@@ -250,4 +250,60 @@ mod tests {
         let sql = adapter.dialect().create_table_as("t", "SELECT 1");
         assert!(sql.contains("CREATE OR REPLACE TABLE t"));
     }
+
+    /// Conformance test for the default `clone_table_for_branch` impl.
+    ///
+    /// DuckDB doesn't override the trait method, so this case proves the
+    /// portable CTAS default actually clones rows from the source schema
+    /// into the branch schema. Future native-clone adapters
+    /// (Databricks SHALLOW CLONE, Snowflake CLONE, BigQuery COPY) will
+    /// add their own per-adapter cases; the DuckDB path stays the
+    /// canonical regression test for the default implementation.
+    #[tokio::test]
+    async fn clone_table_for_branch_default_path() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+
+        // Stand up a base schema with one row in it.
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS demo")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE TABLE demo.orders AS SELECT 1 AS id, 'a' AS name")
+            .await
+            .unwrap();
+
+        // Create the branch schema and clone the table into it.
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS branch__pr1")
+            .await
+            .unwrap();
+
+        let source = TableRef {
+            catalog: String::new(),
+            schema: "demo".into(),
+            table: "orders".into(),
+        };
+        adapter
+            .clone_table_for_branch(&source, "branch__pr1")
+            .await
+            .expect("default CTAS clone must succeed on DuckDB");
+
+        // Verify the cloned table contains the original row.
+        let result = adapter
+            .execute_query("SELECT id FROM branch__pr1.orders")
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1, "cloned table should carry the row");
+
+        // Validation guard: rejects identifiers that would otherwise enable
+        // SQL injection through the branch / source / table names.
+        assert!(
+            adapter
+                .clone_table_for_branch(&source, "branch; DROP TABLE demo.orders; --")
+                .await
+                .is_err(),
+            "branch_schema must be validated as a SQL identifier"
+        );
+    }
 }

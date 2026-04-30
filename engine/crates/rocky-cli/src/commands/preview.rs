@@ -1081,16 +1081,13 @@ pub fn empty_cost_summary() -> PreviewCostSummary {
 /// copy set still runs so the PR-comment surface is informative.
 ///
 /// **DuckDB note.** DuckDB CTAS doesn't accept the catalog prefix on
-/// every dialect path; the SQL is written without catalog qualifier
-/// (just `schema.table`) which works for DuckDB and the cloud
-/// warehouses. Phase 5 lifts to native clones with adapter-aware DDL.
-///
-/// **Why this isn't a new trait method.** `WarehouseAdapter::execute_statement`
-/// already covers what we need; introducing `clone_table` on the trait
-/// today would block the Phase 5 native-clone landing on a wider
-/// refactor. When Phase 5 ships native clones, that's the moment to
-/// introduce a `clone_table_from(&self, src, dst)` adapter method with
-/// the CTAS as the default impl.
+/// every dialect path; the default trait impl writes the SQL without a
+/// catalog qualifier (just `schema.table`), which works for DuckDB and
+/// the cloud warehouses. Adapters that ship native warehouse clones
+/// (Databricks `SHALLOW CLONE`, Snowflake `CLONE`, BigQuery
+/// `CREATE TABLE ... COPY`) override
+/// [`WarehouseAdapter::clone_table_for_branch`] in their own crates;
+/// this function only calls the trait method.
 async fn execute_copy_from_base(
     config_path: &Path,
     models_dir: &Path,
@@ -1159,12 +1156,17 @@ async fn execute_copy_from_base(
         };
         let source_schema = model.config.target.schema.clone();
         let table = model.config.target.table.clone();
+        let source_catalog = model.config.target.catalog.clone();
+        let source_ref = rocky_core::ir::TableRef {
+            catalog: source_catalog,
+            schema: source_schema.clone(),
+            table: table.clone(),
+        };
 
-        let ctas = format!(
-            "CREATE OR REPLACE TABLE \"{branch_schema}\".\"{table}\" AS \
-             SELECT * FROM \"{source_schema}\".\"{table}\""
-        );
-        match adapter.execute_statement(&ctas).await {
+        match adapter
+            .clone_table_for_branch(&source_ref, branch_schema)
+            .await
+        {
             Ok(()) => results.push(PreviewCopiedModel {
                 model_name: model_name.clone(),
                 source_schema,
