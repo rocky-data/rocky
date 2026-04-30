@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.2] — 2026-04-30
+
+CI-only re-cut of `1.19.1`. Source code is identical to `1.19.1`; binary semantics unchanged. Adds the missing Windows archive (and the `SHA256SUMS` checksums file gated on it) that the `1.19.1` matrix run failed to produce because `aws-lc-sys` (transitive dep of `jsonwebtoken` via the `aws_lc_rs` feature flag) needs NASM on the Windows runner to assemble AWS-LC's optimized crypto kernels — the macOS / Linux toolchains fall back to a YASM-equivalent that ships by default. The release workflow now installs NASM on the Windows job before `cargo build`. macOS / Linux v1.19.1 binaries are correct and stay valid; this release just fills in the cross-platform set.
+
 ## [1.19.1] — 2026-04-30
 
 Patch release. Headline: **`clone_table_for_branch` warehouse-native overrides on Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`)** turn the per-PR branch substrate from a portable CTAS that re-scans bytes into a metadata-only operation that's effectively zero-cost at create time. Snowflake stays on the CTAS default (still correct, just slower) until a Snowflake consumer asks for the native `CLONE` path.

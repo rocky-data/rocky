@@ -1,6 +1,6 @@
 [package]
 name = "rocky-server"
-version = "1.19.1"
+version = "1.19.2"
 description = "Rocky HTTP API server and LSP for IDE integration"
 edition.workspace = true
 license.workspace = true
