@@ -1,0 +1,17 @@
+# 11-lineage-diff — `rocky lineage-diff` PR-time blast-radius
+#
+# Transformation pipeline so the compiler IR has real column-level
+# dependencies for `rocky lineage-diff` to walk.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true

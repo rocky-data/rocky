@@ -1,5 +1,7 @@
 # 01-incremental-watermark — Watermark-based incremental replication
 
+![Two rocky run invocations sandwiching a 25-row append: run 1 copies 500 rows, run 2 copies the 25-row delta in 0.2s](../../../../../docs/public/demo-incremental-watermark.gif)
+
 > **Category:** 02-performance
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s

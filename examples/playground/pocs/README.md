@@ -1,6 +1,6 @@
 # POC Catalog
 
-53 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
+55 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
 
 ## Categories
 
@@ -10,7 +10,7 @@
 - [03-ai](03-ai/) — AI generation, sync, test generation, trust-arc 5 schema-grounded validation (5 POCs · `ANTHROPIC_API_KEY`)
 - [04-governance](04-governance/) — Unity Catalog grants, isolation, tagging (4 POCs · Databricks)
 - [05-orchestration](05-orchestration/) — Hooks, webhooks, state, resume, Valkey cache, trust-arc 3 circuit breaker (8 POCs · DuckDB / docker)
-- [06-developer-experience](06-developer-experience/) — Lineage, serve, dbt migration, shadow, CI, hybrid dbt workflows, trust-arc 4 trace-Gantt, trust-arc 6 portability lint, trust-arc 7 SQL types (9 POCs · DuckDB)
+- [06-developer-experience](06-developer-experience/) — Lineage, serve, dbt migration, shadow, CI, hybrid dbt workflows, trust-arc 4 trace-Gantt, trust-arc 6 portability lint, trust-arc 7 SQL types, PR-preview, lineage-diff (11 POCs · DuckDB)
 - [07-adapters](07-adapters/) — Snowflake, Databricks, Fivetran, custom adapter, BigQuery (5 POCs · mixed)
 
 ## Credentials at a glance
