@@ -2032,12 +2032,7 @@ mod tests {
     fn idempotency_key_explicit_flag_wins() {
         let _guard = ENV_LOCK.lock().unwrap();
         set_env("ROCKY_IDEMPOTENCY_KEY", "from_env");
-        let key = parse_run_idempotency_key(&[
-            "rocky",
-            "run",
-            "--idempotency-key",
-            "from_flag",
-        ]);
+        let key = parse_run_idempotency_key(&["rocky", "run", "--idempotency-key", "from_flag"]);
         remove_env("ROCKY_IDEMPOTENCY_KEY");
         assert_eq!(key.as_deref(), Some("from_flag"));
     }

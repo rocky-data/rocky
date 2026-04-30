@@ -81,10 +81,7 @@ async fn list_tables_403_classifies_as_auth() {
 
     assert_eq!(result.connectors.len(), 0);
     assert_eq!(result.failed.len(), 1);
-    assert_eq!(
-        result.failed[0].error_class,
-        FailedSourceErrorClass::Auth
-    );
+    assert_eq!(result.failed[0].error_class, FailedSourceErrorClass::Auth);
 }
 
 #[tokio::test]
