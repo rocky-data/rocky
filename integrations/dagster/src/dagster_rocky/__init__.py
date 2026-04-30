@@ -66,7 +66,13 @@ from .partitions import (
 from .resource import MIN_ROCKY_VERSION, Resolver, ResolverContext, RockyResource
 from .scaffold import init_rocky_project
 from .schedules import build_rocky_schedule
-from .sensor import rocky_source_sensor
+from .sensor import (
+    BacklogCap,
+    EmitContext,
+    FailedSourcesContext,
+    SkipContext,
+    rocky_source_sensor,
+)
 from .translator import RockyDagsterTranslator
 from .types import (
     AdapterTestResult,
@@ -172,6 +178,10 @@ __all__ = [
     "rocky_cron_automation",
     # Sensor + schedule (T1.3, T1.5)
     "rocky_source_sensor",
+    "BacklogCap",
+    "EmitContext",
+    "FailedSourcesContext",
+    "SkipContext",
     "build_rocky_schedule",
     # Observability (T4.1, T4.2, T4.4)
     "ANOMALY_CHECK_NAME",

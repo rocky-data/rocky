@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky_source_sensor` per-tag-key backlog cap (FR-015).** New opt-in `backlog_cap=BacklogCap(tag_key=..., max_in_flight=..., statuses=...)` argument that consults `context.instance.get_runs(...)` before each emit and suppresses the `RunRequest` when the in-flight count for the matched tag value is at or above the cap. The cursor still advances on suppression so the in-flight run picks up the latest data via Rocky's per-source state — avoiding the stuck-tick failure mode where freezing the cursor would re-detect the same sync forever. Default off; existing call sites unchanged. New `BacklogCap` NamedTuple is exported from the package root.
+- **`rocky_source_sensor` lifecycle hooks (FR-016).** Three new optional best-effort callbacks — `on_run_request_emitted`, `on_failed_sources`, `on_skip` — each receiving a frozen-dataclass context (`EmitContext` / `FailedSourcesContext` / `SkipContext`). Hooks fire after the sensor decides what to do and never block emits; raised exceptions are caught and logged at WARN. Lets consumers attach OTel metrics, alert webhooks, or audit logs without wrapping the sensor. The four new public types (`EmitContext`, `FailedSourcesContext`, `SkipContext`, plus the existing FR-015 `BacklogCap`) are exported from the package root.
+- **`rocky_source_sensor` resource-key injection (FR-017).** The `rocky_resource` argument now accepts either a `RockyResource` instance (legacy form, closure-captured) or a string key (new default `"rocky"`) that the sensor resolves through Dagster's required-resource injection at evaluation time. The keyed form is swap-safe (per-deployment overrides actually apply to the sensor), mock-friendly (`dg.build_sensor_context(resources={"rocky": ...})` works without monkeypatching), and removes the build-order coupling that previously forced the resource to exist before sensor construction. Existing instance-form call sites keep working with no change.
+
 ## [1.16.0] — 2026-04-30
 
 Companion release to engine `v1.19.0`. Picks up the regenerated Pydantic model for the new `rocky lineage-diff` command surface and wires it into the dispatch table.
