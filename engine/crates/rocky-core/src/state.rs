@@ -45,15 +45,14 @@ const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_
 /// zero-copy `CLONE`) are a follow-up — the schema-prefix approach ships first
 /// because it works uniformly across every adapter.
 const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
-/// Cache of `DESCRIBE TABLE` results for source warehouses (Arc 7 wave 2
-/// wave-2).
+/// Cache of `DESCRIBE TABLE` results for source warehouses.
 ///
 /// Key format: `"<catalog>.<schema>.<table>"` (lowercased). Value: serialized
 /// [`crate::schema_cache::SchemaCacheEntry`]. Read by
 /// `rocky_compiler::schema_cache::load_source_schemas_from_cache` to populate
 /// `CompilerConfig.source_schemas` without a live round-trip. Written
 /// opportunistically by `rocky run`'s drift/materialize paths and explicitly
-/// by `rocky discover --with-schemas` (wiring lands in PR 1b / PR 2 / PR 3).
+/// by `rocky discover --with-schemas`.
 ///
 /// Replicates as `replicate = false` by default in `state_sync.rs` so a fresh
 /// clone doesn't inherit another machine's stale types — see design doc §5.7.
@@ -1569,7 +1568,7 @@ impl StateStore {
     }
 
     // -----------------------------------------------------------------------
-    // Schema cache (Arc 7 wave 2 wave-2)
+    // Schema cache
     // -----------------------------------------------------------------------
 
     /// Read a single schema cache entry by key.
@@ -1802,11 +1801,12 @@ impl ResolvedStatePath {
 
 /// Resolve the canonical state-file path for a project.
 ///
-/// Unifies the CLI and LSP defaults that diverged through Arc 7 wave 2
-/// wave-2: the CLI wrote `./rocky-state.redb` in CWD while the LSP read
-/// `<models_dir>/.rocky-state.redb`, so the schema-cache write tap and
-/// inlay-hint read path missed each other in every project where they
-/// weren't already co-located.
+/// Unifies the CLI and LSP defaults: a divergence (CLI wrote
+/// `./rocky-state.redb` in CWD while the LSP read
+/// `<models_dir>/.rocky-state.redb`) made the schema-cache write tap and
+/// inlay-hint read path miss each other in every project where they
+/// weren't already co-located. This resolver is the single source of
+/// truth for both surfaces.
 ///
 /// Policy (checked in order):
 ///
@@ -2966,7 +2966,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Schema cache (Arc 7 wave 2 wave-2)
+    // Schema cache
     // -----------------------------------------------------------------------
 
     use crate::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};

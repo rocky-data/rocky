@@ -1,7 +1,7 @@
-//! Arc 7 wave 2 wave-2 PR 2 — `rocky run` write tap for the schema cache.
+//! `rocky run` write tap for the schema cache.
 //!
-//! Sibling to `source_schemas.rs` (the read helper wired in PR 1b). The two
-//! ends of the cache share the same `SchemaCacheConfig` gate, key shape, and
+//! Sibling to `source_schemas.rs` (the read helper). The two ends of
+//! the cache share the same `SchemaCacheConfig` gate, key shape, and
 //! `state.redb` table — only the direction of travel differs.
 //!
 //! The write tap hangs off `rocky run`'s batch `DESCRIBE TABLE` pass. Any code

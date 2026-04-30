@@ -49,11 +49,10 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
 
 /// Compile the project from a models directory.
 ///
-/// Wave-2 of Arc 7 wave 2: source schemas flow from the persisted cache
-/// (populated by `rocky run` / `rocky discover --with-schemas` in later
-/// PRs) so the AI prompt is grounded in real warehouse types when the
-/// cache is warm. Cold cache degrades to empty, which matches the
-/// pre-wave-2 behaviour this function had.
+/// Source schemas flow from the persisted cache (populated by
+/// `rocky run` / `rocky discover --with-schemas`) so the AI prompt is
+/// grounded in real warehouse types when the cache is warm. Cold cache
+/// degrades to empty.
 ///
 /// `cache_ttl_override` is the CLI `--cache-ttl` flag from PR 4.
 fn compile_project(

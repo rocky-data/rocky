@@ -700,10 +700,9 @@ pub async fn run(
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     partition_opts: &PartitionRunOptions,
     model_name_filter: Option<&str>,
-    // `--cache-ttl <seconds>` override (Arc 7 wave 2 wave-2 PR 4).
-    // Applied to the model-execution schema cache read; the replication
-    // path doesn't consult the cache, so this flag is a no-op for
-    // replication-only runs.
+    // `--cache-ttl <seconds>` override applied to the model-execution
+    // schema cache read; the replication path doesn't consult the
+    // cache, so this flag is a no-op for replication-only runs.
     cache_ttl_override: Option<u64>,
     // Caller-supplied `--idempotency-key`. `None` bypasses the dedup path
     // entirely. When `Some`, the run is skipped if the key already dedups
@@ -1684,11 +1683,11 @@ pub async fn run(
             }))
             .await;
 
-        // Arc 7 wave 2 wave-2 PR 2: tap successful describes into the schema
-        // cache. One key per table in the returned map — the DESCRIBE cost
-        // is already paid, so populating the cache for sibling tables is
-        // free signal for future compiles. Write failures are logged at
-        // `warn!` level and never fail the run.
+        // Tap successful describes into the schema cache. One key per
+        // table in the returned map — the DESCRIBE cost is already paid,
+        // so populating the cache for sibling tables is free signal for
+        // future compiles. Write failures are logged at `warn!` level
+        // and never fail the run.
         let mut schema_cache_tap = SchemaCacheWriteTap::default();
 
         for (side, cat, sch, result) in describe_results {
@@ -3309,15 +3308,13 @@ pub(crate) async fn execute_models(
     // the caller having to synthesise a fake pipeline name.
     hook_registry: Option<&HookRegistry>,
     pipeline_name: Option<&str>,
-    // Arc 7 wave 2 wave-2: honour `[cache.schemas]` for source-schema
-    // loading during compile. The write tap that keeps the cache fresh
-    // lands in PR 2; today the loader reads whatever's there.
+    // Honour `[cache.schemas]` for source-schema loading during compile.
     schema_cache_config: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
-    // Wave-2 of Arc 7 wave 2: load the persisted schema cache directly
-    // from the live `StateStore` — no round-trip through
+    // Load the persisted schema cache directly from the live
+    // `StateStore` — no round-trip through
     // `crate::source_schemas::load_cached_source_schemas`, because that
     // helper opens a read-only handle and we already hold a write-capable
     // one here. Degrades silently when the cache is cold or disabled.

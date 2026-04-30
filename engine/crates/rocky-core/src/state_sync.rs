@@ -143,9 +143,9 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
 /// errors. Set `on_upload_failure = "fail"` for strict environments that must
 /// treat state durability as a hard requirement.
 ///
-/// Tables listed in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] are filtered out
-/// of the remote copy by default — Arc 7 wave 2 wave-2 wires the schema cache
-/// here (design doc §5.7). Use
+/// Tables listed in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] are filtered
+/// out of the remote copy by default — the schema cache is wired here so
+/// fresh clones don't inherit another machine's stale types. Use
 /// [`upload_state_with_excluded_tables`] to override the default when
 /// `[cache.schemas] replicate = true` is configured.
 pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
@@ -207,12 +207,12 @@ pub async fn upload_state_with_excluded_tables(
 
 /// Build a temp redb copy of `local_path` with `excluded_tables` removed.
 ///
-/// Returns the path of the temp copy. Caller is responsible for deleting it.
-/// Used by the replicate-filtered upload path (Arc 7 wave 2 wave-2,
-/// design doc §5.7). Kept small and synchronous — the schema cache is the
-/// only local-only table today, its footprint is bounded by TTL (§4.3),
-/// and the round-trip file copy is proportional to total state size (order
-/// of single-digit megabytes for a typical project).
+/// Returns the path of the temp copy. Caller is responsible for deleting
+/// it. Used by the replicate-filtered upload path. Kept small and
+/// synchronous — the schema cache is the only local-only table today,
+/// its footprint is bounded by TTL, and the round-trip file copy is
+/// proportional to total state size (order of single-digit megabytes for
+/// a typical project).
 fn strip_local_only_tables(
     local_path: &Path,
     excluded_tables: &[&str],
@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // strip_local_only_tables (Arc 7 wave 2 wave-2)
+    // strip_local_only_tables
     // -----------------------------------------------------------------------
 
     use crate::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};

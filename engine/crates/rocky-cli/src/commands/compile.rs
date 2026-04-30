@@ -21,8 +21,8 @@ use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 ///
 /// `cache_ttl_override`: optional CLI flag value from the binary's
 /// `--cache-ttl <seconds>` global arg. Replaces
-/// `[cache.schemas] ttl_seconds` for this invocation only (Arc 7 wave 2
-/// wave-2 PR 4). `None` keeps the config/default TTL.
+/// `[cache.schemas] ttl_seconds` for this invocation only. `None`
+/// keeps the config/default TTL.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compile(
     config_path: Option<&Path>,
@@ -36,22 +36,22 @@ pub fn run_compile(
     with_seed: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    // `source_schemas` precedence (Arc 7 wave 2):
-    //   1. `--with-seed` wins -> wave-1 seed loader (explicit user intent,
+    // `source_schemas` precedence:
+    //   1. `--with-seed` wins -> seed loader (explicit user intent,
     //      used for tests/playgrounds where the cache is irrelevant).
-    //   2. Otherwise, the wave-2 schema cache if `[cache.schemas] enabled`.
-    //   3. Cold-cache fallback: empty map — typecheck degrades to Unknown,
-    //      which matches pre-wave-2 behaviour.
+    //   2. Otherwise, the schema cache if `[cache.schemas] enabled`.
+    //   3. Cold-cache fallback: empty map — typecheck degrades to
+    //      Unknown.
     let source_schemas = if with_seed {
-        // Wave-1: run `data/seed.sql` in in-memory DuckDB, read columns
-        // from its `information_schema`. Turns leaf .sql models from
-        // `RockyType::Unknown` into concrete types for any project that
-        // ships a runnable seed (the entire playground).
+        // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
+        // columns from its `information_schema`. Turns leaf .sql models
+        // from `RockyType::Unknown` into concrete types for any project
+        // that ships a runnable seed (the entire playground).
         load_source_schemas_from_seed(models_dir)?
     } else if let Some(path) = config_path {
-        // Wave-2: TTL-filtered load from `state.redb`'s `SCHEMA_CACHE`
-        // table. Honours `[cache.schemas] enabled` + `ttl_seconds`
-        // (after applying the optional CLI `--cache-ttl` override).
+        // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
+        // Honours `[cache.schemas] enabled` + `ttl_seconds` (after
+        // applying the optional CLI `--cache-ttl` override).
         match rocky_config::load_rocky_config(path) {
             Ok(cfg) => {
                 let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
@@ -340,8 +340,8 @@ fn build_p001_diagnostic(
         .with_suggestion(issue.suggestion.clone())
 }
 
-/// Wave-1 of Arc 7 wave 2: load source schemas from a project's
-/// `data/seed.sql` by running it against an in-memory DuckDB.
+/// Load source schemas from a project's `data/seed.sql` by running it
+/// against an in-memory DuckDB.
 ///
 /// Resolution: walks up from `models_dir` looking for `data/seed.sql`. The
 /// playground convention is `<project>/models/` + `<project>/data/seed.sql`,
@@ -740,7 +740,7 @@ schema_template = "s"
         .expect("missing config should fall through, not error");
     }
 
-    // ---- Wave-1 of Arc 7 wave 2: --with-seed source-schema loading ----
+    // ---- --with-seed source-schema loading ----
 
     #[cfg(feature = "duckdb")]
     fn write_seed(project_dir: &Path, sql: &str) {
@@ -877,7 +877,7 @@ schema_template = "s"
         ));
     }
 
-    // ---- Wave-2 of Arc 7 wave 2: cache-backed source_schemas ----
+    // ---- cache-backed source_schemas ----
 
     /// End-to-end wiring check: seed a `SchemaCacheEntry` in `state.redb`,
     /// run `rocky compile` without `--with-seed`, and confirm the cached

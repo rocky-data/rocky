@@ -161,10 +161,10 @@ pub async fn discover(
         });
     }
 
-    // Cache warm-up (Arc 7 wave 2 wave-2 PR 3, design doc §4.2 route B).
-    // Only runs when `--with-schemas` is set; config gating already happened
-    // at the top of this function. Errors inside the warm-up are logged and
-    // counted as misses — a bad source shouldn't abort the whole discovery.
+    // Schema-cache warm-up. Only runs when `--with-schemas` is set;
+    // config gating already happened at the top of this function.
+    // Errors inside the warm-up are logged and counted as misses — a
+    // bad source shouldn't abort the whole discovery.
     let schemas_cached = if with_schemas {
         warm_schema_cache(&adapter_registry, &pipeline.source, connectors, state_path).await?
     } else {
@@ -261,7 +261,7 @@ async fn build_source_table_sets(
     map
 }
 
-/// Populate the Arc 7 wave 2 wave-2 schema cache for every discovered source.
+/// Populate the schema cache for every discovered source.
 ///
 /// For each unique `(catalog, schema)` pair reachable via the source's
 /// warehouse `BatchCheckAdapter`, issues a single `batch_describe_schema`

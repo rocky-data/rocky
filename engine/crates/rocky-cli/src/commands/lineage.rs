@@ -32,8 +32,8 @@ fn to_edge_record(edge: &rocky_compiler::semantic::LineageEdge) -> LineageEdgeRe
 /// Execute `rocky lineage`.
 ///
 /// `cache_ttl_override`: optional CLI `--cache-ttl <seconds>` value
-/// (Arc 7 wave 2 wave-2 PR 4). Replaces `[cache.schemas] ttl_seconds`
-/// for this invocation only.
+/// that replaces `[cache.schemas] ttl_seconds` for this invocation
+/// only.
 #[allow(clippy::too_many_arguments)]
 pub fn run_lineage(
     config_path: &Path,
@@ -46,9 +46,9 @@ pub fn run_lineage(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    // Wave-2 of Arc 7 wave 2: load cached warehouse schemas so lineage
-    // edges inherit real types instead of `RockyType::Unknown` on the
-    // leaves. Degrades to empty on cold cache / missing config.
+    // Load cached warehouse schemas so lineage edges inherit real
+    // types instead of `RockyType::Unknown` on the leaves. Degrades to
+    // empty on cold cache / missing config.
     let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);

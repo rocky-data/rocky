@@ -1,13 +1,12 @@
-//! Shared helper for loading the Arc 7 wave 2 wave-2 schema cache into the
-//! typecheck pipeline.
+//! Shared helper for loading the schema cache into the typecheck
+//! pipeline.
 //!
 //! Every `rocky <verb>` whose internal flow calls
 //! `rocky_compiler::compile::compile` used to pass
-//! `source_schemas: HashMap::new()` — which forces the typechecker to treat
-//! every leaf `FROM <schema>.<table>` as `RockyType::Unknown`. Wave-1 seeded
-//! that map from DuckDB (`--with-seed`); wave-2 seeds it from a persisted
-//! redb cache written by prior `rocky run` / `rocky discover --with-schemas`
-//! invocations (PRs 2-3).
+//! `source_schemas: HashMap::new()` — which forces the typechecker to
+//! treat every leaf `FROM <schema>.<table>` as `RockyType::Unknown`. The
+//! map is now seeded from a persisted redb cache written by prior
+//! `rocky run` / `rocky discover --with-schemas` invocations.
 //!
 //! This helper collapses the read-path boilerplate — config gating, optional
 //! state-store open, TTL application, log emission — into one call. PR 1b
@@ -204,11 +203,11 @@ mod tests {
 
     #[test]
     fn cache_ttl_override_flips_hit_to_miss() {
-        // Arc 7 wave 2 wave-2 PR 4: `--cache-ttl <seconds>` overrides
-        // `[cache.schemas] ttl_seconds`. Baseline (default 24h): a
-        // 1-hour-old entry is a hit. With `--cache-ttl 30` (30s) the
-        // same entry is a miss — the CLI-flag-overridden config is
-        // what `load_cached_source_schemas` ends up using.
+        // `--cache-ttl <seconds>` overrides `[cache.schemas]
+        // ttl_seconds`. Baseline (default 24h): a 1-hour-old entry is a
+        // hit. With `--cache-ttl 30` (30s) the same entry is a miss —
+        // the CLI-flag-overridden config is what
+        // `load_cached_source_schemas` ends up using.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("state.redb");
         {
