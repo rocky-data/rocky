@@ -344,6 +344,38 @@ impl WarehouseAdapter for BigQueryAdapter {
             .collect();
         Ok(tables)
     }
+
+    /// Override the trait default: emit BigQuery's native
+    /// `CREATE OR REPLACE TABLE ... COPY` instead of CTAS. The branch
+    /// table lands in `<source.catalog>.<branch_schema>.<source.table>` —
+    /// same project as the source, since BigQuery's `COPY` primitive is
+    /// scoped to a single project (cross-region multi-region datasets
+    /// are fine, but cross-project is not).
+    ///
+    /// `COPY` is a metadata-only operation: the new table references the
+    /// same physical storage as the source until either side mutates,
+    /// so the per-PR branch is effectively zero-cost at create time.
+    /// Strictly dominates the default CTAS implementation, which would
+    /// re-scan the source bytes.
+    async fn clone_table_for_branch(
+        &self,
+        source: &TableRef,
+        branch_schema: &str,
+    ) -> AdapterResult<()> {
+        validate_identifier(&source.catalog).map_err(AdapterError::new)?;
+        validate_identifier(&source.schema).map_err(AdapterError::new)?;
+        validate_identifier(&source.table).map_err(AdapterError::new)?;
+        validate_identifier(branch_schema).map_err(AdapterError::new)?;
+
+        let project = &source.catalog;
+        let src_dataset = &source.schema;
+        let table = &source.table;
+        let sql = format!(
+            "CREATE OR REPLACE TABLE `{project}`.`{branch_schema}`.`{table}` \
+             COPY `{project}`.`{src_dataset}`.`{table}`"
+        );
+        self.execute_statement(&sql).await
+    }
 }
 
 /// Extract [`ExecutionStats`] from a successful [`BigQueryResponse`].
