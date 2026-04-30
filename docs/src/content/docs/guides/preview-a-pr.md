@@ -131,7 +131,7 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op
 
 **`preview cost` reports `null` for the branch.** The cost rollup uses the same adapter telemetry as [`rocky cost`](/reference/commands/administration/#rocky-cost). DuckDB and unconfigured adapters report `null` USD by design; duration and bytes still surface. Configure `[cost]` in `rocky.toml` to get dollar amounts on Databricks / Snowflake.
 
-**Copy step is slow.** Phase 1 uses CTAS, which physically copies bytes for every copy-set table. On large tables this is the dominant cost of `preview create`. Warehouse-native clones (`SHALLOW CLONE` on Databricks, zero-copy `CLONE` on Snowflake) lift this to a metadata operation; they're a planned follow-up but not yet shipped.
+**Copy step is slow.** The copy substrate dispatches per adapter via `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`) both ship metadata-only overrides as of `engine-v1.19.1` — the per-PR branch table is effectively zero-cost at create time. DuckDB and Snowflake fall through to the portable CTAS default, which physically copies bytes; on large tables this is the dominant cost of `preview create`. Snowflake's native zero-copy `CLONE` will land once a Snowflake consumer drives the integration test against a workspace.
 
 **The diff finds no changes but the model definitely changed.** Check `summary.any_coverage_warning` in the JSON output. If it's `true`, the sampling window missed the changed rows — see the section above.
 
