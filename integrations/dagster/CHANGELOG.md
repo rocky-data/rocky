@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-04-30
+
+Companion release to engine `v1.19.0`. Picks up the regenerated Pydantic model for the new `rocky lineage-diff` command surface and wires it into the dispatch table.
+
+### Added
+
+- **`LineageDiffOutput` Pydantic model + `parse_rocky_output` route** ([#298](https://github.com/rocky-data/rocky/pull/298)). Regenerated from engine v1.19.0's `lineage_diff.schema.json`. New `lineage_diff_schema.py` in `types_generated/`; barrel + curated `types.py` re-exports `LineageDiffOutput`, `LineageDiffResult`, `LineageColumnChange`. `parse_rocky_output` dispatch table grew a `"lineage-diff" → LineageDiffOutput` entry so PyPI consumers decode `lineage-diff` envelopes via the existing facade. Round-tripped end-to-end before merge.
+
 ## [1.15.0] — 2026-04-29
 
 Companion release to engine `v1.18.0`. Picks up regenerated Pydantic models for the `rocky preview` command surface (`PreviewCreateOutput` / `PreviewDiffOutput` / `PreviewCostOutput`) and ships a P1 hardening cluster in the resource + component layer.

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-04-30
+
+Feature release. Headline: **`rocky lineage-diff`** — a new top-level CLI verb that combines `rocky ci-diff`'s structural per-column diff with `rocky lineage --downstream`'s blast-radius walk, emitting a PR-comment-ready Markdown summary of which downstream columns each PR change reaches. Closes the launch-thread commitment to `xiaoher-c` ([HN item 47935246](https://news.ycombinator.com/item?id=47935246)).
+
+Bundled with the public adapter SDK guide + Rust-native skeleton POC that close the launch-thread commitment to `hasyimibhar` (community-driven adapter contributions are now genuinely *"tractable through the Adapter SDK without engine patching"*).
+
+### Added
+
+- **`rocky lineage-diff [<base_ref>]`** ([#298](https://github.com/rocky-data/rocky/pull/298)). New top-level CLI verb. Internally factors a `pub(crate) compute_ci_diff` out of `commands/ci_diff.rs::run_ci_diff` returning `CiDiffData { summary, results, head_compile, changed_file_count }` so both `ci-diff` and `lineage-diff` run git + compile once and share the diff result. `commands/lineage_diff.rs::run_lineage_diff` enriches each `ColumnDiff` via `semantic_graph::trace_column_downstream(model, col)` and dedupes consumers by `(target.model, target.column)`. New `LineageDiffOutput` schema in `output.rs` with sibling `LineageDiffResult` + `LineageColumnChange`; reuses `LineageQualifiedColumn`. Pre-rendered Markdown lives on `LineageDiffOutput.markdown` so a CI-side caller posts the PR comment without re-parsing. v1 trace direction is downstream-from-HEAD only — removed columns report empty consumer sets and the Markdown row reads `_(removed; not traceable on HEAD)_`. Codegen cascade clean (1 new schema → 1 Pydantic file → 1 TypeScript file).
+- **Adapter SDK guide + Rust-native skeleton POC** ([#300](https://github.com/rocky-data/rocky/pull/300)). New `docs/src/content/docs/guides/adapter-sdk.md` (eight sections: when-to-use, full trait surface table, worked example, auth + connection, testing, distribution, gotchas, next steps) + standalone POC at `examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton/`. POC is intentionally NOT a workspace member — models the out-of-tree consumer experience. ClickHouse-shaped: backtick quoting, two-part names, no `MERGE`, partition replace via `ALTER TABLE ... DELETE` + `INSERT`. 11 unit tests; `cargo run --example demo` prints generated SQL end-to-end against an in-memory `MockBackend`. The guide is honestly upfront about three current SDK gaps (two-trait-surface confusion between `rocky-adapter-sdk` and `rocky-core`; static adapter registry; `conformance::run_conformance` is a checklist, not a runner) — tracked as backlog items for future SDK work.
+- **3 new demo GIFs + lineage-diff POC** ([#301](https://github.com/rocky-data/rocky/pull/301)). VHS-rendered `demo-classification-masking.gif` (governance), `demo-incremental-watermark.gif`, `demo-lineage-diff.gif` embedded in the top-level README + relevant POC READMEs. New POC at `examples/playground/pocs/06-developer-experience/11-lineage-diff/` sets up a self-contained scratch git repo with baseline + feature branch and runs `rocky lineage-diff main` to surface 5 column changes across 2 modified models.
+
+### Changed
+
+- **`commands/ci_diff.rs::run_ci_diff` refactored to share its body via `compute_ci_diff`** ([#298](https://github.com/rocky-data/rocky/pull/298)). Pure refactor — JSON output and human-readable messaging are byte-identical to v1.18.0 (the "no changed model files detected" vs "X file(s) changed, but no model files affected" distinction is preserved via the new `changed_file_count` field on `CiDiffData`). `lineage-diff` is the second consumer.
+
 ## [1.18.0] — 2026-04-29
 
 Feature + audit-sweep release. Headline: **`rocky preview`** ships end-to-end — a new top-level command that builds a per-PR branch pre-populated from the base ref, computes a structural + sampled-data diff against base, runs a cost-delta projection, and a companion GitHub Action posts the result as a single PR comment. Also bundles a security audit closeout (#285–#287, #290–#293), a `[budget].max_bytes_scanned` gate, and Snowflake / BigQuery auth fixes.
