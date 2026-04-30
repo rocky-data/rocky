@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-04-30
+
+Tracks engine `v1.19.0`. Regenerated TypeScript bindings for the new `rocky lineage-diff` command surface. No extension feature changes.
+
+### Added
+
+- **TS interface for `rocky lineage-diff`** ([#298](https://github.com/rocky-data/rocky/pull/298)). Regenerated `src/types/generated/lineage_diff.ts` from engine v1.19.0 schemas — full typed surface (`LineageDiffOutput`, `LineageDiffResult`, `LineageColumnChange`) for any future webview / command that wants to consume `rocky lineage-diff`. Barrel `index.ts` updated.
+
 ## [1.10.0] — 2026-04-29
 
 Tracks engine `v1.18.0`. Regenerated TypeScript bindings for the new `rocky preview` command surface plus the additive `[budget].max_bytes_scanned` field on `RunOutput`. No extension feature changes.
