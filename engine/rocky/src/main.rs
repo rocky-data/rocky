@@ -905,6 +905,9 @@ enum Command {
         /// Run only a specific check (config, state, adapters, pipelines, state_sync)
         #[arg(long)]
         check: Option<String>,
+        /// Print extra context for each check (config path, state file size, adapter type, credential type).
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Governance compliance rollup: classification tags + `[mask]`
@@ -1879,8 +1882,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 rocky_cli::commands::list_consumers(&model, &models, json)
             }
         },
-        Command::Doctor { check } => {
-            rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref()).await
+        Command::Doctor { check, verbose } => {
+            rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref(), verbose)
+                .await
         }
         Command::Compliance {
             env,

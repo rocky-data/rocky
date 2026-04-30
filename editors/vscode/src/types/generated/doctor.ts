@@ -24,6 +24,7 @@ export interface DoctorOutput {
  * A single health check result.
  */
 export interface HealthCheck {
+  details?: [string, string][];
   duration_ms: number;
   message: string;
   name: string;

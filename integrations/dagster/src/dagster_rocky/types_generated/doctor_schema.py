@@ -23,6 +23,7 @@ class HealthCheck(BaseModel):
     A single health check result.
     """
 
+    details: list[list[str]] | None = None
     duration_ms: conint(ge=0)
     message: str
     name: str

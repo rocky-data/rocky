@@ -21,6 +21,8 @@ pub struct HealthCheck {
     pub status: HealthStatus,
     pub message: String,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub details: Vec<(String, String)>,
 }
 
 /// Doctor output structure.
@@ -38,6 +40,7 @@ pub async fn doctor(
     state_path: &Path,
     output_json: bool,
     check_filter: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     let mut checks: Vec<HealthCheck> = Vec::new();
     let mut suggestions: Vec<String> = Vec::new();
@@ -45,6 +48,11 @@ pub async fn doctor(
     // 1. Config validation
     if should_run("config", check_filter) {
         let start = Instant::now();
+        let details = if verbose {
+            vec![("path".into(), config_path.display().to_string())]
+        } else {
+            Vec::new()
+        };
         match rocky_core::config::load_rocky_config(config_path) {
             Ok(_) => {
                 checks.push(HealthCheck {
@@ -52,6 +60,7 @@ pub async fn doctor(
                     status: HealthStatus::Healthy,
                     message: "Config syntax valid".into(),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    details,
                 });
             }
             Err(e) => {
@@ -60,6 +69,7 @@ pub async fn doctor(
                     status: HealthStatus::Critical,
                     message: format!("Config invalid: {e}"),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    details,
                 });
                 suggestions.push(format!("Fix config file at {}", config_path.display()));
             }
@@ -69,6 +79,20 @@ pub async fn doctor(
     // 2. State store
     if should_run("state", check_filter) {
         let start = Instant::now();
+        let details = if verbose {
+            let mut details = vec![("path".into(), state_path.display().to_string())];
+            if state_path.exists() {
+                details.push((
+                    "size_bytes".into(),
+                    std::fs::metadata(state_path)
+                        .map(|metadata| metadata.len().to_string())
+                        .unwrap_or_else(|_| "n/a".into()),
+                ));
+            }
+            details
+        } else {
+            Vec::new()
+        };
         match rocky_core::state::StateStore::open_read_only(state_path) {
             Ok(store) => {
                 // Try reading watermarks to verify the DB is healthy
@@ -79,6 +103,7 @@ pub async fn doctor(
                             status: HealthStatus::Healthy,
                             message: format!("State store healthy ({} watermarks)", wms.len()),
                             duration_ms: start.elapsed().as_millis() as u64,
+                            details,
                         });
                     }
                     Err(e) => {
@@ -87,6 +112,7 @@ pub async fn doctor(
                             status: HealthStatus::Warning,
                             message: format!("State store read error: {e}"),
                             duration_ms: start.elapsed().as_millis() as u64,
+                            details,
                         });
                         suggestions.push(
                             "State store may be corrupted — try deleting and re-running".into(),
@@ -100,6 +126,7 @@ pub async fn doctor(
                     status: HealthStatus::Warning,
                     message: format!("Cannot open state store: {e}"),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    details,
                 });
             }
         }
@@ -110,7 +137,21 @@ pub async fn doctor(
         let start = Instant::now();
         if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
             let mut adapter_ok = true;
+            let mut details = Vec::new();
             for (name, adapter) in &cfg.adapters {
+                if verbose {
+                    details.push((format!("{name}.type"), adapter.adapter_type.clone()));
+                    let credential = if adapter.token.is_some() {
+                        "token"
+                    } else if adapter.client_id.is_some() {
+                        "oauth_client"
+                    } else if adapter.api_key.is_some() {
+                        "api_key"
+                    } else {
+                        "none"
+                    };
+                    details.push((format!("{name}.credential"), credential.into()));
+                }
                 match adapter.adapter_type.as_str() {
                     "databricks" => {
                         if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
@@ -145,6 +186,7 @@ pub async fn doctor(
                     "Some adapters have missing configuration".into()
                 },
                 duration_ms: start.elapsed().as_millis() as u64,
+                details,
             });
         }
     }
@@ -153,9 +195,12 @@ pub async fn doctor(
     if should_run("pipelines", check_filter) {
         let start = Instant::now();
         if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
-            let pipeline_count = cfg.pipelines.len();
             let mut issues = Vec::new();
+            let mut details = Vec::new();
             for (name, pipeline) in &cfg.pipelines {
+                if verbose {
+                    details.push((format!("pipeline.{name}"), "configured".into()));
+                }
                 // Check schema pattern is parseable (replication pipelines only)
                 if let Some(repl) = pipeline.as_replication() {
                     if let Err(e) = repl.schema_pattern() {
@@ -163,6 +208,7 @@ pub async fn doctor(
                     }
                 }
             }
+            let pipeline_count = cfg.pipelines.len();
             checks.push(HealthCheck {
                 name: "pipelines".into(),
                 status: if issues.is_empty() {
@@ -176,6 +222,7 @@ pub async fn doctor(
                     format!("{} issue(s) found", issues.len())
                 },
                 duration_ms: start.elapsed().as_millis() as u64,
+                details,
             });
             suggestions.extend(issues);
         }
@@ -187,6 +234,11 @@ pub async fn doctor(
         if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
             let backend = &cfg.state.backend;
             let has_remote = *backend != rocky_core::config::StateBackend::Local;
+            let details = if verbose {
+                vec![("backend".into(), backend.to_string())]
+            } else {
+                Vec::new()
+            };
             checks.push(HealthCheck {
                 name: "state_sync".into(),
                 status: if has_remote {
@@ -196,6 +248,7 @@ pub async fn doctor(
                 },
                 message: format!("State backend: {backend}"),
                 duration_ms: start.elapsed().as_millis() as u64,
+                details,
             });
             if !has_remote {
                 suggestions
@@ -213,12 +266,18 @@ pub async fn doctor(
         let start = Instant::now();
         if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
             let backend = &cfg.state.backend;
+            let details = if verbose {
+                vec![("backend".into(), backend.to_string())]
+            } else {
+                Vec::new()
+            };
             if *backend == rocky_core::config::StateBackend::Local {
                 checks.push(HealthCheck {
                     name: "state_rw".into(),
                     status: HealthStatus::Healthy,
                     message: "Local backend — no remote probe needed".into(),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    details,
                 });
             } else {
                 match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
@@ -228,6 +287,7 @@ pub async fn doctor(
                             status: HealthStatus::Healthy,
                             message: format!("State backend RW probe succeeded ({backend})"),
                             duration_ms: start.elapsed().as_millis() as u64,
+                            details,
                         });
                     }
                     Err(e) => {
@@ -236,6 +296,7 @@ pub async fn doctor(
                             status: HealthStatus::Critical,
                             message: format!("State backend RW probe failed: {e}"),
                             duration_ms: start.elapsed().as_millis() as u64,
+                            details,
                         });
                         suggestions.push(format!(
                             "state_rw: verify the '{backend}' backend has read+write access \
@@ -262,6 +323,7 @@ pub async fn doctor(
                                 status: HealthStatus::Warning,
                                 message: "No warehouse adapters registered".into(),
                                 duration_ms: start.elapsed().as_millis() as u64,
+                                details: Vec::new(),
                             });
                         } else {
                             let mut all_ok = true;
@@ -275,6 +337,7 @@ pub async fn doctor(
                                             status: HealthStatus::Healthy,
                                             message: format!("Authenticated to {name}"),
                                             duration_ms: ping_start.elapsed().as_millis() as u64,
+                                            details: Vec::new(),
                                         });
                                     }
                                     Err(e) => {
@@ -284,6 +347,7 @@ pub async fn doctor(
                                             status: HealthStatus::Critical,
                                             message: format!("Ping failed: {e}"),
                                             duration_ms: ping_start.elapsed().as_millis() as u64,
+                                            details: Vec::new(),
                                         });
                                         suggestions.push(format!(
                                             "Adapter '{name}': verify credentials and network access"
@@ -292,6 +356,11 @@ pub async fn doctor(
                                 }
                             }
                             if all_ok {
+                                let details = if verbose {
+                                    vec![("warehouse_count".into(), names.len().to_string())]
+                                } else {
+                                    Vec::new()
+                                };
                                 checks.push(HealthCheck {
                                     name: "auth".into(),
                                     status: HealthStatus::Healthy,
@@ -300,6 +369,7 @@ pub async fn doctor(
                                         names.len()
                                     ),
                                     duration_ms: start.elapsed().as_millis() as u64,
+                                    details,
                                 });
                             }
                         }
@@ -316,6 +386,7 @@ pub async fn doctor(
                                         status: HealthStatus::Healthy,
                                         message: format!("Discovery adapter {name} reachable"),
                                         duration_ms: ping_start.elapsed().as_millis() as u64,
+                                        details: Vec::new(),
                                     });
                                 }
                                 Err(e) => {
@@ -324,6 +395,7 @@ pub async fn doctor(
                                         status: HealthStatus::Critical,
                                         message: format!("Discovery ping failed: {e}"),
                                         duration_ms: ping_start.elapsed().as_millis() as u64,
+                                        details: Vec::new(),
                                     });
                                     suggestions.push(format!(
                                         "Discovery adapter '{name}': verify API credentials"
@@ -338,6 +410,7 @@ pub async fn doctor(
                             status: HealthStatus::Critical,
                             message: format!("Adapter construction failed: {e}"),
                             duration_ms: start.elapsed().as_millis() as u64,
+                            details: Vec::new(),
                         });
                         suggestions.push(
                             "Fix adapter configuration — see `rocky doctor --check adapters` for details".into(),
@@ -351,6 +424,7 @@ pub async fn doctor(
                     status: HealthStatus::Critical,
                     message: format!("Cannot load config: {e}"),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    details: Vec::new(),
                 });
             }
         }
@@ -393,6 +467,11 @@ pub async fn doctor(
                 "{} {} — {} ({}ms)",
                 icon, check.name, check.message, check.duration_ms
             );
+            if !check.details.is_empty() {
+                for (label, value) in &check.details {
+                    println!("        {label}: {value}");
+                }
+            }
         }
         println!("\nOverall: {}\n", doctor_output.overall);
         if !doctor_output.suggestions.is_empty() {
@@ -530,6 +609,7 @@ mod tests {
             status: HealthStatus::Critical,
             message: format!("Ping failed: {err}"),
             duration_ms: 0,
+            details: Vec::new(),
         };
 
         assert!(matches!(check.status, HealthStatus::Critical));
@@ -548,6 +628,7 @@ mod tests {
             status: HealthStatus::Critical,
             message: format!("Discovery ping failed: {err}"),
             duration_ms: 0,
+            details: Vec::new(),
         };
 
         assert!(matches!(check.status, HealthStatus::Critical));
