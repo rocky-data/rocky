@@ -1,5 +1,7 @@
 # 05-classification-masking-compliance — `[classification]` + `[mask]` + `rocky compliance`
 
+![rocky compliance --env dev rolls up classification tags to mask strategies; --fail-on exception exits 1, gating CI on unmasked PII](../../../../../docs/public/demo-classification-masking.gif)
+
 > **Category:** 04-governance
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s

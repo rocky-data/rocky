@@ -1,0 +1,4 @@
+depends_on = ["stg_orders", "dim_customers"]
+
+[strategy]
+type = "full_refresh"

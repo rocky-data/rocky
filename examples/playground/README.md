@@ -122,9 +122,9 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [07-dagster-dag-mode](pocs/05-orchestration/07-dagster-dag-mode) | `rocky run --dag` unified cross-pipeline DAG with Dagster orchestration |
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 
-### 06 — Developer Experience (9 POCs · DuckDB)
+### 06 — Developer Experience (11 POCs · DuckDB)
 
-Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types.
+Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff.
 
 | POC | Feature |
 |---|---|
@@ -137,6 +137,8 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [07-run-trace-gantt](pocs/06-developer-experience/07-run-trace-gantt) | **Trust arc 4** — `rocky trace latest` Gantt view + feature-gated OTLP exporter |
 | [08-portability-lint](pocs/06-developer-experience/08-portability-lint) | **Trust arc 6** — `rocky compile --target-dialect bq`, `[portability]`, `-- rocky-allow` pragma |
 | [09-sql-types-blast-radius](pocs/06-developer-experience/09-sql-types-blast-radius) | **Trust arc 7** — `rocky compile --with-seed` type grounding + blast-radius `SELECT *` lint |
+| [10-pr-preview-and-data-diff](pocs/06-developer-experience/10-pr-preview-and-data-diff) | `rocky preview create / diff / cost` — column-level pruned re-run + sampled row diff + cost delta on a 5-model DAG |
+| [11-lineage-diff](pocs/06-developer-experience/11-lineage-diff) | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review (Markdown drops into a PR comment) |
 
 ### 07 — Adapters (5 POCs · mixed)
 

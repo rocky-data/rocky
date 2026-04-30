@@ -87,6 +87,36 @@ Describe what you want in plain English. Rocky generates a Rocky DSL model, comp
 
 [POC — `03-ai/01-model-generation`](examples/playground/pocs/03-ai/01-model-generation/)
 
+### PR-time blast-radius with `rocky lineage-diff`
+
+Compare two git refs and get a per-changed-column readout of downstream consumers — pre-rendered Markdown drops straight into a GitHub PR comment. CODEOWNERS-style review tooling can't reach this granularity without a compiled engine.
+
+<p align="center">
+  <img src="docs/public/demo-lineage-diff.gif" alt="rocky lineage-diff main lists added and removed columns across two models with downstream consumers per change" width="900" />
+</p>
+
+[POC — `06-developer-experience/11-lineage-diff`](examples/playground/pocs/06-developer-experience/11-lineage-diff/)
+
+### Classify columns, mask by environment, gate CI
+
+Tag PII columns in the model sidecar; bind tags to mask strategies in `[mask]` / `[mask.<env>]`. `rocky compliance --env prod --fail-on exception` exits 1 the moment a classified column has no resolved strategy — a one-line CI gate against accidentally-unmasked data.
+
+<p align="center">
+  <img src="docs/public/demo-classification-masking.gif" alt="rocky compliance rolls up classification tags to mask strategies; --fail-on exception exits 1, gating CI on unmasked PII" width="900" />
+</p>
+
+[POC — `04-governance/05-classification-masking-compliance`](examples/playground/pocs/04-governance/05-classification-masking-compliance/)
+
+### Incremental loads with persistent watermark state
+
+`strategy = "incremental"` plus a `timestamp_column` is all it takes. Rocky writes the high-water mark to the embedded state store; subsequent runs only `INSERT … WHERE timestamp > watermark`. Append 25 rows after a 500-row load — run 2 still finishes in 0.2s.
+
+<p align="center">
+  <img src="docs/public/demo-incremental-watermark.gif" alt="rocky run with incremental strategy: run 1 copies 500 rows; appended 25 rows; run 2 only copies the delta in 0.2s" width="900" />
+</p>
+
+[POC — `02-performance/01-incremental-watermark`](examples/playground/pocs/02-performance/01-incremental-watermark/)
+
 ## Subprojects
 
 | Path | Artifact | Language | Description |
