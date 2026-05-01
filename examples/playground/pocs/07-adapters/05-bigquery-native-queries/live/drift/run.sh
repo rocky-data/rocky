@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Live BigQuery drift smoke test — first end-to-end replication-from-BQ.
+# Live BigQuery drift smoke test — three-stage replication-from-BQ.
 #
-# Runs `rocky run` twice:
-#   1. Initial: replicates a 2-column source table to the target.
-#   2. After ALTER source ADD COLUMN: re-runs and verifies drift was
-#      detected + the target reflects the new column.
+# Runs `rocky run` three times against the same source/target pair:
+#   1. Initial: replicates a 3-column source to the target. No drift.
+#   2. After ALTER source ADD COLUMN: re-runs and verifies the
+#      `add_columns` drift action fired and the target gained the new
+#      column (no full refresh — historical rows stay intact).
+#   3. After DROP+CREATE source with INT64→STRING column type change:
+#      re-runs and verifies the `drop_and_recreate` action fired and
+#      the target's column type updated.
 #
 # Required env:
 #   GCP_PROJECT_ID                  — GCP project to run against
@@ -46,7 +50,7 @@ bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
       STRUCT(3,        'carol',         TIMESTAMP '2026-04-01 00:00:00')
     ])" > /dev/null
 
-echo "==> rocky run (initial — replicates 2-column source to target)"
+echo "==> stage 1: rocky run (initial — replicates 3-column source to target)"
 rocky -c live.rocky.toml run --output json > expected/run-initial.json
 
 ROW_COUNT="$(bq --project_id="$PROJ" query --use_legacy_sql=false --format=csv --quiet \
@@ -57,55 +61,76 @@ if [[ "$ROW_COUNT" != "3" ]]; then
 fi
 echo "    target replicated, 3 rows"
 
-echo "==> mutating source: change id from INT64 to STRING (unsafe widening)"
-# BigQuery doesn't support ALTER COLUMN TYPE for type swaps, so we DROP +
-# CREATE the source. The new schema differs from the target by the `id`
-# column type — which Rocky's drift detection should classify as
-# DropAndRecreate (no safe widening from STRING to INT64 either way).
+echo "==> stage 2: ALTER source ADD COLUMN region STRING; backfill"
+bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
+   "ALTER TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\` ADD COLUMN region STRING" > /dev/null
+bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
+   "UPDATE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\`
+    SET region = CASE id WHEN 1 THEN 'EU' WHEN 2 THEN 'US' ELSE 'APAC' END,
+        _updated_at = TIMESTAMP '2026-04-02 00:00:00'
+    WHERE id > 0" > /dev/null
+
+echo "==> rocky run (post-add — should detect added column, ALTER target)"
+rocky -c live.rocky.toml run --output json > expected/run-add-col.json
+
+echo "==> stage 3: DROP+CREATE source with INT64→STRING id type change"
 bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    "DROP TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\`" > /dev/null
 bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    "CREATE TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\` AS
-    SELECT id, name, _updated_at FROM UNNEST([
-      STRUCT('1' AS id, 'alice' AS name, TIMESTAMP '2026-04-02 00:00:00' AS _updated_at),
-      STRUCT('2',         'bob',           TIMESTAMP '2026-04-02 00:00:00'),
-      STRUCT('3',         'carol',         TIMESTAMP '2026-04-02 00:00:00'),
-      STRUCT('4',         'dave',          TIMESTAMP '2026-04-02 00:00:00')
+    SELECT id, name, _updated_at, region FROM UNNEST([
+      STRUCT('1' AS id, 'alice' AS name,
+             TIMESTAMP '2026-04-03 00:00:00' AS _updated_at, 'EU' AS region),
+      STRUCT('2',         'bob',           TIMESTAMP '2026-04-03 00:00:00', 'US'),
+      STRUCT('3',         'carol',         TIMESTAMP '2026-04-03 00:00:00', 'APAC'),
+      STRUCT('4',         'dave',          TIMESTAMP '2026-04-03 00:00:00', 'EU')
     ])" > /dev/null
 
-echo "==> rocky run (post-drift — should detect type change + drop_and_recreate)"
-rocky -c live.rocky.toml run --output json > expected/run-drift.json
+echo "==> rocky run (post-type-change — should detect drop_and_recreate)"
+rocky -c live.rocky.toml run --output json > expected/run-type-change.json
 
-echo "==> verifying drift detected in JSON output"
-python3 - "$HERE/expected/run-initial.json" "$HERE/expected/run-drift.json" <<'PY'
+echo "==> verifying drift JSON output across all three runs"
+python3 - "$HERE/expected/run-initial.json" \
+        "$HERE/expected/run-add-col.json" \
+        "$HERE/expected/run-type-change.json" <<'PY'
 import json, sys
 
-initial = json.load(open(sys.argv[1]))
-drift   = json.load(open(sys.argv[2]))
+initial      = json.load(open(sys.argv[1]))
+add_col      = json.load(open(sys.argv[2]))
+type_change  = json.load(open(sys.argv[3]))
 
-# Initial run: target was just created from source, so no drift yet.
-init_drift = initial.get("drift", {})
-if init_drift.get("tables_drifted", -1) != 0:
-    print(f"FAIL: initial run reported drift unexpectedly: {init_drift}")
+# Stage 1: target was just created from source, no drift.
+d = initial.get("drift", {})
+if d.get("tables_drifted", -1) != 0:
+    print(f"FAIL: initial run reported drift unexpectedly: {d}")
     sys.exit(1)
-print(f"    initial drift summary: tables_checked={init_drift.get('tables_checked')}, tables_drifted=0")
+print(f"    stage 1 drift: tables_checked={d.get('tables_checked')}, tables_drifted=0 OK")
 
-# Second run: id type changed INT64 → STRING; drift must classify
-# as drop_and_recreate (not a safe widening either way).
-d = drift.get("drift", {})
-if d.get("tables_drifted", 0) < 1:
-    print(f"FAIL: post-mutation drift not detected: {d}")
-    sys.exit(1)
+# Stage 2: source added `region`, drift must report `add_columns`.
+d = add_col.get("drift", {})
 actions = d.get("actions_taken", [])
-if not any(a.get("action") == "drop_and_recreate" for a in actions):
-    print(f"FAIL: expected drop_and_recreate action, got {actions}")
+if d.get("tables_drifted", 0) < 1 or not any(a.get("action") == "add_columns" for a in actions):
+    print(f"FAIL: expected add_columns action after ALTER ADD, got {d}")
     sys.exit(1)
-print(f"    drift run summary: tables_checked={d.get('tables_checked')}, tables_drifted={d.get('tables_drifted')}")
-for a in actions:
-    print(f"    action: table={a.get('table')} action={a.get('action')} reason={a.get('reason')}")
+print(f"    stage 2 drift: action=add_columns OK ({[a.get('reason') for a in actions]})")
+
+# Stage 3: id type INT64→STRING — drop_and_recreate.
+d = type_change.get("drift", {})
+actions = d.get("actions_taken", [])
+if d.get("tables_drifted", 0) < 1 or not any(a.get("action") == "drop_and_recreate" for a in actions):
+    print(f"FAIL: expected drop_and_recreate action after type change, got {d}")
+    sys.exit(1)
+print(f"    stage 3 drift: action=drop_and_recreate OK ({[a.get('reason') for a in actions]})")
 PY
 
-echo "==> verifying target reflects new id type (STRING)"
+echo "==> verifying target schema reflects all mutations"
+COLS="$(bq --project_id="$PROJ" query --use_legacy_sql=false --format=csv --quiet \
+    "SELECT column_name FROM \`${PROJ}\`.\`${TGT_DS}\`.INFORMATION_SCHEMA.COLUMNS \
+     WHERE table_name = 'customers' ORDER BY ordinal_position" | tail -n +2 | tr '\n' ',' | sed 's/,$//')"
+if [[ "$COLS" != *"region"* ]]; then
+    echo "FAIL: target column list missing 'region': $COLS"
+    exit 1
+fi
 ID_TYPE="$(bq --project_id="$PROJ" query --use_legacy_sql=false --format=csv --quiet \
     "SELECT data_type FROM \`${PROJ}\`.\`${TGT_DS}\`.INFORMATION_SCHEMA.COLUMNS \
      WHERE table_name = 'customers' AND column_name = 'id'" | tail -n 1)"
@@ -113,7 +138,8 @@ if [[ "$ID_TYPE" != "STRING" ]]; then
     echo "FAIL: expected target id type STRING after drop_and_recreate, got '$ID_TYPE'"
     exit 1
 fi
+echo "    target columns: $COLS"
 echo "    target customers.id is now STRING (drop_and_recreate took effect)"
 
 echo
-echo "POC complete: BigQuery drift detection verified live."
+echo "POC complete: BigQuery drift detection (add + type change) verified live."

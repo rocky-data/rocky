@@ -4133,6 +4133,43 @@ async fn process_table(
                 action: "drop_and_recreate".into(),
                 reason,
             });
+        } else if !drift_result.added_columns.is_empty() {
+            // Source added columns the target doesn't have. Without an
+            // ALTER, the next `INSERT INTO target SELECT * FROM source`
+            // produces more columns than the target accepts and BQ /
+            // Snowflake / Databricks all reject it. Issue
+            // `ALTER TABLE ADD COLUMN <name> <type>` for each new
+            // column before the regular INSERT path runs. New columns
+            // are nullable by default — historical rows stay NULL,
+            // newly inserted rows pick up source values via SELECT *.
+            info!(
+                table = target_table.full_name(),
+                added = drift_result.added_columns.len(),
+                "drift detected, adding {} column(s) to target",
+                drift_result.added_columns.len()
+            );
+            let alter_stmts = drift::generate_add_column_sql(
+                &target_table,
+                &drift_result.added_columns,
+                dialect,
+            )?;
+            for stmt in &alter_stmts {
+                warehouse
+                    .execute_statement(stmt)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            let reason = drift_result
+                .added_columns
+                .iter()
+                .map(|c| format!("added column '{}' ({})", c.name, c.data_type))
+                .collect::<Vec<_>>()
+                .join(", ");
+            drift_action = Some(DriftActionOutput {
+                table: target_table.full_name(),
+                action: "add_columns".into(),
+                reason,
+            });
         }
     }
 

@@ -12,7 +12,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
 | `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
-| `drift/run.sh` | `incremental` (replication) | First end-to-end replication-from-BQ + per-table drift detection (column type change → `drop_and_recreate`) |
+| `drift/run.sh` | `incremental` (replication) | Replication-from-BQ + per-table drift detection: `add_columns` (ALTER TABLE ADD COLUMN) and `drop_and_recreate` (column type change) |
 
 Each driver:
 
@@ -115,13 +115,17 @@ Adapter-side gaps to revisit separately:
    cost wire-up runs but the figure is `0` rather than missing. Real
    models that scan source tables produce non-zero values (verified
    via `live/merge/run.sh` and `live/time-interval/run.sh`).
-8. **`detect_drift` ignores added columns.** The function in
-   `engine/crates/rocky-core/src/drift.rs` only flags type changes on
-   columns present in BOTH source and target. A column added to the
-   source after the initial replication is not classified as drift —
-   the comment claims "they appear naturally via SELECT *", but the
-   incremental strategy then issues `INSERT INTO target SELECT * FROM
-   source` against a target whose schema is fixed, and BigQuery
-   rejects it with `Inserted row has wrong column count`. The drift
-   smoke test sidesteps this by changing an existing column's type
-   instead. Worth a separate fix-with-receipt PR.
+8. ~~`detect_drift` ignores added columns~~ — **fixed**.
+   `detect_drift` now populates `added_columns: Vec<ColumnInfo>` for
+   source columns missing from the target, and the runtime issues
+   `ALTER TABLE ADD COLUMN` for each before the next INSERT. The
+   drift smoke test exercises this in stage 2 (`add_columns` action).
+9. **`alter_column_types` drift action is detected but not wired.**
+   `detect_drift` already classifies safe widenings (e.g.
+   `INT64`→`NUMERIC`) as `DriftAction::AlterColumnTypes`, but
+   `run.rs:4105` only emits SQL for `DropAndRecreate`. Safe widenings
+   silently fall through to the next INSERT and may fail with type
+   mismatch errors. Note that `is_safe_type_widening` lists
+   `INT`/`BIGINT`/etc., not BQ's `INT64` — fixing the wiring should
+   come with a BQ type-name expansion. Worth a separate
+   fix-with-receipt PR.
