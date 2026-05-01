@@ -262,6 +262,13 @@ pub struct DriftResult {
     pub table: TableRef,
     pub drifted_columns: Vec<DriftedColumn>,
     pub action: DriftAction,
+    /// Columns present in the source but absent from the target — the
+    /// target needs an `ALTER TABLE ADD COLUMN` before the next
+    /// incremental INSERT can succeed (otherwise BigQuery rejects with
+    /// `Inserted row has wrong column count`, and Snowflake/Databricks
+    /// have analogous failures). Populated by [`detect_drift`].
+    #[serde(default)]
+    pub added_columns: Vec<ColumnInfo>,
     /// Columns in grace period (present in target, absent from source, not yet expired).
     #[serde(default)]
     pub grace_period_columns: Vec<GracePeriodColumn>,

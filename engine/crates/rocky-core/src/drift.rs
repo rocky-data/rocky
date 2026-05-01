@@ -9,9 +9,21 @@ use crate::traits::SqlDialect;
 
 /// Compares source and target column types to detect schema drift.
 ///
-/// A type mismatch on any existing column triggers `DropAndRecreate` (current default behavior:
-/// drop the target table and do a full refresh). Columns present in the source but missing
-/// from the target are not considered drift — they appear naturally via `SELECT *`.
+/// Three categories surface from a single pass over the source columns:
+///
+/// - **Type mismatches** on an existing column populate `drifted_columns`
+///   and drive the [`DriftAction`] (`AlterColumnTypes` when every change
+///   is a safe widening, `DropAndRecreate` otherwise).
+/// - **Added columns** (present in the source, missing from the target)
+///   populate `added_columns`. The runtime issues `ALTER TABLE ADD
+///   COLUMN` for each before the incremental INSERT — without that
+///   step, a `SELECT * FROM source` produces more columns than the
+///   target accepts, and BigQuery / Snowflake / Databricks all reject
+///   the INSERT.
+///
+/// `DriftAction` reflects only the type-change side of drift; added
+/// columns are an additional ALTER step the runtime applies regardless
+/// of `action` (and even when `action == Ignore`).
 pub fn detect_drift(
     table: &TableRef,
     source_columns: &[ColumnInfo],
@@ -20,16 +32,22 @@ pub fn detect_drift(
     let target_map = column_map::build_column_map(target_columns);
 
     let mut drifted_columns = Vec::new();
+    let mut added_columns = Vec::new();
 
     for source_col in source_columns {
         // §P1.9: look up via CiStr borrow — no allocation per column.
-        if let Some(target_col) = target_map.get(column_map::CiStr::new(&source_col.name)) {
-            if source_col.data_type.to_lowercase() != target_col.data_type.to_lowercase() {
-                drifted_columns.push(DriftedColumn {
-                    name: source_col.name.clone(),
-                    source_type: source_col.data_type.clone(),
-                    target_type: target_col.data_type.clone(),
-                });
+        match target_map.get(column_map::CiStr::new(&source_col.name)) {
+            Some(target_col) => {
+                if source_col.data_type.to_lowercase() != target_col.data_type.to_lowercase() {
+                    drifted_columns.push(DriftedColumn {
+                        name: source_col.name.clone(),
+                        source_type: source_col.data_type.clone(),
+                        target_type: target_col.data_type.clone(),
+                    });
+                }
+            }
+            None => {
+                added_columns.push(source_col.clone());
             }
         }
     }
@@ -49,6 +67,7 @@ pub fn detect_drift(
         table: table.clone(),
         drifted_columns,
         action,
+        added_columns,
         grace_period_columns: Vec::new(),
         columns_to_drop: Vec::new(),
     }
@@ -168,6 +187,34 @@ pub fn generate_alter_column_sql(
         statements.push(format!(
             "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
             table_ref, col.name, col.source_type
+        ));
+    }
+    Ok(statements)
+}
+
+/// Generates `ALTER TABLE ... ADD COLUMN` SQL for columns present in
+/// the source but missing from the target.
+///
+/// Standard SQL across BigQuery / Snowflake / Databricks / DuckDB; no
+/// dialect override needed today. Each new column is added as
+/// nullable (the syntax `<name> <type>` defaults to nullable on every
+/// supported dialect), which matches the runtime's
+/// `INSERT INTO target SELECT * FROM source` semantic — backfill is
+/// the responsibility of the next replication run.
+pub fn generate_add_column_sql(
+    table: &TableRef,
+    added_columns: &[ColumnInfo],
+    dialect: &dyn SqlDialect,
+) -> Result<Vec<String>, SqlGenError> {
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+
+    let mut statements = Vec::new();
+    for col in added_columns {
+        rocky_sql::validation::validate_identifier(&col.name)?;
+        crate::sql_gen::validate_sql_type(&col.data_type)?;
+        statements.push(format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table_ref, col.name, col.data_type
         ));
     }
     Ok(statements)
@@ -484,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_column_in_source_not_drift() {
+    fn test_new_column_in_source_populates_added_columns() {
         let source = vec![
             col("id", "INT"),
             col("name", "STRING"),
@@ -493,9 +540,70 @@ mod tests {
         let target = vec![col("id", "INT"), col("name", "STRING")];
         let result = detect_drift(&table_ref(), &source, &target);
 
-        // New columns in source are not drift — SELECT * picks them up
+        // No type drift, so action stays `Ignore` — but the added
+        // column is captured separately so the runtime can ALTER it
+        // before the next INSERT.
         assert!(result.drifted_columns.is_empty());
         assert_eq!(result.action, DriftAction::Ignore);
+        assert_eq!(result.added_columns.len(), 1);
+        assert_eq!(result.added_columns[0].name, "new_col");
+        assert_eq!(result.added_columns[0].data_type, "STRING");
+    }
+
+    #[test]
+    fn test_added_columns_alongside_type_drift() {
+        let source = vec![
+            col("id", "BIGINT"),
+            col("name", "STRING"),
+            col("new_col", "STRING"),
+        ];
+        let target = vec![col("id", "INT"), col("name", "STRING")];
+        let result = detect_drift(&table_ref(), &source, &target);
+
+        // INT→BIGINT is safe widening, so action = AlterColumnTypes.
+        // The new column is captured independently.
+        assert_eq!(result.drifted_columns.len(), 1);
+        assert_eq!(result.action, DriftAction::AlterColumnTypes);
+        assert_eq!(result.added_columns.len(), 1);
+        assert_eq!(result.added_columns[0].name, "new_col");
+    }
+
+    #[test]
+    fn test_generate_add_column_sql() {
+        let table = table_ref();
+        let added = vec![ColumnInfo {
+            name: "region".into(),
+            data_type: "STRING".into(),
+            nullable: true,
+        }];
+        let stmts = generate_add_column_sql(&table, &added, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "ALTER TABLE acme_warehouse.staging__us_west__shopify.orders ADD COLUMN region STRING"
+        );
+    }
+
+    #[test]
+    fn test_generate_add_column_rejects_bad_identifier() {
+        let table = table_ref();
+        let added = vec![ColumnInfo {
+            name: "bad; DROP".into(),
+            data_type: "STRING".into(),
+            nullable: true,
+        }];
+        assert!(generate_add_column_sql(&table, &added, &dialect()).is_err());
+    }
+
+    #[test]
+    fn test_generate_add_column_rejects_bad_type() {
+        let table = table_ref();
+        let added = vec![ColumnInfo {
+            name: "region".into(),
+            data_type: "STRING'; DROP".into(),
+            nullable: true,
+        }];
+        assert!(generate_add_column_sql(&table, &added, &dialect()).is_err());
     }
 
     #[test]
