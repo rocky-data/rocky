@@ -1,0 +1,13 @@
+[strategy]
+type = "merge"
+unique_key = ["id"]
+# `update_columns` must be declared explicitly: BigQuery rejects the
+# default `UPDATE SET target = source` shorthand the dialect emits when
+# this list is omitted. Documented as a finding in ../README.md.
+update_columns = ["name", "amount"]
+
+# Hardcoded to the Rocky BQ sandbox project — model sidecar TOMLs don't
+# honor ${VAR} env substitution today (see live/README.md for context).
+[target]
+catalog = "rocky-sandbox-hc-test-63874"
+schema = "hc_phase1_live_merge"

@@ -175,9 +175,11 @@ pub fn generate_transformation_sql(
 
     // If a lakehouse format is specified, use format-specific DDL generation
     // for strategies that create tables (FullRefresh, Incremental first-run,
-    // Merge first-run). The runtime calls `generate_transformation_initial_ddl`
-    // for the initial table creation of non-FullRefresh strategies; here we
-    // handle FullRefresh which always does CTAS.
+    // Merge first-run). For non-FullRefresh strategies, the runtime probes
+    // target existence via `describe_table` and calls
+    // `generate_transformation_initial_ddl` when missing (Merge today;
+    // Incremental / DeleteInsert / Microbatch wired in as their live smoke
+    // tests land). Here we handle FullRefresh which always does CTAS.
     if let Some(ref format) = plan.format {
         if matches!(plan.strategy, MaterializationStrategy::FullRefresh) {
             let opts = plan.format_options.as_ref().cloned().unwrap_or_default();

@@ -1,0 +1,16 @@
+# Live BigQuery MERGE smoke test.
+#
+# Exercises the BQ-specific MERGE shape (`WHEN NOT MATCHED THEN INSERT
+# ROW`) end-to-end against a real GCP project, including the runtime's
+# bootstrap path that pre-creates the target on first run.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+type = "transformation"
+models = "models/**"
+
+[pipeline.live.target]

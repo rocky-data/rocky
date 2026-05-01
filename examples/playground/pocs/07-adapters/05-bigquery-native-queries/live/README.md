@@ -10,6 +10,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 |---|---|---|
 | `./run.sh` | `full_refresh` | `BigQueryDialect::create_table_as` |
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
+| `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
 
 Each driver:
 
@@ -22,10 +23,12 @@ Each driver:
 
 ## What's not covered yet
 
-- Incremental and MERGE strategies (separate follow-up smoke tests).
+- Incremental strategy (separate follow-up smoke test).
+- Drift cycle (gated on `BigQueryDiscoveryAdapter` — see finding 1).
 - Time-interval failure-path (forced mid-transaction error → BQ
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
+- MERGE without explicit `update_columns` (see finding 5).
 
 ## Run
 
@@ -35,6 +38,7 @@ export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/rocky/bq-sandbox.json"
 export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh                   # full-refresh
 ./time-interval/run.sh     # time-interval (4-statement DML transaction)
+./merge/run.sh             # merge (bootstrap + UPSERT)
 ```
 
 Each script exits 0 on success after dropping its target dataset.
@@ -84,3 +88,10 @@ Adapter-side gaps to revisit separately:
    partition column has to be TIMESTAMP. Other dialects are more
    permissive. The time-interval model uses `TIMESTAMP_TRUNC(...)` to
    produce a TIMESTAMP partition column.
+5. **MERGE requires explicit `update_columns` on BigQuery.** When the
+   model TOML omits the list, the dialect emits the shorthand
+   `UPDATE SET target = source` (`dialect.rs:54`). BigQuery rejects
+   this with `UPDATE ... SET does not support updating the entire row`
+   — it needs explicit per-column assignments. The merge model
+   declares `update_columns = ["name", "amount"]` to sidestep it.
+   Snowflake/DuckDB may accept the shorthand; not verified.
