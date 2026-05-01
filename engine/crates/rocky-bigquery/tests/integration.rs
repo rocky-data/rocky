@@ -124,3 +124,97 @@ async fn test_clone_table_for_branch_copy() {
         .unwrap_or(-1);
     assert_eq!(n_num, 2, "cloned table should have 2 rows, got {n:?}");
 }
+
+/// Verifies `BigQueryDiscoveryAdapter::discover` lists matching
+/// datasets + their tables against the live sandbox. Creates two
+/// datasets with the `hc_phase14_disc_<ts>_` prefix, seeds one table
+/// in each, runs discover, and asserts both datasets and their tables
+/// are returned. Datasets are dropped on test exit (best-effort).
+#[tokio::test]
+#[ignore]
+async fn test_discover_lists_datasets_and_tables() {
+    use rocky_bigquery::BigQueryDiscoveryAdapter;
+    use rocky_core::traits::DiscoveryAdapter as _;
+    use std::sync::Arc;
+
+    let warehouse = adapter_from_env().expect("BigQuery env vars not set");
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let prefix = format!("hc_phase14_disc_{suffix}_");
+    let alpha = format!("{prefix}alpha");
+    let beta = format!("{prefix}beta");
+
+    // Setup. Two datasets, one table each.
+    warehouse
+        .execute_statement(&format!("CREATE SCHEMA `{project}`.`{alpha}`"))
+        .await
+        .expect("create alpha");
+    warehouse
+        .execute_statement(&format!("CREATE SCHEMA `{project}`.`{beta}`"))
+        .await
+        .expect("create beta");
+    warehouse
+        .execute_statement(&format!(
+            "CREATE TABLE `{project}`.`{alpha}`.`orders` AS SELECT 1 AS id"
+        ))
+        .await
+        .expect("seed alpha.orders");
+    warehouse
+        .execute_statement(&format!(
+            "CREATE TABLE `{project}`.`{beta}`.`customers` AS SELECT 1 AS id"
+        ))
+        .await
+        .expect("seed beta.customers");
+
+    let discovery = BigQueryDiscoveryAdapter::new(Arc::new(warehouse));
+    let result = discovery.discover(&prefix).await;
+
+    // Re-construct the warehouse adapter for cleanup; we moved the
+    // original into the discovery adapter via Arc.
+    let cleanup_adapter = adapter_from_env().expect("BigQuery env vars not set");
+    let _ = cleanup_adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{alpha}` CASCADE"
+        ))
+        .await;
+    let _ = cleanup_adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{beta}` CASCADE"
+        ))
+        .await;
+
+    let result = result.expect("discover should succeed");
+    assert_eq!(
+        result.connectors.len(),
+        2,
+        "expected 2 datasets, got {:?}",
+        result
+            .connectors
+            .iter()
+            .map(|c| &c.schema)
+            .collect::<Vec<_>>()
+    );
+    assert!(result.failed.is_empty());
+
+    let alpha_conn = result
+        .connectors
+        .iter()
+        .find(|c| c.schema == alpha)
+        .expect("alpha dataset present");
+    assert_eq!(alpha_conn.source_type, "bigquery");
+    assert_eq!(alpha_conn.tables.len(), 1);
+    assert_eq!(alpha_conn.tables[0].name, "orders");
+
+    let beta_conn = result
+        .connectors
+        .iter()
+        .find(|c| c.schema == beta)
+        .expect("beta dataset present");
+    assert_eq!(beta_conn.tables.len(), 1);
+    assert_eq!(beta_conn.tables[0].name, "customers");
+}

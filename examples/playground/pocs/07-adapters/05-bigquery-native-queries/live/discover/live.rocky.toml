@@ -1,0 +1,28 @@
+# Live BigQuery discovery smoke test.
+#
+# Exercises the BigQueryDiscoveryAdapter end-to-end via `rocky discover`,
+# which uses region-qualified `INFORMATION_SCHEMA.SCHEMATA` to enumerate
+# datasets matching the configured prefix.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+strategy = "full_refresh"
+
+[pipeline.live.source]
+catalog = "${GCP_PROJECT_ID}"
+
+[pipeline.live.source.discovery]
+adapter = "default"
+
+[pipeline.live.source.schema_pattern]
+prefix = "hc_phase14_disc_"
+separator = "_"
+components = ["source"]
+
+[pipeline.live.target]
+catalog_template = "${GCP_PROJECT_ID}"
+schema_template = "hc_phase14_disc_dummy_target"

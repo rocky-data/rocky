@@ -56,9 +56,9 @@ impl AdapterCapability {
 /// adapter implementations in the workspace.
 pub fn capability_for(adapter_type: &str) -> Option<AdapterCapability> {
     let cap = match adapter_type {
-        "databricks" | "snowflake" | "bigquery" => AdapterCapability::DATA_ONLY,
+        "databricks" | "snowflake" => AdapterCapability::DATA_ONLY,
         "fivetran" | "airbyte" | "iceberg" | "manual" => AdapterCapability::DISCOVERY_ONLY,
-        "duckdb" => AdapterCapability::BOTH,
+        "duckdb" | "bigquery" => AdapterCapability::BOTH,
         _ => return None,
     };
     Some(cap)
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn data_only_adapters() {
-        for adapter_type in ["databricks", "snowflake", "bigquery"] {
+        for adapter_type in ["databricks", "snowflake"] {
             let cap = capability_for(adapter_type).expect("known type");
             assert!(cap.supports_data, "{adapter_type} should support data");
             assert!(
@@ -93,10 +93,15 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_supports_both() {
-        let cap = capability_for("duckdb").expect("known type");
-        assert!(cap.supports_data);
-        assert!(cap.supports_discovery);
+    fn duckdb_and_bigquery_support_both() {
+        for adapter_type in ["duckdb", "bigquery"] {
+            let cap = capability_for(adapter_type).expect("known type");
+            assert!(cap.supports_data, "{adapter_type} should support data");
+            assert!(
+                cap.supports_discovery,
+                "{adapter_type} should support discovery"
+            );
+        }
     }
 
     #[test]
