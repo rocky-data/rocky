@@ -3474,6 +3474,50 @@ pub(crate) async fn execute_models(
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+            // MERGE requires the target to exist before the statement runs.
+            // sql_gen exposes `generate_transformation_initial_ddl` for
+            // exactly this purpose but no call site has been wiring it up,
+            // so MERGE on a fresh target failed with "table not found".
+            // Mirror the time_interval bootstrap pattern: probe via
+            // describe_table().is_ok() and run the initial DDL if missing.
+            // (Adds one describe_table round-trip per MERGE model per run;
+            // matches the cost the time_interval path already pays at
+            // run.rs:3707.) Narrow to Merge for now — Incremental /
+            // DeleteInsert / Microbatch likely have the same gap, but each
+            // gets bootstrapped only when a live smoke test for that
+            // strategy lands and verifies the fix end-to-end.
+            if matches!(
+                plan.strategy,
+                rocky_core::ir::MaterializationStrategy::Merge { .. }
+            ) {
+                let target_table_struct = rocky_core::ir::TableRef {
+                    catalog: plan.target.catalog.clone(),
+                    schema: plan.target.schema.clone(),
+                    table: plan.target.table.clone(),
+                };
+                if warehouse
+                    .describe_table(&target_table_struct)
+                    .await
+                    .is_err()
+                {
+                    let initial_ddls =
+                        rocky_core::sql_gen::generate_transformation_initial_ddl(&plan, dialect)?;
+                    info!(
+                        model = model_name.as_str(),
+                        target = target_ref.as_str(),
+                        statements = initial_ddls.len(),
+                        "merge target does not exist — bootstrapping empty table from model schema"
+                    );
+                    for ddl in &initial_ddls {
+                        warehouse.execute_statement(ddl).await.map_err(|e| {
+                            anyhow::anyhow!(
+                                "bootstrap of '{target_ref}' for model '{model_name}' failed: {e}"
+                            )
+                        })?;
+                    }
+                }
+            }
+
             let exec_stmts = rocky_core::sql_gen::generate_transformation_sql(&plan, dialect)?;
 
             info!(
