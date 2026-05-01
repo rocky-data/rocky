@@ -157,8 +157,11 @@ pub enum LeafRowKind {
 /// byte-identical [`BisectionStats`] across runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BisectionStats {
-    /// Total chunks the runner asked the adapter to checksum (sum across
-    /// both sides and all recursion levels).
+    /// Total non-empty chunk-checksum entries returned by the adapter,
+    /// summed across both sides and all recursion levels. Each level
+    /// asks for `K` chunks per side (a fixed cost the adapter charges as
+    /// one batched query); this counter measures the *result-set* shape,
+    /// not the number of underlying SQL queries.
     pub chunks_examined: u64,
     /// Number of leaf chunks materialized for row-by-row diff.
     pub leaves_materialized: u64,
@@ -169,10 +172,16 @@ pub struct BisectionStats {
     /// materialized the dense range as a leaf — so the diff is still
     /// exhaustive over that range; just slower.
     pub depth_capped: bool,
-    /// How the runner split the primary-key space. Sub-step 1 always
+    /// How the runner split the primary-key space. Currently always
     /// reports `IntRange`; `Composite` / `HashBucket` / `FirstColumn`
-    /// land in follow-up phases.
+    /// land in follow-up changes.
     pub split_strategy: SplitStrategy,
+    /// Rows on the base side whose primary-key column is NULL. Excluded
+    /// from chunk membership but counted at the root so a divergence in
+    /// null-PK row counts surfaces instead of silently dropping rows.
+    pub null_pk_rows_base: u64,
+    /// Rows on the branch side whose primary-key column is NULL.
+    pub null_pk_rows_branch: u64,
 }
 
 /// Run a checksum-bisection diff between two tables on the same logical
@@ -214,6 +223,15 @@ pub async fn bisection_diff(
     let leaf_threshold = config.min_chunk_rows.unwrap_or_else(|| {
         std::cmp::max(base.recommended_leaf_size(), branch.recommended_leaf_size())
     });
+
+    // Count null-PK rows once per side at the root. Null-PK rows
+    // never land in any chunk (the chunking SQL filters them out) so a
+    // null-only divergence would otherwise be silent. Surfaced on
+    // BisectionStats; if base and branch counts diverge, the caller
+    // should treat that as a row-count mismatch at the table level.
+    let null_pk_rows_base = count_null_pk_rows(base, target.base, target.pk_column).await?;
+    let null_pk_rows_branch =
+        count_null_pk_rows(branch, target.branch, target.pk_column).await?;
 
     let mut state = TraversalState {
         config,
@@ -264,8 +282,44 @@ pub async fn bisection_diff(
             depth_max: state.depth_max,
             depth_capped: state.depth_capped,
             split_strategy: SplitStrategy::IntRange,
+            null_pk_rows_base,
+            null_pk_rows_branch,
         },
     })
+}
+
+/// Issue one `COUNT(*) WHERE pk IS NULL` per side at the root. Returns
+/// 0 if the table has no null-PK rows.
+async fn count_null_pk_rows(
+    adapter: &dyn WarehouseAdapter,
+    table: &TableRef,
+    pk_column: &str,
+) -> AdapterResult<u64> {
+    rocky_sql::validation::validate_identifier(pk_column).map_err(AdapterError::new)?;
+    let dialect = adapter.dialect();
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM {table_ref} WHERE \"{pk_column}\" IS NULL"
+    );
+    let result = adapter.execute_query(&sql).await?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| AdapterError::msg("null-pk count query returned no rows"))?;
+    let cell = row
+        .first()
+        .ok_or_else(|| AdapterError::msg("null-pk count query returned an empty row"))?;
+    match cell {
+        serde_json::Value::String(s) => s.parse::<u64>().map_err(|e| {
+            AdapterError::msg(format!("failed to parse null-pk count {s:?}: {e}"))
+        }),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| AdapterError::msg(format!("null-pk count not representable as u64: {n}"))),
+        other => Err(AdapterError::msg(format!(
+            "null-pk count returned unexpected JSON shape: {other:?}"
+        ))),
+    }
 }
 
 struct TraversalState<'a> {
@@ -414,7 +468,12 @@ async fn materialize_and_diff(
     while bi < base_rows.len() && ri < branch_rows.len() {
         let b = &base_rows[bi];
         let r = &branch_rows[ri];
-        match b.pk_str.cmp(&r.pk_str) {
+        // Numeric primary-key compare. String comparison would
+        // mis-classify rows whose stringified PKs cross length
+        // boundaries (e.g., "99" string-compares greater than "100"
+        // because '9' > '1'), even though the SQL `ORDER BY` produces
+        // numerically-sorted result sets.
+        match b.pk_value.cmp(&r.pk_value) {
             std::cmp::Ordering::Less => {
                 record_sample(state, LeafRowKind::Removed, &b.pk_str);
                 state.rows_removed = state.rows_removed.saturating_add(1);
@@ -449,6 +508,7 @@ async fn materialize_and_diff(
 }
 
 struct LeafRow {
+    pk_value: i128,
     pk_str: String,
     values: Vec<serde_json::Value>,
 }
@@ -497,8 +557,17 @@ async fn fetch_chunk_rows(
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+        let pk_value: i128 = pk_str.parse().map_err(|e| {
+            AdapterError::msg(format!(
+                "primary-key column \"{pk}\" returned a value that didn't parse as i128: {pk_str:?} ({e})"
+            ))
+        })?;
         let values = row.into_iter().skip(1).collect();
-        out.push(LeafRow { pk_str, values });
+        out.push(LeafRow {
+            pk_value,
+            pk_str,
+            values,
+        });
     }
     Ok(out)
 }
