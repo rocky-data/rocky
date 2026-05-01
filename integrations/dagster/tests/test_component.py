@@ -1084,3 +1084,86 @@ def test_rocky_component_python_kwarg_post_state_write_hook_preserved(tmp_path: 
     assert callable(component.post_state_write_hook)
     component.post_state_write_hook(tmp_path)
     assert calls == [tmp_path]
+
+
+def test_build_defs_survives_duplicate_table_records(tmp_path: Path, caplog):
+    """Defensive: a duplicate ``(asset_key, name)`` from ``rocky discover``
+    must not bring down the whole asset graph.
+
+    Regression: previously a single source whose ``tables`` list contained
+    the same name twice produced two identical ``AssetSpec``s in the
+    group, which fanned out into two identical sets of
+    ``DEFAULT_CHECK_NAMES`` ``AssetCheckSpec``s, which then caused
+    ``@multi_asset(check_specs=...)`` to raise
+    ``DagsterInvalidDefinitionError`` and drop *every* Rocky-derived
+    asset from the user's Dagster graph.
+
+    Expected: dedupe layer warns + keeps the first occurrence, build
+    succeeds with one asset and the four ``DEFAULT_CHECK_NAMES`` checks.
+    """
+    import logging
+
+    discover_payload = {
+        "version": "0.1.0",
+        "command": "discover",
+        "checks": {"freshness": {"threshold_seconds": 86400}},
+        "sources": [
+            {
+                "id": "src_dup",
+                "components": {
+                    "tenant": "pfizer",
+                    "region": "namer",
+                    "subregion": "usa",
+                    "source": "dv360",
+                },
+                "source_type": "fivetran",
+                "last_sync_at": "2026-04-01T10:00:00Z",
+                # Duplicate table record — the bug input.
+                "tables": [
+                    {"name": "do_not_alter_dpm_raw_youtube", "row_count": 1},
+                    {"name": "do_not_alter_dpm_raw_youtube", "row_count": 1},
+                ],
+            }
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover_payload}))
+
+    component = RockyComponent(config_path="rocky.toml")
+    with caplog.at_level(logging.WARNING, logger="dagster_rocky.component"):
+        defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    assets = list(defs.assets or [])
+    # One multi_asset for the (sole) group, with one (deduped) asset key.
+    assert len(assets) == 1
+    asset = assets[0]
+    keys = list(asset.keys)
+    assert len(keys) == 1
+    # And exactly the four DEFAULT_CHECK_NAMES, not eight.
+    check_specs = list(asset.check_specs)
+    assert len(check_specs) == 4
+    check_names = sorted(cs.name for cs in check_specs)
+    assert check_names == sorted(component_module.DEFAULT_CHECK_NAMES)
+    # Group-level dedupe warning fired (names the offending key + source id).
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("src_dup" in m and "duplicate" in m.lower() for m in warnings)
+
+
+def test_build_check_specs_dedupes_when_group_has_duplicate_specs():
+    """Belt-and-suspenders: even if a future code path bypasses the
+    group-level dedup and hands ``_build_check_specs`` a ``_GroupBuild``
+    with two identical ``AssetSpec`` entries, the returned check spec
+    list must not contain the same ``(asset_key, name)`` twice.
+    """
+    key = dg.AssetKey(["dup", "table"])
+    spec = dg.AssetSpec(key=key)
+    group = component_module._GroupBuild(name="dup")
+    # Bypass the group-level dedup explicitly.
+    group.specs = [spec, spec]
+
+    check_specs = component_module._build_check_specs([group])
+
+    # Four DEFAULT_CHECK_NAMES once, not twice.
+    assert len(check_specs) == len(component_module.DEFAULT_CHECK_NAMES)
+    markers = {(cs.asset_key, cs.name) for cs in check_specs}
+    assert len(markers) == len(check_specs)

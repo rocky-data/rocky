@@ -1044,6 +1044,18 @@ def _build_group_contexts(
             group.filter = _build_filter(source)
         group.source_ids.add(source.id)
 
+        # Track AssetKeys already accumulated for this group so a duplicate
+        # ``(source, table)`` pair from ``rocky discover`` (or two distinct
+        # tables that happen to translate to the same key) doesn't smuggle
+        # the same spec — and therefore the same set of check specs — into
+        # the build twice. ``@multi_asset(check_specs=...)`` rejects
+        # duplicate ``(asset_key, name)`` tuples with
+        # ``DagsterInvalidDefinitionError``, which would otherwise drop
+        # *every* Rocky-derived asset from the user's graph for one bad
+        # discover record. Drop the duplicate, log a warning naming the
+        # offending key + source id so it's traceable, and keep building.
+        seen_keys: set[dg.AssetKey] = {spec.key for spec in group.specs}
+
         for table in source.tables:
             # Per-model freshness wins over pipeline-level when the source
             # table name matches a compiled model name. This makes
@@ -1057,6 +1069,18 @@ def _build_group_contexts(
                 policy,
                 translation=translation,
             )
+            if spec.key in seen_keys:
+                _log.warning(
+                    "Dropping duplicate Rocky asset spec for key %s "
+                    "(source id=%s, table=%s) — `rocky discover` returned "
+                    "the same (asset_key, table) twice in this group; the "
+                    "first occurrence wins.",
+                    spec.key.to_user_string(),
+                    source.id,
+                    table.name,
+                )
+                continue
+            seen_keys.add(spec.key)
             group.specs.append(spec)
             group.key_to_source_id[spec.key] = source.id
             group.rocky_key_to_dagster_key[_native_rocky_key(source, table.name)] = spec.key
@@ -1134,22 +1158,47 @@ def _build_check_specs(
     """
     contract_rules_by_model = contract_rules_by_model or {}
     specs: list[dg.AssetCheckSpec] = []
+    # Belt-and-suspenders dedupe: ``_build_group_contexts`` already drops
+    # duplicate ``AssetSpec``s within a group, but a future code path
+    # (custom ``translation``, derived-model surfaces, or a caller that
+    # builds ``_GroupBuild`` directly) could still hand us a
+    # ``group.specs`` list with the same key twice. ``@multi_asset``
+    # raises ``DagsterInvalidDefinitionError`` on duplicate
+    # ``(asset_key, name)`` check spec tuples — which would tear down
+    # every Rocky-derived asset for one bad input — so filter as we
+    # build.
+    seen: set[tuple[dg.AssetKey, str]] = set()
+
+    def _add(spec: dg.AssetCheckSpec) -> None:
+        marker = (spec.asset_key, spec.name)
+        if marker in seen:
+            _log.warning(
+                "Dropping duplicate Rocky asset check spec %s on %s — "
+                "upstream produced the same (asset_key, name) twice; "
+                "the first occurrence wins.",
+                spec.name,
+                spec.asset_key.to_user_string(),
+            )
+            return
+        seen.add(marker)
+        specs.append(spec)
 
     for group in groups:
         for spec in group.specs:
             # Default checks (4 per asset)
             for check_name in DEFAULT_CHECK_NAMES:
-                specs.append(dg.AssetCheckSpec(name=check_name, asset=spec.key))
+                _add(dg.AssetCheckSpec(name=check_name, asset=spec.key))
 
             # Governance compliance check (Wave B, opt-in)
             if surface_compliance:
-                specs.append(dg.AssetCheckSpec(name=COMPLIANCE_CHECK_NAME, asset=spec.key))
+                _add(dg.AssetCheckSpec(name=COMPLIANCE_CHECK_NAME, asset=spec.key))
 
             # Contract checks (per declared rule kind, when matched)
             table_name = spec.key.path[-1]
             rules = contract_rules_by_model.get(table_name)
             if rules is not None:
-                specs.extend(contract_check_specs_for_model(spec.key, rules))
+                for contract_spec in contract_check_specs_for_model(spec.key, rules):
+                    _add(contract_spec)
 
     return specs
 

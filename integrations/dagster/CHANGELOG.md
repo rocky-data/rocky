@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.1] — 2026-05-01
+
+Patch release. Defensive dedup of asset specs and check specs to survive duplicate table records from `rocky discover`.
+
+### Fixed
+
+- **Defensive dedupe of asset specs and check specs in `RockyComponent`.** When `rocky discover` returned the same `(asset_key, name)` tuple twice — typically a single source whose `tables` list contained the same table name twice, often from upstream metadata races — `_build_check_specs` appended `DEFAULT_CHECK_NAMES` once per duplicate spec, the resulting list contained duplicate `(asset_key, name)` check spec tuples, and `@multi_asset(check_specs=...)` raised `DagsterInvalidDefinitionError`. Symptom: every Rocky-derived asset disappeared from the user's Dagster graph for one bad discover record. Fix is two-layered: (1) `_build_group_contexts` now dedupes by `AssetKey` per group as it walks the discover output and logs a warning naming the offending key + source id, and (2) `_build_check_specs` filters by `(asset_key, name)` as it builds — belt-and-suspenders for any future code path that bypasses the group-level dedup. The matching root-cause fix lives in the engine; this is the orchestrator-side hardening so a single weird source record degrades gracefully instead of taking down the whole asset graph.
+
 ## [1.18.0] — 2026-05-01
 
 Companion release to engine `v1.20.0`. Picks up the regenerated Pydantic models for the new catalog-scope shapes on `rocky compact` and `rocky archive`.
