@@ -6,5 +6,5 @@ type = "full_refresh"
 # demo is sandbox-specific by construction. Patch both fields if running
 # against a different project.
 [target]
-catalog = "rocky-sandbox-hc-test-63874"
+catalog = "__GCP_PROJECT__"
 schema = "hc_phase1_live"

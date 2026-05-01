@@ -47,11 +47,21 @@ bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    STRUCT(3,        'carol',            300)
  ])" > /dev/null
 
+# Stage live.rocky.toml + model files into a temp dir with
+# `__GCP_PROJECT__` substituted (see ../run.sh for rationale).
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"; drop_dataset' EXIT
+cp live.rocky.toml "$STAGE/"
+cp -R models "$STAGE/"
+find "$STAGE" -type f \( -name "*.toml" -o -name "*.sql" \) \
+    -exec sed -i.bak "s|__GCP_PROJECT__|${PROJ}|g" {} +
+find "$STAGE" -name "*.bak" -delete
+
 echo "==> rocky validate"
-rocky -c live.rocky.toml validate > /dev/null
+rocky -c "$STAGE/live.rocky.toml" validate > /dev/null
 
 echo "==> rocky run (initial — bootstrap + MERGE inserts all 3 rows)"
-rocky -c live.rocky.toml run --output json > expected/run-initial.json
+rocky -c "$STAGE/live.rocky.toml" run --output json > expected/run-initial.json
 
 EXPECTED_INITIAL='id,name,amount
 1,alice,100
@@ -78,7 +88,7 @@ bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
  ])" > /dev/null
 
 echo "==> rocky run (delta — MERGE UPDATE + INSERT)"
-rocky -c live.rocky.toml run --output json > expected/run-delta.json
+rocky -c "$STAGE/live.rocky.toml" run --output json > expected/run-delta.json
 
 EXPECTED_DELTA='id,name,amount
 1,alice,100

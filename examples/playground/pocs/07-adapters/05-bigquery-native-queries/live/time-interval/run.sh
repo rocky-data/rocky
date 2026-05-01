@@ -53,15 +53,25 @@ bq --project_id="$GCP_PROJECT_ID" query --use_legacy_sql=false --quiet \
    STRUCT(TIMESTAMP '2026-04-02 16:00:00',             3,                300)
  ])" > /dev/null
 
+# Stage live.rocky.toml + model files into a temp dir with
+# `__GCP_PROJECT__` substituted (see ../run.sh for rationale).
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"; drop_dataset' EXIT
+cp live.rocky.toml "$STAGE/"
+cp -R models "$STAGE/"
+find "$STAGE" -type f \( -name "*.toml" -o -name "*.sql" \) \
+    -exec sed -i.bak "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g" {} +
+find "$STAGE" -name "*.bak" -delete
+
 echo "==> rocky validate"
-rocky -c live.rocky.toml validate > /dev/null
+rocky -c "$STAGE/live.rocky.toml" validate > /dev/null
 
 echo "==> rocky run --partition 2026-04-01"
-rocky -c live.rocky.toml run --partition 2026-04-01 --output json \
+rocky -c "$STAGE/live.rocky.toml" run --partition 2026-04-01 --output json \
     > expected/run-2026-04-01.json
 
 echo "==> rocky run --partition 2026-04-02"
-rocky -c live.rocky.toml run --partition 2026-04-02 --output json \
+rocky -c "$STAGE/live.rocky.toml" run --partition 2026-04-02 --output json \
     > expected/run-2026-04-02.json
 
 echo "==> verifying materialized output"

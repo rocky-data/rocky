@@ -53,11 +53,15 @@ Each `live/<scenario>/run.sh` is independent: own `live.rocky.toml`, own model(s
 Full tour:
 
 ```bash
-export GCP_PROJECT_ID="rocky-sandbox-hc-test-63874"
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/rocky/bq-sandbox.json"
+export GCP_PROJECT_ID="<your-gcp-project-id>"
+export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"
 export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh
 ```
+
+`GCP_PROJECT_ID` is templated into each driver's `live.rocky.toml` and model
+files at runtime via a `__GCP_PROJECT__` placeholder — no project ID is
+checked into the repo. See [`live/README.md`](./live/README.md) for details.
 
 Or one scenario at a time:
 

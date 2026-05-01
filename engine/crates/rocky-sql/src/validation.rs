@@ -15,7 +15,7 @@ static PRINCIPAL_NAME_RE: LazyLock<Regex> =
 /// GCP requires project IDs to be 6–30 chars, lowercase alphanumeric +
 /// hyphens, starting with a letter and not ending in a hyphen. The
 /// hyphen is what makes the stricter [`SQL_IDENTIFIER_RE`] reject them
-/// (e.g. `rocky-sandbox-hc-test-63874`).
+/// (e.g. `my-gcp-project-123`).
 static GCP_PROJECT_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$").unwrap());
 
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn test_valid_gcp_project_ids() {
         assert!(validate_gcp_project_id("rocky-sandbox").is_ok());
-        assert!(validate_gcp_project_id("rocky-sandbox-hc-test-63874").is_ok());
+        assert!(validate_gcp_project_id("my-gcp-project-123").is_ok());
         assert!(validate_gcp_project_id("my-project-1").is_ok());
         // Lower bound: 6 chars total (1 leading letter + 4 middle + 1 tail).
         assert!(validate_gcp_project_id("abc12d").is_ok());

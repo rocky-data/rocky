@@ -41,8 +41,8 @@ Each driver:
 ## Run
 
 ```bash
-export GCP_PROJECT_ID="rocky-sandbox-hc-test-63874"
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/rocky/bq-sandbox.json"
+export GCP_PROJECT_ID="<your-gcp-project-id>"
+export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"
 export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh                   # full-refresh
 ./time-interval/run.sh     # time-interval (4-statement DML transaction)
@@ -53,14 +53,18 @@ export BQ_LOCATION="EU"   # optional; default EU
 
 Each script exits 0 on success after dropping its target dataset.
 
-## Sandbox-specific by construction
+## Project-ID templating
 
-Model sidecar TOMLs (and the time-interval model SQL, which references
-the source table by 3-part name) hardcode the project ID
-`rocky-sandbox-hc-test-63874`. Model files don't honor `${VAR}` env
-substitution today (only `rocky.toml` does), so these demos are wired
-to a single project. Patch the catalog / hardcoded project if pointing
-elsewhere.
+Model sidecar TOMLs (and the time-interval / merge / cost-cross-check
+model SQL, which references source tables by 3-part name) need a
+project-qualified reference. Model files don't honor `${VAR}` env
+substitution today (only `rocky.toml` does — see finding 2 below), so
+each driver writes a `__GCP_PROJECT__` placeholder into its committed
+files and substitutes it at runtime by staging the config + models
+into a temp dir, running `sed -i "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g"`
+across the staged copy, and pointing `rocky -c` at the temp
+`live.rocky.toml`. The repo therefore contains no project IDs; each
+driver works against whatever project `GCP_PROJECT_ID` resolves to.
 
 ## Why a separate `live/` subdir
 
