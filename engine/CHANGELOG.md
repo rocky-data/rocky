@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`CompactOutput.model` is now optional**. Was required (`String`); now `Option<String>` so the catalog-scope path can omit it. JSON schema relaxes from required to optional; existing single-model JSON output is byte-stable. Pydantic + TypeScript bindings regenerated accordingly.
 - **`rocky-cli/src/scope.rs`**. The managed-table resolver previously private to `commands/compact.rs` (`resolve_managed_tables`, `resolve_replication_managed_tables`, `resolve_transformation_managed_tables`, `managed_catalog_set`) lifted into a shared module so both `compact` (`--measure-dedup`, `--catalog`) and `archive` (`--catalog`) reuse one implementation. Pure refactor for the dedup path — its tests come along.
+- **`rocky compact` no-scope error message lists every valid scope.** Replaces clap's `required_unless_present_any` + per-flag `conflicts_with` declarations with a single `ArgGroup` (`compact_scope`) over `model` / `catalog` / `measure_dedup`. Running `rocky compact` with no scope now errors with `<MODEL|--catalog <CATALOG>|--measure-dedup>` instead of just `<MODEL>`, so the user sees that `--catalog` and `--measure-dedup` are valid alternatives. Mutual exclusion is unchanged — the group's `multiple(false)` enforces it.
 
 ## [1.19.2] — 2026-04-30
 
