@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`{name:SEP}` placeholder grammar in schema-pattern templates.** `ParsedSchema::resolve_template` now accepts an optional explicit join separator at the use site: `{name:SEP}` joins multi-valued components with the literal string `SEP` instead of the caller-supplied default. Closes a footgun where the same placeholder rendered differently across call sites — `target.{catalog,schema}_template` joins with `target.separator`, while `metadata_columns.value` joins with `pattern.separator`, so `{regions}` could resolve to `us_west_us_east` in one TOML field and `us_west__us_east` in another. Pinning the separator at the use site (`{regions:_}`) makes the rendered value stable across config changes — important for templates feeding hash functions (RLS keys, audit hashes, permission keys). Bare `{name}` is unchanged: every existing template renders identically. The grammar applies uniformly to `catalog_template`, `schema_template`, and `metadata_columns.value`.
+
 ## [1.20.1] — 2026-05-01
 
 Patch release. Root-cause fix for Fivetran auto-rename collisions surfacing as duplicate `DiscoveredTable` records in `rocky discover` output.
