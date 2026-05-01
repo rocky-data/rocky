@@ -188,6 +188,87 @@ pub trait DiscoveryAdapter: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Bisection diff
+// ---------------------------------------------------------------------------
+
+/// One contiguous range of primary-key values, identifying a chunk in a
+/// checksum-bisection diff (see [`WarehouseAdapter::checksum_chunks`]).
+///
+/// Variants correspond one-to-one with [`SplitStrategy`]:
+/// - `IntRange` for declared integer / numeric primary keys.
+/// - `Composite` for multi-column primary keys; lo/hi are tuple boundaries.
+///   Caller pre-computes boundaries (typically via a per-recursion-level
+///   `NTILE` query on one side) so chunk identity stays stable across both
+///   sides of the diff.
+/// - `HashBucket` for opaque-string / UUID primary keys; chunk identity is
+///   `hash(pk) % modulus == residue`. Single-level by construction —
+///   recursion under hash bucketing isn't cost-bounded on unclustered
+///   tables (every level requires a full re-scan to recompute the hash).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PkRange {
+    /// `[lo, hi)` over a single integer/numeric primary-key column.
+    IntRange { lo: i128, hi: i128 },
+    /// `[lo, hi)` over a composite primary-key tuple. Boundaries are
+    /// caller-provided as pre-computed `serde_json::Value` arrays so the
+    /// adapter doesn't re-quantile per call.
+    Composite {
+        lo: Vec<serde_json::Value>,
+        hi: Vec<serde_json::Value>,
+    },
+    /// `hash(pk) % modulus == residue` — single-level, no further recursion.
+    HashBucket { modulus: u32, residue: u32 },
+}
+
+/// One chunk's checksum result returned from
+/// [`WarehouseAdapter::checksum_chunks`].
+///
+/// Empty chunks (zero rows on this side) MAY be omitted by the
+/// implementation; callers MUST index the result by `chunk_id`, not by
+/// vector position. A `chunk_id` absent from the returned vector is
+/// equivalent to `ChunkChecksum { chunk_id, row_count: 0, checksum: 0 }`.
+///
+/// This contract exists because `GROUP BY chunk_id` on every target
+/// warehouse drops empty groups, and back-filling per-adapter is
+/// error-prone. The trait places the alignment burden on the caller, which
+/// already knows the full set of chunks it asked for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkChecksum {
+    /// Index into the `pk_ranges` slice the caller passed to
+    /// [`WarehouseAdapter::checksum_chunks`].
+    pub chunk_id: u32,
+    /// Number of non-null primary-key rows that fell into this chunk.
+    pub row_count: u64,
+    /// XOR-aggregated row hashes, widened to `u128` so the largest native
+    /// adapter hash output (Snowflake `NUMBER(38,0)`) fits without
+    /// truncation. Adapters with smaller native widths (xxhash64,
+    /// FARM_FINGERPRINT) zero-extend.
+    pub checksum: u128,
+}
+
+/// How the bisection runner split the primary-key space into chunks.
+///
+/// Surfaced on the diff result (the `BisectionStats` in
+/// `rocky_core::compare::bisection`) so downstream consumers know whether
+/// chunk identity is a numeric range, a tuple boundary, a hash bucket, or
+/// a non-unique-ordering fallback.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitStrategy {
+    /// Declared integer / numeric primary key; arithmetic split.
+    IntRange,
+    /// Composite primary key; per-level NTILE boundaries on the base side.
+    Composite,
+    /// UUID / opaque string primary key; single-level hash bucketing.
+    HashBucket,
+    /// No declared primary key; fallback ordering by the first column.
+    /// Bisection on this strategy is **not exhaustive** — multiple rows
+    /// can share the same chunk identity and tie-breaks are warehouse-
+    /// defined. Callers should treat the diff as best-effort and surface
+    /// a coverage warning.
+    FirstColumn,
+}
+
+// ---------------------------------------------------------------------------
 // Warehouse
 // ---------------------------------------------------------------------------
 
@@ -322,6 +403,238 @@ pub trait WarehouseAdapter: Send + Sync {
         );
         self.execute_statement(&sql).await
     }
+
+    /// Compute checksums for a batch of chunks defined by primary-key
+    /// ranges. The bisection runner in
+    /// [`crate::compare::bisection`] calls this once per recursion level
+    /// per side; one call returns up to `K` chunks.
+    ///
+    /// **Returns one entry per non-empty chunk.** Chunks with zero rows on
+    /// this side MAY be omitted by the implementation; callers MUST index
+    /// the result by [`ChunkChecksum::chunk_id`], not by vector position.
+    /// A `chunk_id` absent from the returned vector is equivalent to
+    /// `ChunkChecksum { chunk_id, row_count: 0, checksum: 0 }`. This
+    /// alignment burden lives on the caller because `GROUP BY chunk_id`
+    /// drops empty groups on every target warehouse and back-filling
+    /// per-adapter is error-prone.
+    ///
+    /// `value_columns` are the columns to hash for the chunk checksum
+    /// (typically every non-`pk_column` column the caller cares about).
+    /// `pk_column` identifies the bucketing column. The default impl
+    /// supports a single integer/numeric column (`PkRange::IntRange`);
+    /// composite and hash-bucket strategies require an adapter override
+    /// that knows how to emit the corresponding bucketing SQL.
+    ///
+    /// **Integer-PK value range.** The default impl interpolates `lo`
+    /// and `hi` as decimal literals into SQL, and the chunk-id
+    /// arithmetic uses 64-bit floating-point. Tables whose PK exceeds
+    /// the i64 range require an adapter override that handles wider
+    /// integers natively.
+    ///
+    /// The default implementation uses [`SqlDialect::row_hash_expr`] +
+    /// `BIT_XOR` to produce a portable query. Adapters with native
+    /// hash + bucketing primitives (DuckDB `hash()` + `width_bucket`,
+    /// BigQuery `FARM_FINGERPRINT`, Snowflake `HASH` + `BITXOR_AGG`,
+    /// Databricks `xxhash64`) override for performance.
+    async fn checksum_chunks(
+        &self,
+        table: &TableRef,
+        pk_column: &str,
+        value_columns: &[String],
+        pk_ranges: &[PkRange],
+    ) -> AdapterResult<Vec<ChunkChecksum>> {
+        default_checksum_chunks(self, table, pk_column, value_columns, pk_ranges).await
+    }
+
+    /// Adapter-tuned override for the bisection leaf-row threshold (the
+    /// `MIN_CHUNK_ROWS` knob). Below this row count, the bisection runner
+    /// stops splitting and materializes the chunk for row-by-row diff.
+    ///
+    /// Defaults to `1000`, which lands break-even on DuckDB and similar
+    /// in-process engines. Adapters with high per-query setup cost
+    /// (Databricks, Snowflake, BigQuery) override to a higher value to
+    /// avoid spending fixed roundtrip cost on small chunks.
+    fn recommended_leaf_size(&self) -> u64 {
+        1000
+    }
+
+    /// Adapter-tuned override for the row-count threshold above which
+    /// UUID / hash-bucket-PK tables auto-fall-back from bisection to
+    /// sampled (with a coverage warning).
+    ///
+    /// Defaults to `10_000_000` — chosen so the auto-fallback fires before
+    /// a single mismatched bucket on `K=32` materializes more than ~300k
+    /// rows per side. Adapters with cheap large-table scans (or with
+    /// native hash-clustering guarantees) can lower this; the default is
+    /// conservative.
+    fn recommended_uuid_threshold(&self) -> u64 {
+        10_000_000
+    }
+}
+
+/// Default `checksum_chunks` implementation, factored out so it lives
+/// outside the trait body and can call helpers without recursion-into-self
+/// concerns. Adapter overrides bypass this entirely.
+async fn default_checksum_chunks(
+    adapter: &(impl WarehouseAdapter + ?Sized),
+    table: &TableRef,
+    pk_column: &str,
+    value_columns: &[String],
+    pk_ranges: &[PkRange],
+) -> AdapterResult<Vec<ChunkChecksum>> {
+    if pk_ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Sub-step 1 supports IntRange only; composite + hash-bucket land in
+    // follow-up phases. The error here is what the bisection runner
+    // surfaces to the user when they request `--algorithm=bisection` on a
+    // table whose PK isn't a single integer column on an adapter without
+    // a native override.
+    let (lo_min, hi_max, k) = uniform_int_range_window(pk_ranges)?;
+    let step = (hi_max - lo_min) / (k as i128);
+    if step <= 0 {
+        return Err(AdapterError::msg(
+            "default checksum_chunks requires a positive integer step \
+             across the chunk window (lo == hi or hi < lo)",
+        ));
+    }
+
+    rocky_sql::validation::validate_identifier(pk_column).map_err(AdapterError::new)?;
+    for col in value_columns {
+        rocky_sql::validation::validate_identifier(col).map_err(AdapterError::new)?;
+    }
+
+    let dialect = adapter.dialect();
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+    let row_hash = dialect.row_hash_expr(value_columns)?;
+
+    // FLOOR((pk - lo) / step) is the most-portable chunk-id construction —
+    // works on Snowflake, Databricks Spark, BigQuery, and DuckDB without
+    // dialect dispatch. The outer LEAST clamp handles the integer-step
+    // truncation case: when `step * k < hi - lo`, the last chunk absorbs
+    // the remainder (per `split_int_range`'s contract), so the SQL
+    // bucketing must clamp the highest pk values back into chunk K-1
+    // instead of overflowing to K. The outer SELECT pins ORDER BY for
+    // stable serialization.
+    let last_id = k - 1;
+    let sql = format!(
+        "SELECT chunk_id, COUNT(*) AS row_count, BIT_XOR({row_hash}) AS chk \
+         FROM ( \
+             SELECT *, \
+                    LEAST( \
+                        CAST(FLOOR((CAST(\"{pk_column}\" AS DOUBLE) - {lo}) / {step}) AS BIGINT), \
+                        {last_id} \
+                    ) AS chunk_id \
+             FROM {table_ref} \
+             WHERE \"{pk_column}\" IS NOT NULL \
+               AND \"{pk_column}\" >= {lo} \
+               AND \"{pk_column}\" < {hi} \
+         ) AS chunked \
+         GROUP BY chunk_id \
+         ORDER BY chunk_id",
+        lo = lo_min,
+        hi = hi_max,
+    );
+
+    let result = adapter.execute_query(&sql).await?;
+    parse_chunk_checksums(&result, k)
+}
+
+/// Verifies the caller passed `K` contiguous, equal-width `IntRange`
+/// chunks and returns `(lo_min, hi_max, K)` so the default impl can
+/// derive the SQL `FLOOR((pk - lo) / step)` predicate.
+fn uniform_int_range_window(pk_ranges: &[PkRange]) -> AdapterResult<(i128, i128, u32)> {
+    let mut lo_min: Option<i128> = None;
+    let mut hi_max: Option<i128> = None;
+    for range in pk_ranges {
+        match range {
+            PkRange::IntRange { lo, hi } => {
+                lo_min = Some(lo_min.map_or(*lo, |x| x.min(*lo)));
+                hi_max = Some(hi_max.map_or(*hi, |x| x.max(*hi)));
+            }
+            PkRange::Composite { .. } | PkRange::HashBucket { .. } => {
+                return Err(AdapterError::msg(
+                    "default checksum_chunks supports IntRange only; \
+                     composite and hash-bucket strategies require an \
+                     adapter override",
+                ));
+            }
+        }
+    }
+    let lo = lo_min.expect("non-empty pk_ranges checked above");
+    let hi = hi_max.expect("non-empty pk_ranges checked above");
+    let k = u32::try_from(pk_ranges.len()).map_err(|_| {
+        AdapterError::msg("checksum_chunks accepts up to u32::MAX chunks per call")
+    })?;
+    Ok((lo, hi, k))
+}
+
+/// Parse a `chunk_id, row_count, chk` result set into [`ChunkChecksum`]
+/// rows. Empty chunks are absent from the input by SQL contract — the
+/// caller back-fills via `chunk_id`.
+fn parse_chunk_checksums(result: &QueryResult, k: u32) -> AdapterResult<Vec<ChunkChecksum>> {
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        if row.len() < 3 {
+            return Err(AdapterError::msg(
+                "checksum_chunks query returned a row with fewer than 3 \
+                 columns; expected (chunk_id, row_count, chk)",
+            ));
+        }
+        let chunk_id: u32 = parse_chunk_id(&row[0], k)?;
+        let row_count: u64 = parse_u64(&row[1])?;
+        let checksum: u128 = parse_checksum(&row[2])?;
+        out.push(ChunkChecksum {
+            chunk_id,
+            row_count,
+            checksum,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_chunk_id(v: &serde_json::Value, k: u32) -> AdapterResult<u32> {
+    let raw = parse_i128(v)?;
+    if raw < 0 || raw >= i128::from(k) {
+        return Err(AdapterError::msg(format!(
+            "checksum_chunks returned chunk_id={raw}, outside [0, {k})"
+        )));
+    }
+    Ok(raw as u32)
+}
+
+fn parse_u64(v: &serde_json::Value) -> AdapterResult<u64> {
+    let raw = parse_i128(v)?;
+    u64::try_from(raw).map_err(|_| {
+        AdapterError::msg(format!(
+            "checksum_chunks returned row_count={raw}, expected non-negative u64"
+        ))
+    })
+}
+
+fn parse_checksum(v: &serde_json::Value) -> AdapterResult<u128> {
+    let raw = parse_i128(v)?;
+    Ok(raw as u128)
+}
+
+fn parse_i128(v: &serde_json::Value) -> AdapterResult<i128> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<i128>().map_err(|e| {
+            AdapterError::msg(format!(
+                "failed to parse {s:?} as i128 from checksum_chunks result: {e}"
+            ))
+        });
+    }
+    if let Some(n) = v.as_i64() {
+        return Ok(n.into());
+    }
+    if let Some(n) = v.as_u64() {
+        return Ok(n.into());
+    }
+    Err(AdapterError::msg(format!(
+        "checksum_chunks result column had unexpected JSON shape: {v:?}"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +792,30 @@ pub trait SqlDialect: Send + Sync {
     /// `CURRENT_TIMESTAMP()` because it requires the function form.
     fn current_timestamp_expr(&self) -> &'static str {
         "CURRENT_TIMESTAMP"
+    }
+
+    /// SQL expression that computes a single-row hash over `columns`,
+    /// returning an integer wide enough to feed `BIT_XOR(...)` for
+    /// chunk-checksum aggregation in
+    /// [`WarehouseAdapter::checksum_chunks`].
+    ///
+    /// **No portable default exists** — the per-warehouse native hash
+    /// functions all return integer types but the SQL surface differs
+    /// (DuckDB `hash(...)`, Databricks `xxhash64(concat_ws(...))`,
+    /// Snowflake `HASH(...)`, BigQuery
+    /// `FARM_FINGERPRINT(TO_JSON_STRING(STRUCT(...)))`). The default impl
+    /// returns an error so adapters that haven't overridden surface a
+    /// helpful message at `--algorithm=bisection` time rather than
+    /// emitting broken SQL.
+    ///
+    /// `columns` are quoted by the caller; the dialect must produce a SQL
+    /// fragment safe to embed under `BIT_XOR(...)` and `GROUP BY
+    /// chunk_id`.
+    fn row_hash_expr(&self, _columns: &[String]) -> AdapterResult<String> {
+        Err(AdapterError::msg(
+            "row_hash_expr not supported by this dialect; required for \
+             the checksum-bisection diff",
+        ))
     }
 
     /// Returns `true` when changing a column's data type from

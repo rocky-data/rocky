@@ -1,7 +1,18 @@
-//! Shadow mode comparison engine.
+//! Cross-table comparison primitives.
 //!
-//! Compares shadow table output against production tables to detect
-//! discrepancies in row counts, schemas, and sampled data.
+//! Two layers live here:
+//!
+//! - **Shadow comparison** (this module's body) — schema + row-count
+//!   diff between a shadow run's output and the production table it
+//!   would replace.
+//! - **Checksum-bisection diff** ([`bisection`]) — exhaustive row-level
+//!   diff between any two tables on the same logical schema, e.g., a
+//!   PR's branch-schema clone vs. the base-schema source. Current scope
+//!   is single-column integer primary keys; DuckDB ships with the
+//!   `row_hash_expr` override out of the box, other adapters provide
+//!   their own native hash before bisection works against them.
+
+pub mod bisection;
 
 use std::collections::HashMap;
 

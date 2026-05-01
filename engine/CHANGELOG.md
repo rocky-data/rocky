@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Checksum-bisection diff kernel.** `rocky_core::compare::bisection::bisection_diff` walks the `K`-fanout chunk lattice over a single-column integer / numeric primary key, recurses into mismatched chunks until the leaf threshold, then materializes-and-diffs the leaves row-by-row. Datafold-style: a no-op diff bottoms out at `K` chunk checksums per side; a single-row change recurses to the row in `O(K · log_K(N))` chunks examined. Conformance suite at `engine/crates/rocky-duckdb/tests/bisection_conformance.rs` pins determinism, the no-op cost bound, and a 100k-row planted-change fixture.
+- **Adapter trait surface for bisection.** `WarehouseAdapter::checksum_chunks` (with `recommended_leaf_size` + `recommended_uuid_threshold` getters) on both `rocky-core` and the public-stable `rocky-adapter-sdk`. The in-tree default emits a portable `BIT_XOR(<row_hash>)`-over-`FLOOR((pk - lo) / step)` query that composes with `SqlDialect::row_hash_expr`; the SDK default returns "not supported" so out-of-tree adapters surface a clear error until they wire their native hash. New `ChunkChecksum`, `PkRange`, `SplitStrategy` types are re-exported from both crates.
+- **`SqlDialect::row_hash_expr`** on `rocky-core::traits::SqlDialect`. Returns the per-dialect SQL fragment for a single-row hash usable under `BIT_XOR(...)`. Default is an explicit not-supported error so adapters that haven't overridden surface a helpful message rather than emitting broken SQL. DuckDB ships with the override (`CAST(hash(...) AS HUGEINT)`); the other in-tree adapters add their native hash in follow-up changes.
+
+### Notes for downstream consumers
+
+- **`rocky-adapter-sdk` trait surface gained one method** (`checksum_chunks`) with a default-error impl and two utility getters with safe defaults (`recommended_leaf_size`, `recommended_uuid_threshold`). Out-of-tree adapters that don't override get a "not supported" error from `checksum_chunks`, which is the intended state until each adapter wires its native hash. Treat as a minor SDK bump at the next engine release cut; no source-level breaking changes.
+
 ## [1.21.0] — 2026-05-01
 
 Feature release. Headline: **BigQuery adapter promoted out of experimental** — every BQ-specific dialect surface is now live-verified end-to-end (full-refresh, time-interval DML transactions, MERGE bootstrap, region-qualified discovery, drift across all three actions, cost cross-check). `MaterializationOutput.job_ids` lets consumers cross-check rocky-reported bytes against the warehouse console. Bundles the FR-021 explicit-separator grammar in schema-pattern templates.
