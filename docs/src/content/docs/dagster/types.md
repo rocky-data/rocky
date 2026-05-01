@@ -735,6 +735,7 @@ A single health check result.
 | `status` | `HealthStatus` | One of `"healthy"`, `"warning"`, `"critical"` |
 | `message` | `str` | Check result message |
 | `duration_ms` | `int` | Check duration |
+| `details` | `list[tuple[str, str]]` | Optional per-check `(key, value)` context populated when `rocky doctor` is invoked with `--verbose` (config path, state file size, adapter type + credential signal, pipeline kind, state backend). Empty list when the engine omits the field. |
 
 ---
 
