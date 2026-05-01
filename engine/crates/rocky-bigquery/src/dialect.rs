@@ -145,13 +145,19 @@ impl SqlDialect for BigQueryDialect {
         partition_filter: &str,
         select_sql: &str,
     ) -> AdapterResult<Vec<String>> {
-        // BigQuery supports DML transactions since 2023
-        Ok(vec![
-            "BEGIN TRANSACTION".to_string(),
-            format!("DELETE FROM {target} WHERE {partition_filter}"),
-            format!("INSERT INTO {target}\n{select_sql}"),
-            "COMMIT TRANSACTION".to_string(),
-        ])
+        // BigQuery's REST API is stateless — each `jobs.query` call is its
+        // own session, so issuing BEGIN/COMMIT as separate statements
+        // fails with `Transaction control statements are supported only in
+        // scripts or sessions`. Emit the DML transaction as a single
+        // semicolon-joined script so the runtime submits all four
+        // statements as one job, which BigQuery executes atomically and
+        // auto-rolls-back on any sub-statement error.
+        Ok(vec![format!(
+            "BEGIN TRANSACTION;\n\
+             DELETE FROM {target} WHERE {partition_filter};\n\
+             INSERT INTO {target}\n{select_sql};\n\
+             COMMIT TRANSACTION"
+        )])
     }
 
     fn list_tables_sql(
@@ -232,9 +238,14 @@ mod tests {
                 "SELECT * FROM src",
             )
             .unwrap();
-        assert_eq!(stmts.len(), 4);
-        assert_eq!(stmts[0], "BEGIN TRANSACTION");
-        assert_eq!(stmts[3], "COMMIT TRANSACTION");
+        // BigQuery requires the transaction to be a single script (its
+        // REST API rejects standalone BEGIN/COMMIT calls).
+        assert_eq!(stmts.len(), 1);
+        let script = &stmts[0];
+        assert!(script.starts_with("BEGIN TRANSACTION;\n"));
+        assert!(script.contains("DELETE FROM `p`.`d`.`t` WHERE date_col >= '2024-01-01';"));
+        assert!(script.contains("INSERT INTO `p`.`d`.`t`\nSELECT * FROM src;"));
+        assert!(script.ends_with("COMMIT TRANSACTION"));
     }
 
     #[test]

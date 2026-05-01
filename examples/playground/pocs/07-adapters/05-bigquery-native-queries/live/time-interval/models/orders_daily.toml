@@ -1,0 +1,15 @@
+[strategy]
+type = "time_interval"
+# Must be a TIMESTAMP column on BigQuery: the runtime emits the partition
+# filter as `'YYYY-MM-DD HH:MM:SS'` literals, which BQ refuses to coerce
+# to a DATE column.
+time_column = "order_day"
+granularity = "day"
+lookback = 0
+first_partition = "2026-04-01"
+
+# Hardcoded to the Rocky BQ sandbox project — model sidecar TOMLs don't
+# honor ${VAR} env substitution today (see live/README.md for context).
+[target]
+catalog = "rocky-sandbox-hc-test-63874"
+schema = "hc_phase1_live_ti"

@@ -3902,10 +3902,12 @@ async fn run_one_partition(
     // transactional dialects (Snowflake / DuckDB) don't leave partial state
     // visible.
     //
-    // Accumulate warehouse-reported bytes across all statements — the BQ
-    // `insert_overwrite_partition` contract emits 4 statements
-    // (BEGIN / DELETE / INSERT / COMMIT), each of which potentially reports
-    // its own `totalBytesBilled`. Summing gives the partition-total cost
+    // Accumulate warehouse-reported bytes across all statements. Snowflake
+    // and DuckDB emit 4 statements (BEGIN / DELETE / INSERT / COMMIT);
+    // BigQuery emits a single semicolon-joined script (its stateless REST
+    // API rejects standalone BEGIN/COMMIT calls); Databricks emits one
+    // `INSERT INTO ... REPLACE WHERE`. Each statement potentially reports
+    // its own `totalBytesBilled` — summing gives the partition-total cost
     // input. Non-BQ adapters return `None` from the default trait method,
     // so `bytes_acc` stays `None` and `compute_observed_cost_usd` falls
     // through to the duration-based branch.

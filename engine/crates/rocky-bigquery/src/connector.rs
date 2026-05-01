@@ -329,6 +329,18 @@ impl WarehouseAdapter for BigQueryAdapter {
             })
             .collect();
 
+        // INFORMATION_SCHEMA.COLUMNS returns zero rows for a missing table
+        // rather than raising — so an empty result here means the table
+        // doesn't exist. Surface that as an error so callers using
+        // `describe_table().is_ok()` to probe existence (e.g. the
+        // time-interval bootstrap path) get the right answer.
+        if columns.is_empty() {
+            return Err(AdapterError::msg(format!(
+                "table `{}`.`{}`.`{}` not found",
+                table.catalog, table.schema, table.table
+            )));
+        }
+
         Ok(columns)
     }
 
