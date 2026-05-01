@@ -218,3 +218,43 @@ async fn test_discover_lists_datasets_and_tables() {
     assert_eq!(beta_conn.tables.len(), 1);
     assert_eq!(beta_conn.tables[0].name, "customers");
 }
+
+/// Verifies `execute_statement_with_stats` enriches the response with
+/// `statistics.query.totalBytesBilled` via a follow-up `jobs.get` call.
+/// Without the enrichment, only the bare `totalBytesProcessed` from
+/// the synchronous `jobs.query` response would surface — which doesn't
+/// apply BigQuery's 10 MB minimum-bill floor.
+///
+/// Uses `INFORMATION_SCHEMA.SCHEMATA` so the query reads real data
+/// (constant queries like `SELECT 1` are exempt from the bill floor).
+/// If the enrichment regresses, `bytes_scanned` falls back to
+/// `totalBytesProcessed` — which is small for a metadata view scan
+/// and well below the 10 MB floor.
+#[tokio::test]
+#[ignore]
+async fn test_execute_statement_with_stats_reports_billed_bytes() {
+    use rocky_core::traits::WarehouseAdapter;
+
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+    let location = std::env::var("BIGQUERY_TEST_LOCATION").unwrap_or_else(|_| "EU".to_string());
+
+    let adapter = adapter_from_env().expect("BigQuery env vars not set");
+    let region = format!("region-{}", location.to_lowercase());
+    let sql = format!("SELECT COUNT(*) AS n FROM `{project}.{region}.INFORMATION_SCHEMA.SCHEMATA`");
+
+    let stats = adapter
+        .execute_statement_with_stats(&sql)
+        .await
+        .expect("execute_statement_with_stats");
+
+    let bytes = stats
+        .bytes_scanned
+        .expect("bytes_scanned should be populated via jobs.get enrichment");
+    const MIN_BILL: u64 = 10 * 1024 * 1024;
+    assert!(
+        bytes >= MIN_BILL,
+        "bytes_scanned ({bytes}) below 10 MB minimum-bill floor — \
+         likely fell back to totalBytesProcessed from jobs.query"
+    );
+}

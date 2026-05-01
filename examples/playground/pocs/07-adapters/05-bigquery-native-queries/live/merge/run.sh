@@ -95,7 +95,7 @@ if [[ "$ACTUAL" != "$EXPECTED_DELTA" ]]; then
 fi
 echo "    delta: bob updated to 250, dave inserted, alice/carol unchanged"
 
-echo "==> verifying cost attribution populated"
+echo "==> verifying cost attribution reports billed bytes (with 10MB floor)"
 python3 - "$HERE/expected/run-delta.json" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
@@ -103,13 +103,21 @@ with open(sys.argv[1]) as f:
 mat = out["materializations"][0]
 bs = mat.get("bytes_scanned")
 cu = mat.get("cost_usd")
-if not isinstance(bs, int) or bs <= 0:
-    print(f"FAIL: materializations[0].bytes_scanned not populated (got {bs!r})")
+# Sub-10MB queries (this MERGE seeds 4 rows) MUST report at the 10 MB
+# minimum-bill floor when the connector reads `totalBytesBilled` via
+# the jobs.get enrichment path. If this falls back to the bare
+# `totalBytesProcessed` from the `jobs.query` response, the figure
+# would be a few hundred bytes — which is correct for "scanned" but
+# wrong for "billed", and misrepresents the actual GCP charge.
+MIN_BILL = 10 * 1024 * 1024  # 10 MiB
+if not isinstance(bs, int) or bs < MIN_BILL:
+    print(f"FAIL: bytes_scanned ({bs!r}) below 10MB minimum bill — "
+          f"connector likely fell back to totalBytesProcessed")
     sys.exit(1)
-if not isinstance(cu, (int, float)) or cu < 0:
-    print(f"FAIL: materializations[0].cost_usd not populated (got {cu!r})")
+if not isinstance(cu, (int, float)) or cu <= 0:
+    print(f"FAIL: cost_usd not populated (got {cu!r})")
     sys.exit(1)
-print(f"    bytes_scanned = {bs}, cost_usd = {cu}")
+print(f"    bytes_scanned = {bs} (= 10MB floor), cost_usd = {cu}")
 PY
 
 echo
