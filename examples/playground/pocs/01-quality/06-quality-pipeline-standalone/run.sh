@@ -39,5 +39,5 @@ duckdb poc.duckdb -c "SELECT order_id, customer_id, status,
   ORDER BY order_id;"
 
 echo
-echo "POC complete: unified check surface + mixed severity + Phase 3 row quarantine (split)."
+echo "POC complete: unified check surface + mixed severity + row quarantine (split)."
 echo "Flip fail_on_error=true in rocky.toml to make error-severity failures non-zero."

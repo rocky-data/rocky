@@ -15,7 +15,7 @@ sidebar:
 
 2. **Compute the prune set from the compiler IR.** Loading the working-tree models into the [compiler](/concepts/compiler/) gives a column-level dependency graph. The prune set is every changed model **plus** every model that transitively depends on a changed column. Models downstream of an *unchanged* column on a changed model are not pulled in — column-level pruning is strictly tighter than git-diff alone.
 
-3. **Compute the copy set.** Every working-DAG model not in the prune set is a copy candidate: it's logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. For each copy-set model, Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter. This is the Phase 1 substrate.
+3. **Compute the copy set.** Every working-DAG model not in the prune set is a copy candidate: it's logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. For each copy-set model, Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter — the portable copy substrate, with per-adapter overrides described below.
 
 4. **Run the prune set.** Rocky calls the existing branch run path ([`rocky run --branch <name>`](/reference/commands/core-pipeline/#rocky-run)) with a model selector limited to the prune set. The branch is registered via [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch); the run writes into the branch's `schema_prefix`.
 
@@ -49,7 +49,7 @@ The article does not document Smart Run's internal mechanism beyond the conceptu
 
 ## Sampling correctness ceiling
 
-`rocky preview diff` produces a row-level diff per model in the prune set by sampling. The Phase 1 sampling rule is:
+`rocky preview diff` produces a row-level diff per model in the prune set by sampling. The current sampling rule is:
 
 ```
 ORDER BY <primary_key>     -- or first column if no PK declared
@@ -69,7 +69,7 @@ This is fast, deterministic, and bounded — but it has a known false-negative m
 
 `coverage_warning: true` means the row count outside the sampling window is non-trivial — a clean sample does not imply "no change". The aggregate `summary.any_coverage_warning` lifts the flag to the run level so a reviewer can spot it without scanning every model.
 
-A checksum-bisection exhaustive diff (the technique [datafold's data-diff](https://github.com/datafold/data-diff) uses — split the table into PK-range chunks, checksum each chunk, recurse into mismatched chunks for bounded scan cost with exhaustive coverage) is the planned Phase 2.5 lift. Until then, treat the row-level diff as a sample-quality signal, not a correctness primitive — and don't ignore `coverage_warning`.
+A checksum-bisection exhaustive diff (the technique [datafold's data-diff](https://github.com/datafold/data-diff) uses — split the table into PK-range chunks, checksum each chunk, recurse into mismatched chunks for bounded scan cost with exhaustive coverage) is the planned next lift. Until then, treat the row-level diff as a sample-quality signal, not a correctness primitive — and don't ignore `coverage_warning`.
 
 ## Output shapes
 

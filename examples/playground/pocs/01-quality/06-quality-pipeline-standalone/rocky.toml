@@ -27,11 +27,11 @@ row_count = true
 column_match = { enabled = true, severity = "warning" }
 freshness = { threshold_seconds = 86400, severity = "warning" }
 anomaly_threshold_pct = 30.0
-# Phase 2 escape hatch: keep the POC green while surfacing failing rows.
+# Escape hatch: keep the POC green while surfacing failing rows.
 # Remove (or set `true`) to fail CI on any error-severity violation.
 fail_on_error = false
 
-# --- Phase 3: row quarantine (split mode) ---
+# --- Row quarantine (split mode) ---
 # Splits `orders` into `orders__valid` (passing rows) and
 # `orders__quarantine` (failing rows with `_error_*` label columns).
 # Only error-severity row-level assertions on `orders` drive the split:
@@ -42,7 +42,7 @@ fail_on_error = false
 enabled = true
 mode    = "split"
 
-# --- Phase 1: row-level assertions (unified surface) ---
+# --- Row-level assertions (unified surface) ---
 
 # not_null — 2 rows (order_id 7, 42) violate this.
 [[pipeline.nightly_dq.checks.assertions]]
@@ -90,7 +90,7 @@ min      = 40
 max      = 60
 severity = "error"
 
-# --- Phase 4a: in_range + regex_match + per-check filter ---
+# --- in_range + regex_match + per-check filter ---
 
 # in_range — amount should be within [0, 10000]. Row 99 has amount = -5
 # (failing) but the `expression` assertion above already catches it at
@@ -129,7 +129,7 @@ column   = "customer_id"
 filter   = "status = 'shipped'"
 severity = "warning"
 
-# --- Phase 4b: aggregate + composite unique + time_window ---
+# --- aggregate + composite unique + time_window ---
 
 # aggregate — sum(amount) must be > 0. Passes because positive amounts
 # dominate (the single row with amount = -5 doesn't flip the sign).
