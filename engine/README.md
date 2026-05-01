@@ -72,6 +72,7 @@ rocky run            # Execute the pipeline
 rocky state          # Inspect stored watermarks
 rocky ai "<intent>"  # Generate a model from natural language
 rocky lineage        # Trace column-level lineage
+rocky lineage-diff   # Per-changed-column downstream blast-radius for PR review
 rocky doctor         # Aggregate health checks
 rocky serve          # HTTP API + live watch
 rocky lsp            # Language Server Protocol for IDEs
