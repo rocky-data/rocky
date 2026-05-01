@@ -544,10 +544,12 @@ fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
                 .as_deref()
                 .and_then(|s| s.parse::<u64>().ok())
         });
+    let job_id = response.job_reference.as_ref().map(|jr| jr.job_id.clone());
     ExecutionStats {
         bytes_scanned,
         bytes_written: None,
         rows_affected: None,
+        job_id,
     }
 }
 

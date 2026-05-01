@@ -693,9 +693,10 @@ pub async fn run_snapshot(
             cost_usd: None,
             // snapshot_scd2 uses `execute_query` (multi-statement) and
             // doesn't thread stats through yet — BigQuery snapshot cost
-            // attribution is a follow-up wave.
+            // attribution + job-id capture is a follow-up wave.
             bytes_scanned: None,
             bytes_written: None,
+            job_ids: Vec::new(),
         });
     } else {
         output.tables_failed = 1;

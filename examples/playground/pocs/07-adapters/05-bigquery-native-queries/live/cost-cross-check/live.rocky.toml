@@ -1,0 +1,18 @@
+# Live BigQuery cost cross-check.
+#
+# Runs a single-statement transformation that scans a real source
+# table, captures the job_id from the rocky run output, and
+# cross-checks rocky's reported `bytes_scanned` against the
+# `totalBytesBilled` BigQuery reports for the same job via
+# `bq show -j`.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+type = "transformation"
+models = "models/**"
+
+[pipeline.live.target]

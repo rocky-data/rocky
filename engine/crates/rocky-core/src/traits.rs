@@ -103,7 +103,7 @@ pub struct ExplainResult {
 /// `MaterializationOutput.bytes_scanned` / `.bytes_written` so
 /// `rocky cost` can compute real dollar figures without re-querying the
 /// warehouse.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionStats {
     /// Adapter-reported bytes figure used for cost accounting. This is
     /// the *billing-relevant* number per adapter, not literal scan
@@ -141,6 +141,19 @@ pub struct ExecutionStats {
     /// per-adapter row counts through without another trait-method
     /// addition.
     pub rows_affected: Option<u64>,
+    /// Warehouse-specific job identifier for this statement, when one
+    /// exists. Threaded into `MaterializationOutput.job_ids` so callers
+    /// can cross-check warehouse-side statistics against rocky's
+    /// reported figures (e.g., comparing `bytes_scanned` to
+    /// `bq show -j <id>`'s `totalBytesBilled`).
+    ///
+    /// - **BigQuery:** `jobReference.jobId` from the `jobs.query`
+    ///   response.
+    /// - **Databricks / Snowflake:** `None` today — both surface a
+    ///   statement identifier in their REST responses; wiring is a
+    ///   follow-up wave.
+    /// - **DuckDB:** `None` — no job concept.
+    pub job_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
