@@ -1598,34 +1598,110 @@ pub struct TableCompareResult {
 }
 
 /// JSON output for `rocky compact`.
+///
+/// Two shapes share this struct:
+///
+/// - **Single-model (`rocky compact <fqn>`)**: `model` is set; `scope`,
+///   `catalog`, `tables`, and `totals` are absent. Byte-stable with
+///   envelopes that predate the catalog-scope flag.
+/// - **Catalog scope (`rocky compact --catalog <name>`)**: `model` is
+///   absent, `scope = "catalog"`, `catalog` is set, `tables` keys per-FQN
+///   statement bundles, and `totals` carries aggregate counts. The flat
+///   `statements` field still carries every SQL statement across all
+///   tables for consumers that just iterate it.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CompactOutput {
     pub version: String,
     pub command: String,
-    pub model: String,
+    /// Set when invoked as `rocky compact <fqn>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Set when invoked as `rocky compact --catalog <name>`. Stores the
+    /// catalog identifier as resolved (lowercased to match the
+    /// managed-table resolver's normalization).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    /// `"catalog"` for the catalog-scoped path; absent for single-model
+    /// invocations to keep their envelope byte-stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub dry_run: bool,
     pub target_size_mb: u64,
+    /// Flat list of every SQL statement across every table. Single-model
+    /// invocations have one bundle here; `--catalog` invocations have
+    /// the concatenation of every per-table bundle (in the same order
+    /// as `tables`'s key iteration order).
+    pub statements: Vec<NamedStatement>,
+    /// Per-table breakdown, keyed by fully-qualified table name. Present
+    /// only on `--catalog` invocations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<BTreeMap<String, CompactTableEntry>>,
+    /// Aggregate counts across the catalog. Present only on `--catalog`
+    /// invocations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<CompactTotals>,
+}
+
+/// Per-table compaction plan inside a `--catalog` envelope.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CompactTableEntry {
     pub statements: Vec<NamedStatement>,
 }
 
-/// Named SQL statement (purpose + sql), reused by compact and archive.
+/// Aggregate counts over a `rocky compact --catalog` invocation.
 #[derive(Debug, Serialize, JsonSchema)]
+pub struct CompactTotals {
+    pub table_count: usize,
+    pub statement_count: usize,
+}
+
+/// Named SQL statement (purpose + sql), reused by compact and archive.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct NamedStatement {
     pub purpose: String,
     pub sql: String,
 }
 
 /// JSON output for `rocky archive`.
+///
+/// Mirrors [`CompactOutput`]: single-model invocations populate `model`
+/// and leave the catalog-scope fields absent; `--catalog` invocations
+/// populate `catalog`, `scope = "catalog"`, `tables`, and `totals`. The
+/// flat `statements` list carries every statement across every table.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ArchiveOutput {
     pub version: String,
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Set when invoked as `rocky archive --catalog <name>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    /// `"catalog"` for the catalog-scoped path; absent for single-model
+    /// invocations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub older_than: String,
     pub older_than_days: u64,
     pub dry_run: bool,
     pub statements: Vec<NamedStatement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<BTreeMap<String, ArchiveTableEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<ArchiveTotals>,
+}
+
+/// Per-table archive plan inside a `--catalog` envelope.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ArchiveTableEntry {
+    pub statements: Vec<NamedStatement>,
+}
+
+/// Aggregate counts over a `rocky archive --catalog` invocation.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ArchiveTotals {
+    pub table_count: usize,
+    pub statement_count: usize,
 }
 
 /// JSON output for `rocky compact --measure-dedup` (Layer 0 storage experiment).

@@ -1,6 +1,41 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "ArchiveTableEntry": {
+      "description": "Per-table archive plan inside a `--catalog` envelope.",
+      "properties": {
+        "statements": {
+          "items": {
+            "$ref": "#/definitions/NamedStatement"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "statements"
+      ],
+      "type": "object"
+    },
+    "ArchiveTotals": {
+      "description": "Aggregate counts over a `rocky archive --catalog` invocation.",
+      "properties": {
+        "statement_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "statement_count",
+        "table_count"
+      ],
+      "type": "object"
+    },
     "NamedStatement": {
       "description": "Named SQL statement (purpose + sql), reused by compact and archive.",
       "properties": {
@@ -18,8 +53,15 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky archive`.",
+  "description": "JSON output for `rocky archive`.\n\nMirrors [`CompactOutput`]: single-model invocations populate `model` and leave the catalog-scope fields absent; `--catalog` invocations populate `catalog`, `scope = \"catalog\"`, `tables`, and `totals`. The flat `statements` list carries every statement across every table.",
   "properties": {
+    "catalog": {
+      "description": "Set when invoked as `rocky archive --catalog <name>`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "command": {
       "type": "string"
     },
@@ -40,11 +82,37 @@
       "minimum": 0.0,
       "type": "integer"
     },
+    "scope": {
+      "description": "`\"catalog\"` for the catalog-scoped path; absent for single-model invocations.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "statements": {
       "items": {
         "$ref": "#/definitions/NamedStatement"
       },
       "type": "array"
+    },
+    "tables": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ArchiveTableEntry"
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "totals": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ArchiveTotals"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "version": {
       "type": "string"

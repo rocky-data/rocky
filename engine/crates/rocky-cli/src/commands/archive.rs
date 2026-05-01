@@ -1,8 +1,12 @@
 //! `rocky archive` — archive old data partitions.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use anyhow::Result;
 
-use crate::output::{ArchiveOutput, NamedStatement, print_json};
+use crate::output::{ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement, print_json};
+use crate::scope::resolve_managed_tables_in_catalog;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -29,10 +33,14 @@ pub fn run_archive(
             version: VERSION.to_string(),
             command: "archive".to_string(),
             model: model.map(String::from),
+            catalog: None,
+            scope: None,
             older_than: older_than.to_string(),
             older_than_days: days,
             dry_run,
             statements: typed_statements,
+            tables: None,
+            totals: None,
         };
         print_json(&output)?;
     } else {
@@ -48,6 +56,84 @@ pub fn run_archive(
         for (purpose, sql) in &statements {
             println!("-- {purpose}");
             println!("{sql};");
+            println!();
+        }
+
+        if dry_run {
+            println!("(dry run: no statements executed)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute `rocky archive --catalog <name>` — generate archive SQL for
+/// every Rocky-managed table in the catalog.
+///
+/// Mirrors `rocky compact --catalog`: resolves the managed-table set via
+/// [`resolve_managed_tables_in_catalog`] (config-only, no warehouse round
+/// trip), then templates `DELETE` / `VACUUM` per table and aggregates
+/// into a single envelope.
+pub async fn run_archive_catalog(
+    config_path: &Path,
+    catalog: &str,
+    older_than: &str,
+    dry_run: bool,
+    output_json: bool,
+) -> Result<()> {
+    let days = parse_duration_days(older_than)?;
+    let scope = resolve_managed_tables_in_catalog(config_path, catalog).await?;
+
+    let mut flat_statements: Vec<NamedStatement> = Vec::new();
+    let mut per_table: BTreeMap<String, ArchiveTableEntry> = BTreeMap::new();
+
+    for fqn in &scope.tables {
+        let stmts = generate_archive_sql(Some(fqn), days);
+        let typed: Vec<NamedStatement> = stmts
+            .into_iter()
+            .map(|(purpose, sql)| NamedStatement { purpose, sql })
+            .collect();
+        flat_statements.extend(typed.iter().cloned());
+        per_table.insert(fqn.clone(), ArchiveTableEntry { statements: typed });
+    }
+
+    let totals = ArchiveTotals {
+        table_count: scope.tables.len(),
+        statement_count: flat_statements.len(),
+    };
+
+    if output_json {
+        let output = ArchiveOutput {
+            version: VERSION.to_string(),
+            command: "archive".to_string(),
+            model: None,
+            catalog: Some(scope.catalog.clone()),
+            scope: Some("catalog".to_string()),
+            older_than: older_than.to_string(),
+            older_than_days: days,
+            dry_run,
+            statements: flat_statements,
+            tables: Some(per_table),
+            totals: Some(totals),
+        };
+        print_json(&output)?;
+    } else {
+        println!(
+            "Archive plan for catalog '{}' ({} tables, older than {} = {} days){}",
+            scope.catalog,
+            scope.tables.len(),
+            older_than,
+            days,
+            if dry_run { " [DRY RUN]" } else { "" }
+        );
+        println!();
+
+        for (fqn, entry) in &per_table {
+            println!("-- {fqn}");
+            for s in &entry.statements {
+                println!("-- {}", s.purpose);
+                println!("{};", s.sql);
+            }
             println!();
         }
 

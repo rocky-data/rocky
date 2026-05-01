@@ -3,7 +3,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, conint
+
+
+class ArchiveTotals(BaseModel):
+    """
+    Aggregate counts over a `rocky archive --catalog` invocation.
+    """
+
+    statement_count: conint(ge=0)
+    table_count: conint(ge=0)
 
 
 class NamedStatement(BaseModel):
@@ -18,12 +29,32 @@ class NamedStatement(BaseModel):
 class ArchiveOutput(BaseModel):
     """
     JSON output for `rocky archive`.
+
+    Mirrors [`CompactOutput`]: single-model invocations populate `model` and leave the catalog-scope fields absent; `--catalog` invocations populate `catalog`, `scope = "catalog"`, `tables`, and `totals`. The flat `statements` list carries every statement across every table.
     """
 
+    catalog: str | None = None
+    """
+    Set when invoked as `rocky archive --catalog <name>`.
+    """
     command: str
     dry_run: bool
     model: str | None = None
     older_than: str
     older_than_days: conint(ge=0)
+    scope: str | None = None
+    """
+    `"catalog"` for the catalog-scoped path; absent for single-model invocations.
+    """
     statements: list[NamedStatement]
+    tables: dict[str, Any] | None = None
+    totals: ArchiveTotals | None = None
     version: str
+
+
+class ArchiveTableEntry(BaseModel):
+    """
+    Per-table archive plan inside a `--catalog` envelope.
+    """
+
+    statements: list[NamedStatement]

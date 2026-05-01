@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky compact --catalog <name>` and `rocky archive --catalog <name>`**. New scope flag that resolves the set of Rocky-managed tables in a single catalog from the pipeline config (replication discovery or transformation model files — no warehouse round trip) and aggregates per-table OPTIMIZE/VACUUM (compact) or DELETE/VACUUM (archive) SQL into one JSON envelope. Replaces the consumer-side `SHOW SCHEMAS`/`SHOW TABLES` enumeration that multi-catalog deployments otherwise have to reimplement to drive a weekly maintenance sweep — one subprocess call per catalog instead of one per table. Mutually exclusive with `--model` (and, for compact, `--measure-dedup`). Empty matches error with the available catalogs listed so consumer typos don't silently turn into no-ops.
+- **`CompactOutput` / `ArchiveOutput` carry per-catalog aggregation fields**. New optional `catalog`, `scope`, `tables` (per-FQN statement bundles), and `totals` (`table_count` + `statement_count`) fields populated only on `--catalog` invocations. Single-model envelopes are unchanged (the new fields are `skip_serializing_if = "Option::is_none"`); the flat top-level `statements` list still carries every SQL statement across every table for consumers that just iterate it.
+
+### Changed
+
+- **`CompactOutput.model` is now optional**. Was required (`String`); now `Option<String>` so the catalog-scope path can omit it. JSON schema relaxes from required to optional; existing single-model JSON output is byte-stable. Pydantic + TypeScript bindings regenerated accordingly.
+- **`rocky-cli/src/scope.rs`**. The managed-table resolver previously private to `commands/compact.rs` (`resolve_managed_tables`, `resolve_replication_managed_tables`, `resolve_transformation_managed_tables`, `managed_catalog_set`) lifted into a shared module so both `compact` (`--measure-dedup`, `--catalog`) and `archive` (`--catalog`) reuse one implementation. Pure refactor for the dedup path — its tests come along.
+
 ## [1.19.2] — 2026-04-30
 
 CI-only re-cut of `1.19.1`. Source code is identical to `1.19.1`; binary semantics unchanged. Adds the missing Windows archive (and the `SHA256SUMS` checksums file gated on it) that the `1.19.1` matrix run failed to produce because `aws-lc-sys` (transitive dep of `jsonwebtoken` via the `aws_lc_rs` feature flag) needs NASM on the Windows runner to assemble AWS-LC's optimized crypto kernels — the macOS / Linux toolchains fall back to a YASM-equivalent that ships by default. The release workflow now installs NASM on the Windows job before `cargo build`. macOS / Linux v1.19.1 binaries are correct and stay valid; this release just fills in the cross-platform set.

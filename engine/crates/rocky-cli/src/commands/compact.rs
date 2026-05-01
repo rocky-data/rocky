@@ -4,7 +4,7 @@
 //! dedup-measurement experiment (`run_measure_dedup`). See
 //! `plans/rocky-storage-layer-0.md` for the scope + decision gate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -17,10 +17,13 @@ use rocky_core::ir::TableRef;
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
 
 use crate::output::{
-    ByteCalibration, CompactDedupOutput, CompactOutput, DedupPair, DedupSummary, NamedStatement,
-    TableDedupContribution, print_json,
+    ByteCalibration, CompactDedupOutput, CompactOutput, CompactTableEntry, CompactTotals,
+    DedupPair, DedupSummary, NamedStatement, TableDedupContribution, print_json,
 };
 use crate::registry::{AdapterRegistry, resolve_pipeline};
+use crate::scope::{
+    managed_catalog_set, resolve_managed_tables, resolve_managed_tables_in_catalog,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -54,10 +57,14 @@ pub fn run_compact(
         let output = CompactOutput {
             version: VERSION.to_string(),
             command: "compact".to_string(),
-            model: model.to_string(),
+            model: Some(model.to_string()),
+            catalog: None,
+            scope: None,
             dry_run,
             target_size_mb: target_mb,
             statements: typed_statements,
+            tables: None,
+            totals: None,
         };
         print_json(&output)?;
     } else {
@@ -70,6 +77,99 @@ pub fn run_compact(
         for (purpose, sql) in &statements {
             println!("-- {purpose}");
             println!("{sql};");
+            println!();
+        }
+
+        if dry_run {
+            println!("(dry run: no statements executed)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute `rocky compact --catalog <name>` — generate compaction SQL
+/// for every Rocky-managed table in the catalog.
+///
+/// Resolves the managed-table set via [`resolve_managed_tables_in_catalog`]
+/// (config-only — no warehouse round trip), then templates `OPTIMIZE` /
+/// `VACUUM` per table via [`generate_compact_sql`], aggregating into a
+/// single envelope. Per-table failures aren't a concern here: the SQL
+/// generator is pure, so the only failure paths are pre-loop (config
+/// load, pipeline resolution, empty catalog) and surface as a hard
+/// error rather than a partial run.
+///
+/// The flat `statements` list and the per-table `tables` map carry the
+/// same information in two shapes — consumers that just iterate SQL
+/// keep working; consumers that want per-table attribution read `tables`.
+pub async fn run_compact_catalog(
+    config_path: &Path,
+    catalog: &str,
+    target_size: Option<&str>,
+    dry_run: bool,
+    output_json: bool,
+) -> Result<()> {
+    let target_mb = target_size
+        .map(|s| {
+            s.trim_end_matches("MB")
+                .trim_end_matches("mb")
+                .parse::<u64>()
+        })
+        .transpose()
+        .map_err(|e| anyhow!("invalid --target-size: {e}"))?
+        .unwrap_or(256);
+
+    let scope = resolve_managed_tables_in_catalog(config_path, catalog).await?;
+
+    let mut flat_statements: Vec<NamedStatement> = Vec::new();
+    let mut per_table: std::collections::BTreeMap<String, CompactTableEntry> =
+        std::collections::BTreeMap::new();
+
+    for fqn in &scope.tables {
+        let stmts = generate_compact_sql(fqn, target_mb);
+        let typed: Vec<NamedStatement> = stmts
+            .into_iter()
+            .map(|(purpose, sql)| NamedStatement { purpose, sql })
+            .collect();
+        flat_statements.extend(typed.iter().cloned());
+        per_table.insert(fqn.clone(), CompactTableEntry { statements: typed });
+    }
+
+    let totals = CompactTotals {
+        table_count: scope.tables.len(),
+        statement_count: flat_statements.len(),
+    };
+
+    if output_json {
+        let output = CompactOutput {
+            version: VERSION.to_string(),
+            command: "compact".to_string(),
+            model: None,
+            catalog: Some(scope.catalog.clone()),
+            scope: Some("catalog".to_string()),
+            dry_run,
+            target_size_mb: target_mb,
+            statements: flat_statements,
+            tables: Some(per_table),
+            totals: Some(totals),
+        };
+        print_json(&output)?;
+    } else {
+        println!(
+            "Compaction plan for catalog '{}' ({} tables, target {}MB){}",
+            scope.catalog,
+            scope.tables.len(),
+            target_mb,
+            if dry_run { " [DRY RUN]" } else { "" }
+        );
+        println!();
+
+        for (fqn, entry) in &per_table {
+            println!("-- {fqn}");
+            for s in &entry.statements {
+                println!("-- {}", s.purpose);
+                println!("{};", s.sql);
+            }
             println!();
         }
 
@@ -425,169 +525,6 @@ pub(crate) async fn compute_measure_dedup(
     Ok(output)
 }
 
-/// Resolve the set of table names that Rocky manages for a given pipeline.
-///
-/// Returns `Ok(Some(set))` with lowercase fully-qualified table names
-/// (`catalog.schema.table`) when the pipeline type supports resolution,
-/// or `Ok(None)` when resolution is not possible (unsupported pipeline
-/// type, no discovery adapter configured, etc.). Callers should fall
-/// back to scanning all warehouse tables when `None` is returned.
-///
-/// ## Pipeline types
-///
-/// - **Replication**: discovers connectors via the discovery adapter,
-///   parses each schema through the source `schema_pattern`, resolves
-///   target catalog/schema from the target templates, and collects
-///   `catalog.schema.table` for every discovered table.
-/// - **Transformation**: loads model files from the models directory
-///   (same walk as `rocky list models`) and extracts the `target`
-///   coordinates from each model's TOML sidecar.
-/// - **Other types** (quality, snapshot, load): not yet supported —
-///   returns `Ok(None)`.
-async fn resolve_managed_tables(
-    config: &rocky_core::config::RockyConfig,
-    pipeline_name: &str,
-    pipeline: &rocky_core::config::PipelineConfig,
-    registry: &AdapterRegistry,
-    config_path: &Path,
-) -> Result<Option<HashSet<String>>> {
-    match pipeline {
-        rocky_core::config::PipelineConfig::Replication(repl) => {
-            resolve_replication_managed_tables(repl, registry, config).await
-        }
-        rocky_core::config::PipelineConfig::Transformation(tx) => {
-            resolve_transformation_managed_tables(tx, config_path)
-        }
-        _ => {
-            tracing::info!(
-                pipeline = pipeline_name,
-                pipeline_type = pipeline.pipeline_type_str(),
-                "managed-table resolution not supported for this pipeline type"
-            );
-            Ok(None)
-        }
-    }
-}
-
-/// Resolve managed tables for a replication pipeline by discovering
-/// connectors and resolving each table through the schema pattern
-/// templates.
-async fn resolve_replication_managed_tables(
-    repl: &rocky_core::config::ReplicationPipelineConfig,
-    registry: &AdapterRegistry,
-    _config: &rocky_core::config::RockyConfig,
-) -> Result<Option<HashSet<String>>> {
-    let pattern = repl
-        .schema_pattern()
-        .map_err(|e| anyhow!("failed to parse schema pattern: {e}"))?;
-
-    // Discovery adapter is required to enumerate source connectors.
-    let disc_config = match repl.source.discovery.as_ref() {
-        Some(d) => d,
-        None => {
-            tracing::warn!(
-                "no discovery adapter configured for this replication pipeline; \
-                 cannot resolve managed tables"
-            );
-            return Ok(None);
-        }
-    };
-    let discovery_adapter = registry.discovery_adapter(&disc_config.adapter)?;
-
-    let connectors = discovery_adapter
-        .discover(&pattern.prefix)
-        .await
-        .map_err(|e| anyhow!("discovery failed: {e}"))?
-        .connectors;
-
-    let target_sep = repl
-        .target
-        .separator
-        .as_deref()
-        .unwrap_or(&pattern.separator);
-
-    let mut managed = HashSet::new();
-    for conn in &connectors {
-        let parsed = match pattern.parse(&conn.schema) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let target_catalog = parsed.resolve_template(&repl.target.catalog_template, target_sep);
-        let target_schema = parsed.resolve_template(&repl.target.schema_template, target_sep);
-
-        for table in &conn.tables {
-            let full_name = format!("{}.{}.{}", target_catalog, target_schema, table.name);
-            managed.insert(full_name.to_lowercase());
-        }
-    }
-
-    tracing::info!(
-        managed_count = managed.len(),
-        "resolved managed tables from replication pipeline"
-    );
-    Ok(Some(managed))
-}
-
-/// Resolve managed tables for a transformation pipeline by loading
-/// model files and extracting their target coordinates.
-fn resolve_transformation_managed_tables(
-    tx: &rocky_core::config::TransformationPipelineConfig,
-    config_path: &Path,
-) -> Result<Option<HashSet<String>>> {
-    // Models directory is relative to the config file's parent.
-    let project_root = config_path.parent().unwrap_or(Path::new("."));
-
-    // The `models` field is a glob like "models/**" — extract the base
-    // directory (everything before any glob wildcard).
-    let models_base = tx
-        .models
-        .split(&['*', '?', '['][..])
-        .next()
-        .unwrap_or("models");
-    let models_dir = project_root.join(models_base.trim_end_matches('/'));
-
-    if !models_dir.exists() {
-        tracing::warn!(
-            models_dir = %models_dir.display(),
-            "models directory does not exist; cannot resolve managed tables"
-        );
-        return Ok(None);
-    }
-
-    // Load models the same way `rocky list models` does: top-level +
-    // immediate subdirectories.
-    let mut all_models = rocky_core::models::load_models_from_dir(&models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path()) {
-                    all_models.extend(sub);
-                }
-            }
-        }
-    }
-
-    let mut managed = HashSet::new();
-    for model in &all_models {
-        let full_name = format!(
-            "{}.{}.{}",
-            model.config.target.catalog, model.config.target.schema, model.config.target.table
-        );
-        managed.insert(full_name.to_lowercase());
-    }
-
-    tracing::info!(
-        managed_count = managed.len(),
-        "resolved managed tables from transformation pipeline"
-    );
-    Ok(Some(managed))
-}
-
 /// Enumerate non-system tables visible to the warehouse adapter via
 /// `information_schema.tables`.
 ///
@@ -701,27 +638,6 @@ fn collect_table_rows(
         });
     }
     Ok(())
-}
-
-/// Extract the distinct set of catalog identifiers from a managed-table
-/// set built by `resolve_managed_tables`.
-///
-/// The set is keyed on fully-qualified lowercase names (`catalog.schema.table`)
-/// assembled via `format!("{}.{}.{}", ...)` in the resolver, so splitting
-/// on the first `.` yields the catalog component. Names without a dot
-/// are skipped (defensive — the resolver always emits three components).
-fn managed_catalog_set(managed: &HashSet<String>) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    for full in managed {
-        if let Some((catalog, _rest)) = full.split_once('.') {
-            if seen.insert(catalog.to_string()) {
-                out.push(catalog.to_string());
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 /// Execute one whole-table checksum SQL against the warehouse and parse
@@ -1233,28 +1149,6 @@ mod tests {
         assert!(stmts[0].1.contains("512MB"));
     }
 
-    #[test]
-    fn managed_catalog_set_extracts_distinct_catalogs() {
-        let mut managed = HashSet::new();
-        managed.insert("acme.raw__shopify.orders".to_string());
-        managed.insert("acme.raw__shopify.events".to_string());
-        managed.insert("beta.raw__stripe.charges".to_string());
-        managed.insert("acme.raw__stripe.customers".to_string());
-
-        let catalogs = managed_catalog_set(&managed);
-        assert_eq!(catalogs, vec!["acme".to_string(), "beta".to_string()]);
-    }
-
-    #[test]
-    fn managed_catalog_set_skips_names_without_catalog_prefix() {
-        let mut managed = HashSet::new();
-        managed.insert("acme.schema.table".to_string());
-        managed.insert("schema_only".to_string()); // defensive: no `.`
-
-        let catalogs = managed_catalog_set(&managed);
-        assert_eq!(catalogs, vec!["acme".to_string()]);
-    }
-
     /// E2E test for `compute_measure_dedup` against an ephemeral DuckDB.
     ///
     /// Sets up a temp database with three tables — two identical
@@ -1517,62 +1411,6 @@ schema_template = "staging__{{source}}"
         assert_eq!(output_all.tables_scanned, 4);
 
         Ok(())
-    }
-
-    /// Test that `resolve_transformation_managed_tables` correctly
-    /// extracts target table names from model sidecar files.
-    #[test]
-    fn resolve_transformation_managed_tables_extracts_targets() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir(&models_dir).unwrap();
-
-        // Model A: target = warehouse.staging.orders
-        std::fs::write(
-            models_dir.join("orders.toml"),
-            r#"
-name = "orders"
-[target]
-catalog = "warehouse"
-schema = "staging"
-table = "orders"
-"#,
-        )
-        .unwrap();
-        std::fs::write(models_dir.join("orders.sql"), "SELECT 1").unwrap();
-
-        // Model B: target = warehouse.marts.customers
-        std::fs::write(
-            models_dir.join("customers.toml"),
-            r#"
-name = "customers"
-[target]
-catalog = "warehouse"
-schema = "marts"
-table = "customers"
-"#,
-        )
-        .unwrap();
-        std::fs::write(models_dir.join("customers.sql"), "SELECT 1").unwrap();
-
-        let tx = rocky_core::config::TransformationPipelineConfig {
-            models: "models/**".to_string(),
-            target: rocky_core::config::TransformationTargetConfig {
-                adapter: "default".to_string(),
-                governance: Default::default(),
-            },
-            checks: Default::default(),
-            execution: Default::default(),
-            depends_on: vec![],
-        };
-
-        let config_path = dir.path().join("rocky.toml");
-        let result = resolve_transformation_managed_tables(&tx, &config_path).unwrap();
-        let managed = result.expect("should resolve some managed tables");
-
-        assert_eq!(managed.len(), 2);
-        assert!(managed.contains("warehouse.staging.orders"));
-        assert!(managed.contains("warehouse.marts.customers"));
     }
 
     #[test]

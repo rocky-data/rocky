@@ -35,8 +35,8 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 | `rocky drift -c rocky.toml` | Schema drift report |
 | `rocky optimize -c rocky.toml` | Cost model + materialization-strategy recommendations |
 | `rocky compare` | Shadow vs production comparison |
-| `rocky compact` | Generate OPTIMIZE/VACUUM SQL plan |
-| `rocky archive` | DELETE + VACUUM SQL plan |
+| `rocky compact <fqn>` / `rocky compact --catalog <name>` | OPTIMIZE/VACUUM SQL plan (single table or every Rocky-managed table in a catalog) |
+| `rocky archive --older-than <span>` (`<fqn>` / `--catalog <name>`) | DELETE + VACUUM SQL plan (single table or catalog-wide) |
 | `rocky profile-storage` | Column encoding recommendations |
 | `rocky import-dbt <path>` | dbt → Rocky migration |
 | `rocky validate-migration` | Validate a dbt → Rocky migration |
