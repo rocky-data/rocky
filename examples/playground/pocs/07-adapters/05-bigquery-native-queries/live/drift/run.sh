@@ -40,17 +40,17 @@ drop_datasets() {
 drop_datasets
 trap drop_datasets EXIT
 
-echo "==> seeding source: $SRC_DS.customers (3-column schema with watermark)"
+echo "==> seeding source: $SRC_DS.customers (4-column schema with watermark + INT64 score)"
 bq --location="$LOCATION" --project_id="$PROJ" mk --dataset "$SRC_DS" > /dev/null
 bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    "CREATE TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\` AS
-    SELECT id, name, _updated_at FROM UNNEST([
-      STRUCT(1 AS id, 'alice' AS name, TIMESTAMP '2026-04-01 00:00:00' AS _updated_at),
-      STRUCT(2,        'bob',           TIMESTAMP '2026-04-01 00:00:00'),
-      STRUCT(3,        'carol',         TIMESTAMP '2026-04-01 00:00:00')
+    SELECT id, name, _updated_at, score FROM UNNEST([
+      STRUCT(1 AS id, 'alice' AS name, TIMESTAMP '2026-04-01 00:00:00' AS _updated_at, 100 AS score),
+      STRUCT(2,        'bob',           TIMESTAMP '2026-04-01 00:00:00',                200),
+      STRUCT(3,        'carol',         TIMESTAMP '2026-04-01 00:00:00',                300)
     ])" > /dev/null
 
-echo "==> stage 1: rocky run (initial — replicates 3-column source to target)"
+echo "==> stage 1: rocky run (initial — replicates 4-column source to target)"
 rocky -c live.rocky.toml run --output json > expected/run-initial.json
 
 ROW_COUNT="$(bq --project_id="$PROJ" query --use_legacy_sql=false --format=csv --quiet \
@@ -78,26 +78,48 @@ bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    "DROP TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\`" > /dev/null
 bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    "CREATE TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\` AS
-    SELECT id, name, _updated_at, region FROM UNNEST([
+    SELECT id, name, _updated_at, region, score FROM UNNEST([
       STRUCT('1' AS id, 'alice' AS name,
-             TIMESTAMP '2026-04-03 00:00:00' AS _updated_at, 'EU' AS region),
-      STRUCT('2',         'bob',           TIMESTAMP '2026-04-03 00:00:00', 'US'),
-      STRUCT('3',         'carol',         TIMESTAMP '2026-04-03 00:00:00', 'APAC'),
-      STRUCT('4',         'dave',          TIMESTAMP '2026-04-03 00:00:00', 'EU')
+             TIMESTAMP '2026-04-03 00:00:00' AS _updated_at, 'EU' AS region, 100 AS score),
+      STRUCT('2',         'bob',           TIMESTAMP '2026-04-03 00:00:00', 'US',   200),
+      STRUCT('3',         'carol',         TIMESTAMP '2026-04-03 00:00:00', 'APAC', 300),
+      STRUCT('4',         'dave',          TIMESTAMP '2026-04-03 00:00:00', 'EU',   400)
     ])" > /dev/null
 
 echo "==> rocky run (post-type-change — should detect drop_and_recreate)"
 rocky -c live.rocky.toml run --output json > expected/run-type-change.json
 
-echo "==> verifying drift JSON output across all three runs"
+echo "==> stage 4: DROP+CREATE source with score INT64→NUMERIC (safe widening)"
+# After stage 3 the target's `score` is INT64. Widening to NUMERIC is
+# a lossless conversion BigQuery supports via `ALTER COLUMN ... SET
+# DATA TYPE` and Rocky's BQ widening allowlist accepts. Casting at
+# the SELECT level forces the source schema to NUMERIC.
+bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
+   "DROP TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\`" > /dev/null
+bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
+   "CREATE TABLE \`${PROJ}\`.\`${SRC_DS}\`.\`customers\` AS
+    SELECT id, name, _updated_at, region, CAST(score AS NUMERIC) AS score FROM UNNEST([
+      STRUCT('1' AS id, 'alice' AS name,
+             TIMESTAMP '2026-04-04 00:00:00' AS _updated_at, 'EU' AS region, 100 AS score),
+      STRUCT('2',         'bob',           TIMESTAMP '2026-04-04 00:00:00', 'US',   200),
+      STRUCT('3',         'carol',         TIMESTAMP '2026-04-04 00:00:00', 'APAC', 300),
+      STRUCT('4',         'dave',          TIMESTAMP '2026-04-04 00:00:00', 'EU',   400)
+    ])" > /dev/null
+
+echo "==> rocky run (post-widen — should detect alter_column_types)"
+rocky -c live.rocky.toml run --output json > expected/run-widen.json
+
+echo "==> verifying drift JSON output across all four runs"
 python3 - "$HERE/expected/run-initial.json" \
         "$HERE/expected/run-add-col.json" \
-        "$HERE/expected/run-type-change.json" <<'PY'
+        "$HERE/expected/run-type-change.json" \
+        "$HERE/expected/run-widen.json" <<'PY'
 import json, sys
 
 initial      = json.load(open(sys.argv[1]))
 add_col      = json.load(open(sys.argv[2]))
 type_change  = json.load(open(sys.argv[3]))
+widen        = json.load(open(sys.argv[4]))
 
 # Stage 1: target was just created from source, no drift.
 d = initial.get("drift", {})
@@ -121,6 +143,14 @@ if d.get("tables_drifted", 0) < 1 or not any(a.get("action") == "drop_and_recrea
     print(f"FAIL: expected drop_and_recreate action after type change, got {d}")
     sys.exit(1)
 print(f"    stage 3 drift: action=drop_and_recreate OK ({[a.get('reason') for a in actions]})")
+
+# Stage 4: score INT64→NUMERIC — safe widening, alter_column_types.
+d = widen.get("drift", {})
+actions = d.get("actions_taken", [])
+if d.get("tables_drifted", 0) < 1 or not any(a.get("action") == "alter_column_types" for a in actions):
+    print(f"FAIL: expected alter_column_types action after safe widening, got {d}")
+    sys.exit(1)
+print(f"    stage 4 drift: action=alter_column_types OK ({[a.get('reason') for a in actions]})")
 PY
 
 echo "==> verifying target schema reflects all mutations"
@@ -138,8 +168,16 @@ if [[ "$ID_TYPE" != "STRING" ]]; then
     echo "FAIL: expected target id type STRING after drop_and_recreate, got '$ID_TYPE'"
     exit 1
 fi
+SCORE_TYPE="$(bq --project_id="$PROJ" query --use_legacy_sql=false --format=csv --quiet \
+    "SELECT data_type FROM \`${PROJ}\`.\`${TGT_DS}\`.INFORMATION_SCHEMA.COLUMNS \
+     WHERE table_name = 'customers' AND column_name = 'score'" | tail -n 1)"
+if [[ "$SCORE_TYPE" != "NUMERIC" ]]; then
+    echo "FAIL: expected target score type NUMERIC after alter_column_types, got '$SCORE_TYPE'"
+    exit 1
+fi
 echo "    target columns: $COLS"
 echo "    target customers.id is now STRING (drop_and_recreate took effect)"
+echo "    target customers.score is now NUMERIC (alter_column_types took effect)"
 
 echo
-echo "POC complete: BigQuery drift detection (add + type change) verified live."
+echo "POC complete: BigQuery drift detection (add + drop_and_recreate + alter_column_types) verified live."

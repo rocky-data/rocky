@@ -12,7 +12,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
 | `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
-| `drift/run.sh` | `incremental` (replication) | Replication-from-BQ + per-table drift detection: `add_columns` (ALTER TABLE ADD COLUMN) and `drop_and_recreate` (column type change) |
+| `drift/run.sh` | `incremental` (replication) | Replication-from-BQ + per-table drift detection: `add_columns` (ALTER TABLE ADD COLUMN), `drop_and_recreate` (unsafe type change), and `alter_column_types` (safe widening, e.g. INT64 → NUMERIC) |
 
 Each driver:
 
@@ -120,12 +120,16 @@ Adapter-side gaps to revisit separately:
    source columns missing from the target, and the runtime issues
    `ALTER TABLE ADD COLUMN` for each before the next INSERT. The
    drift smoke test exercises this in stage 2 (`add_columns` action).
-9. **`alter_column_types` drift action is detected but not wired.**
-   `detect_drift` already classifies safe widenings (e.g.
-   `INT64`→`NUMERIC`) as `DriftAction::AlterColumnTypes`, but
-   `run.rs:4105` only emits SQL for `DropAndRecreate`. Safe widenings
-   silently fall through to the next INSERT and may fail with type
-   mismatch errors. Note that `is_safe_type_widening` lists
-   `INT`/`BIGINT`/etc., not BQ's `INT64` — fixing the wiring should
-   come with a BQ type-name expansion. Worth a separate
-   fix-with-receipt PR.
+9. ~~`alter_column_types` drift action is detected but not wired~~ —
+   **fixed**. `is_safe_type_widening` and `alter_column_type_sql` now
+   live on the `SqlDialect` trait so each adapter declares its own
+   widening semantics + SQL emit. The BigQuery dialect override
+   accepts only the strict lossless promotions BQ supports via
+   `ALTER COLUMN SET DATA TYPE`: `INT64 → NUMERIC`, `INT64 →
+   BIGNUMERIC`, `NUMERIC → BIGNUMERIC`. Lossy conversions (`… →
+   FLOAT64`) and unsupported targets (`… → STRING`, despite being
+   lossless at the value level — BQ's ALTER rejects this with
+   `existing column type X is not assignable to STRING`) are
+   excluded; drift involving them falls through to
+   `drop_and_recreate`. Stage 4 of `drift/run.sh` exercises the path
+   live (INT64 → NUMERIC).
