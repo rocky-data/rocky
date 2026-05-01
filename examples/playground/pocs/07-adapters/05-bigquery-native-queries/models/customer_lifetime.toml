@@ -1,6 +1,0 @@
-[strategy]
-type = "full_refresh"
-
-[target]
-catalog = "${GCP_PROJECT_ID}"
-schema = "marts"
