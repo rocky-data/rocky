@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use rocky_sql::validation::validate_identifier;
 
 use crate::output::{ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement, print_json};
 use crate::scope::resolve_managed_tables_in_catalog;
@@ -19,7 +20,7 @@ pub fn run_archive(
 ) -> Result<()> {
     // Parse the older_than duration (e.g., "90d", "6m", "1y")
     let days = parse_duration_days(older_than)?;
-    let statements = generate_archive_sql(model, days);
+    let statements = generate_archive_sql(model, days)?;
 
     if output_json {
         let typed_statements: Vec<NamedStatement> = statements
@@ -88,7 +89,7 @@ pub async fn run_archive_catalog(
     let mut per_table: BTreeMap<String, ArchiveTableEntry> = BTreeMap::new();
 
     for fqn in &scope.tables {
-        let stmts = generate_archive_sql(Some(fqn), days);
+        let stmts = generate_archive_sql(Some(fqn), days)?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
             .map(|(purpose, sql)| NamedStatement { purpose, sql })
@@ -170,26 +171,36 @@ fn parse_duration_days(s: &str) -> Result<u64> {
 }
 
 /// Generates archive SQL (DELETE + VACUUM) for old data.
-fn generate_archive_sql(model: Option<&str>, days: u64) -> Vec<(String, String)> {
-    let mut stmts = Vec::new();
-    let target = model.unwrap_or("*");
+///
+/// When `model` is `Some`, every dot-separated segment is validated as
+/// a SQL identifier before interpolation — the model name reaches us
+/// from CLI args and config files, both of which are untrusted from
+/// the engine's perspective. See the validation rules in `engine/CLAUDE.md`.
+fn generate_archive_sql(model: Option<&str>, days: u64) -> Result<Vec<(String, String)>> {
+    let target = match model {
+        Some(m) => {
+            for part in m.split('.') {
+                validate_identifier(part)
+                    .with_context(|| format!("invalid model identifier '{m}'"))?;
+            }
+            m.to_string()
+        }
+        None => "*".to_string(),
+    };
 
-    // Delete old rows
-    stmts.push((
-        format!("delete rows older than {days} days"),
-        format!(
-            "DELETE FROM {target}\n\
-             WHERE _fivetran_synced < DATEADD(DAY, -{days}, CURRENT_TIMESTAMP())"
+    Ok(vec![
+        (
+            format!("delete rows older than {days} days"),
+            format!(
+                "DELETE FROM {target}\n\
+                 WHERE _fivetran_synced < DATEADD(DAY, -{days}, CURRENT_TIMESTAMP())"
+            ),
         ),
-    ));
-
-    // VACUUM after deletion to reclaim space
-    stmts.push((
-        "reclaim storage after deletion".to_string(),
-        format!("VACUUM {target} RETAIN 0 HOURS"),
-    ));
-
-    stmts
+        (
+            "reclaim storage after deletion".to_string(),
+            format!("VACUUM {target} RETAIN 0 HOURS"),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -213,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_generate_archive_sql() {
-        let stmts = generate_archive_sql(Some("catalog.schema.orders"), 90);
+        let stmts = generate_archive_sql(Some("catalog.schema.orders"), 90).unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].1.contains("DELETE FROM"));
         assert!(stmts[0].1.contains("-90"));
@@ -222,7 +233,16 @@ mod tests {
 
     #[test]
     fn test_generate_archive_sql_wildcard() {
-        let stmts = generate_archive_sql(None, 30);
+        let stmts = generate_archive_sql(None, 30).unwrap();
         assert!(stmts[0].1.contains("DELETE FROM *"));
+    }
+
+    #[test]
+    fn test_generate_archive_sql_rejects_injection() {
+        assert!(generate_archive_sql(Some("orders; DROP TABLE admin; --"), 30).is_err());
+        assert!(generate_archive_sql(Some("catalog.schema; DROP TABLE x"), 30).is_err());
+        assert!(generate_archive_sql(Some("'; DROP TABLE users; --"), 30).is_err());
+        assert!(generate_archive_sql(Some(""), 30).is_err());
+        assert!(generate_archive_sql(Some("catalog..table"), 30).is_err());
     }
 }

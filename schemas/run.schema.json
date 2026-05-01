@@ -1037,7 +1037,6 @@
     "drift",
     "duration_ms",
     "errors",
-    "excluded_tables",
     "execution",
     "filter",
     "interrupted",

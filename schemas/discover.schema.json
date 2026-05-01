@@ -204,7 +204,6 @@
   },
   "required": [
     "command",
-    "excluded_tables",
     "sources",
     "version"
   ],
