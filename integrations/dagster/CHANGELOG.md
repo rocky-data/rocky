@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-05-01
+
+Companion release to engine `v1.20.0`. Picks up the regenerated Pydantic models for the new catalog-scope shapes on `rocky compact` and `rocky archive`.
+
+### Changed
+
+- **Regenerated `CompactOutput` / `ArchiveOutput` Pydantic models** ([#315](https://github.com/rocky-data/rocky/pull/315)). `model` relaxes from required to optional (`Optional[str]`); four new optional fields land on each — `catalog`, `scope`, `tables` (mapping FQN → per-table statement bundle), and `totals` (`table_count`, `statement_count`). Single-model JSON output is byte-stable, so existing consumers parsing only `model` + `statements` keep working unchanged. New types in `dagster_rocky.types_generated`: `CompactTableEntry`, `CompactTotals`, `ArchiveTableEntry`, `ArchiveTotals`. No changes to the dispatch table in `parse_rocky_output()` — the command discriminator is unchanged.
+
 ## [1.17.0] — 2026-04-30
 
 Minor release. Headline: **three additive enhancements to `rocky_source_sensor`** driven by downstream-consumer operational learnings — backlog cap, lifecycle hooks, and resource-key injection. Companion to engine `v1.19.1` but doesn't require it; works against any engine `≥ 1.17.4`.
