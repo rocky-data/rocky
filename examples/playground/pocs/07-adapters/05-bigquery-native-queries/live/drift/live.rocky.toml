@@ -1,0 +1,36 @@
+# Live BigQuery drift smoke test.
+#
+# First end-to-end replication-from-BQ test: the BigQueryDiscoveryAdapter
+# (PR #327) enumerates source datasets matching the schema_pattern, the
+# warehouse adapter materializes them into target datasets, and per-table
+# drift detection compares source vs target schemas on each run.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+strategy = "incremental"
+# Watermark column must exist on both source and target — the seed
+# in run.sh adds `_updated_at` to the source so the incremental
+# subquery can MAX() it on the target and filter the source.
+timestamp_column = "_updated_at"
+
+[pipeline.live.source]
+catalog = "${GCP_PROJECT_ID}"
+
+[pipeline.live.source.discovery]
+adapter = "default"
+
+[pipeline.live.source.schema_pattern]
+prefix = "hc_phase13_drift_src_"
+separator = "_"
+components = ["source"]
+
+[pipeline.live.target]
+catalog_template = "${GCP_PROJECT_ID}"
+schema_template = "hc_phase13_drift_tgt_{source}"
+
+[pipeline.live.target.governance]
+auto_create_schemas = true

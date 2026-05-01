@@ -12,6 +12,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
 | `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
+| `drift/run.sh` | `incremental` (replication) | First end-to-end replication-from-BQ + per-table drift detection (column type change → `drop_and_recreate`) |
 
 Each driver:
 
@@ -24,13 +25,18 @@ Each driver:
 
 ## What's not covered yet
 
-- Incremental strategy (separate follow-up smoke test).
-- Drift cycle (now unblocked — replication-from-BQ works since
-  `BigQueryDiscoveryAdapter` shipped).
+- Incremental strategy as a transformation pipeline (the
+  transformation incremental path has no callers in the repo and
+  `sql_gen` ignores `timestamp_column` — separate design call).
 - Time-interval failure-path (forced mid-transaction error → BQ
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
 - MERGE without explicit `update_columns` (see finding 5).
+- Drift detection on **added** columns (see finding 7).
+- Safe type-widening drift action (`alter_column_types`) — the
+  detection branch exists in `drift::detect_drift` but the runtime at
+  `run.rs:4137` only wires `drop_and_recreate`; safe widenings fall
+  through to the next `INSERT` and may fail.
 
 ## Run
 
@@ -42,6 +48,7 @@ export BQ_LOCATION="EU"   # optional; default EU
 ./time-interval/run.sh     # time-interval (4-statement DML transaction)
 ./merge/run.sh             # merge (bootstrap + UPSERT)
 ./discover/run.sh          # discover (lists matching datasets via INFORMATION_SCHEMA)
+./drift/run.sh             # drift (replication + drop_and_recreate on column type change)
 ```
 
 Each script exits 0 on success after dropping its target dataset.
@@ -110,3 +117,13 @@ Adapter-side gaps to revisit separately:
    cost wire-up runs but the figure is `0` rather than missing. Real
    models that scan source tables produce non-zero values (verified
    via `live/merge/run.sh` and `live/time-interval/run.sh`).
+8. **`detect_drift` ignores added columns.** The function in
+   `engine/crates/rocky-core/src/drift.rs` only flags type changes on
+   columns present in BOTH source and target. A column added to the
+   source after the initial replication is not classified as drift —
+   the comment claims "they appear naturally via SELECT *", but the
+   incremental strategy then issues `INSERT INTO target SELECT * FROM
+   source` against a target whose schema is fixed, and BigQuery
+   rejects it with `Inserted row has wrong column count`. The drift
+   smoke test sidesteps this by changing an existing column's type
+   instead. Worth a separate fix-with-receipt PR.
