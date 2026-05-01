@@ -323,6 +323,115 @@ async fn empty_base_surfaces_branch_as_added() {
     }
 }
 
+/// Regression: PK comparison at leaves must use numeric ordering, not
+/// lexical. With base = `[0..200)` and branch = `[0..200) ∖ {100}`, a
+/// merge-walk that string-compares would mis-classify rows whose
+/// stringified PKs cross length boundaries (e.g., "99" > "100"
+/// lexically). The numeric compare classifies row 100 as `Removed`
+/// once and every other row as a match.
+#[tokio::test]
+async fn pk_comparison_handles_cross_length_numeric_ids() {
+    let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+    seed_table(&adapter, "base", "t", 200, &[]).await;
+    seed_table(&adapter, "branch", "t", 200, &[]).await;
+    // Drop one row from branch — id=100 sits across the lexical
+    // boundary between two-digit ("99") and three-digit ("100") IDs.
+    adapter
+        .execute_statement("DELETE FROM branch.t WHERE id = 100")
+        .await
+        .unwrap();
+
+    let base = TableRef {
+        catalog: String::new(),
+        schema: "base".into(),
+        table: "t".into(),
+    };
+    let branch = TableRef {
+        catalog: String::new(),
+        schema: "branch".into(),
+        table: "t".into(),
+    };
+    let value_columns = vec!["name".to_string(), "value".to_string()];
+    let config = BisectionConfig {
+        // Force the runner to materialize the chunk that crosses the
+        // cardinality boundary at id=100.
+        min_chunk_rows: Some(500),
+        ..Default::default()
+    };
+
+    let result = bisection_diff(
+        &adapter,
+        &adapter,
+        &target(&base, &branch, 0, 200, &value_columns),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.rows_added, 0);
+    assert_eq!(result.rows_removed, 1, "exactly id=100 should be Removed");
+    assert_eq!(result.rows_changed, 0);
+    assert_eq!(result.samples.len(), 1);
+    assert_eq!(result.samples[0].kind, LeafRowKind::Removed);
+    assert_eq!(result.samples[0].pk, "100");
+}
+
+/// Null-PK rows are excluded from chunks but counted at the root and
+/// surfaced on `BisectionStats`. A divergence in null-PK counts must
+/// not silently disappear from the diff.
+#[tokio::test]
+async fn null_pk_rows_surfaced_on_stats() {
+    let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+    seed_table(&adapter, "base", "t", 100, &[]).await;
+    seed_table(&adapter, "branch", "t", 100, &[]).await;
+    // Insert null-PK rows on each side, with branch carrying more.
+    adapter
+        .execute_statement("INSERT INTO base.t VALUES (NULL, 'null_a', 1), (NULL, 'null_b', 2)")
+        .await
+        .unwrap();
+    adapter
+        .execute_statement(
+            "INSERT INTO branch.t VALUES \
+             (NULL, 'null_a', 1), (NULL, 'null_b', 2), \
+             (NULL, 'null_c', 3), (NULL, 'null_d', 4), (NULL, 'null_e', 5)",
+        )
+        .await
+        .unwrap();
+
+    let base = TableRef {
+        catalog: String::new(),
+        schema: "base".into(),
+        table: "t".into(),
+    };
+    let branch = TableRef {
+        catalog: String::new(),
+        schema: "branch".into(),
+        table: "t".into(),
+    };
+    let value_columns = vec!["name".to_string(), "value".to_string()];
+    let config = BisectionConfig {
+        min_chunk_rows: Some(500),
+        ..Default::default()
+    };
+
+    let result = bisection_diff(
+        &adapter,
+        &adapter,
+        &target(&base, &branch, 0, 100, &value_columns),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    // Non-null rows match; null rows don't appear in the diff totals
+    // but are reported on the stats.
+    assert_eq!(result.rows_added, 0);
+    assert_eq!(result.rows_removed, 0);
+    assert_eq!(result.rows_changed, 0);
+    assert_eq!(result.stats.null_pk_rows_base, 2);
+    assert_eq!(result.stats.null_pk_rows_branch, 5);
+}
+
 /// Smoke test on the `checksum_chunks` adapter call shape: a 32-row
 /// table chunked into K=4 ranges returns 4 entries with row_count=8 each.
 #[tokio::test]
