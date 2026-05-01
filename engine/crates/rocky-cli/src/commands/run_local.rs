@@ -87,6 +87,17 @@ pub async fn run_transformation(
 
     output.duration_ms = start.elapsed().as_millis() as u64;
 
+    // Compute per-model cost_usd from accumulated bytes / duration. The
+    // replication path (run.rs:3030) and model-only path (run.rs:872)
+    // already do this; without it transformation runs always emit
+    // `cost_usd: null` even when adapters report bytes_scanned.
+    let adapter_type = rocky_cfg
+        .adapters
+        .get(&pipeline.target.adapter)
+        .map(|a| a.adapter_type.clone())
+        .unwrap_or_default();
+    output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
         p.log(

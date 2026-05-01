@@ -95,5 +95,22 @@ if [[ "$ACTUAL" != "$EXPECTED_DELTA" ]]; then
 fi
 echo "    delta: bob updated to 250, dave inserted, alice/carol unchanged"
 
+echo "==> verifying cost attribution populated"
+python3 - "$HERE/expected/run-delta.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    out = json.load(f)
+mat = out["materializations"][0]
+bs = mat.get("bytes_scanned")
+cu = mat.get("cost_usd")
+if not isinstance(bs, int) or bs <= 0:
+    print(f"FAIL: materializations[0].bytes_scanned not populated (got {bs!r})")
+    sys.exit(1)
+if not isinstance(cu, (int, float)) or cu < 0:
+    print(f"FAIL: materializations[0].cost_usd not populated (got {cu!r})")
+    sys.exit(1)
+print(f"    bytes_scanned = {bs}, cost_usd = {cu}")
+PY
+
 echo
 echo "POC complete: BigQuery MERGE strategy verified live."

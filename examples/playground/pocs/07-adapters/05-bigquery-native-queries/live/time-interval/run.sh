@@ -87,5 +87,22 @@ fi
 echo "    2026-04-01: 3 orders, revenue=225"
 echo "    2026-04-02: 2 orders, revenue=500"
 
+echo "==> verifying cost attribution populated"
+python3 - "$HERE/expected/run-2026-04-02.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    out = json.load(f)
+mat = out["materializations"][0]
+bs = mat.get("bytes_scanned")
+cu = mat.get("cost_usd")
+if not isinstance(bs, int) or bs <= 0:
+    print(f"FAIL: materializations[0].bytes_scanned not populated (got {bs!r})")
+    sys.exit(1)
+if not isinstance(cu, (int, float)) or cu < 0:
+    print(f"FAIL: materializations[0].cost_usd not populated (got {cu!r})")
+    sys.exit(1)
+print(f"    bytes_scanned = {bs}, cost_usd = {cu}")
+PY
+
 echo
 echo "POC complete: BigQuery time-interval DML transaction verified live."

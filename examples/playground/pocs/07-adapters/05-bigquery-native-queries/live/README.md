@@ -95,3 +95,18 @@ Adapter-side gaps to revisit separately:
    — it needs explicit per-column assignments. The merge model
    declares `update_columns = ["name", "amount"]` to sidestep it.
    Snowflake/DuckDB may accept the shorthand; not verified.
+6. **`bytes_scanned` is `totalBytesProcessed`, not
+   `totalBytesBilled`, on the sync query path.** Synchronous
+   `jobs.query` / `jobs.getQueryResults` REST responses don't include
+   the `statistics` block (that's exclusive to `jobs.get`), so the
+   connector falls back to top-level `totalBytesProcessed`. This
+   under-reports cost for sub-10 MB queries by the 10 MB per-query
+   minimum-bill floor. Wiring a follow-up `jobs.get` call to surface
+   the billed figure is a Phase 2.1 task. The smoke tests today
+   assert `bytes_scanned > 0`, not exact value.
+7. **Full-refresh `bytes_scanned` is zero when the model has no
+   source.** The `live/run.sh` model is `SELECT 1 AS id, ...` with no
+   FROM clause, so BigQuery reports `totalBytesProcessed: 0`. The
+   cost wire-up runs but the figure is `0` rather than missing. Real
+   models that scan source tables produce non-zero values (verified
+   via `live/merge/run.sh` and `live/time-interval/run.sh`).

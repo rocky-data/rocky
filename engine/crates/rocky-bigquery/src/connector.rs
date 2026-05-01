@@ -412,9 +412,19 @@ impl WarehouseAdapter for BigQueryAdapter {
 /// every downstream consumer can keep treating `bytes_scanned` as the
 /// single cost driver without BigQuery-specific branching.
 ///
-/// Returns an all-`None` [`ExecutionStats`] when BigQuery omits the
-/// `statistics` block (most commonly for DDL that completes without a
-/// query job) or when `totalBytesBilled` is missing / unparseable.
+/// Resolution order:
+///
+/// 1. `statistics.query.totalBytesBilled` — the cost-accurate figure
+///    (with 10 MB minimum applied), only present on `jobs.get`
+///    responses.
+/// 2. Top-level `totalBytesProcessed` — surfaced by `jobs.query` /
+///    `jobs.getQueryResults`, which is the path the runtime actually
+///    takes today. Off by the 10 MB floor on sub-10 MB queries; the
+///    cost calc therefore under-reports those slightly until a
+///    follow-up `jobs.get` is wired in.
+/// 3. `None` — no bytes information available (DDL responses BigQuery
+///    omits both fields on, or fields unparseable as `u64`).
+///
 /// `bytes_written` is always `None` — BigQuery query jobs don't expose
 /// a bytes-written figure naturally.
 fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
@@ -422,7 +432,13 @@ fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
         .statistics
         .as_ref()
         .and_then(|s| s.query.as_ref())
-        .and_then(BigQueryQueryStatistics::total_bytes_billed_u64);
+        .and_then(BigQueryQueryStatistics::total_bytes_billed_u64)
+        .or_else(|| {
+            response
+                .total_bytes_processed
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+        });
     ExecutionStats {
         bytes_scanned,
         bytes_written: None,
@@ -453,9 +469,22 @@ struct BigQueryResponse {
     #[allow(dead_code)]
     #[serde(default)]
     total_rows: Option<String>,
-    /// Query-job statistics. Populated for completed query jobs;
-    /// BigQuery may omit the field for DDL statements or async jobs
-    /// that haven't yet finished, so it's `Option`.
+    /// Top-level `totalBytesProcessed` from the `jobs.query` /
+    /// `jobs.getQueryResults` response shape (decimal-encoded int64).
+    /// Set on every successful query job. **Note:** the synchronous
+    /// `jobs.query` endpoint does *not* surface a `statistics` block
+    /// (that's exclusive to `jobs.get`), so this top-level field is
+    /// the only bytes-figure we can read without a follow-up API call.
+    /// `stats_from_response` falls back to this when `statistics` is
+    /// absent.
+    #[serde(default)]
+    total_bytes_processed: Option<String>,
+    /// Query-job statistics. Populated for `jobs.get` responses; the
+    /// synchronous `jobs.query` and `jobs.getQueryResults` endpoints
+    /// omit this entire block, so reading bytes from here alone leaves
+    /// every sync query with `bytes_scanned: None` (PR #326). The
+    /// top-level `total_bytes_processed` covers the sync path; this
+    /// stays `Option` for forward compatibility with `jobs.get` paths.
     #[serde(default)]
     statistics: Option<BigQueryStatistics>,
 }
@@ -723,5 +752,43 @@ mod tests {
         let rows = resp.rows.unwrap();
         assert!(rows[0].f[0].v.is_none());
         assert_eq!(rows[0].f[1].v.as_ref().unwrap(), "test");
+    }
+
+    #[test]
+    fn jobs_query_top_level_total_bytes_processed_is_used() {
+        // The synchronous `jobs.query` / `jobs.getQueryResults` endpoints
+        // surface `totalBytesProcessed` at the top level of the response
+        // and omit the `statistics` block entirely. Before PR #326 the
+        // connector only read from `statistics.query.totalBytesBilled`,
+        // so every sync query returned `bytes_scanned: None` and broke
+        // cost attribution end-to-end.
+        let json = r#"{
+            "jobComplete": true,
+            "totalBytesProcessed": "10485760"
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, Some(10_485_760));
+    }
+
+    #[test]
+    fn jobs_get_statistics_block_takes_precedence_over_top_level() {
+        // When both shapes are present (e.g., a future code path that
+        // also fetches `jobs.get`), the more accurate
+        // `statistics.query.totalBytesBilled` wins because it includes
+        // the 10 MB minimum-bill floor that `totalBytesProcessed`
+        // doesn't account for.
+        let json = r#"{
+            "jobComplete": true,
+            "totalBytesProcessed": "5242880",
+            "statistics": {
+                "query": {
+                    "totalBytesBilled": "10485760"
+                }
+            }
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let stats = stats_from_response(&resp);
+        assert_eq!(stats.bytes_scanned, Some(10_485_760));
     }
 }
