@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
@@ -76,17 +76,11 @@ fn poll_delay(attempt: usize) -> Duration {
 
 impl BigQueryAdapter {
     /// Create a new BigQuery adapter.
-    ///
-    /// Logs a one-time warning that the BigQuery adapter is experimental.
     pub fn new(
         project_id: impl Into<String>,
         location: impl Into<String>,
         auth: BigQueryAuth,
     ) -> Self {
-        warn!(
-            "BigQuery adapter is experimental. \
-             Some features may be incomplete or behave differently from Databricks/Snowflake."
-        );
         Self {
             client: reqwest::Client::builder()
                 .tcp_nodelay(true)
@@ -331,10 +325,6 @@ impl BigQueryAdapter {
 
 #[async_trait]
 impl WarehouseAdapter for BigQueryAdapter {
-    fn is_experimental(&self) -> bool {
-        true
-    }
-
     fn dialect(&self) -> &dyn SqlDialect {
         &self.dialect
     }
