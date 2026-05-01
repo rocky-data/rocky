@@ -63,7 +63,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
         for (conn, schema_result) in fetched {
             match schema_result {
                 Ok(schema_config) => {
-                    let tables = schema_config
+                    let raw_tables: Vec<DiscoveredTable> = schema_config
                         .enabled_tables()
                         .iter()
                         .map(|t| DiscoveredTable {
@@ -71,6 +71,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                             row_count: None,
                         })
                         .collect();
+                    let tables = dedup_tables_by_name(raw_tables, &conn.id);
                     let metadata = metadata_from_connector(&conn);
                     connectors.push(DiscoveredConnector {
                         id: conn.id,
@@ -163,6 +164,54 @@ fn classify_status_code(status: u16) -> FailedSourceErrorClass {
         500..=599 => FailedSourceErrorClass::Transient,
         _ => FailedSourceErrorClass::Unknown,
     }
+}
+
+/// Deduplicate the per-connector table list by table name, preserving the
+/// first occurrence.
+///
+/// Fivetran's `/v1/connectors/{id}/schemas` response can list two distinct
+/// logical schema-entry keys that resolve to the same destination name —
+/// for example, when Fivetran auto-renames a table (`do_not_alter_*` prefix
+/// after a breaking schema change) the original logical key may stay
+/// alongside a fresh entry whose `name_in_destination` matches the renamed
+/// table that already exists. `SchemaConfig::enabled_tables()` faithfully
+/// forwards both rows, which leaves duplicate `DiscoveredTable` records in
+/// the discover output and breaks downstream consumers (e.g. dagster-rocky's
+/// `multi_asset` decorator rejects duplicate `AssetCheckSpec`s).
+///
+/// Dedup is Fivetran-specific: this is an upstream API quirk, not something
+/// other discovery adapters share, so it lives here rather than in
+/// `rocky-core`. A WARN is emitted with the connector id and the duplicate
+/// count so the noise is visible — silently dropping rows would hide a real
+/// upstream-config problem worth surfacing to operators.
+fn dedup_tables_by_name(tables: Vec<DiscoveredTable>, source_id: &str) -> Vec<DiscoveredTable> {
+    let mut seen = std::collections::HashSet::with_capacity(tables.len());
+    let mut deduped = Vec::with_capacity(tables.len());
+    let mut dropped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for table in tables {
+        if seen.insert(table.name.clone()) {
+            deduped.push(table);
+        } else {
+            *dropped.entry(table.name.clone()).or_insert(0) += 1;
+        }
+    }
+    if !dropped.is_empty() {
+        let total: usize = dropped.values().sum();
+        let detail = dropped
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        warn!(
+            source_id,
+            duplicates = total,
+            duplicate_names = detail.as_str(),
+            "fivetran discover: dropped duplicate table records — Fivetran returned multiple \
+             schema entries that resolve to the same destination table name (likely an \
+             auto-rename collision); first occurrence kept"
+        );
+    }
+    deduped
 }
 
 /// Project a stable, namespaced subset of Fivetran connector config into the
@@ -289,6 +338,72 @@ mod tests {
         assert!(!metadata.contains_key("fivetran.custom_reports"));
         // Empty arrays still stamp (distinguishable from "not configured").
         assert!(metadata.contains_key("fivetran.custom_tables"));
+    }
+
+    #[test]
+    fn dedup_tables_drops_duplicates_preserving_first_occurrence() {
+        // Reproduces the Fivetran auto-rename collision: two schema entries
+        // resolve to the same destination table name. `enabled_tables()`
+        // faithfully forwards both; the adapter must dedup before handing
+        // the list to downstream consumers (Dagster's `multi_asset`
+        // rejects duplicate `AssetCheckSpec`s).
+        let input = vec![
+            DiscoveredTable {
+                name: "do_not_alter_dpm_raw_youtube".into(),
+                row_count: Some(100),
+            },
+            DiscoveredTable {
+                name: "orders".into(),
+                row_count: None,
+            },
+            // Duplicate of the first entry, with different metadata to
+            // confirm we keep the first occurrence rather than the last.
+            DiscoveredTable {
+                name: "do_not_alter_dpm_raw_youtube".into(),
+                row_count: Some(999),
+            },
+            DiscoveredTable {
+                name: "orders".into(),
+                row_count: Some(42),
+            },
+        ];
+        let deduped = dedup_tables_by_name(input, "conn_test");
+        assert_eq!(deduped.len(), 2);
+        // First occurrence preserved (row_count: Some(100), not Some(999)).
+        let yt = deduped
+            .iter()
+            .find(|t| t.name == "do_not_alter_dpm_raw_youtube")
+            .expect("youtube table should be present");
+        assert_eq!(yt.row_count, Some(100));
+        let orders = deduped
+            .iter()
+            .find(|t| t.name == "orders")
+            .expect("orders table should be present");
+        assert_eq!(orders.row_count, None);
+    }
+
+    #[test]
+    fn dedup_tables_is_noop_when_no_duplicates() {
+        let input = vec![
+            DiscoveredTable {
+                name: "a".into(),
+                row_count: None,
+            },
+            DiscoveredTable {
+                name: "b".into(),
+                row_count: None,
+            },
+        ];
+        let deduped = dedup_tables_by_name(input.clone(), "conn_test");
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].name, "a");
+        assert_eq!(deduped[1].name, "b");
+    }
+
+    #[test]
+    fn dedup_tables_handles_empty_input() {
+        let deduped = dedup_tables_by_name(Vec::new(), "conn_test");
+        assert!(deduped.is_empty());
     }
 
     #[test]
