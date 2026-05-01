@@ -1,0 +1,16 @@
+# Live BigQuery time-interval smoke test.
+#
+# Exercises the BQ-specific 4-statement DML transaction the time-interval
+# strategy emits (BEGIN TRANSACTION; DELETE; INSERT; COMMIT TRANSACTION)
+# end-to-end against a real GCP project.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+type = "transformation"
+models = "models/**"
+
+[pipeline.live.target]
