@@ -437,6 +437,32 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: segment. Default ``False`` because N derived models = N CLI
     #: invocations on every code-server load.
     surface_column_lineage: bool = False
+    #: When ``True``, several "log and swallow" paths in :meth:`build_defs`
+    #: are converted into hard failures. Use when an empty Rocky asset
+    #: graph is never an acceptable outcome — better to fail the
+    #: code-server load than ship a healthy-looking deployment with no
+    #: assets.
+    #:
+    #: Specifically, when set to ``True``:
+    #:
+    #: * :meth:`_maybe_cold_start_discover` failures re-raise instead of
+    #:   logging at WARN and falling through to the empty-state path.
+    #: * :meth:`build_defs_from_state` raises :class:`dg.Failure` when
+    #:   the state file is missing or contains zero discover sources,
+    #:   instead of returning empty :class:`dg.Definitions`.
+    #: * The discover slot of :meth:`write_state_to_path` re-raises
+    #:   instead of writing an empty discover envelope.
+    #:
+    #: Compile and optimize stay best-effort even under ``strict_build``
+    #: — they are augmentation slots (compiler diagnostics surfaced as
+    #: checks, optimize recommendations as metadata) rather than the
+    #: asset graph itself. A missing compile slot does not mean the
+    #: graph is broken; a missing discover slot does.
+    #:
+    #: Default ``False`` preserves the existing behaviour for adopters
+    #: who rely on "best-effort load with empty graph" as their failure
+    #: mode.
+    strict_build: bool = False
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -505,6 +531,12 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             # DAG output is the primary data source, so an empty discover
             # envelope is acceptable. Log so operators can triage the
             # underlying cause.
+            #
+            # Under ``strict_build`` adopters have explicitly opted into
+            # "fail the deploy rather than ship a partial graph", so the
+            # exception propagates instead of being swallowed.
+            if self.strict_build:
+                raise
             _log.warning(
                 "rocky discover failed during state write — writing empty discover envelope",
                 exc_info=True,
@@ -705,6 +737,8 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         try:
             self.write_state_to_path(state_path)
         except Exception:
+            if self.strict_build:
+                raise
             _log.warning(
                 "RockyComponent fallback discover failed — component will load with no assets",
                 exc_info=True,
@@ -811,6 +845,14 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     ) -> dg.Definitions:
         """Build materializable assets from the cached discover/compile state."""
         if state_path is None:
+            if self.strict_build:
+                raise dg.Failure(
+                    description=(
+                        "RockyComponent strict_build=True: cannot build asset "
+                        "graph from missing state. Either pre-seed state, set "
+                        "discover_on_missing_state=true, or unset strict_build."
+                    ),
+                )
             return dg.Definitions()
 
         # DAG-mode: build the full connected asset graph from ``rocky dag``.
@@ -818,6 +860,15 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             return self._build_defs_from_dag(context, state_path)
 
         discover, compile_result, optimize_result = _load_state(state_path)
+        if self.strict_build and not discover.sources:
+            raise dg.Failure(
+                description=(
+                    "RockyComponent strict_build=True: cannot build asset "
+                    f"graph from state at {state_path} — discover envelope "
+                    "contains zero sources. Either pre-seed state, set "
+                    "discover_on_missing_state=true, or unset strict_build."
+                ),
+            )
         compile_state = _CompileState.from_result(compile_result)
 
         translator = self._get_translator()

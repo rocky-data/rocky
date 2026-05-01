@@ -1167,3 +1167,214 @@ def test_build_check_specs_dedupes_when_group_has_duplicate_specs():
     assert len(check_specs) == len(component_module.DEFAULT_CHECK_NAMES)
     markers = {(cs.asset_key, cs.name) for cs in check_specs}
     assert len(markers) == len(check_specs)
+
+
+# ---------------------------------------------------------------------------
+# FR-019: strict_build converts log-and-swallow paths into hard failures.
+# ---------------------------------------------------------------------------
+
+
+def test_strict_build_default_is_off():
+    """``strict_build`` is opt-in — existing adopters get the legacy
+    log-and-swallow behaviour unless they flip the flag."""
+    component = RockyComponent(config_path="rocky.toml")
+    assert component.strict_build is False
+
+
+def test_strict_build_cold_start_reraises_write_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Under ``strict_build``, a failing ``write_state_to_path`` in the
+    cold-start fallback propagates instead of falling through to the
+    empty-state path."""
+    state_path = tmp_path / "missing-state"
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+        strict_build=True,
+    )
+
+    def raises(self_, p):
+        raise RuntimeError("S3 + state-store both down")
+
+    monkeypatch.setattr(RockyComponent, "write_state_to_path", raises)
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    with pytest.raises(RuntimeError, match="S3"):
+        component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+
+def test_strict_build_off_cold_start_swallows_write_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """``strict_build=False`` (default) preserves the existing
+    log-and-swallow behaviour. Companion to the strict-on test above."""
+    state_path = tmp_path / "missing-state"
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        discover_on_missing_state=True,
+        # strict_build defaults to False
+    )
+
+    def raises(self_, p):
+        raise RuntimeError("transient failure")
+
+    monkeypatch.setattr(RockyComponent, "write_state_to_path", raises)
+    _patch_state_path(monkeypatch, state_path, is_dev=False)
+
+    with caplog.at_level("WARNING", logger="dagster_rocky.component"):
+        # Must not raise.
+        component._maybe_cold_start_discover(SimpleNamespace(project_root=tmp_path))  # type: ignore[arg-type]
+
+    assert any("fallback discover failed" in r.message for r in caplog.records)
+
+
+def test_strict_build_raises_on_none_state_path():
+    """Under ``strict_build``, ``build_defs_from_state(None)`` fails the
+    code-server load instead of returning empty ``Definitions``."""
+    component = RockyComponent(config_path="rocky.toml", strict_build=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=None)
+    assert "missing state" in (excinfo.value.description or "").lower()
+    assert "strict_build" in (excinfo.value.description or "")
+
+
+def test_strict_build_off_returns_empty_defs_on_none_state_path():
+    """Default ``strict_build=False`` keeps the legacy "return empty
+    Definitions" behaviour for missing state."""
+    component = RockyComponent(config_path="rocky.toml")  # strict_build=False
+    defs = component.build_defs_from_state(context=None, state_path=None)
+    assert list(defs.assets or []) == []
+
+
+def test_strict_build_raises_on_empty_discover_sources(tmp_path: Path):
+    """Under ``strict_build``, an on-disk state file whose discover
+    envelope contains zero sources fails the load — same operator
+    signal as missing state."""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "discover": {
+                    "version": "0.0.0",
+                    "command": "discover",
+                    "sources": [],
+                }
+            }
+        )
+    )
+
+    component = RockyComponent(config_path="rocky.toml", strict_build=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+    assert "zero sources" in (excinfo.value.description or "").lower()
+    assert "strict_build" in (excinfo.value.description or "")
+
+
+def test_strict_build_off_returns_empty_defs_on_empty_discover_sources(tmp_path: Path):
+    """Default ``strict_build=False`` returns empty ``Definitions`` for an
+    on-disk state file with zero sources — no load failure."""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "discover": {
+                    "version": "0.0.0",
+                    "command": "discover",
+                    "sources": [],
+                }
+            }
+        )
+    )
+
+    component = RockyComponent(config_path="rocky.toml")
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    assert list(defs.assets or []) == []
+
+
+def test_strict_build_write_state_reraises_discover_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Under ``strict_build``, a failing ``rocky discover`` in
+    ``write_state_to_path`` propagates instead of writing an empty
+    discover envelope."""
+    stub = _StubResource(discover_result=RuntimeError("binary missing"))
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+        strict_build=True,
+    )
+
+    with pytest.raises(RuntimeError, match="binary missing"):
+        component.write_state_to_path(tmp_path / "state")
+
+    # No partial state should have been written.
+    assert not (tmp_path / "state").exists()
+
+
+def test_strict_build_write_state_compile_slot_stays_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Compile is an augmentation slot — under ``strict_build`` a compile
+    failure still omits the slot and writes successful discover state.
+    The asset graph itself is what matters; compiler diagnostics are not
+    a build precondition."""
+    discover = _make_discover_result()
+    stub = _StubResource(
+        discover_result=discover,
+        compile_result=RuntimeError("compile crashed"),
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+        strict_build=True,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)  # must not raise
+
+    state = json.loads(state_path.read_text())
+    assert "discover" in state
+    assert "compile" not in state
+
+
+def test_strict_build_write_state_optimize_slot_stays_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Optimize is an augmentation slot — under ``strict_build`` an
+    optimize failure still omits the slot and writes successful discover
+    state. Same rationale as compile."""
+    discover = _make_discover_result()
+    stub = _StubResource(
+        discover_result=discover,
+        optimize_result=RuntimeError("optimize crashed"),
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),  # skip compile
+        surface_optimize_metadata=True,
+        strict_build=True,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)  # must not raise
+
+    state = json.loads(state_path.read_text())
+    assert "discover" in state
+    assert "optimize" not in state
