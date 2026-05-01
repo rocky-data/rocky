@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use tracing::warn;
 
 /// Extended help text for the shared `--filter` flag on `rocky plan`,
@@ -760,10 +760,15 @@ enum Command {
     },
 
     /// Generate OPTIMIZE/VACUUM SQL for storage compaction
+    #[command(group(
+        ArgGroup::new("compact_scope")
+            .args(["model", "catalog", "measure_dedup"])
+            .required(true)
+            .multiple(false),
+    ))]
     Compact {
         /// Target table (catalog.schema.table). Required unless one of
         /// --catalog or --measure-dedup is set.
-        #[arg(required_unless_present_any = ["measure_dedup", "catalog"])]
         model: Option<String>,
         /// Target file size (e.g., "256MB")
         #[arg(long)]
@@ -775,13 +780,13 @@ enum Command {
         /// Resolves the managed-table set from the pipeline config (no
         /// warehouse round trip) and aggregates per-table OPTIMIZE/VACUUM
         /// SQL into one envelope. Mutually exclusive with --model and
-        /// --measure-dedup.
-        #[arg(long, conflicts_with_all = ["model", "measure_dedup"])]
+        /// --measure-dedup (enforced via the `compact_scope` ArgGroup).
+        #[arg(long)]
         catalog: Option<String>,
         /// Measure cross-table dedup ratio across all Rocky-managed tables
         /// in the project (Layer 0 storage experiment). Project-wide; does
         /// not take a model argument.
-        #[arg(long, conflicts_with = "model")]
+        #[arg(long)]
         measure_dedup: bool,
         /// Comma-separated columns to exclude from the "semantic" dedup
         /// hash. Defaults to the Rocky-owned metadata columns:
