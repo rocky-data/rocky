@@ -36,7 +36,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**40 of 53 POCs run with no external credentials.** See each POC's README for prerequisites.
+**47 of 60 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -96,20 +96,22 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [04-ai-test-generation](pocs/03-ai/04-ai-test-generation) | `rocky ai-test --all --save` generates SQL assertions from intent + schema |
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 
-### 04 — Governance (4 POCs · Databricks required)
+### 04 — Governance (6 POCs · Databricks / DuckDB)
 
-Unity Catalog grants, schema patterns, workspace isolation, tagging.
+Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention.
 
-| POC | Feature |
-|---|---|
-| [01-unity-catalog-grants](pocs/04-governance/01-unity-catalog-grants) | `[[governance.grants]]` declarative RBAC with SHOW GRANTS before/after |
-| [02-schema-patterns-multi-tenant](pocs/04-governance/02-schema-patterns-multi-tenant) | `source.schema_pattern` with `prefix`/`separator`/`components` (incl. variadic `regions...`) routing to per-tenant catalogs |
-| [03-workspace-isolation](pocs/04-governance/03-workspace-isolation) | `[governance.isolation]` with workspace bindings + ISOLATED catalog mode |
-| [04-tagging-lifecycle](pocs/04-governance/04-tagging-lifecycle) | `[governance.tags]` propagated via `ALTER ... SET TAGS` |
+| POC | Feature | Credentials |
+|---|---|---|
+| [01-unity-catalog-grants](pocs/04-governance/01-unity-catalog-grants) | `[[governance.grants]]` declarative RBAC with SHOW GRANTS before/after | Databricks |
+| [02-schema-patterns-multi-tenant](pocs/04-governance/02-schema-patterns-multi-tenant) | `source.schema_pattern` with `prefix`/`separator`/`components` (incl. variadic `regions...`) routing to per-tenant catalogs | Databricks |
+| [03-workspace-isolation](pocs/04-governance/03-workspace-isolation) | `[governance.isolation]` with workspace bindings + ISOLATED catalog mode | Databricks |
+| [04-tagging-lifecycle](pocs/04-governance/04-tagging-lifecycle) | `[governance.tags]` propagated via `ALTER ... SET TAGS` | Databricks |
+| [05-classification-masking-compliance](pocs/04-governance/05-classification-masking-compliance) | `[classification]` + `[mask]` policy + `rocky compliance --fail-on exception` for CI gating on unmasked PII | none |
+| [06-retention-policies](pocs/04-governance/06-retention-policies) | Declarative `retention = "<N>[dy]"` sidecars + `rocky retention-status --drift` | none |
 
-### 05 — Orchestration (8 POCs · DuckDB / docker)
+### 05 — Orchestration (9 POCs · DuckDB / docker)
 
-Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker.
+Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency.
 
 | POC | Feature |
 |---|---|
@@ -121,6 +123,7 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [06-valkey-distributed-cache](pocs/05-orchestration/06-valkey-distributed-cache) | Three-tier caching (memory → Valkey → source) + tiered state backend via docker-compose |
 | [07-dagster-dag-mode](pocs/05-orchestration/07-dagster-dag-mode) | `rocky run --dag` unified cross-pipeline DAG with Dagster orchestration |
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
+| [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 
 ### 06 — Developer Experience (11 POCs · DuckDB)
 
@@ -140,9 +143,9 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [10-pr-preview-and-data-diff](pocs/06-developer-experience/10-pr-preview-and-data-diff) | `rocky preview create / diff / cost` — column-level pruned re-run + sampled row diff + cost delta on a 5-model DAG |
 | [11-lineage-diff](pocs/06-developer-experience/11-lineage-diff) | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review (Markdown drops into a PR comment) |
 
-### 07 — Adapters (5 POCs · mixed)
+### 07 — Adapters (6 POCs · mixed)
 
-Snowflake, Databricks, Fivetran, custom process adapter, BigQuery.
+Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -151,6 +154,7 @@ Snowflake, Databricks, Fivetran, custom process adapter, BigQuery.
 | [03-fivetran-discover](pocs/07-adapters/03-fivetran-discover) | `rocky discover` against Fivetran REST API; metadata only | `FIVETRAN_API_KEY` |
 | [04-custom-process-adapter](pocs/07-adapters/04-custom-process-adapter) | ~80-line Python adapter speaking JSON-RPC over stdio, registered via `[adapter] type = "process"` | none |
 | [05-bigquery-native-queries](pocs/07-adapters/05-bigquery-native-queries) | BigQuery adapter — backtick quoting, time-interval partitions, DML transactions | GCP SA / ADC |
+| [06-rust-native-adapter-skeleton](pocs/07-adapters/06-rust-native-adapter-skeleton) | Out-of-tree warehouse adapter starter — `rocky-adapter-sdk` traits against an in-memory mock, ClickHouse-shaped (backtick quoting, no `MERGE`, partition replace) | none (Rust toolchain) |
 
 ## Benchmarks
 
