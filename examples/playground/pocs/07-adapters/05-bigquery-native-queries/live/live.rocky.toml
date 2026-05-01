@@ -1,0 +1,18 @@
+# Live BigQuery smoke test — full-refresh materialization.
+#
+# Self-contained transformation pipeline that exercises the BigQuery
+# adapter end-to-end against a real GCP project. The model selects from
+# a single-row literal so no seed data is required — `run.sh` creates
+# the target dataset, runs the model, asserts row count, then drops the
+# dataset on exit.
+
+[adapter]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "${BQ_LOCATION:-EU}"
+
+[pipeline.live]
+type = "transformation"
+models = "models/**"
+
+[pipeline.live.target]

@@ -1,0 +1,10 @@
+[strategy]
+type = "full_refresh"
+
+# Hardcoded to the Rocky BQ sandbox project. Model sidecar TOMLs don't
+# honor ${VAR} env substitution today (rocky.toml does), so this live
+# demo is sandbox-specific by construction. Patch both fields if running
+# against a different project.
+[target]
+catalog = "rocky-sandbox-hc-test-63874"
+schema = "hc_phase1_live"

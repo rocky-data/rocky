@@ -62,6 +62,13 @@ POC complete: BigQuery adapter config validated and models compiled.
 3. `daily_revenue` uses time-interval strategy — at execution time, Rocky would run `BEGIN TRANSACTION; DELETE; INSERT; COMMIT TRANSACTION` per partition
 4. `customer_lifetime` uses full-refresh — `CREATE OR REPLACE TABLE`
 
+## Live execution
+
+The default `./run.sh` is compile-only. For an end-to-end materialization
+against a real BigQuery project, see [`live/`](./live/) — a separate,
+credential-gated driver that runs `rocky run` against the BigQuery REST
+API and asserts the resulting row count.
+
 ## Related
 
 - BigQuery adapter source: `engine/crates/rocky-bigquery/`
