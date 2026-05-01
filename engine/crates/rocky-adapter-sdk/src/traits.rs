@@ -275,12 +275,18 @@ pub struct FreshnessResult {
 ///   is `hash(pk) % modulus == residue`. Single-level by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PkRange {
-    IntRange { lo: i128, hi: i128 },
+    IntRange {
+        lo: i128,
+        hi: i128,
+    },
     Composite {
         lo: Vec<serde_json::Value>,
         hi: Vec<serde_json::Value>,
     },
-    HashBucket { modulus: u32, residue: u32 },
+    HashBucket {
+        modulus: u32,
+        residue: u32,
+    },
 }
 
 /// One chunk's checksum result returned from

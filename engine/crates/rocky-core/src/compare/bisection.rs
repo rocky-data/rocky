@@ -212,9 +212,7 @@ pub async fn bisection_diff(
         )));
     }
     if config.k < 2 {
-        return Err(AdapterError::msg(
-            "bisection_diff requires k >= 2",
-        ));
+        return Err(AdapterError::msg("bisection_diff requires k >= 2"));
     }
 
     // The adapter recommendation defines the leaf threshold when the
@@ -230,8 +228,7 @@ pub async fn bisection_diff(
     // BisectionStats; if base and branch counts diverge, the caller
     // should treat that as a row-count mismatch at the table level.
     let null_pk_rows_base = count_null_pk_rows(base, target.base, target.pk_column).await?;
-    let null_pk_rows_branch =
-        count_null_pk_rows(branch, target.branch, target.pk_column).await?;
+    let null_pk_rows_branch = count_null_pk_rows(branch, target.branch, target.pk_column).await?;
 
     let mut state = TraversalState {
         config,
@@ -298,9 +295,7 @@ async fn count_null_pk_rows(
     rocky_sql::validation::validate_identifier(pk_column).map_err(AdapterError::new)?;
     let dialect = adapter.dialect();
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
-    let sql = format!(
-        "SELECT COUNT(*) FROM {table_ref} WHERE \"{pk_column}\" IS NULL"
-    );
+    let sql = format!("SELECT COUNT(*) FROM {table_ref} WHERE \"{pk_column}\" IS NULL");
     let result = adapter.execute_query(&sql).await?;
     let row = result
         .rows
@@ -310,12 +305,12 @@ async fn count_null_pk_rows(
         .first()
         .ok_or_else(|| AdapterError::msg("null-pk count query returned an empty row"))?;
     match cell {
-        serde_json::Value::String(s) => s.parse::<u64>().map_err(|e| {
-            AdapterError::msg(format!("failed to parse null-pk count {s:?}: {e}"))
+        serde_json::Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| AdapterError::msg(format!("failed to parse null-pk count {s:?}: {e}"))),
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            AdapterError::msg(format!("null-pk count not representable as u64: {n}"))
         }),
-        serde_json::Value::Number(n) => n
-            .as_u64()
-            .ok_or_else(|| AdapterError::msg(format!("null-pk count not representable as u64: {n}"))),
         other => Err(AdapterError::msg(format!(
             "null-pk count returned unexpected JSON shape: {other:?}"
         ))),
@@ -369,9 +364,8 @@ async fn diff_one_level(
     let branch_by_id = index_by_chunk_id(&branch_sums);
 
     for (idx, chunk) in chunks.iter().enumerate() {
-        let chunk_id = u32::try_from(idx).map_err(|_| {
-            AdapterError::msg("bisection level produced more than u32::MAX chunks")
-        })?;
+        let chunk_id = u32::try_from(idx)
+            .map_err(|_| AdapterError::msg("bisection level produced more than u32::MAX chunks"))?;
         let base_entry = base_by_id.get(&chunk_id).copied();
         let branch_entry = branch_by_id.get(&chunk_id).copied();
 

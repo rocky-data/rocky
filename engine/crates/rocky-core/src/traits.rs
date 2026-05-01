@@ -564,9 +564,8 @@ fn uniform_int_range_window(pk_ranges: &[PkRange]) -> AdapterResult<(i128, i128,
     }
     let lo = lo_min.expect("non-empty pk_ranges checked above");
     let hi = hi_max.expect("non-empty pk_ranges checked above");
-    let k = u32::try_from(pk_ranges.len()).map_err(|_| {
-        AdapterError::msg("checksum_chunks accepts up to u32::MAX chunks per call")
-    })?;
+    let k = u32::try_from(pk_ranges.len())
+        .map_err(|_| AdapterError::msg("checksum_chunks accepts up to u32::MAX chunks per call"))?;
     Ok((lo, hi, k))
 }
 

@@ -172,9 +172,15 @@ async fn finds_planted_change_at_row_90000() {
     assert_eq!(result.samples.len(), 1);
     assert_eq!(result.samples[0].kind, LeafRowKind::Changed);
     assert_eq!(result.samples[0].pk, "90000");
-    assert!(result.stats.depth_max >= 1, "single-row change requires recursion");
+    assert!(
+        result.stats.depth_max >= 1,
+        "single-row change requires recursion"
+    );
     assert!(!result.stats.depth_capped);
-    assert_eq!(result.stats.leaves_materialized, 1, "exactly one leaf bottoms out");
+    assert_eq!(
+        result.stats.leaves_materialized, 1,
+        "exactly one leaf bottoms out"
+    );
     assert_eq!(result.stats.split_strategy, SplitStrategy::IntRange);
 }
 
@@ -229,7 +235,10 @@ async fn determinism_same_data_byte_identical_stats() {
     };
     let a = run_once(100_000, &config).await;
     let b = run_once(100_000, &config).await;
-    assert_eq!(a, b, "two runs on the same data must produce identical results");
+    assert_eq!(
+        a, b,
+        "two runs on the same data must produce identical results"
+    );
 }
 
 /// Empty branch surfaces every base row as `Removed`. Bisection
@@ -444,15 +453,11 @@ async fn checksum_chunks_smoke_uniform_ranges() {
         .await
         .unwrap();
     adapter
-        .execute_statement(
-            "CREATE OR REPLACE TABLE smoke.t (id INTEGER, name VARCHAR)",
-        )
+        .execute_statement("CREATE OR REPLACE TABLE smoke.t (id INTEGER, name VARCHAR)")
         .await
         .unwrap();
     adapter
-        .execute_statement(
-            "INSERT INTO smoke.t SELECT i, 'r' || i FROM range(0, 32) t(i)",
-        )
+        .execute_statement("INSERT INTO smoke.t SELECT i, 'r' || i FROM range(0, 32) t(i)")
         .await
         .unwrap();
 
