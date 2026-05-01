@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.1] — 2026-05-01
+
+Patch release. Root-cause fix for Fivetran auto-rename collisions surfacing as duplicate `DiscoveredTable` records in `rocky discover` output.
+
 ### Fixed
 
 - **Fivetran discover: dedupe table records per source.** The Fivetran `/v1/connectors/{id}/schemas` response can list two distinct schema-entry keys that resolve to the same destination table name (e.g. an auto-rename leaves the original logical key alongside a fresh entry whose `name_in_destination` matches the renamed table). `SchemaConfig::enabled_tables()` faithfully forwards both rows, which left duplicate `DiscoveredTable` records in the discover output and broke downstream consumers — Dagster's `multi_asset` rejects duplicate `AssetCheckSpec`s, which crashed the entire `RockyComponent` build for affected pipelines. The Fivetran adapter now dedupes the per-connector table list by name (preserving first occurrence) with a WARN log carrying the connector id and the duplicate count, so the upstream-config quirk stays visible to operators rather than getting silently swallowed.
