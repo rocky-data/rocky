@@ -268,35 +268,41 @@ def _parse_rocky_json(output: str, model_cls: type[_TModel], *, command: str) ->
         ) from exc
 
 
-def _forward_stderr_to_context(
+def _forward_stderr_to_sink(
     stderr: Iterable[str] | None,
-    context: dg.AssetExecutionContext | dg.OpExecutionContext,
+    log_line: Callable[[str], None],
     sink: list[str],
 ) -> None:
-    """Reader-thread body that forwards rocky stderr lines to ``context.log``.
+    """Reader-thread body that forwards rocky stderr lines to a caller-supplied sink.
 
     Reads ``stderr`` line-by-line until EOF. Each non-empty line is:
 
     1. Appended to ``sink`` (a list shared with the parent thread for
        use in failure metadata — the parent grabs the tail to surface
        in ``dg.Failure``).
-    2. Logged via ``context.log.info`` so the Dagster run viewer
-       streams progress in real time. Rocky's tracing layer writes to
-       stderr (see ``engine/crates/rocky-observe/src/tracing_setup.rs``)
-       so this captures every ``info!()`` / ``warn!()`` macro emission.
+    2. Handed to ``log_line`` so the caller can route it wherever it
+       wants — Dagster's ``context.log.info`` for the streaming asset
+       path, or the ``dagster_rocky`` module logger for the buffered
+       path called outside of an execution context (component state
+       refresh, ``rocky doctor`` healthcheck, ``state_health`` probe).
+       Rocky's tracing layer writes to stderr (see
+       ``engine/crates/rocky-observe/src/tracing_setup.rs``) so this
+       captures every ``info!()`` / ``warn!()`` macro emission.
 
     This function is the **sole reader** of ``proc.stderr``. Running it
     alongside a ``proc.communicate(timeout=…)`` call (which also reads
     the pipe via raw ``os.read``) violates CPython's documented
     subprocess contract and was the root cause of the 2026-04-18 /
     2026-04-19 production hangs — the timeout intermittently failed to
-    fire under stderr traffic. See :meth:`RockyResource._run_rocky_streaming`
+    fire under stderr traffic. See :meth:`RockyResource._run_rocky_with_log_sink`
     for the single-reader + watchdog pattern that replaces that race.
 
-    On unexpected read errors the reader thread logs the error at WARN
-    via the module logger and exits cleanly so it doesn't take down the
-    parent. We still lose live streaming for the rest of the run, but
-    the subprocess completes and the final stdout parsing still runs.
+    ``log_line`` is responsible for any prefix / formatting and for
+    swallowing its own exceptions if the sink might raise mid-tear-down
+    (the streaming path's ``context.log`` can raise during run teardown,
+    so it wraps the call in :func:`contextlib.suppress`). On unexpected
+    pipe read errors the reader thread logs at WARN via the module
+    logger and exits cleanly so it doesn't take down the parent.
     """
     if stderr is None:
         return
@@ -306,11 +312,7 @@ def _forward_stderr_to_context(
             if not line:
                 continue
             sink.append(line)
-            # `context.log` can raise mid-line if the run is being torn
-            # down — suppress and keep reading so `sink` stays populated
-            # for failure metadata.
-            with contextlib.suppress(Exception):
-                context.log.info(f"rocky: {line}")
+            log_line(line)
     except (OSError, ValueError) as exc:
         # OSError covers broken-pipe / EBADF / closed-file on the subprocess
         # stderr handle. ValueError covers "I/O operation on closed file"
@@ -321,7 +323,7 @@ def _forward_stderr_to_context(
 def _accumulate_stdout(stdout: IO[str] | None, sink: list[str]) -> None:
     """Reader-thread body that accumulates rocky stdout lines into ``sink``.
 
-    Counterpart to :func:`_forward_stderr_to_context` for the stdout
+    Counterpart to :func:`_forward_stderr_to_sink` for the stdout
     pipe. Runs as the **sole reader** of ``proc.stdout`` so the parent
     thread never touches the pipe FD — eliminating the two-readers
     race that caused the 2026-04-18 / 2026-04-19 production hangs.
@@ -933,6 +935,21 @@ class RockyResource(dg.ConfigurableResource):
     def _run_rocky(self, args: list[str], *, allow_partial: bool = False) -> str:
         """Execute the Rocky CLI and return stdout.
 
+        Streams the binary's stderr to the ``dagster_rocky`` module logger
+        line-by-line as it runs, instead of buffering until exit. This
+        eliminates the "is it stuck or working?" silence in ``dg dev``
+        cold starts and component state refresh — operators see live
+        progress from ``rocky discover`` / ``compile`` / ``optimize`` /
+        ``state`` / ``cost`` / ``compliance`` / ``retention-status`` /
+        ``test`` / ``ci`` invocations in the same console where the
+        rest of the dagster-rocky log lines already appear. Adopters
+        who want a quieter console can downgrade ``dagster_rocky`` to
+        WARN.
+
+        Used for every read-only Rocky CLI invocation that doesn't have
+        a Dagster execution context. For asset materialization with
+        live ``context.log`` streaming see :meth:`_run_rocky_streaming`.
+
         Args:
             args: CLI arguments after the global flags. ``--config``,
                 ``--state-path`` and ``--output json`` are inserted automatically.
@@ -940,41 +957,10 @@ class RockyResource(dg.ConfigurableResource):
                 when stdout starts with valid JSON (Rocky's partial-success
                 semantics, where some tables succeed and some fail).
         """
-        self._verify_engine_version()
-        cmd = self._build_cmd(args)
-        try:
-            result = subprocess.run(  # noqa: S603 - cmd is fully constructed from typed args
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=self.timeout_seconds,
-            )
-        except FileNotFoundError:
-            raise dg.Failure(
-                description=(
-                    f"Rocky binary not found at '{self.binary_path}'. "
-                    "Install from: https://github.com/rocky-data/rocky/releases"
-                ),
-            ) from None
-        except subprocess.TimeoutExpired:
-            raise dg.Failure(
-                description=f"Rocky command timed out after {self.timeout_seconds}s",
-            ) from None
-
-        if result.returncode == 0:
-            return result.stdout
-
-        # Partial-success: Rocky exits non-zero but still emits a valid JSON
-        # payload describing the successful materializations alongside errors.
-        if allow_partial and result.stdout.lstrip().startswith("{"):
-            return result.stdout
-
-        raise dg.Failure(
-            description=f"Rocky command failed (exit {result.returncode})",
-            metadata={
-                "stderr": dg.MetadataValue.text(_truncate_stderr_for_metadata(result.stderr)),
-            },
+        return self._run_rocky_with_log_sink(
+            args,
+            log_line=lambda line: _log.info("rocky: %s", line),
+            allow_partial=allow_partial,
         )
 
     def _build_cmd(self, args: list[str]) -> list[str]:
@@ -999,44 +985,20 @@ class RockyResource(dg.ConfigurableResource):
     ) -> str:
         """Execute the Rocky CLI with live stderr streaming to ``context.log``.
 
-        This is the Pipes-style alternative to :meth:`_run_rocky`. Instead
-        of buffering everything via ``subprocess.run``, it spawns the
-        binary via ``subprocess.Popen`` with separated stdout/stderr,
-        starts dedicated reader threads on each pipe, and relies on an
-        external watchdog thread (not ``communicate(timeout=)``) to
-        enforce the wall-clock timeout.
+        Pipes-style alternative to :meth:`_run_rocky`: forwards each
+        rocky stderr line to the Dagster run viewer via
+        ``context.log.info`` instead of the module logger, so the
+        progress is visible in the run-step log panel rather than in
+        the code-server / ``dg dev`` console.
 
-        Rocky's tracing logs go to stderr (see
-        ``engine/crates/rocky-observe/src/tracing_setup.rs``) and the
-        structured ``--output json`` payload goes to stdout, so the
-        separation is clean: users see human-readable progress lines
-        in the Dagster run viewer in real time, and the integration
-        gets the typed result back at the end.
-
-        Concurrency model (fixes the 2026-04-18 / 2026-04-19 prod hangs)::
-
-            Popen(..., start_new_session=True)   # rocky gets its own pgid
-              ├── stderr forwarder thread         # SOLE reader of proc.stderr
-              ├── stdout accumulator thread       # SOLE reader of proc.stdout
-              ├── watchdog thread                 # os.killpg on timeout
-              └── main thread: proc.wait()        # blocks until external kill
-
-        The previous implementation combined the stderr forwarder with
-        ``proc.communicate(timeout=…)``, which also reads the stderr
-        pipe via raw ``os.read``. Two concurrent readers on the same
-        pipe FD violates CPython's documented ``subprocess`` contract
-        ("the process must have been started with the stream set to
-        ``PIPE`` and the stream must not be read from otherwise") —
-        under stderr traffic the ``TimeoutExpired`` path intermittently
-        failed to fire and the subprocess hung for hours. The watchdog
-        pattern kills the process externally via
-        ``os.killpg(SIGKILL)``, so enforcement is pipe-FD-independent.
+        Concurrency model and timeout behaviour are identical to
+        :meth:`_run_rocky` — both methods delegate to the shared
+        :meth:`_run_rocky_with_log_sink` helper. They differ only in
+        where each stderr line gets routed.
 
         For full Dagster Pipes integration with structured per-model
         materialization and check events, use
-        :meth:`RockyResource.run_pipes` instead. This method provides
-        live log streaming + final result parsing without requiring
-        the Pipes protocol.
+        :meth:`RockyResource.run_pipes` instead.
 
         Args:
             args: CLI arguments after the global flags. ``--config``,
@@ -1053,6 +1015,89 @@ class RockyResource(dg.ConfigurableResource):
         Returns:
             The captured stdout as a string, ready to be parsed via
             ``RunResult.model_validate_json``.
+
+        Raises:
+            dg.Failure: When the binary is missing, the subprocess
+                times out, or the run fails without partial-success
+                semantics.
+        """
+
+        def _log_to_context(line: str) -> None:
+            # ``context.log`` can raise mid-line if the run is being torn
+            # down — suppress and keep reading so the failure-metadata
+            # ``sink`` stays populated for ``dg.Failure``. The module
+            # logger doesn't need this defence, so the suppression lives
+            # in the streaming-path's sink rather than in the shared
+            # forwarder.
+            with contextlib.suppress(Exception):
+                context.log.info(f"rocky: {line}")
+
+        return self._run_rocky_with_log_sink(
+            args,
+            log_line=_log_to_context,
+            allow_partial=allow_partial,
+        )
+
+    def _run_rocky_with_log_sink(
+        self,
+        args: list[str],
+        log_line: Callable[[str], None],
+        *,
+        allow_partial: bool = False,
+    ) -> str:
+        """Shared implementation behind :meth:`_run_rocky` + :meth:`_run_rocky_streaming`.
+
+        Spawns the Rocky binary via ``subprocess.Popen`` with separated
+        stdout / stderr, starts dedicated reader threads on each pipe,
+        and relies on an external watchdog thread (not
+        ``communicate(timeout=)``) to enforce the wall-clock timeout.
+
+        Each non-empty stderr line is appended to a tail buffer (used in
+        failure metadata) and handed to ``log_line`` for live routing —
+        the module logger for the buffered path, ``context.log.info``
+        for the streaming path.
+
+        Rocky's tracing layer routes ``info!()`` / ``warn!()`` macros to
+        stderr (see ``engine/crates/rocky-observe/src/tracing_setup.rs``)
+        and the structured ``--output json`` payload to stdout, so the
+        separation is clean: callers see human-readable progress lines
+        in real time and the integration gets the typed result back at
+        the end.
+
+        Concurrency model (fixes the 2026-04-18 / 2026-04-19 prod hangs)::
+
+            Popen(..., start_new_session=True)   # rocky gets its own pgid
+              ├── stderr forwarder thread         # SOLE reader of proc.stderr
+              ├── stdout accumulator thread       # SOLE reader of proc.stdout
+              ├── watchdog thread                 # os.killpg on timeout
+              └── main thread: proc.wait()        # blocks until external kill
+
+        The previous ``_run_rocky`` implementation used
+        ``subprocess.run(capture_output=True, timeout=…)``, which
+        buffered stderr until exit and gave operators no signal during
+        long discover / state-refresh runs. The previous
+        ``_run_rocky_streaming`` implementation used
+        ``proc.communicate(timeout=…)`` alongside a daemon stderr
+        reader, which violated CPython's "stream must not be read from
+        otherwise" contract and caused intermittent multi-hour hangs in
+        production. The single-reader + external watchdog pattern fixes
+        both: live progress, and pipe-FD-independent timeout enforcement
+        via ``os.killpg(SIGKILL)``.
+
+        Args:
+            args: CLI arguments after the global flags. ``--config``,
+                ``--state-path`` and ``--output json`` are inserted
+                automatically by :meth:`_build_cmd`.
+            log_line: Per-stderr-line sink. Called once per non-empty
+                line as the subprocess runs. The sink is responsible
+                for any prefix / formatting and for swallowing its own
+                exceptions if the destination might raise mid-tear-down.
+            allow_partial: Accept a non-zero exit when stdout starts
+                with valid JSON (Rocky partial-success).
+
+        Returns:
+            The captured stdout as a string, ready to be parsed via
+            ``_parse_rocky_json``.
 
         Raises:
             dg.Failure: When the binary is missing, the subprocess
@@ -1108,8 +1153,8 @@ class RockyResource(dg.ConfigurableResource):
         stderr_lines: list[str] = []
         stdout_chunks: list[str] = []
         stderr_reader = threading.Thread(
-            target=_forward_stderr_to_context,
-            args=(proc.stderr, context, stderr_lines),
+            target=_forward_stderr_to_sink,
+            args=(proc.stderr, log_line, stderr_lines),
             daemon=True,
             name="rocky-stderr-forwarder",
         )

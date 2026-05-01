@@ -8,6 +8,7 @@ real Rocky binary or hitting a server.
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import subprocess
 import sys
@@ -23,7 +24,6 @@ import pytest
 
 from dagster_rocky.resource import (
     DEFAULT_HTTP_TIMEOUT_SECONDS,
-    DEFAULT_TIMEOUT_SECONDS,
     MIN_ROCKY_VERSION,
     RockyResource,
     _redact_argv,
@@ -79,30 +79,62 @@ def test_build_cmd_includes_global_flags():
 
 # ---------------------------------------------------------------------------
 # _run_rocky — happy path, partial success, failures
+#
+# Both the buffered (``_run_rocky``) and streaming (``_run_rocky_streaming``)
+# entry points delegate to ``_run_rocky_with_log_sink`` which spawns rocky
+# via ``subprocess.Popen`` with sole-reader threads and a watchdog timeout.
+# Tests therefore mock ``subprocess.Popen`` rather than ``subprocess.run``.
+# Each stderr line is forwarded to the sink — the module logger for the
+# buffered path, ``context.log.info`` for the streaming path — so the
+# buffered tests rely on ``caplog`` at INFO to assert routing.
 # ---------------------------------------------------------------------------
+
+
+def _popen_mock(
+    *,
+    stdout: str = "",
+    stderr_lines: list[str] | None = None,
+    returncode: int = 0,
+):
+    """Build a Popen mock the shared Popen + reader-threads helper can drive.
+
+    ``stdout`` is exposed as a single-element iterator so the stdout
+    accumulator concatenates it verbatim. ``stderr`` is exposed as a
+    line-by-line iterator (with trailing newlines added) so the
+    stderr forwarder sees one line at a time and drains to EOF.
+    ``proc.wait()`` is a no-op mock — the watchdog Event is dismissed
+    by the helper's ``finally`` clause once the iterators have drained.
+    """
+    proc = MagicMock()
+    proc.pid = 12345
+    proc.stdout = iter([stdout]) if stdout else iter([])
+    proc.stderr = iter(line + "\n" for line in (stderr_lines or []))
+    proc.returncode = returncode
+    proc.kill = MagicMock()
+    proc.wait = MagicMock()
+    return proc
 
 
 def test_run_rocky_returns_stdout_on_success():
     rocky = RockyResource()
-    with _patched_run(return_value=_completed(stdout='{"hello": "world"}')) as run_mock:
+    proc = _popen_mock(stdout='{"hello": "world"}')
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+    ):
         out = rocky._run_rocky(["discover"])
     assert out == '{"hello": "world"}'
-    # Default timeout was passed through.
-    assert run_mock.call_args.kwargs["timeout"] == DEFAULT_TIMEOUT_SECONDS
-
-
-def test_run_rocky_uses_configured_timeout():
-    rocky = RockyResource(timeout_seconds=42)
-    with _patched_run(return_value=_completed()) as run_mock:
-        rocky._run_rocky(["discover"])
-    assert run_mock.call_args.kwargs["timeout"] == 42
 
 
 def test_run_rocky_partial_success_returns_stdout():
     """A non-zero exit with valid JSON should return the JSON when allowed."""
     rocky = RockyResource()
     payload = '{"command": "run", "tables_failed": 1}'
-    with _patched_run(return_value=_completed(stdout=payload, returncode=1)):
+    proc = _popen_mock(stdout=payload, returncode=1)
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+    ):
         out = rocky._run_rocky(["run", "--filter", "x=y"], allow_partial=True)
     assert out == payload
 
@@ -110,8 +142,10 @@ def test_run_rocky_partial_success_returns_stdout():
 def test_run_rocky_partial_success_disallowed_raises():
     """Without ``allow_partial`` a non-zero exit always becomes a Failure."""
     rocky = RockyResource()
+    proc = _popen_mock(stdout="{}", stderr_lines=["boom"], returncode=1)
     with (
-        _patched_run(return_value=_completed(stdout="{}", stderr="boom", returncode=1)),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure, match="exit 1"),
     ):
         rocky._run_rocky(["discover"])
@@ -120,8 +154,10 @@ def test_run_rocky_partial_success_disallowed_raises():
 def test_run_rocky_partial_success_only_when_json():
     """Partial success only kicks in when stdout actually starts with JSON."""
     rocky = RockyResource()
+    proc = _popen_mock(stdout="not json", stderr_lines=["boom"], returncode=2)
     with (
-        _patched_run(return_value=_completed(stdout="not json", stderr="boom", returncode=2)),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure),
     ):
         rocky._run_rocky(["run", "--filter", "x=y"], allow_partial=True)
@@ -130,19 +166,147 @@ def test_run_rocky_partial_success_only_when_json():
 def test_run_rocky_missing_binary_raises_failure():
     rocky = RockyResource(binary_path="/nope/rocky")
     with (
-        _patched_run(side_effect=FileNotFoundError),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", side_effect=FileNotFoundError),
         pytest.raises(dg.Failure, match="not found"),
     ):
         rocky._run_rocky(["discover"])
 
 
-def test_run_rocky_timeout_raises_failure():
-    rocky = RockyResource(timeout_seconds=5)
+def test_run_rocky_failure_metadata_carries_stderr_tail():
+    """A non-partial failure exposes the stderr tail in ``dg.Failure.metadata``."""
+    rocky = RockyResource()
+    proc = _popen_mock(
+        stdout="not json",
+        stderr_lines=[f"INFO step {i}" for i in range(5)] + ["ERROR fatal: connection refused"],
+        returncode=2,
+    )
     with (
-        _patched_run(side_effect=subprocess.TimeoutExpired(cmd="rocky", timeout=5)),
-        pytest.raises(dg.Failure, match="timed out after 5s"),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        pytest.raises(dg.Failure) as excinfo,
     ):
         rocky._run_rocky(["discover"])
+    assert "stderr_tail" in excinfo.value.metadata
+    tail = excinfo.value.metadata["stderr_tail"].text
+    assert "ERROR fatal: connection refused" in tail
+
+
+def test_run_rocky_streams_stderr_to_module_logger(caplog: pytest.LogCaptureFixture):
+    """Each non-empty stderr line reaches the ``dagster_rocky.resource`` logger.
+
+    This is the FR-020 contract — the buffered path no longer holds
+    progress lines until exit; they're surfaced to the module logger
+    line-by-line so ``dg dev`` cold starts and code-server reloads
+    show the same live progress as the streaming path.
+    """
+    rocky = RockyResource()
+    proc = _popen_mock(
+        stdout='{"ok": true}',
+        stderr_lines=[
+            "INFO discovering sources",
+            "INFO 53 connectors enumerated",
+            "INFO discover complete",
+        ],
+    )
+    with (
+        caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+    ):
+        rocky._run_rocky(["discover"])
+    streamed = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "dagster_rocky.resource" and rec.getMessage().startswith("rocky:")
+    ]
+    assert "rocky: INFO discovering sources" in streamed
+    assert "rocky: INFO 53 connectors enumerated" in streamed
+    assert "rocky: INFO discover complete" in streamed
+
+
+def test_run_rocky_skips_empty_stderr_lines(caplog: pytest.LogCaptureFixture):
+    """Blank stderr lines are not propagated to the module logger."""
+    rocky = RockyResource()
+    proc = _popen_mock(
+        stdout='{"ok": true}',
+        stderr_lines=["INFO start", "", "INFO done"],
+    )
+    with (
+        caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+    ):
+        rocky._run_rocky(["discover"])
+    streamed = [rec.getMessage() for rec in caplog.records if rec.getMessage().startswith("rocky:")]
+    assert streamed == ["rocky: INFO start", "rocky: INFO done"]
+
+
+def test_run_rocky_redacts_argv_in_startup_log(caplog: pytest.LogCaptureFixture):
+    """Credential-bearing flag values are redacted in the startup log line.
+
+    The startup line is shared with the streaming path and lives in the
+    helper, so the same redaction guarantee applies whether the caller
+    has a Dagster context or not.
+    """
+    rocky = RockyResource()
+    proc = _popen_mock(stdout='{"ok": true}')
+    with (
+        caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+    ):
+        rocky._run_rocky(["run", "--idempotency-key", "secret-token-123"])
+    startup_lines = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.getMessage().startswith("rocky subprocess started")
+    ]
+    assert startup_lines, "startup line should be emitted on the module logger"
+    joined = "\n".join(startup_lines)
+    assert "secret-token-123" not in joined
+    assert "***" in joined
+    assert "--idempotency-key" in joined
+
+
+def test_run_rocky_timeout_kills_proc_and_raises():
+    """When the subprocess hangs past ``timeout_seconds``, the watchdog
+    thread kills the process group via ``os.killpg(SIGKILL)`` and
+    ``_run_rocky`` raises ``dg.Failure`` with the configured timeout
+    in the message — same path as ``_run_rocky_streaming``.
+    """
+    rocky = RockyResource(timeout_seconds=1)
+
+    killed = threading.Event()
+
+    def fake_wait(timeout: float | None = None) -> int:
+        killed.wait()
+        return proc.returncode
+
+    proc = _popen_mock(stdout="", stderr_lines=["INFO hung at step 3"])
+    proc.wait = MagicMock(side_effect=fake_wait)
+
+    killpg_mock = MagicMock(
+        side_effect=lambda pgid, sig: (
+            object.__setattr__(proc, "returncode", -signal.SIGKILL),
+            killed.set(),
+        )[0],
+    )
+
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("dagster_rocky.resource.os.killpg", killpg_mock),
+        patch("dagster_rocky.resource.os.getpgid", return_value=proc.pid),
+        pytest.raises(dg.Failure) as excinfo,
+    ):
+        rocky._run_rocky(["discover"])
+
+    killpg_mock.assert_called_once()
+    desc = excinfo.value.description or ""
+    assert "1s" in desc
+    assert "timed out" in desc.lower()
+    assert "watchdog-killed" in desc.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -747,11 +911,10 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
     cause of the prior hangs.
     """
 
-    def _noop_forwarder(stderr, context, sink):
+    def _noop_forwarder(stderr, log_line, sink):
         # Drain stderr quickly to avoid filling the pipe buffer (which
-        # would block the subprocess after a few KB). We don't log
-        # anything to context.log — this is the "no daemon reader"
-        # simulation.
+        # would block the subprocess after a few KB). We don't call
+        # ``log_line`` — this is the "no daemon reader" simulation.
         if stderr is None:
             return
         try:
@@ -764,7 +927,7 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
             return
 
     monkeypatch.setattr(
-        "dagster_rocky.resource._forward_stderr_to_context",
+        "dagster_rocky.resource._forward_stderr_to_sink",
         _noop_forwarder,
     )
 
@@ -792,6 +955,39 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
     assert elapsed < 5.0, (
         f"run_streaming took {elapsed:.2f}s without daemon reader; "
         "expected < 5s. The watchdog is the enforcer — race or no race."
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fake binary")
+def test_run_rocky_buffered_path_hard_kills_hung_binary(tmp_path: Path):
+    """Regression test for the buffered ``_run_rocky`` after the FR-020 refactor.
+
+    Before this FR ``_run_rocky`` used ``subprocess.run(timeout=…)``, which
+    raised ``TimeoutExpired`` synchronously. After the refactor it shares
+    the same Popen + sole-reader-threads + watchdog model as the streaming
+    path, so the timeout enforcement now runs through ``os.killpg(SIGKILL)``.
+    Confirms a hung rocky binary still raises ``dg.Failure`` within the
+    configured timeout + a small grace window for the buffered path too,
+    not just the streaming path.
+    """
+    fake = _write_hang_fake(tmp_path)
+    rocky = RockyResource(
+        binary_path=str(fake),
+        config_path=str(tmp_path / "rocky.toml"),
+        state_path=str(tmp_path / ".rocky-state.redb"),
+        models_dir=str(tmp_path),
+        timeout_seconds=2,
+    )
+
+    t0 = time.monotonic()
+    with pytest.raises(dg.Failure, match="timed out"):
+        rocky._run_rocky(["discover"])
+    elapsed = time.monotonic() - t0
+
+    # Same budget as the streaming path's positive test: 2s timeout + 3s
+    # grace for watchdog + reader joins.
+    assert elapsed < 5.0, (
+        f"_run_rocky took {elapsed:.2f}s; expected < 5s. Watchdog may not be firing."
     )
 
 
@@ -1381,18 +1577,26 @@ def test_verify_version_semver_comparison_logic():
 
 
 def test_verify_version_called_by_run_rocky():
-    """_run_rocky calls _verify_engine_version before executing the command."""
-    rocky = RockyResource()
+    """_run_rocky calls _verify_engine_version before executing the command.
 
-    # Two subprocess.run calls: first for --version, second for the actual command
-    with _patched_run(return_value=_completed(stdout='{"ok":true}')) as run_mock:
+    Version check still goes through ``subprocess.run`` (one-shot, no
+    streaming needed). The actual command goes through the shared
+    Popen + log-sink helper.
+    """
+    rocky = RockyResource()
+    proc = _popen_mock(stdout='{"ok": true}')
+
+    with (
+        _patched_run(return_value=_version_completed(f"rocky {MIN_ROCKY_VERSION}")) as run_mock,
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc) as popen_mock,
+    ):
         rocky._run_rocky(["discover"])
 
-    # First call was the version check
+    # subprocess.run was called exactly once — for the version check.
     version_call = run_mock.call_args_list[0]
     assert "--version" in version_call.args[0]
-    # Second call was the actual command
-    actual_call = run_mock.call_args_list[1]
+    # The actual command went through Popen.
+    actual_call = popen_mock.call_args_list[0]
     assert "discover" in actual_call.args[0]
 
 
@@ -1668,17 +1872,23 @@ def test_run_rocky_failure_truncates_oversize_stderr_in_metadata():
 
     Pins both the SEC fix (no unbounded blob in the Dagster UI) and the
     operator-debugging path (the marker tells them how much was clipped).
+    The buffered path now keeps only the last 20 stderr lines (same tail
+    semantics as the streaming path), so we feed in 50 long lines and
+    verify the surfaced ``stderr_tail`` is bounded by the metadata cap.
     """
     rocky = RockyResource()
-    huge_stderr = "ERR " * 5000  # 20KB of stderr noise
+    long_line = "ERR " * 200  # 800 bytes/line × 50 lines = 40KB, well above the 8KB cap
+    huge_stderr_lines = [long_line for _ in range(50)]
+    proc = _popen_mock(stdout="", stderr_lines=huge_stderr_lines, returncode=2)
     with (
-        _patched_run(return_value=_completed(stdout="", stderr=huge_stderr, returncode=2)),
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky._run_rocky(["discover"])
 
     metadata = excinfo.value.metadata
-    assert "stderr" in metadata
-    text = metadata["stderr"].text
+    assert "stderr_tail" in metadata
+    text = metadata["stderr_tail"].text
     assert len(text) <= 8300
     assert "truncated" in text
