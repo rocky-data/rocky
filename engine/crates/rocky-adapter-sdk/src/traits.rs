@@ -261,6 +261,56 @@ pub struct FreshnessResult {
 }
 
 // ---------------------------------------------------------------------------
+// Bisection diff
+// ---------------------------------------------------------------------------
+
+/// One contiguous range of primary-key values, identifying a chunk in a
+/// checksum-bisection diff (see [`WarehouseAdapter::checksum_chunks`]).
+///
+/// Variants correspond one-to-one with [`SplitStrategy`]:
+/// - `IntRange` for declared integer / numeric primary keys.
+/// - `Composite` for multi-column primary keys; lo/hi are tuple
+///   boundaries pre-computed by the caller.
+/// - `HashBucket` for opaque-string / UUID primary keys; chunk identity
+///   is `hash(pk) % modulus == residue`. Single-level by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PkRange {
+    IntRange { lo: i128, hi: i128 },
+    Composite {
+        lo: Vec<serde_json::Value>,
+        hi: Vec<serde_json::Value>,
+    },
+    HashBucket { modulus: u32, residue: u32 },
+}
+
+/// One chunk's checksum result returned from
+/// [`WarehouseAdapter::checksum_chunks`].
+///
+/// Empty chunks (zero rows on this side) MAY be omitted by the
+/// implementation; callers MUST index by `chunk_id`, not by vector
+/// position. A `chunk_id` absent from the returned vector is equivalent
+/// to `ChunkChecksum { chunk_id, row_count: 0, checksum: 0 }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkChecksum {
+    pub chunk_id: u32,
+    pub row_count: u64,
+    /// XOR-aggregated row hashes, widened to `u128` so the largest
+    /// native adapter hash output (Snowflake `NUMBER(38,0)`) fits without
+    /// truncation.
+    pub checksum: u128,
+}
+
+/// How the bisection runner split the primary-key space into chunks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitStrategy {
+    IntRange,
+    Composite,
+    HashBucket,
+    FirstColumn,
+}
+
+// ---------------------------------------------------------------------------
 // Core trait: WarehouseAdapter
 // ---------------------------------------------------------------------------
 
@@ -286,6 +336,51 @@ pub trait WarehouseAdapter: Send + Sync {
 
     /// Release any resources held by this adapter.
     async fn close(&self) -> AdapterResult<()>;
+
+    /// Compute checksums for a batch of chunks defined by primary-key
+    /// ranges. Used by Rocky's checksum-bisection diff to compare two
+    /// tables row-by-row without scanning either side end-to-end.
+    ///
+    /// **Returns one entry per non-empty chunk.** Chunks with zero rows
+    /// on this side MAY be omitted; callers MUST index by
+    /// [`ChunkChecksum::chunk_id`], not by vector position. A `chunk_id`
+    /// absent from the returned vector is treated as
+    /// `ChunkChecksum { chunk_id, row_count: 0, checksum: 0 }`.
+    ///
+    /// Default impl returns "not supported" — out-of-tree adapters must
+    /// override to support `--algorithm=bisection`. Adapters compose the
+    /// query around their native hash and bucketing primitives (DuckDB
+    /// `hash()` + `width_bucket`, Spark `xxhash64`, Snowflake `HASH` +
+    /// `BITXOR_AGG`, BigQuery `FARM_FINGERPRINT`); the in-tree
+    /// equivalents live in `rocky-core` and ship with overrides per
+    /// adapter.
+    async fn checksum_chunks(
+        &self,
+        _table: &TableRef,
+        _pk_column: &str,
+        _value_columns: &[String],
+        _pk_ranges: &[PkRange],
+    ) -> AdapterResult<Vec<ChunkChecksum>> {
+        Err(AdapterError::not_supported("checksum_chunks"))
+    }
+
+    /// Adapter-tuned override for the bisection leaf-row threshold (the
+    /// `MIN_CHUNK_ROWS` knob). Below this row count the runner stops
+    /// splitting and materializes the chunk for row-by-row diff.
+    ///
+    /// Defaults to `1000`, which lands break-even on in-process engines.
+    /// Adapters with high per-query setup cost (Databricks, Snowflake,
+    /// BigQuery) should override to a higher value.
+    fn recommended_leaf_size(&self) -> u64 {
+        1000
+    }
+
+    /// Adapter-tuned override for the row-count threshold above which
+    /// UUID / hash-bucket-PK tables auto-fall-back from bisection to
+    /// sampled. Defaults to `10_000_000`.
+    fn recommended_uuid_threshold(&self) -> u64 {
+        10_000_000
+    }
 }
 
 // ---------------------------------------------------------------------------

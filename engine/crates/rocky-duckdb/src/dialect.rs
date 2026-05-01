@@ -192,6 +192,28 @@ impl SqlDialect for DuckDbSqlDialect {
     fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
         Ok(format!("regexp_matches({column}, '{pattern}')"))
     }
+
+    fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+        if columns.is_empty() {
+            return Err(AdapterError::msg(
+                "row_hash_expr requires at least one column to hash",
+            ));
+        }
+        for col in columns {
+            validation::validate_identifier(col).map_err(AdapterError::new)?;
+        }
+        // DuckDB's `hash(expr_list)` accepts any number of arguments and
+        // returns UBIGINT (xxhash64). Cast to HUGEINT so `BIT_XOR(...)`
+        // widens cleanly to i128 — matches the [`ChunkChecksum::checksum`]
+        // u128 contract without truncation when the hash's high bit is
+        // set.
+        let arg_list = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("CAST(hash({arg_list}) AS HUGEINT)"))
+    }
 }
 
 #[cfg(test)]
