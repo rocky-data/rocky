@@ -193,6 +193,57 @@ impl SqlDialect for BigQueryDialect {
     fn current_timestamp_expr(&self) -> &'static str {
         "CURRENT_TIMESTAMP()"
     }
+
+    /// BigQuery's safe-widening allowlist.
+    ///
+    /// Strict subset of BigQuery's documented `ALTER COLUMN SET DATA
+    /// TYPE` widenings — only the lossless numeric promotions:
+    ///
+    /// - `INT64 → NUMERIC`, `INT64 → BIGNUMERIC` — full INT64 range
+    ///   fits losslessly in NUMERIC (precision 38) and BIGNUMERIC.
+    /// - `NUMERIC → BIGNUMERIC` — strict precision widening.
+    ///
+    /// **Excluded by design:**
+    ///
+    /// - `INT64 → FLOAT64`, `NUMERIC → FLOAT64`, `BIGNUMERIC → FLOAT64`
+    ///   — BigQuery accepts these via `SET DATA TYPE` but they are
+    ///   lossy for absolute values > 2^53. Rocky's "safe widening"
+    ///   contract excludes any conversion with potential value loss
+    ///   (matches the strictness of the default Databricks/Spark
+    ///   allowlist, which also omits `INT → FLOAT`).
+    /// - **All `… → STRING` conversions.** Despite being lossless at
+    ///   the value level, BigQuery's `ALTER COLUMN SET DATA TYPE`
+    ///   rejects any conversion to `STRING` (`existing column type X
+    ///   is not assignable to STRING`). The default allowlist's
+    ///   "any numeric → STRING" pattern doesn't transfer to BigQuery.
+    ///
+    /// Drift involving any excluded pair falls through to
+    /// `DropAndRecreate`.
+    fn is_safe_type_widening(&self, source_type: &str, target_type: &str) -> bool {
+        let src = source_type.to_uppercase();
+        let tgt = target_type.to_uppercase();
+        matches!(
+            (tgt.as_str(), src.as_str()),
+            ("INT64", "NUMERIC") | ("INT64", "BIGNUMERIC") | ("NUMERIC", "BIGNUMERIC"),
+        )
+    }
+
+    /// BigQuery requires `ALTER COLUMN ... SET DATA TYPE ...`; the ANSI
+    /// `ALTER COLUMN ... TYPE ...` form returns `Expected keyword DROP
+    /// or keyword SET`. Other dialects use the default impl on the
+    /// `SqlDialect` trait.
+    fn alter_column_type_sql(
+        &self,
+        table_ref: &str,
+        column: &str,
+        new_type: &str,
+    ) -> AdapterResult<String> {
+        validation::validate_identifier(column).map_err(AdapterError::new)?;
+        rocky_core::sql_gen::validate_sql_type(new_type).map_err(AdapterError::new)?;
+        Ok(format!(
+            "ALTER TABLE {table_ref} ALTER COLUMN {column} SET DATA TYPE {new_type}"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -312,5 +363,78 @@ mod tests {
             d.drop_table_sql("`p`.`d`.`t`"),
             "DROP TABLE IF EXISTS `p`.`d`.`t`"
         );
+    }
+
+    #[test]
+    fn alter_column_type_sql_uses_bq_set_data_type_form() {
+        let d = BigQueryDialect;
+        let sql = d
+            .alter_column_type_sql("`p`.`d`.`t`", "score", "NUMERIC")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE `p`.`d`.`t` ALTER COLUMN score SET DATA TYPE NUMERIC"
+        );
+    }
+
+    #[test]
+    fn alter_column_type_sql_rejects_bad_identifier() {
+        let d = BigQueryDialect;
+        assert!(
+            d.alter_column_type_sql("`p`.`d`.`t`", "bad; DROP", "NUMERIC")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn alter_column_type_sql_rejects_bad_type() {
+        let d = BigQueryDialect;
+        assert!(
+            d.alter_column_type_sql("`p`.`d`.`t`", "score", "NUMERIC; DROP")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn is_safe_type_widening_int64_to_numeric() {
+        let d = BigQueryDialect;
+        assert!(d.is_safe_type_widening("NUMERIC", "INT64"));
+        assert!(d.is_safe_type_widening("BIGNUMERIC", "INT64"));
+        assert!(d.is_safe_type_widening("BIGNUMERIC", "NUMERIC"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_excludes_to_string() {
+        // BigQuery's ALTER COLUMN SET DATA TYPE rejects any conversion
+        // to STRING (`existing column type INT64 is not assignable to
+        // STRING`), so even though STRING is lossless at the value
+        // level, it can't be used as a drift evolution target.
+        let d = BigQueryDialect;
+        assert!(!d.is_safe_type_widening("STRING", "INT64"));
+        assert!(!d.is_safe_type_widening("STRING", "NUMERIC"));
+        assert!(!d.is_safe_type_widening("STRING", "FLOAT64"));
+        assert!(!d.is_safe_type_widening("STRING", "BOOL"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_excludes_to_float64() {
+        // BigQuery accepts these conversions via SET DATA TYPE, but
+        // they are lossy for absolute values > 2^53. Rocky's "safe"
+        // contract is strict — drift involving these falls through to
+        // DropAndRecreate.
+        let d = BigQueryDialect;
+        assert!(!d.is_safe_type_widening("FLOAT64", "INT64"));
+        assert!(!d.is_safe_type_widening("FLOAT64", "NUMERIC"));
+        assert!(!d.is_safe_type_widening("FLOAT64", "BIGNUMERIC"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_excludes_narrowing_and_unrelated() {
+        let d = BigQueryDialect;
+        // Narrowing is never safe.
+        assert!(!d.is_safe_type_widening("INT64", "STRING"));
+        assert!(!d.is_safe_type_widening("INT64", "NUMERIC"));
+        // Unrelated type families fall through.
+        assert!(!d.is_safe_type_widening("DATE", "TIMESTAMP"));
     }
 }

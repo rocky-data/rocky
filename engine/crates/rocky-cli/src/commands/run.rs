@@ -4133,6 +4133,61 @@ async fn process_table(
                 action: "drop_and_recreate".into(),
                 reason,
             });
+        } else if drift_result.action == DriftAction::AlterColumnTypes {
+            // Every drifted column passed the dialect's safe-widening
+            // check. Issue `ALTER TABLE ALTER COLUMN ... TYPE ...` (or
+            // BigQuery's `SET DATA TYPE` form) for each before the
+            // INSERT continues — target keeps its existing rows with
+            // the values reinterpreted under the new type.
+            info!(
+                table = target_table.full_name(),
+                drifted = drift_result.drifted_columns.len(),
+                "drift detected, widening {} column type(s)",
+                drift_result.drifted_columns.len()
+            );
+            let alter_stmts = drift::generate_alter_column_sql(
+                &target_table,
+                &drift_result.drifted_columns,
+                dialect,
+            )?;
+            for stmt in &alter_stmts {
+                warehouse
+                    .execute_statement(stmt)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            // If the same drift round also surfaced added columns,
+            // apply them as part of the same schema-evolution step
+            // before the INSERT runs.
+            if !drift_result.added_columns.is_empty() {
+                let add_stmts = drift::generate_add_column_sql(
+                    &target_table,
+                    &drift_result.added_columns,
+                    dialect,
+                )?;
+                for stmt in &add_stmts {
+                    warehouse
+                        .execute_statement(stmt)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            let reason = drift_result
+                .drifted_columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "column '{}' widened {} → {}",
+                        c.name, c.target_type, c.source_type
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            drift_action = Some(DriftActionOutput {
+                table: target_table.full_name(),
+                action: "alter_column_types".into(),
+                reason,
+            });
         } else if !drift_result.added_columns.is_empty() {
             // Source added columns the target doesn't have. Without an
             // ALTER, the next `INSERT INTO target SELECT * FROM source`
