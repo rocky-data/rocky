@@ -637,21 +637,21 @@ mod tests {
             .unwrap();
 
         // Bare form joins with caller default — call-site dependent.
-        let bare_with_source_sep = parsed
-            .resolve_template("md5('fivetran_{client}_{hierarchies}_{connector}')", "__");
+        let bare_with_source_sep =
+            parsed.resolve_template("md5('fivetran_{client}_{hierarchies}_{connector}')", "__");
         assert_eq!(
             bare_with_source_sep,
             "md5('fivetran_pfizer_namer__can_googleads')"
         );
 
         // Explicit form pins the separator regardless of caller default.
-        let explicit = parsed
-            .resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "__");
+        let explicit =
+            parsed.resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "__");
         assert_eq!(explicit, "md5('fivetran_pfizer_namer_can_googleads')");
 
         // Same explicit form, caller passes target sep — same output.
-        let explicit_target_default = parsed
-            .resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "_");
+        let explicit_target_default =
+            parsed.resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "_");
         assert_eq!(
             explicit_target_default,
             "md5('fivetran_pfizer_namer_can_googleads')"
