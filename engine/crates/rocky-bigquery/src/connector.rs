@@ -267,6 +267,66 @@ impl BigQueryAdapter {
             timeout_secs: self.timeout_secs,
         })
     }
+
+    /// Fetch the full `Job` resource for a completed job ID and return
+    /// just its `statistics` block.
+    ///
+    /// The synchronous `jobs.query` and `jobs.getQueryResults` endpoints
+    /// only surface `totalBytesProcessed` at the top level of the
+    /// response; the `statistics.query.totalBytesBilled` figure (which
+    /// applies the 10 MB per-query minimum-bill floor and is what the
+    /// BigQuery console displays) is exclusive to `jobs.get`. Calling
+    /// this method after `run_query` succeeds enriches the existing
+    /// response so [`stats_from_response`] picks the billed figure
+    /// rather than falling back to processed bytes.
+    ///
+    /// One extra HTTP roundtrip per query. `jobs.get` is free and
+    /// returns in tens of milliseconds for a fresh job, so the trade-off
+    /// is a small latency tax for accurate cost numbers.
+    async fn fetch_job_statistics(
+        &self,
+        job_ref: &JobReference,
+    ) -> Result<BigQueryStatistics, BigQueryError> {
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/jobs/{}",
+            self.project_id, job_ref.job_id
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("location", self.location.as_str())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().to_string();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BigQueryError::ApiError {
+                status,
+                message: body,
+            });
+        }
+
+        // `jobs.get` returns the full Job resource; we only care about
+        // `statistics`. A minimal local struct keeps the deserializer
+        // tolerant of fields we don't read.
+        #[derive(Deserialize)]
+        struct JobGetResponse {
+            statistics: Option<BigQueryStatistics>,
+        }
+
+        let job: JobGetResponse = resp.json().await?;
+        job.statistics.ok_or_else(|| BigQueryError::ApiError {
+            status: "missing statistics".into(),
+            message: format!(
+                "jobs.get response for job '{}' had no statistics block",
+                job_ref.job_id
+            ),
+        })
+    }
 }
 
 #[async_trait]
@@ -287,7 +347,34 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 
     async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
-        let response = self.run_query(sql).await.map_err(AdapterError::new)?;
+        let mut response = self.run_query(sql).await.map_err(AdapterError::new)?;
+
+        // Enrich with `jobs.get` statistics so cost reporting reflects
+        // `totalBytesBilled` (10 MB minimum-bill floor applied) instead
+        // of the bare `totalBytesProcessed` `jobs.query` returns.
+        // `run_query`'s response shape never carries `statistics` on the
+        // sync path, so the `is_none()` check is currently always true
+        // when a job ran — but keeping it defensive against future
+        // codepaths that might pre-populate the field.
+        if response.statistics.is_none() {
+            if let Some(ref job_ref) = response.job_reference {
+                match self.fetch_job_statistics(job_ref).await {
+                    Ok(stats) => response.statistics = Some(stats),
+                    Err(e) => {
+                        // Best-effort: fall back to top-level
+                        // `total_bytes_processed`. Logged so a future
+                        // "cost numbers look low" debug session has the
+                        // failure reason recorded.
+                        debug!(
+                            job_id = %job_ref.job_id,
+                            error = %e,
+                            "jobs.get failed; falling back to totalBytesProcessed",
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(stats_from_response(&response))
     }
 
