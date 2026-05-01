@@ -1,6 +1,6 @@
 [package]
 name = "rocky-databricks"
-version = "1.20.1"
+version = "1.21.0"
 description = "Databricks warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true
