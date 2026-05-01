@@ -28,6 +28,7 @@ pub fn detect_drift(
     table: &TableRef,
     source_columns: &[ColumnInfo],
     target_columns: &[ColumnInfo],
+    dialect: &dyn SqlDialect,
 ) -> DriftResult {
     let target_map = column_map::build_column_map(target_columns);
 
@@ -56,7 +57,7 @@ pub fn detect_drift(
         DriftAction::Ignore
     } else if drifted_columns
         .iter()
-        .all(|d| is_safe_type_widening(&d.source_type, &d.target_type))
+        .all(|d| dialect.is_safe_type_widening(&d.source_type, &d.target_type))
     {
         DriftAction::AlterColumnTypes
     } else {
@@ -91,12 +92,18 @@ pub fn generate_drop_table_sql(
     Ok(dialect.drop_table_sql(&ref_str))
 }
 
-/// Determines if a column type change from `target_type` to `source_type` is a safe
-/// widening that can be handled via ALTER TABLE instead of DROP+recreate.
+/// Default body of [`SqlDialect::is_safe_type_widening`] — Databricks /
+/// Spark / DuckDB / Snowflake share enough type-name conventions that
+/// a single allowlist covers them.
 ///
-/// Conservative allowlist -- only well-known safe promotions. Unknown types
-/// or narrowing changes fall back to DropAndRecreate.
-fn is_safe_type_widening(source_type: &str, target_type: &str) -> bool {
+/// Dialects with different type spellings (BigQuery `INT64` /
+/// `NUMERIC` / `FLOAT64` / `BIGNUMERIC`) override
+/// [`SqlDialect::is_safe_type_widening`] in their dialect impl rather
+/// than bolting names onto this list — keeping the global default
+/// dialect-neutral (no BQ types here) avoids the asymmetry of having
+/// e.g. both `BIGINT → STRING` and `INT64 → STRING` for what is
+/// semantically the same conversion.
+pub(crate) fn default_is_safe_type_widening(source_type: &str, target_type: &str) -> bool {
     let src = source_type.to_uppercase();
     let tgt = target_type.to_uppercase();
 
@@ -130,7 +137,7 @@ fn is_safe_type_widening(source_type: &str, target_type: &str) -> bool {
 }
 
 /// Checks DECIMAL(p1,s) -> DECIMAL(p2,s) where p2 >= p1 (precision widening).
-fn is_safe_decimal_widening(target: &str, source: &str) -> bool {
+pub(crate) fn is_safe_decimal_widening(target: &str, source: &str) -> bool {
     fn parse_decimal(t: &str) -> Option<(u32, u32)> {
         let t = t.trim();
         if !t.starts_with("DECIMAL(") || !t.ends_with(')') {
@@ -154,7 +161,7 @@ fn is_safe_decimal_widening(target: &str, source: &str) -> bool {
 }
 
 /// Checks VARCHAR(n) -> VARCHAR(m) where m >= n.
-fn is_safe_varchar_widening(target: &str, source: &str) -> bool {
+pub(crate) fn is_safe_varchar_widening(target: &str, source: &str) -> bool {
     fn parse_varchar(t: &str) -> Option<u32> {
         let t = t.trim();
         if !t.starts_with("VARCHAR(") || !t.ends_with(')') {
@@ -170,7 +177,11 @@ fn is_safe_varchar_widening(target: &str, source: &str) -> bool {
     }
 }
 
-/// Generates ALTER TABLE SQL for safe type changes.
+/// Generates ALTER TABLE SQL for safe type changes via the dialect's
+/// `alter_column_type_sql` (which validates identifier + type and emits
+/// the dialect-specific syntax). Most dialects use the default ANSI
+/// `ALTER COLUMN x TYPE y` form; BigQuery overrides to its
+/// `ALTER COLUMN x SET DATA TYPE y` form.
 pub fn generate_alter_column_sql(
     table: &TableRef,
     drifted_columns: &[DriftedColumn],
@@ -180,14 +191,7 @@ pub fn generate_alter_column_sql(
 
     let mut statements = Vec::new();
     for col in drifted_columns {
-        // Validate column name
-        rocky_sql::validation::validate_identifier(&col.name)?;
-        // Validate the type string to prevent injection
-        crate::sql_gen::validate_sql_type(&col.source_type)?;
-        statements.push(format!(
-            "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
-            table_ref, col.name, col.source_type
-        ));
+        statements.push(dialect.alter_column_type_sql(&table_ref, &col.name, &col.source_type)?);
     }
     Ok(statements)
 }
@@ -473,7 +477,7 @@ mod tests {
     fn test_no_drift() {
         let source = vec![col("id", "INT"), col("name", "STRING")];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         assert!(result.drifted_columns.is_empty());
         assert_eq!(result.action, DriftAction::Ignore);
@@ -483,7 +487,7 @@ mod tests {
     fn test_type_mismatch() {
         let source = vec![col("id", "INT"), col("status", "INT")];
         let target = vec![col("id", "INT"), col("status", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         assert_eq!(result.drifted_columns.len(), 1);
         assert_eq!(result.drifted_columns[0].name, "status");
@@ -504,7 +508,7 @@ mod tests {
             col("amount", "STRING"),
             col("name", "STRING"),
         ];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         assert_eq!(result.drifted_columns.len(), 2);
         assert_eq!(result.action, DriftAction::DropAndRecreate);
@@ -514,7 +518,7 @@ mod tests {
     fn test_case_insensitive_column_names() {
         let source = vec![col("ID", "INT"), col("Name", "STRING")];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         assert!(result.drifted_columns.is_empty());
         assert_eq!(result.action, DriftAction::Ignore);
@@ -524,7 +528,7 @@ mod tests {
     fn test_case_insensitive_types() {
         let source = vec![col("id", "int"), col("name", "string")];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         assert!(result.drifted_columns.is_empty());
         assert_eq!(result.action, DriftAction::Ignore);
@@ -538,7 +542,7 @@ mod tests {
             col("new_col", "STRING"),
         ];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         // No type drift, so action stays `Ignore` — but the added
         // column is captured separately so the runtime can ALTER it
@@ -558,7 +562,7 @@ mod tests {
             col("new_col", "STRING"),
         ];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         // INT→BIGINT is safe widening, so action = AlterColumnTypes.
         // The new column is captured independently.
@@ -610,7 +614,7 @@ mod tests {
     fn test_column_removed_from_source_not_drift() {
         let source = vec![col("id", "INT")];
         let target = vec![col("id", "INT"), col("old_col", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
 
         // Columns only in target are not checked (source drives drift detection)
         assert!(result.drifted_columns.is_empty());
@@ -619,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_empty_columns() {
-        let result = detect_drift(&table_ref(), &[], &[]);
+        let result = detect_drift(&table_ref(), &[], &[], &dialect());
         assert!(result.drifted_columns.is_empty());
         assert_eq!(result.action, DriftAction::Ignore);
     }
@@ -658,7 +662,7 @@ mod tests {
     fn test_safe_int_to_bigint() {
         let source = vec![col("id", "BIGINT"), col("name", "STRING")];
         let target = vec![col("id", "INT"), col("name", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.drifted_columns.len(), 1);
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
     }
@@ -667,7 +671,7 @@ mod tests {
     fn test_safe_float_to_double() {
         let source = vec![col("amount", "DOUBLE")];
         let target = vec![col("amount", "FLOAT")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
     }
 
@@ -675,7 +679,7 @@ mod tests {
     fn test_safe_decimal_widening() {
         let source = vec![col("price", "DECIMAL(18,2)")];
         let target = vec![col("price", "DECIMAL(10,2)")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
     }
 
@@ -683,7 +687,7 @@ mod tests {
     fn test_unsafe_decimal_scale_change() {
         let source = vec![col("price", "DECIMAL(10,4)")];
         let target = vec![col("price", "DECIMAL(10,2)")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::DropAndRecreate);
     }
 
@@ -691,7 +695,7 @@ mod tests {
     fn test_safe_varchar_widening() {
         let source = vec![col("code", "VARCHAR(200)")];
         let target = vec![col("code", "VARCHAR(100)")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
     }
 
@@ -699,7 +703,7 @@ mod tests {
     fn test_unsafe_varchar_narrowing() {
         let source = vec![col("code", "VARCHAR(50)")];
         let target = vec![col("code", "VARCHAR(100)")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::DropAndRecreate);
     }
 
@@ -708,7 +712,7 @@ mod tests {
         // One safe (INT->BIGINT) + one unsafe (STRING->INT) = DropAndRecreate
         let source = vec![col("id", "BIGINT"), col("status", "INT")];
         let target = vec![col("id", "INT"), col("status", "STRING")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.drifted_columns.len(), 2);
         assert_eq!(result.action, DriftAction::DropAndRecreate);
     }
@@ -717,7 +721,7 @@ mod tests {
     fn test_int_to_string_safe() {
         let source = vec![col("code", "STRING")];
         let target = vec![col("code", "INT")];
-        let result = detect_drift(&table_ref(), &source, &target);
+        let result = detect_drift(&table_ref(), &source, &target, &dialect());
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
     }
 

@@ -467,6 +467,46 @@ pub trait SqlDialect: Send + Sync {
     fn current_timestamp_expr(&self) -> &'static str {
         "CURRENT_TIMESTAMP"
     }
+
+    /// Returns `true` when changing a column's data type from
+    /// `target_type` to `source_type` is safe enough to handle via
+    /// `ALTER TABLE` instead of dropping and recreating the table.
+    ///
+    /// "Safe" means existing target values can be losslessly
+    /// reinterpreted under the new type — typically a strict widening
+    /// (`INT → BIGINT`) or a representation change with no value loss
+    /// (`INT → STRING`). Each dialect's allowlist reflects its own
+    /// type system; the default impl encodes Databricks/Spark
+    /// conventions plus DECIMAL precision and VARCHAR length widening.
+    /// Adapters with different type names (BigQuery `INT64` /
+    /// `NUMERIC` / `FLOAT64` / `BIGNUMERIC`) override.
+    fn is_safe_type_widening(&self, source_type: &str, target_type: &str) -> bool {
+        crate::drift::default_is_safe_type_widening(source_type, target_type)
+    }
+
+    /// SQL to change a column's data type as part of drift evolution.
+    ///
+    /// Default emits the ANSI `ALTER TABLE x ALTER COLUMN y TYPE z`
+    /// form (works for Databricks / Snowflake / DuckDB). BigQuery
+    /// overrides — it requires `ALTER COLUMN y SET DATA TYPE z`.
+    ///
+    /// `column` is validated as a SQL identifier and `new_type` against
+    /// the strict type allowlist
+    /// ([`crate::sql_gen::validate_sql_type`]) before interpolation.
+    /// `table_ref` should already be a fully formatted dialect-specific
+    /// reference — the caller obtains it via `format_table_ref`.
+    fn alter_column_type_sql(
+        &self,
+        table_ref: &str,
+        column: &str,
+        new_type: &str,
+    ) -> AdapterResult<String> {
+        rocky_sql::validation::validate_identifier(column).map_err(AdapterError::new)?;
+        crate::sql_gen::validate_sql_type(new_type).map_err(AdapterError::new)?;
+        Ok(format!(
+            "ALTER TABLE {table_ref} ALTER COLUMN {column} TYPE {new_type}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

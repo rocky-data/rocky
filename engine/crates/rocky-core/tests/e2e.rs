@@ -338,7 +338,7 @@ fn test_drift_detection_type_mismatch() {
         },
     ];
 
-    let result = drift::detect_drift(&table, &source_cols, &target_cols);
+    let result = drift::detect_drift(&table, &source_cols, &target_cols, &TestDialect);
 
     // Incompatible type changes trigger DropAndRecreate
     assert_eq!(
@@ -398,7 +398,7 @@ fn test_drift_detection_no_drift() {
         },
     ];
 
-    let result = drift::detect_drift(&table, &cols, &cols);
+    let result = drift::detect_drift(&table, &cols, &cols, &TestDialect);
     assert_eq!(result.action, DriftAction::Ignore);
     assert!(result.drifted_columns.is_empty());
 }
@@ -430,7 +430,7 @@ fn test_drift_new_column_not_drift() {
     }];
 
     // New columns in source are NOT drift (SELECT * picks them up)
-    let result = drift::detect_drift(&table, &source_cols, &target_cols);
+    let result = drift::detect_drift(&table, &source_cols, &target_cols, &TestDialect);
     assert_eq!(result.action, DriftAction::Ignore);
     assert!(result.drifted_columns.is_empty());
 }
@@ -961,7 +961,7 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
         schema: "staging__us_west__shopify".into(),
         table: "orders".into(),
     };
-    let drift_result = drift::detect_drift(&table, &source_cols, &target_cols);
+    let drift_result = drift::detect_drift(&table, &source_cols, &target_cols, &TestDialect);
     assert_eq!(drift_result.action, DriftAction::DropAndRecreate);
 
     // On drift: delete watermark to force full refresh
