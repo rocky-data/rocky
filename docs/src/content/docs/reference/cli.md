@@ -318,6 +318,14 @@ rocky doctor --check auth
 rocky doctor --check state_rw   # live round-trip probe against the remote state backend
 ```
 
+**Verbose mode (v1.20.0+):**
+
+```bash
+rocky doctor --verbose
+```
+
+Prints extra per-check context (config path, state file size, adapter type + credential signal, pipeline kind, state backend) under each check in human-readable output. The JSON output is unchanged unless `--verbose` is passed — each `checks[]` entry then carries a `details` array of `[key, value]` string pairs (omitted entirely when empty). Credential signal values: `token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`.
+
 ---
 
 ### `rocky list`

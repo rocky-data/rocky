@@ -345,19 +345,23 @@ Generate `OPTIMIZE` and `VACUUM` SQL for storage compaction on Delta tables. Com
 
 ```bash
 rocky compact <model> [flags]
-rocky compact --measure-dedup [flags]   # experimental, project-wide scope
+rocky compact --catalog <name> [flags]   # every Rocky-managed table in the catalog
+rocky compact --measure-dedup [flags]    # experimental, project-wide scope
 ```
+
+Exactly one scope is required: a fully-qualified `<model>`, `--catalog <name>`, or `--measure-dedup`. The three forms are mutually exclusive.
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `model` | `string` | **(required unless `--measure-dedup`)** | Target table in `catalog.schema.table` format. |
+| `model` | `string` | **(one scope required)** | Target table in `catalog.schema.table` format. |
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--catalog <NAME>` | `string` | | Aggregate per-table OPTIMIZE/VACUUM SQL across every Rocky-managed table in the catalog. The managed-table set is resolved from the pipeline config (replication discovery or transformation model files) — no warehouse round trip. Mutually exclusive with `<model>` and `--measure-dedup`. Errors with the available catalogs listed if no managed tables match. |
 | `--target-size <SIZE>` | `string` | | Target file size (e.g., `256MB`, `512MB`, `1GB`). |
 | `--dry-run` | `bool` | `false` | Show SQL without executing. |
 | `--measure-dedup` | `bool` | `false` | Experimental. Measure the cross-table dedup ratio across all Rocky-managed tables in the project (Layer 0 storage experiment). Project-wide; does not take a model argument. |
@@ -396,6 +400,48 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256M
 ```
 
 The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`).
+
+#### Catalog-scoped compaction
+
+`--catalog <name>` resolves every Rocky-managed table in the named catalog and emits a single envelope keyed by FQN. The flat `statements` list still carries every SQL statement across all tables in iteration order — consumers that just want to execute the plan don't need to walk `tables`.
+
+```bash
+rocky compact --catalog acme_warehouse --target-size 256MB --dry-run
+```
+
+```json
+{
+  "version": "1.20.0",
+  "command": "compact",
+  "catalog": "acme_warehouse",
+  "scope": "catalog",
+  "dry_run": true,
+  "target_size_mb": 256,
+  "statements": [
+    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
+    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" },
+    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events" },
+    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
+  ],
+  "tables": {
+    "acme_warehouse.staging__us_west__shopify.events": {
+      "statements": [
+        { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events" },
+        { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
+      ]
+    },
+    "acme_warehouse.staging__us_west__shopify.orders": {
+      "statements": [
+        { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
+        { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
+      ]
+    }
+  },
+  "totals": { "table_count": 2, "statement_count": 4 }
+}
+```
+
+The single-model envelope is byte-stable — `catalog`, `scope`, `tables`, and `totals` are all `skip_serializing_if = "Option::is_none"`. The catalog identifier is normalized to lowercase to match the managed-table resolver.
 
 #### Layer 0 dedup measurement (experimental)
 
@@ -488,6 +534,7 @@ Archive old data partitions by moving them to cold storage or deleting them base
 
 ```bash
 rocky archive [flags]
+rocky archive --catalog <name> [flags]   # every Rocky-managed table in the catalog
 ```
 
 ### Flags
@@ -495,7 +542,8 @@ rocky archive [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--older-than <DURATION>` | `string` | **(required)** | Age threshold. Accepted formats: `90d` (days), `6m` (months), `1y` (years). |
-| `--model <NAME>` | `string` | | Filter to a specific model. If omitted, archives across all models. |
+| `--model <NAME>` | `string` | | Filter to a specific model. If omitted, archives across all models. Mutually exclusive with `--catalog`. |
+| `--catalog <NAME>` | `string` | | Aggregate per-table archive SQL across every Rocky-managed table in the named catalog. The managed-table set is resolved from the pipeline config (no warehouse round trip). Mutually exclusive with `--model`. Errors with the available catalogs listed if no managed tables match. |
 | `--dry-run` | `bool` | `false` | Show SQL without executing. |
 
 ### Examples
@@ -535,6 +583,45 @@ rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.e
 ```
 
 Same output shape — `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
+
+#### Catalog-scoped archival
+
+`--catalog <name>` mirrors `rocky compact --catalog`: it resolves every Rocky-managed table in the catalog from the pipeline config and aggregates per-table DELETE SQL into a single envelope keyed by FQN. The flat `statements` list still carries every statement across every table.
+
+```bash
+rocky archive --older-than 90d --catalog acme_warehouse --dry-run
+```
+
+```json
+{
+  "version": "1.20.0",
+  "command": "archive",
+  "catalog": "acme_warehouse",
+  "scope": "catalog",
+  "older_than": "90d",
+  "older_than_days": 90,
+  "dry_run": true,
+  "statements": [
+    { "purpose": "archive:orders", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'" },
+    { "purpose": "archive:events", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'" }
+  ],
+  "tables": {
+    "acme_warehouse.staging__us_west__shopify.events": {
+      "statements": [
+        { "purpose": "archive:events", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'" }
+      ]
+    },
+    "acme_warehouse.staging__us_west__shopify.orders": {
+      "statements": [
+        { "purpose": "archive:orders", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'" }
+      ]
+    }
+  },
+  "totals": { "table_count": 2, "statement_count": 2 }
+}
+```
+
+The single-model envelope is byte-stable — `catalog`, `scope`, `tables`, and `totals` are absent on the existing `rocky archive` and `rocky archive --model` paths.
 
 ### Related Commands
 

@@ -442,11 +442,14 @@ rocky doctor                     # Run all checks
 rocky doctor --check config      # Run only the config check
 rocky doctor --check auth        # Verify credentials + connectivity for all adapters
 rocky doctor --check state_rw    # Round-trip a marker object against the state backend
+rocky doctor --verbose           # Add per-check context to human-readable output
 ```
 
 The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an adapter-specific cheaper query) and each discovery adapter. Reports per-adapter pass/fail with latency.
 
 The `state_rw` check (v1.13.0+) runs a put → get → delete probe against the configured state backend so IAM and reachability problems surface at cold start rather than at end-of-run upload. Local backend is a no-op; tiered probes both legs.
+
+The `--verbose` flag (v1.20.0+) prints extra per-check context inline: config path, state file size, adapter type and credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`), pipeline kind (`replication` / `transformation` / `quality` / `snapshot`), and state backend. JSON output is unchanged when `--verbose` is not passed — the new `details` array on each `HealthCheck` only serializes when populated, so existing consumers see byte-stable envelopes.
 
 See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
 

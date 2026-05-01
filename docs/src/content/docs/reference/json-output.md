@@ -365,6 +365,7 @@ Aggregate health checks across config, state, adapters, and pipelines.
 | `checks[].status` | string | `"healthy"`, `"warning"`, or `"critical"`. |
 | `checks[].message` | string | Human-readable result. |
 | `checks[].duration_ms` | integer | Time spent on this check in milliseconds. |
+| `checks[].details` | array of `[key, value]` string pairs | Optional per-check context (config path, state file size, adapter type + credential signal, pipeline kind, state backend). Populated only when `--verbose` is passed; omitted from the envelope entirely otherwise (`skip_serializing_if = "Vec::is_empty"`). |
 | `suggestions` | array of strings | Actionable fix suggestions for any non-healthy checks. |
 
 ---
@@ -966,11 +967,15 @@ Generate `OPTIMIZE` and `VACUUM` SQL for Delta table compaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `model` | string | Target table in `catalog.schema.table` format. |
+| `model` | string or absent | Target table in `catalog.schema.table` format. Set when invoked as `rocky compact <fqn>`; absent under `--catalog` and `--measure-dedup`. |
+| `catalog` | string or absent | Catalog identifier (lowercased to match the managed-table resolver). Set only on `rocky compact --catalog <name>`. |
+| `scope` | string or absent | `"catalog"` for the catalog-scoped path; absent for single-model invocations to keep their envelope byte-stable. |
 | `dry_run` | boolean | Whether this was a dry run. |
 | `target_size_mb` | integer | Target file size in megabytes. |
 | `statements[].purpose` | string | Statement purpose (`"optimize"`, `"vacuum"`). |
-| `statements[].sql` | string | The SQL statement. |
+| `statements[].sql` | string | The SQL statement. Catalog-scoped invocations carry the concatenation of every per-table bundle here. |
+| `tables` | object or absent | Per-table breakdown keyed by fully-qualified table name. Each entry has the same `statements` shape as the flat list. Present only on `--catalog` invocations. |
+| `totals` | object or absent | Aggregate counts: `table_count` and `statement_count`. Present only on `--catalog` invocations. |
 
 ---
 
@@ -1003,12 +1008,16 @@ Generate or execute `DELETE` and `VACUUM` SQL for archiving old data.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `model` | string or absent | Target table, if filtered to a specific model. |
+| `model` | string or absent | Target table, if filtered to a specific model. Absent under `--catalog`. |
+| `catalog` | string or absent | Catalog identifier. Set only on `rocky archive --catalog <name>`. |
+| `scope` | string or absent | `"catalog"` for the catalog-scoped path; absent for single-model invocations. |
 | `older_than` | string | Age threshold as specified (e.g., `"90d"`, `"6m"`, `"1y"`). |
 | `older_than_days` | integer | Age threshold normalized to days. |
 | `dry_run` | boolean | Whether this was a dry run. |
 | `statements[].purpose` | string | Statement purpose (`"delete"`, `"vacuum"`). |
-| `statements[].sql` | string | The SQL statement. |
+| `statements[].sql` | string | The SQL statement. Catalog-scoped invocations carry every per-table statement here. |
+| `tables` | object or absent | Per-table breakdown keyed by fully-qualified table name. Present only on `--catalog` invocations. |
+| `totals` | object or absent | Aggregate counts: `table_count` and `statement_count`. Present only on `--catalog` invocations. |
 
 ---
 
