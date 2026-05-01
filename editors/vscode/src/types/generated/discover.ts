@@ -17,7 +17,7 @@ export interface DiscoverOutput {
   /**
    * Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.
    */
-  excluded_tables: ExcludedTableOutput[];
+  excluded_tables?: ExcludedTableOutput[];
   /**
    * Sources the discovery adapter attempted to fetch metadata for and failed (transient HTTP error, timeout, rate-limit budget exhausted, auth blip). Their absence from `sources` does NOT mean they were removed upstream — consumers diffing against a prior run must treat failed sources as "unknown state, do not delete." Empty when discovery completed cleanly. See FR-014.
    */

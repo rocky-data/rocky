@@ -92,7 +92,7 @@ export interface RunOutput {
   /**
    * Tables that the discovery adapter reported as enabled but that do not exist in the source warehouse (e.g. Fivetran has them configured but hasn't synced them, or they carry the `do_not_alter__` broken-table marker). Surfaced so orchestrators can flag the gap in their UIs instead of silently dropping the assets.
    */
-  excluded_tables: ExcludedTableOutput[];
+  excluded_tables?: ExcludedTableOutput[];
   execution: ExecutionSummary;
   filter: string;
   /**

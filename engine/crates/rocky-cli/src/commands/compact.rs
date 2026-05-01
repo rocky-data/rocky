@@ -15,6 +15,7 @@ use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
 use rocky_core::ir::TableRef;
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
+use rocky_sql::validation::validate_identifier;
 
 use crate::output::{
     ByteCalibration, CompactDedupOutput, CompactOutput, CompactTableEntry, CompactTotals,
@@ -44,7 +45,7 @@ pub fn run_compact(
         .map_err(|e| anyhow::anyhow!("invalid --target-size: {e}"))?
         .unwrap_or(256);
 
-    let statements = generate_compact_sql(model, target_mb);
+    let statements = generate_compact_sql(model, target_mb)?;
 
     if output_json {
         let typed_statements: Vec<NamedStatement> = statements
@@ -126,7 +127,7 @@ pub async fn run_compact_catalog(
         std::collections::BTreeMap::new();
 
     for fqn in &scope.tables {
-        let stmts = generate_compact_sql(fqn, target_mb);
+        let stmts = generate_compact_sql(fqn, target_mb)?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
             .map(|(purpose, sql)| NamedStatement { purpose, sql })
@@ -999,6 +1000,17 @@ async fn calibrate_byte_dedup(
         });
     }
 
+    // Validate sample-table FQNs before interpolating into SELECT.
+    // The names trace back to rocky.toml pipeline config — untrusted
+    // from the engine's perspective. See `engine/CLAUDE.md`.
+    for table_name in &sample_tables {
+        for part in table_name.split('.') {
+            validate_identifier(part).with_context(|| {
+                format!("calibrate-bytes: invalid table identifier '{table_name}'")
+            })?;
+        }
+    }
+
     tracing::info!(
         tables = ?sample_tables,
         sample_rows = CALIBRATE_SAMPLE_ROWS,
@@ -1111,22 +1123,27 @@ fn pick_sample_tables(stats: &DedupStats, max: usize) -> Vec<String> {
 /// For Delta Lake (Databricks):
 /// - `OPTIMIZE` compacts small files into larger ones
 /// - `VACUUM` removes old data files no longer referenced
-fn generate_compact_sql(model: &str, target_size_mb: u64) -> Vec<(String, String)> {
-    let mut stmts = Vec::new();
+///
+/// Every dot-separated segment of `model` is validated as a SQL
+/// identifier before interpolation — the model name reaches us from
+/// CLI args and config files (via `--catalog` scope resolution),
+/// both of which are untrusted from the engine's perspective. See
+/// the validation rules in `engine/CLAUDE.md`.
+fn generate_compact_sql(model: &str, target_size_mb: u64) -> Result<Vec<(String, String)>> {
+    for part in model.split('.') {
+        validate_identifier(part).with_context(|| format!("invalid model identifier '{model}'"))?;
+    }
 
-    // OPTIMIZE with file size target
-    stmts.push((
-        "compact small files".to_string(),
-        format!("OPTIMIZE {model} WHERE true\n  -- target file size: {target_size_mb}MB"),
-    ));
-
-    // VACUUM to remove old unreferenced files (default 7 days retention)
-    stmts.push((
-        "remove stale data files".to_string(),
-        format!("VACUUM {model} RETAIN 168 HOURS"),
-    ));
-
-    stmts
+    Ok(vec![
+        (
+            "compact small files".to_string(),
+            format!("OPTIMIZE {model} WHERE true\n  -- target file size: {target_size_mb}MB"),
+        ),
+        (
+            "remove stale data files".to_string(),
+            format!("VACUUM {model} RETAIN 168 HOURS"),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -1135,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_generate_compact_sql() {
-        let stmts = generate_compact_sql("catalog.schema.orders", 256);
+        let stmts = generate_compact_sql("catalog.schema.orders", 256).unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].1.contains("OPTIMIZE"));
         assert!(stmts[0].1.contains("catalog.schema.orders"));
@@ -1145,8 +1162,17 @@ mod tests {
 
     #[test]
     fn test_generate_compact_sql_custom_size() {
-        let stmts = generate_compact_sql("my_table", 512);
+        let stmts = generate_compact_sql("my_table", 512).unwrap();
         assert!(stmts[0].1.contains("512MB"));
+    }
+
+    #[test]
+    fn test_generate_compact_sql_rejects_injection() {
+        assert!(generate_compact_sql("orders; DROP TABLE admin; --", 256).is_err());
+        assert!(generate_compact_sql("catalog.schema; DROP TABLE x", 256).is_err());
+        assert!(generate_compact_sql("'; DROP TABLE users; --", 256).is_err());
+        assert!(generate_compact_sql("", 256).is_err());
+        assert!(generate_compact_sql("catalog..table", 256).is_err());
     }
 
     /// E2E test for `compute_measure_dedup` against an ephemeral DuckDB.

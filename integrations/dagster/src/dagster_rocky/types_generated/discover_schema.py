@@ -118,7 +118,7 @@ class DiscoverOutput(BaseModel):
     Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves.
     """
     command: str
-    excluded_tables: list[ExcludedTableOutput]
+    excluded_tables: list[ExcludedTableOutput] | None = None
     """
     Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.
     """

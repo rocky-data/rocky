@@ -84,7 +84,7 @@ pub struct DiscoverOutput {
     /// discovery adapter but do not exist in the source warehouse. Same
     /// shape as `RunOutput.excluded_tables` so consumers can use one
     /// parser. Empty when nothing was filtered.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_tables: Vec<ExcludedTableOutput>,
     /// Sources the discovery adapter attempted to fetch metadata for and
     /// failed (transient HTTP error, timeout, rate-limit budget exhausted,
@@ -197,7 +197,7 @@ pub struct RunOutput {
     /// hasn't synced them, or they carry the `do_not_alter__` broken-table
     /// marker). Surfaced so orchestrators can flag the gap in their UIs
     /// instead of silently dropping the assets.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_tables: Vec<ExcludedTableOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
