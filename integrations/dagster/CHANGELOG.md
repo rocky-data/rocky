@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RockyComponent.strict_build` opt-in (FR-019).** New boolean field, default `False`. When set to `True`, three "log and swallow" paths in `build_defs` are converted into hard failures: (1) `_maybe_cold_start_discover` re-raises a failing `write_state_to_path` instead of warning and falling through to the empty-state path, (2) `build_defs_from_state` raises `dg.Failure` when state is missing or contains zero discover sources instead of returning empty `Definitions`, and (3) the discover slot of `write_state_to_path` re-raises instead of writing an empty discover envelope. Compile and optimize slots stay best-effort even under `strict_build` — they are augmentation surfaces (compiler diagnostics, optimize recommendations) rather than the asset graph itself, so a missing slot does not signal a broken graph. Use when an empty Rocky asset graph is never an acceptable code-server load — fail the deploy rather than ship a healthy-looking deployment with no assets. Default-off preserves existing behaviour for adopters who rely on best-effort load with empty graph as their failure mode.
+
 ## [1.18.1] — 2026-05-01
 
 Patch release. Defensive dedup of asset specs and check specs to survive duplicate table records from `rocky discover`.
