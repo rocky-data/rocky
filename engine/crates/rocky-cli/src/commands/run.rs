@@ -3536,6 +3536,7 @@ pub(crate) async fn execute_models(
             let mut exec_error: Option<anyhow::Error> = None;
             let mut bytes_scanned_acc: Option<u64> = None;
             let mut bytes_written_acc: Option<u64> = None;
+            let mut job_ids_acc: Vec<String> = Vec::new();
             for exec_sql in &exec_stmts {
                 match warehouse.execute_statement_with_stats(exec_sql).await {
                     Ok(stats) => {
@@ -3543,6 +3544,9 @@ pub(crate) async fn execute_models(
                             accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                         bytes_written_acc =
                             accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                        if let Some(jid) = stats.job_id {
+                            job_ids_acc.push(jid);
+                        }
                     }
                     Err(e) => {
                         exec_error = Some(anyhow::anyhow!("model '{model_name}' failed: {e}"));
@@ -3594,6 +3598,7 @@ pub(crate) async fn execute_models(
                 cost_usd: None,
                 bytes_scanned: bytes_scanned_acc,
                 bytes_written: bytes_written_acc,
+                job_ids: job_ids_acc,
             });
             if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                 let _ = reg
@@ -3958,11 +3963,15 @@ async fn run_one_partition(
     let mut exec_err: Option<anyhow::Error> = None;
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut job_ids_acc: Vec<String> = Vec::new();
     for stmt in &stmts {
         match warehouse.execute_statement_with_stats(stmt).await {
             Ok(stats) => {
                 bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                 bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                if let Some(jid) = stats.job_id {
+                    job_ids_acc.push(jid);
+                }
             }
             Err(e) => {
                 exec_err = Some(anyhow::anyhow!("{e}"));
@@ -4030,6 +4039,7 @@ async fn run_one_partition(
             cost_usd: None,
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
+            job_ids: job_ids_acc,
         }),
     }
 }
@@ -4411,6 +4421,7 @@ async fn process_table(
             cost_usd: None,
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
+            job_ids: exec_stats.job_id.clone().into_iter().collect(),
         },
         drift_checked: true,
         drift_detected: drift_action,

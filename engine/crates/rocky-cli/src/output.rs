@@ -461,6 +461,19 @@ pub struct MaterializationOutput {
     /// can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// Warehouse-side job identifiers for the SQL statements rocky
+    /// issued to materialize this output. Populated for adapters whose
+    /// REST API surfaces a job reference per statement (BigQuery
+    /// today via `jobReference.jobId`).
+    ///
+    /// Useful for cross-checking rocky's reported figures against the
+    /// warehouse's own statistics — e.g., feeding a job ID into
+    /// `bq show -j <id>` and comparing `totalBytesBilled` to
+    /// [`Self::bytes_scanned`]. Empty `Vec` for adapters that don't
+    /// surface a job concept (DuckDB) or haven't wired it yet
+    /// (Databricks, Snowflake).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub job_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2788,6 +2801,7 @@ mod cost_finalize_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            job_ids: Vec::new(),
         }
     }
 
@@ -2998,6 +3012,7 @@ mod run_record_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            job_ids: Vec::new(),
         }
     }
 

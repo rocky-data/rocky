@@ -290,6 +290,12 @@ export interface MaterializationOutput {
    */
   cost_usd?: number | null;
   duration_ms: number;
+  /**
+   * Warehouse-side job identifiers for the SQL statements rocky issued to materialize this output. Populated for adapters whose REST API surfaces a job reference per statement (BigQuery today via `jobReference.jobId`).
+   *
+   * Useful for cross-checking rocky's reported figures against the warehouse's own statistics — e.g., feeding a job ID into `bq show -j <id>` and comparing `totalBytesBilled` to [`Self::bytes_scanned`]. Empty `Vec` for adapters that don't surface a job concept (DuckDB) or haven't wired it yet (Databricks, Snowflake).
+   */
+  job_ids?: string[];
   metadata: MaterializationMetadata;
   /**
    * Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge).
