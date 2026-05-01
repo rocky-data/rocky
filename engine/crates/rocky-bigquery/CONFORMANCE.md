@@ -48,25 +48,18 @@ Each is documented either in the adapter source or
 4. **MERGE requires explicit `update_columns` on BigQuery.** BQ rejects `UPDATE SET target = source` shorthand. Workaround: declare `update_columns` in the model TOML.
 5. **`bytes_scanned` is `totalBytesProcessed` for queries that return zero rows-billed.** BQ exempts constant queries (e.g., the full-refresh smoke's no-source UNNEST literal) from the 10 MB minimum-bill floor. Real source-scanning models populate non-zero values via the `jobs.get` enrichment path (PR #330).
 
-## Recommendation: ready to drop `is_experimental`
+## Status: out of experimental
 
-`BigQueryAdapter::is_experimental()` returns `true` today, which fires
-two warnings on every adapter construction:
-
-- `BigQueryAdapter::new` logs `"BigQuery adapter is experimental..."`
-- The CLI registry emits a separate `"adapter '<name>' is
-  experimental — some features may be incomplete..."`
-
-The adapter has been live-verified across every dialect surface
-that has a live smoke driver. The remaining gaps are documented
-limitations (above) — most engine-wide, none breaking the workflows
-they cover when the user is aware.
+The BigQuery adapter no longer overrides
+`WarehouseAdapter::is_experimental`, which means it inherits the
+trait default (`false`). The construction-time warning in
+`BigQueryAdapter::new` is also gone. Both startup warnings are
+silenced; users see Databricks/Snowflake-equivalent messaging.
 
 The gate per the trial-window plan was: "Conformance suite green or
 every red has a documented exemption." Given the conformance suite
-itself is a stub, the equivalent gate is: "Live smokes green or every
-gap is documented in this file." That gate is met today.
-
-**Flipping the flag is a one-line change in `src/connector.rs`** plus
-removing the warning. **Not done in this PR — it's a credibility
-statement to users and should land with explicit go-ahead.**
+itself is a stub, the equivalent gate was: "Live smokes green or every
+gap is documented in this file." That gate is met — every dialect
+surface with a live smoke driver has been verified across the
+trial-window arc; remaining gaps are listed as documented limitations
+above, mostly engine-wide rather than BQ-specific.
