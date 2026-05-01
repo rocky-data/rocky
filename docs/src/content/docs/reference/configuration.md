@@ -322,8 +322,8 @@ Given `src__acme__us_west__us_east__shopify`, this pattern extracts:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `adapter` | string | Yes | Name of the warehouse adapter. Must match a `[adapter.NAME]` key. |
-| `catalog_template` | string | Yes | Template for the target catalog name. Uses `{component}` placeholders. |
-| `schema_template` | string | Yes | Template for the target schema name. Uses `{component}` placeholders. |
+| `catalog_template` | string | Yes | Template for the target catalog name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
+| `schema_template` | string | Yes | Template for the target schema name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
 
 ```toml
 [pipeline.bronze.target]

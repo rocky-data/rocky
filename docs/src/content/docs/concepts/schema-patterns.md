@@ -139,6 +139,30 @@ Source: `src__acme__us_west__shopify`
 
 Target table: `acme_warehouse.staging__us_west__shopify.<table_name>`
 
+### Pinning the join separator at the use site
+
+By default, multi-valued components (`{regions}`) are joined with the caller-supplied separator. Different call sites supply different separators: target rendering uses `target.separator` while `metadata_columns.value` uses `pattern.separator`. The same placeholder can therefore resolve to different strings depending on which TOML field it appears in — a footgun for templates that hash or compare the rendered value (RLS keys, audit hashes).
+
+Use `{name:SEP}` to pin the join separator at the use site:
+
+```toml
+[pipeline.bronze]
+metadata_columns = [
+    { name = "permission_key", type = "STRING",
+      value = "md5('fivetran_{client}_{regions:_}_{source}')" }
+    #                              ^^^ join `regions` with "_" regardless of caller default
+]
+```
+
+Grammar:
+
+| Form | Behavior |
+|---|---|
+| `{name}` | Bare form — multi-valued components join with the caller-supplied default separator. |
+| `{name:SEP}` | Explicit form — multi-valued components join with the literal string `SEP` (may be empty, single-, or multi-character). The closing `}` terminates `SEP`, so a literal `}` cannot appear inside it. |
+
+`:SEP` is silently ignored when `name` resolves to a single-valued component, so swapping a component from single to variadic does not require updating every template.
+
 ## Error handling
 
 Rocky produces clear errors for invalid schemas:

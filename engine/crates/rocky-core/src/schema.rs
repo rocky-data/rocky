@@ -50,6 +50,11 @@
 //!   the **target** separator, which may differ from the source
 //!   separator — a target using `_` can consume a multi-valued
 //!   component that was split by `__` in the source.
+//! * Authors can pin the join separator at the use site with
+//!   `{name:SEP}`. The rendered value is then independent of which
+//!   caller-default separator is in effect — useful for
+//!   `metadata_columns.value` templates whose hashed output must stay
+//!   stable across config changes. See [`ParsedSchema::resolve_template`].
 //!
 //! # Filter integration
 //!
@@ -290,21 +295,87 @@ impl ParsedSchema {
         }
     }
 
-    /// Resolves a template string by replacing `{name}` placeholders.
+    /// Resolves a template string by replacing `{name}` and `{name:sep}` placeholders.
     ///
-    /// - Single values: `{tenant}` → `acme`
-    /// - Multiple values: `{regions}` → `us_west__us_central` (joined with separator)
-    pub fn resolve_template(&self, template: &str, separator: &str) -> String {
-        let mut result = template.to_string();
-        for (name, value) in &self.values {
-            let placeholder = format!("{{{name}}}");
-            let replacement = match value {
-                SchemaValue::Single(s) => s.clone(),
-                SchemaValue::Multiple(v) => v.join(separator),
-            };
-            result = result.replace(&placeholder, &replacement);
+    /// # Grammar
+    ///
+    /// - `{name}` — bare form; multi-valued components join with `default_sep`.
+    /// - `{name:SEP}` — explicit form; multi-valued components join with the literal
+    ///   string `SEP` (which may be empty, single-, or multi-character). The closing
+    ///   `}` terminates `SEP`, so a literal `}` cannot appear inside it.
+    ///
+    /// `:SEP` is silently ignored when `name` resolves to a single-valued component.
+    /// Unknown placeholders pass through unchanged (same as the prior implementation).
+    ///
+    /// # Why explicit separators
+    ///
+    /// Different call sites pass different `default_sep` values: target rendering
+    /// uses `target.separator` while `metadata_columns.value` uses
+    /// `pattern.separator`. The same placeholder can therefore resolve to
+    /// different strings depending on which TOML field it appears in. Authors
+    /// who want a stable, audit-friendly value can pin the separator at the use
+    /// site with `{name:_}` — the rendered value is then independent of the
+    /// caller-default and stable across config changes.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Single value: separator is ignored.
+    /// // {tenant} → "acme"
+    ///
+    /// // Multi-valued, bare form uses default_sep.
+    /// // {regions} with default_sep="__" → "us_west__us_central"
+    ///
+    /// // Multi-valued, explicit form pins the separator.
+    /// // {regions:_} → "us_west_us_central"
+    /// // {regions:} → "us_westus_central"
+    /// // {regions:::} → "us_west::us_central"
+    /// ```
+    pub fn resolve_template(&self, template: &str, default_sep: &str) -> String {
+        // Single-pass scanner over byte indices. `{` and `}` are ASCII so they
+        // never appear inside multi-byte UTF-8 sequences; that means byte-index
+        // arithmetic stays on char boundaries even when the surrounding text
+        // contains non-ASCII content (the surrounding bytes copy through via
+        // the `&template[start..i]` slice, which preserves UTF-8).
+        let mut out = String::with_capacity(template.len());
+        let bytes = template.as_bytes();
+        let mut start = 0; // start of the next literal run to copy verbatim
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if bytes[i] == b'{'
+                && let Some(rel_end) = template[i + 1..].find('}')
+            {
+                let body = &template[i + 1..i + 1 + rel_end];
+                let (name, sep) = match body.split_once(':') {
+                    Some((n, s)) => (n, s),
+                    None => (body, default_sep),
+                };
+                if let Some(value) = self.values.get(name) {
+                    // Flush literal run accumulated since the last placeholder.
+                    out.push_str(&template[start..i]);
+                    match value {
+                        SchemaValue::Single(s) => out.push_str(s),
+                        SchemaValue::Multiple(v) => {
+                            let mut iter = v.iter();
+                            if let Some(first) = iter.next() {
+                                out.push_str(first);
+                                for part in iter {
+                                    out.push_str(sep);
+                                    out.push_str(part);
+                                }
+                            }
+                        }
+                    }
+                    i += 1 + rel_end + 1; // advance past `{...}`
+                    start = i;
+                    continue;
+                }
+            }
+            i += 1;
         }
-        result
+        out.push_str(&template[start..]);
+        out
     }
 }
 
@@ -539,6 +610,131 @@ mod tests {
             .unwrap();
         let catalog = parsed.resolve_template("warehouse_{client}", "_");
         assert_eq!(catalog, "warehouse_contoso");
+    }
+
+    #[test]
+    fn test_resolve_template_explicit_separator_pins_variadic_join() {
+        // The motivating Gold-Engine case: a `permission_key`
+        // metadata_columns.value template hashes a string composed of
+        // `{client}_{hierarchies}_{connector}`. Without an explicit
+        // separator, `{hierarchies}` is joined with whatever the caller
+        // passes — which today differs across call sites
+        // (target rendering vs metadata_columns rendering). Pinning the
+        // separator at the use site removes that ambiguity.
+        let pattern = SchemaPattern {
+            prefix: "q__raw__".into(),
+            separator: "__".into(),
+            components: SchemaPattern::parse_components(&[
+                "client".into(),
+                "hierarchies...".into(),
+                "connector".into(),
+            ])
+            .unwrap(),
+        };
+
+        let parsed = pattern
+            .parse("q__raw__pfizer__namer__can__googleads")
+            .unwrap();
+
+        // Bare form joins with caller default — call-site dependent.
+        let bare_with_source_sep = parsed
+            .resolve_template("md5('fivetran_{client}_{hierarchies}_{connector}')", "__");
+        assert_eq!(
+            bare_with_source_sep,
+            "md5('fivetran_pfizer_namer__can_googleads')"
+        );
+
+        // Explicit form pins the separator regardless of caller default.
+        let explicit = parsed
+            .resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "__");
+        assert_eq!(explicit, "md5('fivetran_pfizer_namer_can_googleads')");
+
+        // Same explicit form, caller passes target sep — same output.
+        let explicit_target_default = parsed
+            .resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "_");
+        assert_eq!(
+            explicit_target_default,
+            "md5('fivetran_pfizer_namer_can_googleads')"
+        );
+    }
+
+    #[test]
+    fn test_resolve_template_explicit_separator_edge_cases() {
+        let pattern = SchemaPattern {
+            prefix: "q__".into(),
+            separator: "__".into(),
+            components: SchemaPattern::parse_components(&[
+                "tenant".into(),
+                "regions...".into(),
+                "source".into(),
+            ])
+            .unwrap(),
+        };
+        let parsed = pattern.parse("q__acme__a__b__c__shopify").unwrap();
+
+        // Empty separator: `{regions:}` → "abc"
+        let v = parsed.resolve_template("{regions:}", "__");
+        assert_eq!(v, "abc");
+
+        // Multi-character separator: `{regions:--}` → "a--b--c"
+        let v = parsed.resolve_template("{regions:--}", "__");
+        assert_eq!(v, "a--b--c");
+
+        // Separator may itself contain a colon: `{regions:::}` → splits on the
+        // *first* colon, so name="regions", sep="::" → "a::b::c".
+        let v = parsed.resolve_template("{regions:::}", "__");
+        assert_eq!(v, "a::b::c");
+
+        // Single-valued component: `:sep` is silently ignored.
+        let v = parsed.resolve_template("{tenant:_}", "__");
+        assert_eq!(v, "acme");
+
+        // Unknown placeholder passes through unchanged (back-compat).
+        let v = parsed.resolve_template("{unknown:_}", "__");
+        assert_eq!(v, "{unknown:_}");
+
+        // Unmatched `{` passes through unchanged.
+        let v = parsed.resolve_template("prefix{ no close", "__");
+        assert_eq!(v, "prefix{ no close");
+
+        // Multiple placeholders in one template, mixed bare and explicit.
+        let v = parsed.resolve_template("{tenant}/{regions:_}/{source}", "__");
+        assert_eq!(v, "acme/a_b_c/shopify");
+    }
+
+    #[test]
+    fn test_resolve_template_explicit_separator_applies_to_all_call_sites() {
+        // The same scanner is used by `catalog_template`, `schema_template`,
+        // and `metadata_columns.value`. Pin the separator and the rendered
+        // value is identical regardless of which caller-default is passed.
+        let pattern = SchemaPattern {
+            prefix: "q__".into(),
+            separator: "__".into(),
+            components: SchemaPattern::parse_components(&[
+                "tenant".into(),
+                "regions...".into(),
+                "source".into(),
+            ])
+            .unwrap(),
+        };
+        let parsed = pattern.parse("q__acme__us__west__shopify").unwrap();
+
+        // Catalog template (single-valued usage — explicit sep is no-op).
+        let catalog_a = parsed.resolve_template("{tenant}_warehouse", "__");
+        let catalog_b = parsed.resolve_template("{tenant}_warehouse", "_");
+        assert_eq!(catalog_a, "acme_warehouse");
+        assert_eq!(catalog_b, "acme_warehouse");
+
+        // Schema template — pinned separator works the same as today's
+        // target-default for this caller.
+        let schema = parsed.resolve_template("staging_{regions:_}_{source}", "__");
+        assert_eq!(schema, "staging_us_west_shopify");
+
+        // Metadata template — pinned separator overrides the source default.
+        let meta_a = parsed.resolve_template("md5('{regions:_}__{source}')", "__");
+        let meta_b = parsed.resolve_template("md5('{regions:_}__{source}')", "_");
+        assert_eq!(meta_a, "md5('us_west__shopify')");
+        assert_eq!(meta_b, "md5('us_west__shopify')");
     }
 
     // Real-world connector pattern tests
