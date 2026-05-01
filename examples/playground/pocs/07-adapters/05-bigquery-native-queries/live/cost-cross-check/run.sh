@@ -54,11 +54,21 @@ bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
    STRUCT( 6,                500)
  ])" > /dev/null
 
+# Stage live.rocky.toml + model files into a temp dir with
+# `__GCP_PROJECT__` substituted (see ../run.sh for rationale).
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"; drop_dataset' EXIT
+cp live.rocky.toml "$STAGE/"
+cp -R models "$STAGE/"
+find "$STAGE" -type f \( -name "*.toml" -o -name "*.sql" \) \
+    -exec sed -i.bak "s|__GCP_PROJECT__|${PROJ}|g" {} +
+find "$STAGE" -name "*.bak" -delete
+
 echo "==> rocky validate"
-rocky -c live.rocky.toml validate > /dev/null
+rocky -c "$STAGE/live.rocky.toml" validate > /dev/null
 
 echo "==> rocky run --output json"
-rocky -c live.rocky.toml run --output json > expected/run.json
+rocky -c "$STAGE/live.rocky.toml" run --output json > expected/run.json
 
 echo "==> verifying job_ids captured + bytes match BQ console"
 python3 - "$HERE/expected/run.json" "$PROJ" <<'PY'

@@ -2,72 +2,81 @@
 
 > **Category:** 07-adapters
 > **Credentials:** GCP Service Account JSON or ADC (`GOOGLE_APPLICATION_CREDENTIALS` or `BIGQUERY_TOKEN`)
-> **Runtime:** < 10s (compile-only without credentials)
-> **Rocky features:** BigQuery adapter, backtick quoting, time_interval partitioning, REST API execution
+> **Runtime:** ~3–5 minutes against the EU sandbox
+> **Rocky features:** BigQuery adapter, backtick quoting, region-qualified `INFORMATION_SCHEMA`, time-interval DML transactions, MERGE bootstrap, drift evolution (add / type-change / safe-widen), cost cross-check
 
 ## What it shows
 
-Rocky's BigQuery adapter targeting Google BigQuery via the REST API (jobs.query). Demonstrates:
-- BigQuery three-part naming: `project`.`dataset`.`table` (backtick-quoted)
-- Service Account JSON key or Application Default Credentials (ADC)
-- Time-interval partitioning with DML transactions (`BEGIN TRANSACTION` / `COMMIT TRANSACTION`)
-- Incremental replication with watermark-based filtering
+Rocky's BigQuery adapter end-to-end against a real GCP project — every BigQuery-specific surface the adapter exercises in production, verified live. The top-level `./run.sh` orchestrates six live scenarios under `live/`, each runnable independently.
 
 ## Why it's distinctive
 
-- BigQuery projects can't be created via SQL — `create_catalog_sql()` returns `None`
-- Partition operations use DML transactions (4-statement flow: BEGIN, DELETE, INSERT, COMMIT)
-- Uses `INFORMATION_SCHEMA.COLUMNS` instead of `DESCRIBE TABLE` for schema introspection
+- **BigQuery REST API is stateless.** `BEGIN TRANSACTION` / `COMMIT TRANSACTION` issued as separate `jobs.query` calls are rejected with `Transaction control statements are supported only in scripts or sessions`. The dialect emits the time-interval flow as one semicolon-joined script.
+- **Three-part naming with backtick quoting.** `project.dataset.table` is the canonical reference; project IDs allow hyphens (validated via a separate identifier rule).
+- **Region-scoped `INFORMATION_SCHEMA`.** Discovery uses `<project>.region-<location>.INFORMATION_SCHEMA.SCHEMATA` because the unqualified form silently misses cross-region datasets.
+- **MERGE shape:** `WHEN NOT MATCHED THEN INSERT ROW` (BQ-unique). MERGE on a fresh target needs a bootstrap CREATE TABLE first.
+- **`ALTER COLUMN ... SET DATA TYPE`**, not the ANSI `ALTER COLUMN ... TYPE`. BQ's safe-widening allowlist is BQ-specific (INT64 → NUMERIC, NUMERIC → BIGNUMERIC, etc.).
+- **`bytes_scanned` is `totalBytesBilled`** (with the 10 MB minimum-bill floor), fetched via a follow-up `jobs.get` call after the synchronous `jobs.query` response. Each materialization surfaces its job IDs so callers can cross-check rocky's reported figures against the BigQuery console.
 
 ## Layout
 
 ```
 .
-├── README.md         this file
-├── rocky.toml        pipeline config (BigQuery adapter)
-├── run.sh            end-to-end demo (compile-only without credentials)
-└── models/           SQL models + .toml sidecars
-    ├── daily_revenue.sql / .toml     time-interval partitioned aggregate
-    └── customer_lifetime.sql / .toml full-refresh lifetime value
+├── README.md                          this file
+├── run.sh                             orchestrates every live driver below
+└── live/                              live drivers (one per scenario)
+    ├── README.md
+    ├── run.sh                         full-refresh CTAS
+    ├── live.rocky.toml
+    ├── models/
+    ├── time-interval/                 BEGIN/DELETE/INSERT/COMMIT script
+    ├── merge/                         WHEN NOT MATCHED THEN INSERT ROW + bootstrap
+    ├── discover/                      BigQueryDiscoveryAdapter via INFORMATION_SCHEMA
+    ├── drift/                         per-table drift: add / drop+recreate / alter
+    └── cost-cross-check/              bytes_scanned vs `bq show -j` totalBytesBilled
 ```
+
+Each `live/<scenario>/run.sh` is independent: own `live.rocky.toml`, own model(s), own `hc_phase*` dataset, trap-cleanup on exit. They can run in any order or individually; the top-level `./run.sh` just chains them.
 
 ## Prerequisites
 
 - `rocky` on PATH
+- `bq` CLI on PATH (used by every driver for seed + cleanup)
+- `python3` on PATH (used by drivers for JSON assertions)
 - GCP project with BigQuery API enabled
 - One of:
   - `GOOGLE_APPLICATION_CREDENTIALS` — path to Service Account JSON key
-  - `BIGQUERY_TOKEN` — pre-supplied Bearer token (e.g., from `gcloud auth print-access-token`)
+  - `BIGQUERY_TOKEN` — pre-supplied Bearer token (e.g., `gcloud auth print-access-token`)
 
 ## Run
 
+Full tour:
+
 ```bash
-export GCP_PROJECT_ID="my-gcp-project"
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/sa-key.json"
+export GCP_PROJECT_ID="<your-gcp-project-id>"
+export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"
+export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh
 ```
 
-## Expected output
+`GCP_PROJECT_ID` is templated into each driver's `live.rocky.toml` and model
+files at runtime via a `__GCP_PROJECT__` placeholder — no project ID is
+checked into the repo. See [`live/README.md`](./live/README.md) for details.
 
-```text
-Config validated: 1 adapter, 1 pipeline (replication)
-  Models compiled: 2 models, 0 errors
-POC complete: BigQuery adapter config validated and models compiled.
+Or one scenario at a time:
+
+```bash
+./live/run.sh                   # full-refresh
+./live/time-interval/run.sh
+./live/merge/run.sh
+./live/discover/run.sh
+./live/drift/run.sh
+./live/cost-cross-check/run.sh
 ```
 
-## What happened
+## Conformance audit
 
-1. `rocky validate` checked the BigQuery adapter config and pipeline definition
-2. `rocky compile` parsed and type-checked the two SQL models against BigQuery dialect
-3. `daily_revenue` uses time-interval strategy — at execution time, Rocky would run `BEGIN TRANSACTION; DELETE; INSERT; COMMIT TRANSACTION` per partition
-4. `customer_lifetime` uses full-refresh — `CREATE OR REPLACE TABLE`
-
-## Live execution
-
-The default `./run.sh` is compile-only. For an end-to-end materialization
-against a real BigQuery project, see [`live/`](./live/) — a separate,
-credential-gated driver that runs `rocky run` against the BigQuery REST
-API and asserts the resulting row count.
+For the mapping of `rocky_adapter_sdk::conformance` test categories to the live drivers that exercise them, see [`engine/crates/rocky-bigquery/CONFORMANCE.md`](../../../../../engine/crates/rocky-bigquery/CONFORMANCE.md).
 
 ## Related
 

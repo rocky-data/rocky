@@ -4,5 +4,5 @@ type = "full_refresh"
 # Hardcoded to the Rocky BQ sandbox project — model sidecar TOMLs
 # don't honor `${VAR}` env substitution today (see live/README.md).
 [target]
-catalog = "rocky-sandbox-hc-test-63874"
+catalog = "__GCP_PROJECT__"
 schema = "hc_phase21_cost_check"

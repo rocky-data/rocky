@@ -9,5 +9,5 @@ update_columns = ["name", "amount"]
 # Hardcoded to the Rocky BQ sandbox project — model sidecar TOMLs don't
 # honor ${VAR} env substitution today (see live/README.md for context).
 [target]
-catalog = "rocky-sandbox-hc-test-63874"
+catalog = "__GCP_PROJECT__"
 schema = "hc_phase1_live_merge"

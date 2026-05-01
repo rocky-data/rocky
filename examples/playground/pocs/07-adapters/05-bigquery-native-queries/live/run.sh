@@ -40,11 +40,24 @@ echo "==> dataset: $GCP_PROJECT_ID.$DATASET (location: $LOCATION)"
 bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \
    mk --dataset "$DATASET"
 
+# Stage live.rocky.toml + model files into a temp dir with the
+# `__GCP_PROJECT__` placeholder substituted to the user's project.
+# Model-sidecar TOMLs and model SQL don't honor ${VAR} env-substitution
+# today (only the top-level rocky.toml does), so we materialize the
+# resolved files at runtime instead of committing the user's project ID.
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"; drop_dataset' EXIT
+cp live.rocky.toml "$STAGE/"
+cp -R models "$STAGE/"
+find "$STAGE" -type f \( -name "*.toml" -o -name "*.sql" \) \
+    -exec sed -i.bak "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g" {} +
+find "$STAGE" -name "*.bak" -delete
+
 echo "==> rocky validate"
-rocky -c live.rocky.toml validate
+rocky -c "$STAGE/live.rocky.toml" validate
 
 echo "==> rocky run"
-rocky -c live.rocky.toml run --output json > expected/run.json
+rocky -c "$STAGE/live.rocky.toml" run --output json > expected/run.json
 echo "    exit ok"
 
 echo "==> verifying row count"

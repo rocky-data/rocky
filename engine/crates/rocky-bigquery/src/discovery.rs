@@ -140,7 +140,7 @@ mod tests {
         // construction; safe to use in unit tests that exercise pure
         // logic on the adapter (region qualifier, etc.).
         Arc::new(BigQueryAdapter::new(
-            "rocky-sandbox-hc-test-63874".to_string(),
+            "test-project".to_string(),
             location.to_string(),
             BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new(
                 "test-token".to_string(),

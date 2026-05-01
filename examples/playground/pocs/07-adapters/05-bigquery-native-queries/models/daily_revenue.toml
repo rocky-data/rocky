@@ -1,9 +1,0 @@
-[strategy]
-type = "time_interval"
-time_column = "revenue_date"
-granularity = "day"
-lookback = 3
-
-[target]
-catalog = "${GCP_PROJECT_ID}"
-schema = "marts"
