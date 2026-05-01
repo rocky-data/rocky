@@ -315,6 +315,10 @@ impl AdapterRegistry {
                             .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300)),
                     );
                     bigquery_adapters.insert(name.clone(), adapter.clone());
+                    let discovery_adapter = Arc::new(
+                        rocky_bigquery::BigQueryDiscoveryAdapter::new(adapter.clone()),
+                    );
+                    discovery.insert(name.clone(), discovery_adapter as Arc<dyn DiscoveryAdapter>);
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
                 other => {

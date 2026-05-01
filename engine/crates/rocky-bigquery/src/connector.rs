@@ -127,6 +127,24 @@ impl BigQueryAdapter {
         self
     }
 
+    /// GCP project ID this adapter is bound to. Exposed so adapters that
+    /// share state with this one (e.g. `BigQueryDiscoveryAdapter`) can
+    /// build region-qualified `INFORMATION_SCHEMA` queries without the
+    /// caller having to thread the project ID through twice.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Dataset location ("EU", "US", "us-east1", …). Used by
+    /// `BigQueryDiscoveryAdapter` to build region-scoped
+    /// `INFORMATION_SCHEMA.SCHEMATA` queries — BigQuery's
+    /// region-unqualified form returns rows only for datasets in the
+    /// region the query is *executed* in, so cross-region projects need
+    /// the explicit `region-<location>` qualifier.
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
     /// Execute a query via the BigQuery REST API.
     async fn run_query(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
         let token = self.auth.get_token(&self.client).await?;

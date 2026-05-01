@@ -11,6 +11,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `./run.sh` | `full_refresh` | `BigQueryDialect::create_table_as` |
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
+| `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
 
 Each driver:
 
@@ -24,7 +25,8 @@ Each driver:
 ## What's not covered yet
 
 - Incremental strategy (separate follow-up smoke test).
-- Drift cycle (gated on `BigQueryDiscoveryAdapter` — see finding 1).
+- Drift cycle (now unblocked — replication-from-BQ works since
+  `BigQueryDiscoveryAdapter` shipped).
 - Time-interval failure-path (forced mid-transaction error → BQ
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
@@ -39,6 +41,7 @@ export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh                   # full-refresh
 ./time-interval/run.sh     # time-interval (4-statement DML transaction)
 ./merge/run.sh             # merge (bootstrap + UPSERT)
+./discover/run.sh          # discover (lists matching datasets via INFORMATION_SCHEMA)
 ```
 
 Each script exits 0 on success after dropping its target dataset.
@@ -62,13 +65,10 @@ means that path is unchanged.
 
 Adapter-side gaps to revisit separately:
 
-1. **No `BigQueryDiscoveryAdapter`** — the BQ adapter implements
-   `WarehouseAdapter` only, and `engine/crates/rocky-core/src/adapter_capability.rs`
-   correctly marks BQ as `DATA_ONLY`. As a result, replication
-   pipelines with a BigQuery source bail with "no discovery adapter
-   configured" at run time. These smoke tests deliberately use
-   transformation pipelines to exercise the BQ adapter without needing
-   discovery.
+1. ~~No `BigQueryDiscoveryAdapter`~~ — **shipped**. BQ now
+   supports both `WarehouseAdapter` and `DiscoveryAdapter` traits;
+   `adapter_capability.rs` reports `BOTH`. Replication-from-BQ
+   pipelines work end-to-end (see `discover/run.sh`).
 2. **Model-sidecar TOMLs skip env substitution.** `rocky.toml` is piped
    through `substitute_env_vars` at parse time but model `.toml` files
    are read raw (`engine/crates/rocky-core/src/models.rs:642`). The
