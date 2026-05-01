@@ -7,7 +7,7 @@ sidebar:
 
 Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter — the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, and `rocky-duckdb` are wired today.
 
-This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Trino, Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree.
+This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Trino, Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree.
 
 ## When to reach for the SDK
 
@@ -45,11 +45,11 @@ Each opt-in trait is gated by a flag in `AdapterCapabilities`. Set the flag, imp
 
 ## Worked example: a ClickHouse-shaped skeleton
 
-The POC at [`examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton) is a compiling, tested starter. To run it:
+The POC at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) is a compiling, tested starter. To run it:
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
-cd rocky/examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton
+cd rocky/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton
 ./run.sh
 ```
 
@@ -214,7 +214,7 @@ These are real and surface during implementation — flagging them up front so y
 
 ## Next steps
 
-- Browse the [skeleton POC source](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/05-rust-native-adapter-skeleton) — `adapter/src/lib.rs` is meant to be read top-to-bottom.
+- Browse the [skeleton POC source](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) — `adapter/src/lib.rs` is meant to be read top-to-bottom.
 - Read the [adapter concepts page](/concepts/adapters/) for the architecture overview.
 - Look at the in-tree adapters in `engine/crates/rocky-{databricks,snowflake,bigquery,duckdb,fivetran}/` for production patterns.
 - File an issue on [github.com/rocky-data/rocky](https://github.com/rocky-data/rocky/issues) if a trait method is missing what you need — the SDK is still young and feedback shapes the roadmap.
