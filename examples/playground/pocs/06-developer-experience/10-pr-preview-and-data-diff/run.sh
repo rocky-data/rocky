@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 10-pr-preview-and-data-diff — `rocky preview create / diff / cost` on a
-# 5-model DAG. Production path as of engine-v1.18.0 (Phases 1, 1.5, 2, 3
-# all merged). Earlier revisions of this script wrapped each preview call
-# in a stub-tolerating helper; that scaffolding is gone.
+# 5-model DAG. Production path as of engine-v1.18.0. Earlier revisions of
+# this script wrapped each preview call in a stub-tolerating helper; that
+# scaffolding is gone.
 #
 # Flow:
 #   1. Compile + seed DuckDB.

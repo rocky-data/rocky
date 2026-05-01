@@ -230,6 +230,7 @@ Returns a complete summary of the pipeline execution.
 | `metadata.column_count` | integer or absent | Number of columns in the materialized table. |
 | `metadata.compile_time_ms` | integer or absent | Compile time in milliseconds for derived models. |
 | `metadata.cost_usd` | float or absent | Estimated cost for this materialization in USD. Rolls up into `cost_summary.total_usd` at the run level. |
+| `job_ids` | array of strings | Warehouse-side job IDs for the statements this materialization issued, accumulated alongside `bytes_scanned` / `bytes_written`. Lets orchestrators cross-check rocky-reported figures against the warehouse console (`bq show -j`, Snowflake query history, Databricks SQL warehouse history). Empty `[]` for adapters that don't surface a job id. Available since engine `1.21.0`. |
 | `partition` | object or absent | Partition window info for `time_interval` materializations. |
 
 **`check_results[]`:**

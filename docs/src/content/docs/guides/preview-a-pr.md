@@ -119,7 +119,7 @@ When you see this flag, your options are:
 
 - Re-run with a larger `--sample-size` if a bounded sample of N more rows is enough confidence for this PR.
 - Inspect the changed columns directly via `rocky compile --model <name>` and reason about the change manually.
-- Wait for the Phase 2.5 checksum-bisection exhaustive diff (planned) — it covers the whole table at bounded scan cost.
+- Wait for the planned checksum-bisection exhaustive diff — it covers the whole table at bounded scan cost.
 
 A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op for that model.
 

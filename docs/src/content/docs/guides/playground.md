@@ -455,7 +455,7 @@ The playground includes a curated catalog of 58 POCs that showcase Rocky's disti
 | `08-circuit-breaker` | Trust arc 3: retry policy + three-state circuit breaker |
 | `09-idempotency-key` | `rocky run --idempotency-key` dedup + skip semantics |
 
-### Developer Experience (10 POCs)
+### Developer Experience (11 POCs)
 
 | POC | Feature |
 |---|---|
@@ -469,8 +469,9 @@ The playground includes a curated catalog of 58 POCs that showcase Rocky's disti
 | `08-portability-lint` | Trust arc 6: compile-time portability gate via `[portability]` |
 | `09-sql-types-blast-radius` | Trust arc 7: SQL as first-class with typed blast-radius |
 | `10-pr-preview-and-data-diff` | `rocky preview create / diff / cost` end-to-end PR bundle |
+| `11-lineage-diff` | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review |
 
-### Adapters (5 POCs)
+### Adapters (6 POCs)
 
 | POC | Feature |
 |---|---|
@@ -479,6 +480,7 @@ The playground includes a curated catalog of 58 POCs that showcase Rocky's disti
 | `03-fivetran-discover` | `rocky discover` against Fivetran REST API |
 | `04-custom-process-adapter` | Python adapter via JSON-RPC over stdio |
 | `05-bigquery-native-queries` | BigQuery adapter end-to-end with native query patterns |
+| `06-rust-native-adapter-skeleton` | Rust-native out-of-tree adapter via the `rocky-adapter-sdk` |
 
 ### Running a POC
 

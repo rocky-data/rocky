@@ -15,7 +15,7 @@ DuckDB transformation pipeline:
 1. **`rocky preview create --base <ref>`** — git-diff identifies changed
    model files between `<ref>` and HEAD; the compiler IR computes a
    **column-level prune set**; every model *not* in the prune set is
-   copied from the base schema via CTAS (Phase 1) into a per-PR branch
+   copied from the base schema via CTAS into a per-PR branch
    schema; the prune set re-executes against the branch.
 2. **`rocky preview diff`** — structural (column added/removed/type
    changed) plus sampled row-level diff between branch and base for
@@ -55,10 +55,10 @@ without rewriting dbt's compiler:
   no output diff"* — is something only a compiled engine can do.
 - **Cost delta as a state-store query, not a fresh measurement.**
   `rocky cost latest` already rolls per-run cost from adapter telemetry;
-  Phase 3 is the diff layer over that machinery.
-- **Single artefact for the reviewer.** Phase 4 stitches all three
-  outputs into one PR comment that answers *"should I merge this?"*
-  with row counts, columns, and dollars — not log lines.
+  `preview cost` is the diff layer over that machinery.
+- **Single artefact for the reviewer.** The composite GitHub Action
+  stitches all three outputs into one PR comment that answers *"should
+  I merge this?"* with row counts, columns, and dollars — not log lines.
 
 Compare:
 
@@ -90,9 +90,9 @@ Compare:
 └── expected/
     ├── compile.json                   from `rocky compile`
     ├── run_main.json                  from `rocky run`
-    ├── preview_create.example.json    target shape (Phase 1 not yet wired)
-    ├── preview_diff.example.json      target shape (Phase 2 not yet wired)
-    └── preview_cost.example.json      target shape (Phase 3 not yet wired)
+    ├── preview_create.example.json    shape contract for `rocky preview create`
+    ├── preview_diff.example.json      shape contract for `rocky preview diff`
+    └── preview_cost.example.json      shape contract for `rocky preview cost`
 ```
 
 ## Note on model surfaces
@@ -106,11 +106,11 @@ run` for both DSL and SQL surfaces.
 
 ## Status
 
-Production path as of **engine-v1.18.0** (Phases 1, 1.5, 2, 3 all merged).
-Earlier revisions of `run.sh` wrapped each preview call in a
-stub-tolerating helper while the engine handlers were still scaffolding;
-that scaffolding is gone — the script now treats `preview create / diff /
-cost` like any other production CLI command (`set -e` enforces failure).
+Production path as of **engine-v1.18.0**. Earlier revisions of `run.sh`
+wrapped each preview call in a stub-tolerating helper while the engine
+handlers were still scaffolding; that scaffolding is gone — the script
+now treats `preview create / diff / cost` like any other production CLI
+command (`set -e` enforces failure).
 
 The `expected/preview_*.example.json` files remain as the shape contract
 that the live `expected/preview_*.json` outputs should match modulo
@@ -153,8 +153,7 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
   — the four trust-arc primitives (branches, replay, column lineage,
   state store) that `preview` composes.
 - Sibling POC: [`06-developer-experience/04-shadow-mode-compare/`](../04-shadow-mode-compare/)
-  — the precursor `rocky compare` kernel that Phase 2's `preview diff`
-  extends.
+  — the precursor `rocky compare` kernel that `preview diff` extends.
 - Engine source: `engine/crates/rocky-cli/src/commands/preview.rs`,
   `engine/crates/rocky-cli/src/output.rs`
   (`PreviewCreateOutput`, `PreviewDiffOutput`, `PreviewCostOutput`).

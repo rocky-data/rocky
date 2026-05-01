@@ -141,7 +141,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 `init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch` · `preview create` · `preview diff` · `preview cost`
 
 ### Modeling & Compilation
-`compile` · `lineage` · `test` · `ci` · `ci-diff` · `export-schemas`
+`compile` · `lineage` · `lineage-diff` · `test` · `ci` · `ci-diff` · `export-schemas`
 
 ### AI
 `ai` (generate) · `ai-sync` · `ai-explain` · `ai-test`
