@@ -1,6 +1,41 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "CompactTableEntry": {
+      "description": "Per-table compaction plan inside a `--catalog` envelope.",
+      "properties": {
+        "statements": {
+          "items": {
+            "$ref": "#/definitions/NamedStatement"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "statements"
+      ],
+      "type": "object"
+    },
+    "CompactTotals": {
+      "description": "Aggregate counts over a `rocky compact --catalog` invocation.",
+      "properties": {
+        "statement_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "statement_count",
+        "table_count"
+      ],
+      "type": "object"
+    },
     "NamedStatement": {
       "description": "Named SQL statement (purpose + sql), reused by compact and archive.",
       "properties": {
@@ -18,8 +53,15 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky compact`.",
+  "description": "JSON output for `rocky compact`.\n\nTwo shapes share this struct:\n\n- **Single-model (`rocky compact <fqn>`)**: `model` is set; `scope`, `catalog`, `tables`, and `totals` are absent. Byte-stable with envelopes that predate the catalog-scope flag. - **Catalog scope (`rocky compact --catalog <name>`)**: `model` is absent, `scope = \"catalog\"`, `catalog` is set, `tables` keys per-FQN statement bundles, and `totals` carries aggregate counts. The flat `statements` field still carries every SQL statement across all tables for consumers that just iterate it.",
   "properties": {
+    "catalog": {
+      "description": "Set when invoked as `rocky compact --catalog <name>`. Stores the catalog identifier as resolved (lowercased to match the managed-table resolver's normalization).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "command": {
       "type": "string"
     },
@@ -27,18 +69,51 @@
       "type": "boolean"
     },
     "model": {
-      "type": "string"
+      "description": "Set when invoked as `rocky compact <fqn>`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "description": "`\"catalog\"` for the catalog-scoped path; absent for single-model invocations to keep their envelope byte-stable.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "statements": {
+      "description": "Flat list of every SQL statement across every table. Single-model invocations have one bundle here; `--catalog` invocations have the concatenation of every per-table bundle (in the same order as `tables`'s key iteration order).",
       "items": {
         "$ref": "#/definitions/NamedStatement"
       },
       "type": "array"
     },
+    "tables": {
+      "additionalProperties": {
+        "$ref": "#/definitions/CompactTableEntry"
+      },
+      "description": "Per-table breakdown, keyed by fully-qualified table name. Present only on `--catalog` invocations.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
     "target_size_mb": {
       "format": "uint64",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "totals": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompactTotals"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Aggregate counts across the catalog. Present only on `--catalog` invocations."
     },
     "version": {
       "type": "string"
@@ -47,7 +122,6 @@
   "required": [
     "command",
     "dry_run",
-    "model",
     "statements",
     "target_size_mb",
     "version"

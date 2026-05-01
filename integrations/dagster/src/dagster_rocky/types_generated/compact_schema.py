@@ -3,7 +3,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, conint
+
+
+class CompactTotals(BaseModel):
+    """
+    Aggregate counts over a `rocky compact --catalog` invocation.
+    """
+
+    statement_count: conint(ge=0)
+    table_count: conint(ge=0)
 
 
 class NamedStatement(BaseModel):
@@ -18,11 +29,45 @@ class NamedStatement(BaseModel):
 class CompactOutput(BaseModel):
     """
     JSON output for `rocky compact`.
+
+    Two shapes share this struct:
+
+    - **Single-model (`rocky compact <fqn>`)**: `model` is set; `scope`, `catalog`, `tables`, and `totals` are absent. Byte-stable with envelopes that predate the catalog-scope flag. - **Catalog scope (`rocky compact --catalog <name>`)**: `model` is absent, `scope = "catalog"`, `catalog` is set, `tables` keys per-FQN statement bundles, and `totals` carries aggregate counts. The flat `statements` field still carries every SQL statement across all tables for consumers that just iterate it.
     """
 
+    catalog: str | None = None
+    """
+    Set when invoked as `rocky compact --catalog <name>`. Stores the catalog identifier as resolved (lowercased to match the managed-table resolver's normalization).
+    """
     command: str
     dry_run: bool
-    model: str
+    model: str | None = None
+    """
+    Set when invoked as `rocky compact <fqn>`.
+    """
+    scope: str | None = None
+    """
+    `"catalog"` for the catalog-scoped path; absent for single-model invocations to keep their envelope byte-stable.
+    """
     statements: list[NamedStatement]
+    """
+    Flat list of every SQL statement across every table. Single-model invocations have one bundle here; `--catalog` invocations have the concatenation of every per-table bundle (in the same order as `tables`'s key iteration order).
+    """
+    tables: dict[str, Any] | None = None
+    """
+    Per-table breakdown, keyed by fully-qualified table name. Present only on `--catalog` invocations.
+    """
     target_size_mb: conint(ge=0)
+    totals: CompactTotals | None = None
+    """
+    Aggregate counts across the catalog. Present only on `--catalog` invocations.
+    """
     version: str
+
+
+class CompactTableEntry(BaseModel):
+    """
+    Per-table compaction plan inside a `--catalog` envelope.
+    """
+
+    statements: list[NamedStatement]
