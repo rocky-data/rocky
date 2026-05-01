@@ -331,7 +331,7 @@ fn test_safe_widening_int_to_bigint() {
         schema: "s".into(),
         table: "t".into(),
     };
-    let result = drift::detect_drift(&table, &source, &target);
+    let result = drift::detect_drift(&table, &source, &target, &dialect());
     assert_eq!(result.action, DriftAction::AlterColumnTypes);
 }
 
@@ -352,7 +352,7 @@ fn test_safe_widening_float_to_double() {
         schema: "s".into(),
         table: "t".into(),
     };
-    let result = drift::detect_drift(&table, &source, &target);
+    let result = drift::detect_drift(&table, &source, &target, &dialect());
     assert_eq!(result.action, DriftAction::AlterColumnTypes);
 }
 
@@ -373,7 +373,7 @@ fn test_unsafe_change_triggers_drop_and_recreate() {
         schema: "s".into(),
         table: "t".into(),
     };
-    let result = drift::detect_drift(&table, &source, &target);
+    let result = drift::detect_drift(&table, &source, &target, &dialect());
     assert!(!result.drifted_columns.is_empty(), "should detect drift");
     assert_eq!(result.action, DriftAction::DropAndRecreate);
 }
@@ -403,7 +403,7 @@ fn test_new_column_no_drift() {
         schema: "s".into(),
         table: "t".into(),
     };
-    let result = drift::detect_drift(&table, &source, &target);
+    let result = drift::detect_drift(&table, &source, &target, &dialect());
     assert_eq!(
         result.action,
         DriftAction::Ignore,

@@ -4103,7 +4103,7 @@ async fn process_table(
     let mut drift_action: Option<DriftActionOutput> = None;
 
     if target_exists {
-        let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols);
+        let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols, dialect);
         if drift_result.action == DriftAction::DropAndRecreate {
             info!(
                 table = target_table.full_name(),
