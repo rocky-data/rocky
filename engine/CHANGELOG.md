@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-05-02
+
+Feature release. Headline: **exhaustive checksum-bisection diff** — `rocky preview diff --algorithm bisection` covers every row in a target table at bounded scan cost, ending the sampling false-negative ceiling. Live-verified on DuckDB, BigQuery, and Databricks; Snowflake stays on the sampled fallback until a consumer drives the override. Bundles pre-merge budget projection on `rocky preview cost`, rolling z-score + health score on `rocky history`, a state-store retention sweep, and a tagged-enum restructure of `PreviewDiffOutput` (the breaking shape change downstream consumers need to migrate for).
+
+**Migration callout (breaking JSON-shape change).** `PreviewDiffOutput.models[*].sampled` and `.sampling_window` move under a new `algorithm` discriminated union. Direct JSON readers must migrate from `model.sampled.rows_changed` to `model.algorithm.sampled.rows_changed` (with a `kind` discriminator check first). The dagster typed-resource layer and the VS Code extension's adapter absorb the shape change automatically through `dagster-rocky` 1.20.0's regenerated bindings — only third-party scripts that read the JSON directly need to update.
+
 ### Changed
 
 - **`PreviewDiffOutput.models[*].algorithm` tagged enum (breaking JSON-shape restructure).** Per-model row-level diff is now carried in a `PreviewModelDiffAlgorithm` discriminated union with two variants: `{ "kind": "sampled", "sampled": …, "sampling_window": … }` and `{ "kind": "bisection", "diff": …, "bisection_stats": … }`. The legacy `model.sampled` and `model.sampling_window` fields move under `model.algorithm` — direct JSON consumers (shell scripts, custom dashboards) must migrate to `model.algorithm.sampled.*` / `model.algorithm.bisection.*` with a `kind` discriminator check. The dagster typed-resource layer absorbs the change automatically through `dagster_rocky.types_generated`; the VS Code extension's adapter regenerates via `just codegen` and stays consumer-clean. `summary.any_coverage_warning` keeps its name and widens semantically — it now fires on `Sampled { sampling_window.coverage_warning: true }` *or* `Bisection { bisection_stats.depth_capped: true }`. The `--algorithm=bisection` CLI flag (previously `tracing`-log-only) now surfaces results as the typed `Bisection` variant on the JSON output.
