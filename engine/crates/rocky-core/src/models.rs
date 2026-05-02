@@ -562,7 +562,6 @@ impl Model {
             StrategyConfig::Incremental { timestamp_column } => {
                 MaterializationStrategy::Incremental {
                     timestamp_column: timestamp_column.clone(),
-                    watermark: None,
                 }
             }
             StrategyConfig::Merge {

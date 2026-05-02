@@ -2,6 +2,16 @@
 //! `partition_by`, `ColumnSelection::Explicit`, `columns_to_drop` — use
 //! `Vec<Arc<str>>` so cloning a plan / drift result is refcount-cheap.
 //! JSON wire format is preserved by serde's `rc` feature.
+//!
+//! ## Canonical-JSON convention for [`ModelIr`] / [`ProjectIr`]
+//!
+//! Recipe-hash determinism requires a single, predictable serialization
+//! shape. Every `Option<T>` field on [`ModelIr`] and [`ProjectIr`] (and on
+//! types they own that are introduced alongside the IR) carries
+//! `#[serde(default, skip_serializing_if = "Option::is_none")]`. `None`
+//! values are absent from the JSON; the recipe-hash never sees an explicit
+//! `null`. Add new optional fields with the same attribute pair so the rule
+//! stays uniform.
 
 use std::sync::Arc;
 
@@ -72,10 +82,14 @@ pub enum MaterializationStrategy {
     /// Drop and recreate the entire table.
     FullRefresh,
     /// Append rows newer than the watermark.
-    Incremental {
-        timestamp_column: String,
-        watermark: Option<WatermarkState>,
-    },
+    ///
+    /// The watermark value itself is not carried on the strategy: it is
+    /// runtime state read from the embedded state store (see
+    /// [`crate::state::StateStore::get_watermark`]) and the SQL generator
+    /// emits a `WHERE ts > (SELECT MAX(ts) FROM target)` subquery that
+    /// resolves the bound at execution time. Keeping the field off the
+    /// strategy means recipe-hash inputs are runtime-state-free.
+    Incremental { timestamp_column: String },
     /// Upsert based on unique key columns.
     Merge {
         unique_key: Vec<Arc<str>>,
@@ -420,6 +434,181 @@ pub struct ResolvedRole {
     pub inherits_from: Vec<String>,
 }
 
+/// A single resolved column-masking instruction.
+///
+/// Policy lives in [`crate::config::RockyConfig`] (workspace-default
+/// `[mask]` block plus optional per-env `[mask.<env>]` overrides). The
+/// resolution-as-applied — column name plus the strategy chosen for the
+/// active environment — is captured here so the recipe-hash reflects what
+/// the warehouse actually sees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnMask {
+    /// Column name, interned for cheap cloning.
+    pub column: Arc<str>,
+    /// Resolved strategy for the active environment.
+    pub strategy: crate::traits::MaskStrategy,
+}
+
+/// Per-model intermediate representation.
+///
+/// Carries everything Rocky needs to know about a single model to generate
+/// SQL, run governance, and compute a recipe-hash: the SQL itself, the
+/// typed output columns, the lineage edges that target this model, the
+/// materialization strategy, governance metadata, and the resolved
+/// column-masking plan for the active environment.
+///
+/// `ModelIr` is an internal contract. It does not derive `JsonSchema` and
+/// is not part of the public CLI output schema; consumers outside the
+/// engine should depend on the typed `*Output` structs in
+/// `rocky-cli::output` instead.
+///
+/// All `Option` fields follow the canonical-JSON rule documented at the
+/// top of this module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelIr {
+    /// Stable identifier for this model (project-unique).
+    pub name: Arc<str>,
+    /// User-written SQL for this model. The SQL string is the load-bearing
+    /// recipe-hash input: text changes (even comments) hash to a different
+    /// value.
+    pub sql: String,
+    /// Inferred output columns. May be empty when typecheck partial-failed
+    /// or the model uses `SELECT *` against an upstream that hasn't been
+    /// typechecked yet.
+    pub typed_columns: Vec<crate::types::TypedColumn>,
+    /// Column-level lineage edges whose target is this model. Cross-model
+    /// edges that originate elsewhere appear in the consumer's slice.
+    pub lineage_edges: Vec<crate::lineage::LineageEdge>,
+    /// How the warehouse should materialize this model.
+    ///
+    /// Recipe-hash invariant: when this strategy is
+    /// [`MaterializationStrategy::TimeInterval`], the `window` field MUST
+    /// be `None` at hash time. The static plan emits `None`; the runtime
+    /// fills `Some(...)` per partition. Hashing the resolved partition
+    /// would yield a different recipe-hash for every partition of the same
+    /// model, defeating content-addressed write semantics.
+    pub materialization: MaterializationStrategy,
+    /// Governance metadata (catalog/schema lifecycle policy).
+    pub governance: GovernanceConfig,
+    /// Resolved column masks for the active environment. Populated at IR
+    /// construction by reading
+    /// [`crate::config::RockyConfig::resolve_mask_for_env`]. Empty when no
+    /// classifications matched or every resolved strategy was
+    /// [`crate::traits::MaskStrategy::None`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_masks: Vec<ColumnMask>,
+}
+
+impl ModelIr {
+    /// Compute the recipe-hash of this model.
+    ///
+    /// The hash is `blake3` over a canonical JSON encoding of `self`: keys
+    /// sorted, no insignificant whitespace, `Option::None` skipped per the
+    /// canonical-JSON rule documented at the top of this module.
+    ///
+    /// Determinism contract: given two byte-identical [`ModelIr`] values
+    /// the returned hash is byte-identical. Mutating any input field
+    /// (SQL, typed columns, lineage edges, materialization, governance,
+    /// resolved masks) changes the hash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` cannot be serialized to JSON. All fields on
+    /// [`ModelIr`] derive `Serialize` over infallible primitives, so this
+    /// only fires on a programming error (e.g. a `Map` with non-string
+    /// keys introduced after this comment was written).
+    pub fn recipe_hash(&self) -> blake3::Hash {
+        let canonical = canonical_json(self);
+        blake3::hash(canonical.as_bytes())
+    }
+}
+
+/// Project-level intermediate representation.
+///
+/// Thin wrapper that pairs the per-model IRs with the project's DAG and
+/// the cross-model lineage edges. Project-level recipe-hash is *derived*
+/// from the per-model hashes; it is not stored on this struct.
+///
+/// `ProjectIr` is an internal contract and does not derive `JsonSchema`
+/// (see [`ModelIr`] for the rationale).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectIr {
+    /// All models in this project. Ordering is caller-defined; the
+    /// project-level recipe-hash sorts by per-model hash before combining.
+    pub models: Vec<ModelIr>,
+    /// DAG nodes describing model-to-model dependencies. Use
+    /// [`crate::dag::topological_sort`] or
+    /// [`crate::dag::execution_layers`] to derive an execution order.
+    pub dag: Vec<crate::dag::DagNode>,
+    /// Full cross-model column-level lineage. Each [`ModelIr`] also carries
+    /// the slice of edges that target it; this field is the union and is
+    /// the canonical store.
+    pub lineage_edges: Vec<crate::lineage::LineageEdge>,
+}
+
+impl ProjectIr {
+    /// Compute the project-level recipe-hash.
+    ///
+    /// Each model contributes its [`ModelIr::recipe_hash`]; the per-model
+    /// hashes are sorted lexicographically by their hex representation and
+    /// hashed together so the result is independent of `models` ordering.
+    ///
+    /// Project-level fields ([`Self::dag`], [`Self::lineage_edges`]) are
+    /// not folded into the project-level hash — they are derived facts
+    /// about how the per-model recipes relate, not part of any single
+    /// model's recipe. Changes to the DAG or cross-model lineage that do
+    /// not change a model's own recipe leave the per-model hashes (and
+    /// therefore the project-level hash) untouched.
+    pub fn recipe_hash(&self) -> blake3::Hash {
+        let mut per_model: Vec<String> = self
+            .models
+            .iter()
+            .map(|m| m.recipe_hash().to_hex().to_string())
+            .collect();
+        per_model.sort();
+        let mut hasher = blake3::Hasher::new();
+        for h in &per_model {
+            hasher.update(h.as_bytes());
+            // Length-prefix the separator so concatenation is unambiguous.
+            hasher.update(b"\n");
+        }
+        hasher.finalize()
+    }
+}
+
+/// Canonical-JSON encoder used by [`ModelIr::recipe_hash`].
+///
+/// `serde_json` preserves field insertion order on `Map`, which is not
+/// stable enough for content-addressed hashing across different inputs of
+/// the same logical value. This helper round-trips through a
+/// [`serde_json::Value`] and rewrites every nested map into a
+/// [`std::collections::BTreeMap`] (key-sorted). The resulting string has
+/// no insignificant whitespace and skipped-on-`None` fields stay absent
+/// because they were already absent at serialize time.
+fn canonical_json<T: Serialize>(value: &T) -> String {
+    let raw = serde_json::to_value(value)
+        .expect("recipe_hash inputs must be JSON-encodable; programming error");
+    let canonical = canonicalize(raw);
+    serde_json::to_string(&canonical)
+        .expect("BTreeMap-based serde_json::Value is always serializable")
+}
+
+fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                map.into_iter().map(|(k, v)| (k, canonicalize(v))).collect();
+            // serde_json serializes BTreeMap keys in sorted order; round-trip
+            // back through Value to keep the type uniform.
+            serde_json::to_value(sorted).expect("BTreeMap<String, Value> always converts to Value")
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize).collect())
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,7 +628,6 @@ mod tests {
             },
             strategy: MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
-                watermark: None,
             },
             columns: ColumnSelection::All,
             metadata_columns: vec![MetadataColumn {
@@ -573,7 +761,6 @@ mod tests {
             MaterializationStrategy::FullRefresh,
             MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
-                watermark: None,
             },
             MaterializationStrategy::Merge {
                 unique_key: vec!["id".into()],
@@ -602,5 +789,269 @@ mod tests {
             let json = serde_json::to_string(strategy).unwrap();
             let _: MaterializationStrategy = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    // ----- ModelIr / ProjectIr round-trip + recipe-hash tests -----
+
+    use crate::lineage::{LineageEdge, QualifiedColumn};
+    use crate::traits::MaskStrategy;
+    use crate::types::{RockyType, TypedColumn};
+    use rocky_sql::lineage::TransformKind;
+
+    fn sample_replication_model() -> ModelIr {
+        ModelIr {
+            name: Arc::from("orders"),
+            sql: "SELECT * FROM source_catalog.src__acme.shopify.orders".into(),
+            typed_columns: vec![TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            }],
+            lineage_edges: vec![],
+            materialization: MaterializationStrategy::Incremental {
+                timestamp_column: "_fivetran_synced".into(),
+            },
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: true,
+                auto_create_schemas: true,
+            },
+            column_masks: vec![],
+        }
+    }
+
+    fn sample_transformation_model() -> ModelIr {
+        ModelIr {
+            name: Arc::from("dim_customers"),
+            sql: "SELECT customer_id, email FROM stg_customers".into(),
+            typed_columns: vec![
+                TypedColumn {
+                    name: "customer_id".into(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                },
+                TypedColumn {
+                    name: "email".into(),
+                    data_type: RockyType::String,
+                    nullable: true,
+                },
+            ],
+            lineage_edges: vec![LineageEdge {
+                source: QualifiedColumn {
+                    model: Arc::from("stg_customers"),
+                    column: Arc::from("customer_id"),
+                },
+                target: QualifiedColumn {
+                    model: Arc::from("dim_customers"),
+                    column: Arc::from("customer_id"),
+                },
+                transform: TransformKind::Direct,
+            }],
+            materialization: MaterializationStrategy::Merge {
+                unique_key: vec![Arc::from("customer_id")],
+                update_columns: ColumnSelection::All,
+            },
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            column_masks: vec![ColumnMask {
+                column: Arc::from("email"),
+                strategy: MaskStrategy::Hash,
+            }],
+        }
+    }
+
+    fn sample_full_refresh_model() -> ModelIr {
+        // [`ModelIr`] does not yet carry SnapshotPlan-specific fields
+        // (`unique_key`, `updated_at`, `invalidate_hard_deletes`). The third
+        // strategy variant exercised by the round-trip suite is therefore
+        // FullRefresh. SnapshotPlan-style coverage will land alongside the
+        // construction-site migration when source/target refs are threaded
+        // through.
+        ModelIr {
+            name: Arc::from("dim_users_full_refresh"),
+            sql: "SELECT * FROM dim_users".into(),
+            typed_columns: vec![],
+            lineage_edges: vec![],
+            materialization: MaterializationStrategy::FullRefresh,
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            column_masks: vec![],
+        }
+    }
+
+    #[test]
+    fn model_ir_replication_roundtrip_byte_stable() {
+        let m = sample_replication_model();
+        let json1 = serde_json::to_string(&m).unwrap();
+        let back: ModelIr = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2, "round-trip must be byte-stable");
+    }
+
+    #[test]
+    fn model_ir_transformation_roundtrip_byte_stable() {
+        let m = sample_transformation_model();
+        let json1 = serde_json::to_string(&m).unwrap();
+        let back: ModelIr = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2, "round-trip must be byte-stable");
+    }
+
+    #[test]
+    fn model_ir_full_refresh_roundtrip_byte_stable() {
+        let m = sample_full_refresh_model();
+        let json1 = serde_json::to_string(&m).unwrap();
+        let back: ModelIr = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2, "round-trip must be byte-stable");
+    }
+
+    #[test]
+    fn project_ir_roundtrip_with_multiple_models() {
+        let project = ProjectIr {
+            models: vec![
+                sample_replication_model(),
+                sample_transformation_model(),
+                sample_full_refresh_model(),
+            ],
+            dag: vec![
+                crate::dag::DagNode {
+                    name: "orders".into(),
+                    depends_on: vec![],
+                },
+                crate::dag::DagNode {
+                    name: "dim_customers".into(),
+                    depends_on: vec![],
+                },
+                crate::dag::DagNode {
+                    name: "dim_users_full_refresh".into(),
+                    depends_on: vec!["dim_customers".into()],
+                },
+            ],
+            lineage_edges: vec![LineageEdge {
+                source: QualifiedColumn {
+                    model: Arc::from("stg_customers"),
+                    column: Arc::from("customer_id"),
+                },
+                target: QualifiedColumn {
+                    model: Arc::from("dim_customers"),
+                    column: Arc::from("customer_id"),
+                },
+                transform: TransformKind::Direct,
+            }],
+        };
+        let json1 = serde_json::to_string(&project).unwrap();
+        let back: ProjectIr = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2, "ProjectIr round-trip must be byte-stable");
+        assert_eq!(back.models.len(), 3);
+    }
+
+    #[test]
+    fn model_ir_missing_required_field_fails_noisily() {
+        // The `sql` field has no serde default; dropping it must fail
+        // deserialization rather than silently producing an empty SQL string.
+        let json = r#"{
+            "name": "orders",
+            "typed_columns": [],
+            "lineage_edges": [],
+            "materialization": {"strategy": "FullRefresh"},
+            "governance": {
+                "permissions_file": null,
+                "auto_create_catalogs": false,
+                "auto_create_schemas": false
+            }
+        }"#;
+        let err = serde_json::from_str::<ModelIr>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("sql"),
+            "expected error to mention missing `sql` field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_is_deterministic() {
+        let m1 = sample_transformation_model();
+        let m2 = sample_transformation_model();
+        assert_eq!(
+            m1.recipe_hash(),
+            m2.recipe_hash(),
+            "identical inputs must produce identical hashes"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_sql_changes() {
+        let mut m = sample_transformation_model();
+        let h1 = m.recipe_hash();
+        m.sql.push_str(" -- a comment");
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "SQL text changes must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_column_mask_changes() {
+        let mut m = sample_transformation_model();
+        let h1 = m.recipe_hash();
+        m.column_masks[0].strategy = MaskStrategy::Redact;
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "resolved-mask changes must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_typed_columns_change() {
+        let mut m = sample_transformation_model();
+        let h1 = m.recipe_hash();
+        m.typed_columns.push(TypedColumn {
+            name: "added_at".into(),
+            data_type: RockyType::Timestamp,
+            nullable: true,
+        });
+        let h2 = m.recipe_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn project_recipe_hash_is_independent_of_model_order() {
+        let a = sample_replication_model();
+        let b = sample_transformation_model();
+        let p1 = ProjectIr {
+            models: vec![a.clone(), b.clone()],
+            dag: vec![],
+            lineage_edges: vec![],
+        };
+        let p2 = ProjectIr {
+            models: vec![b, a],
+            dag: vec![],
+            lineage_edges: vec![],
+        };
+        assert_eq!(
+            p1.recipe_hash(),
+            p2.recipe_hash(),
+            "project hash must sort per-model hashes before combining"
+        );
+    }
+
+    #[test]
+    fn empty_column_masks_omitted_from_serialization() {
+        // Rule A consistency: empty Vec on `column_masks` is skipped.
+        let m = sample_replication_model();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("column_masks"),
+            "empty column_masks must be skipped per the canonical-JSON rule, got: {json}"
+        );
     }
 }

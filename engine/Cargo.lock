@@ -3522,6 +3522,7 @@ name = "rocky-core"
 version = "1.23.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "chrono",
  "criterion",

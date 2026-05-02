@@ -138,7 +138,6 @@ pub async fn plan(
                 "incremental" => (
                     MaterializationStrategy::Incremental {
                         timestamp_column: pipeline.timestamp_column.clone(),
-                        watermark: None,
                     },
                     "incremental_copy",
                 ),
