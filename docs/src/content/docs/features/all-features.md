@@ -10,7 +10,7 @@ sidebar:
 | Warehouse | Status | Auth methods |
 |---|---|---|
 | **Databricks** | Production | Unity Catalog, SQL Statement API, OAuth M2M |
-| **Snowflake** | Beta | Key-pair JWT, OAuth, password |
+| **Snowflake** | Beta | PAT, Key-pair JWT, OAuth, password |
 | **BigQuery** | Beta | Service account, application default |
 | **DuckDB** | Production | Embedded (local dev/test, no credentials) |
 

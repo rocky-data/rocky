@@ -498,6 +498,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: None,
+            pat: None,
             role: None,
             database: None,
             project_id: None,

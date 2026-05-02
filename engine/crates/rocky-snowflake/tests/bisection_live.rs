@@ -34,7 +34,7 @@
 //!   `SqlDialect::quote_identifier`; if the seed used unquoted
 //!   `id` (which Snowflake folds to `ID`), the kernel's lowercase
 //!   reference would resolve to a non-existent column.
-//! - Schemas use the `hc_bisection_*` prefix per the standard
+//! - Schemas use the `rocky_bisection_*` prefix per the standard
 //!   per-test schema-isolation convention.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -152,8 +152,8 @@ async fn live_noop_diff_examines_root_chunks_only() {
         return;
     };
     let suffix = schema_suffix();
-    let base_schema = format!("hc_bisection_base_{suffix}");
-    let branch_schema = format!("hc_bisection_branch_{suffix}");
+    let base_schema = format!("rocky_bisection_base_{suffix}");
+    let branch_schema = format!("rocky_bisection_branch_{suffix}");
 
     create_schema(&adapter, &database, &base_schema).await;
     create_schema(&adapter, &database, &branch_schema).await;
@@ -214,8 +214,8 @@ async fn live_finds_planted_change() {
         return;
     };
     let suffix = schema_suffix();
-    let base_schema = format!("hc_bisection_base_{suffix}");
-    let branch_schema = format!("hc_bisection_branch_{suffix}");
+    let base_schema = format!("rocky_bisection_base_{suffix}");
+    let branch_schema = format!("rocky_bisection_branch_{suffix}");
 
     create_schema(&adapter, &database, &base_schema).await;
     create_schema(&adapter, &database, &branch_schema).await;
