@@ -763,8 +763,8 @@ pub trait SqlDialect: Send + Sync {
     /// `column` matches `pattern` (`REGEXP` / `RLIKE` / `REGEXP_LIKE` /
     /// `REGEXP_CONTAINS`, depending on the warehouse).
     ///
-    /// Used by `TestType::RegexMatch` (Phase 4a). The default impl
-    /// returns an error — adapters that support regex must override.
+    /// Used by `TestType::RegexMatch`. The default impl returns an
+    /// error — adapters that support regex must override.
     /// `column` is already validated as a SQL identifier; `pattern` is
     /// already validated against the strict allowlist
     /// ([`crate::tests::validate_regex_pattern`]).
@@ -775,8 +775,8 @@ pub trait SqlDialect: Send + Sync {
     }
 
     /// Build a dialect-specific SQL expression equivalent to
-    /// `CURRENT_DATE - N days`. Used by `TestType::OlderThanNDays`
-    /// (Phase 4b). The default impl uses the ANSI
+    /// `CURRENT_DATE - N days`. Used by `TestType::OlderThanNDays`.
+    /// The default impl uses the ANSI
     /// `CURRENT_DATE - INTERVAL 'N' DAY` form, which works for
     /// Databricks, Snowflake, and DuckDB. BigQuery overrides because
     /// it requires `DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)`.
@@ -785,7 +785,7 @@ pub trait SqlDialect: Send + Sync {
     }
 
     /// SQL expression returning the current timestamp. Used by
-    /// `TestType::NotInFuture` (Phase 4b).
+    /// `TestType::NotInFuture`.
     ///
     /// Default: `CURRENT_TIMESTAMP` (ANSI keyword, no parens). Works for
     /// Databricks, Snowflake, DuckDB. BigQuery overrides to

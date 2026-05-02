@@ -22,13 +22,12 @@
 //! |---|---|
 //! | [`StateBackend::Local`] | redb write transaction inside the existing `state.redb.lock` file lock |
 //! | [`StateBackend::Valkey`] / [`StateBackend::Tiered`] | Valkey `SET NX EX` on `{prefix}idempotency:<key>` |
-//! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"` (Phase 2) |
-//! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0` (Phase 3) |
+//! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"` |
+//! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0` |
 //!
-//! For `s3` / `gcs` backends before Phase 2 / Phase 3 ship, this module
-//! returns [`IdempotencyError::UnsupportedBackend`] on any idempotency op —
-//! consumed by `rocky run` at flag-parse time with a clear "switch to
-//! tiered" error message.
+//! The `s3` / `gcs` backends are not yet wired through this module — calls
+//! return [`IdempotencyError::UnsupportedBackend`], consumed by `rocky run`
+//! at flag-parse time with a clear "switch to tiered" error message.
 //!
 //! # Key storage
 //!
@@ -876,7 +875,7 @@ pub(crate) fn classify_existing(
 // the types, even though the concrete providers land in later patches.
 // -----------------------------------------------------------------------
 
-/// Object-store–backed idempotency key path for Phase 2 / Phase 3.
+/// Object-store–backed idempotency key path (S3 / GCS).
 ///
 /// Layout: `idempotency/<sha256-hex>` — hashed to keep the object name
 /// URL-safe + bounded regardless of caller-supplied key shape. The key

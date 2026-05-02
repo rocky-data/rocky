@@ -184,11 +184,11 @@ pub async fn run_preview_create(
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    // Phase 1 emits `run_status = "planned"` — actually invoking
+    // Emits `run_status = "planned"` — actually invoking
     // `rocky run --branch <name>` for each prune-set model is left to
-    // the caller (or to the Phase 4 GitHub Action). Going planned-only
-    // keeps Phase 1 honest about scope without breaking the PR-comment
-    // contract.
+    // the caller (or to the GitHub Action). Going planned-only keeps
+    // the contract honest about scope without breaking the PR-comment
+    // surface.
     let out = PreviewCreateOutput::new(
         resolved_branch_name,
         branch_schema,
@@ -2358,7 +2358,7 @@ mod tests {
     }
 
     /// Markdown rendering is deterministic and includes the headline
-    /// metrics. Used by the Phase 4 GitHub Action.
+    /// metrics. Used by the `rocky-preview` GitHub Action.
     #[test]
     fn diff_markdown_renders_table() {
         let branch = run_record(

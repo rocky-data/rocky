@@ -286,7 +286,7 @@ pub fn compile_rocky_model(source: &str) -> String {
         }
     };
 
-    // Phase 3: Extract lineage from lowered SQL
+    // Extract lineage from lowered SQL
     let lineage = match rocky_sql::lineage::extract_lineage(&sql) {
         Ok(result) => serde_json::to_value(&result).ok(),
         Err(e) => {
