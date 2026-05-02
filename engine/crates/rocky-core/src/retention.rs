@@ -168,6 +168,169 @@ impl std::str::FromStr for RetentionPolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// State-store retention
+// ---------------------------------------------------------------------------
+//
+// Distinct from the per-model warehouse `RetentionPolicy` above. This config
+// governs sweeping of Rocky's own `state.redb` tables — run history, DAG
+// snapshots, and quality snapshots — to prevent unbounded growth of the
+// control-plane store. Operational tables (`schema_cache`, `watermarks`,
+// `partitions`) are never swept here; they hold live state, not history.
+
+/// Domain identifier for the state-store retention sweep.
+///
+/// The wire format is a lowercase string in `applies_to` — the [`Display`]
+/// impl produces the canonical spelling, and the `from_str` impl accepts
+/// only that spelling (no aliases).
+///
+/// [`Display`]: std::fmt::Display
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateRetentionDomain {
+    /// Pipeline run records (`run_history` table). Each row carries
+    /// `started_at`/`finished_at` and the governance audit trail.
+    History,
+    /// DAG snapshots (`dag_snapshots` table). Each entry carries the graph
+    /// hash and the diff against the prior snapshot.
+    Lineage,
+    /// Per-model quality snapshots (`quality_history` table). Each entry
+    /// carries `timestamp`, `run_id`, and the metric blob.
+    Audit,
+}
+
+impl std::fmt::Display for StateRetentionDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StateRetentionDomain::History => "history",
+            StateRetentionDomain::Lineage => "lineage",
+            StateRetentionDomain::Audit => "audit",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for StateRetentionDomain {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "history" => Ok(StateRetentionDomain::History),
+            "lineage" => Ok(StateRetentionDomain::Lineage),
+            "audit" => Ok(StateRetentionDomain::Audit),
+            other => Err(format!(
+                "unknown state retention domain '{other}' (expected one of: history, lineage, audit)"
+            )),
+        }
+    }
+}
+
+/// Default `max_age_days` when `[state.retention]` is unset or omits the field.
+///
+/// One year is the conservative default: long enough that a year-over-year
+/// query against `rocky history` is still useful, short enough that the
+/// state store does not balloon for projects that run hourly.
+pub const DEFAULT_STATE_RETENTION_MAX_AGE_DAYS: u32 = 365;
+
+/// Default `min_runs_kept` when `[state.retention]` is unset.
+///
+/// Applied independently per domain (last 100 runs, last 100 DAG snapshots,
+/// last 100 quality snapshots) so a long-idle project never has every row
+/// swept just because every row is older than `max_age_days`.
+pub const DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT: u32 = 100;
+
+/// State-store retention policy.
+///
+/// Bounds the size of Rocky's `state.redb` by sweeping rows older than
+/// `max_age_days` from the run-history, DAG-snapshot, and
+/// quality-snapshot tables. The most recent `min_runs_kept` rows in each
+/// domain are always preserved, so a project that has not run in months
+/// still has its last good baseline available for `rocky history` and
+/// `rocky compare`.
+///
+/// Operational state — schema cache, watermarks, partition records — is
+/// never swept by this policy: those tables hold live correctness data
+/// (without them, the next run cannot resume), not history.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StateRetentionConfig {
+    /// Drop rows whose timestamp is older than this many days. Counted
+    /// from the row's recorded `started_at` (history), `timestamp`
+    /// (lineage / audit) — not the file mtime. Defaults to
+    /// [`DEFAULT_STATE_RETENTION_MAX_AGE_DAYS`].
+    #[serde(default = "default_state_retention_max_age_days")]
+    pub max_age_days: u32,
+
+    /// Always preserve at least this many rows in each domain, even if
+    /// every row is older than `max_age_days`. Applied per domain
+    /// (last N runs, last N DAG snapshots, last N quality snapshots).
+    /// Defaults to [`DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT`].
+    #[serde(default = "default_state_retention_min_runs_kept")]
+    pub min_runs_kept: u32,
+
+    /// Domains to sweep. Defaults to `["history", "lineage", "audit"]`.
+    /// Setting `applies_to = []` disables the sweep entirely without
+    /// removing the config block — useful for staged rollouts.
+    #[serde(default = "default_state_retention_applies_to")]
+    pub applies_to: Vec<StateRetentionDomain>,
+}
+
+impl Default for StateRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: default_state_retention_max_age_days(),
+            min_runs_kept: default_state_retention_min_runs_kept(),
+            applies_to: default_state_retention_applies_to(),
+        }
+    }
+}
+
+fn default_state_retention_max_age_days() -> u32 {
+    DEFAULT_STATE_RETENTION_MAX_AGE_DAYS
+}
+
+fn default_state_retention_min_runs_kept() -> u32 {
+    DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT
+}
+
+fn default_state_retention_applies_to() -> Vec<StateRetentionDomain> {
+    vec![
+        StateRetentionDomain::History,
+        StateRetentionDomain::Lineage,
+        StateRetentionDomain::Audit,
+    ]
+}
+
+impl StateRetentionConfig {
+    /// `true` when this domain should be swept under the current policy.
+    pub fn applies_to_domain(&self, domain: StateRetentionDomain) -> bool {
+        self.applies_to.contains(&domain)
+    }
+}
+
+/// Per-domain count of rows the sweep removed and rows it kept.
+///
+/// Returned by `StateStore::sweep_retention`. `duration_ms` is the wall
+/// clock for the whole sweep (all domains, all transactions).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SweepReport {
+    /// Run records (`run_history`) deleted.
+    pub runs_deleted: u64,
+    /// Run records kept (those younger than `max_age_days` plus the most
+    /// recent `min_runs_kept`).
+    pub runs_kept: u64,
+    /// DAG snapshots (`dag_snapshots`) deleted.
+    pub lineage_deleted: u64,
+    /// DAG snapshots kept.
+    pub lineage_kept: u64,
+    /// Quality snapshots (`quality_history`) deleted.
+    pub audit_deleted: u64,
+    /// Quality snapshots kept.
+    pub audit_kept: u64,
+    /// Wall-clock duration of the sweep, in milliseconds.
+    pub duration_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
