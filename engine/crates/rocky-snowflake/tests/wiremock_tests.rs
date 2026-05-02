@@ -23,6 +23,7 @@ fn test_connector(server: &MockServer) -> SnowflakeConnector {
         password: None,
         oauth_token: Some("test-sf-token".into()),
         private_key_path: None,
+        pat: None,
     })
     .unwrap();
 
@@ -50,6 +51,7 @@ fn test_connector_with_retries(server: &MockServer, max_retries: u32) -> Snowfla
         password: None,
         oauth_token: Some("test-sf-token".into()),
         private_key_path: None,
+        pat: None,
     })
     .unwrap();
 
@@ -637,6 +639,7 @@ async fn test_keypair_auth_headers() {
         password: None,
         oauth_token: None,
         private_key_path: Some("/unused-because-cache-primed.pem".into()),
+        pat: None,
     })
     .unwrap();
     auth.prime_cache_with("fake-jwt-token", Duration::from_secs(3540))
@@ -714,6 +717,7 @@ async fn test_password_auth_omits_token_type_header() {
         password: Some("test_pass".into()),
         oauth_token: None,
         private_key_path: None,
+        pat: None,
     })
     .unwrap();
     // Skip the live login-request hit by priming the session-token cache.
