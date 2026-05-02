@@ -1,6 +1,6 @@
 [package]
 name = "rocky"
-version = "1.22.0"
+version = "1.23.0"
 description = "Rust SQL transformation engine"
 edition.workspace = true
 license.workspace = true

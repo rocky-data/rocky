@@ -1,6 +1,6 @@
 [package]
 name = "rocky-lsp"
-version = "1.22.0"
+version = "1.23.0"
 description = "Rocky Language Server Protocol binary (minimal, adapter-free)"
 edition.workspace = true
 license.workspace = true
