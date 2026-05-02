@@ -25,8 +25,8 @@ use crate::output::{
     LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput,
     OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
     ProfileStorageOutput, ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, RunOutput,
-    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput,
-    ValidateMigrationOutput, ValidateOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
+    ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.

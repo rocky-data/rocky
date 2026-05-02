@@ -1538,12 +1538,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             Some(StateAction::Retention {
                 action: RetentionAction::Sweep { dry_run },
-            }) => rocky_cli::commands::state_retention_sweep(
-                &cli.config,
-                &state_path,
-                dry_run,
-                json,
-            ),
+            }) => {
+                rocky_cli::commands::state_retention_sweep(&cli.config, &state_path, dry_run, json)
+            }
         },
         Command::Compile {
             models,

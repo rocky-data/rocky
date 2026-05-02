@@ -2675,7 +2675,7 @@ impl RetentionSweepOutput {
             dry_run,
             max_age_days: policy.max_age_days,
             min_runs_kept: policy.min_runs_kept,
-            domains: policy.applies_to.iter().map(|d| d.to_string()).collect(),
+            domains: policy.applies_to.iter().map(ToString::to_string).collect(),
             runs_deleted: report.runs_deleted,
             runs_kept: report.runs_kept,
             lineage_deleted: report.lineage_deleted,
