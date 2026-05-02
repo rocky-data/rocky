@@ -483,6 +483,13 @@ pub struct StateConfig {
     /// [`IdempotencyConfig`].
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
+    /// Retention policy applied to Rocky's own `state.redb` tables (run
+    /// history, DAG snapshots, quality snapshots). Bounds the size of the
+    /// control-plane store; operational tables (schema cache, watermarks,
+    /// partition records) are never swept by this policy. See
+    /// [`crate::retention::StateRetentionConfig`].
+    #[serde(default)]
+    pub retention: crate::retention::StateRetentionConfig,
 }
 
 impl Default for StateConfig {
@@ -499,6 +506,7 @@ impl Default for StateConfig {
             retry: RetryConfig::default(),
             on_upload_failure: StateUploadFailureMode::default(),
             idempotency: IdempotencyConfig::default(),
+            retention: crate::retention::StateRetentionConfig::default(),
         }
     }
 }
