@@ -184,6 +184,17 @@ from .branch_schema import BranchEntry, BranchOutput
 from .branch_list_schema import BranchListOutput
 from .branch_delete_schema import BranchDeleteOutput
 
+# Catalog (project-wide column-lineage snapshot)
+from .catalog_schema import (
+    AssetKind,
+    CatalogAsset,
+    CatalogColumn,
+    CatalogEdge,
+    CatalogOutput,
+    CatalogStats,
+    EdgeConfidence,
+)
+
 # Replay (inspection-only run record)
 from .replay_schema import ReplayModelOutput, ReplayOutput
 
@@ -341,6 +352,14 @@ __all__ = [
     "BranchEntry",
     "BranchListOutput",
     "BranchDeleteOutput",
+    # catalog
+    "CatalogOutput",
+    "CatalogAsset",
+    "CatalogColumn",
+    "CatalogEdge",
+    "CatalogStats",
+    "AssetKind",
+    "EdgeConfidence",
     # replay
     "ReplayOutput",
     "ReplayModelOutput",

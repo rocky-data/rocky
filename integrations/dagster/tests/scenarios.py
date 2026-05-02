@@ -726,3 +726,69 @@ RETENTION_STATUS: dict[str, Any] = {
         },
     ],
 }
+
+# ---------------------------------------------------------------------------
+# catalog — project-wide column-lineage snapshot covering one source and
+# two derived models. Mirrors what `rocky catalog` would emit against the
+# playground POC.
+# ---------------------------------------------------------------------------
+
+CATALOG: dict[str, Any] = {
+    "version": "1.22.0",
+    "command": "catalog",
+    "generated_at": "2026-05-02T12:00:00Z",
+    "project_name": "playground",
+    "config_hash": "abcdef0123456789",
+    "assets": [
+        {
+            "fqn": "raw__orders.orders",
+            "model_name": "raw_orders",
+            "kind": "Source",
+            "columns": [
+                {"name": "order_id", "data_type": "INT64", "nullable": False},
+                {"name": "customer_id", "data_type": "INT64", "nullable": False},
+                {"name": "amount", "data_type": "FLOAT64", "nullable": True},
+            ],
+            "upstream_models": [],
+            "downstream_models": ["customer_orders"],
+        },
+        {
+            "fqn": "playground.staging__orders.customer_orders",
+            "model_name": "customer_orders",
+            "kind": "Model",
+            "columns": [
+                {"name": "customer_id", "data_type": "INT64", "nullable": False},
+                {"name": "total_revenue", "data_type": "FLOAT64", "nullable": True},
+            ],
+            "upstream_models": ["raw_orders"],
+            "downstream_models": ["revenue_summary"],
+            "intent": "Per-customer revenue rollup.",
+        },
+    ],
+    "edges": [
+        {
+            "source_model": "raw_orders",
+            "source_column": "amount",
+            "target_model": "customer_orders",
+            "target_column": "total_revenue",
+            "transform": "aggregation: sum",
+            "confidence": "High",
+        },
+        {
+            "source_model": "raw_orders",
+            "source_column": "customer_id",
+            "target_model": "customer_orders",
+            "target_column": "customer_id",
+            "transform": "direct",
+            "confidence": "High",
+        },
+    ],
+    "stats": {
+        "asset_count": 2,
+        "column_count": 5,
+        "edge_count": 2,
+        "assets_with_star": 0,
+        "orphan_columns": 0,
+        "duration_ms": 7,
+    },
+}

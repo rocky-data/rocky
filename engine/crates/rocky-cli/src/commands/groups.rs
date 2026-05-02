@@ -81,7 +81,9 @@ pub fn classify_command(name: &str) -> Option<CommandGroup> {
             Some(CommandGroup::Pipeline)
         }
         // Model
-        "compile" | "test" | "lineage" | "metrics" | "optimize" | "ci" => Some(CommandGroup::Model),
+        "compile" | "test" | "lineage" | "catalog" | "metrics" | "optimize" | "ci" => {
+            Some(CommandGroup::Model)
+        }
         // Infra
         "doctor" | "hooks" | "archive" | "compact" | "profile-storage" | "watch" => {
             Some(CommandGroup::Infra)
@@ -119,6 +121,7 @@ fn commands_for_group(group: CommandGroup) -> &'static [(&'static str, &'static 
             ),
             ("test", "Run local model tests via DuckDB"),
             ("lineage", "Show column-level lineage for a model"),
+            ("catalog", "Emit a project-wide column-lineage snapshot"),
             ("metrics", "Show quality metrics for a model"),
             ("optimize", "Analyze costs and recommend strategy changes"),
             ("ci", "Run CI pipeline: compile + test"),
@@ -212,6 +215,7 @@ mod tests {
         assert_eq!(classify_command("compile"), Some(CommandGroup::Model));
         assert_eq!(classify_command("test"), Some(CommandGroup::Model));
         assert_eq!(classify_command("lineage"), Some(CommandGroup::Model));
+        assert_eq!(classify_command("catalog"), Some(CommandGroup::Model));
         assert_eq!(classify_command("metrics"), Some(CommandGroup::Model));
         assert_eq!(classify_command("optimize"), Some(CommandGroup::Model));
         assert_eq!(classify_command("ci"), Some(CommandGroup::Model));

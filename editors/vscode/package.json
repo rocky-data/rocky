@@ -160,6 +160,11 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.catalog",
+        "title": "Build Project Catalog (Column Lineage Snapshot)",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.compact",
         "title": "Compact Table",
         "category": "Rocky"

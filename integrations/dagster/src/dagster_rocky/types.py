@@ -956,10 +956,16 @@ from .types_generated import (  # noqa: E402, F401
     AiSyncOutput,
     AiTestOutput,
     AnomalyOutput,
+    AssetKind,
     BranchDeleteOutput,
     BranchEntry,
     BranchListOutput,
     BranchOutput,
+    CatalogAsset,
+    CatalogColumn,
+    CatalogEdge,
+    CatalogOutput,
+    CatalogStats,
     ChecksConfigOutput,
     CiDiffOutput,
     CiOutput,
@@ -983,6 +989,7 @@ from .types_generated import (  # noqa: E402, F401
     DriftActionOutput,
     DriftOutput,
     DriftSummary,
+    EdgeConfidence,
     EnvMaskingStatus,
     FailedSourceOutput,
     FreshnessConfigOutput,
@@ -1084,6 +1091,7 @@ RockyOutput = (
     | DagResult
     | ComplianceOutput
     | RetentionStatusOutput
+    | CatalogOutput
 )
 
 
@@ -1115,6 +1123,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "dag": DagResult,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
+    "catalog": CatalogOutput,
 }
 
 

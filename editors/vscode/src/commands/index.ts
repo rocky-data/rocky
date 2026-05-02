@@ -4,7 +4,7 @@ import { aiExplain, aiGenerate, aiSync, aiTest } from "./ai";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { hooksList, hooksTest } from "./hooks";
-import { history, metrics } from "./inspect";
+import { catalog, history, metrics } from "./inspect";
 import { showLineage } from "./lineage";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
@@ -43,6 +43,7 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     // State inspection
     vscode.commands.registerCommand("rocky.history", history),
     vscode.commands.registerCommand("rocky.metrics", metrics),
+    vscode.commands.registerCommand("rocky.catalog", catalog),
 
     // Storage management
     vscode.commands.registerCommand("rocky.compact", compact),

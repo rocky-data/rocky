@@ -43,6 +43,7 @@ from .types import (
     AiResult,
     AiSyncResult,
     AiTestResult,
+    CatalogOutput,
     CiResult,
     ColumnLineageResult,
     CompileResult,
@@ -1749,6 +1750,24 @@ class RockyResource(dg.ConfigurableResource):
         if column is not None:
             return _parse_rocky_json(output, ColumnLineageResult, command="lineage")
         return _parse_rocky_json(output, ModelLineageResult, command="lineage")
+
+    def catalog(self, *, out: str | None = None) -> CatalogOutput:
+        """Run ``rocky catalog`` and return the parsed catalog snapshot.
+
+        Walks the project's SemanticGraph and returns a project-wide
+        column-lineage artifact. The same payload is also written to
+        ``./.rocky/catalog/catalog.json`` (or ``out`` when supplied)
+        for non-Rocky consumers.
+
+        Args:
+            out: Optional output directory. When ``None``, the binary
+                writes to ``./.rocky/catalog/`` relative to the current
+                working directory.
+        """
+        args = ["catalog", "--models", self.models_dir]
+        if out is not None:
+            args.extend(["--out", out])
+        return _parse_rocky_json(self._run_rocky(args), CatalogOutput, command="catalog")
 
     # ------------------------------------------------------------------ #
     # DAG + per-model execution                                          #

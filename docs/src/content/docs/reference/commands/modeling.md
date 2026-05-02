@@ -263,6 +263,75 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 ---
 
+## `rocky catalog`
+
+Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as a single JSON artifact so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
+
+```bash
+rocky catalog [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
+| `--out <PATH>` | `PathBuf` | `.rocky/catalog/` | Output directory. The JSON file is always written to `<out>/catalog.json`. |
+
+### Behaviour
+
+`rocky catalog` always writes `<out>/catalog.json`. The CLI's stdout is a one-line summary in the default `--output table` mode, or the same JSON payload mirrored to stdout in `--output json` mode.
+
+The artifact contains:
+
+- `assets` — one entry per model or upstream source, with columns (name plus inferred type and nullability when known), upstream / downstream lists, and the model's intent description when supplied.
+- `edges` — one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `expression`, `aggregation: <fn>`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved for future use).
+- `stats` — aggregate counts (`asset_count`, `edge_count`, `column_count`, `assets_with_star`, `orphan_columns`, `duration_ms`).
+- A `config_hash` fingerprint of `rocky.toml` so consumers can tell whether the catalog was built against the current configuration.
+
+### Examples
+
+Build the default snapshot:
+
+```bash
+rocky catalog
+```
+
+```text
+rocky catalog
+  project:          playground
+  assets:           3
+  columns:          13
+  edges:            13
+  json:             .rocky/catalog/catalog.json
+  duration:         12ms
+```
+
+Pipe the JSON shape directly:
+
+```bash
+rocky catalog --output json | jq '.stats'
+```
+
+Write to a custom directory (for example, when building a per-PR artifact):
+
+```bash
+rocky catalog --out build/catalog
+```
+
+### Limitations (PR-1)
+
+- JSON only. Parquet output (`edges.parquet` + `assets.parquet`) lands in a follow-up release.
+- `last_run_id` and `last_materialized_at` are unset. State-store enrichment lands in a follow-up release.
+- Lineage extraction inherits the existing extractor's coverage — window functions, CTEs, set operations, `CASE WHEN` projections, and join keys are not yet surfaced as edges. Asset-level partial lineage is flagged via `stats.assets_with_star`.
+
+### Related Commands
+
+- [`rocky lineage`](#rocky-lineage) -- per-model lineage exploration with `--column` traces
+- [`rocky compile`](#rocky-compile) -- build the semantic graph that the catalog reads
+
+---
+
 ## `rocky test`
 
 Run local model tests via DuckDB without needing warehouse credentials. Validates model SQL, contract compliance, and user-defined test assertions.

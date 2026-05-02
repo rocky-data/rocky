@@ -3,6 +3,7 @@ mod archive;
 #[cfg(feature = "duckdb")]
 pub mod bench;
 mod branch;
+mod catalog;
 #[cfg(feature = "duckdb")]
 mod ci;
 mod ci_diff;
@@ -61,6 +62,7 @@ pub use bench::run_bench;
 pub use branch::{
     run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_show,
 };
+pub use catalog::{default_out_dir as catalog_default_out_dir, run_catalog};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::run_ci_diff;
