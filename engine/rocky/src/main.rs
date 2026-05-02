@@ -719,6 +719,14 @@ enum Command {
         /// fields for byte-stability with schema v5 consumers.
         #[arg(long)]
         audit: bool,
+        /// Augment `--model` output with rolling statistics (mean, std dev,
+        /// z-score, and health score) computed over the most recent N
+        /// successful executions. Requires `--model`.
+        #[arg(long)]
+        rolling_stats: bool,
+        /// Window size for `--rolling-stats` (number of successful executions).
+        #[arg(long, default_value_t = 20)]
+        window: usize,
     },
 
     /// Show quality metrics for a model
@@ -1753,11 +1761,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             model,
             since,
             audit,
+            rolling_stats,
+            window,
         } => rocky_cli::commands::run_history(
             &state_path,
             model.as_deref(),
             since.as_deref(),
             audit,
+            rolling_stats,
+            window,
             json,
         ),
         Command::Metrics {
