@@ -1470,6 +1470,42 @@ pub struct ClearSchemaCacheOutput {
     pub dry_run: bool,
 }
 
+/// JSON output for `rocky state retention sweep`.
+///
+/// Mirrors [`rocky_core::retention::SweepReport`] with the
+/// version/command envelope every CLI JSON output carries. `dry_run = true`
+/// reports counts that *would* result without touching the state store.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RetentionSweepOutput {
+    pub version: String,
+    pub command: String,
+    /// `true` when `--dry-run` was set; the state store was left untouched.
+    pub dry_run: bool,
+    /// Configured retention window in days at the time of the sweep.
+    pub max_age_days: u32,
+    /// Configured per-domain floor at the time of the sweep.
+    pub min_runs_kept: u32,
+    /// Domains that were considered in this sweep, as the canonical
+    /// lowercase strings (`"history"`, `"lineage"`, `"audit"`).
+    pub domains: Vec<String>,
+    /// Run records (`run_history`) deleted, or that would be deleted in
+    /// dry-run mode.
+    pub runs_deleted: u64,
+    /// Run records remaining after the sweep.
+    pub runs_kept: u64,
+    /// DAG snapshots (`dag_snapshots`) deleted, or that would be deleted.
+    pub lineage_deleted: u64,
+    /// DAG snapshots remaining.
+    pub lineage_kept: u64,
+    /// Quality snapshots (`quality_history`) deleted, or that would be
+    /// deleted.
+    pub audit_deleted: u64,
+    /// Quality snapshots remaining.
+    pub audit_kept: u64,
+    /// Wall-clock duration of the sweep in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// JSON output for `rocky list pipelines`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ListPipelinesOutput {
@@ -2623,6 +2659,30 @@ impl ClearSchemaCacheOutput {
             command: "state-clear-schema-cache".to_string(),
             entries_deleted,
             dry_run,
+        }
+    }
+}
+
+impl RetentionSweepOutput {
+    pub fn new(
+        report: &rocky_core::retention::SweepReport,
+        policy: &rocky_core::retention::StateRetentionConfig,
+        dry_run: bool,
+    ) -> Self {
+        RetentionSweepOutput {
+            version: VERSION.to_string(),
+            command: "state-retention-sweep".to_string(),
+            dry_run,
+            max_age_days: policy.max_age_days,
+            min_runs_kept: policy.min_runs_kept,
+            domains: policy.applies_to.iter().map(|d| d.to_string()).collect(),
+            runs_deleted: report.runs_deleted,
+            runs_kept: report.runs_kept,
+            lineage_deleted: report.lineage_deleted,
+            lineage_kept: report.lineage_kept,
+            audit_deleted: report.audit_deleted,
+            audit_kept: report.audit_kept,
+            duration_ms: report.duration_ms,
         }
     }
 }

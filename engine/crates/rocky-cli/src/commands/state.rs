@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use rocky_core::config::load_rocky_config;
+use rocky_core::retention::StateRetentionConfig;
 use rocky_core::state::StateStore;
 
 use crate::output::*;
@@ -85,6 +87,83 @@ pub fn state_clear_schema_cache(state_path: &Path, dry_run: bool, output_json: b
     }
 
     emit_result(count, dry_run, output_json)
+}
+
+/// Execute `rocky state retention sweep`.
+///
+/// Loads the [`StateRetentionConfig`] from the project's `[state.retention]`
+/// block (falling back to the defaults — `max_age_days = 365`,
+/// `min_runs_kept = 100`, `applies_to = [history, lineage, audit]` —
+/// when the section is absent), then sweeps run history, DAG snapshots,
+/// and quality snapshots accordingly.
+///
+/// Behaviour:
+/// - Missing `state.redb` → emits a zero-count report and exits cleanly,
+///   matching `state clear-schema-cache` (CI-safe on ephemeral runners).
+/// - `dry_run = true` runs the planner but skips every write transaction
+///   so the store is left untouched. The reported counts match what an
+///   apply run would produce, modulo concurrent writers.
+pub fn state_retention_sweep(
+    config_path: &Path,
+    state_path: &Path,
+    dry_run: bool,
+    output_json: bool,
+) -> Result<()> {
+    // Read the policy from rocky.toml so the same sweep semantics apply
+    // whether the operator runs the command manually or it's wired into a
+    // future scheduled hook. `config_path` may not exist (init flow) — in
+    // that case we sweep with the defaults.
+    let policy = if config_path.exists() {
+        let cfg = load_rocky_config(config_path)
+            .with_context(|| format!("loading rocky config at {}", config_path.display()))?;
+        cfg.state.retention
+    } else {
+        StateRetentionConfig::default()
+    };
+
+    if !state_path.exists() {
+        emit_sweep_report(&Default::default(), &policy, dry_run, output_json)?;
+        return Ok(());
+    }
+
+    let store = StateStore::open(state_path).context(format!(
+        "failed to open state store at {}",
+        state_path.display()
+    ))?;
+
+    let report = if dry_run {
+        store
+            .sweep_retention_dry_run(&policy)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        store
+            .sweep_retention(&policy)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+
+    emit_sweep_report(&report, &policy, dry_run, output_json)
+}
+
+fn emit_sweep_report(
+    report: &rocky_core::retention::SweepReport,
+    policy: &StateRetentionConfig,
+    dry_run: bool,
+    output_json: bool,
+) -> Result<()> {
+    if output_json {
+        print_json(&RetentionSweepOutput::new(report, policy, dry_run))?;
+    } else {
+        let prefix = if dry_run { "[dry-run] would remove" } else { "Removed" };
+        println!(
+            "{prefix} {} run records, {} dag snapshots, {} quality snapshots ({} ms)",
+            report.runs_deleted, report.lineage_deleted, report.audit_deleted, report.duration_ms,
+        );
+        println!(
+            "Kept: {} runs, {} dag snapshots, {} quality snapshots",
+            report.runs_kept, report.lineage_kept, report.audit_kept,
+        );
+    }
+    Ok(())
 }
 
 fn emit_result(count: usize, dry_run: bool, output_json: bool) -> Result<()> {

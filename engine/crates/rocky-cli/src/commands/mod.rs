@@ -107,7 +107,7 @@ pub use seed::run_seed;
 pub use serve::run_serve;
 pub use shell::run_shell;
 pub use snapshot::run_snapshot;
-pub use state::{state_clear_schema_cache, state_show};
+pub use state::{state_clear_schema_cache, state_retention_sweep, state_show};
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]
