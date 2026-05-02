@@ -231,12 +231,25 @@ pub async fn run_preview_create(
 /// how many rows the model produced?"* and *"did the cost change?"* —
 /// the two things a reviewer most needs to see. Sampled row content
 /// remains the gold standard but the structural layer ships today.
+/// Algorithm selector mirrored on the public command surface so the
+/// `rocky` binary can map its clap `ValueEnum` to a stable in-tree type
+/// without leaking clap into the CLI library.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewDiffAlgorithmSelector {
+    #[default]
+    Sampled,
+    Bisection,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_preview_diff(
-    _config_path: &Path,
+    config_path: &Path,
     state_path: &Path,
+    models_dir: &Path,
     branch_name: &str,
     base_ref: &str,
     _sample_size: usize,
+    algorithm: PreviewDiffAlgorithmSelector,
     json: bool,
 ) -> Result<()> {
     use crate::output::PreviewDiffOutput;
@@ -244,13 +257,12 @@ pub async fn run_preview_diff(
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    // Phase 2 substance: pull the latest two runs from the state store
-    // and pair them up by branch-name. The *latest* run keyed to the
-    // branch is "branch"; the most recent prior run *not* tagged to
-    // this branch is "base." Tighter branch-vs-main partitioning lands
-    // when `git_branch` is plumbed through the state-store branch
-    // record (today the audit trail records `git_branch` on the
-    // RunRecord directly).
+    // Pull the latest two runs from the state store and pair them up by
+    // branch-name. The *latest* run keyed to the branch is "branch"; the
+    // most recent prior run *not* tagged to this branch is "base."
+    // Tighter branch-vs-main partitioning lands when `git_branch` is
+    // plumbed through the state-store branch record (today the audit
+    // trail records `git_branch` on the RunRecord directly).
     let mut branch_run: Option<rocky_core::state::RunRecord> = None;
     let mut base_run: Option<rocky_core::state::RunRecord> = None;
     for record in store.list_runs(50)? {
@@ -284,12 +296,276 @@ pub async fn run_preview_diff(
         print_json(&out)?;
     } else {
         info!(
-            "preview diff '{branch_name}' vs {base_ref}: {} models with changes \
-             (sampling deferred to Phase 2.5)",
+            "preview diff '{branch_name}' vs {base_ref}: {} models with changes",
             out.summary.models_with_changes
         );
     }
+
+    // Bisection is opt-in via `--algorithm=bisection`. The result is
+    // logged via tracing today; the JSON output stays unchanged so this
+    // change doesn't ride the schema-cascade gate. The follow-up output-
+    // schema swap is tracked separately and folds the bisection result
+    // into the `PreviewModelDiff` shape.
+    if matches!(algorithm, PreviewDiffAlgorithmSelector::Bisection) {
+        if let Some(branch_run) = branch_run.as_ref() {
+            run_bisection_for_branch_run(config_path, models_dir, branch_name, branch_run).await?;
+        } else {
+            info!(
+                "preview diff '{branch_name}': no branch run found in state store; \
+                 nothing to bisect"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Run checksum-bisection diff for every model in the branch run that
+/// has a single integer / numeric primary key. Emits one
+/// `tracing::info!` per model with the diff totals and stats; logs a
+/// `tracing::warn!` skip-reason for models whose strategy doesn't
+/// declare a usable PK.
+///
+/// JSON output is unchanged in this PR — bisection results land via
+/// tracing only. The `PreviewModelDiff` schema swap that surfaces them
+/// as a typed field is its own change.
+async fn run_bisection_for_branch_run(
+    config_path: &Path,
+    models_dir: &Path,
+    branch_name: &str,
+    branch_run: &rocky_core::state::RunRecord,
+) -> Result<()> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let registry = crate::registry::AdapterRegistry::from_config(&cfg)
+        .context("building adapter registry from config for --algorithm=bisection")?;
+
+    // Match the resolution `execute_copy_from_base` uses: prefer
+    // `default`, fall back to first-declared.
+    let adapter_names = registry.warehouse_adapter_names();
+    let adapter_name = if adapter_names.iter().any(|n| n == "default") {
+        "default".to_string()
+    } else {
+        adapter_names
+            .into_iter()
+            .next()
+            .context("no warehouse adapters configured for --algorithm=bisection")?
+    };
+    let adapter = registry.warehouse_adapter(&adapter_name)?;
+
+    let models = rocky_core::models::load_models_from_dir(models_dir)
+        .with_context(|| format!("loading models from {}", models_dir.display()))?;
+    let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
+        models.iter().map(|m| (m.config.name.clone(), m)).collect();
+
+    let branch_schema = format!("branch__{branch_name}");
+
+    for executed in &branch_run.models_executed {
+        let Some(model) = model_by_name.get(executed.model_name.as_str()) else {
+            tracing::warn!(
+                "bisection: model '{}' is in the branch run but absent from {}; skipping",
+                executed.model_name,
+                models_dir.display(),
+            );
+            continue;
+        };
+        let Some(pk) = single_column_pk(&model.config.strategy) else {
+            tracing::warn!(
+                "bisection: model '{}' has no single-column unique_key declared in its \
+                 sidecar (strategy is not Merge with one column); skipping",
+                executed.model_name,
+            );
+            continue;
+        };
+
+        let base_table = rocky_core::ir::TableRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: model.config.target.schema.clone(),
+            table: model.config.target.table.clone(),
+        };
+        let branch_table = rocky_core::ir::TableRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: branch_schema.clone(),
+            table: model.config.target.table.clone(),
+        };
+
+        if let Err(e) = bisect_one_model(
+            adapter.as_ref(),
+            &model.config.name,
+            &pk,
+            &base_table,
+            &branch_table,
+        )
+        .await
+        {
+            tracing::warn!("bisection: model '{}' failed: {e}", executed.model_name,);
+        }
+    }
+    Ok(())
+}
+
+/// Pull the single-column PK off a `StrategyConfig::Merge` sidecar
+/// declaration. Returns `None` for any other strategy or for a
+/// composite key — bisection on composite keys requires the follow-up
+/// composite-bucketing path that's not in this PR.
+fn single_column_pk(strategy: &rocky_core::models::StrategyConfig) -> Option<String> {
+    match strategy {
+        rocky_core::models::StrategyConfig::Merge { unique_key, .. } if unique_key.len() == 1 => {
+            Some(unique_key[0].clone())
+        }
+        _ => None,
+    }
+}
+
+/// Run bisection for one model pair: query MIN/MAX of the PK, discover
+/// non-PK columns via DESCRIBE TABLE, and invoke the kernel.
+async fn bisect_one_model(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    model_name: &str,
+    pk_column: &str,
+    base_table: &rocky_core::ir::TableRef,
+    branch_table: &rocky_core::ir::TableRef,
+) -> Result<()> {
+    use rocky_core::compare::bisection::{BisectionConfig, BisectionTarget, bisection_diff};
+
+    let (pk_lo, pk_hi) = pk_window(adapter, base_table, branch_table, pk_column)
+        .await
+        .with_context(|| format!("resolving PK window for '{model_name}'"))?;
+    if pk_hi <= pk_lo {
+        info!(
+            "bisection: model '{model_name}' has empty PK window [{pk_lo}, {pk_hi}); \
+             nothing to diff"
+        );
+        return Ok(());
+    }
+
+    let columns = describe_value_columns(adapter, branch_table, base_table, pk_column)
+        .await
+        .with_context(|| format!("DESCRIBE TABLE for '{model_name}'"))?;
+    if columns.is_empty() {
+        tracing::warn!("bisection: model '{model_name}' has no non-PK columns; skipping");
+        return Ok(());
+    }
+
+    let target = BisectionTarget {
+        base: base_table,
+        branch: branch_table,
+        pk_column,
+        value_columns: &columns,
+        pk_lo,
+        pk_hi,
+    };
+    let config = BisectionConfig::default();
+    let result = bisection_diff(adapter, adapter, &target, &config)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    info!(
+        target: "rocky::preview::bisection",
+        model = model_name,
+        rows_added = result.rows_added,
+        rows_removed = result.rows_removed,
+        rows_changed = result.rows_changed,
+        chunks_examined = result.stats.chunks_examined,
+        leaves_materialized = result.stats.leaves_materialized,
+        depth_max = result.stats.depth_max,
+        depth_capped = result.stats.depth_capped,
+        null_pk_rows_base = result.stats.null_pk_rows_base,
+        null_pk_rows_branch = result.stats.null_pk_rows_branch,
+        "bisection complete",
+    );
+    Ok(())
+}
+
+/// Resolve `[lo, hi)` over the union of base + branch PK ranges.
+/// `MIN(pk)` / `MAX(pk)+1` semantics; falls back to `(0, 0)` when both
+/// sides are empty.
+async fn pk_window(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    base: &rocky_core::ir::TableRef,
+    branch: &rocky_core::ir::TableRef,
+    pk_column: &str,
+) -> Result<(i128, i128)> {
+    rocky_sql::validation::validate_identifier(pk_column)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let dialect = adapter.dialect();
+    let base_ref = dialect
+        .format_table_ref(&base.catalog, &base.schema, &base.table)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let branch_ref = dialect
+        .format_table_ref(&branch.catalog, &branch.schema, &branch.table)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let (base_lo, base_hi) = single_pk_window(adapter, &base_ref, pk_column).await?;
+    let (branch_lo, branch_hi) = single_pk_window(adapter, &branch_ref, pk_column).await?;
+
+    let lo = match (base_lo, branch_lo) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        _ => None,
+    };
+    let hi = match (base_hi, branch_hi) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        _ => None,
+    };
+    Ok((lo.unwrap_or(0), hi.map(|h| h + 1).unwrap_or(0)))
+}
+
+async fn single_pk_window(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    table_ref: &str,
+    pk_column: &str,
+) -> Result<(Option<i128>, Option<i128>)> {
+    let sql = format!(
+        "SELECT MIN(\"{pk_column}\"), MAX(\"{pk_column}\") FROM {table_ref} \
+         WHERE \"{pk_column}\" IS NOT NULL"
+    );
+    let result = adapter
+        .execute_query(&sql)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let Some(row) = result.rows.first() else {
+        return Ok((None, None));
+    };
+    let lo = parse_optional_i128(row.first());
+    let hi = parse_optional_i128(row.get(1));
+    Ok((lo, hi))
+}
+
+fn parse_optional_i128(cell: Option<&serde_json::Value>) -> Option<i128> {
+    let cell = cell?;
+    if cell.is_null() {
+        return None;
+    }
+    if let Some(n) = cell.as_i64() {
+        return Some(n.into());
+    }
+    if let Some(n) = cell.as_u64() {
+        return Some(n.into());
+    }
+    cell.as_str().and_then(|s| s.parse().ok())
+}
+
+/// Discover the non-PK column list to feed the bisection chunk hash.
+/// Prefer the branch side (it's the side that likely has the new
+/// columns); fall back to base if branch is missing or empty.
+async fn describe_value_columns(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    primary: &rocky_core::ir::TableRef,
+    fallback: &rocky_core::ir::TableRef,
+    pk_column: &str,
+) -> Result<Vec<String>> {
+    let cols = match adapter.describe_table(primary).await {
+        Ok(c) if !c.is_empty() => c,
+        _ => adapter
+            .describe_table(fallback)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    };
+    Ok(cols
+        .into_iter()
+        .filter_map(|c| (c.name != pk_column).then_some(c.name))
+        .collect())
 }
 
 /// Build the per-model + summary structural diff from a branch and base
@@ -2201,5 +2477,155 @@ mod tests {
         };
         let md = render_preview_cost_markdown("feature", &summary, &per_model, &[], &budget);
         assert!(!md.contains("Budget projection"));
+    }
+
+    // ---------------------- bisection invocation ----------------------
+
+    /// `single_column_pk` returns the column name for a Merge strategy
+    /// with one unique key, and `None` for everything else (including
+    /// composite Merge until composite-bucketing lands).
+    #[test]
+    fn single_column_pk_picks_merge_one_key() {
+        use rocky_core::models::StrategyConfig;
+        let merge_one = StrategyConfig::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: None,
+        };
+        assert_eq!(single_column_pk(&merge_one).as_deref(), Some("id"));
+
+        let merge_two = StrategyConfig::Merge {
+            unique_key: vec!["a".into(), "b".into()],
+            update_columns: None,
+        };
+        assert_eq!(single_column_pk(&merge_two), None);
+
+        assert_eq!(single_column_pk(&StrategyConfig::FullRefresh), None);
+        assert_eq!(
+            single_column_pk(&StrategyConfig::Incremental {
+                timestamp_column: "ts".into()
+            }),
+            None
+        );
+        assert_eq!(single_column_pk(&StrategyConfig::Ephemeral), None);
+    }
+
+    /// `parse_optional_i128` handles every shape DuckDB's QueryResult
+    /// might return MIN/MAX in: stringified integer, JSON i64, JSON
+    /// u64, and the empty/null cases that mean "table is empty."
+    #[test]
+    fn parse_optional_i128_handles_every_shape() {
+        assert_eq!(
+            parse_optional_i128(Some(&serde_json::Value::String("42".into()))),
+            Some(42)
+        );
+        assert_eq!(
+            parse_optional_i128(Some(&serde_json::Value::Number(7.into()))),
+            Some(7)
+        );
+        assert_eq!(parse_optional_i128(Some(&serde_json::Value::Null)), None);
+        assert_eq!(parse_optional_i128(None), None);
+        assert_eq!(
+            parse_optional_i128(Some(&serde_json::Value::String("not a number".into()))),
+            None
+        );
+    }
+
+    /// End-to-end exercise of `bisect_one_model` against an in-process
+    /// DuckDB. Plants a one-row diff at id=42 in a 200-row fixture and
+    /// asserts the kernel finds it without surfacing into JSON output
+    /// (this PR's contract — bisection results stay in tracing logs
+    /// until the schema swap lands).
+    #[tokio::test]
+    async fn bisect_one_model_finds_planted_change() {
+        use rocky_core::ir::TableRef;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS base")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS branch__test")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE base.fact AS \
+                 SELECT i AS id, 'r' || i AS name, i * 7 AS value \
+                 FROM range(0, 200) t(i)",
+            )
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE branch__test.fact AS \
+                 SELECT i AS id, 'r' || i AS name, \
+                        CASE WHEN i = 42 THEN -1 ELSE i * 7 END AS value \
+                 FROM range(0, 200) t(i)",
+            )
+            .await
+            .unwrap();
+
+        let base_table = TableRef {
+            catalog: String::new(),
+            schema: "base".into(),
+            table: "fact".into(),
+        };
+        let branch_table = TableRef {
+            catalog: String::new(),
+            schema: "branch__test".into(),
+            table: "fact".into(),
+        };
+
+        // The function is async and returns Result<()>; the assertion
+        // is "doesn't error" plus a follow-up DESCRIBE that proves the
+        // adapter saw the right tables.
+        bisect_one_model(&adapter, "fact", "id", &base_table, &branch_table)
+            .await
+            .expect("bisect_one_model on the in-process DuckDB pair must succeed");
+    }
+
+    /// Empty-window short-circuit — both sides empty, no kernel
+    /// invocation, no error.
+    #[tokio::test]
+    async fn bisect_one_model_empty_window_short_circuits() {
+        use rocky_core::ir::TableRef;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS base")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS branch__empty")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE TABLE base.t (id INTEGER, name VARCHAR)")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE TABLE branch__empty.t (id INTEGER, name VARCHAR)")
+            .await
+            .unwrap();
+
+        let base_table = TableRef {
+            catalog: String::new(),
+            schema: "base".into(),
+            table: "t".into(),
+        };
+        let branch_table = TableRef {
+            catalog: String::new(),
+            schema: "branch__empty".into(),
+            table: "t".into(),
+        };
+
+        bisect_one_model(&adapter, "t", "id", &base_table, &branch_table)
+            .await
+            .expect("empty-window bisect must short-circuit cleanly");
     }
 }

@@ -92,7 +92,9 @@ pub use metrics::run_metrics;
 pub use optimize::run_optimize;
 pub use plan::plan;
 pub use playground::{run_playground, run_playground_with_template};
-pub use preview::{run_preview_cost, run_preview_create, run_preview_diff};
+pub use preview::{
+    PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
+};
 pub use profile_storage::run_profile_storage;
 pub use replay::run_replay;
 pub use retention_status::run_retention_status;
