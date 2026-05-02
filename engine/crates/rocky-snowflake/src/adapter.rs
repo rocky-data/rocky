@@ -232,6 +232,50 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         let result = self.execute_query(&sql).await?;
         parse_snowflake_chunk_checksums(&result, k)
     }
+
+    /// Override: emit Snowflake's native zero-copy
+    /// `CREATE TABLE ... CLONE` instead of the portable CTAS default.
+    ///
+    /// At create time the clone is metadata-only — Snowflake shares the
+    /// source table's micropartitions with the new table and only
+    /// diverges them on subsequent writes (copy-on-write). This makes
+    /// branch creation effectively free regardless of source size.
+    ///
+    /// Branch table lands in `<source.catalog>.<branch_schema>.<source.table>`,
+    /// matching the trait surface (`branch_schema` scopes the branch by
+    /// schema only, source database is preserved).
+    ///
+    /// Uses `CREATE TABLE` rather than `CREATE OR REPLACE TABLE`: if the
+    /// target table already exists, that signals a caller bug (e.g. a
+    /// branch was not torn down between runs), and silently overwriting
+    /// it would mask the issue. The error surfaces as an `AdapterError`.
+    ///
+    /// All identifier components are validated through
+    /// [`rocky_sql::validation::validate_identifier`] before
+    /// interpolation, then wrapped in double quotes per Snowflake's
+    /// quoting convention.
+    ///
+    /// Requires `SELECT` on the source table and `CREATE TABLE` on the
+    /// target schema for the executing role.
+    async fn clone_table_for_branch(
+        &self,
+        source: &TableRef,
+        branch_schema: &str,
+    ) -> AdapterResult<()> {
+        validation::validate_identifier(&source.catalog).map_err(AdapterError::new)?;
+        validation::validate_identifier(&source.schema).map_err(AdapterError::new)?;
+        validation::validate_identifier(&source.table).map_err(AdapterError::new)?;
+        validation::validate_identifier(branch_schema).map_err(AdapterError::new)?;
+
+        let database = &source.catalog;
+        let src_schema = &source.schema;
+        let table = &source.table;
+        let sql = format!(
+            "CREATE TABLE \"{database}\".\"{branch_schema}\".\"{table}\" \
+             CLONE \"{database}\".\"{src_schema}\".\"{table}\""
+        );
+        self.execute_statement(&sql).await
+    }
 }
 
 /// Verify the bisection runner passed K contiguous IntRange chunks and
