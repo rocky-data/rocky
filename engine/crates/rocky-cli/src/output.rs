@@ -309,6 +309,33 @@ pub struct BudgetBreachOutput {
     pub actual: f64,
 }
 
+/// One per-model budget breach surfaced on
+/// [`PreviewCostOutput::projected_per_model_budget_breaches`].
+///
+/// Same fields as [`BudgetBreachOutput`] plus `model_name`. Kept as a
+/// distinct type so the run-level `budget_breaches` shape stays
+/// untouched; downstream consumers iterate the two surfaces with
+/// separate code paths or merge them deliberately.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PerModelBudgetBreachOutput {
+    /// Name of the model whose resolved per-model budget was breached.
+    pub model_name: String,
+    /// Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or
+    /// `"max_bytes_scanned"`.
+    pub limit_type: String,
+    /// Effective limit applied — i.e. the field-inheritance result of
+    /// per-model overrides composed against the project-level
+    /// `[budget]`. Surfaced as the resolved value rather than the raw
+    /// override so PR readers see the limit they actually crossed.
+    pub limit: f64,
+    pub actual: f64,
+    /// Resolved on-breach action for this model: `"warn"` or `"error"`.
+    /// When `"error"`, this breach would fail the run if merged.
+    /// Defaults from the project-level config when the sidecar omits
+    /// `on_breach`.
+    pub on_breach: String,
+}
+
 fn is_zero(v: &usize) -> bool {
     *v == 0
 }
@@ -4218,6 +4245,20 @@ pub struct PreviewCostOutput {
     /// process both with one code path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projected_budget_breaches: Vec<BudgetBreachOutput>,
+    /// Budget breaches projected against per-model branch totals —
+    /// populated only when at least one model's resolved budget (its
+    /// sidecar `[budget]` composed against the project-level config) is
+    /// breached. Each entry carries `model_name` plus the same
+    /// `limit_type` / `limit` / `actual` triple as
+    /// [`Self::projected_budget_breaches`], with the resolved
+    /// `on_breach` so downstream consumers can render
+    /// advisory-vs-blocking per row. Empty when no per-model breach is
+    /// projected. Strictly additive — kept on a separate field so
+    /// existing consumers of `projected_budget_breaches` (which
+    /// continues to surface only project-level breaches) are
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_per_model_budget_breaches: Vec<PerModelBudgetBreachOutput>,
     pub markdown: String,
 }
 
@@ -4339,6 +4380,7 @@ impl PreviewCostOutput {
         summary: PreviewCostSummary,
         per_model: Vec<PreviewModelCostDelta>,
         projected_budget_breaches: Vec<BudgetBreachOutput>,
+        projected_per_model_budget_breaches: Vec<PerModelBudgetBreachOutput>,
         markdown: String,
     ) -> Self {
         PreviewCostOutput {
@@ -4350,6 +4392,7 @@ impl PreviewCostOutput {
             summary,
             per_model,
             projected_budget_breaches,
+            projected_per_model_budget_breaches,
             markdown,
         }
     }

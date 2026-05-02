@@ -1461,6 +1461,80 @@ pub struct BudgetBreach {
     pub actual: f64,
 }
 
+/// Per-model `[budget]` overrides declared in a model sidecar.
+///
+/// Same field set as [`BudgetConfig`], but every field — including
+/// `on_breach` — is `Option`. Absence vs. explicit value matters so a
+/// partial sidecar block (e.g. only `max_usd`) inherits the missing
+/// fields from the project-level `[budget]`. Resolved against the
+/// project-level config via [`ModelBudgetConfig::resolve`] before any
+/// breach check runs.
+///
+/// Precedence is "per-model is the local authority": when a field is
+/// explicitly set on the sidecar it wins, even when the project-level
+/// has its own value. A per-model `on_breach = "warn"` overrides a
+/// project-level `on_breach = "error"` for that one model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBudgetConfig {
+    /// Maximum allowed branch cost in USD for this single model. Inherits
+    /// the project-level value when unset.
+    #[serde(default)]
+    pub max_usd: Option<f64>,
+
+    /// Maximum allowed branch wall-clock duration in milliseconds for this
+    /// single model. Inherits the project-level value when unset.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+
+    /// Maximum allowed branch bytes scanned for this single model.
+    /// Inherits the project-level value when unset. Today this dimension
+    /// only fires for BigQuery (the only adapter that populates
+    /// `bytes_scanned`); other adapters skip it rather than treat it as
+    /// zero. Mirrors [`BudgetConfig::max_bytes_scanned`] semantics.
+    #[serde(default)]
+    pub max_bytes_scanned: Option<u64>,
+
+    /// Action to take when a per-model limit is breached. When unset,
+    /// inherits the project-level [`BudgetConfig::on_breach`]. When set
+    /// explicitly it takes precedence over the project-level value for
+    /// this one model — a sidecar `on_breach = "warn"` keeps a local
+    /// breach advisory even when the project enforces with
+    /// `on_breach = "error"`.
+    #[serde(default)]
+    pub on_breach: Option<BudgetBreachAction>,
+}
+
+impl ModelBudgetConfig {
+    /// True when no field is set — caller should fall back to the
+    /// project-level config rather than building a degenerate
+    /// [`BudgetConfig`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.max_usd.is_none()
+            && self.max_duration_ms.is_none()
+            && self.max_bytes_scanned.is_none()
+            && self.on_breach.is_none()
+    }
+
+    /// Compose this per-model override against a project-level
+    /// [`BudgetConfig`] into a fully-resolved [`BudgetConfig`].
+    ///
+    /// Field-level inheritance: each field on the returned config is
+    /// the per-model value when explicitly set, otherwise the
+    /// project-level value. The result feeds directly into
+    /// [`BudgetConfig::check_breaches`].
+    #[must_use]
+    pub fn resolve(&self, project: &BudgetConfig) -> BudgetConfig {
+        BudgetConfig {
+            max_usd: self.max_usd.or(project.max_usd),
+            max_duration_ms: self.max_duration_ms.or(project.max_duration_ms),
+            max_bytes_scanned: self.max_bytes_scanned.or(project.max_bytes_scanned),
+            on_breach: self.on_breach.unwrap_or(project.on_breach),
+        }
+    }
+}
+
 /// Valkey/Redis cache configuration for distributed caching.
 ///
 /// Note: this type has existed since the early cache experiments and is
@@ -5679,6 +5753,97 @@ max_rows = 1000000
         let cfg = BudgetConfig::default();
         let breaches = cfg.check_breaches(None, 0, Some(u64::MAX));
         assert!(breaches.is_empty());
+    }
+
+    // -- ModelBudgetConfig (per-model overrides) ----------------------------
+
+    #[test]
+    fn model_budget_default_is_empty() {
+        let m = ModelBudgetConfig::default();
+        assert!(m.is_empty());
+        assert!(m.max_usd.is_none());
+        assert!(m.on_breach.is_none());
+    }
+
+    #[test]
+    fn model_budget_parses_from_toml() {
+        // Partial block: only `max_usd` and `on_breach` set; the other
+        // two fields stay `None` so they inherit from the project-level
+        // config when resolved.
+        let toml_str = r#"
+max_usd = 0.50
+on_breach = "warn"
+"#;
+        let m: ModelBudgetConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(m.max_usd, Some(0.50));
+        assert!(m.max_duration_ms.is_none());
+        assert!(m.max_bytes_scanned.is_none());
+        assert_eq!(m.on_breach, Some(BudgetBreachAction::Warn));
+    }
+
+    #[test]
+    fn model_budget_rejects_unknown_fields() {
+        let toml_str = r#"
+max_usd = 1.0
+max_rows = 1000
+"#;
+        let result: Result<ModelBudgetConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn model_budget_resolve_field_inheritance() {
+        let project = BudgetConfig {
+            max_usd: Some(10.0),
+            max_duration_ms: Some(60_000),
+            max_bytes_scanned: Some(1_000_000),
+            on_breach: BudgetBreachAction::Error,
+        };
+        // Override one field; the rest inherit.
+        let over = ModelBudgetConfig {
+            max_usd: Some(2.0),
+            max_duration_ms: None,
+            max_bytes_scanned: None,
+            on_breach: None,
+        };
+        let resolved = over.resolve(&project);
+        assert_eq!(resolved.max_usd, Some(2.0));
+        assert_eq!(resolved.max_duration_ms, Some(60_000));
+        assert_eq!(resolved.max_bytes_scanned, Some(1_000_000));
+        // `on_breach` falls back to project when per-model is `None`.
+        assert_eq!(resolved.on_breach, BudgetBreachAction::Error);
+    }
+
+    #[test]
+    fn model_budget_resolve_per_model_on_breach_wins() {
+        // The load-bearing precedence call: per-model `on_breach`,
+        // when explicitly set, is the local authority. A per-model
+        // `warn` overrides a project-level `error` for that one model.
+        let project = BudgetConfig {
+            max_usd: Some(10.0),
+            on_breach: BudgetBreachAction::Error,
+            ..BudgetConfig::default()
+        };
+        let over = ModelBudgetConfig {
+            on_breach: Some(BudgetBreachAction::Warn),
+            ..ModelBudgetConfig::default()
+        };
+        assert_eq!(over.resolve(&project).on_breach, BudgetBreachAction::Warn);
+
+        // Reverse direction also holds — per-model `error` over project
+        // `warn`.
+        let project_warn = BudgetConfig {
+            on_breach: BudgetBreachAction::Warn,
+            ..BudgetConfig::default()
+        };
+        let over_err = ModelBudgetConfig {
+            on_breach: Some(BudgetBreachAction::Error),
+            ..ModelBudgetConfig::default()
+        };
+        assert_eq!(
+            over_err.resolve(&project_warn).on_breach,
+            BudgetBreachAction::Error
+        );
     }
 
     // -----------------------------------------------------------------------

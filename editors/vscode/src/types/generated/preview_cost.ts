@@ -29,6 +29,10 @@ export interface PreviewCostOutput {
    * Budget breaches projected against the branch totals — populated only when the project declares a `[budget]` block. Lets a PR reviewer (and a CI gate) see "this PR would breach the run-level `max_usd` / `max_duration_ms` / `max_bytes_scanned` if merged" before the merge actually happens. Empty when no budget is configured or the projected totals stay within every limit. Mirrors the `RunOutput.budget_breaches` shape so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.
    */
   projected_budget_breaches?: BudgetBreachOutput[];
+  /**
+   * Budget breaches projected against per-model branch totals — populated only when at least one model's resolved budget (its sidecar `[budget]` composed against the project-level config) is breached. Each entry carries `model_name` plus the same `limit_type` / `limit` / `actual` triple as [`Self::projected_budget_breaches`], with the resolved `on_breach` so downstream consumers can render advisory-vs-blocking per row. Empty when no per-model breach is projected. Strictly additive — kept on a separate field so existing consumers of `projected_budget_breaches` (which continues to surface only project-level breaches) are unaffected.
+   */
+  projected_per_model_budget_breaches?: PerModelBudgetBreachOutput[];
   summary: PreviewCostSummary;
   version: string;
   [k: string]: unknown;
@@ -63,6 +67,31 @@ export interface BudgetBreachOutput {
    * Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
    */
   limit_type: string;
+  [k: string]: unknown;
+}
+/**
+ * One per-model budget breach surfaced on [`PreviewCostOutput::projected_per_model_budget_breaches`].
+ *
+ * Same fields as [`BudgetBreachOutput`] plus `model_name`. Kept as a distinct type so the run-level `budget_breaches` shape stays untouched; downstream consumers iterate the two surfaces with separate code paths or merge them deliberately.
+ */
+export interface PerModelBudgetBreachOutput {
+  actual: number;
+  /**
+   * Effective limit applied — i.e. the field-inheritance result of per-model overrides composed against the project-level `[budget]`. Surfaced as the resolved value rather than the raw override so PR readers see the limit they actually crossed.
+   */
+  limit: number;
+  /**
+   * Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
+   */
+  limit_type: string;
+  /**
+   * Name of the model whose resolved per-model budget was breached.
+   */
+  model_name: string;
+  /**
+   * Resolved on-breach action for this model: `"warn"` or `"error"`. When `"error"`, this breach would fail the run if merged. Defaults from the project-level config when the sidecar omits `on_breach`.
+   */
+  on_breach: string;
   [k: string]: unknown;
 }
 /**

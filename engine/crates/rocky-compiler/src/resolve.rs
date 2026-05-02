@@ -205,6 +205,7 @@ mod tests {
                 format_options: None,
                 classification: Default::default(),
                 retention: None,
+                budget: None,
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),

@@ -214,6 +214,7 @@ fn import_manifest_node(
         format_options: None,
         classification: Default::default(),
         retention: None,
+        budget: None,
     };
 
     result.imported.push(ImportedModel {
@@ -602,6 +603,7 @@ fn import_single_model(
         format_options: None,
         classification: Default::default(),
         retention: None,
+        budget: None,
     };
 
     Ok((
