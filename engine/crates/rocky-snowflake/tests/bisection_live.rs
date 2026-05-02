@@ -60,6 +60,7 @@ fn adapter_from_env() -> Option<(SnowflakeWarehouseAdapter, String)> {
         password: std::env::var("SNOWFLAKE_PASSWORD").ok(),
         oauth_token: std::env::var("SNOWFLAKE_OAUTH_TOKEN").ok(),
         private_key_path: std::env::var("SNOWFLAKE_PRIVATE_KEY_PATH").ok(),
+        pat: std::env::var("SNOWFLAKE_PAT").ok(),
     })
     .ok()?;
 

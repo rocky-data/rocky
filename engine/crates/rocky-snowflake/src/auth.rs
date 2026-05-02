@@ -47,6 +47,8 @@ pub enum TokenType {
     OAuth,
     /// Session token from username/password login — no token-type header.
     SessionToken,
+    /// Programmatic Access Token — sets `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`.
+    Pat,
 }
 
 impl TokenType {
@@ -58,6 +60,7 @@ impl TokenType {
             TokenType::KeypairJwt => Some("KEYPAIR_JWT"),
             TokenType::OAuth => Some("OAUTH"),
             TokenType::SessionToken => None,
+            TokenType::Pat => Some("PROGRAMMATIC_ACCESS_TOKEN"),
         }
     }
 }
@@ -96,6 +99,8 @@ pub struct AuthConfig {
     pub oauth_token: Option<String>,
     /// Path to RSA private key file (PEM) for key-pair auth.
     pub private_key_path: Option<String>,
+    /// Programmatic Access Token (issued via Snowsight User Profile).
+    pub pat: Option<String>,
 }
 
 /// Opaque auth handle. Use [`Auth::from_config`] to create.
@@ -123,6 +128,9 @@ enum AuthInner {
         private_key_path: String,
         cached_token: Arc<RwLock<Option<CachedToken>>>,
     },
+    /// Programmatic Access Token — used as a Bearer token directly with the
+    /// `PROGRAMMATIC_ACCESS_TOKEN` token-type header.
+    Pat { token: RedactedString },
 }
 
 #[derive(Clone)]
@@ -168,12 +176,22 @@ struct LoginData {
 
 impl Auth {
     /// Creates an Auth provider using auto-detection:
-    /// 1. If `oauth_token` is set -> OAuth
-    /// 2. If `private_key_path` is set -> Key-pair (RS256 JWT)
-    /// 3. If `username` + `password` are set -> Password
-    /// 4. Otherwise -> error
+    /// 1. If `pat` is set -> Programmatic Access Token
+    /// 2. If `oauth_token` is set -> OAuth
+    /// 3. If `private_key_path` is set -> Key-pair (RS256 JWT)
+    /// 4. If `username` + `password` are set -> Password
+    /// 5. Otherwise -> error
     pub fn from_config(config: AuthConfig) -> Result<Self, AuthError> {
-        // OAuth takes highest priority
+        // PAT takes highest priority — distinct token-type header from OAuth.
+        if let Some(token) = config.pat.filter(|t| !t.is_empty()) {
+            return Ok(Auth {
+                inner: AuthInner::Pat {
+                    token: RedactedString::new(token),
+                },
+            });
+        }
+
+        // OAuth — pre-obtained access token from an IdP.
         if let Some(token) = config.oauth_token.filter(|t| !t.is_empty()) {
             return Ok(Auth {
                 inner: AuthInner::OAuth {
@@ -205,7 +223,10 @@ impl Auth {
                     account: config.account,
                     username: user,
                     password: RedactedString::new(pass),
-                    http_client: Client::new(),
+                    http_client: Client::builder()
+                        .user_agent(concat!("rocky/", env!("CARGO_PKG_VERSION")))
+                        .build()
+                        .unwrap_or_else(|_| Client::new()),
                     cached_token: Arc::new(RwLock::new(None)),
                 },
             }),
@@ -222,6 +243,7 @@ impl Auth {
             AuthInner::OAuth { .. } => TokenType::OAuth,
             AuthInner::KeyPair { .. } => TokenType::KeypairJwt,
             AuthInner::Password { .. } => TokenType::SessionToken,
+            AuthInner::Pat { .. } => TokenType::Pat,
         }
     }
 
@@ -229,6 +251,8 @@ impl Auth {
     pub async fn get_token(&self) -> Result<String, AuthError> {
         match &self.inner {
             AuthInner::OAuth { token } => Ok(token.expose().to_string()),
+
+            AuthInner::Pat { token } => Ok(token.expose().to_string()),
 
             AuthInner::KeyPair {
                 account,
@@ -384,8 +408,8 @@ impl Auth {
     /// token from the cache.
     pub async fn invalidate_cache(&self) {
         match &self.inner {
-            AuthInner::OAuth { .. } => {
-                // OAuth here is caller-supplied and not refreshable by us.
+            AuthInner::OAuth { .. } | AuthInner::Pat { .. } => {
+                // Both are caller-supplied and not refreshable by us.
             }
             AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
                 let mut cache = cached_token.write().await;
@@ -412,7 +436,7 @@ impl Auth {
     #[cfg(test)]
     async fn has_cached_token(&self) -> bool {
         match &self.inner {
-            AuthInner::OAuth { .. } => false,
+            AuthInner::OAuth { .. } | AuthInner::Pat { .. } => false,
             AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
                 cached_token.read().await.is_some()
             }
@@ -432,7 +456,7 @@ impl Auth {
             expires_at: Instant::now() + ttl,
         };
         match &self.inner {
-            AuthInner::OAuth { .. } => {}
+            AuthInner::OAuth { .. } | AuthInner::Pat { .. } => {}
             AuthInner::Password { cached_token, .. } | AuthInner::KeyPair { cached_token, .. } => {
                 *cached_token.write().await = Some(new_cached);
             }
@@ -461,6 +485,7 @@ impl std::fmt::Debug for Auth {
                 .field("account", account)
                 .field("username", username)
                 .finish_non_exhaustive(),
+            AuthInner::Pat { .. } => f.debug_struct("Auth::Pat").field("token", &"***").finish(),
         }
     }
 }
@@ -477,6 +502,7 @@ mod tests {
             password: None,
             oauth_token: Some("oauth_token_abc".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_oauth());
@@ -490,6 +516,7 @@ mod tests {
             password: Some("pass".into()),
             oauth_token: None,
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_password());
@@ -503,6 +530,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: Some("/path/to/key.pem".into()),
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_key_pair());
@@ -516,6 +544,7 @@ mod tests {
             password: Some("pass".into()),
             oauth_token: Some("token".into()),
             private_key_path: Some("/path/to/key.pem".into()),
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_oauth());
@@ -529,6 +558,7 @@ mod tests {
             password: Some("pass".into()),
             oauth_token: None,
             private_key_path: Some("/path/to/key.pem".into()),
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_key_pair());
@@ -542,6 +572,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: None,
+            pat: None,
         });
         assert!(result.is_err());
     }
@@ -554,6 +585,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: None,
+            pat: None,
         });
         assert!(result.is_err());
     }
@@ -566,6 +598,7 @@ mod tests {
             password: None,
             oauth_token: Some("my_oauth_token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         assert_eq!(auth.get_token().await.unwrap(), "my_oauth_token");
@@ -579,6 +612,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: Some("/path/to/key.pem".into()),
+            pat: None,
         })
         .unwrap();
         assert!(!auth.has_cached_token().await);
@@ -597,6 +631,7 @@ mod tests {
             password: Some("pass".into()),
             oauth_token: None,
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         assert!(!auth.has_cached_token().await);
@@ -615,6 +650,7 @@ mod tests {
             password: None,
             oauth_token: Some("pre_supplied_token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         auth.invalidate_cache().await; // should not panic
@@ -629,6 +665,7 @@ mod tests {
             password: None,
             oauth_token: None,
             private_key_path: Some("/nonexistent/key.pem".into()),
+            pat: None,
         })
         .unwrap();
         let result = auth.get_token().await;
@@ -648,6 +685,7 @@ mod tests {
             password: None,
             oauth_token: Some("super_secret_token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         let debug = format!("{auth:?}");
@@ -663,6 +701,7 @@ mod tests {
             password: Some("pass".into()),
             oauth_token: Some(String::new()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
         assert!(auth.is_password());

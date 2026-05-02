@@ -339,6 +339,7 @@ mod tests {
             password: None,
             oauth_token: Some("test_token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
 
@@ -373,6 +374,7 @@ mod tests {
             password: None,
             oauth_token: Some("token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
 
@@ -393,7 +395,7 @@ mod tests {
             .dialect()
             .format_table_ref("mydb", "public", "users")
             .unwrap();
-        assert_eq!(ref_str, "mydb.public.users");
+        assert_eq!(ref_str, "\"mydb\".\"public\".\"users\"");
     }
 
     #[test]
@@ -404,6 +406,7 @@ mod tests {
             password: None,
             oauth_token: Some("token".into()),
             private_key_path: None,
+            pat: None,
         })
         .unwrap();
 

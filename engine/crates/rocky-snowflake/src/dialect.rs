@@ -19,13 +19,21 @@ pub struct SnowflakeSqlDialect;
 
 impl SqlDialect for SnowflakeSqlDialect {
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
-        // Snowflake uses database.schema.table (catalog = database)
+        // Snowflake folds *unquoted* identifiers to UPPERCASE at parse time, so
+        // case-preserving (lowercase or mixed-case) names need explicit
+        // double-quoting to round-trip. The shared `validation::format_table_ref`
+        // emits unquoted identifiers, which silently breaks against any schema
+        // / table created with quoted lowercase names. Quote each component.
+        validation::validate_identifier(schema).map_err(AdapterError::new)?;
+        validation::validate_identifier(table).map_err(AdapterError::new)?;
+        let schema_q = self.quote_identifier(schema);
+        let table_q = self.quote_identifier(table);
         if catalog.is_empty() {
-            validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            validation::validate_identifier(table).map_err(AdapterError::new)?;
-            Ok(format!("{schema}.{table}"))
+            Ok(format!("{schema_q}.{table_q}"))
         } else {
-            validation::format_table_ref(catalog, schema, table).map_err(AdapterError::new)
+            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+            let catalog_q = self.quote_identifier(catalog);
+            Ok(format!("{catalog_q}.{schema_q}.{table_q}"))
         }
     }
 
@@ -260,7 +268,7 @@ mod tests {
         let d = dialect();
         assert_eq!(
             d.format_table_ref("mydb", "public", "users").unwrap(),
-            "mydb.public.users"
+            "\"mydb\".\"public\".\"users\""
         );
     }
 
@@ -269,7 +277,7 @@ mod tests {
         let d = dialect();
         assert_eq!(
             d.format_table_ref("", "public", "users").unwrap(),
-            "public.users"
+            "\"public\".\"users\""
         );
     }
 
