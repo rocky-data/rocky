@@ -14,28 +14,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::project::Project;
 
-/// A column fully qualified by its model (or source) name.
-///
-/// Uses `Arc<str>` for cheap cloning — cloning a `QualifiedColumn` is an
-/// atomic reference-count increment instead of two heap allocations.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QualifiedColumn {
-    /// Model name or source name.
-    pub model: Arc<str>,
-    /// Column name.
-    pub column: Arc<str>,
-}
-
-/// An edge in the semantic graph connecting columns across models.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LineageEdge {
-    /// Upstream column (source).
-    pub source: QualifiedColumn,
-    /// Downstream column (target).
-    pub target: QualifiedColumn,
-    /// How the column is transformed.
-    pub transform: TransformKind,
-}
+// `LineageEdge` and `QualifiedColumn` were relocated to `rocky-core::lineage`
+// as part of Typed-IR Option B Phase 1 PR-1, so that IR types in `rocky-core`
+// can reference them without inducing a dependency cycle (rocky-compiler
+// already depends on rocky-core, one-way). They are re-exported here so that
+// `rocky_compiler::semantic::{LineageEdge, QualifiedColumn}` keeps resolving.
+pub use rocky_core::lineage::{LineageEdge, QualifiedColumn};
 
 /// Definition of a column in a model's output schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
