@@ -1115,6 +1115,11 @@ enum PreviewAction {
         /// Branch name registered by `preview create`.
         #[arg(long)]
         name: String,
+        /// Models directory. Used to load per-model `[budget]` overrides
+        /// from sidecars so the projected-breach surface includes
+        /// per-model breaches alongside the project-level totals.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
 }
 
@@ -1992,8 +1997,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             }
-            PreviewAction::Cost { name } => {
-                rocky_cli::commands::run_preview_cost(&cli.config, &state_path, &name, json).await
+            PreviewAction::Cost { name, models } => {
+                rocky_cli::commands::run_preview_cost(
+                    &cli.config,
+                    &state_path,
+                    &models,
+                    &name,
+                    json,
+                )
+                .await
             }
         },
         Command::RetentionStatus {

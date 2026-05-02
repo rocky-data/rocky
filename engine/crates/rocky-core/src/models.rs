@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config::ModelBudgetConfig;
 use crate::dag::DagNode;
 use crate::ir::{
     GovernanceConfig, MaterializationStrategy, SourceRef, TargetRef, TransformationPlan,
@@ -133,6 +134,27 @@ pub struct ModelConfig {
     /// [`GovernanceAdapter::apply_retention_policy`]: crate::traits::GovernanceAdapter::apply_retention_policy
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionPolicy>,
+
+    /// Per-model `[budget]` overrides. Same field set as the project-level
+    /// [`crate::config::BudgetConfig`] but every field is `Option` —
+    /// absent fields inherit from the project-level config. Resolved
+    /// against the project-level via
+    /// [`crate::config::ModelBudgetConfig::resolve`] when the
+    /// pre-merge cost projection runs.
+    ///
+    /// ```toml
+    /// name = "fct_orders_huge"
+    ///
+    /// [budget]
+    /// max_usd = 5.0
+    /// on_breach = "error"
+    /// ```
+    ///
+    /// Per-model fields are the local authority — a sidecar
+    /// `on_breach = "warn"` overrides a project-level
+    /// `on_breach = "error"` for this one model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ModelBudgetConfig>,
 }
 
 /// Per-model freshness configuration.
@@ -352,6 +374,10 @@ pub struct RawModelConfig {
     /// rather than a generic toml deserialization error.
     #[serde(default)]
     pub retention: Option<String>,
+
+    /// Per-model `[budget]` overrides. See [`ModelConfig::budget`].
+    #[serde(default)]
+    pub budget: Option<ModelBudgetConfig>,
 }
 
 /// Permissive target config — all fields optional.
@@ -502,6 +528,7 @@ fn resolve_model_config(
         format_options: raw.format_options,
         classification: raw.classification,
         retention,
+        budget: raw.budget,
     })
 }
 

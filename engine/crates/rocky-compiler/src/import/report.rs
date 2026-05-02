@@ -513,6 +513,7 @@ mod tests {
                 format_options: None,
                 classification: Default::default(),
                 retention: None,
+                budget: None,
             },
         }
     }

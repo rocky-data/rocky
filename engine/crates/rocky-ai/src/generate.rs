@@ -253,6 +253,7 @@ fn build_generated_model(name: &str, sql: String, source: &str, format: &str) ->
             format_options: None,
             classification: Default::default(),
             retention: None,
+            budget: None,
         },
         sql: if format == "rocky" {
             sql
@@ -334,6 +335,7 @@ mod tests {
                 format_options: None,
                 classification: Default::default(),
                 retention: None,
+                budget: None,
             },
             sql: sql.to_string(),
             file_path: format!("upstream/{name}.sql"),
