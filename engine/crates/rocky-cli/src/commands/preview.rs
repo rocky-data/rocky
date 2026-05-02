@@ -64,8 +64,11 @@ use crate::output::{
 ///    resolve its source schema from the model sidecar (`target.schema`),
 ///    issue `CREATE SCHEMA IF NOT EXISTS branch_schema` then
 ///    `CREATE OR REPLACE TABLE branch_schema.model AS SELECT * FROM
-///    source_schema.model`. Phase 5 lifts this to native warehouse
-///    clones (`SHALLOW CLONE` / zero-copy `CLONE`).
+///    source_schema.model`. Adapters with native zero-copy clone
+///    primitives (Databricks `SHALLOW CLONE`, Snowflake `CLONE`,
+///    BigQuery `CREATE TABLE … COPY`) override
+///    `WarehouseAdapter::clone_table_for_branch` to swap the CTAS for
+///    the cheaper metadata-only operation.
 ///
 /// Returns a [`PreviewCreateOutput`] regardless of partial failures —
 /// the PR-comment surface needs to stay informative.
@@ -211,19 +214,25 @@ pub async fn run_preview_create(
 // `rocky preview diff`
 // ---------------------------------------------------------------------------
 
-/// Structural + (deferred) sampled row-level diff between branch and base
-/// for every model that ran on both sides.
+/// Structural + row-level diff between branch and base for every model
+/// that ran on both sides.
 ///
-/// **Phase 2 scope.** Ships the *structural* layer — for each model that
-/// has a `RunRecord` against both the branch run and the base run, surface
-/// the row-count delta + bytes-scanned/written deltas with a deterministic
-/// Markdown rendering. Each model carries a [`PreviewSamplingWindow`] with
-/// `coverage = "not_yet_sampled"` and `coverage_warning = true` — honest
-/// flag that row-level samples don't run yet. Phase 2.5 lifts to
-/// checksum-bisection exhaustive diff (datafold-style) over the
-/// `rocky_core::compare` shadow kernel; until then, structural deltas
-/// catch row-count and byte-volume regressions, which is the most common
-/// failure mode the PR-comment surface needs to flag.
+/// **Default (`--algorithm=sampled`).** Surfaces the row-count delta +
+/// bytes-scanned/written deltas computed off the per-model `RunRecord`
+/// pair. Each model carries a [`PreviewSamplingWindow`] with
+/// `coverage = "not_yet_sampled"` and `coverage_warning = true` — an
+/// honest flag that the sampled algorithm doesn't read row content
+/// yet, so changes that don't shift row counts won't surface here.
+///
+/// **`--algorithm=bisection`.** Runs the checksum-bisection kernel
+/// (`rocky_core::compare::bisection`) for every model in the branch
+/// run that declares a single-column integer / numeric `unique_key`
+/// on a Merge strategy. Each qualifying model emits a
+/// [`PreviewBisectionRowDiff`] with rows_added/removed/changed and a
+/// [`crate::output::BisectionStatsOutput`] trace; models that don't
+/// qualify (composite key, non-numeric PK, non-Merge strategy) fall
+/// back to the sampled placeholder with a `tracing::warn` skip
+/// reason.
 ///
 /// **Why structural-only is useful.** `RunRecord` carries `rows_affected`
 /// and `bytes_scanned` per model from the live run path, so a
@@ -278,10 +287,39 @@ pub async fn run_preview_diff(
         }
     }
 
-    let (summary, models) = match (branch_run.as_ref(), base_run.as_ref()) {
+    let (mut summary, mut models) = match (branch_run.as_ref(), base_run.as_ref()) {
         (Some(b), Some(p)) => build_preview_diff(b, p),
         _ => (empty_diff_summary(), Vec::new()),
     };
+
+    // When bisection is selected, run the kernel for every qualifying
+    // model and replace its `algorithm = Sampled { ... }` payload with
+    // `algorithm = Bisection { ... }` in-place. Models that don't
+    // qualify (no single-column unique_key, etc.) keep the sampled
+    // placeholder. This must happen before markdown rendering and JSON
+    // serialization so both surface the chosen algorithm.
+    if matches!(algorithm, PreviewDiffAlgorithmSelector::Bisection) {
+        if let Some(branch_run) = branch_run.as_ref() {
+            apply_bisection_to_models(
+                config_path,
+                models_dir,
+                branch_name,
+                branch_run,
+                &mut models,
+            )
+            .await?;
+            // Re-roll the summary's `any_coverage_warning` with the
+            // widened semantic — true if any model is sampled with
+            // coverage_warning OR bisected with depth_capped.
+            summary.any_coverage_warning = compute_any_coverage_warning(&models);
+        } else {
+            info!(
+                "preview diff '{branch_name}': no branch run found in state store; \
+                 nothing to bisect"
+            );
+        }
+    }
+
     let markdown = render_preview_diff_markdown(branch_name, base_ref, &summary, &models);
 
     let out = PreviewDiffOutput::new(
@@ -301,39 +339,42 @@ pub async fn run_preview_diff(
         );
     }
 
-    // Bisection is opt-in via `--algorithm=bisection`. The result is
-    // logged via tracing today; the JSON output stays unchanged so this
-    // change doesn't ride the schema-cascade gate. The follow-up output-
-    // schema swap is tracked separately and folds the bisection result
-    // into the `PreviewModelDiff` shape.
-    if matches!(algorithm, PreviewDiffAlgorithmSelector::Bisection) {
-        if let Some(branch_run) = branch_run.as_ref() {
-            run_bisection_for_branch_run(config_path, models_dir, branch_name, branch_run).await?;
-        } else {
-            info!(
-                "preview diff '{branch_name}': no branch run found in state store; \
-                 nothing to bisect"
-            );
-        }
-    }
     Ok(())
 }
 
+/// Compute `any_coverage_warning` over a per-model diff list. True if
+/// any model is sampled with `coverage_warning = true` or bisected
+/// with `depth_capped = true`.
+fn compute_any_coverage_warning(models: &[crate::output::PreviewModelDiff]) -> bool {
+    use crate::output::PreviewModelDiffAlgorithm;
+    models.iter().any(|m| match &m.algorithm {
+        PreviewModelDiffAlgorithm::Sampled {
+            sampling_window, ..
+        } => sampling_window.coverage_warning,
+        PreviewModelDiffAlgorithm::Bisection {
+            bisection_stats, ..
+        } => bisection_stats.depth_capped,
+    })
+}
+
 /// Run checksum-bisection diff for every model in the branch run that
-/// has a single integer / numeric primary key. Emits one
-/// `tracing::info!` per model with the diff totals and stats; logs a
-/// `tracing::warn!` skip-reason for models whose strategy doesn't
-/// declare a usable PK.
+/// has a single integer / numeric primary key, then fold the result
+/// into the matching `PreviewModelDiff::algorithm` slot. Models whose
+/// sidecar strategy doesn't expose a usable PK keep their sampled
+/// placeholder and the function logs a `tracing::warn!` skip-reason.
 ///
-/// JSON output is unchanged in this PR — bisection results land via
-/// tracing only. The `PreviewModelDiff` schema swap that surfaces them
-/// as a typed field is its own change.
-async fn run_bisection_for_branch_run(
+/// Failures from the kernel surface as a `tracing::warn!` per model
+/// and the model retains the sampled placeholder — one bad model
+/// doesn't poison the whole preview.
+async fn apply_bisection_to_models(
     config_path: &Path,
     models_dir: &Path,
     branch_name: &str,
     branch_run: &rocky_core::state::RunRecord,
+    models_out: &mut [crate::output::PreviewModelDiff],
 ) -> Result<()> {
+    use crate::output::{PreviewBisectionRowDiff, PreviewModelDiffAlgorithm};
+
     let cfg = rocky_core::config::load_rocky_config(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let registry = crate::registry::AdapterRegistry::from_config(&cfg)
@@ -356,6 +397,10 @@ async fn run_bisection_for_branch_run(
         .with_context(|| format!("loading models from {}", models_dir.display()))?;
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
+    let mut model_out_idx: HashMap<String, usize> = HashMap::new();
+    for (i, m) in models_out.iter().enumerate() {
+        model_out_idx.insert(m.model_name.clone(), i);
+    }
 
     let branch_schema = format!("branch__{branch_name}");
 
@@ -388,16 +433,89 @@ async fn run_bisection_for_branch_run(
             table: model.config.target.table.clone(),
         };
 
-        if let Err(e) = bisect_one_model(
+        let bisection_outcome = bisect_one_model(
             adapter.as_ref(),
             &model.config.name,
             &pk,
             &base_table,
             &branch_table,
         )
-        .await
-        {
-            tracing::warn!("bisection: model '{}' failed: {e}", executed.model_name,);
+        .await;
+        let outcome = match bisection_outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::warn!("bisection: model '{}' failed: {e}", executed.model_name);
+                continue;
+            }
+        };
+
+        let Some(out_idx) = model_out_idx.get(&executed.model_name).copied() else {
+            // Model isn't in the structural diff list (no base
+            // execution to pair against). Surface via tracing so the
+            // result isn't silently lost.
+            tracing::info!(
+                target: "rocky::preview::bisection",
+                model = %executed.model_name,
+                "bisection result has no paired entry in the diff list; skipping fold-in"
+            );
+            continue;
+        };
+        let bisection_kind = outcome.kind_for_log();
+        match outcome {
+            BisectionOutcome::Ran { result } => {
+                let stats = crate::output::BisectionStatsOutput::from_kernel(&result.stats);
+                info!(
+                    target: "rocky::preview::bisection",
+                    model = %executed.model_name,
+                    rows_added = result.rows_added,
+                    rows_removed = result.rows_removed,
+                    rows_changed = result.rows_changed,
+                    chunks_examined = stats.chunks_examined,
+                    leaves_materialized = stats.leaves_materialized,
+                    depth_max = stats.depth_max,
+                    depth_capped = stats.depth_capped,
+                    null_pk_rows_base = stats.null_pk_rows_base,
+                    null_pk_rows_branch = stats.null_pk_rows_branch,
+                    "bisection complete",
+                );
+                let samples = result
+                    .samples
+                    .iter()
+                    .map(|s| crate::output::PreviewRowSample {
+                        primary_key: s.pk.clone(),
+                        // Bisection's leaf record only carries the PK;
+                        // per-column changes are not retained on
+                        // LeafRowSample. Surface an empty `changes`
+                        // list to match the existing PreviewRowSample
+                        // shape.
+                        changes: Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                models_out[out_idx].algorithm = PreviewModelDiffAlgorithm::Bisection {
+                    diff: PreviewBisectionRowDiff {
+                        rows_added: result.rows_added,
+                        rows_removed: result.rows_removed,
+                        rows_changed: result.rows_changed,
+                        samples,
+                    },
+                    bisection_stats: stats,
+                };
+            }
+            BisectionOutcome::EmptyWindow => {
+                info!(
+                    target: "rocky::preview::bisection",
+                    model = %executed.model_name,
+                    outcome = bisection_kind,
+                    "bisection short-circuited; leaving sampled placeholder"
+                );
+            }
+            BisectionOutcome::NoColumns => {
+                tracing::warn!(
+                    target: "rocky::preview::bisection",
+                    model = %executed.model_name,
+                    "bisection: model has no non-PK columns; leaving sampled placeholder"
+                );
+            }
         }
     }
     Ok(())
@@ -416,15 +534,45 @@ fn single_column_pk(strategy: &rocky_core::models::StrategyConfig) -> Option<Str
     }
 }
 
+/// Outcome of a single-model bisection invocation. Surfaces the three
+/// terminal states the runner cares about so the caller can fold the
+/// result back onto the matching `PreviewModelDiff` (or skip it).
+enum BisectionOutcome {
+    /// Kernel ran end-to-end; carries the diff result for the caller
+    /// to fold into the preview output.
+    Ran {
+        result: rocky_core::compare::bisection::BisectionDiffResult,
+    },
+    /// Both sides reported an empty `[pk_lo, pk_hi)` window — nothing
+    /// to diff.
+    EmptyWindow,
+    /// `DESCRIBE TABLE` returned only the PK column. Without any
+    /// value columns there's nothing meaningful to hash; the runner
+    /// skips this model.
+    NoColumns,
+}
+
+impl BisectionOutcome {
+    fn kind_for_log(&self) -> &'static str {
+        match self {
+            BisectionOutcome::Ran { .. } => "ran",
+            BisectionOutcome::EmptyWindow => "empty_window",
+            BisectionOutcome::NoColumns => "no_columns",
+        }
+    }
+}
+
 /// Run bisection for one model pair: query MIN/MAX of the PK, discover
-/// non-PK columns via DESCRIBE TABLE, and invoke the kernel.
+/// non-PK columns via DESCRIBE TABLE, and invoke the kernel. Returns a
+/// [`BisectionOutcome`] so the caller can decide what to surface in
+/// the preview output.
 async fn bisect_one_model(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
     model_name: &str,
     pk_column: &str,
     base_table: &rocky_core::ir::TableRef,
     branch_table: &rocky_core::ir::TableRef,
-) -> Result<()> {
+) -> Result<BisectionOutcome> {
     use rocky_core::compare::bisection::{BisectionConfig, BisectionTarget, bisection_diff};
 
     let (pk_lo, pk_hi) = pk_window(adapter, base_table, branch_table, pk_column)
@@ -435,15 +583,14 @@ async fn bisect_one_model(
             "bisection: model '{model_name}' has empty PK window [{pk_lo}, {pk_hi}); \
              nothing to diff"
         );
-        return Ok(());
+        return Ok(BisectionOutcome::EmptyWindow);
     }
 
     let columns = describe_value_columns(adapter, branch_table, base_table, pk_column)
         .await
         .with_context(|| format!("DESCRIBE TABLE for '{model_name}'"))?;
     if columns.is_empty() {
-        tracing::warn!("bisection: model '{model_name}' has no non-PK columns; skipping");
-        return Ok(());
+        return Ok(BisectionOutcome::NoColumns);
     }
 
     let target = BisectionTarget {
@@ -459,21 +606,7 @@ async fn bisect_one_model(
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    info!(
-        target: "rocky::preview::bisection",
-        model = model_name,
-        rows_added = result.rows_added,
-        rows_removed = result.rows_removed,
-        rows_changed = result.rows_changed,
-        chunks_examined = result.stats.chunks_examined,
-        leaves_materialized = result.stats.leaves_materialized,
-        depth_max = result.stats.depth_max,
-        depth_capped = result.stats.depth_capped,
-        null_pk_rows_base = result.stats.null_pk_rows_base,
-        null_pk_rows_branch = result.stats.null_pk_rows_branch,
-        "bisection complete",
-    );
-    Ok(())
+    Ok(BisectionOutcome::Ran { result })
 }
 
 /// Resolve `[lo, hi)` over the union of base + branch PK ranges.
@@ -587,14 +720,15 @@ fn build_preview_diff(
     Vec<crate::output::PreviewModelDiff>,
 ) {
     use crate::output::{
-        PreviewModelDiff, PreviewSampledRowDiff, PreviewSamplingWindow, PreviewStructuralDiff,
+        PreviewModelDiff, PreviewModelDiffAlgorithm, PreviewSampledRowDiff, PreviewSamplingWindow,
+        PreviewStructuralDiff,
     };
 
     let mut models: Vec<PreviewModelDiff> = Vec::new();
     let mut models_with_changes: usize = 0;
     let mut total_rows_added: u64 = 0;
     let mut total_rows_removed: u64 = 0;
-    let total_rows_changed: u64 = 0; // sampled-only; always 0 in Phase 2
+    let total_rows_changed: u64 = 0; // sampled-only; always 0 by default
 
     // Index base executions by model name for O(N) pairing.
     let base_by_name: BTreeMap<&str, &rocky_core::state::ModelExecution> = base
@@ -607,7 +741,7 @@ fn build_preview_diff(
         let base_exec = base_by_name.get(branch_exec.model_name.as_str()).copied();
 
         // Row delta: signed difference of `rows_affected`. None on either
-        // side surfaces as zero — the sampled layer (Phase 2.5) catches
+        // side surfaces as zero — the row-content layer catches
         // unreported row changes.
         let branch_rows = branch_exec.rows_affected.unwrap_or(0);
         let base_rows = base_exec.and_then(|e| e.rows_affected).unwrap_or(0);
@@ -627,29 +761,35 @@ fn build_preview_diff(
             // Structural column-level delta is an open follow-up — the
             // RunRecord doesn't persist column lists today, and the
             // compiler-IR-driven path requires both runs to be
-            // re-compiled (heavy). Phase 2.5 wires this; until then,
-            // empty arrays make the absence explicit on the wire.
+            // re-compiled (heavy). Empty arrays make the absence
+            // explicit on the wire.
             structural: PreviewStructuralDiff {
                 added_columns: Vec::new(),
                 removed_columns: Vec::new(),
                 type_changes: Vec::new(),
             },
-            sampled: PreviewSampledRowDiff {
-                rows_added,
-                rows_removed,
-                rows_changed: 0,
-                samples: Vec::new(),
-            },
-            sampling_window: PreviewSamplingWindow {
-                ordered_by: String::new(),
-                limit: 0,
-                // `coverage_warning = true` is honest: row content
-                // changes that don't change row counts will not
-                // surface in this diff. The PR-comment surface
-                // renders this verbatim so reviewers don't infer
-                // false coverage.
-                coverage: "not_yet_sampled".to_string(),
-                coverage_warning: true,
+            // Default to the sampled placeholder. The bisection runner
+            // overwrites this slot in `apply_bisection_to_models` for
+            // every qualifying model when `--algorithm=bisection` is
+            // selected.
+            algorithm: PreviewModelDiffAlgorithm::Sampled {
+                sampled: PreviewSampledRowDiff {
+                    rows_added,
+                    rows_removed,
+                    rows_changed: 0,
+                    samples: Vec::new(),
+                },
+                sampling_window: PreviewSamplingWindow {
+                    ordered_by: String::new(),
+                    limit: 0,
+                    // `coverage_warning = true` is honest: row content
+                    // changes that don't change row counts will not
+                    // surface in this diff. The PR-comment surface
+                    // renders this verbatim so reviewers don't infer
+                    // false coverage.
+                    coverage: "not_yet_sampled".to_string(),
+                    coverage_warning: true,
+                },
             },
         });
     }
@@ -674,6 +814,8 @@ fn render_preview_diff_markdown(
     summary: &crate::output::PreviewDiffSummary,
     models: &[crate::output::PreviewModelDiff],
 ) -> String {
+    use crate::output::PreviewModelDiffAlgorithm;
+
     if models.is_empty() {
         return format!(
             "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
@@ -681,6 +823,11 @@ fn render_preview_diff_markdown(
              on the prune set, then re-invoke `rocky preview diff`._\n"
         );
     }
+
+    let any_bisection = models
+        .iter()
+        .any(|m| matches!(m.algorithm, PreviewModelDiffAlgorithm::Bisection { .. }));
+
     let mut out = String::new();
     out.push_str(&format!(
         "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
@@ -690,23 +837,91 @@ fn render_preview_diff_markdown(
         summary.total_rows_added,
         summary.total_rows_removed,
     ));
-    out.push_str("| model | +rows | −rows | sampled? |\n|---|---:|---:|---|\n");
-    for m in models {
-        let sampled = if m.sampling_window.coverage_warning {
-            ":warning: not yet sampled"
-        } else {
-            ":white_check_mark: sampled"
-        };
-        out.push_str(&format!(
-            "| `{}` | {} | {} | {} |\n",
-            m.model_name, m.sampled.rows_added, m.sampled.rows_removed, sampled,
-        ));
+
+    if any_bisection {
+        // Wider table — bisection rows have ~rows + chunks_examined +
+        // leaves_materialized + depth_max columns that the sampled
+        // table doesn't carry. Render every row in this layout for
+        // consistency; sampled rows leave the bisection-only columns
+        // blank.
+        out.push_str(
+            "| model | algorithm | +rows | −rows | ~rows | chunks | leaves | depth | notes |\n\
+             |---|---|---:|---:|---:|---:|---:|---:|---|\n",
+        );
+        for m in models {
+            match &m.algorithm {
+                PreviewModelDiffAlgorithm::Sampled {
+                    sampled,
+                    sampling_window,
+                } => {
+                    let note = if sampling_window.coverage_warning {
+                        ":warning: not yet sampled"
+                    } else {
+                        ":white_check_mark: sampled"
+                    };
+                    out.push_str(&format!(
+                        "| `{}` | sampled | {} | {} | 0 | — | — | — | {} |\n",
+                        m.model_name, sampled.rows_added, sampled.rows_removed, note,
+                    ));
+                }
+                PreviewModelDiffAlgorithm::Bisection {
+                    diff,
+                    bisection_stats,
+                } => {
+                    let note = if bisection_stats.depth_capped {
+                        ":warning: depth-capped"
+                    } else {
+                        ":white_check_mark: exhaustive"
+                    };
+                    out.push_str(&format!(
+                        "| `{}` | bisection | {} | {} | {} | {} | {} | {} | {} |\n",
+                        m.model_name,
+                        diff.rows_added,
+                        diff.rows_removed,
+                        diff.rows_changed,
+                        bisection_stats.chunks_examined,
+                        bisection_stats.leaves_materialized,
+                        bisection_stats.depth_max,
+                        note,
+                    ));
+                }
+            }
+        }
+    } else {
+        out.push_str("| model | +rows | −rows | sampled? |\n|---|---:|---:|---|\n");
+        for m in models {
+            let (rows_added, rows_removed, note) = match &m.algorithm {
+                PreviewModelDiffAlgorithm::Sampled {
+                    sampled,
+                    sampling_window,
+                } => {
+                    let note = if sampling_window.coverage_warning {
+                        ":warning: not yet sampled"
+                    } else {
+                        ":white_check_mark: sampled"
+                    };
+                    (sampled.rows_added, sampled.rows_removed, note)
+                }
+                PreviewModelDiffAlgorithm::Bisection { .. } => {
+                    // unreachable in this branch — `any_bisection` is
+                    // false here. Defensive fallback so the renderer
+                    // doesn't panic if invariants change.
+                    (0, 0, ":white_check_mark: exhaustive")
+                }
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                m.model_name, rows_added, rows_removed, note,
+            ));
+        }
     }
+
     if summary.any_coverage_warning {
         out.push_str(
-            "\n> :warning: Row-content changes that don't move row counts \
-             are not surfaced in this diff. Phase 2.5 lifts to \
-             checksum-bisection exhaustive sampling.\n",
+            "\n> :warning: Row-content changes might not be fully surfaced. \
+             Sampled diffs miss content drift outside the sampling window; \
+             bisection diffs depth-capped on this run reached the recursion \
+             limit before bottoming out.\n",
         );
     }
     out
@@ -720,11 +935,13 @@ fn render_preview_diff_markdown(
 /// over `rocky cost latest`'s machinery — does not introduce new cost
 /// math.
 ///
-/// **Phase 3 scope.** Resolves the latest branch run and the most recent
-/// non-branch run from the state store, computes per-model deltas via
-/// `compute_observed_cost_usd` (the same formula `rocky cost` uses), and
-/// emits a `PreviewCostOutput`. Models on base but not on branch roll
-/// into `models_skipped_via_copy` + `savings_from_copy_usd`.
+/// Resolves the latest branch run and the most recent non-branch run
+/// from the state store, computes per-model deltas via
+/// `compute_observed_cost_usd` (the same formula `rocky cost` uses),
+/// and emits a `PreviewCostOutput`. Models on base but not on branch
+/// roll into `models_skipped_via_copy` + `savings_from_copy_usd`.
+/// Projected `[budget]` breaches against the branch totals land on
+/// `projected_budget_breaches` when a budget is configured.
 pub async fn run_preview_cost(
     config_path: &Path,
     state_path: &Path,
@@ -1679,8 +1896,11 @@ mod tests {
 
     /// Coverage-warning path: the sampling-window field surfaces verbatim
     /// in the per-model diff, even when the sampled deltas are zero.
+    /// Also pins the tagged-enum discriminator (`"kind":"sampled"`) on
+    /// the JSON wire — the schema-cascade pipeline relies on this.
     #[test]
     fn sampling_window_surfaces_coverage_warning() {
+        use crate::output::PreviewModelDiffAlgorithm;
         let m = PreviewModelDiff {
             model_name: "wide_table".into(),
             structural: PreviewStructuralDiff {
@@ -1688,22 +1908,65 @@ mod tests {
                 removed_columns: vec![],
                 type_changes: vec![],
             },
-            sampled: PreviewSampledRowDiff {
-                rows_added: 0,
-                rows_removed: 0,
-                rows_changed: 0,
-                samples: vec![],
-            },
-            sampling_window: PreviewSamplingWindow {
-                ordered_by: "id".into(),
-                limit: 1000,
-                coverage: "first_n_by_order".into(),
-                coverage_warning: true,
+            algorithm: PreviewModelDiffAlgorithm::Sampled {
+                sampled: PreviewSampledRowDiff {
+                    rows_added: 0,
+                    rows_removed: 0,
+                    rows_changed: 0,
+                    samples: vec![],
+                },
+                sampling_window: PreviewSamplingWindow {
+                    ordered_by: "id".into(),
+                    limit: 1000,
+                    coverage: "first_n_by_order".into(),
+                    coverage_warning: true,
+                },
             },
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"coverage_warning\":true"));
         assert!(s.contains("\"first_n_by_order\""));
+        assert!(s.contains("\"kind\":\"sampled\""));
+    }
+
+    /// The bisection arm of `PreviewModelDiffAlgorithm` round-trips
+    /// through serde with the tagged-enum discriminator + the
+    /// bisection_stats payload intact.
+    #[test]
+    fn bisection_arm_surfaces_stats() {
+        use crate::output::{
+            BisectionStatsOutput, PreviewBisectionRowDiff, PreviewModelDiffAlgorithm,
+        };
+        let m = PreviewModelDiff {
+            model_name: "fct_revenue".into(),
+            structural: PreviewStructuralDiff {
+                added_columns: vec![],
+                removed_columns: vec![],
+                type_changes: vec![],
+            },
+            algorithm: PreviewModelDiffAlgorithm::Bisection {
+                diff: PreviewBisectionRowDiff {
+                    rows_added: 1,
+                    rows_removed: 0,
+                    rows_changed: 2,
+                    samples: vec![],
+                },
+                bisection_stats: BisectionStatsOutput {
+                    chunks_examined: 96,
+                    leaves_materialized: 1,
+                    depth_max: 2,
+                    depth_capped: false,
+                    split_strategy: "int_range".into(),
+                    null_pk_rows_base: 0,
+                    null_pk_rows_branch: 0,
+                },
+            },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"kind\":\"bisection\""));
+        assert!(s.contains("\"chunks_examined\":96"));
+        assert!(s.contains("\"split_strategy\":\"int_range\""));
+        assert!(s.contains("\"rows_changed\":2"));
     }
 
     /// Sample row roundtrips cleanly — sanity check on the nested struct.
@@ -1861,7 +2124,7 @@ mod tests {
         assert_eq!(out, vec!["foo.sql", "bar.toml", "baz"]);
     }
 
-    // ---------------------- Phase 2 + Phase 3 substance ----------------------
+    // ---------------------- diff + cost substance ----------------------
 
     use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource};
 
@@ -1933,24 +2196,38 @@ mod tests {
         assert!(summary.any_coverage_warning);
         let by_name: HashMap<&str, &crate::output::PreviewModelDiff> =
             models.iter().map(|m| (m.model_name.as_str(), m)).collect();
-        assert_eq!(by_name["a"].sampled.rows_added, 10);
-        assert_eq!(by_name["a"].sampled.rows_removed, 0);
-        assert_eq!(by_name["b"].sampled.rows_added, 0);
-        assert_eq!(by_name["b"].sampled.rows_removed, 10);
+        let sampled = |m: &crate::output::PreviewModelDiff| -> (u64, u64) {
+            match &m.algorithm {
+                crate::output::PreviewModelDiffAlgorithm::Sampled { sampled, .. } => {
+                    (sampled.rows_added, sampled.rows_removed)
+                }
+                _ => panic!("expected sampled arm"),
+            }
+        };
+        assert_eq!(sampled(by_name["a"]), (10, 0));
+        assert_eq!(sampled(by_name["b"]), (0, 10));
     }
 
     /// Identical row counts → no changes; coverage_warning still fires
-    /// because Phase 2 didn't sample contents.
+    /// because the structural-only fallback didn't sample contents.
     #[test]
     fn diff_no_change_still_warns_about_coverage() {
+        use crate::output::PreviewModelDiffAlgorithm;
         let branch = run_record("br", vec![exec("a", 100, Some(100), None)], Some("feature"));
         let base = run_record("ba", vec![exec("a", 100, Some(100), None)], None);
         let (summary, models) = build_preview_diff(&branch, &base);
         assert_eq!(summary.models_with_changes, 0);
         assert_eq!(summary.models_unchanged, 1);
         assert!(summary.any_coverage_warning);
-        assert!(models[0].sampling_window.coverage_warning);
-        assert_eq!(models[0].sampling_window.coverage, "not_yet_sampled");
+        match &models[0].algorithm {
+            PreviewModelDiffAlgorithm::Sampled {
+                sampling_window, ..
+            } => {
+                assert!(sampling_window.coverage_warning);
+                assert_eq!(sampling_window.coverage, "not_yet_sampled");
+            }
+            _ => panic!("expected sampled arm by default"),
+        }
     }
 
     /// Cost delta on paired models: branch faster than base → negative
@@ -2108,7 +2385,9 @@ mod tests {
         assert!(md.contains("| `a` |"));
         assert!(md.contains("| `b` |"));
         assert!(md.contains("not yet sampled"));
-        assert!(md.contains("Phase 2.5"));
+        // Coverage-warning hint surfaces on the structural-only fallback
+        // path. Wording is generic — no internal phase labels.
+        assert!(md.contains("might not be fully surfaced"));
     }
 
     /// Empty diff path produces a "no paired runs" hint, not an empty

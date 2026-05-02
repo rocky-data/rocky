@@ -3737,15 +3737,21 @@ pub struct PreviewCopiedModel {
 /// JSON output for `rocky preview diff`.
 ///
 /// Combines the structural diff (column added/removed/type-changed) from
-/// the existing `rocky_core::ci_diff` machinery with a sampled row-level
-/// diff that extends the `rocky_core::compare`/`shadow` kernel.
+/// the existing `rocky_core::ci_diff` machinery with a row-level diff
+/// produced by either the sampled or the checksum-bisection algorithm.
+/// Each per-model entry's `algorithm` field carries a `kind`
+/// discriminator (`"sampled"` or `"bisection"`) plus the matching
+/// payload.
 ///
-/// **Sampling correctness ceiling.** Phase 2 sampling reads `LIMIT N`
-/// rows ordered by primary key (or first column). Changes outside that
-/// window appear as no-change unless the row count itself differs.
-/// `sampling_window.coverage_warning = true` flags this risk on the
-/// per-model level so reviewers don't infer false coverage. A
-/// checksum-bisection exhaustive diff is the Phase 2.5 lift.
+/// **Sampled correctness ceiling.** The sampled algorithm reads
+/// `LIMIT N` rows ordered by primary key (or first column). Changes
+/// outside that window appear as no-change unless the row count itself
+/// differs; `sampling_window.coverage_warning = true` flags that risk.
+/// **Bisection** walks the chunk lattice exhaustively over a
+/// single-column primary key; `bisection_stats.depth_capped = true`
+/// flags the rare case where the recursion bottomed out at the depth
+/// cap before reaching leaf size. `summary.any_coverage_warning` rolls
+/// both signals up.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewDiffOutput {
     pub version: String,
@@ -3766,19 +3772,120 @@ pub struct PreviewDiffSummary {
     pub total_rows_added: u64,
     pub total_rows_removed: u64,
     pub total_rows_changed: u64,
-    /// `true` if **any** per-model diff carries
-    /// `sampling_window.coverage_warning = true`.
+    /// `true` if **any** per-model diff is either a sampled diff with
+    /// `sampling_window.coverage_warning = true` or a bisection diff
+    /// with `bisection_stats.depth_capped = true`. Both conditions
+    /// indicate the row-level findings might be incomplete and a
+    /// reviewer shouldn't infer "no change" from a clean result.
     pub any_coverage_warning: bool,
 }
 
-/// Per-model diff. Combines structural (column-level) and sampled
-/// (row-level) findings.
+/// Per-model diff. Combines a structural (column-level) delta with a
+/// row-level diff that was produced by either the sampled or the
+/// checksum-bisection algorithm. The active algorithm is encoded by the
+/// `kind` discriminator on [`PreviewModelDiffAlgorithm`].
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewModelDiff {
     pub model_name: String,
     pub structural: PreviewStructuralDiff,
-    pub sampled: PreviewSampledRowDiff,
-    pub sampling_window: PreviewSamplingWindow,
+    /// Row-level diff payload, tagged by which algorithm produced it.
+    /// Different models in the same run can carry different variants:
+    /// a model with a single-column integer primary key runs through
+    /// the bisection kernel, while a model that lacks a usable PK
+    /// falls back to the sampled algorithm.
+    pub algorithm: PreviewModelDiffAlgorithm,
+}
+
+/// Row-level diff payload tagged by which algorithm produced it. The
+/// `kind` discriminator (`"sampled"` or `"bisection"`) lets consumers
+/// reading the JSON pick the right shape without having to check
+/// optional fields.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreviewModelDiffAlgorithm {
+    /// Sampled diff — `LIMIT N` rows ordered by primary key (or first
+    /// column). Carries a coverage warning when changes outside the
+    /// sampling window are not surfaced.
+    Sampled {
+        sampled: PreviewSampledRowDiff,
+        sampling_window: PreviewSamplingWindow,
+    },
+    /// Checksum-bisection exhaustive diff. Walks the chunk lattice and
+    /// materializes leaves for row-by-row compare. Carries
+    /// [`BisectionStatsOutput`] so consumers can audit the recursion
+    /// trace.
+    Bisection {
+        diff: PreviewBisectionRowDiff,
+        bisection_stats: BisectionStatsOutput,
+    },
+}
+
+/// Row-level diff produced by the checksum-bisection algorithm. All
+/// counts are exhaustive over the diffed table — no sampling window.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewBisectionRowDiff {
+    pub rows_added: u64,
+    pub rows_removed: u64,
+    pub rows_changed: u64,
+    /// Up to `--max-samples` (default 5) representative changed rows
+    /// surfaced from the leaves. Bisection samples only carry the
+    /// primary key — column-level diffs are not retained on the
+    /// kernel's leaf record. Empty when no rows differ.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<PreviewRowSample>,
+}
+
+/// CLI-side mirror of [`rocky_core::compare::bisection::BisectionStats`].
+/// Kept separate so the JSON schema lives alongside the rest of the
+/// `rocky preview diff` output types — same pattern as
+/// [`BudgetBreachOutput`] mirroring `rocky_core::config::BudgetBreach`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BisectionStatsOutput {
+    /// Total non-empty chunk-checksum entries returned across both
+    /// sides and all recursion levels.
+    pub chunks_examined: u64,
+    /// Number of leaf chunks materialized for row-by-row diff.
+    pub leaves_materialized: u64,
+    /// Maximum recursion depth reached.
+    pub depth_max: u32,
+    /// `true` if the runner hit the `max_depth` cap before any chunk
+    /// fell below the leaf threshold. The dense range was still
+    /// materialized exhaustively, so the diff is correct — just slower.
+    pub depth_capped: bool,
+    /// How the runner split the primary-key space into chunks. One of
+    /// `"int_range"`, `"composite"`, `"hash_bucket"`, `"first_column"`.
+    pub split_strategy: String,
+    /// Rows on the base side whose primary-key column was NULL.
+    /// Excluded from chunk membership; counted at the root so a
+    /// null-PK divergence surfaces instead of silently dropping rows.
+    pub null_pk_rows_base: u64,
+    /// Rows on the branch side whose primary-key column was NULL.
+    pub null_pk_rows_branch: u64,
+}
+
+impl BisectionStatsOutput {
+    /// Mirror a [`rocky_core::compare::bisection::BisectionStats`] into
+    /// the CLI-side output shape. The `split_strategy` enum is
+    /// flattened to its serde wire tag so the JSON schema doesn't have
+    /// to drag the rocky-core enum through `JsonSchema`.
+    pub fn from_kernel(stats: &rocky_core::compare::bisection::BisectionStats) -> Self {
+        let split_strategy = match stats.split_strategy {
+            rocky_core::traits::SplitStrategy::IntRange => "int_range",
+            rocky_core::traits::SplitStrategy::Composite => "composite",
+            rocky_core::traits::SplitStrategy::HashBucket => "hash_bucket",
+            rocky_core::traits::SplitStrategy::FirstColumn => "first_column",
+        }
+        .to_string();
+        BisectionStatsOutput {
+            chunks_examined: stats.chunks_examined,
+            leaves_materialized: stats.leaves_materialized,
+            depth_max: stats.depth_max,
+            depth_capped: stats.depth_capped,
+            split_strategy,
+            null_pk_rows_base: stats.null_pk_rows_base,
+            null_pk_rows_branch: stats.null_pk_rows_branch,
+        }
+    }
 }
 
 /// Column-level structural diff. Mirrors the shape produced by
@@ -3841,8 +3948,10 @@ pub struct PreviewRowSampleChange {
 pub struct PreviewSamplingWindow {
     pub ordered_by: String,
     pub limit: usize,
-    /// One of `"first_n_by_order"` (Phase 2) or `"checksum_bisection"`
-    /// (Phase 2.5 lift, not yet shipped).
+    /// Sampling-strategy tag. `"first_n_by_order"` is the standard
+    /// PK-ordered window; `"not_yet_sampled"` is a placeholder used
+    /// when the sampling layer didn't run (e.g. the structural-only
+    /// fallback path).
     pub coverage: String,
     pub coverage_warning: bool,
 }
