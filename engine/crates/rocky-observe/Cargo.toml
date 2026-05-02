@@ -8,7 +8,12 @@ rust-version.workspace = true
 
 [features]
 default = []
-otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
+otel = [
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "opentelemetry-otlp",
+    "tracing-opentelemetry",
+]
 
 [dependencies]
 chrono = { workspace = true }
@@ -19,8 +24,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio", "metrics"] }
-opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio", "metrics", "trace"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "metrics", "trace"] }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

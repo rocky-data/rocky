@@ -157,10 +157,13 @@ wasm-bindgen = "0.2"
 # Testing
 wiremock = "0.6"
 
-# OpenTelemetry (feature-gated in rocky-observe)
+# OpenTelemetry (feature-gated in rocky-observe).
+# `tracing-opentelemetry` major versions track `opentelemetry` minor
+# versions: 0.32 pairs with opentelemetry 0.31 — pin the pair together.
 opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
 opentelemetry-otlp = "0.31"
+tracing-opentelemetry = "0.32"
 
 [profile.release]
 opt-level = 3
