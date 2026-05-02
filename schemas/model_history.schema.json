@@ -35,6 +35,80 @@
         "status"
       ],
       "type": "object"
+    },
+    "RollingDimension": {
+      "description": "Per-dimension rolling statistics (mean, std dev, latest z-score).",
+      "properties": {
+        "latest_z_score": {
+          "description": "Z-score of the most recent execution relative to the window.\n\n`None` when fewer than 2 samples are available or when `std_dev` is exactly 0 (all samples are equal — no meaningful deviation).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mean": {
+          "description": "Population mean over the sample window.",
+          "format": "double",
+          "type": "number"
+        },
+        "std_dev": {
+          "description": "Population standard deviation (÷N) over the sample window.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "mean",
+        "std_dev"
+      ],
+      "type": "object"
+    },
+    "RollingStats": {
+      "description": "Rolling statistics computed over the most recent N successful executions of a model. Populated by `rocky history --model <name> --rolling-stats`.\n\nStatistics use population standard deviation (divided by N, not N-1), so `std_dev` is exactly 0 when all samples are equal.",
+      "properties": {
+        "duration_ms": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RollingDimension"
+            }
+          ],
+          "description": "Rolling statistics for the `duration_ms` dimension."
+        },
+        "health_score": {
+          "description": "Composite health score in `[0.0, 1.0]`.\n\nComputed as `1.0 - clamp((max(|z_rows|, |z_duration|) - 2.0) / 4.0, 0.0, 1.0)`. A score of `1.0` means both z-scores are within 2σ of the mean; `0.0` means at least one z-score is 6σ or more.",
+          "format": "double",
+          "type": "number"
+        },
+        "rows_affected": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RollingDimension"
+            }
+          ],
+          "description": "Rolling statistics for the `rows_affected` dimension. Computed only over executions where `rows_affected` is not null."
+        },
+        "samples": {
+          "description": "Actual number of successful executions used (≤ window; may be smaller when model history is shorter than the requested window).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window": {
+          "description": "Maximum number of executions requested for the rolling window.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "health_score",
+        "rows_affected",
+        "samples",
+        "window"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky history --model <name>`.",
@@ -55,6 +129,17 @@
     },
     "model": {
       "type": "string"
+    },
+    "rolling_stats": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RollingStats"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Rolling statistics over the most recent N successful executions. Present only when `--rolling-stats` is passed."
     },
     "version": {
       "type": "string"
