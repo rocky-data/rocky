@@ -171,6 +171,43 @@ impl SqlDialect for DatabricksSqlDialect {
     ) -> rocky_core::traits::AdapterResult<String> {
         Ok(format!("{column} RLIKE '{pattern}'"))
     }
+
+    fn quote_identifier(&self, name: &str) -> String {
+        // Backticks are the universally-safe Databricks identifier
+        // quote — they work in both `ANSI_MODE = on` (the default since
+        // DBR 14.x, where `"col"` is also a valid identifier) and
+        // `ANSI_MODE = off` (where `"col"` is a STRING literal). Using
+        // backticks keeps generated SQL stable across the workspace
+        // SQL-config knob without requiring runtime introspection.
+        format!("`{name}`")
+    }
+
+    fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+        if columns.is_empty() {
+            return Err(AdapterError::msg(
+                "row_hash_expr requires at least one column to hash",
+            ));
+        }
+        for col in columns {
+            validation::validate_identifier(col).map_err(AdapterError::new)?;
+        }
+        // `xxhash64(col_a, col_b, ...)` — Spark's multi-arg form hashes
+        // the binary representation of each column with positional NULL
+        // handling built in: `xxhash64(NULL, 'x')` ≠ `xxhash64('x', NULL)`,
+        // so two rows that swap a NULL across columns hash differently
+        // (a `concat_ws`-based scheme would silently collide them
+        // because `concat_ws` skips NULL arguments). Type-aware as a
+        // bonus: an INT-to-STRING column-type change shows up as a
+        // diff. `xxhash64` returns BIGINT; `BIT_XOR(BIGINT)` returns
+        // BIGINT, which round-trips cleanly to the kernel's `i128`
+        // slot (sign-extended; the parser bit-casts into `u128`).
+        let arg_list = columns
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("xxhash64({arg_list})"))
+    }
 }
 
 #[cfg(test)]
@@ -363,5 +400,39 @@ mod tests {
         assert!(stmts[0].starts_with("INSERT INTO warehouse.marts.fct_daily_orders REPLACE WHERE"));
         assert!(stmts[0].contains("order_date >= '2026-04-07 00:00:00'"));
         assert!(stmts[0].contains("SELECT order_date"));
+    }
+
+    #[test]
+    fn test_quote_identifier_uses_backticks() {
+        let d = dialect();
+        assert_eq!(d.quote_identifier("id"), "`id`");
+        assert_eq!(d.quote_identifier("customer_id"), "`customer_id`");
+    }
+
+    #[test]
+    fn test_row_hash_expr_emits_multi_arg_xxhash64() {
+        let d = dialect();
+        let sql = d.row_hash_expr(&["name".into(), "value".into()]).unwrap();
+        assert_eq!(sql, "xxhash64(`name`, `value`)");
+    }
+
+    #[test]
+    fn test_row_hash_expr_single_column() {
+        let d = dialect();
+        let sql = d.row_hash_expr(&["only".into()]).unwrap();
+        assert_eq!(sql, "xxhash64(`only`)");
+    }
+
+    #[test]
+    fn test_row_hash_expr_rejects_empty_columns() {
+        let d = dialect();
+        assert!(d.row_hash_expr(&[]).is_err());
+    }
+
+    #[test]
+    fn test_row_hash_expr_rejects_invalid_identifier() {
+        let d = dialect();
+        // SQL-injection attempt: column name carrying a quote.
+        assert!(d.row_hash_expr(&["a`; DROP TABLE x; --".into()]).is_err());
     }
 }

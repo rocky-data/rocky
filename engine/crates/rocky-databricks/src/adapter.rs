@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 
 use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
-    AdapterError, AdapterResult, BatchCheckAdapter, ExecutionStats, FreshnessResult, QueryResult,
-    RowCountResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats, FreshnessResult,
+    PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
 };
 
 use crate::batch::{self, BatchTableRef};
@@ -91,6 +91,74 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .await
             .map(|tables| tables.into_iter().map(|t| t.to_lowercase()).collect())
             .map_err(AdapterError::new)
+    }
+
+    /// Databricks override of the checksum-bisection chunk-checksum
+    /// query. The kernel default in `rocky-core` uses double-quoted
+    /// identifiers (`"id"`), which Databricks treats as a STRING
+    /// literal under `ANSI_MODE = off` (and even under ANSI mode the
+    /// implicit cast can confuse the type-checker on numeric
+    /// comparisons). This override quotes columns with backticks,
+    /// emits Spark's `BIGINT` cast (matching the dialect's native
+    /// integer type), and composes the per-row hash with
+    /// `BIT_XOR(<dialect.row_hash_expr>)`.
+    ///
+    /// The `LEAST(K-1, FLOOR(...))` clamp matches the kernel default
+    /// — `split_int_range` lets the last chunk absorb the integer-
+    /// step truncation remainder, so the SQL bucketing has to pin the
+    /// highest pk values back into chunk K-1 instead of overflowing
+    /// to K.
+    async fn checksum_chunks(
+        &self,
+        table: &TableRef,
+        pk_column: &str,
+        value_columns: &[String],
+        pk_ranges: &[PkRange],
+    ) -> AdapterResult<Vec<ChunkChecksum>> {
+        if pk_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (lo_min, hi_max, k) = databricks_uniform_int_window(pk_ranges)?;
+        let step = (hi_max - lo_min) / (k as i128);
+        if step <= 0 {
+            return Err(AdapterError::msg(
+                "Databricks checksum_chunks requires a positive integer step \
+                 across the chunk window (lo == hi or hi < lo)",
+            ));
+        }
+
+        rocky_sql::validation::validate_identifier(pk_column).map_err(AdapterError::new)?;
+        for col in value_columns {
+            rocky_sql::validation::validate_identifier(col).map_err(AdapterError::new)?;
+        }
+
+        let table_ref =
+            self.dialect
+                .format_table_ref(&table.catalog, &table.schema, &table.table)?;
+        let row_hash = self.dialect.row_hash_expr(value_columns)?;
+        let last_id = k - 1;
+
+        let sql = format!(
+            "SELECT chunk_id, COUNT(*) AS row_count, BIT_XOR({row_hash}) AS chk \
+             FROM ( \
+                 SELECT *, \
+                        LEAST( \
+                            CAST(FLOOR((CAST(`{pk_column}` AS DOUBLE) - {lo}) / {step}) AS BIGINT), \
+                            {last_id} \
+                        ) AS chunk_id \
+                 FROM {table_ref} \
+                 WHERE `{pk_column}` IS NOT NULL \
+                   AND `{pk_column}` >= {lo} \
+                   AND `{pk_column}` < {hi} \
+             ) AS chunked \
+             GROUP BY chunk_id \
+             ORDER BY chunk_id",
+            lo = lo_min,
+            hi = hi_max,
+        );
+
+        let result = self.execute_query(&sql).await?;
+        parse_databricks_chunk_checksums(&result, k)
     }
 
     /// Override: emit `SHALLOW CLONE` instead of CTAS. Branch table lands in
@@ -213,4 +281,88 @@ impl BatchCheckAdapter for DatabricksBatchCheckAdapter {
             .await
             .map_err(AdapterError::new)
     }
+}
+
+/// Verify the bisection runner passed K contiguous IntRange chunks and
+/// return `(lo_min, hi_max, K)` for SQL interpolation. Mirrors the
+/// kernel default's `uniform_int_range_window`; composite + hash-bucket
+/// strategies are out of scope and surface as an explicit error.
+fn databricks_uniform_int_window(pk_ranges: &[PkRange]) -> AdapterResult<(i128, i128, u32)> {
+    let mut lo_min: Option<i128> = None;
+    let mut hi_max: Option<i128> = None;
+    for range in pk_ranges {
+        match range {
+            PkRange::IntRange { lo, hi } => {
+                lo_min = Some(lo_min.map_or(*lo, |x| x.min(*lo)));
+                hi_max = Some(hi_max.map_or(*hi, |x| x.max(*hi)));
+            }
+            PkRange::Composite { .. } | PkRange::HashBucket { .. } => {
+                return Err(AdapterError::msg(
+                    "Databricks checksum_chunks supports IntRange only; \
+                     composite and hash-bucket strategies require follow-up changes",
+                ));
+            }
+        }
+    }
+    let lo = lo_min.expect("non-empty pk_ranges checked by caller");
+    let hi = hi_max.expect("non-empty pk_ranges checked by caller");
+    let k = u32::try_from(pk_ranges.len())
+        .map_err(|_| AdapterError::msg("checksum_chunks accepts up to u32::MAX chunks per call"))?;
+    Ok((lo, hi, k))
+}
+
+/// Parse a Databricks `(chunk_id, row_count, chk)` result set into
+/// [`ChunkChecksum`] rows. Databricks's connector returns every cell
+/// as a `serde_json::Value` (string for BIGINT, number for smaller
+/// ints); the parser handles both shapes.
+fn parse_databricks_chunk_checksums(
+    result: &QueryResult,
+    k: u32,
+) -> AdapterResult<Vec<ChunkChecksum>> {
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        if row.len() < 3 {
+            return Err(AdapterError::msg(
+                "checksum_chunks query returned a row with fewer than 3 columns",
+            ));
+        }
+        let chunk_id_raw = parse_databricks_i128(&row[0])?;
+        if chunk_id_raw < 0 || chunk_id_raw >= i128::from(k) {
+            return Err(AdapterError::msg(format!(
+                "checksum_chunks returned chunk_id={chunk_id_raw}, outside [0, {k})"
+            )));
+        }
+        let row_count_raw = parse_databricks_i128(&row[1])?;
+        let row_count = u64::try_from(row_count_raw).map_err(|_| {
+            AdapterError::msg(format!(
+                "checksum_chunks returned row_count={row_count_raw}, expected non-negative u64"
+            ))
+        })?;
+        let checksum = parse_databricks_i128(&row[2])? as u128;
+        out.push(ChunkChecksum {
+            chunk_id: chunk_id_raw as u32,
+            row_count,
+            checksum,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_databricks_i128(v: &serde_json::Value) -> AdapterResult<i128> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<i128>().map_err(|e| {
+            AdapterError::msg(format!(
+                "failed to parse {s:?} as i128 from Databricks result: {e}"
+            ))
+        });
+    }
+    if let Some(n) = v.as_i64() {
+        return Ok(n.into());
+    }
+    if let Some(n) = v.as_u64() {
+        return Ok(n.into());
+    }
+    Err(AdapterError::msg(format!(
+        "Databricks checksum_chunks result column had unexpected JSON shape: {v:?}"
+    )))
 }
