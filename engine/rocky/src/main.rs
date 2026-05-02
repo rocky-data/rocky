@@ -1166,6 +1166,28 @@ enum StateAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Retention controls for the state store's history tables.
+    Retention {
+        #[command(subcommand)]
+        action: RetentionAction,
+    },
+}
+
+/// Subcommands under `rocky state retention`.
+#[derive(Subcommand)]
+enum RetentionAction {
+    /// Sweep run history, DAG snapshots, and quality snapshots
+    /// according to `[state.retention]` in `rocky.toml`.
+    ///
+    /// Operational tables (schema cache, watermarks, partition records)
+    /// are never touched. The most recent `min_runs_kept` rows in each
+    /// domain are preserved unconditionally.
+    Sweep {
+        /// Plan the sweep without deleting anything. Reports the same
+        /// counts an apply run would produce, modulo concurrent writers.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1522,6 +1544,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             Some(StateAction::ClearSchemaCache { dry_run }) => {
                 rocky_cli::commands::state_clear_schema_cache(&state_path, dry_run, json)
             }
+            Some(StateAction::Retention {
+                action: RetentionAction::Sweep { dry_run },
+            }) => rocky_cli::commands::state_retention_sweep(
+                &cli.config,
+                &state_path,
+                dry_run,
+                json,
+            ),
         },
         Command::Compile {
             models,
