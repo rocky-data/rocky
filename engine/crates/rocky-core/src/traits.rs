@@ -518,18 +518,19 @@ async fn default_checksum_chunks(
     // instead of overflowing to K. The outer SELECT pins ORDER BY for
     // stable serialization.
     let last_id = k - 1;
+    let pk_quoted = dialect.quote_identifier(pk_column);
     let sql = format!(
         "SELECT chunk_id, COUNT(*) AS row_count, BIT_XOR({row_hash}) AS chk \
          FROM ( \
              SELECT *, \
                     LEAST( \
-                        CAST(FLOOR((CAST(\"{pk_column}\" AS DOUBLE) - {lo}) / {step}) AS BIGINT), \
+                        CAST(FLOOR((CAST({pk_quoted} AS DOUBLE) - {lo}) / {step}) AS BIGINT), \
                         {last_id} \
                     ) AS chunk_id \
              FROM {table_ref} \
-             WHERE \"{pk_column}\" IS NOT NULL \
-               AND \"{pk_column}\" >= {lo} \
-               AND \"{pk_column}\" < {hi} \
+             WHERE {pk_quoted} IS NOT NULL \
+               AND {pk_quoted} >= {lo} \
+               AND {pk_quoted} < {hi} \
          ) AS chunked \
          GROUP BY chunk_id \
          ORDER BY chunk_id",
@@ -791,6 +792,26 @@ pub trait SqlDialect: Send + Sync {
     /// `CURRENT_TIMESTAMP()` because it requires the function form.
     fn current_timestamp_expr(&self) -> &'static str {
         "CURRENT_TIMESTAMP"
+    }
+
+    /// Quote a column / table identifier for safe interpolation into
+    /// generated SQL. The caller has already validated `name` against
+    /// the SQL-identifier allowlist; this method picks the dialect's
+    /// quoting style.
+    ///
+    /// Default: `"name"` (DuckDB / Snowflake / Databricks accept double
+    /// quotes for identifiers). BigQuery overrides to backticks because
+    /// double-quoted strings in BigQuery are STRING literals, not
+    /// identifiers — using the default on BQ produces SQL that
+    /// type-checks the column name against the literal text rather than
+    /// the column itself.
+    ///
+    /// Used by checksum-bisection's per-row fetch and the default
+    /// `checksum_chunks` impl, where dialect-correct quoting is
+    /// load-bearing for a query that interpolates the column name into
+    /// numeric comparisons.
+    fn quote_identifier(&self, name: &str) -> String {
+        format!("\"{name}\"")
     }
 
     /// SQL expression that computes a single-row hash over `columns`,

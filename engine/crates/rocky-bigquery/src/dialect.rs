@@ -194,6 +194,45 @@ impl SqlDialect for BigQueryDialect {
         "CURRENT_TIMESTAMP()"
     }
 
+    fn quote_identifier(&self, name: &str) -> String {
+        // BigQuery uses backticks for identifiers; double quotes denote
+        // STRING literals. The default `"name"` quoting from the trait
+        // would silently turn column references into the literal text
+        // and break any generated SQL that compares the column against
+        // a numeric (BQ throws "STRING vs INT64" on the implicit cast).
+        format!("`{name}`")
+    }
+
+    fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+        if columns.is_empty() {
+            return Err(AdapterError::msg(
+                "row_hash_expr requires at least one column to hash",
+            ));
+        }
+        for col in columns {
+            validation::validate_identifier(col).map_err(AdapterError::new)?;
+        }
+        // FARM_FINGERPRINT(TO_JSON_STRING(STRUCT(...))) is the
+        // collision-resistant integer hash BigQuery exposes natively;
+        // see https://cloud.google.com/bigquery/docs/reference/standard-sql/hash_functions#farm_fingerprint.
+        // TO_JSON_STRING serialises NULLs as `null` and stringifies
+        // every column type deterministically, so per-row hashes are
+        // stable across data-type promotions and `NULL`-handling
+        // edge cases that would trip a CONCAT-based scheme.
+        // FARM_FINGERPRINT returns INT64; `BIT_XOR(INT64)` returns
+        // INT64, which round-trips cleanly to the kernel's `i128`
+        // checksum slot (sign-extended; the parser bit-casts into
+        // `u128`).
+        let arg_list = columns
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "FARM_FINGERPRINT(TO_JSON_STRING(STRUCT({arg_list})))"
+        ))
+    }
+
     /// BigQuery's safe-widening allowlist.
     ///
     /// Strict subset of BigQuery's documented `ALTER COLUMN SET DATA
