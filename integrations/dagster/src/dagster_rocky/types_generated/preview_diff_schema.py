@@ -3,7 +3,44 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, Field, conint
+
+
+class BisectionStatsOutput(BaseModel):
+    """
+    CLI-side mirror of [`rocky_core::compare::bisection::BisectionStats`]. Kept separate so the JSON schema lives alongside the rest of the `rocky preview diff` output types — same pattern as [`BudgetBreachOutput`] mirroring `rocky_core::config::BudgetBreach`.
+    """
+
+    chunks_examined: conint(ge=0)
+    """
+    Total non-empty chunk-checksum entries returned across both sides and all recursion levels.
+    """
+    depth_capped: bool
+    """
+    `true` if the runner hit the `max_depth` cap before any chunk fell below the leaf threshold. The dense range was still materialized exhaustively, so the diff is correct — just slower.
+    """
+    depth_max: conint(ge=0)
+    """
+    Maximum recursion depth reached.
+    """
+    leaves_materialized: conint(ge=0)
+    """
+    Number of leaf chunks materialized for row-by-row diff.
+    """
+    null_pk_rows_base: conint(ge=0)
+    """
+    Rows on the base side whose primary-key column was NULL. Excluded from chunk membership; counted at the root so a null-PK divergence surfaces instead of silently dropping rows.
+    """
+    null_pk_rows_branch: conint(ge=0)
+    """
+    Rows on the branch side whose primary-key column was NULL.
+    """
+    split_strategy: str
+    """
+    How the runner split the primary-key space into chunks. One of `"int_range"`, `"composite"`, `"hash_bucket"`, `"first_column"`.
+    """
 
 
 class PreviewColumnTypeChange(BaseModel):
@@ -23,13 +60,21 @@ class PreviewDiffSummary(BaseModel):
 
     any_coverage_warning: bool
     """
-    `true` if **any** per-model diff carries `sampling_window.coverage_warning = true`.
+    `true` if **any** per-model diff is either a sampled diff with `sampling_window.coverage_warning = true` or a bisection diff with `bisection_stats.depth_capped = true`. Both conditions indicate the row-level findings might be incomplete and a reviewer shouldn't infer "no change" from a clean result.
     """
     models_unchanged: conint(ge=0)
     models_with_changes: conint(ge=0)
     total_rows_added: conint(ge=0)
     total_rows_changed: conint(ge=0)
     total_rows_removed: conint(ge=0)
+
+
+class Kind(StrEnum):
+    sampled = "sampled"
+
+
+class Kind1(StrEnum):
+    bisection = "bisection"
 
 
 class PreviewRowSampleChange(BaseModel):
@@ -51,7 +96,7 @@ class PreviewSamplingWindow(BaseModel):
 
     coverage: str
     """
-    One of `"first_n_by_order"` (Phase 2) or `"checksum_bisection"` (Phase 2.5 lift, not yet shipped).
+    Sampling-strategy tag. `"first_n_by_order"` is the standard PK-ordered window; `"not_yet_sampled"` is a placeholder used when the sampling layer didn't run (e.g. the structural-only fallback path).
     """
     coverage_warning: bool
     limit: conint(ge=0)
@@ -97,14 +142,50 @@ class PreviewSampledRowDiff(BaseModel):
     """
 
 
-class PreviewModelDiff(BaseModel):
+class PreviewBisectionRowDiff(BaseModel):
     """
-    Per-model diff. Combines structural (column-level) and sampled (row-level) findings.
+    Row-level diff produced by the checksum-bisection algorithm. All counts are exhaustive over the diffed table — no sampling window.
     """
 
-    model_name: str
+    rows_added: conint(ge=0)
+    rows_changed: conint(ge=0)
+    rows_removed: conint(ge=0)
+    samples: list[PreviewRowSample]
+    """
+    Up to `--max-samples` (default 5) representative changed rows surfaced from the leaves. Bisection samples only carry the primary key — column-level diffs are not retained on the kernel's leaf record. Empty when no rows differ.
+    """
+
+
+class PreviewModelDiffAlgorithm1(BaseModel):
+    """
+    Phase 2 sampled diff — `LIMIT N` rows ordered by primary key (or first column). Carries a coverage warning when changes outside the sampling window are not surfaced.
+    """
+
+    kind: Kind
     sampled: PreviewSampledRowDiff
     sampling_window: PreviewSamplingWindow
+
+
+class PreviewModelDiffAlgorithm2(BaseModel):
+    """
+    Checksum-bisection exhaustive diff. Walks the chunk lattice and materializes leaves for row-by-row compare. Carries [`BisectionStatsOutput`] so consumers can audit the recursion trace.
+    """
+
+    bisection_stats: BisectionStatsOutput
+    diff: PreviewBisectionRowDiff
+    kind: Kind1
+
+
+class PreviewModelDiff(BaseModel):
+    """
+    Per-model diff. Combines a structural (column-level) delta with a row-level diff that was produced by either the sampled or the checksum-bisection algorithm. The active algorithm is encoded by the `kind` discriminator on [`PreviewModelDiffAlgorithm`].
+    """
+
+    algorithm: PreviewModelDiffAlgorithm1 | PreviewModelDiffAlgorithm2
+    """
+    Row-level diff payload, tagged by which algorithm produced it. Different models in the same run can carry different variants: a model with a single-column integer primary key runs through the bisection kernel, while a model that lacks a usable PK falls back to the sampled algorithm.
+    """
+    model_name: str
     structural: PreviewStructuralDiff
 
 
@@ -112,9 +193,9 @@ class PreviewDiffOutput(BaseModel):
     """
     JSON output for `rocky preview diff`.
 
-    Combines the structural diff (column added/removed/type-changed) from the existing `rocky_core::ci_diff` machinery with a sampled row-level diff that extends the `rocky_core::compare`/`shadow` kernel.
+    Combines the structural diff (column added/removed/type-changed) from the existing `rocky_core::ci_diff` machinery with a row-level diff produced by either the sampled or the checksum-bisection algorithm. Each per-model entry's `algorithm` field carries a `kind` discriminator (`"sampled"` or `"bisection"`) plus the matching payload.
 
-    **Sampling correctness ceiling.** Phase 2 sampling reads `LIMIT N` rows ordered by primary key (or first column). Changes outside that window appear as no-change unless the row count itself differs. `sampling_window.coverage_warning = true` flags this risk on the per-model level so reviewers don't infer false coverage. A checksum-bisection exhaustive diff is the Phase 2.5 lift.
+    **Sampled correctness ceiling.** The sampled algorithm reads `LIMIT N` rows ordered by primary key (or first column). Changes outside that window appear as no-change unless the row count itself differs; `sampling_window.coverage_warning = true` flags that risk. **Bisection** walks the chunk lattice exhaustively over a single-column primary key; `bisection_stats.depth_capped = true` flags the rare case where the recursion bottomed out at the depth cap before reaching leaf size. `summary.any_coverage_warning` rolls both signals up.
     """
 
     base_ref: str

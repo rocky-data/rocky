@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`PreviewDiffOutput.models[*].algorithm` tagged enum (breaking JSON-shape restructure).** Per-model row-level diff is now carried in a `PreviewModelDiffAlgorithm` discriminated union with two variants: `{ "kind": "sampled", "sampled": …, "sampling_window": … }` and `{ "kind": "bisection", "diff": …, "bisection_stats": … }`. The legacy `model.sampled` and `model.sampling_window` fields move under `model.algorithm` — direct JSON consumers (shell scripts, custom dashboards) must migrate to `model.algorithm.sampled.*` / `model.algorithm.bisection.*` with a `kind` discriminator check. The dagster typed-resource layer absorbs the change automatically through `dagster_rocky.types_generated`; the VS Code extension's adapter regenerates via `just codegen` and stays consumer-clean. `summary.any_coverage_warning` keeps its name and widens semantically — it now fires on `Sampled { sampling_window.coverage_warning: true }` *or* `Bisection { bisection_stats.depth_capped: true }`. The `--algorithm=bisection` CLI flag (previously `tracing`-log-only) now surfaces results as the typed `Bisection` variant on the JSON output.
+
 ### Added
 
 - **Databricks checksum-bisection support.** `DatabricksSqlDialect::row_hash_expr` (`xxhash64(\`col_a\`, \`col_b\`, ...)` — Spark's multi-arg form, positional NULL-aware + type-aware, no `concat_ws` collision risk) and `DatabricksSqlDialect::quote_identifier` (backticks — works under both `ANSI_MODE = on` and `off`) plus a Databricks-specific `WarehouseAdapter::checksum_chunks` override land. The override emits Databricks-canonical SQL — backtick-quoted columns, `BIGINT` cast (Spark's native integer type), the `LEAST(K-1, FLOOR(...))` clamp matching the kernel's last-chunk-absorbs-remainder contract. Unit-tested via 5 new dialect tests; live verification gates merge — `tests/bisection_live.rs` is `#[ignore]`-gated and runs locally with `DATABRICKS_HOST` + `DATABRICKS_HTTP_PATH` + `DATABRICKS_TOKEN` + `DATABRICKS_TEST_CATALOG` set.
