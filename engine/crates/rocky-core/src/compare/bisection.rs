@@ -295,7 +295,8 @@ async fn count_null_pk_rows(
     rocky_sql::validation::validate_identifier(pk_column).map_err(AdapterError::new)?;
     let dialect = adapter.dialect();
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
-    let sql = format!("SELECT COUNT(*) FROM {table_ref} WHERE \"{pk_column}\" IS NULL");
+    let pk = dialect.quote_identifier(pk_column);
+    let sql = format!("SELECT COUNT(*) FROM {table_ref} WHERE {pk} IS NULL");
     let result = adapter.execute_query(&sql).await?;
     let row = result
         .rows
@@ -520,25 +521,24 @@ async fn fetch_chunk_rows(
     }
     let dialect = adapter.dialect();
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
-    let pk = target.pk_column;
+    let pk_quoted = dialect.quote_identifier(target.pk_column);
     let cols_clause = if target.value_columns.is_empty() {
-        format!("\"{pk}\"")
+        pk_quoted.clone()
     } else {
-        let mut clause = format!("\"{pk}\"");
+        let mut clause = pk_quoted.clone();
         for c in target.value_columns {
-            clause.push_str(", \"");
-            clause.push_str(c);
-            clause.push('"');
+            clause.push_str(", ");
+            clause.push_str(&dialect.quote_identifier(c));
         }
         clause
     };
 
     let sql = format!(
         "SELECT {cols_clause} FROM {table_ref} \
-         WHERE \"{pk}\" IS NOT NULL \
-           AND \"{pk}\" >= {lo} \
-           AND \"{pk}\" < {hi} \
-         ORDER BY \"{pk}\""
+         WHERE {pk_quoted} IS NOT NULL \
+           AND {pk_quoted} >= {lo} \
+           AND {pk_quoted} < {hi} \
+         ORDER BY {pk_quoted}"
     );
 
     let result = adapter.execute_query(&sql).await?;
@@ -553,7 +553,7 @@ async fn fetch_chunk_rows(
         };
         let pk_value: i128 = pk_str.parse().map_err(|e| {
             AdapterError::msg(format!(
-                "primary-key column \"{pk}\" returned a value that didn't parse as i128: {pk_str:?} ({e})"
+                "primary-key column {pk_quoted} returned a value that didn't parse as i128: {pk_str:?} ({e})"
             ))
         })?;
         let values = row.into_iter().skip(1).collect();
