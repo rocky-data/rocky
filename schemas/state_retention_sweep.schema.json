@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky state retention sweep`.\n\nMirrors [`rocky_core::retention::SweepReport`] with the version/command envelope every CLI JSON output carries. `dry_run = true` reports counts that *would* result without touching the state store.",
+  "properties": {
+    "audit_deleted": {
+      "description": "Quality snapshots (`quality_history`) deleted, or that would be deleted.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "audit_kept": {
+      "description": "Quality snapshots remaining.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "domains": {
+      "description": "Domains that were considered in this sweep, as the canonical lowercase strings (`\"history\"`, `\"lineage\"`, `\"audit\"`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "dry_run": {
+      "description": "`true` when `--dry-run` was set; the state store was left untouched.",
+      "type": "boolean"
+    },
+    "duration_ms": {
+      "description": "Wall-clock duration of the sweep in milliseconds.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "lineage_deleted": {
+      "description": "DAG snapshots (`dag_snapshots`) deleted, or that would be deleted.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "lineage_kept": {
+      "description": "DAG snapshots remaining.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "max_age_days": {
+      "description": "Configured retention window in days at the time of the sweep.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "min_runs_kept": {
+      "description": "Configured per-domain floor at the time of the sweep.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "runs_deleted": {
+      "description": "Run records (`run_history`) deleted, or that would be deleted in dry-run mode.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "runs_kept": {
+      "description": "Run records remaining after the sweep.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "audit_deleted",
+    "audit_kept",
+    "command",
+    "domains",
+    "dry_run",
+    "duration_ms",
+    "lineage_deleted",
+    "lineage_kept",
+    "max_age_days",
+    "min_runs_kept",
+    "runs_deleted",
+    "runs_kept",
+    "version"
+  ],
+  "title": "RetentionSweepOutput",
+  "type": "object"
+}
