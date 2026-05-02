@@ -1684,6 +1684,14 @@ class StateRetentionConfig(BaseModel):
     """
     Always preserve at least this many rows in each domain, even if every row is older than `max_age_days`. Applied per domain (last N runs, last N DAG snapshots, last N quality snapshots). Defaults to [`DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT`].
     """
+    sweep_budget_ms: conint(ge=0) | None = 5000
+    """
+    Wall-clock budget (in milliseconds) the auto-sweep measures itself against at end-of-run. The sweep always runs to completion; exceeding the budget flips the per-run log line from `tracing::debug` to `tracing::warn` so operators can spot a state store that has grown large enough to warrant manual intervention. Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_BUDGET_MS`].
+    """
+    sweep_interval_seconds: conint(ge=0) | None = 3600
+    """
+    Minimum number of seconds between two automatic end-of-run sweeps. The `rocky run` end-of-run hook reads `last_retention_sweep_at` from the state store's metadata table and skips the sweep when `now - last < sweep_interval_seconds`. The manual `rocky state retention sweep` subcommand is unaffected — it always runs. Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_INTERVAL_SECONDS`].
+    """
 
 
 class ChecksConfig(BaseModel):
@@ -2054,6 +2062,8 @@ class StateConfig(BaseModel):
             "applies_to": ["history", "lineage", "audit"],
             "max_age_days": 365,
             "min_runs_kept": 100,
+            "sweep_budget_ms": 5000,
+            "sweep_interval_seconds": 3600,
         },
         validate_default=True,
     )
@@ -2512,6 +2522,8 @@ class RockyConfig(BaseModel):
                 "applies_to": ["history", "lineage", "audit"],
                 "max_age_days": 365,
                 "min_runs_kept": 100,
+                "sweep_budget_ms": 5000,
+                "sweep_interval_seconds": 3600,
             },
             "retry": {
                 "backoff_multiplier": 2.0,

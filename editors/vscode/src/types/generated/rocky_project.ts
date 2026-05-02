@@ -1386,4 +1386,12 @@ export interface StateRetentionConfig {
    * Always preserve at least this many rows in each domain, even if every row is older than `max_age_days`. Applied per domain (last N runs, last N DAG snapshots, last N quality snapshots). Defaults to [`DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT`].
    */
   min_runs_kept?: number;
+  /**
+   * Wall-clock budget (in milliseconds) the auto-sweep measures itself against at end-of-run. The sweep always runs to completion; exceeding the budget flips the per-run log line from `tracing::debug` to `tracing::warn` so operators can spot a state store that has grown large enough to warrant manual intervention. Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_BUDGET_MS`].
+   */
+  sweep_budget_ms?: number;
+  /**
+   * Minimum number of seconds between two automatic end-of-run sweeps. The `rocky run` end-of-run hook reads `last_retention_sweep_at` from the state store's metadata table and skips the sweep when `now - last < sweep_interval_seconds`. The manual `rocky state retention sweep` subcommand is unaffected — it always runs. Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_INTERVAL_SECONDS`].
+   */
+  sweep_interval_seconds?: number;
 }

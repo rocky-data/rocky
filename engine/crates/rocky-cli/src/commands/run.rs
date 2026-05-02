@@ -737,6 +737,19 @@ pub async fn run(
     let rocky_cfg_for_idemp = rocky_core::config::load_rocky_config(config_path).context(
         format!("failed to load config from {}", config_path.display()),
     )?;
+
+    // OTLP metrics exporter (feature-gated). Auto-initialises when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
+    // env alone — no CLI flag needed. Drop flushes the final snapshot
+    // and shuts the periodic reader down, so this guard covers every
+    // exit path (happy, interrupted, error) without threading an
+    // explicit cleanup call.
+    //
+    // Held at function scope (not inside the inner async block) so the
+    // end-of-run auto-sweep call below still emits its spans through an
+    // active tracer before the guard drops at function return.
+    let _otel_guard = crate::otel_guard::OtelGuard::init_if_enabled();
+
     let mut idempotency_ctx = match idempotency_key {
         Some(key) => {
             match try_claim_idempotency(
@@ -766,14 +779,6 @@ pub async fn run(
     // one-shot (takes the ctx out of the `Option`); if that already fired,
     // the wrapper's error-path finalize is a no-op.
     let run_result: Result<()> = async {
-
-    // OTLP metrics exporter (feature-gated). Auto-initialises when
-    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
-    // env alone — no CLI flag needed. Drop flushes the final snapshot
-    // and shuts the periodic reader down, so this guard covers every
-    // exit path (happy, interrupted, error) without threading an
-    // explicit cleanup call.
-    let _otel_guard = crate::otel_guard::OtelGuard::init_if_enabled();
 
     // Detect Dagster Pipes mode. When the parent process is a Dagster
     // job that launched us via PipesSubprocessClient, both
@@ -3164,6 +3169,18 @@ pub async fn run(
     }
     .await;
 
+    // End-of-run retention auto-sweep. Wires `StateStore::sweep_retention`
+    // into the run loop so retention "just works" without an external cron
+    // — the manual `rocky state retention sweep` subcommand stays as the
+    // operator escape hatch. Runs unconditionally on both Ok and Err
+    // paths: a failed run shouldn't postpone state cleanup, and the
+    // interval gate inside `auto_sweep_retention_at_end_of_run` still
+    // suppresses thrash. All errors swallowed as `tracing::warn` — the
+    // run's exit code reflects the run, never the sweep. Placed before
+    // the idempotency error-path finalize so an over-budget sweep never
+    // delays the InFlight stamp release.
+    auto_sweep_retention_at_end_of_run(state_path, &rocky_cfg_for_idemp.state.retention).await;
+
     // FR-004 F1 error-path finalize. If the body returned `Err`, the
     // claim is almost certainly still `InFlight` (the happy/interrupted/
     // partial-failure sites all call `finalize_idempotency` which takes
@@ -3178,6 +3195,121 @@ pub async fn run(
     }
 
     run_result
+}
+
+/// End-of-run retention sweep, gated by `last_retention_sweep_at`.
+///
+/// Reads the configured `[state.retention]` policy and the timestamp of
+/// the most recent prior sweep from the state store's metadata table. If
+/// the prior sweep is younger than `sweep_interval_seconds`, returns
+/// without doing any work. Otherwise invokes [`StateStore::sweep_retention`],
+/// measures wall-clock against `sweep_budget_ms`, and emits a
+/// `tracing::warn` line on overrun. The sweep timestamp is stamped
+/// regardless of whether the budget was met — otherwise an over-budget
+/// sweep would fire every run.
+///
+/// Every error path is swallowed as `tracing::warn`. The run's exit code
+/// reflects the run, never the sweep — auto-sweep is opportunistic by
+/// contract.
+///
+/// Skipped when `applies_to = []` (sweep disabled by config) or when the
+/// state store cannot be opened (lock contention, missing file mid-run).
+/// In the disabled case we never stamp `last_retention_sweep_at` so
+/// flipping `applies_to` back on triggers a sweep next run regardless of
+/// recency.
+async fn auto_sweep_retention_at_end_of_run(
+    state_path: &Path,
+    policy: &rocky_core::retention::StateRetentionConfig,
+) {
+    if policy.applies_to.is_empty() {
+        // Sweep disabled by config. Don't stamp the timestamp — flipping
+        // `applies_to` back on should trigger a sweep next run.
+        return;
+    }
+
+    if !state_path.exists() {
+        // Fresh project on an ephemeral runner; nothing to sweep.
+        return;
+    }
+
+    // Safe to open: the inner async block's `state_store` (the writer
+    // held during the run body) has dropped by the time the outer
+    // `.await` resolves, so re-opening here doesn't deadlock on its
+    // exclusive flock.
+    let store = match rocky_core::state::StateStore::open(state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %state_path.display(),
+                "auto-sweep: failed to open state store; skipping");
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    match store.get_last_retention_sweep_at() {
+        Ok(Some(last)) => {
+            let elapsed = now.signed_duration_since(last);
+            let interval = chrono::Duration::seconds(policy.sweep_interval_seconds as i64);
+            if elapsed < interval {
+                tracing::debug!(
+                    last_sweep_at = %last.to_rfc3339(),
+                    elapsed_secs = elapsed.num_seconds(),
+                    interval_secs = policy.sweep_interval_seconds,
+                    "auto-sweep: within configured interval; skipping"
+                );
+                return;
+            }
+        }
+        Ok(None) => {
+            // First run with auto-sweep enabled — proceed.
+        }
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "auto-sweep: cannot read last_retention_sweep_at; skipping");
+            return;
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let report = match store.sweep_retention(policy) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "auto-sweep: sweep_retention failed");
+            // Do not stamp the timestamp — a sweep that never landed
+            // shouldn't reset the interval gate.
+            return;
+        }
+    };
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms > policy.sweep_budget_ms {
+        tracing::warn!(
+            elapsed_ms,
+            budget_ms = policy.sweep_budget_ms,
+            overrun_ms = elapsed_ms.saturating_sub(policy.sweep_budget_ms),
+            runs_deleted = report.runs_deleted,
+            lineage_deleted = report.lineage_deleted,
+            audit_deleted = report.audit_deleted,
+            "auto-sweep: budget exceeded; consider running `rocky state retention sweep` \
+             out-of-band or shortening max_age_days"
+        );
+    } else {
+        tracing::debug!(
+            elapsed_ms,
+            budget_ms = policy.sweep_budget_ms,
+            runs_deleted = report.runs_deleted,
+            lineage_deleted = report.lineage_deleted,
+            audit_deleted = report.audit_deleted,
+            "auto-sweep: complete"
+        );
+    }
+
+    // Stamp regardless of overrun — otherwise a consistently-slow sweep
+    // would fire every run and degrade the user experience further.
+    if let Err(e) = store.set_last_retention_sweep_at(now) {
+        tracing::warn!(error = %e,
+            "auto-sweep: failed to stamp last_retention_sweep_at");
+    }
 }
 
 /// Emit Dagster Pipes messages for every materialization, check, and
@@ -5320,5 +5452,155 @@ adapter = "default"
              Succeeded, not leave the InFlight claim for the TTL sweep to reap \
              (FR-004 F2 regression guard)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-sweep at end-of-run
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn auto_sweep_missing_state_path_is_a_noop() {
+        // Ephemeral CI runner: no `state.redb` yet. The helper must
+        // exit quietly without creating the file.
+        use rocky_core::retention::StateRetentionConfig;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        assert!(!path.exists());
+
+        auto_sweep_retention_at_end_of_run(&path, &StateRetentionConfig::default()).await;
+        assert!(!path.exists(), "auto-sweep must not create state.redb");
+    }
+
+    #[tokio::test]
+    async fn auto_sweep_disabled_by_empty_applies_to_does_not_stamp() {
+        // applies_to = [] is the documented "disable" knob. We must
+        // skip the sweep AND not stamp last_retention_sweep_at — so
+        // flipping applies_to back on triggers a sweep next run
+        // regardless of recency.
+        use rocky_core::retention::StateRetentionConfig;
+        use rocky_core::state::StateStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let _ = StateStore::open(&path).expect("init");
+        }
+
+        let mut policy = StateRetentionConfig::default();
+        policy.applies_to.clear();
+
+        auto_sweep_retention_at_end_of_run(&path, &policy).await;
+
+        let store = StateStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.get_last_retention_sweep_at().unwrap(),
+            None,
+            "disabled sweep must not stamp last_retention_sweep_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sweep_first_run_stamps_timestamp() {
+        // Fresh state store, default policy: the helper should run
+        // the sweep (no-op on an empty history table) and stamp the
+        // timestamp.
+        use rocky_core::retention::StateRetentionConfig;
+        use rocky_core::state::StateStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let _ = StateStore::open(&path).expect("init");
+        }
+
+        let before = chrono::Utc::now();
+        auto_sweep_retention_at_end_of_run(&path, &StateRetentionConfig::default()).await;
+        let after = chrono::Utc::now();
+
+        let store = StateStore::open(&path).expect("reopen");
+        let stamped = store
+            .get_last_retention_sweep_at()
+            .unwrap()
+            .expect("first auto-sweep must stamp the timestamp");
+        assert!(
+            stamped >= before && stamped <= after,
+            "stamped timestamp {stamped} should sit between {before} and {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sweep_within_interval_skips_without_updating_stamp() {
+        // Pre-stamp a recent sweep timestamp. A second invocation
+        // within the configured interval must be a no-op — the
+        // stamp must NOT advance, so the same call once the interval
+        // does elapse will fire (if we'd advanced the stamp on every
+        // gated call we'd never sweep).
+        use rocky_core::retention::StateRetentionConfig;
+        use rocky_core::state::StateStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let pre_stamp = chrono::Utc::now() - chrono::Duration::seconds(60);
+        {
+            let store = StateStore::open(&path).expect("init");
+            store.set_last_retention_sweep_at(pre_stamp).unwrap();
+        }
+
+        // Default interval is 1 hour; pre_stamp is 60s ago — gate fires.
+        auto_sweep_retention_at_end_of_run(&path, &StateRetentionConfig::default()).await;
+
+        let store = StateStore::open(&path).expect("reopen");
+        let stamped = store.get_last_retention_sweep_at().unwrap().unwrap();
+        assert_eq!(
+            stamped, pre_stamp,
+            "within-interval skip must not update last_retention_sweep_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sweep_after_interval_runs_and_advances_stamp() {
+        // Pre-stamp a sweep timestamp older than the configured
+        // interval. The helper should run the sweep and advance the
+        // stamp.
+        use rocky_core::retention::StateRetentionConfig;
+        use rocky_core::state::StateStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        // Use a tight interval so the test is deterministic without
+        // having to fast-forward time.
+        let policy = StateRetentionConfig {
+            sweep_interval_seconds: 1,
+            ..StateRetentionConfig::default()
+        };
+        let pre_stamp = chrono::Utc::now() - chrono::Duration::seconds(10);
+        {
+            let store = StateStore::open(&path).expect("init");
+            store.set_last_retention_sweep_at(pre_stamp).unwrap();
+        }
+
+        auto_sweep_retention_at_end_of_run(&path, &policy).await;
+
+        let store = StateStore::open(&path).expect("reopen");
+        let stamped = store.get_last_retention_sweep_at().unwrap().unwrap();
+        assert!(
+            stamped > pre_stamp,
+            "post-interval sweep must advance stamp ({stamped} should be > {pre_stamp})"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sweep_does_not_propagate_failure() {
+        // The contract: auto-sweep is opportunistic; any failure
+        // path is swallowed as `tracing::warn` so the run's exit
+        // code reflects the run, not the sweep. We exercise that
+        // by pointing at a directory (not a file) that opens as a
+        // path the StateStore cannot use as a database file. The
+        // helper must return cleanly.
+        use rocky_core::retention::StateRetentionConfig;
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create a sub-directory, then point the state path AT the
+        // directory: redb cannot open a directory as a database.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+
+        // Should return without panicking or propagating.
+        auto_sweep_retention_at_end_of_run(&blocked, &StateRetentionConfig::default()).await;
     }
 }

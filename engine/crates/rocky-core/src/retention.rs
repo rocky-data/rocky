@@ -239,6 +239,28 @@ pub const DEFAULT_STATE_RETENTION_MAX_AGE_DAYS: u32 = 365;
 /// swept just because every row is older than `max_age_days`.
 pub const DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT: u32 = 100;
 
+/// Default `sweep_interval_seconds` when `[state.retention]` is unset.
+///
+/// One hour: short enough that hourly-cron-style projects sweep every run,
+/// long enough that a project running every minute does not pay the sweep
+/// cost on every invocation. The `rocky run` end-of-run auto-sweep gates
+/// on this interval — see [`StateStore::get_last_retention_sweep_at`].
+///
+/// [`StateStore::get_last_retention_sweep_at`]: crate::state::StateStore::get_last_retention_sweep_at
+pub const DEFAULT_STATE_RETENTION_SWEEP_INTERVAL_SECONDS: u64 = 3_600;
+
+/// Default `sweep_budget_ms` when `[state.retention]` is unset.
+///
+/// Five seconds is the budget the auto-sweep at end-of-run measures itself
+/// against. The sweep runs to completion regardless — this value is the
+/// threshold that flips the per-run log line from `tracing::debug` to
+/// `tracing::warn` so operators can spot a state store that has grown
+/// large enough to warrant a manual `rocky state retention sweep` outside
+/// the normal run loop. Synchronous `redb` commits don't take cancellation,
+/// so the budget is intentionally a soft measure rather than a hard
+/// timeout.
+pub const DEFAULT_STATE_RETENTION_SWEEP_BUDGET_MS: u64 = 5_000;
+
 /// State-store retention policy.
 ///
 /// Bounds the size of Rocky's `state.redb` by sweeping rows older than
@@ -273,6 +295,24 @@ pub struct StateRetentionConfig {
     /// removing the config block — useful for staged rollouts.
     #[serde(default = "default_state_retention_applies_to")]
     pub applies_to: Vec<StateRetentionDomain>,
+
+    /// Minimum number of seconds between two automatic end-of-run sweeps.
+    /// The `rocky run` end-of-run hook reads `last_retention_sweep_at`
+    /// from the state store's metadata table and skips the sweep when
+    /// `now - last < sweep_interval_seconds`. The manual `rocky state
+    /// retention sweep` subcommand is unaffected — it always runs.
+    /// Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_INTERVAL_SECONDS`].
+    #[serde(default = "default_state_retention_sweep_interval_seconds")]
+    pub sweep_interval_seconds: u64,
+
+    /// Wall-clock budget (in milliseconds) the auto-sweep measures itself
+    /// against at end-of-run. The sweep always runs to completion;
+    /// exceeding the budget flips the per-run log line from
+    /// `tracing::debug` to `tracing::warn` so operators can spot a state
+    /// store that has grown large enough to warrant manual intervention.
+    /// Defaults to [`DEFAULT_STATE_RETENTION_SWEEP_BUDGET_MS`].
+    #[serde(default = "default_state_retention_sweep_budget_ms")]
+    pub sweep_budget_ms: u64,
 }
 
 impl Default for StateRetentionConfig {
@@ -281,6 +321,8 @@ impl Default for StateRetentionConfig {
             max_age_days: default_state_retention_max_age_days(),
             min_runs_kept: default_state_retention_min_runs_kept(),
             applies_to: default_state_retention_applies_to(),
+            sweep_interval_seconds: default_state_retention_sweep_interval_seconds(),
+            sweep_budget_ms: default_state_retention_sweep_budget_ms(),
         }
     }
 }
@@ -299,6 +341,14 @@ fn default_state_retention_applies_to() -> Vec<StateRetentionDomain> {
         StateRetentionDomain::Lineage,
         StateRetentionDomain::Audit,
     ]
+}
+
+fn default_state_retention_sweep_interval_seconds() -> u64 {
+    DEFAULT_STATE_RETENTION_SWEEP_INTERVAL_SECONDS
+}
+
+fn default_state_retention_sweep_budget_ms() -> u64 {
+    DEFAULT_STATE_RETENTION_SWEEP_BUDGET_MS
 }
 
 impl StateRetentionConfig {
