@@ -1453,7 +1453,61 @@ impl StateStore {
         }
         Ok(n)
     }
+
+    /// Read the timestamp of the most recent successful end-of-run
+    /// auto-sweep, if any.
+    ///
+    /// Returns `Ok(None)` when the key is absent (fresh store, or older
+    /// rocky binary that never wrote it). Returns `Err` only when the
+    /// stored value is present but unparseable as RFC3339 — that is a
+    /// genuine corruption signal, not a missing-key signal, and the
+    /// caller should treat it as "do not auto-sweep this run" so the
+    /// state store stays unchanged until an operator inspects it.
+    ///
+    /// The auto-sweep gate at end-of-run reads this value and skips
+    /// sweeping when `now - last < sweep_interval_seconds`. The manual
+    /// `rocky state retention sweep` subcommand never consults this
+    /// field — it always runs.
+    pub fn get_last_retention_sweep_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(METADATA)?;
+        let Some(value) = table.get(LAST_RETENTION_SWEEP_AT_KEY)? else {
+            return Ok(None);
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(value.value())
+            .map_err(|e| StateError::VersionParse(format!("last_retention_sweep_at: {e}")))?
+            .with_timezone(&chrono::Utc);
+        Ok(Some(parsed))
+    }
+
+    /// Stamp the `last_retention_sweep_at` metadata key to `at`,
+    /// serialised as RFC3339.
+    ///
+    /// Called by the end-of-run auto-sweep regardless of whether the
+    /// sweep stayed inside its budget — the stamp tracks "when did we
+    /// last attempt", not "when did we last finish quickly". That keeps
+    /// the interval gate from firing every run on a state store that
+    /// consistently breaches the soft budget.
+    pub fn set_last_retention_sweep_at(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let formatted = at.to_rfc3339();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(METADATA)?;
+            table.insert(LAST_RETENTION_SWEEP_AT_KEY, formatted.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
 }
+
+/// Metadata key for the timestamp of the most recent end-of-run
+/// auto-sweep (see [`StateStore::get_last_retention_sweep_at`]).
+const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";
 
 // ---------------------------------------------------------------------------
 // Idempotency-key persistence (see `crate::idempotency`)
@@ -4004,6 +4058,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 0,
             applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
         };
         let report = store.sweep_retention(&policy).unwrap();
         assert_eq!(report.runs_deleted, 0);
@@ -4028,6 +4083,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 10,
             applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
         };
         let report = store.sweep_retention(&policy).unwrap();
         assert_eq!(report.runs_deleted, 0);
@@ -4062,6 +4118,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 5,
             applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
         };
         let report = store.sweep_retention(&policy).unwrap();
         // The 7 old runs are not in the most-recent-5 and exceed cutoff →
@@ -4092,6 +4149,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 0,
             applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
         };
 
         let dry = store.sweep_retention_dry_run(&policy).unwrap();
@@ -4122,6 +4180,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 0,
             applies_to: vec![StateRetentionDomain::Lineage],
+            ..StateRetentionConfig::default()
         };
         let report = store.sweep_retention(&policy).unwrap();
         assert_eq!(report.runs_deleted, 0);
@@ -4156,6 +4215,7 @@ mod tests {
             max_age_days: 30,
             min_runs_kept: 2,
             applies_to: vec![StateRetentionDomain::Audit],
+            ..StateRetentionConfig::default()
         };
         let report = store.sweep_retention(&policy).unwrap();
         assert_eq!(report.audit_deleted, 4);
@@ -4183,5 +4243,63 @@ mod tests {
         assert_eq!(report.runs_kept, 3);
         assert_eq!(report.lineage_deleted, 0);
         assert_eq!(report.audit_deleted, 0);
+    }
+
+    #[test]
+    fn last_retention_sweep_at_absent_returns_none() {
+        // Fresh state store has no metadata key yet.
+        let (store, _dir) = temp_store();
+        let result = store.get_last_retention_sweep_at().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn last_retention_sweep_at_round_trips() {
+        // Stamp a known timestamp and read it back; the chrono RFC3339
+        // serializer is lossless at second precision so we round-trip
+        // exactly for second-aligned inputs.
+        let (store, _dir) = temp_store();
+        let stamped = chrono::DateTime::parse_from_rfc3339("2026-05-02T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.set_last_retention_sweep_at(stamped).unwrap();
+
+        let read_back = store.get_last_retention_sweep_at().unwrap();
+        assert_eq!(read_back, Some(stamped));
+    }
+
+    #[test]
+    fn last_retention_sweep_at_set_overwrites() {
+        // Subsequent stamps replace the prior value; we don't keep a
+        // history of sweep timestamps in the metadata table.
+        let (store, _dir) = temp_store();
+        let first = chrono::DateTime::parse_from_rfc3339("2026-05-02T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second = chrono::DateTime::parse_from_rfc3339("2026-05-02T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.set_last_retention_sweep_at(first).unwrap();
+        store.set_last_retention_sweep_at(second).unwrap();
+
+        let read_back = store.get_last_retention_sweep_at().unwrap();
+        assert_eq!(read_back, Some(second));
+    }
+
+    #[test]
+    fn last_retention_sweep_at_persists_across_reopen() {
+        // The metadata key is durable: closing and reopening the store
+        // recovers the timestamp.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let stamped = chrono::DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.set_last_retention_sweep_at(stamped).unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.get_last_retention_sweep_at().unwrap(), Some(stamped));
     }
 }

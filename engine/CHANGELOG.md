@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **End-of-run auto-sweep for state-store retention.** `rocky run` now invokes `StateStore::sweep_retention` at the end of every run so the policy declared in `[state.retention]` (introduced in 1.22.0) "just works" without an external cron. The sweep is gated by a `last_retention_sweep_at` metadata key in the state store: subsequent runs within `sweep_interval_seconds` (default 3600 = 1h) skip without doing any work, so a project running every minute does not pay sweep cost on every invocation. A `sweep_budget_ms` knob (default 5000 = 5s) controls the soft budget — the sweep always runs to completion, but exceeding the budget flips the per-run log line from `tracing::debug` to `tracing::warn` so operators can spot a state store grown large enough to warrant a manual `rocky state retention sweep` outside the normal run loop. Auto-sweep failures (cannot open state store, sweep itself errors) are swallowed as `tracing::warn` and never mask the run's exit code. Setting `applies_to = []` disables the auto-sweep without touching the manual subcommand. The two new `[state.retention]` fields (`sweep_interval_seconds`, `sweep_budget_ms`) are additive and default-populated — existing configs upgrade without changes.
+
 ## [1.22.0] — 2026-05-02
 
 Feature release. Headline: **exhaustive checksum-bisection diff** — `rocky preview diff --algorithm bisection` covers every row in a target table at bounded scan cost, ending the sampling false-negative ceiling. Live-verified on DuckDB, BigQuery, and Databricks; Snowflake stays on the sampled fallback until a consumer drives the override. Bundles pre-merge budget projection on `rocky preview cost`, rolling z-score + health score on `rocky history`, a state-store retention sweep, and a tagged-enum restructure of `PreviewDiffOutput` (the breaking shape change downstream consumers need to migrate for).
