@@ -1033,6 +1033,15 @@ enum HooksAction {
     },
 }
 
+/// Algorithm selector for `rocky preview diff`. Hidden from `--help` for
+/// now because bisection is opt-in: the JSON output is unchanged and the
+/// result lands in tracing logs only.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PreviewDiffAlgorithm {
+    Sampled,
+    Bisection,
+}
+
 #[derive(Subcommand)]
 enum PreviewAction {
     /// Register a branch, copy unchanged upstream from the base schema,
@@ -1062,6 +1071,17 @@ enum PreviewAction {
         /// Maximum rows to sample per model (default: 1000)
         #[arg(long, default_value_t = 1000)]
         sample_size: usize,
+        /// Diff algorithm: `sampled` (default — structural delta from the
+        /// run records) or `bisection` (exhaustive checksum-bisection on
+        /// each Merge-strategy model with a single integer / numeric
+        /// primary key). Bisection results are surfaced via tracing
+        /// today; the JSON output shape is unchanged.
+        #[arg(long, value_enum, default_value_t = PreviewDiffAlgorithm::Sampled, hide = true)]
+        algorithm: PreviewDiffAlgorithm,
+        /// Models directory (used by bisection to discover each
+        /// model's primary-key column).
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
     /// Produce a per-model bytes/duration/USD delta between the preview
     /// branch's run and the latest base-schema run.
@@ -1875,13 +1895,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 name,
                 base,
                 sample_size,
+                algorithm,
+                models,
             } => {
+                let algorithm = match algorithm {
+                    PreviewDiffAlgorithm::Sampled => {
+                        rocky_cli::commands::PreviewDiffAlgorithmSelector::Sampled
+                    }
+                    PreviewDiffAlgorithm::Bisection => {
+                        rocky_cli::commands::PreviewDiffAlgorithmSelector::Bisection
+                    }
+                };
                 rocky_cli::commands::run_preview_diff(
                     &cli.config,
                     &state_path,
+                    &models,
                     &name,
                     &base,
                     sample_size,
+                    algorithm,
                     json,
                 )
                 .await
