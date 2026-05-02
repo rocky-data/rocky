@@ -2679,6 +2679,10 @@ impl RunOutput {
             if let Some(rid) = run_id {
                 evt = evt.with_run_id(rid);
             }
+            // Annotate the active span with this breach as an OTel
+            // span event before fanning out to bus subscribers. No-op
+            // when the `otel` feature is off.
+            rocky_observe::events::record_span_event(&evt);
             bus.emit(evt);
         }
 
