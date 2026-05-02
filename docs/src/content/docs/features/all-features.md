@@ -150,7 +150,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 `playground` · `serve` · `lsp` · `init-adapter` · `test-adapter` · `import-dbt` · `validate-migration`
 
 ### Administration
-`doctor` · `history` · `replay` · `trace` · `cost` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `bench` · `hooks list` · `hooks test`
+`doctor` · `history` · `history --rolling-stats` · `replay` · `trace` · `cost` · `metrics` · `optimize` · `compact` · `profile-storage` · `archive` · `state retention sweep` · `bench` · `hooks list` · `hooks test`
 
 ## Observability
 
@@ -160,6 +160,10 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 - **Timed half-open circuit breaker** — three-state (`Closed` / `Open` / `HalfOpen`) breaker shared across Databricks + Snowflake adapters. Fires `circuit_breaker_tripped` / `circuit_breaker_recovered` events.
 - **OTLP metrics export** (feature-gated via `--features otel`) — `rocky run` exports in-process counters and histograms to any OTLP-compatible collector.
 - **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` + `max_bytes_scanned` with `on_breach = "warn" | "error"`; any single dimension breach fires the `budget_breach` event. See [`[budget]`](/reference/configuration/#budget).
+- **Pre-merge budget projection** — `rocky preview cost` projects budget breaches against the branch totals before merge, so reviewers see "this PR would breach `max_usd` if merged" in the PR comment. Output field `projected_budget_breaches` mirrors `RunOutput.budget_breaches`; the Markdown flips between advisory and "would fail the run" based on `[budget].on_breach`.
+- **Rolling stats + model health score** — `rocky history --model <name> --rolling-stats [--window N]` augments `ModelHistoryOutput` with rolling z-score on `rows_affected` + `duration_ms` over the most recent N successful runs (default 20), plus a composite `health_score` (`1.0 − clamp((max(|z|) − 2) / 4, 0, 1)`).
+- **State-store retention sweep** — `[state.retention] {max_age_days, min_runs_kept, applies_to}` config knob + `rocky state retention sweep [--dry-run]` subcommand. Sweeps history (`runs`), lineage (`dag_snapshots`), and audit (`quality_history`); explicitly leaves operational state (schema cache, watermarks, partitions) untouched.
+- **Exhaustive checksum-bisection diff** — `rocky preview diff --algorithm bisection` walks the chunk lattice over a single-column integer / numeric primary key for exhaustive row-level coverage at bounded scan cost (`O(K · log_K(N))` chunks examined for a single-row change). Per-adapter native row-hashes — DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`. Snowflake stays on the sampled fallback until a consumer drives the override.
 - **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
 - **`rocky cost <run_id|latest>`** — historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
 

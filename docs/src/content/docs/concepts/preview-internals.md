@@ -47,29 +47,76 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 
 The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages — column-level pruning, compile-time type-equivalence detection, warehouse-native clones — are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
 
-## Sampling correctness ceiling
+## Two diff algorithms
 
-`rocky preview diff` produces a row-level diff per model in the prune set by sampling. The current sampling rule is:
+`rocky preview diff` produces a row-level diff per model in the prune set using one of two algorithms; the active algorithm is encoded by a `kind` discriminator on each per-model entry.
+
+### `--algorithm sampled` (default)
 
 ```
 ORDER BY <primary_key>     -- or first column if no PK declared
 LIMIT <sample_size>        -- default 1000, override with --sample-size
 ```
 
-This is fast, deterministic, and bounded — but it has a known false-negative mode: a row that changed outside the sampling window appears as no-change. The diff layer flags this risk explicitly. Each per-model diff carries a `sampling_window` block:
+Fast, deterministic, bounded — but with a known false-negative mode: a row that changed outside the sampling window appears as no-change. The diff layer flags this risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block:
 
-```json
+```jsonc
 {
-  "ordered_by": "order_id",
-  "limit": 1000,
-  "coverage": "first_n_by_order",
-  "coverage_warning": true
+  "kind": "sampled",
+  "sampled": { /* per-row totals */ },
+  "sampling_window": {
+    "ordered_by": "order_id",
+    "limit": 1000,
+    "coverage": "first_n_by_order",
+    "coverage_warning": true
+  }
 }
 ```
 
-`coverage_warning: true` means the row count outside the sampling window is non-trivial — a clean sample does not imply "no change". The aggregate `summary.any_coverage_warning` lifts the flag to the run level so a reviewer can spot it without scanning every model.
+`coverage_warning: true` means the row count outside the sampling window is non-trivial — a clean sample does not imply "no change".
 
-A checksum-bisection exhaustive diff (the technique [datafold's data-diff](https://github.com/datafold/data-diff) uses — split the table into PK-range chunks, checksum each chunk, recurse into mismatched chunks for bounded scan cost with exhaustive coverage) is the planned next lift. Until then, treat the row-level diff as a sample-quality signal, not a correctness primitive — and don't ignore `coverage_warning`.
+### `--algorithm bisection`
+
+Exhaustive checksum-bisection over a single-column integer / numeric primary key. The technique is what [datafold's data-diff](https://github.com/datafold/data-diff) uses:
+
+1. Split the primary-key range into `K` chunks (default `K=32`).
+2. On both the branch and base sides, compute a per-chunk checksum: a `BIT_XOR` aggregate over a per-row hash (DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`).
+3. Compare the two sides chunk-by-chunk. Matching chunks (equal row count + equal checksum) are pruned from the search.
+4. Recurse into mismatched chunks until each chunk falls below a leaf threshold (default `MIN_CHUNK_ROWS=1000`); at the leaf, materialize both sides and walk them in lockstep, classifying each row as added / removed / changed.
+5. Bound recursion at `MAX_DEPTH=8` (covers `K^8 ≈ 10^12` rows). On hit, surface `bisection_stats.depth_capped: true`.
+
+Two properties make this a step-change over sampling:
+
+- **Bounded scan cost.** A no-op diff bottoms out at `K=32` chunk checksums per side. A single-row change recurses to the row in `O(K · log_K(N))` chunks examined — for a 1B-row table at `K=32`, that's ~128 chunk reads.
+- **Exhaustive coverage.** Every row hashes into exactly one chunk; if any row differs, the chunk it lives in is guaranteed to mismatch and the recursion is guaranteed to find it. No `coverage_warning` hedge.
+
+Each per-model `Bisection` variant carries a `bisection_stats` block:
+
+```jsonc
+{
+  "kind": "bisection",
+  "diff": { "rows_added": 0, "rows_removed": 0, "rows_changed": 1, "samples": [...] },
+  "bisection_stats": {
+    "chunks_examined": 64,
+    "leaves_materialized": 1,
+    "depth_max": 2,
+    "depth_capped": false,
+    "split_strategy": "int_range",
+    "null_pk_rows_base": 0,
+    "null_pk_rows_branch": 0
+  }
+}
+```
+
+The `samples` field carries up to `--max-samples` (default 5) representative changed rows surfaced from the leaves.
+
+### Which algorithm runs?
+
+Bisection requires a single-column integer / numeric `unique_key` declared on the model's `Merge` strategy. Models without a usable PK (composite key, non-numeric PK, non-Merge strategy) skip bisection with a `tracing::warn` reason and fall back to the sampled placeholder. Future work extends bisection to composite primary keys (per-level `NTILE` quantile boundaries on the base side) and UUID / hash-bucket primary keys (single-level hash bucketing with explicit cost-bound disclosure).
+
+### Coverage-warning roll-up
+
+The aggregate `summary.any_coverage_warning` rolls both signals up to the run level: it fires when *any* per-model diff is `Sampled` with `sampling_window.coverage_warning: true` *or* `Bisection` with `bisection_stats.depth_capped: true`. A reviewer can spot either incompleteness signal in the Markdown PR comment without scanning every model.
 
 ## Output shapes
 
