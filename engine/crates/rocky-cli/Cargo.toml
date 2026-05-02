@@ -42,6 +42,8 @@ notify = { workspace = true }
 blake3 = { workspace = true }
 hostname = { workspace = true }
 toml = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
