@@ -106,6 +106,28 @@ enum OutputFormat {
     Table,
 }
 
+/// Artefact family selector for `rocky catalog --format`.
+///
+/// Maps 1:1 to [`rocky_cli::commands::CatalogFormat`]. Kept in
+/// `main.rs` so `clap::ValueEnum` does not need to leak into the CLI
+/// library crate.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CatalogFormatArg {
+    Json,
+    Parquet,
+    Both,
+}
+
+impl From<CatalogFormatArg> for rocky_cli::commands::CatalogFormat {
+    fn from(value: CatalogFormatArg) -> Self {
+        match value {
+            CatalogFormatArg::Json => Self::Json,
+            CatalogFormatArg::Parquet => Self::Parquet,
+            CatalogFormatArg::Both => Self::Both,
+        }
+    }
+}
+
 /// CLI alias for `rocky compile --target-dialect`. Short names
 /// (`dbx`, `sf`, `bq`, `duckdb`) are the user-facing spelling; they map
 /// 1:1 to `rocky_cli::commands::Dialect`.
@@ -455,20 +477,30 @@ enum Command {
     /// Emit a project-wide column-level lineage snapshot.
     ///
     /// Walks the SemanticGraph and writes a persisted catalog artifact
-    /// (default: `./.rocky/catalog/catalog.json`) so any non-Rocky
-    /// consumer can read column-level lineage without invoking the
-    /// engine. PR-1 emits JSON only; Parquet output and run-history
-    /// enrichment land in follow-up PRs.
+    /// (default: `./.rocky/catalog/`) so any non-Rocky consumer can
+    /// read column-level lineage without invoking the engine. The
+    /// snapshot is emitted as `catalog.json` (single-file front door),
+    /// `edges.parquet` (one row per column-lineage edge), and
+    /// `assets.parquet` (one row per asset column). Use `--format` to
+    /// restrict the output to a single artefact family.
     Catalog {
         /// Models directory.
         #[arg(long, default_value = "models")]
         models: PathBuf,
         /// Output directory for the catalog artifacts.
         ///
-        /// Defaults to `./.rocky/catalog/`. The JSON file is always
-        /// written to `<out>/catalog.json`.
+        /// Defaults to `./.rocky/catalog/`. The JSON file is written
+        /// to `<out>/catalog.json`; the Parquet files to
+        /// `<out>/edges.parquet` and `<out>/assets.parquet`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Which artefact family to emit.
+        ///
+        /// `json` writes only `catalog.json`; `parquet` writes only
+        /// `edges.parquet` + `assets.parquet`; `both` (the default)
+        /// writes all three.
+        #[arg(long, value_enum, default_value_t = CatalogFormatArg::Both)]
+        format: CatalogFormatArg,
     },
 
     /// Show column-level lineage for a model
@@ -1613,13 +1645,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             json,
             cli.cache_ttl,
         ),
-        Command::Catalog { models, out } => {
+        Command::Catalog {
+            models,
+            out,
+            format,
+        } => {
             let out_dir = out.unwrap_or_else(rocky_cli::commands::catalog_default_out_dir);
             rocky_cli::commands::run_catalog(
                 &cli.config,
                 &state_path,
                 &models,
                 &out_dir,
+                format.into(),
                 json,
                 cli.cache_ttl,
             )

@@ -1,17 +1,33 @@
 //! `rocky catalog` — emit a project-wide column-level lineage snapshot.
 //!
-//! PR-1 of the catalog rollout: walks the SemanticGraph, builds a
-//! [`CatalogOutput`], and writes it to `./.rocky/catalog/catalog.json`
-//! by default. Stdout is a one-screen summary; the structured payload
-//! is the file. State-store and Parquet emit are deferred to
-//! follow-up PRs.
+//! Walks the SemanticGraph, builds a [`CatalogOutput`], and writes it
+//! to `./.rocky/catalog/` by default. Stdout is a one-screen summary;
+//! the structured payload is the file(s).
+//!
+//! Two artefact families:
+//!
+//! - `catalog.json` — single-file snapshot with assets + edges nested
+//!   together; the "front door" for shell scripts and PR bots.
+//! - `edges.parquet` + `assets.parquet` — flat analytics-friendly
+//!   files, one row per column-lineage edge / one row per asset
+//!   column. Designed to JOIN against warehouse queries.
+//!
+//! Format selection lives behind `--format json|parquet|both`
+//! (default `both`).
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::Utc;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::semantic::{LineageEdge, SemanticGraph};
@@ -24,29 +40,72 @@ use crate::registry::resolve_pipeline;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Which on-disk artefact families to emit.
+///
+/// `Both` is the default: write `catalog.json` plus `edges.parquet` +
+/// `assets.parquet`. The variants are intentionally orthogonal to the
+/// CLI's `--output` meta-format, which only controls what stdout
+/// summarises (table vs JSON mirror of the persisted payload).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogFormat {
+    Json,
+    Parquet,
+    Both,
+}
+
+impl CatalogFormat {
+    fn writes_json(self) -> bool {
+        matches!(self, Self::Json | Self::Both)
+    }
+
+    fn writes_parquet(self) -> bool {
+        matches!(self, Self::Parquet | Self::Both)
+    }
+}
+
 /// Execute `rocky catalog`.
 pub fn run_catalog(
     config_path: &Path,
     state_path: &Path,
     models_dir: &Path,
     out_dir: &Path,
+    format: CatalogFormat,
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let started = Instant::now();
     let output = compute_catalog_output(config_path, state_path, models_dir, cache_ttl_override)?;
 
-    // Persist the JSON artifact regardless of stdout format. The file
-    // is the contract; stdout is the human-readable summary.
-    let json_path = out_dir.join("catalog.json");
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let pretty = serde_json::to_string_pretty(&output).context("serializing catalog")?;
-    std::fs::write(&json_path, pretty + "\n")
-        .with_context(|| format!("writing {}", json_path.display()))?;
+
+    // Track every file we write so the human summary can list them.
+    let mut written: Vec<PathBuf> = Vec::new();
+
+    if format.writes_json() {
+        let json_path = out_dir.join("catalog.json");
+        let pretty = serde_json::to_string_pretty(&output).context("serializing catalog")?;
+        std::fs::write(&json_path, pretty + "\n")
+            .with_context(|| format!("writing {}", json_path.display()))?;
+        written.push(json_path);
+    }
+
+    if format.writes_parquet() {
+        let edges_path = out_dir.join("edges.parquet");
+        write_edges_parquet(&edges_path, &output)
+            .with_context(|| format!("writing {}", edges_path.display()))?;
+        written.push(edges_path);
+
+        let assets_path = out_dir.join("assets.parquet");
+        write_assets_parquet(&assets_path, &output)
+            .with_context(|| format!("writing {}", assets_path.display()))?;
+        written.push(assets_path);
+    }
 
     if output_json {
         // Mirror the persisted artifact on stdout so machine consumers
-        // can pipe `rocky catalog --output json` without re-reading the file.
+        // can pipe `rocky catalog --output json` without re-reading the
+        // file. Note the stdout JSON is independent of `--format`; it
+        // is always the same `CatalogOutput` shape.
         crate::output::print_json(&output)?;
     } else {
         let duration_ms = started.elapsed().as_millis();
@@ -64,7 +123,9 @@ pub fn run_catalog(
         if output.stats.orphan_columns > 0 {
             println!("  orphan columns:   {}", output.stats.orphan_columns);
         }
-        println!("  json:             {}", json_path.display());
+        for path in &written {
+            println!("  wrote:            {}", path.display());
+        }
         println!("  duration:         {duration_ms}ms");
     }
 
@@ -245,6 +306,19 @@ pub(crate) fn compute_catalog_output(
     });
     regrade_star_edges(&mut edges, &result.semantic_graph);
 
+    // 9. Sort assets by (fqn, then by name as a tiebreaker for
+    //    same-fqn collisions) and sort columns within each asset by
+    //    name. Both sorts are stable and keep `assets.parquet` /
+    //    `catalog.json` byte-stable across compiles.
+    for asset in &mut assets {
+        asset.columns.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    assets.sort_by(|a, b| {
+        a.fqn
+            .cmp(&b.fqn)
+            .then_with(|| a.model_name.cmp(&b.model_name))
+    });
+
     let stats = CatalogStats {
         asset_count: assets.len(),
         column_count: total_columns,
@@ -308,6 +382,238 @@ fn regrade_star_edges(edges: &mut [CatalogEdge], graph: &SemanticGraph) {
 /// Default catalog output directory: `./.rocky/catalog/`.
 pub fn default_out_dir() -> PathBuf {
     PathBuf::from(".rocky").join("catalog")
+}
+
+// ---------------------------------------------------------------------------
+// Parquet writers
+// ---------------------------------------------------------------------------
+//
+// Two flat schemas, one row per edge / one row per (asset, column).
+// Both files share `generated_at` and `config_hash` so consumers can
+// JOIN edges to assets without round-tripping through the JSON. All
+// timestamps are encoded as `TIMESTAMP(MICROS, UTC)`; the timezone tag
+// is part of the schema so DuckDB / BigQuery / Spark all treat the
+// column as zoned rather than naive.
+
+const TIMESTAMP_TZ: &str = "UTC";
+
+/// Schema for `edges.parquet`.
+///
+/// Columns mirror the design memo §3.2 verbatim:
+/// `source_model`, `source_column`, `target_model`, `target_column`,
+/// `transform`, `confidence`, `generated_at`, `config_hash`,
+/// `last_run_id` (nullable).
+fn edges_arrow_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("source_model", DataType::Utf8, false),
+        Field::new("source_column", DataType::Utf8, false),
+        Field::new("target_model", DataType::Utf8, false),
+        Field::new("target_column", DataType::Utf8, false),
+        Field::new("transform", DataType::Utf8, false),
+        Field::new("confidence", DataType::Utf8, false),
+        Field::new(
+            "generated_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            false,
+        ),
+        Field::new("config_hash", DataType::Utf8, false),
+        Field::new("last_run_id", DataType::Utf8, true),
+    ]))
+}
+
+/// Schema for `assets.parquet`.
+///
+/// Columns mirror the design memo §3.2 verbatim:
+/// `asset_fqn`, `model_name`, `asset_kind`, `column_name`,
+/// `data_type` (nullable), `is_nullable` (nullable), `has_star`,
+/// `intent` (nullable), `last_materialized_at` (nullable),
+/// `generated_at`, `config_hash`.
+fn assets_arrow_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("asset_fqn", DataType::Utf8, false),
+        Field::new("model_name", DataType::Utf8, false),
+        Field::new("asset_kind", DataType::Utf8, false),
+        Field::new("column_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, true),
+        Field::new("is_nullable", DataType::Boolean, true),
+        Field::new("has_star", DataType::Boolean, false),
+        Field::new("intent", DataType::Utf8, true),
+        Field::new(
+            "last_materialized_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            true,
+        ),
+        Field::new(
+            "generated_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            false,
+        ),
+        Field::new("config_hash", DataType::Utf8, false),
+    ]))
+}
+
+/// Write `edges.parquet` (one row per [`CatalogEdge`]).
+///
+/// The output is sorted by
+/// `(source_model, source_column, target_model, target_column)` —
+/// preserves the same order the JSON artifact uses so consumers
+/// JOINing the two see identical row orderings.
+pub fn write_edges_parquet(path: &Path, output: &CatalogOutput) -> Result<()> {
+    let schema = edges_arrow_schema();
+    let n = output.edges.len();
+    let generated_at_micros = output.generated_at.timestamp_micros();
+
+    let mut source_model: Vec<&str> = Vec::with_capacity(n);
+    let mut source_column: Vec<&str> = Vec::with_capacity(n);
+    let mut target_model: Vec<&str> = Vec::with_capacity(n);
+    let mut target_column: Vec<&str> = Vec::with_capacity(n);
+    let mut transform: Vec<&str> = Vec::with_capacity(n);
+    let mut confidence: Vec<&str> = Vec::with_capacity(n);
+
+    for edge in &output.edges {
+        source_model.push(&edge.source_model);
+        source_column.push(&edge.source_column);
+        target_model.push(&edge.target_model);
+        target_column.push(&edge.target_column);
+        transform.push(&edge.transform);
+        confidence.push(confidence_label(&edge.confidence));
+    }
+
+    let last_run_id_arr = StringArray::from(vec![output.last_run_id.as_deref(); n]);
+    let generated_at_arr =
+        TimestampMicrosecondArray::from(vec![generated_at_micros; n]).with_timezone(TIMESTAMP_TZ);
+    let config_hash_arr = StringArray::from(vec![output.config_hash.as_str(); n]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(source_model)),
+        Arc::new(StringArray::from(source_column)),
+        Arc::new(StringArray::from(target_model)),
+        Arc::new(StringArray::from(target_column)),
+        Arc::new(StringArray::from(transform)),
+        Arc::new(StringArray::from(confidence)),
+        Arc::new(generated_at_arr),
+        Arc::new(config_hash_arr),
+        Arc::new(last_run_id_arr),
+    ];
+
+    let batch =
+        RecordBatch::try_new(schema.clone(), columns).context("building edges record batch")?;
+
+    write_record_batch(path, schema, &batch)
+}
+
+/// Write `assets.parquet` (one row per asset column).
+///
+/// Per the design memo, the table is "one row = one column on one
+/// asset" — assets without columns produce zero rows. The output is
+/// sorted by `(asset_fqn, column_name)` because the upstream
+/// `compute_catalog_output` sorts assets by `fqn` and columns by
+/// `name`, and we iterate in that order.
+pub fn write_assets_parquet(path: &Path, output: &CatalogOutput) -> Result<()> {
+    let schema = assets_arrow_schema();
+    let generated_at_micros = output.generated_at.timestamp_micros();
+
+    // Pre-size optimistically: most assets have a handful of columns.
+    let approx_rows: usize = output.assets.iter().map(|a| a.columns.len()).sum();
+
+    let mut asset_fqn: Vec<&str> = Vec::with_capacity(approx_rows);
+    let mut model_name: Vec<&str> = Vec::with_capacity(approx_rows);
+    let mut asset_kind: Vec<&str> = Vec::with_capacity(approx_rows);
+    let mut column_name: Vec<&str> = Vec::with_capacity(approx_rows);
+    let mut data_type: Vec<Option<&str>> = Vec::with_capacity(approx_rows);
+    let mut is_nullable: Vec<Option<bool>> = Vec::with_capacity(approx_rows);
+    let mut has_star: Vec<bool> = Vec::with_capacity(approx_rows);
+    let mut intent: Vec<Option<&str>> = Vec::with_capacity(approx_rows);
+    let mut last_materialized_micros: Vec<Option<i64>> = Vec::with_capacity(approx_rows);
+
+    // Track `has_star` per asset by membership in `upstream_models`
+    // emitted by the regrade pass — but the catalog asset doesn't
+    // carry the bit directly. Recover it from the assets that own
+    // medium-confidence outbound edges. Cheaper: we treat any asset
+    // whose `model_name` matches a Medium target as star-derived.
+    let star_targets: std::collections::HashSet<&str> = output
+        .edges
+        .iter()
+        .filter(|e| matches!(e.confidence, EdgeConfidence::Medium))
+        .map(|e| e.target_model.as_str())
+        .collect();
+
+    for asset in &output.assets {
+        let kind_label = asset_kind_label(&asset.kind);
+        let fqn = asset.fqn.as_str();
+        let m_name = asset.model_name.as_str();
+        let intent_str = asset.intent.as_deref();
+        let asset_has_star = star_targets.contains(m_name);
+        let last_mat = asset.last_materialized_at.map(|t| t.timestamp_micros());
+
+        for col in &asset.columns {
+            asset_fqn.push(fqn);
+            model_name.push(m_name);
+            asset_kind.push(kind_label);
+            column_name.push(col.name.as_str());
+            data_type.push(col.data_type.as_deref());
+            is_nullable.push(col.nullable);
+            has_star.push(asset_has_star);
+            intent.push(intent_str);
+            last_materialized_micros.push(last_mat);
+        }
+    }
+
+    let n = asset_fqn.len();
+
+    let last_materialized_arr =
+        TimestampMicrosecondArray::from(last_materialized_micros).with_timezone(TIMESTAMP_TZ);
+    let generated_at_arr =
+        TimestampMicrosecondArray::from(vec![generated_at_micros; n]).with_timezone(TIMESTAMP_TZ);
+    let config_hash_arr = StringArray::from(vec![output.config_hash.as_str(); n]);
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(asset_fqn)),
+        Arc::new(StringArray::from(model_name)),
+        Arc::new(StringArray::from(asset_kind)),
+        Arc::new(StringArray::from(column_name)),
+        Arc::new(StringArray::from(data_type)),
+        Arc::new(BooleanArray::from(is_nullable)),
+        Arc::new(BooleanArray::from(has_star)),
+        Arc::new(StringArray::from(intent)),
+        Arc::new(last_materialized_arr),
+        Arc::new(generated_at_arr),
+        Arc::new(config_hash_arr),
+    ];
+
+    let batch =
+        RecordBatch::try_new(schema.clone(), columns).context("building assets record batch")?;
+
+    write_record_batch(path, schema, &batch)
+}
+
+fn write_record_batch(path: &Path, schema: Arc<Schema>, batch: &RecordBatch) -> Result<()> {
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(file, schema, Some(props)).context("opening parquet writer")?;
+    writer.write(batch).context("writing record batch")?;
+    writer.close().context("closing parquet writer")?;
+    Ok(())
+}
+
+fn confidence_label(c: &EdgeConfidence) -> &'static str {
+    match c {
+        EdgeConfidence::High => "high",
+        EdgeConfidence::Medium => "medium",
+        EdgeConfidence::Low => "low",
+    }
+}
+
+fn asset_kind_label(k: &AssetKind) -> &'static str {
+    match k {
+        AssetKind::Source => "source",
+        AssetKind::Model => "model",
+        AssetKind::View => "view",
+        AssetKind::MaterializedView => "materialized_view",
+    }
 }
 
 #[cfg(test)]
@@ -393,12 +699,169 @@ mod tests {
         sorted_keys.sort();
         assert_eq!(keys, sorted_keys, "edges must be sorted before emit");
 
+        // Assets should be deterministically sorted by (fqn, model_name)
+        // and each asset's columns sorted by name. The artefact is meant
+        // to be diffable in git — non-deterministic ordering would break
+        // that contract for both catalog.json and assets.parquet.
+        let asset_keys: Vec<_> = output.assets.iter().map(|a| a.fqn.as_str()).collect();
+        let mut sorted_asset_keys = asset_keys.clone();
+        sorted_asset_keys.sort();
+        assert_eq!(
+            asset_keys, sorted_asset_keys,
+            "assets must be sorted by fqn"
+        );
+        for asset in &output.assets {
+            let col_names: Vec<&str> = asset.columns.iter().map(|c| c.name.as_str()).collect();
+            let mut sorted_col_names = col_names.clone();
+            sorted_col_names.sort();
+            assert_eq!(
+                col_names, sorted_col_names,
+                "columns must be sorted by name on asset {}",
+                asset.fqn
+            );
+        }
+
         // Two compiles must produce identical structural output (assets,
         // edges, counts) — the catalog is meant to be diffable in git.
         let again = compute_catalog_output(&config_path, &state_path, &models_dir, None)?;
         assert_eq!(output.assets.len(), again.assets.len());
         assert_eq!(output.edges.len(), again.edges.len());
         assert_eq!(output.stats.column_count, again.stats.column_count);
+
+        Ok(())
+    }
+
+    /// Schema-conformance test for the two Parquet artefacts.
+    ///
+    /// Runs the catalog assembler against the playground POC, writes
+    /// both files, then re-opens them with the Arrow Parquet reader
+    /// and asserts (a) the column names match the design memo §3.2
+    /// schema verbatim, (b) the timestamp columns carry the `UTC`
+    /// timezone tag, and (c) the row counts line up with the in-memory
+    /// catalog (one row per edge / one row per asset column).
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn parquet_files_match_design_memo_schema() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let poc_dir = std::path::Path::new(manifest_dir)
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("playground")
+            .join("pocs")
+            .join("00-foundations")
+            .join("00-playground-default");
+
+        if !poc_dir.is_dir() {
+            eprintln!(
+                "skipping parquet_files_match_design_memo_schema: \
+                 {} not found (running outside the monorepo?)",
+                poc_dir.display()
+            );
+            return Ok(());
+        }
+
+        let config_path = poc_dir.join("rocky.toml");
+        let models_dir = poc_dir.join("models");
+        let state_path = poc_dir.join(".rocky-state.redb");
+
+        let output = compute_catalog_output(&config_path, &state_path, &models_dir, None)?;
+
+        let tmp = tempfile::tempdir()?;
+        let edges_path = tmp.path().join("edges.parquet");
+        let assets_path = tmp.path().join("assets.parquet");
+        write_edges_parquet(&edges_path, &output)?;
+        write_assets_parquet(&assets_path, &output)?;
+
+        // edges.parquet — schema + row count.
+        let file = std::fs::File::open(&edges_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let mut total_rows = 0usize;
+        let mut observed_schema: Option<arrow::datatypes::SchemaRef> = None;
+        for batch in reader {
+            let batch = batch?;
+            total_rows += batch.num_rows();
+            observed_schema.get_or_insert_with(|| batch.schema());
+        }
+        assert_eq!(
+            total_rows,
+            output.edges.len(),
+            "edges.parquet row count diverged from CatalogOutput.edges"
+        );
+        let schema = observed_schema.expect("edges.parquet had no batches");
+        let edge_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            edge_cols,
+            vec![
+                "source_model",
+                "source_column",
+                "target_model",
+                "target_column",
+                "transform",
+                "confidence",
+                "generated_at",
+                "config_hash",
+                "last_run_id",
+            ],
+            "edges.parquet column names diverged from design memo §3.2"
+        );
+        let generated_at_field = schema.field_with_name("generated_at")?;
+        assert_eq!(
+            generated_at_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            "edges.parquet generated_at must be TIMESTAMP(MICROS, UTC)"
+        );
+        assert!(!schema.field_with_name("source_model")?.is_nullable());
+        assert!(schema.field_with_name("last_run_id")?.is_nullable());
+
+        // assets.parquet — schema + row count.
+        let file = std::fs::File::open(&assets_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let mut total_rows = 0usize;
+        let mut observed_schema: Option<arrow::datatypes::SchemaRef> = None;
+        for batch in reader {
+            let batch = batch?;
+            total_rows += batch.num_rows();
+            observed_schema.get_or_insert_with(|| batch.schema());
+        }
+        let expected_rows: usize = output.assets.iter().map(|a| a.columns.len()).sum();
+        assert_eq!(
+            total_rows, expected_rows,
+            "assets.parquet row count diverged from sum(asset.columns.len())"
+        );
+        let schema = observed_schema.expect("assets.parquet had no batches");
+        let asset_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            asset_cols,
+            vec![
+                "asset_fqn",
+                "model_name",
+                "asset_kind",
+                "column_name",
+                "data_type",
+                "is_nullable",
+                "has_star",
+                "intent",
+                "last_materialized_at",
+                "generated_at",
+                "config_hash",
+            ],
+            "assets.parquet column names diverged from design memo §3.2"
+        );
+        let last_mat_field = schema.field_with_name("last_materialized_at")?;
+        assert_eq!(
+            last_mat_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            "assets.parquet last_materialized_at must be TIMESTAMP(MICROS, UTC)"
+        );
+        assert!(last_mat_field.is_nullable());
+        assert!(!schema.field_with_name("has_star")?.is_nullable());
+        assert!(schema.field_with_name("data_type")?.is_nullable());
+        assert!(schema.field_with_name("is_nullable")?.is_nullable());
+        assert!(schema.field_with_name("intent")?.is_nullable());
 
         Ok(())
     }
