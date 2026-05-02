@@ -14,7 +14,9 @@ use reqwest::{Client, RequestBuilder};
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
-use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
+use rocky_observe::events::{
+    ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -265,10 +267,10 @@ impl SnowflakeConnector {
             match self.submit_and_wait_once(sql).await {
                 Ok(resp) => {
                     if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
-                        global_event_bus().emit(
-                            PipelineEvent::new("circuit_breaker_recovered")
-                                .with_target("snowflake"),
-                        );
+                        let evt = PipelineEvent::new("circuit_breaker_recovered")
+                            .with_target("snowflake");
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                     }
                     return Ok(resp);
                 }
@@ -277,12 +279,12 @@ impl SnowflakeConnector {
                         && self.circuit_breaker.record_failure(&err.to_string())
                             == TransitionOutcome::Tripped
                     {
-                        global_event_bus().emit(
-                            PipelineEvent::new("circuit_breaker_tripped")
-                                .with_target("snowflake")
-                                .with_error(err.to_string())
-                                .with_error_class(classify_error(&err)),
-                        );
+                        let evt = PipelineEvent::new("circuit_breaker_tripped")
+                            .with_target("snowflake")
+                            .with_error(err.to_string())
+                            .with_error_class(classify_error(&err));
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
                         // Run-level retry budget (§P2.7). Short-circuit if
@@ -297,15 +299,19 @@ impl SnowflakeConnector {
                                 error = %err,
                                 "retry budget exhausted for this run; aborting further retries",
                             );
+                            // Mark active span Error — terminal failure.
+                            set_current_span_error(format!(
+                                "retry budget exhausted (limit {limit})"
+                            ));
                             return Err(ConnectorError::RetryBudgetExhausted { limit });
                         }
                         // §P2.8 retry event emission — see databricks/connector.rs
-                        global_event_bus().emit(
-                            PipelineEvent::new("statement_retry")
-                                .with_error(err.to_string())
-                                .with_attempt(attempt + 1, retry.max_retries)
-                                .with_error_class(classify_error(&err)),
-                        );
+                        let evt = PipelineEvent::new("statement_retry")
+                            .with_error(err.to_string())
+                            .with_attempt(attempt + 1, retry.max_retries)
+                            .with_error_class(classify_error(&err));
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                         // 401 from Snowflake often means the cached keypair
                         // JWT crossed the server-side expiry boundary between
                         // mint and request. Drop the cache so the next
@@ -325,6 +331,8 @@ impl SnowflakeConnector {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
+                    // Retry exhausted (or non-transient) — terminal failure.
+                    set_current_span_error(err.to_string());
                     return Err(err);
                 }
             }

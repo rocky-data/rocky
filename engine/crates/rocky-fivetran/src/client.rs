@@ -31,7 +31,7 @@ fn build_http_client() -> Client {
 }
 use rocky_core::config::RetryConfig;
 use rocky_core::redacted::RedactedString;
-use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
+use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus, record_span_event};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -139,12 +139,12 @@ impl FivetranClient {
     /// `get_single_page` should call this so event-bus subscribers see
     /// structured attempt count + classification instead of free-form text.
     fn emit_retry_event(&self, attempt: u32, reason: &str, class: ErrorClass) {
-        global_event_bus().emit(
-            PipelineEvent::new("http_retry")
-                .with_error(reason.to_string())
-                .with_attempt(attempt + 1, self.retry.max_retries)
-                .with_error_class(class),
-        );
+        let evt = PipelineEvent::new("http_retry")
+            .with_error(reason.to_string())
+            .with_attempt(attempt + 1, self.retry.max_retries)
+            .with_error_class(class);
+        record_span_event(&evt);
+        global_event_bus().emit(evt);
     }
 
     /// GET request with automatic response envelope unwrapping and retry on transient errors.

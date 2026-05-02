@@ -319,8 +319,8 @@ mod tests {
     /// PR 1 smoke test: an existing `info_span!` produces a span that
     /// reaches the OTLP-side exporter once the layer is registered.
     /// Asserts the layer routing is wired correctly — without it,
-    /// `dag_node` / `discover_sources` / `pipeline.run` etc. silently
-    /// drop on the floor.
+    /// `materialize.table` / `discover_sources` / `pipeline.run` etc.
+    /// silently drop on the floor.
     #[test]
     fn info_span_lands_at_otel_exporter() {
         let rt = tokio::runtime::Builder::new_current_thread()

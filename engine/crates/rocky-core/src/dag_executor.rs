@@ -224,7 +224,18 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                 let kind_str = kind.to_string();
                 let id_str = id.0.clone();
                 let label_for_task = label.clone();
-                let span = info_span!("dag_node", id = %id, kind = %kind);
+                // OTel-conventional span name: `<verb>.<resource>`. Each
+                // node corresponds to materialising a model, so
+                // `materialize.table` is the user-facing name.
+                // `rocky.model.fqn` / `rocky.model.kind` follow the
+                // `<vendor>.<resource>.<name>` attribute convention so
+                // dashboards and trace views can pivot consistently
+                // across the rest of the wave's instrumentation.
+                let span = info_span!(
+                    "materialize.table",
+                    rocky.model.fqn = %id,
+                    rocky.model.kind = %kind,
+                );
 
                 join_set.spawn(
                     async move {

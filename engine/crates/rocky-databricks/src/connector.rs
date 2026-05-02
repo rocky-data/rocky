@@ -4,7 +4,9 @@ use std::time::Duration;
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
-use rocky_observe::events::{ErrorClass, PipelineEvent, global_event_bus};
+use rocky_observe::events::{
+    ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -276,10 +278,10 @@ impl DatabricksConnector {
             match self.submit_and_wait_once(sql).await {
                 Ok(resp) => {
                     if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
-                        global_event_bus().emit(
-                            PipelineEvent::new("circuit_breaker_recovered")
-                                .with_target("databricks"),
-                        );
+                        let evt = PipelineEvent::new("circuit_breaker_recovered")
+                            .with_target("databricks");
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                     }
                     if attempt > 0 {
                         rocky_observe::metrics::METRICS.inc_retries_succeeded();
@@ -291,12 +293,12 @@ impl DatabricksConnector {
                         && self.circuit_breaker.record_failure(&err.to_string())
                             == TransitionOutcome::Tripped
                     {
-                        global_event_bus().emit(
-                            PipelineEvent::new("circuit_breaker_tripped")
-                                .with_target("databricks")
-                                .with_error(err.to_string())
-                                .with_error_class(classify_error(&err)),
-                        );
+                        let evt = PipelineEvent::new("circuit_breaker_tripped")
+                            .with_target("databricks")
+                            .with_error(err.to_string())
+                            .with_error_class(classify_error(&err));
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                     }
                     if attempt < retry.max_retries && is_transient(&err) {
                         // Run-level retry budget (§P2.7). If exhausted, abort
@@ -312,18 +314,25 @@ impl DatabricksConnector {
                                 error = %err,
                                 "retry budget exhausted for this run; aborting further retries",
                             );
+                            // Mark the active OTel span as Error so trace
+                            // viewers surface the run-level retry-budget
+                            // exhaustion without dashboard-side log
+                            // string-matching. No-op when `otel` is off.
+                            set_current_span_error(format!(
+                                "retry budget exhausted (limit {limit})"
+                            ));
                             return Err(ConnectorError::RetryBudgetExhausted { limit });
                         }
                         // §P2.8 emit site: retry-about-to-fire with structured
                         // attempt / classification so event-bus subscribers
                         // (Dagster, dashboards) can tell "retry 2/5" from
                         // terminal failure without string-matching.
-                        global_event_bus().emit(
-                            PipelineEvent::new("statement_retry")
-                                .with_error(err.to_string())
-                                .with_attempt(attempt + 1, retry.max_retries)
-                                .with_error_class(classify_error(&err)),
-                        );
+                        let evt = PipelineEvent::new("statement_retry")
+                            .with_error(err.to_string())
+                            .with_attempt(attempt + 1, retry.max_retries)
+                            .with_error_class(classify_error(&err));
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                         rocky_observe::metrics::METRICS.inc_retries_attempted();
                         // 401/403 typically mean the OAuth token expired
                         // between cache-mint and server-use. Databricks
@@ -352,6 +361,9 @@ impl DatabricksConnector {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
+                    // Retry exhausted (or non-transient error) — terminal
+                    // failure. Mark the active OTel span as Error.
+                    set_current_span_error(err.to_string());
                     return Err(err);
                 }
             }

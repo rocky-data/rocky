@@ -738,16 +738,19 @@ pub async fn run(
         format!("failed to load config from {}", config_path.display()),
     )?;
 
-    // OTLP metrics exporter (feature-gated). Auto-initialises when
+    // OTLP **metrics** exporter (feature-gated). Auto-initialises when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
     // env alone — no CLI flag needed. Drop flushes the final snapshot
     // and shuts the periodic reader down, so this guard covers every
     // exit path (happy, interrupted, error) without threading an
     // explicit cleanup call.
     //
-    // Held at function scope (not inside the inner async block) so the
-    // end-of-run auto-sweep call below still emits its spans through an
-    // active tracer before the guard drops at function return.
+    // The OTel **tracer** provider is owned by `init_tracing` at the
+    // top of `main.rs` — see the `TracingGuard` returned there. This
+    // split lets every existing `info_span!` (in
+    // `dag_executor::materialize.table`, `commands/run.rs::*`,
+    // `state_sync.rs::state.*`, etc.) reach the OTLP collector even
+    // before the run dispatch enters this function.
     let _otel_guard = crate::otel_guard::OtelGuard::init_if_enabled();
 
     let mut idempotency_ctx = match idempotency_key {

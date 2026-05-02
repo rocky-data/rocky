@@ -218,6 +218,113 @@ pub fn global_event_bus() -> &'static EventBus {
 }
 
 // ---------------------------------------------------------------------------
+// OTel span-event bridge
+// ---------------------------------------------------------------------------
+
+/// Annotate the current `tracing::Span` with a span event derived from the
+/// given [`PipelineEvent`].
+///
+/// When the `otel` feature is enabled and a `tracing-opentelemetry` layer
+/// is registered (see `rocky_observe::tracing_setup::init_tracing`), this
+/// translates the event's structured fields (`event_type` becomes the
+/// span event name; `error`, `target`, `attempt`/`max_attempts`, and
+/// `error_class` become attributes) into an OTLP span event on
+/// `Span::current()`. Without the layer or feature, this is a no-op so
+/// callers don't need to gate the call.
+///
+/// Use this at every `EventBus::emit` site where the event represents a
+/// point-in-time annotation (retry fired, breaker tripped, budget
+/// breached). Span boundaries (`pipeline_start` / `pipeline_complete`)
+/// stay as bus events and are *not* converted — the per-run lifecycle
+/// span is the OTel-native shape for those.
+pub fn record_span_event(event: &PipelineEvent) {
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::KeyValue;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        let mut attrs: Vec<KeyValue> = Vec::with_capacity(4 + event.metadata.len());
+        if let Some(target) = &event.target {
+            attrs.push(KeyValue::new("rocky.event.target", target.clone()));
+        }
+        if let Some(err) = &event.error {
+            attrs.push(KeyValue::new("rocky.event.error", err.clone()));
+        }
+        if let (Some(a), Some(m)) = (event.attempt, event.max_attempts) {
+            attrs.push(KeyValue::new("rocky.event.attempt", i64::from(a)));
+            attrs.push(KeyValue::new("rocky.event.max_attempts", i64::from(m)));
+        }
+        if let Some(class) = event.error_class {
+            attrs.push(KeyValue::new(
+                "rocky.event.error_class",
+                error_class_to_str(class).to_string(),
+            ));
+        }
+        // Numeric / string metadata is forwarded too; complex values get
+        // their JSON serialisation as a string so dashboards can pivot
+        // without the producer learning the OTel attribute taxonomy.
+        for (k, v) in &event.metadata {
+            let key = format!("rocky.event.metadata.{k}");
+            match v {
+                serde_json::Value::String(s) => attrs.push(KeyValue::new(key, s.clone())),
+                serde_json::Value::Bool(b) => attrs.push(KeyValue::new(key, *b)),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        attrs.push(KeyValue::new(key, i));
+                    } else if let Some(f) = n.as_f64() {
+                        attrs.push(KeyValue::new(key, f));
+                    } else {
+                        attrs.push(KeyValue::new(key, n.to_string()));
+                    }
+                }
+                _ => attrs.push(KeyValue::new(key, v.to_string())),
+            }
+        }
+
+        // `Cow<'static, str>` requires the name to be 'static, but
+        // `PipelineEvent::event_type` is a `String`. The underlying OTel
+        // API takes `Into<Cow<...>>`; `String` works directly because
+        // `Cow<'static, str>` accepts owned `String` via `From`.
+        tracing::Span::current().add_event(event.event_type.clone(), attrs);
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = event;
+    }
+}
+
+/// Mark the current `tracing::Span` as `Error` with the supplied
+/// description. Used at retry-loop terminal-failure sites so the active
+/// adapter span (and, by inheritance, the parent `materialize.table`
+/// span) carries the right OTel status.
+///
+/// No-op when the `otel` feature is disabled.
+pub fn set_current_span_error(message: impl Into<String>) {
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::trace::Status;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        tracing::Span::current().set_status(Status::error(message.into()));
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = message.into();
+    }
+}
+
+#[cfg(feature = "otel")]
+fn error_class_to_str(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "transient",
+        ErrorClass::Permanent => "permanent",
+        ErrorClass::Timeout => "timeout",
+        ErrorClass::Auth => "auth",
+        ErrorClass::Config => "config",
+        ErrorClass::RateLimit => "rate_limit",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -387,5 +494,181 @@ mod tests {
         assert_eq!(event.attempt, None);
         assert_eq!(event.max_attempts, None);
         assert_eq!(event.error_class, None);
+    }
+
+    /// `record_span_event` must not panic when called outside any
+    /// `tracing` span (e.g., a unit test that didn't enter a span).
+    /// `Span::current()` returns the no-op span; the OTel layer's
+    /// `add_event` impl is a silent drop on a no-op span.
+    #[test]
+    fn record_span_event_no_span_is_noop() {
+        let evt = PipelineEvent::new("statement_retry")
+            .with_target("databricks")
+            .with_attempt(2, 5)
+            .with_error_class(ErrorClass::Transient);
+        // Must not panic.
+        record_span_event(&evt);
+    }
+
+    /// `set_current_span_error` likewise must not panic on a no-op span.
+    #[test]
+    fn set_current_span_error_no_span_is_noop() {
+        // Must not panic.
+        set_current_span_error("retry budget exhausted (limit 25)");
+    }
+
+    /// With the `otel` feature on and a `tracing-opentelemetry` layer
+    /// registered, `record_span_event` annotates the active span. The
+    /// in-memory exporter pattern from `tracing_setup::tests` confirms
+    /// the event lands with the right name and attribute values.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn record_span_event_annotates_active_span() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default, Debug)]
+        struct Cap(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Cap {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend(batch);
+                }
+                Ok(())
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter_rt = rt.enter();
+
+        let exp = Cap::default();
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exp.clone())
+            .build();
+        let tracer = provider.tracer("rocky_test");
+        let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("materialize.table");
+            let _enter = span.enter();
+            let evt = PipelineEvent::new("statement_retry")
+                .with_target("databricks")
+                .with_error("HTTP 503")
+                .with_attempt(2, 5)
+                .with_error_class(ErrorClass::Transient);
+            record_span_event(&evt);
+        });
+        provider.shutdown().expect("shutdown");
+
+        let captured = exp.0.lock().unwrap();
+        let span = captured
+            .iter()
+            .find(|s| s.name == "materialize.table")
+            .expect("span captured");
+        let event = span
+            .events
+            .iter()
+            .find(|e| e.name == "statement_retry")
+            .expect("statement_retry event captured");
+
+        // Iterate attributes and confirm the structured fields landed.
+        let attrs: Vec<(String, String)> = event
+            .attributes
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "rocky.event.target" && v == "databricks"),
+            "expected target attr, got {attrs:?}"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "rocky.event.error_class" && v == "transient"),
+            "expected error_class attr, got {attrs:?}"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "rocky.event.attempt" && v == "2"),
+            "expected attempt attr, got {attrs:?}"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "rocky.event.max_attempts" && v == "5"),
+            "expected max_attempts attr, got {attrs:?}"
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "rocky.event.error" && v == "HTTP 503"),
+            "expected error attr, got {attrs:?}"
+        );
+    }
+
+    /// `set_current_span_error` should set the OTel span status to
+    /// `Error` with the supplied description when the layer is on.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn set_current_span_error_sets_otel_status() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default, Debug)]
+        struct Cap(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Cap {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend(batch);
+                }
+                Ok(())
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter_rt = rt.enter();
+
+        let exp = Cap::default();
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exp.clone())
+            .build();
+        let tracer = provider.tracer("rocky_test");
+        let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("materialize.table");
+            let _enter = span.enter();
+            set_current_span_error("retry budget exhausted (limit 25)");
+        });
+        provider.shutdown().expect("shutdown");
+
+        let captured = exp.0.lock().unwrap();
+        let span = captured
+            .iter()
+            .find(|s| s.name == "materialize.table")
+            .expect("span captured");
+        match &span.status {
+            opentelemetry::trace::Status::Error { description } => {
+                assert_eq!(description.as_ref(), "retry budget exhausted (limit 25)");
+            }
+            other => panic!("expected Error status, got {other:?}"),
+        }
     }
 }
