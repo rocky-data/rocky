@@ -82,9 +82,8 @@ struct Cli {
 
     /// Override `[cache.schemas] ttl_seconds` for this invocation.
     ///
-    /// Precedence (Arc 7 wave 2 wave-2 PR 4):
-    /// `--cache-ttl` > `[cache.schemas] ttl_seconds` in `rocky.toml`
-    /// > built-in default (86400s / 24h).
+    /// Precedence: `--cache-ttl` > `[cache.schemas] ttl_seconds` in
+    /// `rocky.toml` > built-in default (86400s / 24h).
     ///
     /// `--cache-ttl 0` treats every entry as instantly stale (the read
     /// path returns an empty map). To disable the cache entirely, set
@@ -191,10 +190,10 @@ enum Command {
         /// adapter, issues one `batch_describe_schema` round-trip and
         /// persists the per-table columns to `state.redb::schema_cache`.
         /// Subsequent `rocky compile` / `rocky lsp` invocations pick up
-        /// the entries via the Arc 7 wave 2 wave-2 schema cache instead
-        /// of typechecking leaf models as `Unknown`. Errors on individual
-        /// sources are logged and skipped — one bad source does not
-        /// abort the warm-up.
+        /// the entries via the schema cache instead of typechecking
+        /// leaf models as `Unknown`. Errors on individual sources are
+        /// logged and skipped — one bad source does not abort the
+        /// warm-up.
         #[arg(long)]
         with_schemas: bool,
     },
@@ -259,7 +258,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"])]
         branch: Option<String>,
 
-        // ----- time_interval partition selection (Phase 3) -----
+        // ----- time_interval partition selection -----
         /// Run a single partition by canonical key (e.g. 2026-04-07 for daily,
         /// 2026-04 for monthly). Errors if the format doesn't match the
         /// model's granularity. Mutually exclusive with --from/--to/--latest/--missing.
@@ -432,7 +431,7 @@ enum Command {
         /// Run `data/seed.sql` against an in-memory DuckDB before compiling
         /// and use its `information_schema` as the source-of-truth for
         /// raw source schemas. Turns leaf .sql models from `Unknown`
-        /// columns into concrete types (Arc 7 wave 2).
+        /// columns into concrete types.
         #[arg(long)]
         with_seed: bool,
     },
@@ -1142,13 +1141,12 @@ enum BranchAction {
 enum StateAction {
     /// Show stored watermarks (same as bare `rocky state`).
     Show,
-    /// Flush the Arc 7 wave 2 wave-2 `DESCRIBE TABLE` cache.
+    /// Flush the cached `DESCRIBE TABLE` results.
     ///
     /// Removes every `SCHEMA_CACHE` entry from `state.redb`. The next
-    /// `rocky run` (PR 2 write tap) or `rocky discover --with-schemas`
-    /// (PR 3) warms it back up — until then, `rocky compile` falls back
-    /// to `RockyType::Unknown` for leaf models, matching pre-wave-2
-    /// behaviour.
+    /// `rocky run` (write tap) or `rocky discover --with-schemas` warms
+    /// the cache back up — until then, `rocky compile` falls back to
+    /// `RockyType::Unknown` for leaf models.
     ///
     /// Use cases:
     ///   * After a manual warehouse DDL change, when TTL expiry would

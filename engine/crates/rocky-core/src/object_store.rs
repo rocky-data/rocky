@@ -233,7 +233,7 @@ impl ObjectStoreProvider {
     /// through [`ObjectStoreError::Backend`].
     ///
     /// This is the atomic primitive backing `rocky run --idempotency-key` on
-    /// `s3`-only and `gcs`-only state backends (FR-004 Phase 2 / Phase 3).
+    /// `s3`-only and `gcs`-only state backends.
     pub async fn put_if_not_exists(
         &self,
         relative_path: &str,

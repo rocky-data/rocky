@@ -29,7 +29,7 @@ pub enum TestGenError {
     MissingInRangeBound,
 
     #[error(
-        "in_range bound '{value}' must parse as a number (Phase 4a supports numeric ranges only; use `time_window` or `expression` for temporal bounds)"
+        "in_range bound '{value}' must parse as a number — `in_range` supports numeric ranges only; use `time_window` or `expression` for temporal bounds"
     )]
     InvalidInRangeBound { value: String },
 
@@ -107,8 +107,8 @@ pub enum TestType {
         max: Option<u64>,
     },
     /// Assert that a column's values fall within a numeric range
-    /// (inclusive, half-open either side). Phase 4a supports numeric
-    /// bounds only — use `time_window` (Phase 4b) or `expression` for
+    /// (inclusive, half-open either side). `in_range` supports
+    /// numeric bounds only — use `time_window` or `expression` for
     /// temporal comparisons.
     ///
     /// NULL column values pass (consistent with existing `NOT IN` /

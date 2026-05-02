@@ -687,7 +687,7 @@ export interface ReplicationPipelineConfig {
    */
   checks?: ChecksConfig;
   /**
-   * Pipeline dependencies for chaining (Phase 4).
+   * Pipeline dependencies for chaining.
    */
   depends_on?: string[];
   /**

@@ -1,6 +1,6 @@
 //! Row-quarantine SQL compilation for the quality pipeline.
 //!
-//! Phase 3 of the DQX parity plan. Lowers a subset of row-level
+//! Lowers a subset of row-level
 //! [`crate::tests::TestType`] assertions into a single boolean predicate
 //! per target table, and emits CTAS statements that split the source into
 //! `<table>__valid` (passing rows) and `<table>__quarantine` (failing
@@ -922,7 +922,7 @@ mod unit_tests {
         assert!(err.is_some());
     }
 
-    // ----- Phase 4a -----
+    // ----- where-clause filter handling -----
 
     fn assertion_with_filter(
         kind: TestType,

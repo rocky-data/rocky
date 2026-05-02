@@ -2385,7 +2385,7 @@ pub struct ReplicationPipelineConfig {
     #[serde(default)]
     pub execution: ExecutionConfig,
 
-    /// Pipeline dependencies for chaining (Phase 4).
+    /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
 }

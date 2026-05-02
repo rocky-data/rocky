@@ -1391,7 +1391,7 @@ class QualityAssertion6(BaseModel):
 
 class QualityAssertion7(BaseModel):
     """
-    Assert that a column's values fall within a numeric range (inclusive, half-open either side). Phase 4a supports numeric bounds only — use `time_window` (Phase 4b) or `expression` for temporal comparisons.
+    Assert that a column's values fall within a numeric range (inclusive, half-open either side). `in_range` supports numeric bounds only — use `time_window` or `expression` for temporal comparisons.
 
     NULL column values pass (consistent with existing `NOT IN` / `NOT (expr)` semantics).
     """
@@ -1940,7 +1940,7 @@ class ReplicationPipelineConfig(BaseModel):
     """
     depends_on: list[str] | None = []
     """
-    Pipeline dependencies for chaining (Phase 4).
+    Pipeline dependencies for chaining.
     """
     execution: ExecutionConfig | None = Field(
         {
