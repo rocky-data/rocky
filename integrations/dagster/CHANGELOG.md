@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-05-02
+
+Companion release to engine `v1.22.0`. The `dagster_rocky.types_generated` layer regenerates against the engine's checksum-bisection diff output, the rolling-stats history block, the projected-budget-breaches preview-cost block, and the new state-store retention sweep. The typed-resource layer absorbs the engine's breaking `PreviewModelDiff` shape change automatically — Dagster code that consumes `RockyResource.preview_diff(...)` results doesn't need any source-level migration, the new tagged-enum is exposed as a Pydantic discriminated union.
+
+### Added
+
+- **`PreviewModelDiff.algorithm` discriminated union** (engine [#347](https://github.com/rocky-data/rocky/pull/347)). The regenerated `dagster_rocky.types_generated.preview_diff_schema` exposes the engine's new `PreviewModelDiffAlgorithm` tagged enum as a Pydantic v2 discriminated union with two variants — `Sampled { sampled, sampling_window }` and `Bisection { diff, bisection_stats }`. Consumers branch on `model.algorithm.kind`. The `summary.any_coverage_warning` field stays in place but its semantic widens — it now fires on either sampled-with-coverage-warning or bisection-with-depth-cap.
+- **`PreviewCostOutput.projected_budget_breaches`** (engine [#343](https://github.com/rocky-data/rocky/pull/343)). New `List[BudgetBreachOutput]` field on the regenerated `PreviewCostOutput`. Mirrors `RunOutput.budget_breaches` so PR-comment templates and JSON listeners can process both with one code path.
+- **`ModelHistoryOutput.rolling_stats`** (engine [#348](https://github.com/rocky-data/rocky/pull/348)). New `Optional[RollingStats]` field exposing rolling z-score on `rows_affected` and `duration_ms` plus a composite `health_score`. Populated when the upstream call passes `--rolling-stats`.
+- **`RetentionSweepOutput`** (engine [#349](https://github.com/rocky-data/rocky/pull/349)). New typed wrapper around the `rocky state retention sweep` JSON output — per-domain delete/keep counts plus the dry-run flag.
+
+### Changed
+
+- **`PreviewModelDiff` shape restructure absorbed automatically.** The legacy `model.sampled` / `model.sampling_window` fields move under `model.algorithm` per engine [#347](https://github.com/rocky-data/rocky/pull/347). User code that touched `RockyResource.preview_diff(...)` results through the typed `dagster_rocky.types` re-exports keeps working — Pydantic auto-resolves to the right variant via the `kind` discriminator. Direct readers of the underlying JSON (e.g., `subprocess.run(["rocky", "preview", "diff", "-o", "json"])` and `json.loads`) need to migrate; the `dagster_rocky` typed path absorbs the change.
+
 ## [1.19.0] — 2026-05-01
 
 Companion release to engine `v1.21.0`. Headlines: **`RockyComponent.strict_build`** turns three "log and swallow" paths in `build_defs` into hard failures for adopters who never want an empty asset graph to ship as healthy, and **`_run_rocky` streams stderr to the module logger as it runs** so cold-start discover calls no longer go silent for 60+ seconds. Picks up regenerated Pydantic models for `MaterializationOutput.job_ids`.
