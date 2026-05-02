@@ -18,6 +18,58 @@ class ModelExecutionRecord(BaseModel):
     status: str
 
 
+class RollingDimension(BaseModel):
+    """
+    Per-dimension rolling statistics (mean, std dev, latest z-score).
+    """
+
+    latest_z_score: float | None = None
+    """
+    Z-score of the most recent execution relative to the window.
+
+    `None` when fewer than 2 samples are available or when `std_dev` is exactly 0 (all samples are equal — no meaningful deviation).
+    """
+    mean: float
+    """
+    Population mean over the sample window.
+    """
+    std_dev: float
+    """
+    Population standard deviation (÷N) over the sample window.
+    """
+
+
+class RollingStats(BaseModel):
+    """
+    Rolling statistics computed over the most recent N successful executions of a model. Populated by `rocky history --model <name> --rolling-stats`.
+
+    Statistics use population standard deviation (divided by N, not N-1), so `std_dev` is exactly 0 when all samples are equal.
+    """
+
+    duration_ms: RollingDimension
+    """
+    Rolling statistics for the `duration_ms` dimension.
+    """
+    health_score: float
+    """
+    Composite health score in `[0.0, 1.0]`.
+
+    Computed as `1.0 - clamp((max(|z_rows|, |z_duration|) - 2.0) / 4.0, 0.0, 1.0)`. A score of `1.0` means both z-scores are within 2σ of the mean; `0.0` means at least one z-score is 6σ or more.
+    """
+    rows_affected: RollingDimension
+    """
+    Rolling statistics for the `rows_affected` dimension. Computed only over executions where `rows_affected` is not null.
+    """
+    samples: conint(ge=0)
+    """
+    Actual number of successful executions used (≤ window; may be smaller when model history is shorter than the requested window).
+    """
+    window: conint(ge=0)
+    """
+    Maximum number of executions requested for the rolling window.
+    """
+
+
 class ModelHistoryOutput(BaseModel):
     """
     JSON output for `rocky history --model <name>`.
@@ -27,4 +79,8 @@ class ModelHistoryOutput(BaseModel):
     count: conint(ge=0)
     executions: list[ModelExecutionRecord]
     model: str
+    rolling_stats: RollingStats | None = None
+    """
+    Rolling statistics over the most recent N successful executions. Present only when `--rolling-stats` is passed.
+    """
     version: str

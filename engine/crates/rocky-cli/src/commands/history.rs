@@ -505,7 +505,10 @@ mod tests {
         assert_eq!(stats.samples, 3);
         assert!((stats.duration_ms.mean - 100.0).abs() < 1e-9);
         assert!((stats.duration_ms.std_dev).abs() < 1e-9);
-        assert!(stats.duration_ms.latest_z_score.is_none(), "std_dev=0 → z=None");
+        assert!(
+            stats.duration_ms.latest_z_score.is_none(),
+            "std_dev=0 → z=None"
+        );
         assert!((stats.rows_affected.mean - 50.0).abs() < 1e-9);
         assert!(stats.rows_affected.std_dev.abs() < 1e-9);
         assert!(stats.rows_affected.latest_z_score.is_none());
@@ -552,11 +555,17 @@ mod tests {
 
         assert!((stats.duration_ms.mean - expected_mean).abs() < 1e-9);
         assert!((stats.duration_ms.std_dev - expected_std).abs() < 1e-9);
-        let dz = stats.duration_ms.latest_z_score.expect("z_score should be Some");
+        let dz = stats
+            .duration_ms
+            .latest_z_score
+            .expect("z_score should be Some");
         assert!((dz - expected_z).abs() < 1e-9);
 
         assert!((stats.rows_affected.mean - expected_mean).abs() < 1e-9);
-        let rz = stats.rows_affected.latest_z_score.expect("rows z_score should be Some");
+        let rz = stats
+            .rows_affected
+            .latest_z_score
+            .expect("rows z_score should be Some");
         assert!((rz - expected_z).abs() < 1e-9);
 
         // max |z| ≈ 1.2247 < 2 → health_score = 1.0
@@ -582,9 +591,10 @@ mod tests {
         // Construct samples where latest z ≈ 4 (midpoint → health = 0.5).
         // Use values [0, 0, ..., 0, 8] (9 zeros + one 8) → mean=0.8, pop-std ≈ 2.4,
         // latest (8) → z ≈ 3.0 → health = 1 - (3-2)/4 = 0.75
-        let mut execs: Vec<ModelExecution> = std::iter::repeat_with(|| make_exec(0, Some(0), "success"))
-            .take(9)
-            .collect();
+        let mut execs: Vec<ModelExecution> =
+            std::iter::repeat_with(|| make_exec(0, Some(0), "success"))
+                .take(9)
+                .collect();
         // Prepend the "newest" outlier (duration=8, rows=8)
         execs.insert(0, make_exec(8, Some(8), "success"));
 
