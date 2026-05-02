@@ -153,7 +153,11 @@ fn emit_sweep_report(
     if output_json {
         print_json(&RetentionSweepOutput::new(report, policy, dry_run))?;
     } else {
-        let prefix = if dry_run { "[dry-run] would remove" } else { "Removed" };
+        let prefix = if dry_run {
+            "[dry-run] would remove"
+        } else {
+            "Removed"
+        };
         println!(
             "{prefix} {} run records, {} dag snapshots, {} quality snapshots ({} ms)",
             report.runs_deleted, report.lineage_deleted, report.audit_deleted, report.duration_ms,
