@@ -190,6 +190,61 @@ impl SqlDialect for SnowflakeSqlDialect {
     ) -> rocky_core::traits::AdapterResult<String> {
         Ok(format!("REGEXP_LIKE({column}, '{pattern}')"))
     }
+
+    fn quote_identifier(&self, name: &str) -> String {
+        // Snowflake folds *unquoted* identifiers to UPPER (`id` becomes
+        // `ID`); double-quoted identifiers are taken verbatim and
+        // case-sensitive. The trait default already returns
+        // double-quoted form, but we override anyway so the dialect's
+        // contract is explicit at the call site and so we can pin the
+        // documentation alongside the BigQuery (backticks) and
+        // Databricks (backticks) overrides for the cross-adapter
+        // diff-bisection sweep. Callers in the bisection kernel build
+        // schemas with lowercase column names — the double quotes here
+        // make those references resolve correctly without depending on
+        // case-fold defaults.
+        format!("\"{name}\"")
+    }
+
+    fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+        if columns.is_empty() {
+            return Err(AdapterError::msg(
+                "row_hash_expr requires at least one column to hash",
+            ));
+        }
+        for col in columns {
+            validation::validate_identifier(col).map_err(AdapterError::new)?;
+        }
+        // `HASH(col_a, col_b, ...)` is Snowflake's proprietary
+        // 64-bit non-cryptographic hash, the canonical analogue of
+        // BigQuery's `FARM_FINGERPRINT` and Spark's `xxhash64`. It
+        // accepts variadic column args directly (no `STRUCT` /
+        // `TO_JSON_STRING` wrapping like BQ; no `concat_ws`
+        // contortions). Per Snowflake's docs, `HASH` is positionally
+        // NULL-aware: `HASH(NULL, 'x')` ≠ `HASH('x', NULL)`, so two
+        // rows that swap a NULL across columns hash differently — the
+        // same correctness property the Databricks override pins.
+        // `HASH` returns `NUMBER(19, 0)` (signed 64-bit); the outer
+        // `BITXOR_AGG` (which Snowflake uses in place of `BIT_XOR`)
+        // round-trips cleanly to the kernel's `i128` checksum slot
+        // via sign-extension.
+        //
+        // **NULL-row handling.** `HASH(NULL)` returns `NULL`, and
+        // Snowflake's aggregate functions skip `NULL` rows. We wrap
+        // the call in `COALESCE(..., 0)` so an all-NULL value-column
+        // row still contributes a non-NULL deterministic hash to the
+        // chunk checksum (per the kernel's contract that every row
+        // is hashed into exactly one chunk). The `0` sentinel is
+        // safe because real `HASH` outputs span the full signed
+        // 64-bit range with effectively zero collision probability
+        // at non-NULL inputs.
+        let arg_list = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("COALESCE(HASH({arg_list}), 0)"))
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +356,43 @@ mod tests {
         // Snowflake says "DATABASE", not "CATALOG"
         assert!(sql.contains("DATABASE"));
         assert!(!sql.contains("CATALOG"));
+    }
+
+    #[test]
+    fn test_quote_identifier_uses_double_quotes() {
+        let d = dialect();
+        assert_eq!(d.quote_identifier("id"), "\"id\"");
+        assert_eq!(d.quote_identifier("customer_id"), "\"customer_id\"");
+    }
+
+    #[test]
+    fn test_row_hash_expr_emits_hash_with_coalesce_null_guard() {
+        let d = dialect();
+        let sql = d.row_hash_expr(&["name".into(), "value".into()]).unwrap();
+        // Wrap in COALESCE so the all-NULL row case (HASH(NULL, NULL)
+        // returns NULL) still contributes a deterministic 0 hash to
+        // the chunk checksum, since BITXOR_AGG skips NULLs.
+        assert_eq!(sql, "COALESCE(HASH(\"name\", \"value\"), 0)");
+    }
+
+    #[test]
+    fn test_row_hash_expr_single_column() {
+        let d = dialect();
+        let sql = d.row_hash_expr(&["only".into()]).unwrap();
+        assert_eq!(sql, "COALESCE(HASH(\"only\"), 0)");
+    }
+
+    #[test]
+    fn test_row_hash_expr_rejects_empty_columns() {
+        let d = dialect();
+        assert!(d.row_hash_expr(&[]).is_err());
+    }
+
+    #[test]
+    fn test_row_hash_expr_rejects_invalid_identifier() {
+        let d = dialect();
+        // Identifier-injection attempt: column name carrying a quote.
+        assert!(d.row_hash_expr(&["a\"; DROP TABLE x; --".into()]).is_err());
     }
 
     #[test]
