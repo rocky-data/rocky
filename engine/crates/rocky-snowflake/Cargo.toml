@@ -33,6 +33,7 @@ required-features = ["test-support"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
 

@@ -966,3 +966,129 @@ async fn test_read_retention_days_empty_rows_returns_none() {
     };
     assert_eq!(governance.read_retention_days(&table).await.unwrap(), None);
 }
+
+type SpanFields = Vec<(String, String)>;
+type CapturedSpan = (String, SpanFields);
+
+/// Capture sink for the test-binary-wide span subscriber installed by
+/// [`init_capture_subscriber`]. A global-default subscriber is the only
+/// way a span born in an `async fn` polled by tokio's runtime sees our
+/// test's layer reliably across cargo's parallel test runner — per-thread
+/// `set_default` works under `#[test]` alone but loses spans created on
+/// runtime worker threads when other `#[tokio::test]` cases are in flight.
+static CAPTURED_SPANS: std::sync::OnceLock<std::sync::Mutex<Vec<CapturedSpan>>> =
+    std::sync::OnceLock::new();
+
+fn captured_spans() -> &'static std::sync::Mutex<Vec<CapturedSpan>> {
+    CAPTURED_SPANS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn init_capture_subscriber() {
+    use std::sync::Once;
+    use tracing::{Subscriber, span};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{Layer, Registry};
+
+    static INIT: Once = Once::new();
+
+    struct CaptureLayer;
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &span::Attributes<'_>, _id: &span::Id, _ctx: Context<'_, S>) {
+            // Filter to spans we care about so unrelated `info_span!`
+            // calls in other crates (rocky-core, reqwest, etc.) don't
+            // grow the capture buffer unbounded.
+            if attrs.metadata().name() != "statement.execute" {
+                return;
+            }
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl<'a> tracing::field::Visit for Visit<'a> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push((field.name().to_string(), value.to_string()));
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .push((field.name().to_string(), format!("{value:?}")));
+                }
+            }
+            let mut fields = Vec::new();
+            attrs.record(&mut Visit(&mut fields));
+            captured_spans()
+                .lock()
+                .unwrap()
+                .push((attrs.metadata().name().to_string(), fields));
+        }
+    }
+
+    INIT.call_once(|| {
+        let subscriber = Registry::default().with(CaptureLayer);
+        // `try_init`-style: ignore the error if some other test happened
+        // to register a global subscriber first. The capture layer is
+        // additive — no fmt formatter, no IO — so installing it as the
+        // process-wide default has no effect on tests that don't inspect
+        // spans.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// Canary: a `statement.execute` span is opened around every Snowflake
+/// statement submission with `adapter = "snowflake"` and a
+/// `statement.kind` attribute. Asserted via a tracing-subscriber
+/// `Layer` that captures spans into a process-wide static — the only
+/// reliable approach across cargo's parallel test runner because the
+/// span is created inside an `async fn` whose polling thread isn't
+/// guaranteed to be the one that called `set_default`.
+#[tokio::test]
+async fn test_statement_execute_span_emitted() {
+    init_capture_subscriber();
+    captured_spans().lock().unwrap().clear();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-span-canary",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    connector
+        .execute_statement("CREATE TABLE canary (id INT)")
+        .await
+        .unwrap();
+
+    let captured = captured_spans().lock().unwrap();
+    let stmt_span = captured
+        .iter()
+        .find(|(name, _)| name == "statement.execute")
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = captured.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("expected a statement.execute span, got: {names:?}")
+        });
+    let adapter = stmt_span
+        .1
+        .iter()
+        .find(|(k, _)| k == "adapter")
+        .expect("expected `adapter` attribute on statement.execute span");
+    assert_eq!(adapter.1, "snowflake");
+    let kind = stmt_span
+        .1
+        .iter()
+        .find(|(k, _)| k == "statement.kind")
+        .expect("expected `statement.kind` attribute on statement.execute span");
+    assert_eq!(kind.1, "query");
+}

@@ -19,7 +19,7 @@ use rocky_observe::events::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 use crate::auth::Auth;
 
@@ -250,7 +250,27 @@ impl SnowflakeConnector {
     }
 
     /// Submit with retry logic and circuit breaker.
+    ///
+    /// Wrapped in a single `statement.execute` span per logical statement
+    /// — retries surface as `statement_retry` / `circuit_breaker_*` span
+    /// events on the same parent (see `record_span_event` calls below)
+    /// rather than spawning a new span per attempt. Mirrors the OTel
+    /// `<verb>.<resource>` shape used by the `materialize.table` parent.
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+        // `statement.kind = "query"` is a best-effort default — Snowflake
+        // routes DDL, DML, and SELECT through the same `/statements`
+        // endpoint and the wire request doesn't surface the parsed
+        // statement kind. TODO: classify via `rocky-sql` if downstream
+        // consumers need to filter ddl/dml from query traffic.
+        let span = info_span!(
+            "statement.execute",
+            adapter = "snowflake",
+            statement.kind = "query",
+        );
+        self.submit_and_wait_inner(sql).instrument(span).await
+    }
+
+    async fn submit_and_wait_inner(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
         let retry = &self.config.retry;
 
         // Circuit breaker: fail fast if Open. When timed half-open

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{Instrument, debug, info_span};
 
 use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
@@ -141,58 +141,79 @@ impl BigQueryAdapter {
     }
 
     /// Execute a query via the BigQuery REST API.
+    ///
+    /// Wrapped in a `statement.execute` span so every BigQuery API call —
+    /// `execute_statement`, `execute_statement_with_stats`, `execute_query`,
+    /// `describe_table`, `list_tables`, etc. — appears under a consistent,
+    /// adapter-tagged child span when traced. Mirrors the OTel
+    /// `<verb>.<resource>` shape used by the `materialize.table` parent.
     async fn run_query(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
-        let token = self.auth.get_token(&self.client).await?;
-        let url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
-            self.project_id
+        // `statement.kind = "query"` is a best-effort default — BigQuery
+        // routes DDL, DML, and SELECT through the same `jobs.query`
+        // endpoint and the wire request doesn't surface the parsed
+        // statement kind. TODO: classify via `rocky-sql` if downstream
+        // consumers need to filter ddl/dml from query traffic.
+        let span = info_span!(
+            "statement.execute",
+            adapter = "bigquery",
+            statement.kind = "query",
         );
+        async move {
+            let token = self.auth.get_token(&self.client).await?;
+            let url = format!(
+                "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
+                self.project_id
+            );
 
-        let request = QueryRequest {
-            query: sql.to_string(),
-            use_legacy_sql: false,
-            location: self.location.clone(),
-            timeout_ms: self.timeout_secs * 1000,
-            max_results: MAX_RESULTS_PER_PAGE,
-        };
+            let request = QueryRequest {
+                query: sql.to_string(),
+                use_legacy_sql: false,
+                location: self.location.clone(),
+                timeout_ms: self.timeout_secs * 1000,
+                max_results: MAX_RESULTS_PER_PAGE,
+            };
 
-        debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
+            debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&request)
-            .send()
-            .await?;
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&request)
+                .send()
+                .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().to_string();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(BigQueryError::ApiError {
-                status,
-                message: body,
-            });
+            if !resp.status().is_success() {
+                let status = resp.status().to_string();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(BigQueryError::ApiError {
+                    status,
+                    message: body,
+                });
+            }
+
+            let response: BigQueryResponse = resp.json().await?;
+
+            if response.job_complete {
+                return Ok(response);
+            }
+
+            // Async job: BigQuery deferred the result. Poll jobs.getQueryResults
+            // until it reports `job_complete=true` or `timeout_secs` elapses.
+            // Without this, the previous behaviour silently returned an empty
+            // rows array for any query slower than BigQuery's sync window.
+            let job_ref = response
+                .job_reference
+                .ok_or_else(|| BigQueryError::ApiError {
+                    status: "missing jobReference".into(),
+                    message:
+                        "BigQuery returned job_complete=false with no job_reference; cannot poll"
+                            .into(),
+                })?;
+            self.poll_query_results(&job_ref).await
         }
-
-        let response: BigQueryResponse = resp.json().await?;
-
-        if response.job_complete {
-            return Ok(response);
-        }
-
-        // Async job: BigQuery deferred the result. Poll jobs.getQueryResults
-        // until it reports `job_complete=true` or `timeout_secs` elapses.
-        // Without this, the previous behaviour silently returned an empty
-        // rows array for any query slower than BigQuery's sync window.
-        let job_ref = response
-            .job_reference
-            .ok_or_else(|| BigQueryError::ApiError {
-                status: "missing jobReference".into(),
-                message: "BigQuery returned job_complete=false with no job_reference; cannot poll"
-                    .into(),
-            })?;
-        self.poll_query_results(&job_ref).await
+        .instrument(span)
+        .await
     }
 
     /// Poll `jobs.getQueryResults` until the job finishes or the configured
