@@ -79,6 +79,28 @@ impl RunMetrics {
         }
     }
 
+    /// Snapshot the raw table-duration observations without draining them.
+    ///
+    /// Append-only by design: the periodic OTLP exporter (when the `otel`
+    /// feature is enabled) tracks its own cursor over this slice so it can
+    /// stream new observations into a histogram instrument without
+    /// double-counting and without disturbing the run-end JSON snapshot.
+    pub fn read_table_durations(&self) -> Vec<u64> {
+        self.table_durations_ms
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the raw query-duration observations without draining them.
+    /// See [`Self::read_table_durations`] for the cursor protocol.
+    pub fn read_query_durations(&self) -> Vec<u64> {
+        self.query_durations_ms
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
     /// Snapshot all metrics into a serializable summary.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let table_durations = self
@@ -184,5 +206,46 @@ mod tests {
         assert_eq!(snap.tables_processed, 2);
         assert_eq!(snap.retries_attempted, 1);
         assert_eq!(snap.table_duration_max_ms, 200);
+    }
+
+    #[test]
+    fn test_read_table_durations_does_not_drain() {
+        // The OTLP exporter (when the `otel` feature is enabled) reads
+        // raw observations through a cursor and pumps them into a
+        // histogram instrument. The accessor must be append-only so the
+        // run-end JSON snapshot still sees every observation.
+        let m = RunMetrics::new();
+        m.record_table_duration_ms(10);
+        m.record_table_duration_ms(20);
+        m.record_table_duration_ms(30);
+
+        let read1 = m.read_table_durations();
+        assert_eq!(read1, vec![10, 20, 30]);
+
+        // Snapshot taken after read should still see everything.
+        let snap = m.snapshot();
+        assert_eq!(snap.table_duration_max_ms, 30);
+
+        // A second read should still return all three observations
+        // (proving the accessor is non-draining).
+        m.record_table_duration_ms(40);
+        let read2 = m.read_table_durations();
+        assert_eq!(read2, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_read_query_durations_does_not_drain() {
+        let m = RunMetrics::new();
+        m.record_query_duration_ms(5);
+        m.record_query_duration_ms(15);
+
+        let read1 = m.read_query_durations();
+        assert_eq!(read1, vec![5, 15]);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.query_duration_max_ms, 15);
+
+        let read2 = m.read_query_durations();
+        assert_eq!(read2, vec![5, 15]);
     }
 }

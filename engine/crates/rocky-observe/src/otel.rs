@@ -14,6 +14,7 @@
 //! | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | gRPC endpoint of the OTLP collector |
 //! | `OTEL_SERVICE_NAME` | `rocky` | Value of the `service.name` resource attribute |
 
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use opentelemetry::metrics::MeterProvider;
@@ -31,6 +32,14 @@ const DEFAULT_SERVICE_NAME: &str = "rocky";
 /// pushing Rocky's in-process metrics to an external collector.
 pub struct OtelExporter {
     provider: SdkMeterProvider,
+    /// Cursor over `METRICS.table_durations_ms` — index of the next
+    /// unrecorded observation. Each call to [`Self::export_metrics`] reads
+    /// the slice from this cursor onwards and feeds the new observations
+    /// into the OTLP histogram instrument, so the periodic flush stays
+    /// idempotent and the run-end JSON snapshot (which reads the full Vec)
+    /// is not disturbed.
+    table_cursor: Mutex<usize>,
+    query_cursor: Mutex<usize>,
 }
 
 impl OtelExporter {
@@ -73,15 +82,25 @@ impl OtelExporter {
 
         debug!("OTLP meter provider initialised");
 
-        Ok(OtelExporter { provider })
+        Ok(OtelExporter {
+            provider,
+            table_cursor: Mutex::new(0),
+            query_cursor: Mutex::new(0),
+        })
     }
 
-    /// Record the current in-process metrics snapshot as OTLP gauge/counter
-    /// observations.
+    /// Record the current in-process metrics snapshot as OTLP observations.
     ///
-    /// This reads the global [`METRICS`] singleton, creates OTel instruments on
-    /// the meter, and records the current values. The `PeriodicReader` will
-    /// flush them to the collector on its next interval (or on [`shutdown`](Self::shutdown)).
+    /// Counter values are emitted as gauges (last-value-wins is the right
+    /// shape for monotonic process-local counters); duration distributions
+    /// are emitted as histograms. The `PeriodicReader` flushes the
+    /// instruments to the collector on its next interval (or on
+    /// [`shutdown`](Self::shutdown)).
+    ///
+    /// Histogram observations are streamed from the cursor stored on
+    /// `self` so successive flushes never double-count. The source `Vec`
+    /// in [`crate::metrics::METRICS`] is never drained — callers reading
+    /// the run-end JSON snapshot still see every observation.
     pub fn export_metrics(&self) {
         let meter = self.provider.meter("rocky");
 
@@ -131,42 +150,36 @@ impl OtelExporter {
             .build();
         error_rate.record(snap.error_rate_pct, &[]);
 
-        // --- Duration histograms (p50, p95, max) ---
-        let table_p50 = meter
-            .u64_gauge("rocky.table_duration_p50_ms")
-            .with_description("Table materialisation duration p50 (ms)")
+        // --- Duration histograms ---
+        //
+        // OTel semantic conventions specify duration metrics as histogram
+        // instruments (the backend computes percentiles across hosts/runs).
+        // The previous shape — emitting in-process p50/p95/max as gauges —
+        // both lost information at the OTLP boundary and conflicted with
+        // semantic conventions. Switch to histograms recording each raw
+        // observation; cursor state on `self` keeps the periodic reader
+        // idempotent (no double-counting between flushes) without draining
+        // the source Vec, so the run-end JSON snapshot still sees every
+        // observation.
+        let table_durations = meter
+            .u64_histogram("rocky.table_duration_ms")
+            .with_unit("ms")
+            .with_description("Table materialisation duration distribution")
             .build();
-        table_p50.record(snap.table_duration_p50_ms, &[]);
+        let table_obs = METRICS.read_table_durations();
+        for ms in advance_cursor(&self.table_cursor, &table_obs) {
+            table_durations.record(ms, &[]);
+        }
 
-        let table_p95 = meter
-            .u64_gauge("rocky.table_duration_p95_ms")
-            .with_description("Table materialisation duration p95 (ms)")
+        let query_durations = meter
+            .u64_histogram("rocky.query_duration_ms")
+            .with_unit("ms")
+            .with_description("SQL statement duration distribution")
             .build();
-        table_p95.record(snap.table_duration_p95_ms, &[]);
-
-        let table_max = meter
-            .u64_gauge("rocky.table_duration_max_ms")
-            .with_description("Table materialisation duration max (ms)")
-            .build();
-        table_max.record(snap.table_duration_max_ms, &[]);
-
-        let query_p50 = meter
-            .u64_gauge("rocky.query_duration_p50_ms")
-            .with_description("Query duration p50 (ms)")
-            .build();
-        query_p50.record(snap.query_duration_p50_ms, &[]);
-
-        let query_p95 = meter
-            .u64_gauge("rocky.query_duration_p95_ms")
-            .with_description("Query duration p95 (ms)")
-            .build();
-        query_p95.record(snap.query_duration_p95_ms, &[]);
-
-        let query_max = meter
-            .u64_gauge("rocky.query_duration_max_ms")
-            .with_description("Query duration max (ms)")
-            .build();
-        query_max.record(snap.query_duration_max_ms, &[]);
+        let query_obs = METRICS.read_query_durations();
+        for ms in advance_cursor(&self.query_cursor, &query_obs) {
+            query_durations.record(ms, &[]);
+        }
 
         debug!("OTLP metrics recorded — awaiting next periodic flush");
     }
@@ -179,5 +192,59 @@ impl OtelExporter {
         if let Err(e) = self.provider.shutdown() {
             error!(error = %e, "OTLP meter provider shutdown failed");
         }
+    }
+}
+
+/// Returns the slice of observations the caller has not yet consumed and
+/// advances the cursor past them. The `min()` guards against an
+/// out-of-bounds cursor in the unlikely event the source `Vec` is
+/// truncated externally (it isn't today, but defending against future
+/// drift is cheap).
+fn advance_cursor(cursor: &Mutex<usize>, observations: &[u64]) -> Vec<u64> {
+    let mut guard = cursor.lock().expect("OTLP histogram cursor poisoned");
+    let start = (*guard).min(observations.len());
+    let new = observations[start..].to_vec();
+    *guard = observations.len();
+    new
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_cursor_returns_only_new_observations() {
+        let cursor = Mutex::new(0);
+        let obs = vec![10, 20, 30];
+        assert_eq!(advance_cursor(&cursor, &obs), vec![10, 20, 30]);
+        assert_eq!(*cursor.lock().unwrap(), 3);
+
+        // No new observations since the last flush.
+        assert!(advance_cursor(&cursor, &obs).is_empty());
+        assert_eq!(*cursor.lock().unwrap(), 3);
+
+        // Two more observations appear; the next flush should record only those.
+        let obs = vec![10, 20, 30, 40, 50];
+        assert_eq!(advance_cursor(&cursor, &obs), vec![40, 50]);
+        assert_eq!(*cursor.lock().unwrap(), 5);
+    }
+
+    #[test]
+    fn advance_cursor_handles_empty_initial_state() {
+        let cursor = Mutex::new(0);
+        let obs: Vec<u64> = vec![];
+        assert!(advance_cursor(&cursor, &obs).is_empty());
+        assert_eq!(*cursor.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn advance_cursor_clamps_when_cursor_exceeds_length() {
+        // Defensive: if the source Vec ever shrinks below the cursor (it
+        // won't today — `read_table_durations` clones an append-only
+        // Mutex<Vec>) the helper must not panic on slice-out-of-bounds.
+        let cursor = Mutex::new(10);
+        let obs = vec![1, 2, 3];
+        assert!(advance_cursor(&cursor, &obs).is_empty());
+        assert_eq!(*cursor.lock().unwrap(), 3);
     }
 }
