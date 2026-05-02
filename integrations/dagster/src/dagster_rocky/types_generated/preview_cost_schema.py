@@ -6,6 +6,21 @@ from __future__ import annotations
 from pydantic import BaseModel, conint
 
 
+class BudgetBreachOutput(BaseModel):
+    """
+    One budget breach surfaced on [`RunOutput::budget_breaches`].
+
+    Kept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.
+    """
+
+    actual: float
+    limit: float
+    limit_type: str
+    """
+    Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
+    """
+
+
 class PreviewCostSummary(BaseModel):
     """
     Aggregate cost rollup for [`PreviewCostOutput`].
@@ -27,9 +42,17 @@ class PreviewCostSummary(BaseModel):
     """
     Sum of every per-model `base_cost_usd` (limited to models in the prune set — copied models contribute 0 here, accounted for in `savings_from_copy_usd`).
     """
+    total_branch_bytes_scanned: conint(ge=0) | None = None
+    """
+    Sum of every per-model `branch_bytes_scanned` that produced a number. `None` when no branch model reported a byte count (mirrors `RunOutput.cost.total_bytes_scanned` semantics — the non-BigQuery adapters today still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Used to project the `[budget]` `max_bytes_scanned` limit at preview time.
+    """
     total_branch_cost_usd: float | None = None
     """
     Sum of every per-model `branch_cost_usd` that produced a number.
+    """
+    total_branch_duration_ms: conint(ge=0)
+    """
+    Sum of every per-model `branch_duration_ms`. Used to project the `[budget]` `max_duration_ms` limit at preview time.
     """
 
 
@@ -73,5 +96,9 @@ class PreviewCostOutput(BaseModel):
     command: str
     markdown: str
     per_model: list[PreviewModelCostDelta]
+    projected_budget_breaches: list[BudgetBreachOutput] | None = None
+    """
+    Budget breaches projected against the branch totals — populated only when the project declares a `[budget]` block. Lets a PR reviewer (and a CI gate) see "this PR would breach the run-level `max_usd` / `max_duration_ms` / `max_bytes_scanned` if merged" before the merge actually happens. Empty when no budget is configured or the projected totals stay within every limit. Mirrors the `RunOutput.budget_breaches` shape so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.
+    """
     summary: PreviewCostSummary
     version: str

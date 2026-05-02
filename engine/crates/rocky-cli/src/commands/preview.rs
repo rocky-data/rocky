@@ -477,29 +477,44 @@ pub async fn run_preview_cost(
         }
     }
 
-    // Resolve adapter cost params best-effort (mirrors `run_cost`).
+    // Resolve adapter cost params + project-level budget best-effort.
+    // A missing or malformed config silently skips both projections —
+    // the same fallback `run_cost` uses.
+    let loaded_config = rocky_core::config::load_rocky_config(config_path).ok();
     let cost_params: Option<(rocky_core::cost::WarehouseType, f64, f64)> =
-        match rocky_core::config::load_rocky_config(config_path) {
-            Ok(cfg) => {
-                let dbu_per_hour =
-                    rocky_core::cost::warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-                let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
-                cfg.adapters
-                    .get("default")
-                    .or_else(|| cfg.adapters.values().next())
-                    .and_then(|a| {
-                        rocky_core::cost::WarehouseType::from_adapter_type(&a.adapter_type)
-                    })
-                    .map(|wh| (wh, dbu_per_hour, cost_per_dbu))
-            }
-            Err(_) => None,
-        };
+        loaded_config.as_ref().and_then(|cfg| {
+            let dbu_per_hour =
+                rocky_core::cost::warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
+            let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+            cfg.adapters
+                .get("default")
+                .or_else(|| cfg.adapters.values().next())
+                .and_then(|a| rocky_core::cost::WarehouseType::from_adapter_type(&a.adapter_type))
+                .map(|wh| (wh, dbu_per_hour, cost_per_dbu))
+        });
+    let budget = loaded_config
+        .as_ref()
+        .map(|cfg| cfg.budget.clone())
+        .unwrap_or_default();
 
     let (summary, per_model) = match (branch_run.as_ref(), base_run.as_ref()) {
         (Some(b), Some(p)) => build_preview_cost_delta(b, p, cost_params.as_ref()),
         _ => (empty_cost_summary(), Vec::new()),
     };
-    let markdown = render_preview_cost_markdown(branch_name, &summary, &per_model);
+
+    // Project budget breaches against the branch totals.  Empty when no
+    // budget is configured or the projected totals stay within every
+    // limit. Mirrors `RunOutput.budget_breaches` so the same downstream
+    // consumers can process both with one code path.
+    let projected_budget_breaches = project_budget_breaches(&budget, &summary);
+
+    let markdown = render_preview_cost_markdown(
+        branch_name,
+        &summary,
+        &per_model,
+        &projected_budget_breaches,
+        &budget,
+    );
 
     let out = PreviewCostOutput::new(
         branch_name.to_string(),
@@ -509,6 +524,7 @@ pub async fn run_preview_cost(
             .map_or(String::new(), |r| r.run_id.clone()),
         summary,
         per_model,
+        projected_budget_breaches,
         markdown,
     );
 
@@ -583,6 +599,9 @@ fn build_preview_cost_delta(
     let mut savings: f64 = 0.0;
     let mut any_savings = false;
     let mut models_skipped_via_copy: usize = 0;
+    let mut total_branch_duration_ms: u64 = 0;
+    let mut total_branch_bytes: u64 = 0;
+    let mut any_branch_bytes = false;
 
     for name in all_names {
         let branch_exec = branch_by_name.get(name).copied();
@@ -597,6 +616,16 @@ fn build_preview_cost_delta(
         let base_duration_ms = base_exec.map(|e| e.duration_ms).unwrap_or(0);
         let branch_bytes_scanned = branch_exec.and_then(|e| e.bytes_scanned);
         let base_bytes_scanned = base_exec.and_then(|e| e.bytes_scanned);
+
+        // Accumulate the run-level totals used for `[budget]` projection.
+        // Duration totals every branch model (the run-level wall-clock
+        // proxy); bytes only count branch models that reported a number,
+        // matching `RunOutput.cost.total_bytes_scanned`'s semantics.
+        total_branch_duration_ms = total_branch_duration_ms.saturating_add(branch_duration_ms);
+        if let Some(b) = branch_bytes_scanned {
+            total_branch_bytes = total_branch_bytes.saturating_add(b);
+            any_branch_bytes = true;
+        }
 
         let branch_cost_usd = if branch_exec.is_some() {
             let c = cost_for(branch_bytes_scanned, branch_duration_ms);
@@ -662,14 +691,53 @@ fn build_preview_cost_delta(
     };
     let savings_from_copy_usd = if any_savings { Some(savings) } else { None };
 
+    let total_branch_bytes_scanned = if any_branch_bytes {
+        Some(total_branch_bytes)
+    } else {
+        None
+    };
+
     let summary = crate::output::PreviewCostSummary {
         total_branch_cost_usd,
         total_base_cost_usd,
         delta_usd,
+        total_branch_duration_ms,
+        total_branch_bytes_scanned,
         models_skipped_via_copy,
         savings_from_copy_usd,
     };
     (summary, per_model)
+}
+
+/// Translate a `PreviewCostSummary` into projected budget breaches by
+/// running `BudgetConfig::check_breaches` against the branch totals.
+/// Returns an empty vector when the budget is unset or every limit is
+/// satisfied.
+///
+/// Pure: no I/O, no global state. Surfaced as a top-level helper so a
+/// follow-up can call it from contexts other than `run_preview_cost`
+/// (e.g., a future `rocky budget check` subcommand).
+pub fn project_budget_breaches(
+    budget: &rocky_core::config::BudgetConfig,
+    summary: &crate::output::PreviewCostSummary,
+) -> Vec<crate::output::BudgetBreachOutput> {
+    use crate::output::BudgetBreachOutput;
+    if budget.is_unset() {
+        return Vec::new();
+    }
+    budget
+        .check_breaches(
+            summary.total_branch_cost_usd,
+            summary.total_branch_duration_ms,
+            summary.total_branch_bytes_scanned,
+        )
+        .into_iter()
+        .map(|b| BudgetBreachOutput {
+            limit_type: b.limit_type.as_str().to_string(),
+            limit: b.limit,
+            actual: b.actual,
+        })
+        .collect()
 }
 
 /// Render a `PreviewCostOutput` summary into the PR-comment Markdown.
@@ -677,6 +745,8 @@ fn render_preview_cost_markdown(
     branch_name: &str,
     summary: &crate::output::PreviewCostSummary,
     per_model: &[crate::output::PreviewModelCostDelta],
+    projected_budget_breaches: &[crate::output::BudgetBreachOutput],
+    budget: &rocky_core::config::BudgetConfig,
 ) -> String {
     if per_model.is_empty() {
         return format!(
@@ -717,6 +787,51 @@ fn render_preview_cost_markdown(
         "\n_{} model(s) skipped via copy._\n",
         summary.models_skipped_via_copy,
     ));
+
+    // Budget projection — surface a separate section when the projected
+    // branch totals would breach `[budget]`. The whole block is skipped
+    // when no breaches are projected so we don't add noise on every
+    // PR comment of every project that happens to declare a budget.
+    if !projected_budget_breaches.is_empty() {
+        let blocking = matches!(
+            budget.on_breach,
+            rocky_core::config::BudgetBreachAction::Error
+        );
+        out.push_str(if blocking {
+            "\n**:no_entry_sign: Budget projection** — this PR would **fail the run** \
+             at the configured `[budget]` limits if merged:\n\n"
+        } else {
+            "\n**:warning: Budget projection** — this PR would breach `[budget]` \
+             warnings if merged (run-level totals over the configured limits):\n\n"
+        });
+        out.push_str("| limit | configured | projected |\n|---|---:|---:|\n");
+        for breach in projected_budget_breaches {
+            let (limit_str, actual_str) = match breach.limit_type.as_str() {
+                "max_usd" => (
+                    format!("${:.6}", breach.limit),
+                    format!("${:.6}", breach.actual),
+                ),
+                "max_duration_ms" => (
+                    format!("{}ms", breach.limit as u64),
+                    format!("{}ms", breach.actual as u64),
+                ),
+                "max_bytes_scanned" => (
+                    format!("{} bytes", breach.limit as u64),
+                    format!("{} bytes", breach.actual as u64),
+                ),
+                _ => (breach.limit.to_string(), breach.actual.to_string()),
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                breach.limit_type, limit_str, actual_str,
+            ));
+        }
+        if !blocking {
+            out.push_str(
+                "\n_Set `[budget].on_breach = \"error\"` to make the run fail on these breaches._\n",
+            );
+        }
+    }
     out
 }
 
@@ -1060,6 +1175,8 @@ pub fn empty_cost_summary() -> PreviewCostSummary {
         total_branch_cost_usd: None,
         total_base_cost_usd: None,
         delta_usd: None,
+        total_branch_duration_ms: 0,
+        total_branch_bytes_scanned: None,
         models_skipped_via_copy: 0,
         savings_from_copy_usd: None,
     }
@@ -1845,12 +1962,244 @@ mod tests {
         );
         let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
         let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
-        let md = render_preview_cost_markdown("feature", &summary, &per_model);
+        let budget = rocky_core::config::BudgetConfig::default();
+        let md = render_preview_cost_markdown("feature", &summary, &per_model, &[], &budget);
         assert!(md.contains("**Preview cost**"));
         assert!(md.contains("`feature`"));
         assert!(md.contains("Δ vs base"));
         assert!(md.contains("| `a` |"));
         assert!(md.contains("| `upstream` |"));
         assert!(md.contains("1 model(s) skipped via copy"));
+    }
+
+    /// Project budget breaches against the run-level totals — every
+    /// limit dimension surfaces independently. Bytes-only branch
+    /// totals (no cost params configured) still trip
+    /// `max_bytes_scanned` without falsely tripping `max_usd`.
+    #[test]
+    fn project_budget_breaches_each_limit_dimension() {
+        use crate::output::PreviewCostSummary;
+        use rocky_core::config::BudgetConfig;
+
+        // Run-level totals: $5, 90s wall-clock, 5MB scanned.
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: Some(5.0),
+            total_base_cost_usd: Some(2.0),
+            delta_usd: Some(3.0),
+            total_branch_duration_ms: 90_000,
+            total_branch_bytes_scanned: Some(5 * 1024 * 1024),
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+
+        // Cost-only breach.
+        let budget = BudgetConfig {
+            max_usd: Some(2.5),
+            ..BudgetConfig::default()
+        };
+        let breaches = project_budget_breaches(&budget, &summary);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, "max_usd");
+
+        // Duration-only breach (cost stays within budget).
+        let budget = BudgetConfig {
+            max_duration_ms: Some(60_000),
+            ..BudgetConfig::default()
+        };
+        let breaches = project_budget_breaches(&budget, &summary);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, "max_duration_ms");
+        assert_eq!(breaches[0].limit, 60_000.0);
+        assert_eq!(breaches[0].actual, 90_000.0);
+
+        // Bytes-only breach.
+        let budget = BudgetConfig {
+            max_bytes_scanned: Some(1024 * 1024),
+            ..BudgetConfig::default()
+        };
+        let breaches = project_budget_breaches(&budget, &summary);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].limit_type, "max_bytes_scanned");
+
+        // All three dimensions trip at once.
+        let budget = BudgetConfig {
+            max_usd: Some(2.5),
+            max_duration_ms: Some(60_000),
+            max_bytes_scanned: Some(1024 * 1024),
+            ..BudgetConfig::default()
+        };
+        let breaches = project_budget_breaches(&budget, &summary);
+        assert_eq!(breaches.len(), 3);
+    }
+
+    /// Unset budget projects no breaches — covers the common "no budget
+    /// configured" path so the field stays clean on the JSON output.
+    #[test]
+    fn project_budget_breaches_unset_budget_returns_empty() {
+        use crate::output::PreviewCostSummary;
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: Some(99.0),
+            total_base_cost_usd: Some(1.0),
+            delta_usd: Some(98.0),
+            total_branch_duration_ms: 10 * 60 * 60 * 1000, // 10 hours
+            total_branch_bytes_scanned: Some(1_000_000_000_000), // 1TB
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+        let budget = rocky_core::config::BudgetConfig::default();
+        assert!(project_budget_breaches(&budget, &summary).is_empty());
+    }
+
+    /// Within-budget totals project no breaches even when a budget is set.
+    #[test]
+    fn project_budget_breaches_within_limits_returns_empty() {
+        use crate::output::PreviewCostSummary;
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: Some(1.0),
+            total_base_cost_usd: Some(0.5),
+            delta_usd: Some(0.5),
+            total_branch_duration_ms: 10_000,
+            total_branch_bytes_scanned: Some(1024),
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+        let budget = rocky_core::config::BudgetConfig {
+            max_usd: Some(10.0),
+            max_duration_ms: Some(60_000),
+            max_bytes_scanned: Some(1024 * 1024),
+            ..rocky_core::config::BudgetConfig::default()
+        };
+        assert!(project_budget_breaches(&budget, &summary).is_empty());
+    }
+
+    /// Cost-dimension projection skips when no cost was computed (no
+    /// adapter cost params). Mirrors `BudgetConfig::check_breaches`'
+    /// `None`-cost short-circuit; a "no cost data" preview should not
+    /// false-positive a `max_usd` breach.
+    #[test]
+    fn project_budget_breaches_skips_cost_dimension_when_total_is_none() {
+        use crate::output::PreviewCostSummary;
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: None,
+            total_base_cost_usd: None,
+            delta_usd: None,
+            total_branch_duration_ms: 0,
+            total_branch_bytes_scanned: None,
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+        let budget = rocky_core::config::BudgetConfig {
+            max_usd: Some(0.01),
+            ..rocky_core::config::BudgetConfig::default()
+        };
+        assert!(project_budget_breaches(&budget, &summary).is_empty());
+    }
+
+    /// Markdown surfaces a budget-projection section with limit / actual
+    /// columns when breaches are projected. The section text changes
+    /// based on `on_breach`: `error` flags the run as failing, `warn`
+    /// frames it as advisory.
+    #[test]
+    fn cost_markdown_includes_budget_projection_section_when_breaches() {
+        use crate::output::{BudgetBreachOutput, PreviewCostSummary};
+
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: Some(5.0),
+            total_base_cost_usd: Some(2.0),
+            delta_usd: Some(3.0),
+            total_branch_duration_ms: 90_000,
+            total_branch_bytes_scanned: Some(2 * 1024 * 1024),
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+        let breaches = vec![
+            BudgetBreachOutput {
+                limit_type: "max_usd".into(),
+                limit: 2.5,
+                actual: 5.0,
+            },
+            BudgetBreachOutput {
+                limit_type: "max_duration_ms".into(),
+                limit: 60_000.0,
+                actual: 90_000.0,
+            },
+        ];
+        // Render expects at least one per-model row — empty per_model
+        // hits the "no branch run yet" short-circuit path that skips
+        // the table and the budget section.
+        let per_model = vec![crate::output::PreviewModelCostDelta {
+            model_name: "a".into(),
+            skipped_via_copy: false,
+            branch_cost_usd: Some(5.0),
+            base_cost_usd: Some(2.0),
+            delta_usd: Some(3.0),
+            branch_duration_ms: 90_000,
+            base_duration_ms: 30_000,
+            branch_bytes_scanned: Some(2 * 1024 * 1024),
+            base_bytes_scanned: Some(512 * 1024),
+        }];
+
+        // Warn variant — advisory framing.
+        let budget_warn = rocky_core::config::BudgetConfig {
+            max_usd: Some(2.5),
+            max_duration_ms: Some(60_000),
+            ..rocky_core::config::BudgetConfig::default()
+        };
+        let md_warn =
+            render_preview_cost_markdown("feature", &summary, &per_model, &breaches, &budget_warn);
+        assert!(md_warn.contains("Budget projection"));
+        assert!(md_warn.contains("breach"));
+        assert!(md_warn.contains("`max_usd`"));
+        assert!(md_warn.contains("`max_duration_ms`"));
+        assert!(md_warn.contains("$2.500000"));
+        assert!(md_warn.contains("$5.000000"));
+        assert!(md_warn.contains("60000ms"));
+        assert!(md_warn.contains("90000ms"));
+
+        // Error variant — surfaced with the "fail the run" framing.
+        let budget_err = rocky_core::config::BudgetConfig {
+            max_usd: Some(2.5),
+            max_duration_ms: Some(60_000),
+            on_breach: rocky_core::config::BudgetBreachAction::Error,
+            ..rocky_core::config::BudgetConfig::default()
+        };
+        let md_err =
+            render_preview_cost_markdown("feature", &summary, &per_model, &breaches, &budget_err);
+        assert!(md_err.contains("fail the run"));
+    }
+
+    /// No projected breaches → no budget section rendered. Avoids
+    /// adding noise to PR comments on every project that happens to
+    /// declare a `[budget]` block.
+    #[test]
+    fn cost_markdown_omits_budget_section_when_no_breaches() {
+        use crate::output::PreviewCostSummary;
+
+        let summary = PreviewCostSummary {
+            total_branch_cost_usd: Some(0.5),
+            total_base_cost_usd: Some(0.4),
+            delta_usd: Some(0.1),
+            total_branch_duration_ms: 1000,
+            total_branch_bytes_scanned: Some(1024),
+            models_skipped_via_copy: 0,
+            savings_from_copy_usd: None,
+        };
+        let per_model = vec![crate::output::PreviewModelCostDelta {
+            model_name: "a".into(),
+            skipped_via_copy: false,
+            branch_cost_usd: Some(0.5),
+            base_cost_usd: Some(0.4),
+            delta_usd: Some(0.1),
+            branch_duration_ms: 1000,
+            base_duration_ms: 800,
+            branch_bytes_scanned: Some(1024),
+            base_bytes_scanned: Some(800),
+        }];
+        let budget = rocky_core::config::BudgetConfig {
+            max_usd: Some(10.0),
+            ..rocky_core::config::BudgetConfig::default()
+        };
+        let md = render_preview_cost_markdown("feature", &summary, &per_model, &[], &budget);
+        assert!(!md.contains("Budget projection"));
     }
 }

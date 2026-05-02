@@ -25,6 +25,10 @@ export interface PreviewCostOutput {
   command: string;
   markdown: string;
   per_model: PreviewModelCostDelta[];
+  /**
+   * Budget breaches projected against the branch totals — populated only when the project declares a `[budget]` block. Lets a PR reviewer (and a CI gate) see "this PR would breach the run-level `max_usd` / `max_duration_ms` / `max_bytes_scanned` if merged" before the merge actually happens. Empty when no budget is configured or the projected totals stay within every limit. Mirrors the `RunOutput.budget_breaches` shape so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.
+   */
+  projected_budget_breaches?: BudgetBreachOutput[];
   summary: PreviewCostSummary;
   version: string;
   [k: string]: unknown;
@@ -48,6 +52,20 @@ export interface PreviewModelCostDelta {
   [k: string]: unknown;
 }
 /**
+ * One budget breach surfaced on [`RunOutput::budget_breaches`].
+ *
+ * Kept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.
+ */
+export interface BudgetBreachOutput {
+  actual: number;
+  limit: number;
+  /**
+   * Which limit was breached: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`.
+   */
+  limit_type: string;
+  [k: string]: unknown;
+}
+/**
  * Aggregate cost rollup for [`PreviewCostOutput`].
  */
 export interface PreviewCostSummary {
@@ -68,8 +86,16 @@ export interface PreviewCostSummary {
    */
   total_base_cost_usd?: number | null;
   /**
+   * Sum of every per-model `branch_bytes_scanned` that produced a number. `None` when no branch model reported a byte count (mirrors `RunOutput.cost.total_bytes_scanned` semantics — the non-BigQuery adapters today still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Used to project the `[budget]` `max_bytes_scanned` limit at preview time.
+   */
+  total_branch_bytes_scanned?: number | null;
+  /**
    * Sum of every per-model `branch_cost_usd` that produced a number.
    */
   total_branch_cost_usd?: number | null;
+  /**
+   * Sum of every per-model `branch_duration_ms`. Used to project the `[budget]` `max_duration_ms` limit at preview time.
+   */
+  total_branch_duration_ms: number;
   [k: string]: unknown;
 }

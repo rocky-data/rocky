@@ -3870,6 +3870,17 @@ pub struct PreviewCostOutput {
     pub branch_run_id: String,
     pub summary: PreviewCostSummary,
     pub per_model: Vec<PreviewModelCostDelta>,
+    /// Budget breaches projected against the branch totals — populated
+    /// only when the project declares a `[budget]` block. Lets a PR
+    /// reviewer (and a CI gate) see "this PR would breach the run-level
+    /// `max_usd` / `max_duration_ms` / `max_bytes_scanned` if merged"
+    /// before the merge actually happens. Empty when no budget is
+    /// configured or the projected totals stay within every limit.
+    /// Mirrors the `RunOutput.budget_breaches` shape so the same
+    /// downstream consumers (PR-comment templates, JSON listeners) can
+    /// process both with one code path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_budget_breaches: Vec<BudgetBreachOutput>,
     pub markdown: String,
 }
 
@@ -3888,6 +3899,17 @@ pub struct PreviewCostSummary {
     /// PR costs more to run than `main`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_usd: Option<f64>,
+    /// Sum of every per-model `branch_duration_ms`. Used to project the
+    /// `[budget]` `max_duration_ms` limit at preview time.
+    pub total_branch_duration_ms: u64,
+    /// Sum of every per-model `branch_bytes_scanned` that produced a
+    /// number. `None` when no branch model reported a byte count
+    /// (mirrors `RunOutput.cost.total_bytes_scanned` semantics — the
+    /// non-BigQuery adapters today still inherit the default stub on
+    /// `WarehouseAdapter::execute_statement_with_stats`). Used to
+    /// project the `[budget]` `max_bytes_scanned` limit at preview time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_branch_bytes_scanned: Option<u64>,
     /// Number of models that did not run on the branch because they
     /// were copied from base. Their savings show up below.
     pub models_skipped_via_copy: usize,
@@ -3972,12 +3994,14 @@ impl PreviewDiffOutput {
 }
 
 impl PreviewCostOutput {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         branch_name: String,
         base_run_id: Option<String>,
         branch_run_id: String,
         summary: PreviewCostSummary,
         per_model: Vec<PreviewModelCostDelta>,
+        projected_budget_breaches: Vec<BudgetBreachOutput>,
         markdown: String,
     ) -> Self {
         PreviewCostOutput {
@@ -3988,6 +4012,7 @@ impl PreviewCostOutput {
             branch_run_id,
             summary,
             per_model,
+            projected_budget_breaches,
             markdown,
         }
     }
