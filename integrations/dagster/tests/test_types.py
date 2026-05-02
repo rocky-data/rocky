@@ -7,6 +7,7 @@ import json
 import pytest
 
 from dagster_rocky.types import (
+    CatalogOutput,
     CiResult,
     ColumnLineageResult,
     CompileResult,
@@ -469,6 +470,32 @@ def test_parse_column_lineage():
     assert result.trace[0].source.column == "amount"
 
 
+def test_parse_catalog(catalog_json: str):
+    result = CatalogOutput.model_validate_json(catalog_json)
+    assert result.command == "catalog"
+    assert result.project_name == "playground"
+    assert result.config_hash == "abcdef0123456789"
+    assert result.last_run_id is None
+    assert len(result.assets) == 2
+    assert {a.model_name for a in result.assets} == {"raw_orders", "customer_orders"}
+
+    raw = next(a for a in result.assets if a.model_name == "raw_orders")
+    assert raw.kind.value == "Source"
+    assert raw.fqn == "raw__orders.orders"
+    assert raw.intent is None
+
+    cust = next(a for a in result.assets if a.model_name == "customer_orders")
+    assert cust.kind.value == "Model"
+    assert cust.intent == "Per-customer revenue rollup."
+
+    assert len(result.edges) == 2
+    assert result.edges[0].confidence.value == "High"
+    assert result.edges[0].transform == "aggregation: sum"
+    assert result.stats.asset_count == 2
+    assert result.stats.column_count == 5
+    assert result.stats.assets_with_star == 0
+
+
 def test_parse_test_result(test_result_json: str):
     result = TestResult.model_validate_json(test_result_json)
     assert result.version == "0.1.0"
@@ -561,6 +588,7 @@ def test_parse_rocky_output_auto_detect(
     optimize_json: str,
     doctor_json: str,
     drift_json: str,
+    catalog_json: str,
 ):
     assert isinstance(parse_rocky_output(discover_json), DiscoverResult)
     assert isinstance(parse_rocky_output(run_json), RunResult)
@@ -575,6 +603,7 @@ def test_parse_rocky_output_auto_detect(
     assert isinstance(parse_rocky_output(optimize_json), OptimizeResult)
     assert isinstance(parse_rocky_output(doctor_json), DoctorResult)
     assert isinstance(parse_rocky_output(drift_json), DriftDetectResult)
+    assert isinstance(parse_rocky_output(catalog_json), CatalogOutput)
 
 
 def test_parse_unknown_command():

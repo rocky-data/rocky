@@ -452,6 +452,25 @@ enum Command {
         column_lineage: bool,
     },
 
+    /// Emit a project-wide column-level lineage snapshot.
+    ///
+    /// Walks the SemanticGraph and writes a persisted catalog artifact
+    /// (default: `./.rocky/catalog/catalog.json`) so any non-Rocky
+    /// consumer can read column-level lineage without invoking the
+    /// engine. PR-1 emits JSON only; Parquet output and run-history
+    /// enrichment land in follow-up PRs.
+    Catalog {
+        /// Models directory.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+        /// Output directory for the catalog artifacts.
+        ///
+        /// Defaults to `./.rocky/catalog/`. The JSON file is always
+        /// written to `<out>/catalog.json`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
     /// Show column-level lineage for a model
     Lineage {
         /// Model name (or model.column)
@@ -1582,6 +1601,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             json,
             cli.cache_ttl,
         ),
+        Command::Catalog { models, out } => {
+            let out_dir = out.unwrap_or_else(rocky_cli::commands::catalog_default_out_dir);
+            rocky_cli::commands::run_catalog(
+                &cli.config,
+                &state_path,
+                &models,
+                &out_dir,
+                json,
+                cli.cache_ttl,
+            )
+        }
         Command::Lineage {
             target,
             models,

@@ -1,0 +1,259 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AssetKind": {
+      "description": "Asset kind discriminator for [`CatalogAsset`].",
+      "enum": [
+        "Source",
+        "Model",
+        "View",
+        "MaterializedView"
+      ],
+      "type": "string"
+    },
+    "CatalogAsset": {
+      "description": "A single asset (model or source) in the catalog.",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/definitions/CatalogColumn"
+          },
+          "type": "array"
+        },
+        "downstream_models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fqn": {
+          "description": "Fully-qualified target identifier (`catalog.schema.table`) when resolvable, otherwise the model name.",
+          "type": "string"
+        },
+        "intent": {
+          "description": "Free-form natural-language description of the asset's purpose, when supplied via the model's sidecar config.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AssetKind"
+            }
+          ],
+          "description": "Whether the asset is a project-managed model or an external source."
+        },
+        "last_materialized_at": {
+          "description": "Timestamp of the last successful materialization, when known.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_run_id": {
+          "description": "Identifier of the last successful run that produced the asset, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "description": "Model or source name as it appears in lineage edges.",
+          "type": "string"
+        },
+        "upstream_models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "columns",
+        "downstream_models",
+        "fqn",
+        "kind",
+        "model_name",
+        "upstream_models"
+      ],
+      "type": "object"
+    },
+    "CatalogColumn": {
+      "description": "A column on a catalog asset.",
+      "properties": {
+        "data_type": {
+          "description": "Declared or inferred type of the column, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column accepts nulls, when known.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "CatalogEdge": {
+      "description": "A single column-level lineage edge.",
+      "properties": {
+        "confidence": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EdgeConfidence"
+            }
+          ],
+          "description": "Confidence the producing edge is fully understood. `Medium` is emitted for star-expanded projections (where lineage is inferred rather than parsed from an explicit projection); `High` for edges sourced from explicit columns."
+        },
+        "source_column": {
+          "type": "string"
+        },
+        "source_model": {
+          "type": "string"
+        },
+        "target_column": {
+          "type": "string"
+        },
+        "target_model": {
+          "type": "string"
+        },
+        "transform": {
+          "description": "Transform kind: \"direct\", \"cast\", \"expression\", or \"aggregation: <fn>\". Stringified to match the existing lineage edge shape.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "confidence",
+        "source_column",
+        "source_model",
+        "target_column",
+        "target_model",
+        "transform"
+      ],
+      "type": "object"
+    },
+    "CatalogStats": {
+      "description": "Aggregate counts for the emitted catalog.",
+      "properties": {
+        "asset_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "assets_with_star": {
+          "description": "Number of assets whose lineage was derived from `SELECT *` (and is therefore inferred rather than parsed). Surfaces partial-lineage coverage as a single number in the summary.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "column_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "edge_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "orphan_columns": {
+          "description": "Number of columns with no producing edge — typically the result of a star expansion that could not resolve an upstream column.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "asset_count",
+        "assets_with_star",
+        "column_count",
+        "duration_ms",
+        "edge_count",
+        "orphan_columns"
+      ],
+      "type": "object"
+    },
+    "EdgeConfidence": {
+      "description": "Confidence grading for a [`CatalogEdge`].\n\nCoarse-grained on purpose: every consumer threshold-checks at \"good enough\", and a 3-bucket enum is simpler than a numeric score. A numeric `confidence_score` field can be added alongside this enum later without breaking callers.",
+      "enum": [
+        "High",
+        "Medium",
+        "Low"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "JSON output for `rocky catalog`.\n\nA persisted, queryable snapshot of column-level lineage across the project. Emitted to `./.rocky/catalog/catalog.json` (default) so any non-Rocky consumer (BI tool, governance dashboard, PR bot) can read the artifact without invoking the engine. The CLI's own stdout is a one-screen summary; this struct is the structured payload backing `--output json`.",
+  "properties": {
+    "assets": {
+      "items": {
+        "$ref": "#/definitions/CatalogAsset"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "config_hash": {
+      "description": "Stable fingerprint of the `rocky.toml` bytes. Lets a downstream consumer detect whether the catalog was built against a config that has since changed.",
+      "type": "string"
+    },
+    "edges": {
+      "items": {
+        "$ref": "#/definitions/CatalogEdge"
+      },
+      "type": "array"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "last_run_id": {
+      "description": "Identifier of the last successful run that produced these assets, when known. Absent until the catalog is enriched with run-history metadata.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project_name": {
+      "description": "Pipeline name used to build the catalog. When the project has multiple pipelines, this is the first one in declaration order.",
+      "type": "string"
+    },
+    "stats": {
+      "$ref": "#/definitions/CatalogStats"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "assets",
+    "command",
+    "config_hash",
+    "edges",
+    "generated_at",
+    "project_name",
+    "stats",
+    "version"
+  ],
+  "title": "CatalogOutput",
+  "type": "object"
+}

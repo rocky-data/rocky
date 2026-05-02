@@ -42,6 +42,7 @@ function buildItems(): (vscode.QuickPickItem | CommandPickItem)[] {
     cmd("$(check) Compile", "Type-check models, validate contracts", "rocky.compile"),
     cmd("$(beaker) Test", "Run local tests via DuckDB", "rocky.test"),
     cmd("$(type-hierarchy) Lineage", "Render model DAG as interactive SVG", "rocky.showLineage"),
+    cmd("$(database) Catalog", "Build project-wide column-lineage snapshot", "rocky.catalog"),
     cmd("$(graph) Metrics", "Quality metrics with alerts", "rocky.metrics"),
     cmd("$(lightbulb) Optimize", "Cost & strategy analysis", "rocky.optimize"),
 

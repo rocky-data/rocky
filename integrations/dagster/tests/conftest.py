@@ -112,3 +112,8 @@ def compliance_json() -> str:
 @pytest.fixture
 def retention_status_json() -> str:
     return json.dumps(scenarios.RETENTION_STATUS)
+
+
+@pytest.fixture
+def catalog_json() -> str:
+    return json.dumps(scenarios.CATALOG)

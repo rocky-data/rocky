@@ -16,6 +16,7 @@
 
 import type {
   ArchiveOutput,
+  CatalogOutput,
   CiOutput,
   CompactOutput,
   CompareOutput,
@@ -98,3 +99,5 @@ export type HooksListResult = HooksListOutput;
 export type HooksHookEntry = HookEntry;
 
 export type HooksTestResult = HooksTestOutput;
+
+export type CatalogResult = CatalogOutput;

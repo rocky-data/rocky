@@ -169,6 +169,17 @@ export type { BranchOutput, BranchEntry } from "./branch";
 export type { BranchListOutput } from "./branch_list";
 export type { BranchDeleteOutput } from "./branch_delete";
 
+// Catalog (project-wide column-lineage snapshot)
+export type {
+  AssetKind,
+  CatalogAsset,
+  CatalogColumn,
+  CatalogEdge,
+  CatalogOutput,
+  CatalogStats,
+  EdgeConfidence,
+} from "./catalog";
+
 // Replay (inspection-only run record)
 export type { ReplayOutput, ReplayModelOutput } from "./replay";
 

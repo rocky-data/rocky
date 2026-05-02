@@ -1483,6 +1483,130 @@ pub struct LineageQualifiedColumn {
     pub column: String,
 }
 
+/// JSON output for `rocky catalog`.
+///
+/// A persisted, queryable snapshot of column-level lineage across the
+/// project. Emitted to `./.rocky/catalog/catalog.json` (default) so any
+/// non-Rocky consumer (BI tool, governance dashboard, PR bot) can read
+/// the artifact without invoking the engine. The CLI's own stdout is a
+/// one-screen summary; this struct is the structured payload backing
+/// `--output json`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogOutput {
+    pub version: String,
+    pub command: String,
+    pub generated_at: DateTime<Utc>,
+    /// Pipeline name used to build the catalog. When the project has
+    /// multiple pipelines, this is the first one in declaration order.
+    pub project_name: String,
+    /// Stable fingerprint of the `rocky.toml` bytes. Lets a downstream
+    /// consumer detect whether the catalog was built against a config
+    /// that has since changed.
+    pub config_hash: String,
+    /// Identifier of the last successful run that produced these assets,
+    /// when known. Absent until the catalog is enriched with run-history
+    /// metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+    pub assets: Vec<CatalogAsset>,
+    pub edges: Vec<CatalogEdge>,
+    pub stats: CatalogStats,
+}
+
+/// A single asset (model or source) in the catalog.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogAsset {
+    /// Fully-qualified target identifier (`catalog.schema.table`) when
+    /// resolvable, otherwise the model name.
+    pub fqn: String,
+    /// Model or source name as it appears in lineage edges.
+    pub model_name: String,
+    /// Whether the asset is a project-managed model or an external source.
+    pub kind: AssetKind,
+    pub columns: Vec<CatalogColumn>,
+    pub upstream_models: Vec<String>,
+    pub downstream_models: Vec<String>,
+    /// Free-form natural-language description of the asset's purpose,
+    /// when supplied via the model's sidecar config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Timestamp of the last successful materialization, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialized_at: Option<DateTime<Utc>>,
+    /// Identifier of the last successful run that produced the asset,
+    /// when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+}
+
+/// A column on a catalog asset.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogColumn {
+    pub name: String,
+    /// Declared or inferred type of the column, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    /// Whether the column accepts nulls, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+}
+
+/// A single column-level lineage edge.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogEdge {
+    pub source_model: String,
+    pub source_column: String,
+    pub target_model: String,
+    pub target_column: String,
+    /// Transform kind: "direct", "cast", "expression", or
+    /// "aggregation: <fn>". Stringified to match the existing lineage
+    /// edge shape.
+    pub transform: String,
+    /// Confidence the producing edge is fully understood. `Medium` is
+    /// emitted for star-expanded projections (where lineage is inferred
+    /// rather than parsed from an explicit projection); `High` for
+    /// edges sourced from explicit columns.
+    pub confidence: EdgeConfidence,
+}
+
+/// Confidence grading for a [`CatalogEdge`].
+///
+/// Coarse-grained on purpose: every consumer threshold-checks at "good
+/// enough", and a 3-bucket enum is simpler than a numeric score. A
+/// numeric `confidence_score` field can be added alongside this enum
+/// later without breaking callers.
+#[derive(Debug, Serialize, JsonSchema)]
+pub enum EdgeConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+/// Asset kind discriminator for [`CatalogAsset`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub enum AssetKind {
+    Source,
+    Model,
+    View,
+    MaterializedView,
+}
+
+/// Aggregate counts for the emitted catalog.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogStats {
+    pub asset_count: usize,
+    pub column_count: usize,
+    pub edge_count: usize,
+    /// Number of assets whose lineage was derived from `SELECT *` (and
+    /// is therefore inferred rather than parsed). Surfaces partial-lineage
+    /// coverage as a single number in the summary.
+    pub assets_with_star: usize,
+    /// Number of columns with no producing edge — typically the result
+    /// of a star expansion that could not resolve an upstream column.
+    pub orphan_columns: usize,
+    pub duration_ms: u64,
+}
+
 /// JSON output for `rocky state show`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct StateOutput {
