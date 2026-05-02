@@ -1126,6 +1126,336 @@ impl StateStore {
 }
 
 // ---------------------------------------------------------------------------
+// State-store retention sweep (see `crate::retention::StateRetentionConfig`)
+// ---------------------------------------------------------------------------
+
+impl StateStore {
+    /// Drop history rows that exceed the configured retention policy.
+    ///
+    /// Sweeps three tables — `run_history`, `dag_snapshots`,
+    /// `quality_history` — when each is listed in
+    /// [`StateRetentionConfig::applies_to`]. Operational tables
+    /// (`schema_cache`, `watermarks`, `partitions`, `loaded_files`,
+    /// `branches`, `idempotency_keys`, `grace_periods`, `run_progress`,
+    /// `check_history`) are never touched: they hold live state, not
+    /// history.
+    ///
+    /// For each domain:
+    ///
+    /// 1. Read every row and pair its key with the row's own timestamp
+    ///    (`started_at` for runs, `timestamp` for DAG / quality
+    ///    snapshots).
+    /// 2. Sort by timestamp descending.
+    /// 3. Always keep the most recent `min_runs_kept` rows, regardless of
+    ///    age. Of the rest, delete those older than `now - max_age_days`.
+    ///
+    /// Each domain executes in its own redb write transaction, so a
+    /// failure mid-sweep leaves earlier domains committed and the
+    /// reported counts remain accurate up to the failure point.
+    ///
+    /// `min_runs_kept` is applied **per domain**, not as a global cap.
+    pub fn sweep_retention(
+        &self,
+        policy: &crate::retention::StateRetentionConfig,
+    ) -> Result<crate::retention::SweepReport, StateError> {
+        use crate::retention::{StateRetentionDomain, SweepReport};
+
+        let started = std::time::Instant::now();
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::days(i64::from(policy.max_age_days));
+        let min_keep = policy.min_runs_kept as usize;
+
+        let mut report = SweepReport::default();
+
+        if policy.applies_to_domain(StateRetentionDomain::History) {
+            let (deleted, kept) = self.sweep_run_history(cutoff, min_keep)?;
+            report.runs_deleted = deleted;
+            report.runs_kept = kept;
+        } else {
+            report.runs_kept = self.count_run_history()?;
+        }
+
+        if policy.applies_to_domain(StateRetentionDomain::Lineage) {
+            let (deleted, kept) = self.sweep_dag_snapshots(cutoff, min_keep)?;
+            report.lineage_deleted = deleted;
+            report.lineage_kept = kept;
+        } else {
+            report.lineage_kept = self.count_dag_snapshots()?;
+        }
+
+        if policy.applies_to_domain(StateRetentionDomain::Audit) {
+            let (deleted, kept) = self.sweep_quality_history(cutoff, min_keep)?;
+            report.audit_deleted = deleted;
+            report.audit_kept = kept;
+        } else {
+            report.audit_kept = self.count_quality_history()?;
+        }
+
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        Ok(report)
+    }
+
+    /// Dry-run counterpart to [`StateStore::sweep_retention`]: counts what
+    /// *would* be deleted / kept, without opening a write transaction.
+    pub fn sweep_retention_dry_run(
+        &self,
+        policy: &crate::retention::StateRetentionConfig,
+    ) -> Result<crate::retention::SweepReport, StateError> {
+        use crate::retention::{StateRetentionDomain, SweepReport};
+
+        let started = std::time::Instant::now();
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::days(i64::from(policy.max_age_days));
+        let min_keep = policy.min_runs_kept as usize;
+
+        let mut report = SweepReport::default();
+
+        if policy.applies_to_domain(StateRetentionDomain::History) {
+            let (deleted, kept) = self.count_run_history_sweep(cutoff, min_keep)?;
+            report.runs_deleted = deleted;
+            report.runs_kept = kept;
+        } else {
+            report.runs_kept = self.count_run_history()?;
+        }
+
+        if policy.applies_to_domain(StateRetentionDomain::Lineage) {
+            let (deleted, kept) = self.count_dag_snapshots_sweep(cutoff, min_keep)?;
+            report.lineage_deleted = deleted;
+            report.lineage_kept = kept;
+        } else {
+            report.lineage_kept = self.count_dag_snapshots()?;
+        }
+
+        if policy.applies_to_domain(StateRetentionDomain::Audit) {
+            let (deleted, kept) = self.count_quality_history_sweep(cutoff, min_keep)?;
+            report.audit_deleted = deleted;
+            report.audit_kept = kept;
+        } else {
+            report.audit_kept = self.count_quality_history()?;
+        }
+
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        Ok(report)
+    }
+
+    /// Plan + apply the sweep against `run_history`.
+    ///
+    /// Reads every row, pairs its key with `started_at`, decides which
+    /// keys to delete (older than `cutoff` and not in the most recent
+    /// `min_keep`), then issues all deletes in a single write transaction.
+    fn sweep_run_history(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_run_history_sweep(cutoff, min_keep)?;
+        let total = self.count_run_history()?;
+        let deleted = to_delete.len() as u64;
+
+        if !to_delete.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(RUN_HISTORY)?;
+                for key in &to_delete {
+                    table.remove(key.as_str())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    /// Plan-only counterpart: returns `(would_delete, would_keep)` without
+    /// touching redb. Shared by the dry-run path and the apply path so
+    /// "what got deleted" never drifts from "what was planned".
+    fn count_run_history_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_run_history_sweep(cutoff, min_keep)?;
+        let total = self.count_run_history()?;
+        let deleted = to_delete.len() as u64;
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    fn plan_run_history_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+        let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let run: RunRecord = serde_json::from_slice(value.value())?;
+            entries.push((key.value().to_string(), run.started_at));
+        }
+        // Newest first; the first `min_keep` are protected unconditionally.
+        entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+
+        let to_delete: Vec<String> = entries
+            .into_iter()
+            .skip(min_keep)
+            .filter(|(_, ts)| *ts < cutoff)
+            .map(|(key, _)| key)
+            .collect();
+        Ok(to_delete)
+    }
+
+    fn count_run_history(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+        let mut n = 0u64;
+        for entry in table.iter()? {
+            let _ = entry?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn sweep_dag_snapshots(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_dag_snapshots_sweep(cutoff, min_keep)?;
+        let total = self.count_dag_snapshots()?;
+        let deleted = to_delete.len() as u64;
+
+        if !to_delete.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(DAG_SNAPSHOTS)?;
+                for key in &to_delete {
+                    table.remove(key.as_str())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    fn count_dag_snapshots_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_dag_snapshots_sweep(cutoff, min_keep)?;
+        let total = self.count_dag_snapshots()?;
+        let deleted = to_delete.len() as u64;
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    fn plan_dag_snapshots_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DAG_SNAPSHOTS)?;
+        let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let snap: DagSnapshot = serde_json::from_slice(value.value())?;
+            entries.push((key.value().to_string(), snap.timestamp));
+        }
+        entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+
+        let to_delete: Vec<String> = entries
+            .into_iter()
+            .skip(min_keep)
+            .filter(|(_, ts)| *ts < cutoff)
+            .map(|(key, _)| key)
+            .collect();
+        Ok(to_delete)
+    }
+
+    fn count_dag_snapshots(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DAG_SNAPSHOTS)?;
+        let mut n = 0u64;
+        for entry in table.iter()? {
+            let _ = entry?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn sweep_quality_history(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_quality_history_sweep(cutoff, min_keep)?;
+        let total = self.count_quality_history()?;
+        let deleted = to_delete.len() as u64;
+
+        if !to_delete.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(QUALITY_HISTORY)?;
+                for key in &to_delete {
+                    table.remove(key.as_str())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    fn count_quality_history_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<(u64, u64), StateError> {
+        let to_delete = self.plan_quality_history_sweep(cutoff, min_keep)?;
+        let total = self.count_quality_history()?;
+        let deleted = to_delete.len() as u64;
+        Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    fn plan_quality_history_sweep(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        min_keep: usize,
+    ) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(QUALITY_HISTORY)?;
+        let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let snap: QualitySnapshot = serde_json::from_slice(value.value())?;
+            entries.push((key.value().to_string(), snap.timestamp));
+        }
+        entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+
+        let to_delete: Vec<String> = entries
+            .into_iter()
+            .skip(min_keep)
+            .filter(|(_, ts)| *ts < cutoff)
+            .map(|(key, _)| key)
+            .collect();
+        Ok(to_delete)
+    }
+
+    fn count_quality_history(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(QUALITY_HISTORY)?;
+        let mut n = 0u64;
+        for entry in table.iter()? {
+            let _ = entry?;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Idempotency-key persistence (see `crate::idempotency`)
 // ---------------------------------------------------------------------------
 
@@ -3619,5 +3949,239 @@ mod tests {
             Err(other) => panic!("expected StateError::Busy, got: {other}"),
             Ok(_) => panic!("expected StateError::Busy, got Ok"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // sweep_retention tests
+    // -----------------------------------------------------------------------
+
+    use crate::retention::{StateRetentionConfig, StateRetentionDomain};
+
+    fn run_at(run_id: &str, started_at: chrono::DateTime<Utc>) -> RunRecord {
+        let mut r = minimal_run_record(run_id, vec![]);
+        r.started_at = started_at;
+        r.finished_at = started_at;
+        r
+    }
+
+    fn dag_snapshot_at(timestamp: chrono::DateTime<Utc>, hash: &str) -> DagSnapshot {
+        DagSnapshot {
+            timestamp,
+            graph_hash: hash.to_string(),
+            model_count: 1,
+            edge_count: 0,
+            changes: vec![],
+        }
+    }
+
+    fn quality_at(
+        model_name: &str,
+        run_id: &str,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> QualitySnapshot {
+        QualitySnapshot {
+            timestamp,
+            run_id: run_id.to_string(),
+            model_name: model_name.to_string(),
+            metrics: QualityMetrics {
+                row_count: 1,
+                null_rates: std::collections::HashMap::new(),
+                freshness_lag_seconds: None,
+            },
+        }
+    }
+
+    #[test]
+    fn sweep_retention_all_young_runs_no_deletes() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for i in 0..5 {
+            store
+                .record_run(&run_at(&format!("r{i}"), now - chrono::Duration::days(1)))
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+        };
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.runs_deleted, 0);
+        assert_eq!(report.runs_kept, 5);
+        assert_eq!(store.list_runs(100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn sweep_retention_min_kept_protects_old_runs() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        // 5 ancient runs, all > max_age_days; min_runs_kept >= total → no deletes.
+        for i in 0..5 {
+            store
+                .record_run(&run_at(
+                    &format!("r{i}"),
+                    now - chrono::Duration::days(1000 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 10,
+            applies_to: vec![StateRetentionDomain::History],
+        };
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.runs_deleted, 0);
+        assert_eq!(report.runs_kept, 5);
+        assert_eq!(store.list_runs(100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn sweep_retention_mixed_keeps_recent_5() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        // 5 recent runs (1 day old each, distinct timestamps)
+        for i in 0..5 {
+            store
+                .record_run(&run_at(
+                    &format!("recent-{i}"),
+                    now - chrono::Duration::hours(1 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+        // 7 old runs (2 years old)
+        for i in 0..7 {
+            store
+                .record_run(&run_at(
+                    &format!("old-{i}"),
+                    now - chrono::Duration::days(700 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 5,
+            applies_to: vec![StateRetentionDomain::History],
+        };
+        let report = store.sweep_retention(&policy).unwrap();
+        // The 7 old runs are not in the most-recent-5 and exceed cutoff →
+        // deleted. The 5 recent runs survive.
+        assert_eq!(report.runs_deleted, 7);
+        assert_eq!(report.runs_kept, 5);
+
+        let remaining = store.list_runs(100).unwrap();
+        assert_eq!(remaining.len(), 5);
+        for r in &remaining {
+            assert!(r.run_id.starts_with("recent-"));
+        }
+    }
+
+    #[test]
+    fn sweep_retention_dry_run_does_not_delete() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for i in 0..3 {
+            store
+                .record_run(&run_at(
+                    &format!("old-{i}"),
+                    now - chrono::Duration::days(500 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+        };
+
+        let dry = store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!(dry.runs_deleted, 3);
+        assert_eq!(dry.runs_kept, 0);
+        // dry run must leave the store untouched
+        assert_eq!(store.list_runs(100).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sweep_retention_skips_domains_not_in_applies_to() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        // Old run + old DAG snapshot. With applies_to = [Lineage], only the
+        // DAG snapshot is touched; the run survives even though it would
+        // qualify for deletion.
+        store
+            .record_run(&run_at("old-run", now - chrono::Duration::days(500)))
+            .unwrap();
+        store
+            .record_dag_snapshot(&dag_snapshot_at(
+                now - chrono::Duration::days(500),
+                "hash-old",
+            ))
+            .unwrap();
+
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::Lineage],
+        };
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.runs_deleted, 0);
+        assert_eq!(report.runs_kept, 1);
+        assert_eq!(report.lineage_deleted, 1);
+        assert_eq!(report.lineage_kept, 0);
+    }
+
+    #[test]
+    fn sweep_retention_audit_quality_history() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for i in 0..3 {
+            store
+                .record_quality(&quality_at(
+                    "orders",
+                    &format!("run-{i}"),
+                    now - chrono::Duration::hours(1 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+        for i in 0..4 {
+            store
+                .record_quality(&quality_at(
+                    "users",
+                    &format!("old-{i}"),
+                    now - chrono::Duration::days(800 + i64::from(i)),
+                ))
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 2,
+            applies_to: vec![StateRetentionDomain::Audit],
+        };
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.audit_deleted, 4);
+        assert_eq!(report.audit_kept, 3);
+    }
+
+    #[test]
+    fn sweep_retention_default_policy_keeps_recent() {
+        // Default policy: 365d / 100 / [history, lineage, audit]. With
+        // every row inside the cutoff, the sweep is a no-op.
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for i in 0..3 {
+            store
+                .record_run(&run_at(
+                    &format!("r{i}"),
+                    now - chrono::Duration::days(i64::from(i)),
+                ))
+                .unwrap();
+        }
+        let report = store
+            .sweep_retention(&StateRetentionConfig::default())
+            .unwrap();
+        assert_eq!(report.runs_deleted, 0);
+        assert_eq!(report.runs_kept, 3);
+        assert_eq!(report.lineage_deleted, 0);
+        assert_eq!(report.audit_deleted, 0);
     }
 }
