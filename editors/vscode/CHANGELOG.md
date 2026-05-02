@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-05-02
+
+Tracks engine `v1.23.0`. Surfaces the new `rocky catalog` command in the VS Code extension and regenerates TypeScript bindings for the `CatalogOutput` family, the additive `sweep_interval_seconds` / `sweep_budget_ms` fields on `StateRetentionConfig`, and the additive `projected_per_model_budget_breaches` field plus `PerModelBudgetBreachOutput` interface from per-model `[budget]` blocks.
+
+### Added
+
+- **`rocky catalog` command surface** (engine [#356](https://github.com/rocky-data/rocky/pull/356)). New `rocky.catalog` command ("Build Project Catalog (Column Lineage Snapshot)") registered in `package.json`'s `contributes.commands`, surfaced in the command palette as a "Catalog" entry, and implemented in `src/commands/inspect.ts`. Invokes `rocky catalog` against the active project and renders the resulting column-level lineage snapshot. The command picks up the regenerated `CatalogOutput` TypeScript interfaces so the typed surface matches the engine's JSON output exactly.
+- **TS interfaces for `rocky catalog`** (engine [#356](https://github.com/rocky-data/rocky/pull/356)). Regenerated `src/types/generated/catalog.ts` from engine v1.23.0 schemas — full typed surface (`CatalogOutput`, `CatalogAsset`, `CatalogColumn`, `CatalogEdge`, `CatalogStats`, `AssetKind`, `EdgeConfidence`). Barrel `index.ts` updated; `src/types/rockyJson.ts` shim picks up the new types.
+
+### Changed
+
+- **Regenerated `src/types/generated/rocky_project.ts`** (engine [#355](https://github.com/rocky-data/rocky/pull/355)) for the two additive fields on `StateRetentionConfig` (`sweep_interval_seconds`, `sweep_budget_ms`). Both default-populated and additive, so parsing a pre-1.23 `rocky.toml` still round-trips cleanly.
+- **Regenerated `src/types/generated/preview_cost.ts`** (engine [#361](https://github.com/rocky-data/rocky/pull/361)) for the additive `projected_per_model_budget_breaches` field plus the new `PerModelBudgetBreachOutput` interface. Strictly additive — existing consumers of `projected_budget_breaches` (which continues to surface only project-level breaches) are unaffected.
+
 ## [1.11.0] — 2026-04-30
 
 Tracks engine `v1.19.0`. Regenerated TypeScript bindings for the new `rocky lineage-diff` command surface. No extension feature changes.

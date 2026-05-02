@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.20.0] — 2026-05-02
+## [1.21.0] — 2026-05-02
+
+Companion release to engine `v1.23.0`. Headline: **`RockyResource.catalog()`** — new typed-resource method that drives `rocky catalog` and returns a parsed `CatalogOutput`, so Dagster code can consume the engine's project-wide column-level lineage snapshot without parsing JSON by hand. The `dagster_rocky.types_generated` layer regenerates against the new `CatalogOutput` family, the additive `sweep_interval_seconds` / `sweep_budget_ms` fields on `StateRetentionConfig` (engine [#355](https://github.com/rocky-data/rocky/pull/355)), and the additive `PreviewCostOutput.projected_per_model_budget_breaches` field plus the new `PerModelBudgetBreachOutput` model from per-model `[budget]` blocks (engine [#361](https://github.com/rocky-data/rocky/pull/361)). No source-level migration required for existing callers — additive throughout.
+
+### Added
+
+- **`RockyResource.catalog(...)` typed-resource method** (engine [#356](https://github.com/rocky-data/rocky/pull/356)). New method on `RockyResource` that invokes `rocky catalog` and returns a parsed `CatalogOutput` with the column-level lineage graph for the project. Reads the JSON artifact at `./.rocky/catalog/catalog.json` (or the `--out` override) and round-trips it through the regenerated `dagster_rocky.types_generated.catalog_schema` so consumers get full Pydantic typing on `assets`, `edges`, `stats`, the `AssetKind` and `EdgeConfidence` enums, and the `assets_with_star` partial-coverage signal. Tested via the live binary in `tests/scenarios.py` + a fixture round-trip in `tests/test_types.py`.
+- **`CatalogOutput` family in `dagster_rocky.types`** (engine [#356](https://github.com/rocky-data/rocky/pull/356)). The regenerated `dagster_rocky.types_generated.catalog_schema` exposes `CatalogOutput`, `CatalogAsset`, `CatalogColumn`, `CatalogEdge`, `CatalogStats`, `AssetKind`, and `EdgeConfidence` as Pydantic v2 models. Re-exported from `dagster_rocky.types` for the soft-swap import path.
+- **`PreviewCostOutput.projected_per_model_budget_breaches` + `PerModelBudgetBreachOutput`** (engine [#361](https://github.com/rocky-data/rocky/pull/361)). New `List[PerModelBudgetBreachOutput]` field on the regenerated `PreviewCostOutput`. Each entry carries `model_name` plus the `limit_type` / `limit` / `actual` triple, alongside the resolved `on_breach` so consumers can render advisory-vs-blocking per row. Strictly additive — kept on a separate field so existing consumers of `projected_budget_breaches` (which continues to surface only project-level breaches) are unaffected. Re-exported from `dagster_rocky.types` for the soft-swap import path.
+- **`StateRetentionConfig.sweep_interval_seconds` + `.sweep_budget_ms`** (engine [#355](https://github.com/rocky-data/rocky/pull/355)). Two additive fields on the regenerated `StateRetentionConfig` Pydantic model carrying the auto-sweep cadence (default 3600s) and soft wall-clock budget (default 5000ms). Existing configs round-trip without changes — the defaults are populated server-side so consumers that don't set them keep working.
+
+
 
 Companion release to engine `v1.22.0`. The `dagster_rocky.types_generated` layer regenerates against the engine's checksum-bisection diff output, the rolling-stats history block, the projected-budget-breaches preview-cost block, and the new state-store retention sweep. The typed-resource layer absorbs the engine's breaking `PreviewModelDiff` shape change automatically — Dagster code that consumes `RockyResource.preview_diff(...)` results doesn't need any source-level migration, the new tagged-enum is exposed as a Pydantic discriminated union.
 
