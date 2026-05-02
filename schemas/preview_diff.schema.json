@@ -180,7 +180,7 @@
       "description": "Row-level diff payload tagged by which algorithm produced it. The `kind` discriminator (`\"sampled\"` or `\"bisection\"`) lets consumers reading the JSON pick the right shape without having to check optional fields.",
       "oneOf": [
         {
-          "description": "Phase 2 sampled diff — `LIMIT N` rows ordered by primary key (or first column). Carries a coverage warning when changes outside the sampling window are not surfaced.",
+          "description": "Sampled diff — `LIMIT N` rows ordered by primary key (or first column). Carries a coverage warning when changes outside the sampling window are not surfaced.",
           "properties": {
             "kind": {
               "enum": [

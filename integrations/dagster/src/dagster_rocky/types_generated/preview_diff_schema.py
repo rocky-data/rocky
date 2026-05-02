@@ -158,7 +158,7 @@ class PreviewBisectionRowDiff(BaseModel):
 
 class PreviewModelDiffAlgorithm1(BaseModel):
     """
-    Phase 2 sampled diff — `LIMIT N` rows ordered by primary key (or first column). Carries a coverage warning when changes outside the sampling window are not surfaced.
+    Sampled diff — `LIMIT N` rows ordered by primary key (or first column). Carries a coverage warning when changes outside the sampling window are not surfaced.
     """
 
     kind: Kind
