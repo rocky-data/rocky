@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use rocky_core::state::{RunRecord, SessionSource, StateStore};
 
 use crate::output::{
-    HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RunHistoryRecord, RunModelRecord,
-    print_json,
+    HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RollingDimension, RollingStats,
+    RunHistoryRecord, RunModelRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -94,11 +94,17 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
 /// governance table below the default table) include the full audit
 /// trail. Defaults preserved so existing consumers don't see a
 /// schema change.
+///
+/// When `rolling_stats` is true and `model_filter` is set, augments
+/// `ModelHistoryOutput` with a [`RollingStats`] block computed over the
+/// `window` most recent successful executions.
 pub fn run_history(
     state_path: &Path,
     model_filter: Option<&str>,
     since: Option<&str>,
     audit: bool,
+    rolling_stats: bool,
+    window: usize,
     output_json: bool,
 ) -> Result<()> {
     let store = StateStore::open_read_only(state_path)?;
@@ -116,8 +122,14 @@ pub fn run_history(
         .transpose()?;
 
     if let Some(model_name) = model_filter {
-        // Show history for a specific model
-        let executions = store.get_model_history(model_name, 50)?;
+        // Fetch a wide enough pool so that rolling stats can find `window`
+        // successful executions even when recent history includes failures.
+        let fetch_limit = if rolling_stats {
+            window.saturating_mul(5).max(100)
+        } else {
+            50
+        };
+        let executions = store.get_model_history(model_name, fetch_limit)?;
 
         let filtered: Vec<_> = if let Some(ts) = since_ts {
             executions
@@ -126,6 +138,13 @@ pub fn run_history(
                 .collect()
         } else {
             executions
+        };
+
+        // Compute rolling stats before consuming `filtered`.
+        let stats: Option<RollingStats> = if rolling_stats {
+            Some(compute_rolling_stats(&filtered, window))
+        } else {
+            None
         };
 
         if output_json {
@@ -145,6 +164,7 @@ pub fn run_history(
                 model: model_name.to_string(),
                 count: executions.len(),
                 executions,
+                rolling_stats: stats,
             };
             print_json(&output)?;
         } else {
@@ -289,6 +309,99 @@ fn print_audit_table(runs: &[RunRecord]) {
     }
 }
 
+/// Compute population mean and std dev for a slice of `f64` values.
+/// Returns `(mean, std_dev)`. Returns `(0.0, 0.0)` for an empty slice.
+fn pop_mean_std(values: &[f64]) -> (f64, f64) {
+    let n = values.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    (mean, variance.sqrt())
+}
+
+/// Compute z-score of `value` given `mean` and `std_dev`.
+/// Returns `None` when `std_dev` is 0.
+fn z_score(value: f64, mean: f64, std_dev: f64) -> Option<f64> {
+    if std_dev == 0.0 {
+        None
+    } else {
+        Some((value - mean) / std_dev)
+    }
+}
+
+/// Compute rolling stats over `executions`, taking up to `window` most-recent
+/// successful executions (status `"success"`, case-insensitive lowercase).
+///
+/// `executions` is expected to be newest-first (as returned by
+/// `StateStore::get_model_history`). The most-recent successful execution
+/// supplies the "latest" value used for the z-score.
+fn compute_rolling_stats(
+    executions: &[rocky_core::state::ModelExecution],
+    window: usize,
+) -> RollingStats {
+    // Filter to successful executions, newest-first, take up to `window`.
+    let successful: Vec<_> = executions
+        .iter()
+        .filter(|e| e.status.eq_ignore_ascii_case("success"))
+        .take(window)
+        .collect();
+
+    let samples = successful.len();
+
+    // Duration dimension — all successful executions contribute.
+    let duration_values: Vec<f64> = successful.iter().map(|e| e.duration_ms as f64).collect();
+    let (dur_mean, dur_std) = pop_mean_std(&duration_values);
+    let dur_latest = successful.first().map(|e| e.duration_ms as f64);
+    let dur_z = if samples >= 2 {
+        dur_latest.and_then(|v| z_score(v, dur_mean, dur_std))
+    } else {
+        None
+    };
+
+    // Rows dimension — only executions where rows_affected is Some.
+    let rows_values: Vec<f64> = successful
+        .iter()
+        .filter_map(|e| e.rows_affected.map(|r| r as f64))
+        .collect();
+    let (rows_mean, rows_std) = pop_mean_std(&rows_values);
+    // "Latest" for rows: the most-recent successful execution that has rows_affected set.
+    let rows_latest = successful
+        .iter()
+        .find_map(|e| e.rows_affected.map(|r| r as f64));
+    let rows_z = if rows_values.len() >= 2 {
+        rows_latest.and_then(|v| z_score(v, rows_mean, rows_std))
+    } else {
+        None
+    };
+
+    // Health score: 1.0 - clamp((max(|z_rows|, |z_duration|) - 2) / 4, 0, 1)
+    let max_abs_z = match (rows_z, dur_z) {
+        (Some(rz), Some(dz)) => rz.abs().max(dz.abs()),
+        (Some(rz), None) => rz.abs(),
+        (None, Some(dz)) => dz.abs(),
+        (None, None) => 0.0,
+    };
+    let health_score = 1.0 - ((max_abs_z - 2.0) / 4.0).clamp(0.0, 1.0);
+
+    RollingStats {
+        window,
+        samples,
+        rows_affected: RollingDimension {
+            mean: rows_mean,
+            std_dev: rows_std,
+            latest_z_score: rows_z,
+        },
+        duration_ms: RollingDimension {
+            mean: dur_mean,
+            std_dev: dur_std,
+            latest_z_score: dur_z,
+        },
+        health_score,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +473,133 @@ mod tests {
         assert_eq!(session_source_str(SessionSource::Dagster), "dagster");
         assert_eq!(session_source_str(SessionSource::Lsp), "lsp");
         assert_eq!(session_source_str(SessionSource::HttpApi), "http_api");
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn make_exec(duration_ms: u64, rows_affected: Option<u64>, status: &str) -> ModelExecution {
+        ModelExecution {
+            model_name: "orders".to_string(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration_ms,
+            rows_affected,
+            status: status.to_string(),
+            sql_hash: "abc".to_string(),
+            bytes_scanned: None,
+            bytes_written: None,
+        }
+    }
+
+    // ── rolling stats unit tests ─────────────────────────────────────────────
+
+    /// All samples equal → std_dev = 0, z_score = None, health = 1.0.
+    #[test]
+    fn rolling_stats_all_equal_samples() {
+        let execs = vec![
+            make_exec(100, Some(50), "success"),
+            make_exec(100, Some(50), "success"),
+            make_exec(100, Some(50), "success"),
+        ];
+        let stats = compute_rolling_stats(&execs, 20);
+        assert_eq!(stats.samples, 3);
+        assert!((stats.duration_ms.mean - 100.0).abs() < 1e-9);
+        assert!((stats.duration_ms.std_dev).abs() < 1e-9);
+        assert!(stats.duration_ms.latest_z_score.is_none(), "std_dev=0 → z=None");
+        assert!((stats.rows_affected.mean - 50.0).abs() < 1e-9);
+        assert!(stats.rows_affected.std_dev.abs() < 1e-9);
+        assert!(stats.rows_affected.latest_z_score.is_none());
+        assert!((stats.health_score - 1.0).abs() < 1e-9);
+    }
+
+    /// Window of size 1: single sample → std_dev = 0, z = None, health = 1.0.
+    #[test]
+    fn rolling_stats_single_sample() {
+        let execs = vec![make_exec(200, Some(10), "success")];
+        let stats = compute_rolling_stats(&execs, 20);
+        assert_eq!(stats.samples, 1);
+        assert!((stats.duration_ms.mean - 200.0).abs() < 1e-9);
+        assert!(stats.duration_ms.std_dev.abs() < 1e-9);
+        assert!(stats.duration_ms.latest_z_score.is_none());
+        assert!((stats.rows_affected.mean - 10.0).abs() < 1e-9);
+        assert!(stats.rows_affected.latest_z_score.is_none());
+        assert!((stats.health_score - 1.0).abs() < 1e-9);
+    }
+
+    /// Normal case — hand-computed values.
+    ///
+    /// Samples (newest-first, as `get_model_history` returns):
+    ///   duration_ms = [30, 20, 10]  → mean=20, pop-std=√(200/3) ≈ 8.165
+    ///   rows_affected = [30, 20, 10]
+    ///   latest (first element) = 30
+    ///   z_duration = (30 - 20) / √(200/3) ≈ 1.2247
+    ///   z_rows = same
+    ///   max |z| ≈ 1.2247 < 2 → health = 1.0
+    #[test]
+    fn rolling_stats_normal_case() {
+        // Newest-first
+        let execs = vec![
+            make_exec(30, Some(30), "success"),
+            make_exec(20, Some(20), "success"),
+            make_exec(10, Some(10), "success"),
+        ];
+        let stats = compute_rolling_stats(&execs, 20);
+        assert_eq!(stats.samples, 3);
+
+        let expected_mean = 20.0_f64;
+        let expected_std = (200.0_f64 / 3.0).sqrt();
+        let expected_z = (30.0 - expected_mean) / expected_std;
+
+        assert!((stats.duration_ms.mean - expected_mean).abs() < 1e-9);
+        assert!((stats.duration_ms.std_dev - expected_std).abs() < 1e-9);
+        let dz = stats.duration_ms.latest_z_score.expect("z_score should be Some");
+        assert!((dz - expected_z).abs() < 1e-9);
+
+        assert!((stats.rows_affected.mean - expected_mean).abs() < 1e-9);
+        let rz = stats.rows_affected.latest_z_score.expect("rows z_score should be Some");
+        assert!((rz - expected_z).abs() < 1e-9);
+
+        // max |z| ≈ 1.2247 < 2 → health_score = 1.0
+        assert!((stats.health_score - 1.0).abs() < 1e-9);
+    }
+
+    /// Non-successful executions are excluded from rolling stats.
+    #[test]
+    fn rolling_stats_filters_non_success() {
+        let execs = vec![
+            make_exec(100, Some(10), "success"),
+            make_exec(999, Some(9999), "failure"),
+            make_exec(100, Some(10), "success"),
+        ];
+        let stats = compute_rolling_stats(&execs, 20);
+        assert_eq!(stats.samples, 2, "failure row should be excluded");
+        assert!((stats.duration_ms.mean - 100.0).abs() < 1e-9);
+    }
+
+    /// Health degrades linearly from 1.0 at |z|=2 to 0.0 at |z|=6.
+    #[test]
+    fn rolling_stats_health_score_formula() {
+        // Construct samples where latest z ≈ 4 (midpoint → health = 0.5).
+        // Use values [0, 0, ..., 0, 8] (9 zeros + one 8) → mean=0.8, pop-std ≈ 2.4,
+        // latest (8) → z ≈ 3.0 → health = 1 - (3-2)/4 = 0.75
+        let mut execs: Vec<ModelExecution> = std::iter::repeat_with(|| make_exec(0, Some(0), "success"))
+            .take(9)
+            .collect();
+        // Prepend the "newest" outlier (duration=8, rows=8)
+        execs.insert(0, make_exec(8, Some(8), "success"));
+
+        let stats = compute_rolling_stats(&execs, 20);
+        // mean = (8 + 0*9) / 10 = 0.8
+        // variance = (sum of (v - 0.8)^2) / 10 = (9 * 0.64 + 1 * 51.84) / 10 = 5.76 → std = 2.4
+        let mean = 0.8_f64;
+        let std = 2.4_f64;
+        let z = (8.0 - mean) / std; // ≈ 3.0
+        let expected_health = 1.0 - ((z - 2.0) / 4.0).clamp(0.0, 1.0);
+
+        assert!((stats.duration_ms.mean - mean).abs() < 1e-9);
+        assert!((stats.duration_ms.std_dev - std).abs() < 1e-9);
+        let dz = stats.duration_ms.latest_z_score.expect("z should be Some");
+        assert!((dz - z).abs() < 1e-9);
+        assert!((stats.health_score - expected_health).abs() < 1e-9);
     }
 }

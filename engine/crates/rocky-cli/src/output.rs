@@ -1133,6 +1133,50 @@ pub struct ModelHistoryOutput {
     pub model: String,
     pub executions: Vec<ModelExecutionRecord>,
     pub count: usize,
+    /// Rolling statistics over the most recent N successful executions.
+    /// Present only when `--rolling-stats` is passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolling_stats: Option<RollingStats>,
+}
+
+/// Rolling statistics computed over the most recent N successful executions
+/// of a model. Populated by `rocky history --model <name> --rolling-stats`.
+///
+/// Statistics use population standard deviation (divided by N, not N-1),
+/// so `std_dev` is exactly 0 when all samples are equal.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RollingStats {
+    /// Maximum number of executions requested for the rolling window.
+    pub window: usize,
+    /// Actual number of successful executions used (≤ window; may be
+    /// smaller when model history is shorter than the requested window).
+    pub samples: usize,
+    /// Rolling statistics for the `rows_affected` dimension.
+    /// Computed only over executions where `rows_affected` is not null.
+    pub rows_affected: RollingDimension,
+    /// Rolling statistics for the `duration_ms` dimension.
+    pub duration_ms: RollingDimension,
+    /// Composite health score in `[0.0, 1.0]`.
+    ///
+    /// Computed as `1.0 - clamp((max(|z_rows|, |z_duration|) - 2.0) / 4.0, 0.0, 1.0)`.
+    /// A score of `1.0` means both z-scores are within 2σ of the mean;
+    /// `0.0` means at least one z-score is 6σ or more.
+    pub health_score: f64,
+}
+
+/// Per-dimension rolling statistics (mean, std dev, latest z-score).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RollingDimension {
+    /// Population mean over the sample window.
+    pub mean: f64,
+    /// Population standard deviation (÷N) over the sample window.
+    pub std_dev: f64,
+    /// Z-score of the most recent execution relative to the window.
+    ///
+    /// `None` when fewer than 2 samples are available or when `std_dev`
+    /// is exactly 0 (all samples are equal — no meaningful deviation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_z_score: Option<f64>,
 }
 
 /// One run from the state store, mirroring `rocky_core::state::RunRecord`
