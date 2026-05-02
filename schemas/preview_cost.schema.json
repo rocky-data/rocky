@@ -1,6 +1,29 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BudgetBreachOutput": {
+      "description": "One budget breach surfaced on [`RunOutput::budget_breaches`].\n\nKept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.",
+      "properties": {
+        "actual": {
+          "format": "double",
+          "type": "number"
+        },
+        "limit": {
+          "format": "double",
+          "type": "number"
+        },
+        "limit_type": {
+          "description": "Which limit was breached: `\"max_usd\"`, `\"max_duration_ms\"`, or `\"max_bytes_scanned\"`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actual",
+        "limit",
+        "limit_type"
+      ],
+      "type": "object"
+    },
     "PreviewCostSummary": {
       "description": "Aggregate cost rollup for [`PreviewCostOutput`].",
       "properties": {
@@ -34,6 +57,15 @@
             "null"
           ]
         },
+        "total_branch_bytes_scanned": {
+          "description": "Sum of every per-model `branch_bytes_scanned` that produced a number. `None` when no branch model reported a byte count (mirrors `RunOutput.cost.total_bytes_scanned` semantics — the non-BigQuery adapters today still inherit the default stub on `WarehouseAdapter::execute_statement_with_stats`). Used to project the `[budget]` `max_bytes_scanned` limit at preview time.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "total_branch_cost_usd": {
           "description": "Sum of every per-model `branch_cost_usd` that produced a number.",
           "format": "double",
@@ -41,10 +73,17 @@
             "number",
             "null"
           ]
+        },
+        "total_branch_duration_ms": {
+          "description": "Sum of every per-model `branch_duration_ms`. Used to project the `[budget]` `max_duration_ms` limit at preview time.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "required": [
-        "models_skipped_via_copy"
+        "models_skipped_via_copy",
+        "total_branch_duration_ms"
       ],
       "type": "object"
     },
@@ -140,6 +179,13 @@
     "per_model": {
       "items": {
         "$ref": "#/definitions/PreviewModelCostDelta"
+      },
+      "type": "array"
+    },
+    "projected_budget_breaches": {
+      "description": "Budget breaches projected against the branch totals — populated only when the project declares a `[budget]` block. Lets a PR reviewer (and a CI gate) see \"this PR would breach the run-level `max_usd` / `max_duration_ms` / `max_bytes_scanned` if merged\" before the merge actually happens. Empty when no budget is configured or the projected totals stay within every limit. Mirrors the `RunOutput.budget_breaches` shape so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.",
+      "items": {
+        "$ref": "#/definitions/BudgetBreachOutput"
       },
       "type": "array"
     },
