@@ -1310,8 +1310,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         .ok(); // Ignore if already set (e.g., in tests)
     }
 
-    // Init structured logging (JSON when output is JSON, human-readable otherwise)
-    rocky_observe::tracing_setup::init_tracing(json);
+    // Init structured logging (JSON when output is JSON, human-readable
+    // otherwise). When the `otel` feature is enabled and
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, this also registers the
+    // `tracing-opentelemetry` layer + W3C `TraceContextPropagator` so
+    // every existing `info_span!` is exported via OTLP gRPC. The
+    // returned guard owns the OTel batch span processor's tracer
+    // provider — bind it to a `_` prefix so it lives until the end of
+    // `run_async`; dropping it earlier loses the final batch on exit.
+    let _tracing_guard = rocky_observe::tracing_setup::init_tracing(json);
 
     let config_path = cli.config.clone();
 

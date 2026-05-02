@@ -1,9 +1,15 @@
-//! Lifecycle wrapper around `rocky_observe::otel::OtelExporter`.
+//! Lifecycle wrapper around the OTLP **metrics** exporter
+//! ([`rocky_observe::otel::OtelExporter`]).
 //!
-//! When the `otel` feature is enabled, [`OtelGuard::init_if_enabled`]
-//! inspects the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable and
-//! — if set — spins up the OTLP metrics exporter. Dropping the guard
-//! flushes the final metrics snapshot and shuts the exporter down.
+//! Trace exporting now lives in `rocky_observe::tracing_setup` —
+//! `init_tracing` returns a `TracingGuard` that owns the tracer
+//! provider so spans are emitted from process-startup forward. This
+//! guard remains responsible for the metrics path only:
+//!
+//! - reads the in-process `RunMetrics` snapshot and pushes it through
+//!   the OTLP meter provider on a 30s periodic interval,
+//! - flushes a final snapshot on `Drop` so the exit-time counters
+//!   reach the collector before `rocky run` returns.
 //!
 //! When the `otel` feature is disabled, the module compiles to a
 //! zero-size struct so callers in `commands/run.rs` don't have to
