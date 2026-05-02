@@ -158,7 +158,7 @@ client_secret = "${DATABRICKS_CLIENT_SECRET}"
 
 ### `type = "snowflake"`
 
-Snowflake warehouse adapter. Supports OAuth, key-pair (RS256 JWT), and password authentication.
+Snowflake warehouse adapter. Supports Programmatic Access Token (PAT), OAuth, key-pair (RS256 JWT), and password authentication.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -171,11 +171,20 @@ Snowflake warehouse adapter. Supports OAuth, key-pair (RS256 JWT), and password 
 | `password` | string | No | Password for password auth. |
 | `private_key_path` | string | No | Path to PKCS#8 PEM private key for key-pair JWT auth. |
 | `oauth_token` | string | No | Pre-supplied OAuth token from an IdP. |
+| `pat` | string | No | Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header — distinct from `oauth_token`. |
 
-Authentication priority: OAuth (highest) > Key-pair JWT > Password (lowest).
+Authentication priority: PAT (highest) > OAuth > Key-pair JWT > Password (lowest).
 
 ```toml
-# Key-pair JWT auth
+# Programmatic Access Token (PAT) auth — recommended for trial accounts and
+# scripts; issue via Snowsight → User Profile → Personal Access Tokens.
+[adapter.snow]
+type = "snowflake"
+account = "${SNOWFLAKE_ACCOUNT}"
+warehouse = "COMPUTE_WH"
+pat = "${SNOWFLAKE_PAT}"
+
+# Key-pair JWT auth — recommended for production (rotateable, scoped per user).
 [adapter.snow]
 type = "snowflake"
 account = "${SNOWFLAKE_ACCOUNT}"

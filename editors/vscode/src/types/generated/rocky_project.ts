@@ -428,6 +428,10 @@ export interface AdapterConfig {
    */
   password?: RedactedString | null;
   /**
+   * Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header — distinct from `oauth_token`.
+   */
+  pat?: RedactedString | null;
+  /**
    * Optional file path for a persistent DuckDB database. When unset, the adapter uses an in-memory database. A persistent path is required when the same DuckDB adapter is also used as a discovery source — discovery and warehouse share the same database.
    */
   path?: string | null;

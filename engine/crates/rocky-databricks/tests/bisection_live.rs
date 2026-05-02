@@ -14,7 +14,7 @@
 //! Mirrors the DuckDB conformance shape at
 //! `rocky-duckdb/tests/bisection_conformance.rs` and the BigQuery live
 //! tests at `rocky-bigquery/tests/bisection_live.rs`. Schemas use the
-//! `hc_bisection_*` prefix per the workspace housekeeping convention.
+//! `rocky_bisection_*` prefix per the workspace housekeeping convention.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -120,8 +120,8 @@ async fn live_noop_diff_examines_root_chunks_only() {
         return;
     };
     let suffix = schema_suffix();
-    let base_schema = format!("hc_bisection_base_{suffix}");
-    let branch_schema = format!("hc_bisection_branch_{suffix}");
+    let base_schema = format!("rocky_bisection_base_{suffix}");
+    let branch_schema = format!("rocky_bisection_branch_{suffix}");
 
     create_schema(&adapter, &catalog, &base_schema).await;
     create_schema(&adapter, &catalog, &branch_schema).await;
@@ -182,8 +182,8 @@ async fn live_finds_planted_change() {
         return;
     };
     let suffix = schema_suffix();
-    let base_schema = format!("hc_bisection_base_{suffix}");
-    let branch_schema = format!("hc_bisection_branch_{suffix}");
+    let base_schema = format!("rocky_bisection_base_{suffix}");
+    let branch_schema = format!("rocky_bisection_branch_{suffix}");
 
     create_schema(&adapter, &catalog, &base_schema).await;
     create_schema(&adapter, &catalog, &branch_schema).await;

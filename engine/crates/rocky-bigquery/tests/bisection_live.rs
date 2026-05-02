@@ -96,8 +96,8 @@ async fn live_noop_diff_examines_root_chunks_only() {
         return;
     };
     let suffix = dataset_suffix();
-    let base_ds = format!("hc_bisection_base_{suffix}");
-    let branch_ds = format!("hc_bisection_branch_{suffix}");
+    let base_ds = format!("rocky_bisection_base_{suffix}");
+    let branch_ds = format!("rocky_bisection_branch_{suffix}");
 
     create_dataset(&adapter, &project, &base_ds).await;
     create_dataset(&adapter, &project, &branch_ds).await;
@@ -158,8 +158,8 @@ async fn live_finds_planted_change() {
         return;
     };
     let suffix = dataset_suffix();
-    let base_ds = format!("hc_bisection_base_{suffix}");
-    let branch_ds = format!("hc_bisection_branch_{suffix}");
+    let base_ds = format!("rocky_bisection_base_{suffix}");
+    let branch_ds = format!("rocky_bisection_branch_{suffix}");
 
     create_dataset(&adapter, &project, &base_ds).await;
     create_dataset(&adapter, &project, &branch_ds).await;

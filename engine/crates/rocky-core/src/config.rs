@@ -2117,6 +2117,10 @@ pub struct AdapterConfig {
     pub oauth_token: Option<RedactedString>,
     /// Path to RSA private key file (PEM) for key-pair auth.
     pub private_key_path: Option<String>,
+    /// Programmatic Access Token (issued via Snowsight User Profile).
+    /// Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN`
+    /// token-type header — distinct from `oauth_token`.
+    pub pat: Option<RedactedString>,
     /// Snowflake role to use for the session.
     pub role: Option<String>,
     /// Default database for the session.
@@ -5111,6 +5115,7 @@ table = "customers_history"
             password: Some(RedactedString::new("db_PASSWORD_123".into())),
             oauth_token: Some(RedactedString::new("oauth_TOKEN_XYZ".into())),
             private_key_path: None,
+            pat: None,
             role: None,
             database: None,
             project_id: None,

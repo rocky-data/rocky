@@ -265,6 +265,7 @@ impl AdapterRegistry {
                                 .as_ref()
                                 .map(|s| s.expose().to_string()),
                             private_key_path: adapter_cfg.private_key_path.clone(),
+                            pat: adapter_cfg.pat.as_ref().map(|s| s.expose().to_string()),
                         },
                     )
                     .context(format!("adapters.{name}: auth configuration error"))?;
@@ -534,6 +535,7 @@ impl AdapterRegistry {
                 .as_ref()
                 .map(|s| s.expose().to_string()),
             private_key_path: adapter_cfg.private_key_path.clone(),
+            pat: None,
         })
         .context(format!("adapters.{name}: auth configuration error"))?;
 

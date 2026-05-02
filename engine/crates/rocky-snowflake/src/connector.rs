@@ -163,6 +163,7 @@ impl SnowflakeConnector {
             config,
             auth,
             client: Client::builder()
+                .user_agent(concat!("rocky/", env!("CARGO_PKG_VERSION")))
                 .tcp_nodelay(true)
                 .pool_max_idle_per_host(32)
                 .pool_idle_timeout(std::time::Duration::from_secs(300))
@@ -446,17 +447,25 @@ impl SnowflakeConnector {
 }
 
 /// Snowflake SQL API status codes:
-/// - "00000" = success
+/// - "00000" = ANSI SQL success
+/// - "09xxxx" = Snowflake success-with-info (e.g., "090001" for DDL —
+///   "Statement executed successfully.")
 /// - "333334" = async, still executing
-/// - Anything else starting with a non-zero digit = error
+/// - Anything else = error
 fn is_terminal_code(code: &str) -> bool {
     // Async-in-progress is the only non-terminal state
     code != "333334" && !code.is_empty()
 }
 
+/// Snowflake's SQL API returns codes outside the ANSI `00000` for many
+/// successful statement types — DDL most notably emits `090001`, and the
+/// `09xxxx` class is reserved for Snowflake's success-with-info codes.
+fn is_success_code(code: &str) -> bool {
+    code == "00000" || code.starts_with("09")
+}
+
 fn check_terminal(response: StatementResponse) -> Result<StatementResponse, ConnectorError> {
-    // "00000" is the SQL success SQLSTATE
-    if response.code == "00000" {
+    if is_success_code(&response.code) {
         Ok(response)
     } else {
         Err(ConnectorError::StatementFailed {
