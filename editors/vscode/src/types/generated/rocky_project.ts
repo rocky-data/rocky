@@ -298,6 +298,14 @@ export type DedupPolicy = "success" | "any";
  * Policy applied when state upload fails after retries + circuit-breaker are exhausted. See [`StateConfig::on_upload_failure`].
  */
 export type StateUploadFailureMode = "skip" | "fail";
+/**
+ * Domain identifier for the state-store retention sweep.
+ *
+ * The wire format is a lowercase string in `applies_to` — the [`Display`] impl produces the canonical spelling, and the `from_str` impl accepts only that spelling (no aliases).
+ *
+ * [`Display`]: std::fmt::Display
+ */
+export type StateRetentionDomain = "history" | "lineage" | "audit";
 
 /**
  * Top-level Rocky configuration (v2 format).
@@ -1311,6 +1319,10 @@ export interface StateConfig {
    */
   on_upload_failure?: StateUploadFailureMode & string;
   /**
+   * Retention policy applied to Rocky's own `state.redb` tables (run history, DAG snapshots, quality snapshots). Bounds the size of the control-plane store; operational tables (schema cache, watermarks, partition records) are never swept by this policy. See [`crate::retention::StateRetentionConfig`].
+   */
+  retention?: StateRetentionConfig;
+  /**
    * Retry policy applied to transient state-transfer failures (network hiccups, hung endpoints that hit the per-request HTTP timeout, transient 5xx, etc.). Shares the same shape as the adapter retry config so operators can reason about both with a single mental model. Retries share the outer `transfer_timeout_seconds` budget, so the total wall-clock ceiling is unchanged.
    */
   retry?: RetryConfig;
@@ -1353,4 +1365,25 @@ export interface IdempotencyConfig {
    * Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.
    */
   retention_days?: number;
+}
+/**
+ * State-store retention policy.
+ *
+ * Bounds the size of Rocky's `state.redb` by sweeping rows older than `max_age_days` from the run-history, DAG-snapshot, and quality-snapshot tables. The most recent `min_runs_kept` rows in each domain are always preserved, so a project that has not run in months still has its last good baseline available for `rocky history` and `rocky compare`.
+ *
+ * Operational state — schema cache, watermarks, partition records — is never swept by this policy: those tables hold live correctness data (without them, the next run cannot resume), not history.
+ */
+export interface StateRetentionConfig {
+  /**
+   * Domains to sweep. Defaults to `["history", "lineage", "audit"]`. Setting `applies_to = []` disables the sweep entirely without removing the config block — useful for staged rollouts.
+   */
+  applies_to?: StateRetentionDomain[];
+  /**
+   * Drop rows whose timestamp is older than this many days. Counted from the row's recorded `started_at` (history), `timestamp` (lineage / audit) — not the file mtime. Defaults to [`DEFAULT_STATE_RETENTION_MAX_AGE_DAYS`].
+   */
+  max_age_days?: number;
+  /**
+   * Always preserve at least this many rows in each domain, even if every row is older than `max_age_days`. Applied per domain (last N runs, last N DAG snapshots, last N quality snapshots). Defaults to [`DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT`].
+   */
+  min_runs_kept?: number;
 }

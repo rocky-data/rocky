@@ -797,6 +797,30 @@ class StateBackend5(StrEnum):
     tiered = "tiered"
 
 
+class StateRetentionDomain1(StrEnum):
+    """
+    Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail.
+    """
+
+    history = "history"
+
+
+class StateRetentionDomain2(StrEnum):
+    """
+    DAG snapshots (`dag_snapshots` table). Each entry carries the graph hash and the diff against the prior snapshot.
+    """
+
+    lineage = "lineage"
+
+
+class StateRetentionDomain3(StrEnum):
+    """
+    Per-model quality snapshots (`quality_history` table). Each entry carries `timestamp`, `run_id`, and the metric blob.
+    """
+
+    audit = "audit"
+
+
 class StateUploadFailureMode1(StrEnum):
     """
     Log a warning and continue the run successfully. State becomes stale until the next healthy upload; the next run's `discover` re-derives watermarks from target-table metadata. Trades state durability for run liveness — matches the de-facto behaviour of the pre-retry callers in `rocky run`, which already `warn + continue` on a failed upload.
@@ -1633,83 +1657,32 @@ class QuarantineConfig(BaseModel):
     """
 
 
-class StateConfig(BaseModel):
+class StateRetentionConfig(BaseModel):
     """
-    State persistence configuration.
+    State-store retention policy.
 
-    Controls where Rocky stores watermarks and anomaly history between runs. On ephemeral environments (EKS pods), use S3, GCS, or Valkey for persistence.
+    Bounds the size of Rocky's `state.redb` by sweeping rows older than `max_age_days` from the run-history, DAG-snapshot, and quality-snapshot tables. The most recent `min_runs_kept` rows in each domain are always preserved, so a project that has not run in months still has its last good baseline available for `rocky history` and `rocky compare`.
 
-    When both S3 and Valkey are configured (`backend = "tiered"`): - Download: Valkey first (fast), S3 fallback (durable) - Upload: write to both Valkey + S3
+    Operational state — schema cache, watermarks, partition records — is never swept by this policy: those tables hold live correctness data (without them, the next run cannot resume), not history.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
-    backend: (
-        StateBackend1
-        | StateBackend2
-        | StateBackend3
-        | StateBackend4
-        | StateBackend5
+    applies_to: (
+        list[StateRetentionDomain1 | StateRetentionDomain2 | StateRetentionDomain3]
         | None
-    ) = "local"
+    ) = ["history", "lineage", "audit"]
     """
-    Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
+    Domains to sweep. Defaults to `["history", "lineage", "audit"]`. Setting `applies_to = []` disables the sweep entirely without removing the config block — useful for staged rollouts.
     """
-    gcs_bucket: str | None = None
+    max_age_days: conint(ge=0) | None = 365
     """
-    GCS bucket for state persistence
+    Drop rows whose timestamp is older than this many days. Counted from the row's recorded `started_at` (history), `timestamp` (lineage / audit) — not the file mtime. Defaults to [`DEFAULT_STATE_RETENTION_MAX_AGE_DAYS`].
     """
-    gcs_prefix: str | None = None
+    min_runs_kept: conint(ge=0) | None = 100
     """
-    GCS key prefix (default: "rocky/state/")
-    """
-    idempotency: IdempotencyConfig | None = Field(
-        {"dedup_on": "success", "in_flight_ttl_hours": 24, "retention_days": 30},
-        validate_default=True,
-    )
-    """
-    Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
-    """
-    on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
-    """
-    What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
-    """
-    retry: RetryConfig | None = Field(
-        {
-            "backoff_multiplier": 2.0,
-            "circuit_breaker_recovery_timeout_secs": None,
-            "circuit_breaker_threshold": 5,
-            "initial_backoff_ms": 1000,
-            "jitter": True,
-            "max_backoff_ms": 30000,
-            "max_retries": 3,
-            "max_retries_per_run": None,
-        },
-        validate_default=True,
-    )
-    """
-    Retry policy applied to transient state-transfer failures (network hiccups, hung endpoints that hit the per-request HTTP timeout, transient 5xx, etc.). Shares the same shape as the adapter retry config so operators can reason about both with a single mental model. Retries share the outer `transfer_timeout_seconds` budget, so the total wall-clock ceiling is unchanged.
-    """
-    s3_bucket: str | None = None
-    """
-    S3 bucket for state persistence
-    """
-    s3_prefix: str | None = None
-    """
-    S3 key prefix (default: "rocky/state/")
-    """
-    transfer_timeout_seconds: conint(ge=0) | None = 300
-    """
-    Wall-clock budget (seconds) for each state transfer operation (download or upload). Catches stuck SDK retry loops, DNS, TLS, and hung endpoints that the per-request HTTP timeout does not see. Defaults to 300s; raise for large state or slow networks.
-    """
-    valkey_prefix: str | None = None
-    """
-    Valkey key prefix (default: "rocky:state:")
-    """
-    valkey_url: str | None = None
-    """
-    Valkey/Redis URL for state persistence
+    Always preserve at least this many rows in each domain, even if every row is older than `max_age_days`. Applied per domain (last N runs, last N DAG snapshots, last N quality snapshots). Defaults to [`DEFAULT_STATE_RETENTION_MIN_RUNS_KEPT`].
     """
 
 
@@ -2032,6 +2005,97 @@ class SnapshotTargetConfig(BaseModel):
     )
     schema_: str = Field(..., alias="schema")
     table: str
+
+
+class StateConfig(BaseModel):
+    """
+    State persistence configuration.
+
+    Controls where Rocky stores watermarks and anomaly history between runs. On ephemeral environments (EKS pods), use S3, GCS, or Valkey for persistence.
+
+    When both S3 and Valkey are configured (`backend = "tiered"`): - Download: Valkey first (fast), S3 fallback (durable) - Upload: write to both Valkey + S3
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    backend: (
+        StateBackend1
+        | StateBackend2
+        | StateBackend3
+        | StateBackend4
+        | StateBackend5
+        | None
+    ) = "local"
+    """
+    Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
+    """
+    gcs_bucket: str | None = None
+    """
+    GCS bucket for state persistence
+    """
+    gcs_prefix: str | None = None
+    """
+    GCS key prefix (default: "rocky/state/")
+    """
+    idempotency: IdempotencyConfig | None = Field(
+        {"dedup_on": "success", "in_flight_ttl_hours": 24, "retention_days": 30},
+        validate_default=True,
+    )
+    """
+    Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
+    """
+    on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
+    """
+    What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
+    """
+    retention: StateRetentionConfig | None = Field(
+        {
+            "applies_to": ["history", "lineage", "audit"],
+            "max_age_days": 365,
+            "min_runs_kept": 100,
+        },
+        validate_default=True,
+    )
+    """
+    Retention policy applied to Rocky's own `state.redb` tables (run history, DAG snapshots, quality snapshots). Bounds the size of the control-plane store; operational tables (schema cache, watermarks, partition records) are never swept by this policy. See [`crate::retention::StateRetentionConfig`].
+    """
+    retry: RetryConfig | None = Field(
+        {
+            "backoff_multiplier": 2.0,
+            "circuit_breaker_recovery_timeout_secs": None,
+            "circuit_breaker_threshold": 5,
+            "initial_backoff_ms": 1000,
+            "jitter": True,
+            "max_backoff_ms": 30000,
+            "max_retries": 3,
+            "max_retries_per_run": None,
+        },
+        validate_default=True,
+    )
+    """
+    Retry policy applied to transient state-transfer failures (network hiccups, hung endpoints that hit the per-request HTTP timeout, transient 5xx, etc.). Shares the same shape as the adapter retry config so operators can reason about both with a single mental model. Retries share the outer `transfer_timeout_seconds` budget, so the total wall-clock ceiling is unchanged.
+    """
+    s3_bucket: str | None = None
+    """
+    S3 bucket for state persistence
+    """
+    s3_prefix: str | None = None
+    """
+    S3 key prefix (default: "rocky/state/")
+    """
+    transfer_timeout_seconds: conint(ge=0) | None = 300
+    """
+    Wall-clock budget (seconds) for each state transfer operation (download or upload). Catches stuck SDK retry loops, DNS, TLS, and hung endpoints that the per-request HTTP timeout does not see. Defaults to 300s; raise for large state or slow networks.
+    """
+    valkey_prefix: str | None = None
+    """
+    Valkey key prefix (default: "rocky:state:")
+    """
+    valkey_url: str | None = None
+    """
+    Valkey/Redis URL for state persistence
+    """
 
 
 class TransformationTargetConfig(BaseModel):
@@ -2444,6 +2508,11 @@ class RockyConfig(BaseModel):
                 "retention_days": 30,
             },
             "on_upload_failure": "skip",
+            "retention": {
+                "applies_to": ["history", "lineage", "audit"],
+                "max_age_days": 365,
+                "min_runs_kept": 100,
+            },
             "retry": {
                 "backoff_multiplier": 2.0,
                 "circuit_breaker_recovery_timeout_secs": None,
