@@ -981,8 +981,10 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
 /// Each warehouse adapter provides a `TypeMapper` implementation. The compiler
 /// uses it to convert warehouse column types to `RockyType` for type checking.
 ///
-/// The `RockyType` enum is defined in `rocky-compiler/src/types.rs`. This trait
-/// uses string-based type names to avoid rocky-core depending on rocky-compiler.
+/// The `RockyType` enum is defined in `rocky-core::types` (relocated from
+/// `rocky-compiler::types` in Typed-IR Option B Phase 1). This trait uses
+/// string-based type names so that adapter crates don't have to depend on the
+/// typed representation directly.
 pub trait TypeMapper: Send + Sync {
     /// Parse a warehouse-specific type string into a structured representation.
     /// Returns the type name normalized to uppercase, with parsed precision/scale
