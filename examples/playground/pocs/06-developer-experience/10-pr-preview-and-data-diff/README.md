@@ -18,13 +18,21 @@ DuckDB transformation pipeline:
    copied from the base schema via CTAS into a per-PR branch
    schema; the prune set re-executes against the branch.
 2. **`rocky preview diff`** — structural (column added/removed/type
-   changed) plus sampled row-level diff between branch and base for
-   every model in the prune set, with a `sampling_window` that
-   surfaces the false-negative ceiling verbatim.
+   changed) plus row-level diff between branch and base for every
+   model in the prune set. Each per-model entry carries an
+   `algorithm` tagged enum picking which row-level technique ran:
+   `kind: "sampled"` (default — `LIMIT N` rows ordered by primary
+   key, with `sampling_window.coverage_warning`) or `kind:
+   "bisection"` (`--algorithm bisection` — exhaustive
+   checksum-bisection over a single-column integer / numeric
+   `unique_key`). The POC runs both invocations to demonstrate the
+   discriminator shape.
 3. **`rocky preview cost`** — per-model bytes / duration / USD delta
    versus the latest base-schema run. Copied models contribute to
    `savings_from_copy_usd`; only re-run models contribute to
-   `delta_usd`.
+   `delta_usd`. When `[budget]` is configured, surfaces
+   `projected_budget_breaches` so a reviewer (and the CI gate) sees
+   *"this PR would breach `max_usd` if merged"* before merge.
 
 The 5-model DAG (`raw_orders` + `raw_customers` → `stg_orders` +
 `dim_customers` → `fct_revenue`) gives the prune-set computation
@@ -142,7 +150,8 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
    materializes the per-PR branch schema and copies unchanged upstream
    from the base via DuckDB CTAS.
 8. `rocky preview diff --name pr-preview-poc-10` — structural + sampled
-   row diff between branch and base.
+   row diff between branch and base. Re-invoked with `--algorithm
+   bisection` to demonstrate the tagged-enum output shape.
 9. `rocky preview cost --name pr-preview-poc-10` — per-model bytes /
    duration / USD delta vs. the latest base run.
 10. Reverts the synthetic change (`trap`-protected, idempotent).

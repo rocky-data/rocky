@@ -88,11 +88,25 @@ echo "==> 6. rocky preview create --base $BASE_REF"
     --models models \
     > expected/preview_create.json
 
-echo "==> 7. rocky preview diff --name $PREVIEW_BRANCH"
+echo "==> 7a. rocky preview diff --name $PREVIEW_BRANCH (sampled — default)"
 "$ROCKY_BIN" -c rocky.toml -o json preview diff \
     --name "$PREVIEW_BRANCH" \
     --base "$BASE_REF" \
     > expected/preview_diff.json
+
+echo "==> 7b. rocky preview diff --algorithm bisection --name $PREVIEW_BRANCH"
+# The bisection algorithm runs only on models declaring a single-column
+# integer / numeric `unique_key` on a `Merge` strategy. The POC's
+# fct_revenue is `full_refresh`, so bisection no-ops here and the
+# tracing log records the skip reasons; the JSON output still emits the
+# tagged `algorithm` discriminator (every per-model entry will carry
+# `kind: "sampled"` here). Re-run with a Merge-strategy model to see
+# `kind: "bisection"` lit up.
+"$ROCKY_BIN" -c rocky.toml -o json preview diff \
+    --name "$PREVIEW_BRANCH" \
+    --base "$BASE_REF" \
+    --algorithm bisection \
+    > expected/preview_diff_bisection.json
 
 echo "==> 8. rocky preview cost --name $PREVIEW_BRANCH"
 "$ROCKY_BIN" -c rocky.toml -o json preview cost \
@@ -101,7 +115,7 @@ echo "==> 8. rocky preview cost --name $PREVIEW_BRANCH"
 
 # Quick non-empty sanity check; we don't pin the JSON shape here because
 # the example shapes already live in `expected/preview_*.example.json`.
-for f in expected/preview_create.json expected/preview_diff.json expected/preview_cost.json; do
+for f in expected/preview_create.json expected/preview_diff.json expected/preview_diff_bisection.json expected/preview_cost.json; do
     if [[ ! -s "$f" ]]; then
         echo "FAIL: $f is empty" >&2
         exit 1

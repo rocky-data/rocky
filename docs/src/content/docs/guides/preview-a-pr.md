@@ -71,9 +71,44 @@ rocky preview diff --name preview-fix-price --output markdown
 This combines two layers into one report:
 
 - **Structural diff** — column-level added/removed/type-changed, the same shape `rocky ci-diff` produces.
-- **Sampled row-level diff** — for each prune-set model, sample N rows (default 1000, override with `--sample-size`) ordered by the model's primary key, hash each row, and report added / removed / changed counts plus a small set of representative changed-row samples.
+- **Row-level diff** — per-model row delta surfaced through one of two algorithms (a discriminator on the JSON output picks which):
+  - `kind: "sampled"` (default) — `LIMIT N` rows ordered by primary key (default `--sample-size 1000`); fast, but miss rows outside the window. Carries a `coverage_warning` when the sample doesn't cover the full table.
+  - `kind: "bisection"` — exhaustive checksum-bisection over a single-column integer / numeric `unique_key`. Walks the chunk lattice, recurses into mismatched chunks, surfaces every row-level diff. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. Runs only on Merge-strategy models with a single integer PK; other models stay on sampled (logged via `tracing::warn` with the skip reason).
 
 `--output markdown` writes a PR-comment-ready snippet to stdout. Use `--output json` for the full `PreviewDiffOutput` shape (the JSON output also includes the rendered Markdown in a top-level `markdown` field, so you can pipe it through `jq -r .markdown` for the same effect).
+
+### Choosing the algorithm
+
+```bash
+# Default — sampled (fast, may miss out-of-window changes)
+rocky preview diff --name preview-fix-price
+
+# Exhaustive — checksum-bisection (covers the whole table)
+rocky preview diff --name preview-fix-price --algorithm bisection
+```
+
+Per-model output uses a tagged `algorithm` discriminator:
+
+```jsonc
+"models": [
+  {
+    "model_name": "fct_revenue",
+    "structural": { /* ... */ },
+    "algorithm": {
+      "kind": "bisection",
+      "diff": { "rows_added": 0, "rows_removed": 0, "rows_changed": 1, "samples": [...] },
+      "bisection_stats": {
+        "chunks_examined": 64, "leaves_materialized": 1,
+        "depth_max": 2, "depth_capped": false,
+        "split_strategy": "int_range",
+        "null_pk_rows_base": 0, "null_pk_rows_branch": 0
+      }
+    }
+  }
+]
+```
+
+Direct JSON consumers should read `model.algorithm.kind` first, then unpack the matching variant. The Dagster typed-resource layer absorbs this automatically.
 
 ## Step 3: Compare cost vs. base
 
@@ -86,8 +121,24 @@ This is a diff layer over [`rocky cost latest`](/reference/commands/administrati
 The summary fields tell you:
 
 - `delta_usd` — total branch cost minus base cost. Positive means the PR will cost more to run on `main` after merge.
+- `total_branch_duration_ms` and `total_branch_bytes_scanned` — run-level totals used for budget projection (see below).
 - `savings_from_copy_usd` — what the preview itself saved by copying instead of re-running. This is the empirical evidence that the prune-and-copy substrate is doing work.
 - `models_skipped_via_copy` — count of models that didn't run on the branch because they were copy-set.
+
+### Pre-merge budget projection
+
+When the project declares a `[budget]` block in `rocky.toml`, `preview cost` projects breaches against the branch totals before merge so a reviewer (and the CI gate) sees `this PR would breach max_usd / max_duration_ms / max_bytes_scanned if merged` *before* the merge happens. Output field:
+
+```jsonc
+"projected_budget_breaches": [
+  { "limit_type": "max_usd",          "limit": 2.5,   "actual": 5.0 },
+  { "limit_type": "max_duration_ms",  "limit": 60000, "actual": 90000 }
+]
+```
+
+Empty when no budget is configured or the projected totals stay within every limit. Mirrors the `RunOutput.budget_breaches` shape so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.
+
+The Markdown rendering surfaces a "Budget projection" section only when breaches exist; framing flips between advisory ("would breach") and "would fail the run" based on `[budget].on_breach`.
 
 ## What the prune set means
 
@@ -102,24 +153,28 @@ If the prune set is empty, your PR doesn't change any model output (e.g. a white
 
 ## What `coverage_warning: true` means
 
-`preview diff` samples rows in a fixed window (`ORDER BY <pk> LIMIT N`), so it can miss changes that fall outside that window. When the row count outside the window is non-trivial, the per-model diff sets:
+The default `--algorithm sampled` reads a fixed window (`ORDER BY <pk> LIMIT N`), so it can miss changes outside that window. When the row count outside the window is non-trivial, the per-model diff sets:
 
-```json
-"sampling_window": {
-  "ordered_by": "<column>",
-  "limit": <N>,
-  "coverage": "first_n_by_order",
-  "coverage_warning": true
+```jsonc
+"algorithm": {
+  "kind": "sampled",
+  "sampled": { /* ... */ },
+  "sampling_window": {
+    "ordered_by": "<column>",
+    "limit": <N>,
+    "coverage": "first_n_by_order",
+    "coverage_warning": true
+  }
 }
 ```
 
-The aggregate `summary.any_coverage_warning` lifts the flag to the run level so it's visible in the Markdown PR comment.
+The aggregate `summary.any_coverage_warning` widens to fire on either condition: a sampled diff with `coverage_warning: true` *or* a bisection diff with `bisection_stats.depth_capped: true` (the recursion bottomed out at the depth cap on a pathologically skewed PK distribution before reaching leaf size). Either signals the per-model findings might be incomplete.
 
-When you see this flag, your options are:
+When you see the warning on a sampled diff, your options are:
 
+- **Re-run with `--algorithm bisection`** — covers the whole table exhaustively. Works for any model with a single-column integer / numeric `unique_key`.
 - Re-run with a larger `--sample-size` if a bounded sample of N more rows is enough confidence for this PR.
 - Inspect the changed columns directly via `rocky compile --model <name>` and reason about the change manually.
-- Wait for the planned checksum-bisection exhaustive diff — it covers the whole table at bounded scan cost.
 
 A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op for that model.
 
