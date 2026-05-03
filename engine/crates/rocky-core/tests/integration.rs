@@ -21,6 +21,23 @@ use tempfile::TempDir;
 // Helpers
 // ===========================================================================
 
+/// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
+fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
+    ModelIr::from(&Plan::Replication(plan.clone()))
+}
+
+/// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
+#[allow(dead_code)]
+fn xform_ir(plan: &TransformationPlan) -> ModelIr {
+    ModelIr::from(&Plan::Transformation(plan.clone()))
+}
+
+/// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
+#[allow(dead_code)]
+fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
+    ModelIr::from(&Plan::Snapshot(plan.clone()))
+}
+
 fn dialect() -> DuckDbSqlDialect {
     DuckDbSqlDialect
 }
@@ -99,7 +116,7 @@ async fn test_full_pipeline_lifecycle() {
 
     // Generate and execute full refresh SQL
     let plan = duckdb_replication_plan("orders", "orders", MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     // Verify data was copied
@@ -150,7 +167,7 @@ async fn test_incremental_pipeline_two_runs() {
 
     // Run 1: full refresh (no watermark)
     let plan1 = duckdb_replication_plan("events", "events", MaterializationStrategy::FullRefresh);
-    let sql1 = sql_gen::generate_create_table_as_sql(&plan1, &d).unwrap();
+    let sql1 = sql_gen::generate_create_table_as_sql(&rep_ir(&plan1), &d).unwrap();
     p.execute(&sql1).await.unwrap();
     assert_eq!(p.row_count("target.events").await.unwrap(), 2);
 
@@ -183,7 +200,7 @@ async fn test_incremental_pipeline_two_runs() {
             timestamp_column: "_fivetran_synced".into(),
         },
     );
-    let sql2 = sql_gen::generate_insert_sql(&plan2, &d).unwrap();
+    let sql2 = sql_gen::generate_insert_sql(&rep_ir(&plan2), &d).unwrap();
     p.execute(&sql2).await.unwrap();
 
     // Should now have 4 rows (2 original + 2 new)
@@ -299,7 +316,7 @@ async fn test_pipeline_with_metadata_columns() {
         .unwrap();
 
     let plan = duckdb_replication_plan("items", "items", MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     // Verify _loaded_by column exists and is NULL
@@ -761,7 +778,7 @@ async fn test_full_refresh_on_seeded_data() {
         "raw_orders",
         MaterializationStrategy::FullRefresh,
     );
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     let source_count = p.row_count("source.raw_orders").await.unwrap();

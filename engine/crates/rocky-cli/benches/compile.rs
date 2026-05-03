@@ -272,27 +272,41 @@ fn bench_sql_generation(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_with_input(BenchmarkId::new("ctas", size), &plans, |b, plans| {
-            b.iter(|| {
-                for plan in plans {
-                    sql_gen::generate_create_table_as_sql(plan, &dialect).unwrap();
-                }
-            });
-        });
-
-        // Only bench incremental plans
-        let inc_plans: Vec<&ReplicationPlan> = plans
+        let model_irs: Vec<ModelIr> = plans
             .iter()
-            .filter(|p| matches!(p.strategy, MaterializationStrategy::Incremental { .. }))
+            .map(|plan| ModelIr::from(&Plan::Replication(plan.clone())))
             .collect();
 
         group.bench_with_input(
-            BenchmarkId::new("incremental", inc_plans.len()),
-            &inc_plans,
-            |b, plans| {
+            BenchmarkId::new("ctas", size),
+            &model_irs,
+            |b, model_irs| {
                 b.iter(|| {
-                    for plan in plans.iter() {
-                        sql_gen::generate_insert_sql(plan, &dialect).unwrap();
+                    for model_ir in model_irs {
+                        sql_gen::generate_create_table_as_sql(model_ir, &dialect).unwrap();
+                    }
+                });
+            },
+        );
+
+        // Only bench incremental plans
+        let inc_irs: Vec<&ModelIr> = model_irs
+            .iter()
+            .filter(|ir| {
+                matches!(
+                    ir.materialization,
+                    MaterializationStrategy::Incremental { .. }
+                )
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("incremental", inc_irs.len()),
+            &inc_irs,
+            |b, irs| {
+                b.iter(|| {
+                    for ir in irs.iter() {
+                        sql_gen::generate_insert_sql(ir, &dialect).unwrap();
                     }
                 });
             },
