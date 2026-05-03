@@ -1,0 +1,53 @@
+name: rocky-ai-review
+
+# Self-test for the `.github/actions/rocky-ai-review` composite action.
+#
+# Label-gated rather than always-on: AI calls cost money and not every PR
+# benefits from a review (typo fixes, doc-only edits). Opt in by adding the
+# `ai-review` label to a PR; the workflow re-runs every time the label is
+# (re-)applied so iterating on the prompt + diff is just a label-toggle.
+#
+# Also serves as the canonical reference for users wiring the action into
+# their own repos. Copy the snippet under `Setting up the GitHub Action`
+# in `docs/src/content/docs/guides/ai-review.md` (todo) and adjust the
+# `working_directory` / `models_dir` to match your project layout.
+
+on:
+  pull_request:
+    types: [labeled, opened, reopened, synchronize]
+    paths:
+      # Narrow to the playground POC the action targets — broader paths
+      # would still trigger the workflow but find nothing to review at the
+      # configured `working_directory`. Widen in lockstep with the action's
+      # working_directory if the self-test ever points at another POC.
+      - 'examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff/models/**'
+      - '.github/actions/rocky-ai-review/**'
+      - '.github/workflows/ai-review.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    name: Rocky AI review
+    runs-on: ubuntu-latest
+    # Run only when the `ai-review` label is present on the PR. Skips
+    # `synchronize` events on un-labeled PRs (the common case) so iterating
+    # commits doesn't burn API tokens — the user re-applies the label when
+    # they want a fresh review.
+    if: contains(github.event.pull_request.labels.*.name, 'ai-review')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Required for `git diff <base_ref>...HEAD` inside the action.
+          fetch-depth: 0
+
+      - name: Run rocky AI review
+        uses: ./.github/actions/rocky-ai-review
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
+          models_dir: models
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
