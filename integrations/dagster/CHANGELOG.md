@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-05-03
+
+Companion release to engine `v1.24.0`. The `dagster_rocky.types_generated` layer is unchanged this cycle — engine [#365](https://github.com/rocky-data/rocky/pull/365) (OTel spans), [#366](https://github.com/rocky-data/rocky/pull/366) (catalog Parquet emit), [#367](https://github.com/rocky-data/rocky/pull/367) (typed-IR internals), and [#368](https://github.com/rocky-data/rocky/pull/368) (catalog state-store enrichment + scope) are all source-invisible to the dagster integration. **Observable downstream:** `RockyResource.catalog()` results now have fully-populated `last_run_id` and `last_materialized_at` fields where they were previously stubbed `None` — Dagster code that branches on `if asset.last_run_id is None` will see populated values for assets that have ever materialized successfully. The catalog artifact at `./.rocky/catalog/` now also includes `edges.parquet` + `assets.parquet` alongside `catalog.json`; the typed-resource layer continues to parse the JSON and the Parquet files are file-only artifacts for downstream BI / DuckDB consumption. Wheel re-cut against the v1.24.0 engine binary.
+
 ## [1.21.0] — 2026-05-02
 
 Companion release to engine `v1.23.0`. Headline: **`RockyResource.catalog()`** — new typed-resource method that drives `rocky catalog` and returns a parsed `CatalogOutput`, so Dagster code can consume the engine's project-wide column-level lineage snapshot without parsing JSON by hand. The `dagster_rocky.types_generated` layer regenerates against the new `CatalogOutput` family, the additive `sweep_interval_seconds` / `sweep_budget_ms` fields on `StateRetentionConfig` (engine [#355](https://github.com/rocky-data/rocky/pull/355)), and the additive `PreviewCostOutput.projected_per_model_budget_breaches` field plus the new `PerModelBudgetBreachOutput` model from per-model `[budget]` blocks (engine [#361](https://github.com/rocky-data/rocky/pull/361)). No source-level migration required for existing callers — additive throughout.
