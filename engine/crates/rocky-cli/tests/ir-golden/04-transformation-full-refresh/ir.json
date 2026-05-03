@@ -1,0 +1,42 @@
+{
+  "name": "fct_orders",
+  "sql": "SELECT id, customer_id, total FROM tgtwarehouse.raw__demo.orders",
+  "typed_columns": [
+    {
+      "name": "id",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "customer_id",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "total",
+      "data_type": "Float64",
+      "nullable": true
+    }
+  ],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "FullRefresh"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "fct_orders"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "orders"
+    }
+  ]
+}

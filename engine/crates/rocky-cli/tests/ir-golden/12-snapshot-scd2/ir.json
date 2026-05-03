@@ -1,0 +1,29 @@
+{
+  "name": "dim_customers_history",
+  "sql": "",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "FullRefresh"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "snapshots__demo",
+    "table": "dim_customers_history"
+  },
+  "source": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "dim_customers"
+  },
+  "unique_key": [
+    "customer_id"
+  ],
+  "updated_at": "updated_at",
+  "invalidate_hard_deletes": true
+}

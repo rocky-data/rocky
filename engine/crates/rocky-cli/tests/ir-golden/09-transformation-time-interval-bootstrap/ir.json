@@ -1,0 +1,29 @@
+{
+  "name": "events_daily",
+  "sql": "SELECT event_date, COUNT(*) AS event_count FROM tgtwarehouse.raw__demo.events WHERE event_date >= '@start_date' AND event_date < '@end_date' GROUP BY 1",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "TimeInterval",
+    "time_column": "event_date",
+    "granularity": "day",
+    "window": null
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "events_daily"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "events"
+    }
+  ]
+}

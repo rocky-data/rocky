@@ -1,0 +1,27 @@
+{
+  "name": "dt_orders_recent",
+  "sql": "SELECT id, customer_id, total FROM tgtwarehouse.marts__demo.fct_orders WHERE created_at > CURRENT_DATE - INTERVAL '7' DAY",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "DynamicTable",
+    "target_lag": "1 hour"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "dt_orders_recent"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "marts__demo",
+      "table": "fct_orders"
+    }
+  ]
+}
