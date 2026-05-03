@@ -24,6 +24,8 @@ rocky-fivetran = { path = "../rocky-fivetran" }
 rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-iceberg = { path = "../rocky-iceberg" }
 rocky-cache = { path = "../rocky-cache" }
+clap = { workspace = true }
+clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
