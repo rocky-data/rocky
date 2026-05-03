@@ -128,6 +128,21 @@ Tag PII columns in the model sidecar; bind tags to mask strategies in `[mask]` /
 
 Each subproject has its own README with detailed usage. The [`engine/README.md`](engine/README.md) is the canonical product reference for the Rocky CLI.
 
+## Adapters
+
+| Role | Adapter | Status | Notes |
+|------|---------|--------|-------|
+| Warehouse | Databricks | Production | SQL Statement API · Unity Catalog · `SHALLOW CLONE` for branches |
+| Warehouse | Snowflake | Beta | REST connector · zero-copy `CLONE` for branches · masking policies |
+| Warehouse | BigQuery | Beta | REST connector · `CREATE TABLE … COPY` for branches |
+| Warehouse | DuckDB | Local / Testing | Embedded · powers `rocky playground` (no credentials needed) |
+| Source | Fivetran | Production | REST connector + table discovery |
+| Source | Airbyte | Beta | Catalog discovery |
+| Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |
+| Source | Manual | Production | Schema/table lists inline in `rocky.toml` |
+
+Building a warehouse Rocky doesn't ship in-tree (ClickHouse, Trino, Redshift, …)? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [Rust-native skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
+
 ## Building from source
 
 ```bash
@@ -153,8 +168,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#releases) for the full release flow.
 ## Documentation
 
 Full documentation: **[rocky-data.dev](https://rocky-data.dev)** — concepts, guides, CLI reference, Dagster integration, adapter SDK.
-
-Building a warehouse adapter Rocky doesn't ship in-tree (ClickHouse, Trino, Redshift, ...)? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [Rust-native skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
 
 ## Contributing
 
