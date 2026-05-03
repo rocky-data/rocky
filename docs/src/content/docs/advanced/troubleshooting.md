@@ -5,6 +5,8 @@ sidebar:
   order: 3
 ---
 
+This page is a **symptom-first** reference: paste an error message into your search and find the fix. For the inverse view — categories of failure with a recovery playbook per category — see [Failure modes](./failure-modes).
+
 ## Compilation Errors
 
 ### "Model 'X' not found"
