@@ -1,10 +1,9 @@
 //! `rocky cost <run_id|latest>` — historical per-run cost attribution.
 //!
-//! Trust-system Arc 2 wave 2. The first wave (engine v1.11.0) shipped
-//! per-run cost on [`crate::output::RunOutput::cost_summary`] and the
-//! declarative `[budget]` block; this command adds the *historical*
-//! surface on top of the embedded state store's
-//! [`rocky_core::state::RunRecord`].
+//! The earlier per-run cost surface (engine v1.11.0) shipped
+//! [`crate::output::RunOutput::cost_summary`] and the declarative
+//! `[budget]` block; this command adds the *historical* surface on top
+//! of the embedded state store's [`rocky_core::state::RunRecord`].
 //!
 //! The command re-derives per-model cost via
 //! [`rocky_core::cost::compute_observed_cost_usd`] — the same formula
@@ -19,8 +18,8 @@
 //! emits `adapter_type: None` / `cost_usd: None`; durations and byte
 //! counts are still useful on their own.
 //!
-//! Re-execution with pinned inputs is an Arc-1 follow-up; this command
-//! is inspection-only.
+//! Re-execution with pinned inputs is a follow-up; this command is
+//! inspection-only.
 //!
 //! # Out of scope (this PR)
 //!

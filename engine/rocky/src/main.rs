@@ -898,9 +898,9 @@ enum Command {
     ///
     /// Shows every model that ran with SQL hash, row counts, bytes, and
     /// timings captured at the time. Useful for "what exactly ran at
-    /// 03:15 UTC?" and as the reproducibility artefact for the
-    /// Trust-system Arc 1 claim. Re-execution with pinned inputs is a
-    /// follow-up once the content-addressed write path arrives.
+    /// 03:15 UTC?" and as the reproducibility artefact for branch +
+    /// replay. Re-execution with pinned inputs is a follow-up once the
+    /// content-addressed write path arrives.
     Replay {
         /// Run id or the literal `latest`
         target: String,
@@ -924,12 +924,12 @@ enum Command {
 
     /// Roll up per-model cost attribution for a recorded run.
     ///
-    /// Trust-system Arc 2 wave 2. Reads a `RunRecord` from the state
-    /// store and re-derives per-model cost via
-    /// `compute_observed_cost_usd` — the same formula `rocky run` uses
-    /// for the live summary. Adapter type is resolved from `rocky.toml`;
-    /// when the config can't be loaded the command still emits
-    /// durations and byte counts, with `cost_usd` set to `null`.
+    /// Reads a `RunRecord` from the state store and re-derives per-model
+    /// cost via `compute_observed_cost_usd` — the same formula
+    /// `rocky run` uses for the live summary. Adapter type is resolved
+    /// from `rocky.toml`; when the config can't be loaded the command
+    /// still emits durations and byte counts, with `cost_usd` set to
+    /// `null`.
     Cost {
         /// Run id or the literal `latest`
         target: String,

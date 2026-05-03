@@ -2585,7 +2585,7 @@ impl RunOutput {
 
         for mat in &mut self.materializations {
             // BigQuery: `mat.bytes_scanned` is populated by the adapter
-            // from `statistics.query.totalBytesBilled` (Arc 2 wave 3).
+            // from `statistics.query.totalBytesBilled`.
             // Databricks / Snowflake / DuckDB still inherit the default
             // [`rocky_core::traits::WarehouseAdapter::execute_statement_with_stats`]
             // stub which returns `None`, so those adapters continue to
@@ -3089,10 +3089,10 @@ mod cost_finalize_tests {
 
     #[test]
     fn populate_cost_summary_bigquery_uses_bytes_scanned() {
-        // Arc 2 wave 3: when the BigQuery adapter populates
-        // `bytes_scanned` from `statistics.query.totalBytesBilled`,
-        // `populate_cost_summary` must produce a real dollar figure
-        // rather than the `None` it returned before the plumbing landed.
+        // When the BigQuery adapter populates `bytes_scanned` from
+        // `statistics.query.totalBytesBilled`, `populate_cost_summary`
+        // must produce a real dollar figure rather than the `None` it
+        // returned before the plumbing landed.
         // 1 TB billed at $6.25/TB → $6.25.
         let mut out = RunOutput::new(String::new(), 1_000, 1);
         let mut m = mat(&["orders"], 1_000);
@@ -3650,13 +3650,13 @@ pub struct TraceModelEntry {
 
 /// JSON output for `rocky cost <run_id|latest>`.
 ///
-/// Trust-system Arc 2 wave 2: historical per-run cost attribution read
-/// from the embedded state store's [`rocky_core::state::RunRecord`].
-/// Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`]
-/// — the same formula [`RunOutput::populate_cost_summary`] applies at
-/// the end of a live run. The per-model and per-run totals make the
-/// "what did my last run cost?" question answerable from the recorded
-/// run alone, without re-materialising tables.
+/// Historical per-run cost attribution read from the embedded state
+/// store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost
+/// via [`rocky_core::cost::compute_observed_cost_usd`] — the same
+/// formula [`RunOutput::populate_cost_summary`] applies at the end of
+/// a live run. The per-model and per-run totals make the "what did my
+/// last run cost?" question answerable from the recorded run alone,
+/// without re-materialising tables.
 ///
 /// # Adapter type resolution
 ///
