@@ -4,7 +4,7 @@ Rocky is a monorepo. The four subprojects share one repository, one issue tracke
 
 | Subproject | Path | Language | Build |
 |---|---|---|---|
-| Rocky CLI engine | `engine/` | Rust (20-crate Cargo workspace) | `cargo` |
+| Rocky CLI engine | `engine/` | Rust (21-crate Cargo workspace) | `cargo` |
 | Dagster integration | `integrations/dagster/` | Python | `uv` |
 | VS Code extension | `editors/vscode/` | TypeScript | `npm` |
 | Sample project | `examples/playground/` | TOML / SQL config | none |
@@ -39,7 +39,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The engine is a Cargo workspace with 20 crates (Rust edition 2024, MSRV 1.85). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
+The engine is a Cargo workspace with 21 members — 19 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.85). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
 
 ### Dagster integration (`integrations/dagster/`)
 
