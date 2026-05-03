@@ -1,0 +1,32 @@
+{
+  "name": "fct_events_delta",
+  "sql": "SELECT id, event_type, event_date, payload FROM tgtwarehouse.raw__demo.events",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "FullRefresh"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "fct_events_delta"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "events"
+    }
+  ],
+  "format": "delta_table",
+  "format_options": {
+    "partition_by": [
+      "event_date"
+    ]
+  }
+}

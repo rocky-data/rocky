@@ -1,0 +1,36 @@
+{
+  "name": "fct_order_lines",
+  "sql": "SELECT o.id AS order_id, c.name AS customer_name, p.sku, o.total FROM tgtwarehouse.raw__demo.orders o JOIN tgtwarehouse.raw__demo.customers c ON o.customer_id = c.id JOIN tgtwarehouse.raw__demo.products p ON o.product_id = p.id",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "FullRefresh"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "fct_order_lines"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "orders"
+    },
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "customers"
+    },
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "products"
+    }
+  ]
+}

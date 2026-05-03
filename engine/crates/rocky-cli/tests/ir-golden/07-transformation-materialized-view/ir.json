@@ -1,0 +1,26 @@
+{
+  "name": "mv_orders_daily",
+  "sql": "SELECT DATE(created_at) AS day, COUNT(*) AS order_count, SUM(total) AS revenue FROM tgtwarehouse.marts__demo.fct_orders GROUP BY 1",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "MaterializedView"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "mv_orders_daily"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "marts__demo",
+      "table": "fct_orders"
+    }
+  ]
+}

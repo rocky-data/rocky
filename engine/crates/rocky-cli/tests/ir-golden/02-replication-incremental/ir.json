@@ -1,0 +1,40 @@
+{
+  "name": "events",
+  "sql": "",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "Incremental",
+    "timestamp_column": "_synced_at"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "raw__demo",
+    "table": "events"
+  },
+  "source": {
+    "catalog": "srcwarehouse",
+    "schema": "src__demo",
+    "table": "events"
+  },
+  "columns": {
+    "Explicit": [
+      "id",
+      "event_type",
+      "payload",
+      "_synced_at"
+    ]
+  },
+  "metadata_columns": [
+    {
+      "name": "_loaded_by",
+      "data_type": "STRING",
+      "value": "'rocky'"
+    }
+  ]
+}

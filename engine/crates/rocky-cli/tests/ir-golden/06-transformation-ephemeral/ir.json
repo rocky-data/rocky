@@ -1,0 +1,26 @@
+{
+  "name": "active_orders",
+  "sql": "SELECT * FROM tgtwarehouse.marts__demo.fct_orders WHERE status = 'active'",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "Ephemeral"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "active_orders"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "marts__demo",
+      "table": "fct_orders"
+    }
+  ]
+}

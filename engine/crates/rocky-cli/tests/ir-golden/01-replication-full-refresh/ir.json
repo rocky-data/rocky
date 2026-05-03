@@ -1,0 +1,25 @@
+{
+  "name": "orders",
+  "sql": "",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "FullRefresh"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "raw__demo",
+    "table": "orders"
+  },
+  "source": {
+    "catalog": "srcwarehouse",
+    "schema": "src__demo",
+    "table": "orders"
+  },
+  "columns": "All"
+}

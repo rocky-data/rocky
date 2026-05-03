@@ -1,0 +1,54 @@
+{
+  "name": "dim_customers",
+  "sql": "SELECT customer_id, name, email, updated_at FROM tgtwarehouse.raw__demo.customers",
+  "typed_columns": [],
+  "lineage_edges": [
+    {
+      "source": {
+        "model": "customers",
+        "column": "email"
+      },
+      "target": {
+        "model": "dim_customers",
+        "column": "email"
+      },
+      "transform": "Direct"
+    }
+  ],
+  "materialization": {
+    "strategy": "Merge",
+    "unique_key": [
+      "customer_id"
+    ],
+    "update_columns": {
+      "Explicit": [
+        "name",
+        "email",
+        "updated_at"
+      ]
+    }
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "dim_customers"
+  },
+  "column_masks": [
+    {
+      "column": "email",
+      "strategy": "hash"
+    }
+  ],
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "raw__demo",
+      "table": "customers"
+    }
+  ]
+}

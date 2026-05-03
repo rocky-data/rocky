@@ -1,0 +1,35 @@
+{
+  "name": "customers",
+  "sql": "",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "Merge",
+    "unique_key": [
+      "customer_id"
+    ],
+    "update_columns": {
+      "Explicit": [
+        "name",
+        "email",
+        "updated_at"
+      ]
+    }
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "raw__demo",
+    "table": "customers"
+  },
+  "source": {
+    "catalog": "srcwarehouse",
+    "schema": "src__demo",
+    "table": "customers"
+  },
+  "columns": "All"
+}
