@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::config::ModelBudgetConfig;
 use crate::dag::DagNode;
 use crate::ir::{
-    GovernanceConfig, MaterializationStrategy, SourceRef, TargetRef, TransformationPlan,
+    GovernanceConfig, MaterializationStrategy, ModelIr, Plan, SourceRef, TargetRef,
+    TransformationPlan,
 };
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
@@ -637,6 +638,24 @@ impl Model {
             format_options: self.config.format_options.clone(),
         }
     }
+
+    /// Construct the per-model [`ModelIr`] for this transformation model.
+    ///
+    /// Reuses [`Self::to_plan`] so the materialization-strategy lowering
+    /// stays in one place; the resulting [`Plan::Transformation`] is fed to
+    /// [`From<&Plan> for ModelIr`] and the model's own `name` overrides the
+    /// `target.table`-derived default so the IR carries the project-unique
+    /// identifier rather than the warehouse table name.
+    ///
+    /// `typed_columns`, `lineage_edges`, and `column_masks` stay empty here
+    /// — they are populated by the compiler / governance layers downstream
+    /// when richer typed data is available.
+    pub fn to_model_ir(&self) -> ModelIr {
+        let plan = Plan::Transformation(self.to_plan());
+        let mut ir = ModelIr::from(&plan);
+        ir.name = std::sync::Arc::from(self.config.name.as_str());
+        ir
+    }
 }
 
 /// Loads a model from a sidecar pair: `name.sql` + `name.toml`.
@@ -961,6 +980,82 @@ SELECT id, name, status FROM raw.src
         let (fm, sql) = split_frontmatter(content).unwrap();
         assert_eq!(fm, "name = \"test\"");
         assert_eq!(sql, "SELECT 1");
+    }
+
+    #[test]
+    fn test_to_model_ir_carries_model_name_not_target_table() {
+        // The model name (`fct_orders`) and target.table (`fct_orders_v2`)
+        // differ — `to_model_ir` must use the project-unique model name on
+        // `ModelIr::name`, not whatever `From<&Plan>` would default to from
+        // the target table.
+        let model = parse_model_inline(
+            r#"---toml
+name = "fct_orders"
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "fct_orders_v2"
+---
+SELECT 1
+"#,
+            "fct_orders.sql",
+            None,
+        )
+        .unwrap();
+
+        let ir = model.to_model_ir();
+        assert_eq!(&*ir.name, "fct_orders");
+        assert_eq!(ir.target.table, "fct_orders_v2");
+    }
+
+    #[test]
+    fn test_to_model_ir_lowering_matches_to_plan() {
+        // The strategy / sql / sources / governance / format lowering MUST
+        // match `to_plan` exactly — `to_model_ir` reuses `to_plan` internally
+        // and threads it through `From<&Plan> for ModelIr`. This guards the
+        // contract that the two views agree.
+        let model = parse_model_inline(
+            r#"---toml
+name = "dim"
+depends_on = ["raw.src"]
+[strategy]
+type = "merge"
+unique_key = ["id"]
+update_columns = ["name", "status"]
+[[sources]]
+catalog = "raw"
+schema = "ext"
+table = "src"
+[target]
+catalog = "c"
+schema = "s"
+table = "t"
+---
+SELECT id, name, status FROM raw.ext.src
+"#,
+            "dim.sql",
+            None,
+        )
+        .unwrap();
+
+        let plan = model.to_plan();
+        let ir = model.to_model_ir();
+
+        assert_eq!(ir.sql, plan.sql);
+        // SourceRef / TargetRef / MaterializationStrategy do not derive
+        // `PartialEq`; compare by canonical JSON instead.
+        assert_eq!(
+            serde_json::to_value(&ir.sources).unwrap(),
+            serde_json::to_value(&plan.sources).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&ir.target).unwrap(),
+            serde_json::to_value(&plan.target).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&ir.materialization).unwrap(),
+            serde_json::to_value(&plan.strategy).unwrap()
+        );
     }
 
     // --- Sidecar format tests ---
