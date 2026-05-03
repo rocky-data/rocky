@@ -23,6 +23,9 @@ sqlparser = { workspace = true }
 strsim = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# Used by the contract-quickfix helper signature, which mirrors the
+# `typed_models: IndexMap<String, Vec<TypedColumn>>` shape from rocky-compiler.
+indexmap = { workspace = true }
 # Schema-cache read-path needs `chrono::Utc::now()` + `Duration` for TTL
 # filtering. Reused via `rocky_compiler::schema_cache`.
 chrono = { workspace = true }
@@ -30,7 +33,6 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
-indexmap = { workspace = true }
 tempfile = "3"
 
 [lints]

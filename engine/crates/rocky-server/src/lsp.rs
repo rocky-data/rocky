@@ -1783,6 +1783,35 @@ impl LanguageServer for RockyLsp {
                         }
                     }
                 }
+                Some("E010") | Some("E013") => {
+                    // Contract diagnostic — propose a deterministic SELECT-projection edit
+                    // that re-adds the missing/protected column. Skipped when the model
+                    // uses `.rocky` DSL or `SELECT *`, or when no upstream model exposes
+                    // the column (the structural validation that replaces a recompile
+                    // round-trip).
+                    let Some(model) = self.model_for_uri(result, uri) else {
+                        continue;
+                    };
+                    if let Some((edit, title)) = build_contract_quickfix(
+                        code.unwrap(),
+                        &diag.message,
+                        model,
+                        &result.type_check.typed_models,
+                    ) {
+                        let mut changes = HashMap::new();
+                        changes.insert(uri.clone(), vec![edit]);
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title,
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![diag.clone()]),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }));
+                    }
+                }
                 _ => {
                     // For any diagnostic with a suggestion, offer it
                     if let Some(compiler_diag) = find_compiler_diagnostic(result, diag) {
@@ -2337,6 +2366,104 @@ fn find_compiler_diagnostic<'a>(
         .diagnostics
         .iter()
         .find(|d| &*d.code == code && &*d.message == lsp_diag.message.as_str())
+}
+
+/// Build a deterministic quick-fix `TextEdit` for a contract diagnostic
+/// (`E010` required-column-missing or `E013` protected-column-removed).
+///
+/// Returns `None` when the fix would not actually clear the diagnostic:
+/// - `.rocky` DSL files (separate auto-fix path).
+/// - Multi-statement SQL or non-`SELECT` top-level statement.
+/// - `SELECT *` / wildcard projection (would need expansion first).
+/// - The named column does not appear in any direct upstream model's typed
+///   schema (the structural validation that takes the place of a recompile
+///   round-trip — if no upstream exposes the column, appending it would just
+///   produce a fresh "column not found" error).
+pub(crate) fn build_contract_quickfix(
+    code: &str,
+    message: &str,
+    model: &rocky_core::models::Model,
+    typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> Option<(TextEdit, String)> {
+    // 1. `.rocky` DSL files use a different syntax — skip.
+    if model.file_path.ends_with(".rocky") {
+        return None;
+    }
+
+    // 2. Extract the column name from the diagnostic message verbatim.
+    let (column, title) = match code {
+        "E010" => {
+            let col = message
+                .strip_prefix("required column '")?
+                .strip_suffix("' missing from model output")?;
+            (col, format!("Add required column '{col}' to projection"))
+        }
+        "E013" => {
+            let col = message
+                .strip_prefix("protected column '")?
+                .strip_suffix("' has been removed")?;
+            (col, format!("Restore protected column '{col}'"))
+        }
+        _ => return None,
+    };
+
+    // 3. Structural validation: at least one direct upstream must expose the
+    //    column under its typed schema. Otherwise the fix would just trade
+    //    E010/E013 for a fresh resolution error.
+    let upstream_has_column =
+        model
+            .config
+            .depends_on
+            .iter()
+            .any(|dep| match typed_models.get(dep) {
+                Some(cols) => cols.iter().any(|c| c.name == column),
+                None => false,
+            });
+    if !upstream_has_column {
+        return None;
+    }
+
+    // 4. Parse the model SQL and locate a single top-level SELECT with a
+    //    non-wildcard projection.
+    let dialect = rocky_sql::dialect::DatabricksDialect;
+    let stmts = Parser::parse_sql(&dialect, &model.sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.projection.is_empty() {
+        return None;
+    }
+    if select.projection.iter().any(|item| {
+        matches!(
+            item,
+            ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(_, _)
+        )
+    }) {
+        return None;
+    }
+
+    // 5. Compute the insert position from the end of the last projection
+    //    item's span. Spans are 1-based; LSP `Position` is 0-based.
+    use sqlparser::ast::Spanned;
+    let last_span = select.projection.last()?.span();
+    if last_span.end.line == 0 {
+        return None;
+    }
+    let position = Position::new((last_span.end.line - 1) as u32, last_span.end.column as u32);
+
+    Some((
+        TextEdit {
+            range: Range::new(position, position),
+            new_text: format!(", {column}"),
+        },
+        title,
+    ))
 }
 
 /// Collect semantic tokens from a parsed query.
@@ -3365,6 +3492,258 @@ mod tests {
         assert!(
             !state_path.exists(),
             "LSP loader must not create state.redb as a side effect"
+        );
+    }
+
+    // ── Contract quick-fix tests (E010 / E013) ─────────────────────────
+
+    /// Build a two-model fixture project on disk where `downstream.sql`
+    /// drops a column that the contract requires/protects.
+    ///
+    /// Returns the loaded `CompileResult` plus the path to `downstream.sql`.
+    fn build_contract_fixture(
+        tmp: &tempfile::TempDir,
+        contract_toml: &str,
+    ) -> (CompileResult, std::path::PathBuf) {
+        use std::fs;
+
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        // Upstream model: exposes `id`, `name`, `email`. We need a real FROM
+        // clause for sqlparser-based lineage extraction to register the
+        // projection columns on the model schema.
+        fs::write(
+            models_dir.join("upstream.sql"),
+            "SELECT id, name, email FROM source.raw.users\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("upstream.toml"),
+            "name = \"upstream\"\n\
+             [strategy]\n\
+             type = \"full_refresh\"\n\
+             [target]\n\
+             catalog = \"warehouse\"\n\
+             schema = \"raw\"\n\
+             table = \"upstream\"\n",
+        )
+        .unwrap();
+
+        // Downstream model: drops `email`.
+        let downstream_sql = "SELECT id, name FROM upstream\n";
+        let downstream_path = models_dir.join("downstream.sql");
+        fs::write(&downstream_path, downstream_sql).unwrap();
+        fs::write(
+            models_dir.join("downstream.toml"),
+            "name = \"downstream\"\n\
+             depends_on = [\"upstream\"]\n\
+             [strategy]\n\
+             type = \"full_refresh\"\n\
+             [target]\n\
+             catalog = \"warehouse\"\n\
+             schema = \"gold\"\n\
+             table = \"downstream\"\n",
+        )
+        .unwrap();
+        fs::write(models_dir.join("downstream.contract.toml"), contract_toml).unwrap();
+
+        let config = rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            source_column_info: HashMap::new(),
+            ..Default::default()
+        };
+        let result = rocky_compiler::compile::compile(&config).unwrap();
+        (result, downstream_path)
+    }
+
+    fn diag_message(result: &CompileResult, code: &str) -> String {
+        result
+            .diagnostics
+            .iter()
+            .find(|d| &*d.code == code)
+            .unwrap_or_else(|| panic!("expected a {code} diagnostic"))
+            .message
+            .to_string()
+    }
+
+    #[test]
+    fn test_contract_quickfix_e010_appends_required_column() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, _) = build_contract_fixture(&tmp, "[rules]\nrequired = [\"email\"]\n");
+
+        let msg = diag_message(&result, "E010");
+        let model = result.project.model("downstream").unwrap();
+        let (edit, title) =
+            build_contract_quickfix("E010", &msg, model, &result.type_check.typed_models)
+                .expect("E010 should produce a quick-fix when the column lives upstream");
+
+        assert_eq!(edit.new_text, ", email");
+        assert_eq!(title, "Add required column 'email' to projection");
+        // `SELECT id, name FROM upstream` — projection ends at column 14 (1-based)
+        // on line 1. Convert to 0-based for the LSP `Position`.
+        assert_eq!(edit.range.start, edit.range.end, "edit must be zero-width");
+        assert_eq!(edit.range.start.line, 0);
+        // Projection ends right after `name`; we don't pin the exact column to
+        // avoid tying the test to sqlparser's whitespace handling — just check
+        // the inserted text would land between `name` and ` FROM`.
+        let line = "SELECT id, name FROM upstream";
+        let insert_at = edit.range.start.character as usize;
+        assert!(insert_at <= line.len(), "insert position within line");
+        let prefix = &line[..insert_at];
+        assert!(
+            prefix.trim_end().ends_with("name"),
+            "edit should append after the last projection item, got prefix `{prefix}`"
+        );
+    }
+
+    #[test]
+    fn test_contract_quickfix_e013_restores_protected_column() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, _) = build_contract_fixture(&tmp, "[rules]\nprotected = [\"email\"]\n");
+
+        let msg = diag_message(&result, "E013");
+        let model = result.project.model("downstream").unwrap();
+        let (edit, title) =
+            build_contract_quickfix("E013", &msg, model, &result.type_check.typed_models)
+                .expect("E013 should produce a quick-fix when the column lives upstream");
+
+        assert_eq!(edit.new_text, ", email");
+        assert_eq!(title, "Restore protected column 'email'");
+    }
+
+    #[test]
+    fn test_contract_quickfix_skipped_when_column_not_upstream() {
+        // Contract requires `customer_id`, which no upstream model exposes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, _) = build_contract_fixture(&tmp, "[rules]\nrequired = [\"customer_id\"]\n");
+
+        let msg = diag_message(&result, "E010");
+        let model = result.project.model("downstream").unwrap();
+        assert!(
+            build_contract_quickfix("E010", &msg, model, &result.type_check.typed_models,)
+                .is_none(),
+            "must not offer a fix when the column does not exist upstream"
+        );
+    }
+
+    #[test]
+    fn test_contract_quickfix_skipped_on_rocky_dsl_file() {
+        // The helper short-circuits on extension before touching anything else,
+        // so this test doesn't need a compile pipeline — we synthesise the
+        // smallest `Model` shape that flips the file-path check.
+        let mut typed_models: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> =
+            IndexMap::new();
+        typed_models.insert(
+            "upstream".into(),
+            vec![rocky_compiler::types::TypedColumn {
+                name: "email".into(),
+                data_type: rocky_compiler::types::RockyType::String,
+                nullable: true,
+            }],
+        );
+
+        let model = rocky_core::models::Model {
+            config: rocky_core::models::ModelConfig {
+                name: "downstream".into(),
+                depends_on: vec!["upstream".into()],
+                strategy: rocky_core::models::StrategyConfig::FullRefresh,
+                target: rocky_core::models::TargetConfig {
+                    catalog: "warehouse".into(),
+                    schema: "gold".into(),
+                    table: "downstream".into(),
+                },
+                sources: vec![],
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: vec![],
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                retention: None,
+                budget: None,
+            },
+            sql: "from upstream\nselect { id }\n".into(),
+            file_path: "/tmp/whatever/downstream.rocky".into(),
+            contract_path: None,
+        };
+
+        let msg = "required column 'email' missing from model output";
+        assert!(
+            build_contract_quickfix("E010", msg, &model, &typed_models).is_none(),
+            "must skip `.rocky` DSL files"
+        );
+    }
+
+    #[test]
+    fn test_contract_quickfix_skipped_on_select_star() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        fs::write(
+            models_dir.join("upstream.sql"),
+            "SELECT 1 AS id, 'a' AS email\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("upstream.toml"),
+            "name = \"upstream\"\n\
+             [strategy]\n\
+             type = \"full_refresh\"\n\
+             [target]\n\
+             catalog = \"warehouse\"\n\
+             schema = \"raw\"\n\
+             table = \"upstream\"\n",
+        )
+        .unwrap();
+
+        // Downstream uses SELECT * — auto-fix can't safely append a column.
+        fs::write(
+            models_dir.join("downstream.sql"),
+            "SELECT * FROM upstream\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("downstream.toml"),
+            "name = \"downstream\"\n\
+             depends_on = [\"upstream\"]\n\
+             [strategy]\n\
+             type = \"full_refresh\"\n\
+             [target]\n\
+             catalog = \"warehouse\"\n\
+             schema = \"gold\"\n\
+             table = \"downstream\"\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("downstream.contract.toml"),
+            "[rules]\nrequired = [\"missing_col\"]\n",
+        )
+        .unwrap();
+
+        let config = rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            source_column_info: HashMap::new(),
+            ..Default::default()
+        };
+        let result = rocky_compiler::compile::compile(&config).unwrap();
+
+        // Hand-craft the message so the test isn't coupled to whether the
+        // compiler emits E010 against a `SELECT *` model (which it may
+        // resolve via wildcard expansion).
+        let msg = "required column 'email' missing from model output";
+        let model = result.project.model("downstream").unwrap();
+        assert!(
+            build_contract_quickfix("E010", msg, model, &result.type_check.typed_models,).is_none(),
+            "must skip when the projection is a wildcard"
         );
     }
 }
