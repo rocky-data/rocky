@@ -1,6 +1,6 @@
 # Rocky
 
-> The trust system for your data. A Rust-based control plane for warehouse-side data pipelines: branches, replay, provable reproducibility, column-level lineage, compile-time safety, per-model cost attribution. Keep Databricks or Snowflake. Bring Rocky for the DAG.
+> A Rust-based control plane for warehouse SQL pipelines: branches, replay, provable reproducibility, column-level lineage, compile-time type safety, per-model cost attribution. Storage and compute stay with the warehouse (Databricks, Snowflake, BigQuery, DuckDB); Rocky owns the DAG.
 
 Rocky is not a warehouse. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, DuckDB); Rocky owns the graph — dependencies, compile-time types, drift, incremental logic, lineage, cost. No Jinja, no manifest, no parse step.
 

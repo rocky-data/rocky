@@ -1,8 +1,6 @@
 # Rocky
 
-The **trust system for your data**. A Rust-based control plane for warehouse-side data pipelines: branches, replay, provable reproducibility, column-level lineage, compile-time safety, per-model cost attribution.
-
-Keep Databricks or Snowflake. Bring Rocky for the DAG.
+A Rust-based control plane for warehouse SQL pipelines: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Single static binary; storage and compute stay with your warehouse.
 
 **Rocky is not a warehouse.** Storage and compute stay with your warehouse; Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
 
@@ -19,7 +17,7 @@ No Jinja. No manifest. No parse step.
 | Quality | ✅ | Inline assertions during `rocky run` |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` standalone |
 
-## The seven trust dimensions
+## What Rocky does
 
 1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
 2. **Cost attribution + budgets** — per-model cost on every run; `[budget]` block in `rocky.toml`; `budget_breach` hook event.
