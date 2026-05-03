@@ -376,9 +376,15 @@ fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
             })
             .collect();
 
+        let model_irs: Vec<_> = plans
+            .iter()
+            .map(|plan| {
+                rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Replication(plan.clone()))
+            })
+            .collect();
         let times = measure(iterations, || {
-            for plan in &plans {
-                sql_gen::generate_create_table_as_sql(plan, &dialect).unwrap();
+            for model_ir in &model_irs {
+                sql_gen::generate_create_table_as_sql(model_ir, &dialect).unwrap();
             }
         });
         let mean_ms =

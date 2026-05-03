@@ -2,10 +2,55 @@ use rocky_sql::validation;
 use thiserror::Error;
 
 use crate::ir::{
-    MaterializationStrategy, PartitionWindow, ReplicationPlan, SnapshotPlan, TransformationPlan,
+    MaterializationStrategy, ModelIr, PartitionWindow, Plan, ReplicationPlan, SnapshotPlan,
+    TransformationPlan,
 };
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
+
+/// Extract the variant-typed `ReplicationPlan` from a [`ModelIr`].
+///
+/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
+/// from a [`Plan::Replication`]. The check is shaped by which variant-
+/// specific fields are populated: replication carries an explicit
+/// [`crate::ir::ColumnSelection`] in `columns`.
+fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenError> {
+    match model_ir.to_plan_compatible() {
+        Plan::Replication(plan) => Ok(plan),
+        _ => Err(SqlGenError::InvalidRequest(format!(
+            "expected Replication ModelIr for `{}`",
+            model_ir.name
+        ))),
+    }
+}
+
+/// Extract the variant-typed `TransformationPlan` from a [`ModelIr`].
+///
+/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
+/// from a [`Plan::Transformation`].
+fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlGenError> {
+    match model_ir.to_plan_compatible() {
+        Plan::Transformation(plan) => Ok(plan),
+        _ => Err(SqlGenError::InvalidRequest(format!(
+            "expected Transformation ModelIr for `{}`",
+            model_ir.name
+        ))),
+    }
+}
+
+/// Extract the variant-typed `SnapshotPlan` from a [`ModelIr`].
+///
+/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
+/// from a [`Plan::Snapshot`].
+fn snapshot_from_ir(model_ir: &ModelIr) -> Result<SnapshotPlan, SqlGenError> {
+    match model_ir.to_plan_compatible() {
+        Plan::Snapshot(plan) => Ok(plan),
+        _ => Err(SqlGenError::InvalidRequest(format!(
+            "expected Snapshot ModelIr for `{}`",
+            model_ir.name
+        ))),
+    }
+}
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
 #[derive(Debug, Error)]
@@ -42,11 +87,17 @@ pub enum SqlGenError {
     InvalidRequest(String),
 }
 
-/// Generates the SELECT SQL for a replication plan using the given dialect.
+/// Generates the SELECT SQL for a replication model using the given dialect.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Replication`].
 pub fn generate_select_sql(
-    plan: &ReplicationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = replication_from_ir(model_ir)?;
     let select = dialect.select_clause(&plan.columns, &plan.metadata_columns)?;
 
     let source = dialect.format_table_ref(
@@ -95,40 +146,58 @@ fn generate_select_sql_no_watermark(
 }
 
 /// Generates `INSERT INTO <target> SELECT ...` using the given dialect.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Replication`].
 pub fn generate_insert_sql(
-    plan: &ReplicationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = replication_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
         &plan.target.table,
     )?;
-    let select = generate_select_sql(plan, dialect)?;
+    let select = generate_select_sql(model_ir, dialect)?;
     Ok(dialect.insert_into(&target, &select))
 }
 
 /// Generates CREATE TABLE AS SELECT using the given dialect (full refresh).
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Replication`].
 pub fn generate_create_table_as_sql(
-    plan: &ReplicationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = replication_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
         &plan.target.table,
     )?;
 
-    let select = generate_select_sql_no_watermark(plan, dialect)?;
+    let select = generate_select_sql_no_watermark(&plan, dialect)?;
 
     Ok(dialect.create_table_as(&target, &select))
 }
 
 /// Generates a MERGE INTO statement using the given dialect.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Replication`].
 pub fn generate_merge_sql(
-    plan: &ReplicationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = replication_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -141,11 +210,11 @@ pub fn generate_merge_sql(
             update_columns,
         } => (unique_key, update_columns),
         _ => {
-            return generate_create_table_as_sql(plan, dialect);
+            return generate_create_table_as_sql(model_ir, dialect);
         }
     };
 
-    let select = generate_select_sql_no_watermark(plan, dialect)?;
+    let select = generate_select_sql_no_watermark(&plan, dialect)?;
 
     Ok(dialect.merge_into(&target, &select, unique_key, update_columns)?)
 }
@@ -158,10 +227,16 @@ pub fn generate_merge_sql(
 /// (`FullRefresh`, `Incremental`, `Merge`, `MaterializedView`) the vec
 /// contains exactly one entry; callers that need a single string can pattern-
 /// match `&[only]` or call `.join("\n")` if cosmetic concatenation is fine.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Transformation`].
 pub fn generate_transformation_sql(
-    plan: &TransformationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
+    let plan = transformation_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -204,7 +279,7 @@ pub fn generate_transformation_sql(
             Ok(vec![stmt])
         }
         MaterializationStrategy::MaterializedView => {
-            Ok(vec![generate_materialized_view_sql(plan, dialect)?])
+            Ok(vec![generate_materialized_view_sql(model_ir, dialect)?])
         }
         MaterializationStrategy::DynamicTable { .. } => {
             // Dynamic tables require a warehouse parameter not available in the plan.
@@ -303,10 +378,16 @@ pub fn generate_transformation_sql(
 ///
 /// Once the table exists, subsequent partition runs use the regular
 /// `insert_overwrite_partition` DELETE+INSERT cycle.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Transformation`].
 pub fn generate_time_interval_bootstrap_sql(
-    plan: &TransformationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = transformation_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -360,10 +441,16 @@ pub fn generate_time_interval_bootstrap_sql(
 /// This is complementary to `generate_transformation_sql` — the runtime
 /// calls this once on first run, then switches to the regular strategy
 /// for subsequent runs.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Transformation`].
 pub fn generate_transformation_initial_ddl(
-    plan: &TransformationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
+    let plan = transformation_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -399,11 +486,17 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
     )
 }
 
-/// Generates CREATE MATERIALIZED VIEW SQL for a transformation plan.
+/// Generates CREATE MATERIALIZED VIEW SQL for a transformation model.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Transformation`].
 pub fn generate_materialized_view_sql(
-    plan: &TransformationPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = transformation_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -416,13 +509,19 @@ pub fn generate_materialized_view_sql(
     ))
 }
 
-/// Generates CREATE DYNAMIC TABLE SQL for a transformation plan (Snowflake).
+/// Generates CREATE DYNAMIC TABLE SQL for a transformation model (Snowflake).
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Transformation`].
 pub fn generate_dynamic_table_sql(
-    plan: &TransformationPlan,
+    model_ir: &ModelIr,
     target_lag: &str,
     warehouse: &str,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    let plan = transformation_from_ir(model_ir)?;
     let target = dialect.format_table_ref(
         &plan.target.catalog,
         &plan.target.schema,
@@ -494,10 +593,16 @@ use std::fmt::Write;
 ///    the `updated_at` column has changed.
 /// 2. Inserts new versions with `valid_from = CURRENT_TIMESTAMP, valid_to = NULL`.
 /// 3. Optionally invalidates hard-deleted rows (source rows that no longer exist).
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// constructed from a [`Plan::Snapshot`].
 pub fn generate_snapshot_sql(
-    plan: &SnapshotPlan,
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
+    let plan = snapshot_from_ir(model_ir)?;
     let source = dialect.format_table_ref(
         &plan.source.catalog,
         &plan.source.schema,
@@ -604,13 +709,13 @@ pub fn generate_snapshot_sql(
 /// Each model's SQL generation is independent, making this embarrassingly
 /// parallel. At 50k models, this reduces SQL gen time from ~1.2s to <200ms.
 pub fn generate_transformations_parallel(
-    plans: &[TransformationPlan],
+    model_irs: &[ModelIr],
     dialect: &(dyn SqlDialect + Sync),
 ) -> Vec<Result<Vec<String>, SqlGenError>> {
     use rayon::prelude::*;
-    plans
+    model_irs
         .par_iter()
-        .map(|plan| generate_transformation_sql(plan, dialect))
+        .map(|model_ir| generate_transformation_sql(model_ir, dialect))
         .collect()
 }
 
@@ -774,6 +879,22 @@ mod tests {
         TestDialect
     }
 
+    /// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
+    fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
+        ModelIr::from(&Plan::Replication(plan.clone()))
+    }
+
+    /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
+    fn xform_ir(plan: &TransformationPlan) -> ModelIr {
+        ModelIr::from(&Plan::Transformation(plan.clone()))
+    }
+
+    /// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
+    #[allow(dead_code)]
+    fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
+        ModelIr::from(&Plan::Snapshot(plan.clone()))
+    }
+
     fn sample_incremental_plan() -> ReplicationPlan {
         ReplicationPlan {
             source: SourceRef {
@@ -813,7 +934,7 @@ mod tests {
     #[test]
     fn test_incremental_select() {
         let plan = sample_incremental_plan();
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog.src__acme__us_west__shopify.orders"));
@@ -825,7 +946,7 @@ mod tests {
     #[test]
     fn test_full_refresh_select() {
         let plan = sample_full_refresh_plan();
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog"));
@@ -835,7 +956,7 @@ mod tests {
     #[test]
     fn test_insert_into_sql() {
         let plan = sample_incremental_plan();
-        let sql = generate_insert_sql(&plan, &dialect()).unwrap();
+        let sql = generate_insert_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
         assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
@@ -845,7 +966,7 @@ mod tests {
     #[test]
     fn test_create_table_as_sql() {
         let plan = sample_incremental_plan();
-        let sql = generate_create_table_as_sql(&plan, &dialect()).unwrap();
+        let sql = generate_create_table_as_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         // CTAS always does full refresh (no WHERE clause)
         assert!(sql.starts_with(
@@ -862,7 +983,7 @@ mod tests {
             metadata_columns: vec![],
             ..sample_full_refresh_plan()
         };
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT id, name, status"));
         assert!(!sql.contains("*"));
@@ -874,7 +995,7 @@ mod tests {
             metadata_columns: vec![],
             ..sample_full_refresh_plan()
         };
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert_eq!(sql.lines().next().unwrap().trim(), "SELECT *");
         assert!(!sql.contains("CAST"));
@@ -897,7 +1018,7 @@ mod tests {
             ],
             ..sample_full_refresh_plan()
         };
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         assert!(sql.contains("CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("CAST(42 AS INT) AS load_id"));
@@ -913,7 +1034,7 @@ mod tests {
             },
             ..sample_full_refresh_plan()
         };
-        assert!(generate_select_sql(&plan, &dialect()).is_err());
+        assert!(generate_select_sql(&rep_ir(&plan), &dialect()).is_err());
     }
 
     #[test]
@@ -926,7 +1047,7 @@ mod tests {
             }],
             ..sample_full_refresh_plan()
         };
-        assert!(generate_select_sql(&plan, &dialect()).is_err());
+        assert!(generate_select_sql(&rep_ir(&plan), &dialect()).is_err());
     }
 
     #[test]
@@ -945,7 +1066,7 @@ mod tests {
         // This test now checks that the dialect produces output (it does, since TestDialect
         // doesn't validate literal values). In production, the DatabricksSqlDialect should
         // validate literal values.
-        let _ = generate_select_sql(&plan, &dialect());
+        let _ = generate_select_sql(&rep_ir(&plan), &dialect());
     }
 
     #[test]
@@ -959,7 +1080,7 @@ mod tests {
             ..sample_full_refresh_plan()
         };
         // Same as above: data type validation is delegated to the dialect.
-        let _ = generate_select_sql(&plan, &dialect());
+        let _ = generate_select_sql(&rep_ir(&plan), &dialect());
     }
 
     #[test]
@@ -971,7 +1092,7 @@ mod tests {
             },
             ..sample_full_refresh_plan()
         };
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
         assert!(!sql.contains("WHERE")); // merge SELECT is a full scan
     }
 
@@ -984,7 +1105,7 @@ mod tests {
             },
             ..sample_full_refresh_plan()
         };
-        let sql = generate_merge_sql(&plan, &dialect()).unwrap();
+        let sql = generate_merge_sql(&rep_ir(&plan), &dialect()).unwrap();
         assert!(sql.contains("MERGE INTO"));
         assert!(sql.contains("ON t.id = s.id"));
         assert!(sql.contains("WHEN MATCHED THEN UPDATE SET *"));
@@ -1000,7 +1121,7 @@ mod tests {
             },
             ..sample_full_refresh_plan()
         };
-        let sql = generate_merge_sql(&plan, &dialect()).unwrap();
+        let sql = generate_merge_sql(&rep_ir(&plan), &dialect()).unwrap();
         assert!(sql.contains("ON t.id = s.id AND t.date = s.date"));
         assert!(sql.contains("UPDATE SET t.status = s.status, t.amount = s.amount"));
     }
@@ -1015,7 +1136,7 @@ mod tests {
             ..sample_full_refresh_plan()
         };
         // The dialect returns an error for empty keys, which sql_gen maps to UnsafeFragment
-        assert!(generate_merge_sql(&plan, &dialect()).is_err());
+        assert!(generate_merge_sql(&rep_ir(&plan), &dialect()).is_err());
     }
 
     #[test]
@@ -1041,7 +1162,7 @@ mod tests {
             format: None,
             format_options: None,
         };
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.starts_with("CREATE OR REPLACE TABLE cat.silver.dim_accounts AS"));
@@ -1069,7 +1190,7 @@ mod tests {
             format: None,
             format_options: None,
         };
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].starts_with("INSERT INTO cat.silver.fct_orders"));
     }
@@ -1096,7 +1217,7 @@ mod tests {
             format: None,
             format_options: None,
         };
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.contains("MERGE INTO cat.silver.dim_users AS t"));
@@ -1131,7 +1252,7 @@ mod tests {
     #[test]
     fn test_sample_incremental_sql_matches_expected() {
         let plan = sample_incremental_plan();
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1147,7 +1268,7 @@ WHERE _fivetran_synced > (
     #[test]
     fn test_sample_full_refresh_sql_matches_expected() {
         let plan = sample_full_refresh_plan();
-        let sql = generate_select_sql(&plan, &dialect()).unwrap();
+        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1186,7 +1307,7 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
             strategy: MaterializationStrategy::MaterializedView,
             ..sample_transformation_plan()
         };
-        let sql = generate_materialized_view_sql(&plan, &dialect()).unwrap();
+        let sql = generate_materialized_view_sql(&xform_ir(&plan), &dialect()).unwrap();
 
         let expected = "\
 CREATE OR REPLACE MATERIALIZED VIEW cat.silver.dim_accounts AS
@@ -1201,7 +1322,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             strategy: MaterializationStrategy::MaterializedView,
             ..sample_transformation_plan()
         };
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("CREATE OR REPLACE MATERIALIZED VIEW cat.silver.dim_accounts AS")
@@ -1216,7 +1337,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             ..sample_transformation_plan()
         };
-        let sql = generate_dynamic_table_sql(&plan, "1 hour", "COMPUTE_WH", &dialect()).unwrap();
+        let sql = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "COMPUTE_WH", &dialect()).unwrap();
 
         let expected = "\
 CREATE OR REPLACE DYNAMIC TABLE cat.silver.dim_accounts
@@ -1236,7 +1357,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             ..sample_transformation_plan()
         };
-        let result = generate_dynamic_table_sql(&plan, "1 hour", "WH; DROP TABLE", &dialect());
+        let result = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "WH; DROP TABLE", &dialect());
         assert!(result.is_err());
     }
 
@@ -1249,7 +1370,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             ..sample_transformation_plan()
         };
         let result =
-            generate_dynamic_table_sql(&plan, "1'; DROP TABLE --", "COMPUTE_WH", &dialect());
+            generate_dynamic_table_sql(&xform_ir(&plan), "1'; DROP TABLE --", "COMPUTE_WH", &dialect());
         assert!(result.is_err());
     }
 
@@ -1309,7 +1430,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             "SELECT order_date FROM cat.raw.stg_orders WHERE order_date >= @start_date AND order_date < @end_date",
             None,
         );
-        let result = generate_transformation_sql(&plan, &dialect());
+        let result = generate_transformation_sql(&xform_ir(&plan), &dialect());
         assert!(matches!(result, Err(SqlGenError::MissingPartitionWindow)));
     }
 
@@ -1320,7 +1441,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             "SELECT order_date FROM cat.raw.stg_orders WHERE order_date >= @start_date AND order_date < @end_date",
             Some(april_7_window()),
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1, "test dialect emits a single REPLACE WHERE");
         let sql = &stmts[0];
         // Both placeholders substituted with quoted timestamp literals.
@@ -1354,7 +1475,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             "SELECT 1 FROM cat.raw.stg_orders WHERE 1=1 AND @start_date < @end_date",
             Some(april_7_window()),
         );
-        let result = generate_transformation_sql(&plan, &dialect());
+        let result = generate_transformation_sql(&xform_ir(&plan), &dialect());
         assert!(matches!(result, Err(SqlGenError::UnsafeFragment { .. })));
     }
 
@@ -1382,7 +1503,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
              WHERE order_at >= @start_date AND order_at < @end_date",
             None,
         );
-        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
 
         // Wrapped in CREATE OR REPLACE TABLE AS by the test dialect.
         assert!(
@@ -1415,7 +1536,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             "SELECT order_date FROM cat.raw.x WHERE x.t >= @start_date AND x.t < @end_date",
             None, // window = None
         );
-        let result = generate_time_interval_bootstrap_sql(&plan, &dialect());
+        let result = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect());
         assert!(
             result.is_ok(),
             "bootstrap should not error on missing window: {result:?}"
@@ -1466,7 +1587,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.contains("USING DELTA"), "expected USING DELTA: {sql}");
@@ -1502,7 +1623,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1522,7 +1643,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             LakehouseOptions::default(),
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].contains("CREATE OR REPLACE STREAMING TABLE"),
@@ -1538,7 +1659,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             LakehouseOptions::default(),
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].contains("CREATE OR REPLACE VIEW"),
@@ -1557,7 +1678,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1579,7 +1700,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1609,7 +1730,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 timestamp_column: "updated_at".into(),
             },
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("INSERT INTO"),
@@ -1631,7 +1752,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 timestamp_column: "updated_at".into(),
             },
         );
-        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1661,7 +1782,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 update_columns: ColumnSelection::All,
             },
         );
-        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1687,7 +1808,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 MaterializationStrategy::FullRefresh,
             )
         };
-        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("CREATE OR REPLACE TABLE"),
@@ -1717,7 +1838,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             ..LakehouseOptions::default()
         });
 
-        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert!(
             sql.contains("USING DELTA"),
             "bootstrap should use DELTA: {sql}"
@@ -1755,7 +1876,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
              WHERE order_date >= @start_date AND order_date < @end_date",
             None,
         );
-        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
         assert!(
             sql.starts_with("CREATE OR REPLACE TABLE"),
             "should use plain CTAS: {sql}"
@@ -1779,7 +1900,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 partition_by: vec!["date_key".into()],
             },
         );
-        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1803,7 +1924,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let result = generate_transformation_initial_ddl(&plan, &dialect());
+        let result = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect());
         assert!(result.is_err(), "should reject invalid partition column");
     }
 }

@@ -3601,6 +3601,9 @@ pub(crate) async fn execute_models(
             }
 
             let plan = model.to_plan();
+            let model_ir = rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(
+                plan.clone(),
+            ));
             let target_ref = dialect
                 .format_table_ref(
                     &plan.target.catalog,
@@ -3636,7 +3639,9 @@ pub(crate) async fn execute_models(
                     .is_err()
                 {
                     let initial_ddls =
-                        rocky_core::sql_gen::generate_transformation_initial_ddl(&plan, dialect)?;
+                        rocky_core::sql_gen::generate_transformation_initial_ddl(
+                            &model_ir, dialect,
+                        )?;
                     info!(
                         model = model_name.as_str(),
                         target = target_ref.as_str(),
@@ -3653,7 +3658,8 @@ pub(crate) async fn execute_models(
                 }
             }
 
-            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql(&plan, dialect)?;
+            let exec_stmts =
+                rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect)?;
 
             info!(
                 model = model_name.as_str(),
@@ -3891,7 +3897,10 @@ async fn execute_time_interval_model(
     let target_exists = warehouse.describe_table(&target_ref_struct).await.is_ok();
     if !target_exists {
         let bootstrap_plan = model.to_plan();
-        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_plan, dialect)
+        let bootstrap_ir = rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(
+            bootstrap_plan.clone(),
+        ));
+        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_ir, dialect)
             .with_context(|| format!("failed to render bootstrap SQL for model '{model_name}'"))?;
         info!(
             model = model_name,
@@ -4063,7 +4072,9 @@ async fn run_one_partition(
     // Generate SQL — this is where dialect.insert_overwrite_partition() gets
     // called and the @start_date / @end_date placeholders are substituted
     // (Phase 2D).
-    let stmts = match sql_gen::generate_transformation_sql(&tplan, dialect) {
+    let tplan_ir =
+        rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(tplan.clone()));
+    let stmts = match sql_gen::generate_transformation_sql(&tplan_ir, dialect) {
         Ok(s) => s,
         Err(e) => {
             return PartitionExecutionResult {
@@ -4401,34 +4412,34 @@ async fn process_table(
         },
     };
 
-    // Phase 2b.1: ModelIr built alongside Plan; sql_gen consumes it in 2b.2.
-    let _model_ir = ModelIr::from(&Plan::Replication(replication.clone()));
+    // sql_gen consumes the typed IR directly.
+    let model_ir = ModelIr::from(&Plan::Replication(replication.clone()));
 
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
-        sql_gen::generate_create_table_as_sql(&replication, dialect)?
+        sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
     } else {
         match &replication.strategy {
             MaterializationStrategy::FullRefresh => {
                 strategy_name = "full_refresh";
-                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::Incremental { .. } => {
                 strategy_name = "incremental";
-                sql_gen::generate_insert_sql(&replication, dialect)?
+                sql_gen::generate_insert_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::Merge { .. } => {
                 strategy_name = "merge";
-                sql_gen::generate_merge_sql(&replication, dialect)?
+                sql_gen::generate_merge_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::MaterializedView => {
                 strategy_name = "materialized_view";
-                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::DynamicTable { .. } => {
                 strategy_name = "dynamic_table";
-                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::TimeInterval { .. } => {
                 // time_interval is a transformation strategy (silver-layer
@@ -4449,12 +4460,12 @@ async fn process_table(
             MaterializationStrategy::DeleteInsert { .. } => {
                 strategy_name = "delete_insert";
                 // For replication, delete+insert falls back to full refresh.
-                sql_gen::generate_create_table_as_sql(&replication, dialect)?
+                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
             }
             MaterializationStrategy::Microbatch { .. } => {
                 strategy_name = "microbatch";
                 // Microbatch on replication tables falls back to incremental insert.
-                sql_gen::generate_insert_sql(&replication, dialect)?
+                sql_gen::generate_insert_sql(&model_ir, dialect)?
             }
         }
     };

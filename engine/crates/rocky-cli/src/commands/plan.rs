@@ -165,8 +165,8 @@ pub async fn plan(
                 },
             };
 
-            // Phase 2b.1: ModelIr built alongside Plan; sql_gen consumes it in 2b.2.
-            let _model_ir = ModelIr::from(&Plan::Replication(plan.clone()));
+            // sql_gen consumes the typed IR directly.
+            let model_ir = ModelIr::from(&Plan::Replication(plan.clone()));
 
             // Pick the right SQL generator for the materialization strategy.
             // Full refresh uses CREATE OR REPLACE TABLE AS so the target doesn't
@@ -174,12 +174,12 @@ pub async fn plan(
             // target to already exist (created on the first full-refresh run).
             let sql = match &strategy {
                 MaterializationStrategy::FullRefresh => {
-                    sql_gen::generate_create_table_as_sql(&plan, dialect)?
+                    sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
                 }
                 MaterializationStrategy::Incremental { .. } => {
-                    sql_gen::generate_insert_sql(&plan, dialect)?
+                    sql_gen::generate_insert_sql(&model_ir, dialect)?
                 }
-                _ => sql_gen::generate_insert_sql(&plan, dialect)?,
+                _ => sql_gen::generate_insert_sql(&model_ir, dialect)?,
             };
 
             let target_label = if effective_target_catalog.is_empty() {

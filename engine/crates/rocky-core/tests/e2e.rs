@@ -5,13 +5,29 @@
 
 use rocky_core::ir::{
     ColumnInfo, ColumnSelection, DriftAction, GovernanceConfig, MaterializationStrategy,
-    MetadataColumn, ReplicationPlan, SourceRef, TableRef, TargetRef, TransformationPlan,
-    WatermarkState,
+    MetadataColumn, ModelIr, Plan, ReplicationPlan, SnapshotPlan, SourceRef, TableRef, TargetRef,
+    TransformationPlan, WatermarkState,
 };
 use rocky_core::state::StateStore;
 use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
 use rocky_core::{drift, sql_gen};
 use tempfile::TempDir;
+
+/// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
+fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
+    ModelIr::from(&Plan::Replication(plan.clone()))
+}
+
+/// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
+fn xform_ir(plan: &TransformationPlan) -> ModelIr {
+    ModelIr::from(&Plan::Transformation(plan.clone()))
+}
+
+/// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
+#[allow(dead_code)]
+fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
+    ModelIr::from(&Plan::Snapshot(plan.clone()))
+}
 
 // ---------------------------------------------------------------------------
 // Test dialect (mirrors Databricks behavior for integration tests)
@@ -210,7 +226,7 @@ fn test_full_refresh_pipeline() {
     let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
 
     // Generate CREATE TABLE AS SELECT SQL (full refresh)
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
 
     // Verify SQL structure
     assert!(
@@ -270,7 +286,7 @@ fn test_incremental_pipeline_with_watermark() {
     });
 
     // Generate INSERT INTO ... SELECT SQL (incremental append)
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
 
     // Verify incremental SQL structure
     assert!(
@@ -543,7 +559,7 @@ fn test_transformation_full_refresh() {
         format_options: None,
     };
 
-    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
 
@@ -590,7 +606,7 @@ fn test_transformation_incremental() {
         format_options: None,
     };
 
-    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
     assert!(
@@ -628,7 +644,7 @@ fn test_transformation_merge() {
         format_options: None,
     };
 
-    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
     assert!(
@@ -673,7 +689,7 @@ fn test_merge_sql_generation() {
         },
     };
 
-    let sql = sql_gen::generate_merge_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_merge_sql(&rep_ir(&plan), &dialect).unwrap();
 
     assert!(sql.contains("MERGE INTO"), "expected MERGE INTO: {sql}");
     assert!(
@@ -718,7 +734,7 @@ fn test_merge_composite_key() {
         },
     };
 
-    let sql = sql_gen::generate_merge_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_merge_sql(&rep_ir(&plan), &dialect).unwrap();
     assert!(
         sql.contains("ON t.order_id = s.order_id AND t.line_id = s.line_id"),
         "expected composite ON clause: {sql}"
@@ -842,7 +858,7 @@ fn test_sql_injection_prevention() {
         ..sample_replication_plan(MaterializationStrategy::FullRefresh)
     };
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
         "should reject SQL injection in catalog name"
     );
 
@@ -856,7 +872,7 @@ fn test_sql_injection_prevention() {
         ..sample_replication_plan(MaterializationStrategy::FullRefresh)
     };
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
         "should reject SQL injection in schema name"
     );
 
@@ -870,7 +886,7 @@ fn test_sql_injection_prevention() {
         ..sample_replication_plan(MaterializationStrategy::FullRefresh)
     };
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
         "should reject SQL injection in metadata column name"
     );
 
@@ -905,7 +921,7 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     assert!(wm.is_none(), "no watermark on first run");
 
     let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
     assert!(sql.contains("CREATE OR REPLACE TABLE"));
     assert!(!sql.contains("WHERE"));
 
@@ -931,7 +947,7 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
     assert!(sql.contains("INSERT INTO"));
     assert!(sql.contains("WHERE _fivetran_synced > ("));
 
@@ -975,7 +991,7 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     assert!(drop_sql.contains("DROP TABLE IF EXISTS"));
 
     let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let ctas_sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
+    let ctas_sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
     assert!(ctas_sql.contains("CREATE OR REPLACE TABLE"));
 }
 
@@ -1023,7 +1039,7 @@ fn test_exact_incremental_sql_output() {
         timestamp_column: "_fivetran_synced".into(),
     });
 
-    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_select_sql(&rep_ir(&plan), &dialect).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1041,7 +1057,7 @@ fn test_exact_full_refresh_sql_output() {
     let dialect = TestDialect;
 
     let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_select_sql(&rep_ir(&plan), &dialect).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1055,7 +1071,7 @@ fn test_exact_ctas_sql_output() {
     let dialect = TestDialect;
 
     let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
 
     let expected = "\
 CREATE OR REPLACE TABLE acme_warehouse.staging__us_west__shopify.orders AS
@@ -1072,7 +1088,7 @@ fn test_exact_insert_sql_output() {
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
 
     let expected = "\
 INSERT INTO acme_warehouse.staging__us_west__shopify.orders
@@ -1110,7 +1126,8 @@ WHERE _fivetran_synced > (
 mod time_interval_e2e {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus, partition_key_to_window};
     use rocky_core::ir::{
-        GovernanceConfig, MaterializationStrategy, SourceRef, TargetRef, TransformationPlan,
+        GovernanceConfig, MaterializationStrategy, ModelIr, Plan, SourceRef, TargetRef,
+        TransformationPlan,
     };
     use rocky_core::models::TimeGrain;
     use rocky_core::sql_gen;
@@ -1118,6 +1135,11 @@ mod time_interval_e2e {
     use rocky_core::traits::{SqlDialect, WarehouseAdapter};
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
     use tempfile::TempDir;
+
+    /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
+    fn xform_ir(plan: &TransformationPlan) -> ModelIr {
+        ModelIr::from(&Plan::Transformation(plan.clone()))
+    }
 
     /// SQL to seed a stg_orders table with rows across 5 partitions
     /// (2026-04-04 through 2026-04-08), 2 customers, varying revenue.
@@ -1237,7 +1259,7 @@ mod time_interval_e2e {
     /// adapter, in order. Returns the number of rows in the target afterward.
     async fn execute_partition(adapter: &DuckDbWarehouseAdapter, plan: &TransformationPlan) -> u64 {
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let stmts = sql_gen::generate_transformation_sql(plan, dialect)
+        let stmts = sql_gen::generate_transformation_sql(&xform_ir(plan), dialect)
             .expect("generate time_interval SQL");
         // Sanity: the duckdb dialect emits 4 statements
         // (BEGIN/DELETE/INSERT/COMMIT) per Phase 2C.
@@ -1437,7 +1459,7 @@ mod time_interval_e2e {
         let plan = time_interval_plan("2026-04-05"); // expect 1 customer, 1 order
 
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let stmts = sql_gen::generate_transformation_sql(&plan, dialect).unwrap();
+        let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), dialect).unwrap();
 
         // The INSERT statement (index 2 in the BEGIN/DELETE/INSERT/COMMIT vec)
         // should contain the substituted timestamp literals, not the
@@ -1502,7 +1524,7 @@ mod time_interval_e2e {
         // Step 1: render the bootstrap SQL and execute it.
         let plan = time_interval_plan("2026-04-07");
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&plan, dialect)
+        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&xform_ir(&plan), dialect)
             .expect("bootstrap render");
         adapter
             .execute_statement(&bootstrap_sql)
