@@ -165,6 +165,9 @@ pub async fn plan(
                 },
             };
 
+            // Phase 2b.1: ModelIr built alongside Plan; sql_gen consumes it in 2b.2.
+            let _model_ir = ModelIr::from(&Plan::Replication(plan.clone()));
+
             // Pick the right SQL generator for the materialization strategy.
             // Full refresh uses CREATE OR REPLACE TABLE AS so the target doesn't
             // need to exist; incremental uses INSERT INTO which requires the

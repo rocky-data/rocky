@@ -4401,6 +4401,9 @@ async fn process_table(
         },
     };
 
+    // Phase 2b.1: ModelIr built alongside Plan; sql_gen consumes it in 2b.2.
+    let _model_ir = ModelIr::from(&Plan::Replication(replication.clone()));
+
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";

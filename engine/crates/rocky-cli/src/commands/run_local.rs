@@ -654,6 +654,9 @@ pub async fn run_snapshot(
         },
     };
 
+    // Phase 2b.1: ModelIr built alongside Plan; sql_gen consumes it in 2b.2.
+    let _model_ir = ModelIr::from(&Plan::Snapshot(plan.clone()));
+
     let dialect = warehouse_adapter.dialect();
     let stmts = sql_gen::generate_snapshot_sql(&plan, dialect)?;
 
