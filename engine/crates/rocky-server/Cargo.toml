@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Powers the AI code-action fallback for E010 / E013 — non-deterministic
+# fixes that the structural quickfix can't derive (multi-statement SQL,
+# `SELECT *` projection, or no upstream model exposes the named column).
+rocky-ai = { path = "../rocky-ai" }
 rocky-compiler = { path = "../rocky-compiler" }
 rocky-core = { path = "../rocky-core" }
 rocky-lang = { path = "../rocky-lang" }
