@@ -501,6 +501,13 @@ enum Command {
         /// writes all three.
         #[arg(long, value_enum, default_value_t = CatalogFormatArg::Both)]
         format: CatalogFormatArg,
+        /// Scope the snapshot to a single warehouse catalog.
+        ///
+        /// Mirrors `compact --catalog` and `archive --catalog`. When
+        /// set, only assets whose FQN sits in the named catalog are
+        /// emitted, and edges referencing dropped assets are pruned.
+        #[arg(long)]
+        catalog: Option<String>,
     },
 
     /// Show column-level lineage for a model
@@ -1649,6 +1656,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             out,
             format,
+            catalog,
         } => {
             let out_dir = out.unwrap_or_else(rocky_cli::commands::catalog_default_out_dir);
             rocky_cli::commands::run_catalog(
@@ -1657,9 +1665,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 &out_dir,
                 format.into(),
+                catalog.as_deref(),
                 json,
                 cli.cache_ttl,
             )
+            .await
         }
         Command::Lineage {
             target,

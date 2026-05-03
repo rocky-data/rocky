@@ -31,12 +31,14 @@ use parquet::file::properties::WriterProperties;
 
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::semantic::{LineageEdge, SemanticGraph};
+use rocky_core::state::{RunStatus, StateStore};
 
 use crate::output::{
     AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogOutput, CatalogStats,
     EdgeConfidence, config_fingerprint,
 };
 use crate::registry::resolve_pipeline;
+use crate::scope::resolve_managed_tables_in_catalog;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -64,17 +66,35 @@ impl CatalogFormat {
 }
 
 /// Execute `rocky catalog`.
-pub fn run_catalog(
+///
+/// Async because `--catalog <name>` resolves managed tables via
+/// [`resolve_managed_tables_in_catalog`], which is itself async (it
+/// shares the call shape with `rocky compact --catalog` and
+/// `rocky archive --catalog`).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_catalog(
     config_path: &Path,
     state_path: &Path,
     models_dir: &Path,
     out_dir: &Path,
     format: CatalogFormat,
+    catalog_filter: Option<&str>,
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let started = Instant::now();
-    let output = compute_catalog_output(config_path, state_path, models_dir, cache_ttl_override)?;
+    let mut output =
+        compute_catalog_output(config_path, state_path, models_dir, cache_ttl_override)?;
+
+    // `--catalog <name>` filters the catalog snapshot down to assets
+    // whose target FQN sits in the named warehouse catalog. Reuses the
+    // same scope helper compact + archive use, so the resolution logic
+    // (managed-table set, catalog-name normalisation, "no matches"
+    // diagnostic) is identical across the three commands.
+    if let Some(name) = catalog_filter {
+        let scope = resolve_managed_tables_in_catalog(config_path, name).await?;
+        filter_to_catalog_scope(&mut output, &scope.tables);
+    }
 
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
@@ -135,8 +155,10 @@ pub fn run_catalog(
 /// Build a [`CatalogOutput`] without persisting or rendering it.
 ///
 /// Extracted from [`run_catalog`] so unit tests can assert on the
-/// structured value directly. Pure compute over the SemanticGraph; no
-/// state-store touch in PR-1.
+/// structured value directly. Compiles the project, walks the
+/// SemanticGraph for assets + edges, then enriches with state-store
+/// run history (`last_run_id` / `last_materialized_at`) when the
+/// state store is available.
 pub(crate) fn compute_catalog_output(
     config_path: &Path,
     state_path: &Path,
@@ -280,8 +302,9 @@ pub(crate) fn compute_catalog_output(
             upstream_models: schema.upstream.clone(),
             downstream_models: schema.downstream.clone(),
             intent,
-            // PR-1: state-store enrichment deferred. See the catalog
-            // command memo for the PR-3 plan.
+            // Filled in below by `enrich_with_state_store` once the
+            // full asset list is built and we have a single read-only
+            // state-store handle.
             last_materialized_at: None,
             last_run_id: None,
         });
@@ -319,6 +342,14 @@ pub(crate) fn compute_catalog_output(
             .then_with(|| a.model_name.cmp(&b.model_name))
     });
 
+    // 10. Enrich with state-store run history (best effort). Sets
+    //     `CatalogOutput.last_run_id` to the most recent successful run
+    //     and `CatalogAsset.last_run_id` / `last_materialized_at` to the
+    //     most recent run that produced each model. Falls through
+    //     silently when the state store is missing or unreadable: the
+    //     command must work pre-first-run.
+    let last_run_id = enrich_with_state_store(state_path, &mut assets);
+
     let stats = CatalogStats {
         asset_count: assets.len(),
         column_count: total_columns,
@@ -336,11 +367,108 @@ pub(crate) fn compute_catalog_output(
         generated_at: Utc::now(),
         project_name,
         config_hash,
-        last_run_id: None,
+        last_run_id,
         assets,
         edges,
         stats,
     })
+}
+
+/// Number of recent runs to consider when populating `last_run_id` /
+/// `last_materialized_at`. 50 is enough to cover real workloads
+/// (newest-first) while keeping the redb scan cheap.
+const STATE_RUN_LIMIT: usize = 50;
+
+/// Best-effort state-store enrichment.
+///
+/// Opens the state store read-only so the command never blocks an
+/// in-flight `rocky run`. Returns the project-level `last_run_id` (the
+/// most recent run with `RunStatus::Success`), and mutates each asset
+/// in-place to set `last_run_id` + `last_materialized_at` from the
+/// newest-per-model successful [`ModelExecution`].
+///
+/// Silent on failure: a missing or unreadable state store leaves all
+/// state-derived fields as `None`. `rocky catalog` is meant to run
+/// before the first `rocky run` has ever populated state, and a hard
+/// error there would be hostile.
+fn enrich_with_state_store(state_path: &Path, assets: &mut [CatalogAsset]) -> Option<String> {
+    let store = StateStore::open_read_only(state_path).ok()?;
+    let runs = store.list_runs(STATE_RUN_LIMIT).ok()?;
+
+    // Project-level: first successful run, newest-first.
+    let project_last_run_id = runs
+        .iter()
+        .find(|r| r.status == RunStatus::Success)
+        .map(|r| r.run_id.clone());
+
+    // Per-model: walk runs newest-first and record the first successful
+    // (ModelExecution) hit per model. ModelExecution.status is a
+    // `String`; production writers use lowercase "success" — see
+    // `RunOutput` materialization handling.
+    let mut by_model: HashMap<String, (String, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+    for run in &runs {
+        for me in &run.models_executed {
+            if me.status != "success" {
+                continue;
+            }
+            by_model
+                .entry(me.model_name.clone())
+                .or_insert_with(|| (run.run_id.clone(), me.finished_at));
+        }
+    }
+
+    for asset in assets.iter_mut() {
+        if let Some((run_id, finished_at)) = by_model.get(&asset.model_name) {
+            asset.last_run_id = Some(run_id.clone());
+            asset.last_materialized_at = Some(*finished_at);
+        }
+    }
+
+    project_last_run_id
+}
+
+/// Filter a [`CatalogOutput`] in place to only include assets whose
+/// FQN appears in `tables` (matched case-insensitively against the
+/// scope helper's lowercased entries).
+///
+/// Edges are dropped when *either* endpoint is removed, so the
+/// remaining edge set never points at a missing asset. `stats` is
+/// recomputed from the post-filter assets so consumers see counts that
+/// match the filtered file. Source-kind assets typically fall out
+/// here — `resolve_managed_tables_in_catalog` only returns
+/// project-managed targets, which is the right semantics for "this
+/// catalog's view of the lineage."
+pub(crate) fn filter_to_catalog_scope(output: &mut CatalogOutput, tables: &[String]) {
+    let allow: HashSet<String> = tables.iter().map(|s| s.to_lowercase()).collect();
+
+    output
+        .assets
+        .retain(|a| allow.contains(&a.fqn.to_lowercase()));
+
+    let surviving_models: HashSet<String> =
+        output.assets.iter().map(|a| a.model_name.clone()).collect();
+    output.edges.retain(|e| {
+        surviving_models.contains(&e.source_model) && surviving_models.contains(&e.target_model)
+    });
+
+    let total_columns: usize = output.assets.iter().map(|a| a.columns.len()).sum();
+    let assets_with_star = output
+        .edges
+        .iter()
+        .filter(|e| matches!(e.confidence, EdgeConfidence::Medium))
+        .map(|e| e.target_model.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    output.stats.asset_count = output.assets.len();
+    output.stats.column_count = total_columns;
+    output.stats.edge_count = output.edges.len();
+    output.stats.assets_with_star = assets_with_star;
+    // `orphan_columns` is a structural diagnostic — recomputing it
+    // honestly after the filter requires re-walking the edges; the
+    // count stays valid (no rows are *added* by filtering, just
+    // removed). Leave the pre-filter value to flag global lineage
+    // gaps; the JSON consumer can recompute against `assets` if it
+    // needs a scope-local count.
 }
 
 /// Convert a SemanticGraph [`LineageEdge`] into a [`CatalogEdge`].
@@ -931,5 +1059,282 @@ mod tests {
 
         assert!(matches!(edges[0].confidence, EdgeConfidence::Medium));
         assert!(matches!(edges[1].confidence, EdgeConfidence::High));
+    }
+
+    /// State-store enrichment populates `last_run_id` /
+    /// `last_materialized_at` from the most recent successful
+    /// [`ModelExecution`] per model, and falls through silently when
+    /// the state file does not exist.
+    #[test]
+    fn enrich_with_state_store_populates_last_run_and_falls_back_silently() {
+        use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+        use rocky_core::state::{ModelExecution, RunStatus, RunTrigger};
+
+        // 1. Empty state path (no file) → all assets stay None and the
+        //    project-level run id is None.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_state = tmp.path().join("nonexistent.redb");
+
+        let mut empty_assets = vec![sample_asset("raw_orders")];
+        let project_run = enrich_with_state_store(&missing_state, &mut empty_assets);
+        assert_eq!(project_run, None);
+        assert_eq!(empty_assets[0].last_run_id, None);
+        assert_eq!(empty_assets[0].last_materialized_at, None);
+
+        // 2. Populated state store: two runs, the older one materialised
+        //    `raw_orders`, the newer one materialised `customer_orders`.
+        //    Each model's `last_run_id` should point at the run that
+        //    actually built it; the project's `last_run_id` is the
+        //    newest successful run.
+        let state_path = tmp.path().join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+
+            let older_started = Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap();
+            let older_finished = older_started + ChronoDuration::seconds(30);
+            let newer_started = Utc.with_ymd_and_hms(2026, 5, 2, 10, 0, 0).unwrap();
+            let newer_finished = newer_started + ChronoDuration::seconds(30);
+
+            let older = sample_run_record(
+                "run-001",
+                older_started,
+                older_finished,
+                vec![sample_model_execution(
+                    "raw_orders",
+                    older_started,
+                    older_finished,
+                    "success",
+                )],
+            );
+            let newer = sample_run_record(
+                "run-002",
+                newer_started,
+                newer_finished,
+                vec![sample_model_execution(
+                    "customer_orders",
+                    newer_started,
+                    newer_finished,
+                    "success",
+                )],
+            );
+            store.record_run(&older).unwrap();
+            store.record_run(&newer).unwrap();
+            // Drop the writer before the read-only handle opens.
+            drop(store);
+        }
+
+        let mut assets = vec![
+            sample_asset("raw_orders"),
+            sample_asset("customer_orders"),
+            // Model with no run history → enrichment leaves it None.
+            sample_asset("revenue_summary"),
+        ];
+        let project_run = enrich_with_state_store(&state_path, &mut assets);
+
+        assert_eq!(project_run.as_deref(), Some("run-002"));
+        assert_eq!(assets[0].last_run_id.as_deref(), Some("run-001"));
+        assert!(assets[0].last_materialized_at.is_some());
+        assert_eq!(assets[1].last_run_id.as_deref(), Some("run-002"));
+        assert!(assets[1].last_materialized_at.is_some());
+        assert_eq!(assets[2].last_run_id, None);
+        assert_eq!(assets[2].last_materialized_at, None);
+
+        // 3. Failed model executions never enrich. Add a third run that
+        //    "executed" `revenue_summary` with status "failed"; the
+        //    asset should remain None.
+        let store = StateStore::open(&state_path).unwrap();
+        let failed_started = Utc.with_ymd_and_hms(2026, 5, 3, 10, 0, 0).unwrap();
+        let failed_finished = failed_started + ChronoDuration::seconds(5);
+        store
+            .record_run(&sample_run_record(
+                "run-003-failed",
+                failed_started,
+                failed_finished,
+                vec![sample_model_execution(
+                    "revenue_summary",
+                    failed_started,
+                    failed_finished,
+                    "failed",
+                )],
+            ))
+            .unwrap();
+        drop(store);
+
+        let mut assets = vec![sample_asset("revenue_summary")];
+        let _ = enrich_with_state_store(&state_path, &mut assets);
+        assert_eq!(assets[0].last_run_id, None);
+        assert_eq!(assets[0].last_materialized_at, None);
+
+        fn sample_asset(name: &str) -> CatalogAsset {
+            CatalogAsset {
+                fqn: format!("warehouse.public.{name}"),
+                model_name: name.to_string(),
+                kind: AssetKind::Model,
+                columns: vec![],
+                upstream_models: vec![],
+                downstream_models: vec![],
+                intent: None,
+                last_materialized_at: None,
+                last_run_id: None,
+            }
+        }
+
+        fn sample_run_record(
+            id: &str,
+            started: chrono::DateTime<chrono::Utc>,
+            finished: chrono::DateTime<chrono::Utc>,
+            models: Vec<ModelExecution>,
+        ) -> rocky_core::state::RunRecord {
+            rocky_core::state::RunRecord {
+                run_id: id.to_string(),
+                started_at: started,
+                finished_at: finished,
+                status: RunStatus::Success,
+                models_executed: models,
+                trigger: RunTrigger::Manual,
+                config_hash: "test".to_string(),
+                triggering_identity: None,
+                session_source: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                idempotency_key: None,
+                target_catalog: None,
+                hostname: "test-host".to_string(),
+                rocky_version: "test-version".to_string(),
+            }
+        }
+
+        fn sample_model_execution(
+            name: &str,
+            started: chrono::DateTime<chrono::Utc>,
+            finished: chrono::DateTime<chrono::Utc>,
+            status: &str,
+        ) -> ModelExecution {
+            ModelExecution {
+                model_name: name.to_string(),
+                started_at: started,
+                finished_at: finished,
+                duration_ms: (finished - started).num_milliseconds().max(0) as u64,
+                rows_affected: Some(42),
+                status: status.to_string(),
+                sql_hash: "abc123".to_string(),
+                bytes_scanned: None,
+                bytes_written: None,
+            }
+        }
+    }
+
+    /// `--catalog foo` filters the catalog snapshot to assets whose
+    /// FQN sits in the named warehouse catalog. Edges referencing
+    /// dropped assets are pruned so the JSON / Parquet artifacts never
+    /// have dangling references.
+    #[test]
+    fn filter_to_catalog_scope_drops_other_catalogs_and_dangling_edges() {
+        let mut output = sample_output_with_two_catalogs();
+
+        // Pre-condition: 3 assets across two catalogs, 2 edges that
+        // span catalogs (one stays, one straddles).
+        assert_eq!(output.assets.len(), 3);
+        assert_eq!(output.edges.len(), 2);
+
+        // Scope down to "warehouse_a" only. The scope helper returns
+        // lowercase FQNs, mirroring `resolve_managed_tables_in_catalog`.
+        let scope = vec![
+            "warehouse_a.public.raw_orders".to_string(),
+            "warehouse_a.public.customer_orders".to_string(),
+        ];
+        filter_to_catalog_scope(&mut output, &scope);
+
+        let asset_names: Vec<&str> = output
+            .assets
+            .iter()
+            .map(|a| a.model_name.as_str())
+            .collect();
+        // Filter preserves input order (which here is the deterministic
+        // `(fqn, model_name)` sort produced upstream); the test fixture
+        // puts `raw_orders` before `customer_orders`.
+        assert_eq!(asset_names, vec!["raw_orders", "customer_orders"]);
+
+        // Edge touching `revenue_summary` (which lives in warehouse_b)
+        // is pruned; the in-catalog edge survives.
+        assert_eq!(output.edges.len(), 1);
+        assert_eq!(output.edges[0].source_model, "raw_orders");
+        assert_eq!(output.edges[0].target_model, "customer_orders");
+
+        // Stats are recomputed from the post-filter set.
+        assert_eq!(output.stats.asset_count, 2);
+        assert_eq!(output.stats.edge_count, 1);
+
+        fn sample_output_with_two_catalogs() -> CatalogOutput {
+            CatalogOutput {
+                version: "test".to_string(),
+                command: "catalog".to_string(),
+                generated_at: Utc::now(),
+                project_name: "test".to_string(),
+                config_hash: "test".to_string(),
+                last_run_id: None,
+                assets: vec![
+                    CatalogAsset {
+                        fqn: "warehouse_a.public.raw_orders".to_string(),
+                        model_name: "raw_orders".to_string(),
+                        kind: AssetKind::Model,
+                        columns: vec![],
+                        upstream_models: vec![],
+                        downstream_models: vec!["customer_orders".to_string()],
+                        intent: None,
+                        last_materialized_at: None,
+                        last_run_id: None,
+                    },
+                    CatalogAsset {
+                        fqn: "warehouse_a.public.customer_orders".to_string(),
+                        model_name: "customer_orders".to_string(),
+                        kind: AssetKind::Model,
+                        columns: vec![],
+                        upstream_models: vec!["raw_orders".to_string()],
+                        downstream_models: vec!["revenue_summary".to_string()],
+                        intent: None,
+                        last_materialized_at: None,
+                        last_run_id: None,
+                    },
+                    CatalogAsset {
+                        fqn: "warehouse_b.public.revenue_summary".to_string(),
+                        model_name: "revenue_summary".to_string(),
+                        kind: AssetKind::Model,
+                        columns: vec![],
+                        upstream_models: vec!["customer_orders".to_string()],
+                        downstream_models: vec![],
+                        intent: None,
+                        last_materialized_at: None,
+                        last_run_id: None,
+                    },
+                ],
+                edges: vec![
+                    CatalogEdge {
+                        source_model: "raw_orders".to_string(),
+                        source_column: "id".to_string(),
+                        target_model: "customer_orders".to_string(),
+                        target_column: "id".to_string(),
+                        transform: "direct".to_string(),
+                        confidence: EdgeConfidence::High,
+                    },
+                    CatalogEdge {
+                        source_model: "customer_orders".to_string(),
+                        source_column: "id".to_string(),
+                        target_model: "revenue_summary".to_string(),
+                        target_column: "id".to_string(),
+                        transform: "direct".to_string(),
+                        confidence: EdgeConfidence::High,
+                    },
+                ],
+                stats: CatalogStats {
+                    asset_count: 3,
+                    column_count: 0,
+                    edge_count: 2,
+                    assets_with_star: 0,
+                    orphan_columns: 0,
+                    duration_ms: 0,
+                },
+            }
+        }
     }
 }
