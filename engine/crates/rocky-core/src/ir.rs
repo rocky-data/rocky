@@ -6,12 +6,21 @@
 //! ## Canonical-JSON convention for [`ModelIr`] / [`ProjectIr`]
 //!
 //! Recipe-hash determinism requires a single, predictable serialization
-//! shape. Every `Option<T>` field on [`ModelIr`] and [`ProjectIr`] (and on
-//! types they own that are introduced alongside the IR) carries
-//! `#[serde(default, skip_serializing_if = "Option::is_none")]`. `None`
-//! values are absent from the JSON; the recipe-hash never sees an explicit
-//! `null`. Add new optional fields with the same attribute pair so the rule
-//! stays uniform.
+//! shape. The rule has three legs:
+//!
+//! - Every `Option<T>` field carries
+//!   `#[serde(default, skip_serializing_if = "Option::is_none")]`. `None`
+//!   values are absent from the JSON; the recipe-hash never sees an explicit
+//!   `null`.
+//! - Every `Vec<T>` field that is "conceptually optional" (empty == absent —
+//!   e.g. `metadata_columns`, `unique_key`, `sources`, `column_masks`)
+//!   carries `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+//! - Every `bool` field whose semantic default is `false` (e.g.
+//!   `invalidate_hard_deletes`) carries
+//!   `#[serde(default, skip_serializing_if = "std::ops::Not::not")]` so the
+//!   key is omitted when the value is the default.
+//!
+//! Add new fields with the matching attribute pair so the rule stays uniform.
 
 use std::sync::Arc;
 
@@ -454,15 +463,30 @@ pub struct ColumnMask {
 /// Carries everything Rocky needs to know about a single model to generate
 /// SQL, run governance, and compute a recipe-hash: the SQL itself, the
 /// typed output columns, the lineage edges that target this model, the
-/// materialization strategy, governance metadata, and the resolved
-/// column-masking plan for the active environment.
+/// materialization strategy, governance metadata, the resolved
+/// column-masking plan for the active environment, and the source / target
+/// table refs plus variant-specific metadata (column selection, metadata
+/// columns, snapshot key/timestamp, lakehouse format) needed to losslessly
+/// represent any [`Plan`] variant.
 ///
 /// `ModelIr` is an internal contract. It does not derive `JsonSchema` and
 /// is not part of the public CLI output schema; consumers outside the
 /// engine should depend on the typed `*Output` structs in
 /// `rocky-cli::output` instead.
 ///
-/// All `Option` fields follow the canonical-JSON rule documented at the
+/// ## Flat-fields design
+///
+/// Variant-specific fields ([`Self::source`], [`Self::columns`],
+/// [`Self::unique_key`], ...) live as flat optional / empty-default fields
+/// on [`ModelIr`] rather than inside a nested `kind: ModelKind` enum. The
+/// canonical-JSON convention (skip `None`, skip empty `Vec`, skip default
+/// `bool`) keeps the per-variant JSON shape compact, and a single struct
+/// makes the recipe-hash easier to reason about — there is no enum
+/// discriminant to canonicalise. Compile-time variant exhaustiveness is
+/// retained via the still-present [`Plan`] enum, which converts to /
+/// from [`ModelIr`] losslessly.
+///
+/// All optional fields follow the canonical-JSON rule documented at the
 /// top of this module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelIr {
@@ -490,6 +514,8 @@ pub struct ModelIr {
     pub materialization: MaterializationStrategy,
     /// Governance metadata (catalog/schema lifecycle policy).
     pub governance: GovernanceConfig,
+    /// Target table reference. Required on every [`Plan`] variant.
+    pub target: TargetRef,
     /// Resolved column masks for the active environment. Populated at IR
     /// construction by reading
     /// [`crate::config::RockyConfig::resolve_mask_for_env`]. Empty when no
@@ -497,6 +523,44 @@ pub struct ModelIr {
     /// [`crate::traits::MaskStrategy::None`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_masks: Vec<ColumnMask>,
+    /// Single-source ref. `Some` for [`Plan::Replication`] and
+    /// [`Plan::Snapshot`]; `None` for [`Plan::Transformation`] (which uses
+    /// [`Self::sources`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
+    /// Multi-source refs (joins). Populated for [`Plan::Transformation`];
+    /// empty for [`Plan::Replication`] and [`Plan::Snapshot`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceRef>,
+    /// Column selection. `Some` for [`Plan::Replication`]; `None` for
+    /// other variants (which select via the `sql` field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnSelection>,
+    /// Extra columns added during replication (e.g.
+    /// `CAST(NULL AS STRING) AS _loaded_by`). Populated for
+    /// [`Plan::Replication`]; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_columns: Vec<MetadataColumn>,
+    /// Columns that uniquely identify a snapshot row. Populated for
+    /// [`Plan::Snapshot`]; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_key: Vec<Arc<str>>,
+    /// Column used to detect changes for SCD2 snapshots. `Some` for
+    /// [`Plan::Snapshot`]; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// When true, invalidate rows deleted from source. Only meaningful
+    /// for [`Plan::Snapshot`]; `false` otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invalidate_hard_deletes: bool,
+    /// Optional lakehouse table format (Delta, Iceberg, ...). Lifted from
+    /// [`TransformationPlan::format`]; `None` for non-transformation plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<LakehouseFormat>,
+    /// Format-specific options (partitioning, clustering, properties).
+    /// Lifted from [`TransformationPlan::format_options`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_options: Option<LakehouseOptions>,
 }
 
 impl ModelIr {
@@ -509,7 +573,8 @@ impl ModelIr {
     /// Determinism contract: given two byte-identical [`ModelIr`] values
     /// the returned hash is byte-identical. Mutating any input field
     /// (SQL, typed columns, lineage edges, materialization, governance,
-    /// resolved masks) changes the hash.
+    /// resolved masks, source/target refs, snapshot key/timestamp,
+    /// lakehouse format) changes the hash.
     ///
     /// # Panics
     ///
@@ -520,6 +585,157 @@ impl ModelIr {
     pub fn recipe_hash(&self) -> blake3::Hash {
         let canonical = canonical_json(self);
         blake3::hash(canonical.as_bytes())
+    }
+
+    /// Reconstruct a [`Plan`] from this `ModelIr`, mirroring the
+    /// `From<&Plan> for ModelIr` conversion.
+    ///
+    /// The variant is inferred from which variant-specific fields are
+    /// populated:
+    ///
+    /// - `unique_key` non-empty AND `updated_at` `Some` → [`Plan::Snapshot`]
+    /// - `columns` `Some` (replication carries an explicit
+    ///   [`ColumnSelection`]) → [`Plan::Replication`]
+    /// - otherwise → [`Plan::Transformation`]
+    ///
+    /// Round-trip property: `ModelIr::from(&plan).to_plan_compatible()` is
+    /// canonical-JSON-equal to `plan` for any well-formed input. Used by
+    /// the test suite to verify the conversion is lossless.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a [`ModelIr`] inferred to be a Snapshot is missing
+    /// `source` or if a Replication ModelIr is missing `source`. These
+    /// fields are required on the corresponding [`Plan`] variant; the
+    /// `From<&Plan>` impl always populates them, so this only fires on a
+    /// hand-built `ModelIr` that violates the variant contract.
+    pub fn to_plan_compatible(&self) -> Plan {
+        // Snapshot has both unique_key and updated_at; replication has columns.
+        if !self.unique_key.is_empty() && self.updated_at.is_some() {
+            let source = self
+                .source
+                .clone()
+                .expect("Snapshot ModelIr must carry `source`");
+            let updated_at = self
+                .updated_at
+                .clone()
+                .expect("Snapshot ModelIr must carry `updated_at`");
+            Plan::Snapshot(SnapshotPlan {
+                source,
+                target: self.target.clone(),
+                unique_key: self.unique_key.clone(),
+                updated_at,
+                invalidate_hard_deletes: self.invalidate_hard_deletes,
+                governance: self.governance.clone(),
+            })
+        } else if let Some(columns) = self.columns.clone() {
+            let source = self
+                .source
+                .clone()
+                .expect("Replication ModelIr must carry `source`");
+            Plan::Replication(ReplicationPlan {
+                source,
+                target: self.target.clone(),
+                strategy: self.materialization.clone(),
+                columns,
+                metadata_columns: self.metadata_columns.clone(),
+                governance: self.governance.clone(),
+            })
+        } else {
+            Plan::Transformation(TransformationPlan {
+                sources: self.sources.clone(),
+                target: self.target.clone(),
+                strategy: self.materialization.clone(),
+                sql: self.sql.clone(),
+                governance: self.governance.clone(),
+                format: self.format.clone(),
+                format_options: self.format_options.clone(),
+            })
+        }
+    }
+}
+
+impl From<&Plan> for ModelIr {
+    /// Lossless structural conversion from a [`Plan`] to a [`ModelIr`].
+    ///
+    /// Variant-specific fields are mapped onto the flat [`ModelIr`] shape:
+    ///
+    /// - [`Plan::Replication`] populates `source`, `columns`,
+    ///   `metadata_columns`.
+    /// - [`Plan::Transformation`] populates `sources`, `format`,
+    ///   `format_options`.
+    /// - [`Plan::Snapshot`] populates `source`, `unique_key`, `updated_at`,
+    ///   `invalidate_hard_deletes`.
+    ///
+    /// `name`, `typed_columns`, `lineage_edges`, and `column_masks` are not
+    /// carried by [`Plan`]; they default to the table's own name and empty
+    /// vectors. Callers that have richer typed-column or lineage data
+    /// should populate those fields after construction.
+    fn from(plan: &Plan) -> Self {
+        match plan {
+            Plan::Replication(p) => ModelIr {
+                name: Arc::from(p.target.table.as_str()),
+                sql: String::new(),
+                typed_columns: Vec::new(),
+                lineage_edges: Vec::new(),
+                materialization: p.strategy.clone(),
+                governance: p.governance.clone(),
+                target: p.target.clone(),
+                column_masks: Vec::new(),
+                source: Some(p.source.clone()),
+                sources: Vec::new(),
+                columns: Some(p.columns.clone()),
+                metadata_columns: p.metadata_columns.clone(),
+                unique_key: Vec::new(),
+                updated_at: None,
+                invalidate_hard_deletes: false,
+                format: None,
+                format_options: None,
+            },
+            Plan::Transformation(p) => ModelIr {
+                name: Arc::from(p.target.table.as_str()),
+                sql: p.sql.clone(),
+                typed_columns: Vec::new(),
+                lineage_edges: Vec::new(),
+                materialization: p.strategy.clone(),
+                governance: p.governance.clone(),
+                target: p.target.clone(),
+                column_masks: Vec::new(),
+                source: None,
+                sources: p.sources.clone(),
+                columns: None,
+                metadata_columns: Vec::new(),
+                unique_key: Vec::new(),
+                updated_at: None,
+                invalidate_hard_deletes: false,
+                format: p.format.clone(),
+                format_options: p.format_options.clone(),
+            },
+            Plan::Snapshot(p) => ModelIr {
+                name: Arc::from(p.target.table.as_str()),
+                sql: String::new(),
+                typed_columns: Vec::new(),
+                lineage_edges: Vec::new(),
+                // Snapshots don't have a MaterializationStrategy on the
+                // SnapshotPlan; the SCD2 logic is implicit in
+                // `sql_gen::generate_snapshot_sql`. FullRefresh is the
+                // closest neutral default and matches how snapshot SQL is
+                // generated today.
+                materialization: MaterializationStrategy::FullRefresh,
+                governance: p.governance.clone(),
+                target: p.target.clone(),
+                column_masks: Vec::new(),
+                source: Some(p.source.clone()),
+                sources: Vec::new(),
+                columns: None,
+                metadata_columns: Vec::new(),
+                unique_key: p.unique_key.clone(),
+                updated_at: Some(p.updated_at.clone()),
+                invalidate_hard_deletes: p.invalidate_hard_deletes,
+                format: None,
+                format_options: None,
+            },
+        }
     }
 }
 
@@ -816,7 +1032,29 @@ mod tests {
                 auto_create_catalogs: true,
                 auto_create_schemas: true,
             },
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "raw__shopify".into(),
+                table: "orders".into(),
+            },
             column_masks: vec![],
+            source: Some(SourceRef {
+                catalog: "source_catalog".into(),
+                schema: "src__acme__shopify".into(),
+                table: "orders".into(),
+            }),
+            sources: vec![],
+            columns: Some(ColumnSelection::All),
+            metadata_columns: vec![MetadataColumn {
+                name: "_loaded_by".into(),
+                data_type: "STRING".into(),
+                value: "NULL".into(),
+            }],
+            unique_key: vec![],
+            updated_at: None,
+            invalidate_hard_deletes: false,
+            format: None,
+            format_options: None,
         }
     }
 
@@ -856,23 +1094,35 @@ mod tests {
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "marts__customers".into(),
+                table: "dim_customers".into(),
+            },
             column_masks: vec![ColumnMask {
                 column: Arc::from("email"),
                 strategy: MaskStrategy::Hash,
             }],
+            source: None,
+            sources: vec![SourceRef {
+                catalog: "acme_warehouse".into(),
+                schema: "staging".into(),
+                table: "stg_customers".into(),
+            }],
+            columns: None,
+            metadata_columns: vec![],
+            unique_key: vec![],
+            updated_at: None,
+            invalidate_hard_deletes: false,
+            format: None,
+            format_options: None,
         }
     }
 
-    fn sample_full_refresh_model() -> ModelIr {
-        // [`ModelIr`] does not yet carry SnapshotPlan-specific fields
-        // (`unique_key`, `updated_at`, `invalidate_hard_deletes`). The third
-        // strategy variant exercised by the round-trip suite is therefore
-        // FullRefresh. SnapshotPlan-style coverage will land alongside the
-        // construction-site migration when source/target refs are threaded
-        // through.
+    fn sample_snapshot_model() -> ModelIr {
         ModelIr {
-            name: Arc::from("dim_users_full_refresh"),
-            sql: "SELECT * FROM dim_users".into(),
+            name: Arc::from("dim_users_history"),
+            sql: String::new(),
             typed_columns: vec![],
             lineage_edges: vec![],
             materialization: MaterializationStrategy::FullRefresh,
@@ -881,7 +1131,25 @@ mod tests {
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "snapshots".into(),
+                table: "dim_users_history".into(),
+            },
             column_masks: vec![],
+            source: Some(SourceRef {
+                catalog: "acme_warehouse".into(),
+                schema: "marts".into(),
+                table: "dim_users".into(),
+            }),
+            sources: vec![],
+            columns: None,
+            metadata_columns: vec![],
+            unique_key: vec![Arc::from("user_id")],
+            updated_at: Some("updated_at".into()),
+            invalidate_hard_deletes: true,
+            format: None,
+            format_options: None,
         }
     }
 
@@ -904,8 +1172,8 @@ mod tests {
     }
 
     #[test]
-    fn model_ir_full_refresh_roundtrip_byte_stable() {
-        let m = sample_full_refresh_model();
+    fn model_ir_snapshot_roundtrip_byte_stable() {
+        let m = sample_snapshot_model();
         let json1 = serde_json::to_string(&m).unwrap();
         let back: ModelIr = serde_json::from_str(&json1).unwrap();
         let json2 = serde_json::to_string(&back).unwrap();
@@ -918,7 +1186,7 @@ mod tests {
             models: vec![
                 sample_replication_model(),
                 sample_transformation_model(),
-                sample_full_refresh_model(),
+                sample_snapshot_model(),
             ],
             dag: vec![
                 crate::dag::DagNode {
@@ -930,7 +1198,7 @@ mod tests {
                     depends_on: vec![],
                 },
                 crate::dag::DagNode {
-                    name: "dim_users_full_refresh".into(),
+                    name: "dim_users_history".into(),
                     depends_on: vec!["dim_customers".into()],
                 },
             ],
@@ -966,6 +1234,11 @@ mod tests {
                 "permissions_file": null,
                 "auto_create_catalogs": false,
                 "auto_create_schemas": false
+            },
+            "target": {
+                "catalog": "c",
+                "schema": "s",
+                "table": "t"
             }
         }"#;
         let err = serde_json::from_str::<ModelIr>(json).unwrap_err();
@@ -1047,11 +1320,307 @@ mod tests {
     #[test]
     fn empty_column_masks_omitted_from_serialization() {
         // Rule A consistency: empty Vec on `column_masks` is skipped.
+        // sample_replication_model is the empty-masks fixture (transformation
+        // carries a Hash mask on `email`).
         let m = sample_replication_model();
         let json = serde_json::to_string(&m).unwrap();
         assert!(
             !json.contains("column_masks"),
             "empty column_masks must be skipped per the canonical-JSON rule, got: {json}"
+        );
+    }
+
+    // ----- Plan ↔ ModelIr conversion + variant-coverage tests -----
+
+    fn sample_replication_plan() -> Plan {
+        Plan::Replication(ReplicationPlan {
+            source: SourceRef {
+                catalog: "source_catalog".into(),
+                schema: "src__acme__shopify".into(),
+                table: "orders".into(),
+            },
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "raw__shopify".into(),
+                table: "orders".into(),
+            },
+            strategy: MaterializationStrategy::Incremental {
+                timestamp_column: "_fivetran_synced".into(),
+            },
+            columns: ColumnSelection::Explicit(vec![
+                Arc::from("id"),
+                Arc::from("customer_id"),
+            ]),
+            metadata_columns: vec![MetadataColumn {
+                name: "_loaded_by".into(),
+                data_type: "STRING".into(),
+                value: "NULL".into(),
+            }],
+            governance: GovernanceConfig {
+                permissions_file: Some("perms.yaml".into()),
+                auto_create_catalogs: true,
+                auto_create_schemas: true,
+            },
+        })
+    }
+
+    fn sample_transformation_plan() -> Plan {
+        Plan::Transformation(TransformationPlan {
+            sources: vec![SourceRef {
+                catalog: "acme_warehouse".into(),
+                schema: "staging".into(),
+                table: "stg_customers".into(),
+            }],
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "marts".into(),
+                table: "dim_customers".into(),
+            },
+            strategy: MaterializationStrategy::Merge {
+                unique_key: vec![Arc::from("customer_id")],
+                update_columns: ColumnSelection::All,
+            },
+            sql: "SELECT customer_id, email FROM stg_customers".into(),
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            format: None,
+            format_options: None,
+        })
+    }
+
+    fn sample_snapshot_plan() -> Plan {
+        Plan::Snapshot(SnapshotPlan {
+            source: SourceRef {
+                catalog: "acme_warehouse".into(),
+                schema: "marts".into(),
+                table: "dim_users".into(),
+            },
+            target: TargetRef {
+                catalog: "acme_warehouse".into(),
+                schema: "snapshots".into(),
+                table: "dim_users_history".into(),
+            },
+            unique_key: vec![Arc::from("user_id")],
+            updated_at: "updated_at".into(),
+            invalidate_hard_deletes: true,
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        })
+    }
+
+    /// Canonical-JSON-equality is the equivalence relation used to verify
+    /// the [`Plan`] ↔ [`ModelIr`] round-trip — none of the [`Plan`]
+    /// component types derive `PartialEq`, and adding the derive cascade
+    /// was deemed out of scope for this PR.
+    fn plans_canonical_eq(a: &Plan, b: &Plan) -> bool {
+        canonical_json(a) == canonical_json(b)
+    }
+
+    #[test]
+    fn plan_to_model_ir_replication_roundtrip() {
+        let plan = sample_replication_plan();
+        let ir = ModelIr::from(&plan);
+        let back = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&plan, &back),
+            "replication round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
+            canonical_json(&plan),
+            canonical_json(&back)
+        );
+        assert!(matches!(back, Plan::Replication(_)));
+    }
+
+    #[test]
+    fn plan_to_model_ir_replication_with_merge_strategy_roundtrip() {
+        // Discrimination guardrail: `MaterializationStrategy::Merge` carries
+        // its own `unique_key` field on the strategy enum. The top-level
+        // `ModelIr::unique_key` field must stay empty for a Replication —
+        // otherwise `to_plan_compatible` would mis-classify it as a
+        // [`Plan::Snapshot`] (since updated_at would still be None this
+        // wouldn't actually trigger today, but the test pins the contract).
+        let plan = Plan::Replication(ReplicationPlan {
+            source: SourceRef {
+                catalog: "src".into(),
+                schema: "raw".into(),
+                table: "users".into(),
+            },
+            target: TargetRef {
+                catalog: "tgt".into(),
+                schema: "raw".into(),
+                table: "users".into(),
+            },
+            strategy: MaterializationStrategy::Merge {
+                unique_key: vec![Arc::from("id")],
+                update_columns: ColumnSelection::All,
+            },
+            columns: ColumnSelection::All,
+            metadata_columns: vec![],
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        });
+        let ir = ModelIr::from(&plan);
+        assert!(
+            ir.unique_key.is_empty(),
+            "Merge-strategy unique_key must NOT leak into top-level ModelIr.unique_key"
+        );
+        let back = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&plan, &back),
+            "replication-with-merge round-trip must be canonical-JSON-equal"
+        );
+        assert!(matches!(back, Plan::Replication(_)));
+    }
+
+    #[test]
+    fn plan_to_model_ir_transformation_roundtrip() {
+        let plan = sample_transformation_plan();
+        let ir = ModelIr::from(&plan);
+        let back = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&plan, &back),
+            "transformation round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
+            canonical_json(&plan),
+            canonical_json(&back)
+        );
+        assert!(matches!(back, Plan::Transformation(_)));
+    }
+
+    #[test]
+    fn plan_to_model_ir_snapshot_roundtrip() {
+        let plan = sample_snapshot_plan();
+        let ir = ModelIr::from(&plan);
+        let back = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&plan, &back),
+            "snapshot round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
+            canonical_json(&plan),
+            canonical_json(&back)
+        );
+        assert!(matches!(back, Plan::Snapshot(_)));
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_replication_source_changes() {
+        let mut m = sample_replication_model();
+        let h1 = m.recipe_hash();
+        if let Some(src) = m.source.as_mut() {
+            src.table = "different_table".into();
+        } else {
+            panic!("sample_replication_model must carry source");
+        }
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "changing replication source must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_target_changes() {
+        let mut m = sample_replication_model();
+        let h1 = m.recipe_hash();
+        m.target.table = "different_target".into();
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "changing target must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_unique_key_changes() {
+        let mut m = sample_snapshot_model();
+        let h1 = m.recipe_hash();
+        m.unique_key.push(Arc::from("tenant_id"));
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "changing snapshot unique_key must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_invalidate_hard_deletes_flips() {
+        let mut m = sample_snapshot_model();
+        let h1 = m.recipe_hash();
+        m.invalidate_hard_deletes = !m.invalidate_hard_deletes;
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "flipping invalidate_hard_deletes must propagate into the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_replication_plan_round_trips_into_model_ir_deterministically() {
+        // Same plan input → same ModelIr → same recipe-hash.
+        let plan = sample_replication_plan();
+        let h1 = ModelIr::from(&plan).recipe_hash();
+        let h2 = ModelIr::from(&plan).recipe_hash();
+        assert_eq!(h1, h2, "From<&Plan> must produce a deterministic ModelIr");
+    }
+
+    #[test]
+    fn invalidate_hard_deletes_default_omitted_from_serialization() {
+        // Rule A bool-default extension: `false` is the semantic default and
+        // must be skipped per the canonical-JSON rule.
+        let m = sample_replication_model();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("invalidate_hard_deletes"),
+            "default-false invalidate_hard_deletes must be skipped, got: {json}"
+        );
+    }
+
+    #[test]
+    fn empty_sources_omitted_from_replication_serialization() {
+        // Replication models populate `source` (singular) but not `sources`
+        // (plural Vec). The empty Vec must be skipped per the canonical
+        // JSON rule.
+        let m = sample_replication_model();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("\"sources\":"),
+            "empty sources Vec must be skipped, got: {json}"
+        );
+    }
+
+    #[test]
+    fn empty_unique_key_omitted_from_replication_serialization() {
+        let m = sample_replication_model();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("\"unique_key\":"),
+            "empty unique_key Vec must be skipped, got: {json}"
+        );
+    }
+
+    #[test]
+    fn columns_field_present_only_for_replication() {
+        let rep = sample_replication_model();
+        let tx = sample_transformation_model();
+        let snap = sample_snapshot_model();
+
+        assert!(
+            serde_json::to_string(&rep).unwrap().contains("\"columns\":"),
+            "replication ModelIr must serialize `columns`"
+        );
+        assert!(
+            !serde_json::to_string(&tx).unwrap().contains("\"columns\":"),
+            "transformation ModelIr must omit `columns`"
+        );
+        assert!(
+            !serde_json::to_string(&snap).unwrap().contains("\"columns\":"),
+            "snapshot ModelIr must omit `columns`"
         );
     }
 }
