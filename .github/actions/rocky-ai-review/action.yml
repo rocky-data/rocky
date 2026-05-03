@@ -1,0 +1,388 @@
+name: 'Rocky AI Review'
+description: >-
+  Run an LLM-powered code review on the pipeline changes in a pull request.
+  Composes `rocky compile` + `rocky ci-diff` + `rocky lineage-diff` +
+  `git diff` outputs into a prompt sent to the Anthropic Messages API,
+  then upserts the result as a Markdown PR comment. Decoupled from the
+  deterministic `rocky-preview` action so AI cost is opt-in per repo.
+
+inputs:
+  base_ref:
+    description: 'Git ref to compare against (e.g. main, the PR base branch).'
+    required: true
+  working_directory:
+    description: >-
+      Directory containing `rocky.toml`. The action cd's here before
+      invoking every rocky subcommand.
+    required: false
+    default: '.'
+  models_dir:
+    description: 'Directory containing the model files. Passed to `rocky compile --models`.'
+    required: false
+    default: 'models'
+  rocky_version:
+    description: >-
+      Engine version to install. `latest` (default) resolves the highest
+      `engine-v*` tag; otherwise pass a bare version like `1.24.0` or a
+      full tag like `engine-v1.24.0`.
+    required: false
+    default: 'latest'
+  anthropic_api_key:
+    description: >-
+      Anthropic API key. Pass via a repo-level secret (e.g.
+      `${{ secrets.ANTHROPIC_API_KEY }}`). Required — the action no-ops
+      with a comment-only failure note if absent so a misconfigured
+      workflow doesn't fail the PR check.
+    required: true
+  model:
+    description: >-
+      Anthropic model identifier. Defaults to the latest Sonnet at
+      action-publish time; override to a smaller/faster model for high-PR-
+      volume repos or to a future Opus for higher-quality reviews.
+    required: false
+    default: 'claude-sonnet-4-6'
+  max_tokens:
+    description: >-
+      Per-request `max_tokens`. Bounds worst-case cost on a runaway
+      response. The default is generous enough for a multi-section review
+      on a typical Rocky PR; lower for cost-sensitive setups.
+    required: false
+    default: '4096'
+  diff_byte_limit:
+    description: >-
+      Max bytes of `git diff` to embed in the prompt. Guards against
+      pathologically large PRs blowing the context window. Truncated
+      payload includes a marker so the LLM knows the diff was clipped.
+    required: false
+    default: '32768'
+  comment_marker:
+    description: >-
+      HTML-comment magic string used to find and edit the existing PR
+      comment. Override only if you run multiple AI-review workflows on
+      the same PR and need to disambiguate them.
+    required: false
+    default: '<!-- rocky-ai-review -->'
+  github_token:
+    description: >-
+      Token used to read the PR and upsert the comment. Pass the
+      workflow's github.token (or a PAT for cross-repo permissions).
+      Required because composite actions cannot reference the github
+      context in input defaults.
+    required: true
+
+outputs:
+  comment_url:
+    description: 'HTML URL of the upserted PR comment.'
+    value: ${{ steps.upsert-comment.outputs.comment_url }}
+  review_status:
+    description: >-
+      `ok` when the LLM call succeeded and a review was rendered;
+      `disabled` when `anthropic_api_key` was empty; `failed` on any
+      stage error (compile, ci, LLM HTTP).
+    value: ${{ steps.run-ai-review.outputs.review_status }}
+
+runs:
+  using: 'composite'
+  steps:
+    # --- Step 1: install rocky ----------------------------------------------
+    #
+    # Mirrors `.github/actions/rocky-preview` install logic. install.sh
+    # filters by `engine-v*` tag prefix and verifies SHA256 against the
+    # published checksums.
+    - name: Install rocky (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        export ROCKY_INSTALL_DIR="$HOME/.local/bin"
+        mkdir -p "$ROCKY_INSTALL_DIR"
+        if [ "${{ inputs.rocky_version }}" = "latest" ]; then
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+        else
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "${{ inputs.rocky_version }}"
+        fi
+        echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Install rocky (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if ('${{ inputs.rocky_version }}' -ne 'latest') {
+          $env:ROCKY_VERSION = '${{ inputs.rocky_version }}'
+        }
+        irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
+        Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
+
+    # --- Step 2: gather context for the LLM prompt --------------------------
+    #
+    # Each subcommand runs with `set +e` so a single failure doesn't abort
+    # the action; the comment-rendering step still posts whatever context
+    # we did manage to collect, with a per-stage failure note.
+    #
+    # Captured inputs (in priority order — the prompt embeds them in this
+    # order so the LLM sees the most actionable context first):
+    #   1. `git diff <base>...HEAD` — the actual changeset.
+    #   2. `rocky ci-diff <base>` — structural diff (added / removed /
+    #      type-changed columns between base and HEAD).
+    #   3. `rocky lineage-diff <base>` — per-changed-column downstream
+    #      blast radius (which downstream columns each change reaches).
+    #   4. `rocky compile --output json` — typed model schemas + diagnostics
+    #      across the whole project (broader context the diff alone misses).
+    - name: Collect Rocky context
+      id: collect
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base_ref }}
+        MODELS_DIR: ${{ inputs.models_dir }}
+        DIFF_BYTE_LIMIT: ${{ inputs.diff_byte_limit }}
+      run: |
+        set -uo pipefail
+        cd "${{ inputs.working_directory }}"
+
+        WORK="$RUNNER_TEMP/rocky-ai-review"
+        mkdir -p "$WORK"
+
+        # ---- git diff ----
+        : > "$WORK/diff_failed"
+        if git diff "${BASE_REF}...HEAD" > "$WORK/diff.txt" 2> "$WORK/diff.err"; then
+          # Truncate per `diff_byte_limit` so the prompt stays bounded on
+          # huge PRs. The marker lets the LLM know the truncation happened.
+          if [ "$(wc -c < "$WORK/diff.txt")" -gt "$DIFF_BYTE_LIMIT" ]; then
+            head -c "$DIFF_BYTE_LIMIT" "$WORK/diff.txt" > "$WORK/diff.txt.tmp"
+            printf '\n\n…[diff truncated to %s bytes — see GitHub Files tab for the rest]\n' \
+              "$DIFF_BYTE_LIMIT" >> "$WORK/diff.txt.tmp"
+            mv "$WORK/diff.txt.tmp" "$WORK/diff.txt"
+          fi
+        else
+          echo failed > "$WORK/diff_failed"
+        fi
+
+        # ---- rocky compile --output json ----
+        : > "$WORK/compile_failed"
+        if rocky compile --models "$MODELS_DIR" --output json \
+            > "$WORK/compile.json" 2> "$WORK/compile.err"; then
+          :
+        else
+          echo failed > "$WORK/compile_failed"
+        fi
+
+        # ---- rocky ci-diff <base> ----
+        : > "$WORK/ci_failed"
+        if rocky ci-diff "$BASE_REF" --models "$MODELS_DIR" --output json \
+            > "$WORK/ci.json" 2> "$WORK/ci.err"; then
+          :
+        else
+          echo failed > "$WORK/ci_failed"
+        fi
+
+        # ---- rocky lineage-diff <base> ----
+        : > "$WORK/lineage_failed"
+        if rocky lineage-diff "$BASE_REF" --models "$MODELS_DIR" --output json \
+            > "$WORK/lineage.json" 2> "$WORK/lineage.err"; then
+          :
+        else
+          echo failed > "$WORK/lineage_failed"
+        fi
+
+        echo "work_dir=$WORK" >> "$GITHUB_OUTPUT"
+
+    # --- Step 3: call Anthropic API + render the review --------------------
+    #
+    # Single curl call. Retries are intentionally absent — a failed LLM
+    # request lands in the comment as a structured failure note rather than
+    # silently spending money on retries. Caller can re-run the workflow.
+    - name: Run AI review
+      id: run-ai-review
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.collect.outputs.work_dir }}
+        BASE_REF: ${{ inputs.base_ref }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        ANTHROPIC_MODEL: ${{ inputs.model }}
+        AI_MAX_TOKENS: ${{ inputs.max_tokens }}
+      run: |
+        set -uo pipefail
+
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+          echo "review_status=disabled" >> "$GITHUB_OUTPUT"
+          printf '_AI review disabled: `anthropic_api_key` input is empty. Set the `ANTHROPIC_API_KEY` repository secret and pass it through the workflow._\n' \
+            > "$WORK_DIR/review.md"
+          exit 0
+        fi
+
+        # ---- assemble the user prompt ----
+        PROMPT="$WORK_DIR/prompt.txt"
+        : > "$PROMPT"
+        printf 'You are reviewing a pull request against a Rocky data pipeline.\n\n' >> "$PROMPT"
+        printf 'Base branch: `%s`\n\n' "$BASE_REF" >> "$PROMPT"
+
+        printf '## Git diff\n\n```diff\n' >> "$PROMPT"
+        if [ -s "$WORK_DIR/diff_failed" ]; then
+          printf '(diff capture failed — stderr: %s)\n' "$(head -c 512 "$WORK_DIR/diff.err" 2>/dev/null || true)" >> "$PROMPT"
+        elif [ -s "$WORK_DIR/diff.txt" ]; then
+          cat "$WORK_DIR/diff.txt" >> "$PROMPT"
+        else
+          printf '(empty diff)\n' >> "$PROMPT"
+        fi
+        printf '\n```\n\n' >> "$PROMPT"
+
+        printf '## rocky ci-diff (structural column-level diff)\n\n```json\n' >> "$PROMPT"
+        if [ -s "$WORK_DIR/ci_failed" ]; then
+          printf '(rocky ci-diff failed — stderr: %s)\n' "$(head -c 512 "$WORK_DIR/ci.err" 2>/dev/null || true)" >> "$PROMPT"
+        elif [ -s "$WORK_DIR/ci.json" ]; then
+          cat "$WORK_DIR/ci.json" >> "$PROMPT"
+        else
+          printf '(no payload)\n' >> "$PROMPT"
+        fi
+        printf '\n```\n\n' >> "$PROMPT"
+
+        printf '## rocky lineage-diff (downstream blast radius)\n\n```json\n' >> "$PROMPT"
+        if [ -s "$WORK_DIR/lineage_failed" ]; then
+          printf '(rocky lineage-diff failed — stderr: %s)\n' "$(head -c 512 "$WORK_DIR/lineage.err" 2>/dev/null || true)" >> "$PROMPT"
+        elif [ -s "$WORK_DIR/lineage.json" ]; then
+          cat "$WORK_DIR/lineage.json" >> "$PROMPT"
+        else
+          printf '(no payload)\n' >> "$PROMPT"
+        fi
+        printf '\n```\n\n' >> "$PROMPT"
+
+        printf '## rocky compile (typed schemas + diagnostics)\n\n```json\n' >> "$PROMPT"
+        if [ -s "$WORK_DIR/compile_failed" ]; then
+          printf '(rocky compile failed — stderr: %s)\n' "$(head -c 512 "$WORK_DIR/compile.err" 2>/dev/null || true)" >> "$PROMPT"
+        elif [ -s "$WORK_DIR/compile.json" ]; then
+          cat "$WORK_DIR/compile.json" >> "$PROMPT"
+        else
+          printf '(no payload)\n' >> "$PROMPT"
+        fi
+        printf '\n```\n\n' >> "$PROMPT"
+
+        # ---- request body ----
+        REQ="$WORK_DIR/request.json"
+        SYSTEM='You are a senior data engineer reviewing a Rocky pipeline pull request. Focus on: contract violations, schema-drift risk, materialization-strategy correctness, SQL correctness on the warehouse the project targets, governance regressions (mask / classification / retention drift), and test coverage gaps surfaced by the CI diff. Output Markdown with these sections in order, in this exact heading shape — `### Risk summary`, `### Findings`, `### Suggestions`, `### Looks good`. Keep findings concise; cite the file and approximate line where useful. Skip a section if you have nothing to say there. Do not invent data the inputs do not show.'
+
+        jq -n \
+          --arg model "$ANTHROPIC_MODEL" \
+          --argjson max_tokens "$AI_MAX_TOKENS" \
+          --arg system "$SYSTEM" \
+          --rawfile prompt "$PROMPT" \
+          '{
+            model: $model,
+            max_tokens: $max_tokens,
+            system: $system,
+            messages: [{role: "user", content: $prompt}]
+          }' > "$REQ"
+
+        # ---- POST to Anthropic ----
+        RESP="$WORK_DIR/response.json"
+        HTTP_CODE=$(curl -sS -w '%{http_code}' -o "$RESP" \
+          -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "content-type: application/json" \
+          --data-binary "@${REQ}" \
+          https://api.anthropic.com/v1/messages || echo "000")
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "review_status=failed" >> "$GITHUB_OUTPUT"
+          {
+            printf '### :x: Anthropic API call failed\n\n'
+            printf 'HTTP status: `%s`\n\n```json\n' "$HTTP_CODE"
+            head -c 4096 "$RESP" 2>/dev/null || printf '(no response body)'
+            printf '\n```\n'
+          } > "$WORK_DIR/review.md"
+          exit 0
+        fi
+
+        # ---- extract the markdown from the response ----
+        if jq -e '.content[0].text' "$RESP" > /dev/null 2>&1; then
+          jq -r '.content[0].text' "$RESP" > "$WORK_DIR/review.md"
+          INPUT_TOKENS=$(jq -r '.usage.input_tokens // ""' "$RESP" 2>/dev/null || true)
+          OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // ""' "$RESP" 2>/dev/null || true)
+          {
+            printf '\n\n---\n\n_Tokens: %s in / %s out · model `%s`_\n' \
+              "${INPUT_TOKENS:-?}" "${OUTPUT_TOKENS:-?}" "$ANTHROPIC_MODEL"
+          } >> "$WORK_DIR/review.md"
+          echo "review_status=ok" >> "$GITHUB_OUTPUT"
+        else
+          echo "review_status=failed" >> "$GITHUB_OUTPUT"
+          {
+            printf '### :x: Anthropic response did not contain a text block\n\n```json\n'
+            head -c 4096 "$RESP"
+            printf '\n```\n'
+          } > "$WORK_DIR/review.md"
+        fi
+
+    # --- Step 4: assemble the Markdown comment body ------------------------
+    - name: Render PR comment body
+      id: render
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.collect.outputs.work_dir }}
+        BASE_REF: ${{ inputs.base_ref }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+        MODEL_NAME: ${{ inputs.model }}
+      run: |
+        set -euo pipefail
+        BODY="$RUNNER_TEMP/rocky-ai-review-body.md"
+        : > "$BODY"
+
+        printf '%s\n' "$COMMENT_MARKER" >> "$BODY"
+        printf '## :robot: Rocky AI review — vs `%s`\n\n' "$BASE_REF" >> "$BODY"
+
+        if [ -s "$WORK_DIR/review.md" ]; then
+          cat "$WORK_DIR/review.md" >> "$BODY"
+        else
+          printf '_AI review produced no output._\n' >> "$BODY"
+        fi
+
+        printf '\n---\n\n_Posted by `.github/actions/rocky-ai-review` · automated; treat as advisory._\n' >> "$BODY"
+
+        echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
+
+    # --- Step 5: upsert the PR comment -------------------------------------
+    - name: Upsert PR comment
+      id: upsert-comment
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        BODY_PATH: ${{ steps.render.outputs.body_path }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const body = fs.readFileSync(process.env.BODY_PATH, 'utf8');
+          const marker = process.env.COMMENT_MARKER;
+          const issue_number = context.payload.pull_request.number;
+          const { owner, repo } = context.repo;
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number,
+            per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+          let url;
+          if (existing) {
+            const { data } = await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existing.id,
+              body,
+            });
+            url = data.html_url;
+          } else {
+            const { data } = await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+            url = data.html_url;
+          }
+          core.setOutput('comment_url', url);
+
+branding:
+  icon: 'cpu'
+  color: 'purple'
