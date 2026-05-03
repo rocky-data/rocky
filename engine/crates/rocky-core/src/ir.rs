@@ -1347,10 +1347,7 @@ mod tests {
             strategy: MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
             },
-            columns: ColumnSelection::Explicit(vec![
-                Arc::from("id"),
-                Arc::from("customer_id"),
-            ]),
+            columns: ColumnSelection::Explicit(vec![Arc::from("id"), Arc::from("customer_id")]),
             metadata_columns: vec![MetadataColumn {
                 name: "_loaded_by".into(),
                 data_type: "STRING".into(),
@@ -1611,7 +1608,9 @@ mod tests {
         let snap = sample_snapshot_model();
 
         assert!(
-            serde_json::to_string(&rep).unwrap().contains("\"columns\":"),
+            serde_json::to_string(&rep)
+                .unwrap()
+                .contains("\"columns\":"),
             "replication ModelIr must serialize `columns`"
         );
         assert!(
@@ -1619,7 +1618,9 @@ mod tests {
             "transformation ModelIr must omit `columns`"
         );
         assert!(
-            !serde_json::to_string(&snap).unwrap().contains("\"columns\":"),
+            !serde_json::to_string(&snap)
+                .unwrap()
+                .contains("\"columns\":"),
             "snapshot ModelIr must omit `columns`"
         );
     }
