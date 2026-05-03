@@ -2,9 +2,9 @@
 
 A curated catalog of small POCs that showcase the distinctive capabilities of [Rocky](https://github.com/rocky-data/rocky), plus the benchmark suite comparing Rocky against dbt-core, dbt-fusion, and PySpark.
 
-This repo is a **learning / reference** companion to the official [rocky/examples/](https://github.com/rocky-data/rocky/tree/main/examples) starter projects. The starters show you the shape of a Rocky project; the POCs here show you *what Rocky can do that other tools can't*.
+This catalog is a **learning / reference** companion to the official [rocky/engine/examples/](https://github.com/rocky-data/rocky/tree/main/engine/examples) starter projects. The starters show you the shape of a Rocky project; the POCs here show you *what Rocky can do that other tools can't*.
 
-## When to look here vs `rocky/examples/`
+## When to look here vs `engine/examples/`
 
 | You want to... | Look at |
 |---|---|

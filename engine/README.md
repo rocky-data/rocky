@@ -85,6 +85,8 @@ Full reference: [CLI commands](https://rocky-data.dev/reference/cli/).
 | Role | Adapter | Status | Notes |
 |------|---------|--------|-------|
 | Source | Fivetran | Production | REST API discovery of connectors and tables |
+| Source | Airbyte | Beta | Airbyte API discovery of connections and streams |
+| Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |
 | Source | Manual | Production | Schema/table lists inline in `rocky.toml` |
 | Warehouse | Databricks | Production | SQL Statement API + Unity Catalog governance |
 | Warehouse | Snowflake | Beta | SQL execution via Snowflake connector |

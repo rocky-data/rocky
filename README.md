@@ -121,7 +121,7 @@ Tag PII columns in the model sidecar; bind tags to mask strategies in `[mask]` /
 
 | Path | Artifact | Language | Description |
 |---|---|---|---|
-| [`engine/`](engine/) | `rocky` CLI binary | Rust | Core SQL transformation engine — 20-crate Cargo workspace |
+| [`engine/`](engine/) | `rocky` CLI binary | Rust | Core SQL transformation engine — 21-crate Cargo workspace |
 | [`integrations/dagster/`](integrations/dagster/) | `dagster-rocky` PyPI wheel | Python | Dagster resource and component wrapping the Rocky CLI |
 | [`editors/vscode/`](editors/vscode/) | Rocky VSIX | TypeScript | VS Code extension — LSP client + commands for AI features |
 | [`examples/playground/`](examples/playground/) | (config only) | TOML / SQL | Self-contained DuckDB sample pipeline used for smoke tests and benchmarks |

@@ -17,7 +17,7 @@ Language support for the [Rocky](https://github.com/rocky-data/rocky) SQL transf
 ## Requirements
 
 - **[Rocky CLI](https://github.com/rocky-data/rocky/releases?q=engine)** on your `PATH` (or set `rocky.server.path`)
-- **VS Code** 1.85.0+
+- **VS Code** 1.116.0+
 
 ## Install
 
