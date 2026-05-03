@@ -788,7 +788,6 @@ mod tests {
             },
             strategy: MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
-                watermark: None,
             },
             columns: ColumnSelection::All,
             metadata_columns: vec![MetadataColumn {
@@ -1060,7 +1059,6 @@ mod tests {
             },
             strategy: MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
-                watermark: None,
             },
             sql: "SELECT * FROM cat.sch.raw_orders WHERE updated_at > '2026-01-01'".into(),
             governance: GovernanceConfig {
@@ -1609,7 +1607,6 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             LakehouseOptions::default(),
             MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
-                watermark: None,
             },
         );
         let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
@@ -1632,7 +1629,6 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
-                watermark: None,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();

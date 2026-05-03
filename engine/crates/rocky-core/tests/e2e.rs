@@ -262,10 +262,11 @@ fn test_incremental_pipeline_with_watermark() {
         )
         .unwrap();
 
-    // Build an incremental plan using the stored watermark
+    // Build an incremental plan; the watermark itself is read from the
+    // state store at SQL-generation time, not carried on the strategy.
+    let _wm = store.get_watermark(table_key).unwrap();
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
-        watermark: store.get_watermark(table_key).unwrap(),
     });
 
     // Generate INSERT INTO ... SELECT SQL (incremental append)
@@ -578,7 +579,6 @@ fn test_transformation_incremental() {
         },
         strategy: MaterializationStrategy::Incremental {
             timestamp_column: "updated_at".into(),
-            watermark: None,
         },
         sql: "SELECT * FROM cat.raw.events WHERE updated_at > '2026-01-01'".into(),
         governance: GovernanceConfig {
@@ -925,9 +925,11 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let wm = store.get_watermark(table_key).unwrap();
     assert!(wm.is_some(), "watermark should exist after first run");
 
+    // The watermark value lives in the state store and is consulted by the
+    // SQL generator at execution time; the strategy itself no longer
+    // carries it.
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
-        watermark: wm,
     });
     let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
     assert!(sql.contains("INSERT INTO"));
@@ -1019,7 +1021,6 @@ fn test_exact_incremental_sql_output() {
 
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
-        watermark: None,
     });
 
     let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
@@ -1070,7 +1071,6 @@ fn test_exact_insert_sql_output() {
 
     let plan = sample_replication_plan(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
-        watermark: None,
     });
     let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
 

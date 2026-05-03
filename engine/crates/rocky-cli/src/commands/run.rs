@@ -4388,7 +4388,6 @@ async fn process_table(
         strategy: if pipeline.strategy == "incremental" {
             MaterializationStrategy::Incremental {
                 timestamp_column: pipeline.timestamp_column.clone(),
-                watermark: None,
             }
         } else {
             MaterializationStrategy::FullRefresh

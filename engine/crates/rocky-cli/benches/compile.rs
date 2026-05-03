@@ -256,7 +256,6 @@ fn bench_sql_generation(c: &mut Criterion) {
                 } else {
                     MaterializationStrategy::Incremental {
                         timestamp_column: "_fivetran_synced".into(),
-                        watermark: None,
                     }
                 },
                 columns: ColumnSelection::All,

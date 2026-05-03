@@ -172,13 +172,15 @@ async fn test_incremental_pipeline_two_runs() {
     .await
     .unwrap();
 
-    // Run 2: incremental (only new rows)
+    // Run 2: incremental (only new rows). The watermark itself is read
+    // from the state store at SQL-generation time, not carried on the
+    // strategy.
+    let _wm = store.get_watermark("target.events").unwrap();
     let plan2 = duckdb_replication_plan(
         "events",
         "events",
         MaterializationStrategy::Incremental {
             timestamp_column: "_fivetran_synced".into(),
-            watermark: store.get_watermark("target.events").unwrap(),
         },
     );
     let sql2 = sql_gen::generate_insert_sql(&plan2, &d).unwrap();

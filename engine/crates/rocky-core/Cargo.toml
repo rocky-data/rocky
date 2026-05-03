@@ -33,6 +33,7 @@ futures = { workspace = true }
 lasso = { version = "0.7", features = ["multi-threaded"] }
 memmap2 = "0.9"
 rayon = "1"
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
