@@ -4015,6 +4015,7 @@ dependencies = [
  "indexmap",
  "notify",
  "reqwest",
+ "rocky-ai",
  "rocky-compiler",
  "rocky-core",
  "rocky-lang",

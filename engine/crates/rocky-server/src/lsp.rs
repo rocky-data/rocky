@@ -784,7 +784,18 @@ impl LanguageServer for RockyLsp {
                     retrigger_characters: None,
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // `resolve_provider` is opt-in: the deterministic E010/E013
+                // quickfix and the existing E001/E002/E003 fix-up paths fill
+                // in `edit` synchronously. Only the AI fallback for E010/E013
+                // returns an unresolved action whose `edit` is computed in
+                // `code_action_resolve` (LLM call lives there).
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: Some(true),
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                    },
+                )),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -1788,12 +1799,13 @@ impl LanguageServer for RockyLsp {
                     // that re-adds the missing/protected column. Skipped when the model
                     // uses `.rocky` DSL or `SELECT *`, or when no upstream model exposes
                     // the column (the structural validation that replaces a recompile
-                    // round-trip).
+                    // round-trip). The AI fallback below picks up the latter cases.
                     let Some(model) = self.model_for_uri(result, uri) else {
                         continue;
                     };
+                    let code_str = code.unwrap();
                     if let Some((edit, title)) = build_contract_quickfix(
-                        code.unwrap(),
+                        code_str,
                         &diag.message,
                         model,
                         &result.type_check.typed_models,
@@ -1810,6 +1822,13 @@ impl LanguageServer for RockyLsp {
                             }),
                             ..Default::default()
                         }));
+                    } else if let Some(action) =
+                        build_ai_contract_action(code_str, &diag.message, model, uri, diag)
+                    {
+                        // AI fallback — `edit` is left `None` and computed in
+                        // `code_action_resolve` so the LLM call doesn't block
+                        // the synchronous `textDocument/codeAction` response.
+                        actions.push(CodeActionOrCommand::CodeAction(action));
                     }
                 }
                 _ => {
@@ -1833,6 +1852,67 @@ impl LanguageServer for RockyLsp {
         } else {
             Ok(Some(actions))
         }
+    }
+
+    /// Resolve a deferred code action — currently only the AI fallback for
+    /// E010 / E013 contract diagnostics. Synchronous code actions
+    /// (deterministic E010 / E013, E001, E002, E003, suggestion arm) are
+    /// already fully populated when emitted from `code_action` and pass
+    /// through this handler unchanged on the rare client that still calls
+    /// resolve on them.
+    async fn code_action_resolve(&self, mut action: CodeAction) -> Result<CodeAction> {
+        let Some(data) = action.data.take() else {
+            // Nothing to resolve — return the action as-is. tower-lsp / VS
+            // Code only invoke resolve when `edit` is missing on a returned
+            // action, but the LSP spec allows a no-op response.
+            return Ok(action);
+        };
+
+        let resolved_data: AiContractActionData = match serde_json::from_value(data.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                // Unknown deferred shape — surface a diagnostic on the
+                // action and short-circuit. This keeps a future resolve-using
+                // arm (different `kind` field) from accidentally crashing
+                // the LSP if it forgets to register here.
+                tracing::warn!(error = %e, raw = ?data, "code_action_resolve received unknown data shape");
+                action.data = Some(data);
+                return Ok(action);
+            }
+        };
+
+        // Compile-result snapshot — we need typed schemas for the upstream
+        // models so the prompt is grounded in real columns, not guessed
+        // ones. If the compile result has cycled (e.g. user typed since the
+        // action was emitted), we still proceed with the snapshot in `data`
+        // — the prompt is best-effort, the LLM gets enough context to fix
+        // the SQL even if upstream schemas have shifted.
+        let lock = self.compile_result.read().await;
+        let typed_models = lock
+            .as_ref()
+            .map(|r| r.type_check.typed_models.clone())
+            .unwrap_or_default();
+        drop(lock);
+
+        let outcome = resolve_ai_contract_action(&resolved_data, &typed_models).await;
+        match outcome {
+            AiResolveOutcome::Edit(edit) => {
+                let mut changes = HashMap::new();
+                changes.insert(resolved_data.uri.clone(), vec![edit]);
+                action.edit = Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                });
+            }
+            AiResolveOutcome::Disabled(reason) => {
+                // Surface the reason in the title so VS Code shows it in the
+                // quick-fix menu rather than silently doing nothing. The
+                // action stays selectable; selecting it is a no-op.
+                action.title = format!("{} ({reason})", action.title);
+            }
+        }
+
+        Ok(action)
     }
 
     // ── Inlay Hints (Phase 2F) ──────────────────────────────────────────────
@@ -2464,6 +2544,271 @@ pub(crate) fn build_contract_quickfix(
         },
         title,
     ))
+}
+
+// ── AI fallback for E010 / E013 ────────────────────────────────────────────
+
+/// Marker on the deferred `CodeAction.data` payload so
+/// [`code_action_resolve`] can tell our payload apart from any other
+/// resolve-using code action that lands later.
+const AI_CONTRACT_FIX_KIND: &str = "rocky.ai-contract-fix.v1";
+
+/// Environment variable that gates the AI fallback. Only env-var-based;
+/// the LSP server doesn't currently surface a richer credentials channel
+/// and matching `rocky ai`'s behaviour keeps the rules predictable.
+const AI_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// Serializable payload threaded from [`code_action`] into
+/// [`code_action_resolve`] via the LSP `CodeAction.data` field.
+///
+/// Carrying the model SQL + URI inline (instead of re-deriving from the
+/// compile result on resolve) keeps the resolve handler robust against
+/// document edits that race the resolve callback.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AiContractActionData {
+    /// Marker matching [`AI_CONTRACT_FIX_KIND`].
+    kind: String,
+    /// Diagnostic code: `"E010"` or `"E013"`.
+    diagnostic_code: String,
+    /// Diagnostic message verbatim (the column name is parsed back out at
+    /// resolve time).
+    diagnostic_message: String,
+    /// Model name (project-unique).
+    model_name: String,
+    /// Model SQL captured at code-action time. Resolve replaces this whole
+    /// span with the LLM output, regardless of intervening edits — the
+    /// alternative would risk producing partial overwrites.
+    model_sql: String,
+    /// LSP URI of the model file. Used as the key in the `WorkspaceEdit`.
+    uri: tower_lsp::lsp_types::Url,
+    /// Direct upstreams of the model — the prompt context lists these so
+    /// the LLM knows where to source the missing column.
+    upstream_models: Vec<String>,
+}
+
+/// Outcome of the LLM-backed resolve step.
+#[derive(Debug)]
+pub(crate) enum AiResolveOutcome {
+    /// LLM produced a usable rewrite; emit this `TextEdit`.
+    Edit(TextEdit),
+    /// AI fallback could not run (no API key, network failure, malformed
+    /// LLM output). The wrapped string is appended to the action title so
+    /// the user sees why selecting it didn't change anything.
+    Disabled(String),
+}
+
+/// Build the deferred AI code-action when the deterministic
+/// [`build_contract_quickfix`] returns `None`. The payload here is
+/// pure-data; the LLM call lives in [`resolve_ai_contract_action`] and is
+/// fired only when the user selects the action.
+///
+/// Returns `None` for `.rocky` DSL files (separate auto-fix path) and when
+/// the diagnostic message doesn't parse as an E010 / E013 message — those
+/// are bugs in the compiler diagnostic emitter rather than fixable
+/// at-the-edge by an LLM.
+pub(crate) fn build_ai_contract_action(
+    code: &str,
+    message: &str,
+    model: &rocky_core::models::Model,
+    uri: &tower_lsp::lsp_types::Url,
+    diag: &Diagnostic,
+) -> Option<CodeAction> {
+    if model.file_path.ends_with(".rocky") {
+        return None;
+    }
+
+    let column = parse_contract_column(code, message)?;
+    let title = match code {
+        "E010" => format!("AI fix: add required column '{column}' to projection"),
+        "E013" => format!("AI fix: restore protected column '{column}'"),
+        _ => return None,
+    };
+
+    let data = AiContractActionData {
+        kind: AI_CONTRACT_FIX_KIND.to_string(),
+        diagnostic_code: code.to_string(),
+        diagnostic_message: message.to_string(),
+        model_name: model.config.name.clone(),
+        model_sql: model.sql.clone(),
+        uri: uri.clone(),
+        upstream_models: model.config.depends_on.clone(),
+    };
+
+    Some(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: None,
+        data: Some(serde_json::to_value(data).ok()?),
+        ..Default::default()
+    })
+}
+
+/// Pull the column name out of an E010 / E013 diagnostic message.
+/// Returns `None` if the message doesn't match the expected shape — the
+/// compiler emits these strings, so divergence is a regression rather
+/// than untrusted-input handling.
+fn parse_contract_column<'a>(code: &str, message: &'a str) -> Option<&'a str> {
+    match code {
+        "E010" => message
+            .strip_prefix("required column '")?
+            .strip_suffix("' missing from model output"),
+        "E013" => message
+            .strip_prefix("protected column '")?
+            .strip_suffix("' has been removed"),
+        _ => None,
+    }
+}
+
+/// Run the LLM call for an AI contract fix and convert the response into
+/// a `TextEdit` that replaces the entire model SQL.
+///
+/// Replacing the whole SQL (rather than computing a surgical diff) keeps
+/// the logic simple: the LLM returns the revised SQL, we wrap it in a
+/// `TextEdit` spanning the model's current document range. Any structural
+/// drift between request and response (the LLM moves clauses, adds CTEs,
+/// renames aliases) lands cleanly in one apply step.
+async fn resolve_ai_contract_action(
+    data: &AiContractActionData,
+    typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> AiResolveOutcome {
+    let api_key = match std::env::var(AI_API_KEY_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return AiResolveOutcome::Disabled(format!(
+                "{AI_API_KEY_ENV} not set in the LSP environment"
+            ));
+        }
+    };
+
+    let column = match parse_contract_column(&data.diagnostic_code, &data.diagnostic_message) {
+        Some(c) => c,
+        None => {
+            return AiResolveOutcome::Disabled(
+                "diagnostic message did not match E010 / E013 shape".to_string(),
+            );
+        }
+    };
+
+    let upstream_block = render_upstream_schemas(&data.upstream_models, typed_models);
+    let (system_prompt, user_prompt) = build_contract_fix_prompt(
+        &data.model_name,
+        &data.diagnostic_code,
+        &data.diagnostic_message,
+        column,
+        &data.model_sql,
+        &upstream_block,
+    );
+
+    let ai_config = rocky_ai::client::AiConfig {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        api_key: rocky_core::redacted::RedactedString::new(api_key),
+        default_format: "sql".to_string(),
+        max_attempts: 1,
+        max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+    };
+
+    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+        Ok(c) => c,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+
+    let response = match client.generate(&system_prompt, &user_prompt, None).await {
+        Ok(r) => r,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI request failed: {e}")),
+    };
+
+    let extracted = rocky_ai::generate::extract_code(&response.content);
+    let revised_sql = extracted.trim();
+    if revised_sql.is_empty() {
+        return AiResolveOutcome::Disabled(
+            "AI response did not contain a SQL code block".to_string(),
+        );
+    }
+
+    AiResolveOutcome::Edit(TextEdit {
+        range: full_document_range(&data.model_sql),
+        new_text: revised_sql.to_string(),
+    })
+}
+
+/// Compute the LSP `Range` covering the whole document text. The
+/// `code_action_resolve` `WorkspaceEdit` replaces the entire model SQL
+/// rather than computing a surgical edit — see
+/// [`resolve_ai_contract_action`] for the rationale.
+fn full_document_range(text: &str) -> Range {
+    let line_count = text.lines().count() as u32;
+    let last_line_len = text.lines().last().map_or(0, str::len) as u32;
+    Range::new(
+        Position::new(0, 0),
+        Position::new(line_count.max(1).saturating_sub(1), last_line_len),
+    )
+}
+
+/// Render the upstream-models block fed to the LLM. Each upstream is
+/// listed by name with its typed columns; missing upstreams (not yet
+/// compiled / cached) are listed without a column block so the LLM knows
+/// they exist but can't ground a column rename against them.
+fn render_upstream_schemas(
+    upstreams: &[String],
+    typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> String {
+    if upstreams.is_empty() {
+        return "(no declared upstreams — the model may select from raw sources only)".to_string();
+    }
+    let mut out = String::new();
+    for name in upstreams {
+        match typed_models.get(name) {
+            Some(cols) if !cols.is_empty() => {
+                out.push_str(&format!("- {name}\n"));
+                for col in cols {
+                    out.push_str(&format!("    - {} : {:?}\n", col.name, col.data_type));
+                }
+            }
+            _ => {
+                out.push_str(&format!("- {name} (schema not available)\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Build the LLM prompt for an E010 / E013 contract fix.
+///
+/// `system` carries the role + output-format constraint; `user` carries
+/// the per-call context (SQL + upstreams). Splitting this way keeps the
+/// `system` portion cacheable across resolve calls within a session,
+/// matching the Anthropic prompt-caching pattern documented in the
+/// `rocky-ai` skill.
+fn build_contract_fix_prompt(
+    model_name: &str,
+    code: &str,
+    message: &str,
+    column: &str,
+    sql: &str,
+    upstream_block: &str,
+) -> (String, String) {
+    let system = "You are an expert SQL engineer working on a Rocky data pipeline. \
+                 Your task is to rewrite a model's SQL query so it satisfies a data contract \
+                 by adding or restoring a named column to the SELECT projection. \
+                 Output ONLY the revised SQL inside a single ```sql fenced block — no \
+                 commentary, no explanation, no schema diff. Preserve every other column \
+                 and the existing logical structure of the query."
+        .to_string();
+
+    let user = format!(
+        "Model name: {model_name}\n\
+         Diagnostic: {code} — {message}\n\
+         Column to add or restore: {column}\n\n\
+         Current model SQL:\n```sql\n{sql}\n```\n\n\
+         Upstream models and their columns:\n{upstream_block}\n\n\
+         Rewrite the model SQL so column `{column}` is included in the output. \
+         If `{column}` does not exist verbatim in any upstream, derive it via \
+         CAST, computed expression, or join — but keep the rewrite minimal."
+    );
+
+    (system, user)
 }
 
 /// Collect semantic tokens from a parsed query.
@@ -3745,5 +4090,236 @@ mod tests {
             build_contract_quickfix("E010", msg, model, &result.type_check.typed_models,).is_none(),
             "must skip when the projection is a wildcard"
         );
+    }
+
+    // ── AI contract-fix code-action tests ─────────────────────────────────
+
+    /// Synthesize a tiny `Model` with the given file-path extension. Used
+    /// by the AI-helper tests so they don't have to spin up the full
+    /// compile pipeline.
+    fn synth_model(
+        name: &str,
+        sql: &str,
+        file_path: &str,
+        depends_on: Vec<String>,
+    ) -> rocky_core::models::Model {
+        rocky_core::models::Model {
+            config: rocky_core::models::ModelConfig {
+                name: name.into(),
+                depends_on,
+                strategy: rocky_core::models::StrategyConfig::FullRefresh,
+                target: rocky_core::models::TargetConfig {
+                    catalog: "warehouse".into(),
+                    schema: "gold".into(),
+                    table: name.into(),
+                },
+                sources: vec![],
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: vec![],
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                retention: None,
+                budget: None,
+            },
+            sql: sql.into(),
+            file_path: file_path.into(),
+            contract_path: None,
+        }
+    }
+
+    fn synth_diag(code: &str, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String(code.into())),
+            source: Some("rocky-compiler".into()),
+            message: message.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ai_action_emitted_for_e010_on_sql_file() {
+        let model = synth_model(
+            "downstream",
+            "SELECT id, name FROM upstream",
+            "/tmp/m/downstream.sql",
+            vec!["upstream".into()],
+        );
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/m/downstream.sql").unwrap();
+        let msg = "required column 'email' missing from model output";
+        let diag = synth_diag("E010", msg);
+
+        let action = build_ai_contract_action("E010", msg, &model, &uri, &diag)
+            .expect("AI fallback must emit an action for an E010 on a `.sql` file");
+
+        assert_eq!(
+            action.title,
+            "AI fix: add required column 'email' to projection"
+        );
+        assert!(
+            action.edit.is_none(),
+            "deferred action must leave `edit` for resolve to fill in"
+        );
+        let data = action
+            .data
+            .as_ref()
+            .expect("data must carry resolve payload");
+        let parsed: AiContractActionData =
+            serde_json::from_value(data.clone()).expect("payload must round-trip");
+        assert_eq!(parsed.kind, AI_CONTRACT_FIX_KIND);
+        assert_eq!(parsed.diagnostic_code, "E010");
+        assert_eq!(parsed.model_name, "downstream");
+        assert_eq!(parsed.upstream_models, vec!["upstream".to_string()]);
+    }
+
+    #[test]
+    fn ai_action_skipped_on_rocky_dsl_file() {
+        let model = synth_model(
+            "downstream",
+            "from upstream\nselect { id }\n",
+            "/tmp/m/downstream.rocky",
+            vec!["upstream".into()],
+        );
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/m/downstream.rocky").unwrap();
+        let msg = "required column 'email' missing from model output";
+        let diag = synth_diag("E010", msg);
+
+        assert!(
+            build_ai_contract_action("E010", msg, &model, &uri, &diag).is_none(),
+            "must skip `.rocky` DSL files (separate auto-fix path)"
+        );
+    }
+
+    #[test]
+    fn ai_action_skipped_on_unparseable_message() {
+        let model = synth_model(
+            "downstream",
+            "SELECT id FROM upstream",
+            "/tmp/m/downstream.sql",
+            vec!["upstream".into()],
+        );
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/m/downstream.sql").unwrap();
+        // Wrong shape — diagnostic emitter regression would land here.
+        let msg = "this is not the contract diagnostic shape";
+        let diag = synth_diag("E010", msg);
+
+        assert!(
+            build_ai_contract_action("E010", msg, &model, &uri, &diag).is_none(),
+            "must skip when the diagnostic message doesn't parse"
+        );
+    }
+
+    #[test]
+    fn parse_contract_column_handles_e010_and_e013() {
+        assert_eq!(
+            parse_contract_column("E010", "required column 'email' missing from model output"),
+            Some("email")
+        );
+        assert_eq!(
+            parse_contract_column("E013", "protected column 'ssn' has been removed"),
+            Some("ssn")
+        );
+        assert_eq!(parse_contract_column("E001", "anything"), None);
+        assert_eq!(parse_contract_column("E010", "garbage"), None);
+    }
+
+    #[test]
+    fn full_document_range_spans_text() {
+        let r = full_document_range("SELECT 1");
+        assert_eq!(r.start, Position::new(0, 0));
+        assert_eq!(r.end, Position::new(0, 8));
+
+        let r = full_document_range("SELECT 1\nFROM t\n");
+        assert_eq!(r.start, Position::new(0, 0));
+        // Two non-empty lines (the trailing `\n` does not count as a line
+        // for `str::lines()`); end at the last byte of the second line.
+        assert_eq!(r.end.line, 1);
+        assert_eq!(r.end.character, "FROM t".len() as u32);
+
+        // Empty document — guard the saturating_sub so we don't underflow.
+        let r = full_document_range("");
+        assert_eq!(r.start, Position::new(0, 0));
+        assert_eq!(r.end, Position::new(0, 0));
+    }
+
+    #[test]
+    fn render_upstream_schemas_lists_known_and_unknown() {
+        let mut typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
+        typed.insert(
+            "upstream".into(),
+            vec![rocky_compiler::types::TypedColumn {
+                name: "email".into(),
+                data_type: rocky_compiler::types::RockyType::String,
+                nullable: true,
+            }],
+        );
+
+        let block = render_upstream_schemas(&["upstream".into(), "missing".into()], &typed);
+        assert!(block.contains("- upstream\n"));
+        assert!(block.contains("- email"));
+        assert!(block.contains("- missing (schema not available)"));
+    }
+
+    #[test]
+    fn render_upstream_schemas_handles_no_upstreams() {
+        let typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
+        let block = render_upstream_schemas(&[], &typed);
+        assert!(block.contains("no declared upstreams"));
+    }
+
+    #[test]
+    fn build_contract_fix_prompt_includes_required_substrings() {
+        let (system, user) = build_contract_fix_prompt(
+            "downstream",
+            "E010",
+            "required column 'email' missing from model output",
+            "email",
+            "SELECT id FROM upstream",
+            "- upstream\n    - id : Int\n",
+        );
+        assert!(system.contains("expert SQL engineer"));
+        assert!(system.contains("```sql"));
+        assert!(user.contains("downstream"));
+        assert!(user.contains("E010"));
+        assert!(user.contains("email"));
+        assert!(user.contains("SELECT id FROM upstream"));
+        assert!(user.contains("upstream"));
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_disabled_when_api_key_missing() {
+        // The runtime sets this env var if it's already in the process
+        // env; clear it so the disabled path fires deterministically.
+        // SAFETY: tests run single-threaded inside a `#[tokio::test]`
+        // current-thread runtime; nothing else is reading the env right
+        // now.
+        unsafe {
+            std::env::remove_var(AI_API_KEY_ENV);
+        }
+
+        let data = AiContractActionData {
+            kind: AI_CONTRACT_FIX_KIND.into(),
+            diagnostic_code: "E010".into(),
+            diagnostic_message: "required column 'email' missing from model output".into(),
+            model_name: "downstream".into(),
+            model_sql: "SELECT id FROM upstream".into(),
+            uri: tower_lsp::lsp_types::Url::parse("file:///tmp/m/downstream.sql").unwrap(),
+            upstream_models: vec!["upstream".into()],
+        };
+        let typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
+        let outcome = resolve_ai_contract_action(&data, &typed).await;
+        match outcome {
+            AiResolveOutcome::Disabled(reason) => {
+                assert!(
+                    reason.contains(AI_API_KEY_ENV),
+                    "disabled reason should name the missing env var, got `{reason}`"
+                );
+            }
+            AiResolveOutcome::Edit(_) => panic!("must not produce an edit without an API key"),
+        }
     }
 }
