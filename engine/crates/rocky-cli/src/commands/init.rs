@@ -8,6 +8,7 @@ use anyhow::Result;
 /// - `duckdb` (default) — minimal DuckDB-backed local project, runnable immediately
 /// - `databricks-fivetran` — two-adapter setup (Databricks + Fivetran) with governance
 /// - `snowflake` — Snowflake adapter with key-pair auth
+/// - `bigquery` — BigQuery adapter with Service Account / ADC auth
 pub fn init(path: &str, template: Option<&str>) -> Result<()> {
     let dir = Path::new(path);
 
@@ -26,8 +27,9 @@ pub fn init(path: &str, template: Option<&str>) -> Result<()> {
         "duckdb" => init_duckdb(dir)?,
         "databricks-fivetran" => init_databricks_fivetran(dir)?,
         "snowflake" => init_snowflake(dir)?,
+        "bigquery" => init_bigquery(dir)?,
         _ => anyhow::bail!(
-            "unknown template '{template_name}'. Available: duckdb, databricks-fivetran, snowflake"
+            "unknown template '{template_name}'. Available: duckdb, databricks-fivetran, snowflake, bigquery"
         ),
     }
 
@@ -260,5 +262,90 @@ concurrency = 4
     println!("  1. Set environment variables (SNOWFLAKE_ACCOUNT, etc.)");
     println!("  2. rocky validate");
     println!("  3. rocky discover");
+    Ok(())
+}
+
+fn init_bigquery(dir: &Path) -> Result<()> {
+    // rocky.toml — BigQuery transformation pipeline.
+    //
+    // Auth: BigQuery uses Application Default Credentials. Set
+    // GOOGLE_APPLICATION_CREDENTIALS to the path of a Service Account
+    // JSON key file before running. There is no TOML field for the key
+    // path — it is read from the environment by `BigQueryAuth::detect`.
+    std::fs::write(
+        dir.join("rocky.toml"),
+        r#"# Rocky pipeline configuration — BigQuery
+# Docs: https://rocky-data.dev/
+#
+# Authentication: BigQuery uses Application Default Credentials (ADC).
+# Set GOOGLE_APPLICATION_CREDENTIALS to the path of a Service Account
+# JSON key file before invoking rocky:
+#
+#   export GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcp/service-account.json
+#
+# project_id is the GCP project Rocky reads/writes against. location
+# pins the BigQuery processing region (US, EU, us-central1, etc.) — it
+# must match the region of your datasets.
+
+[adapter]
+type       = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location   = "${BQ_LOCATION:-US}"
+
+[pipeline.demo]
+type   = "transformation"
+models = "models/**"
+
+[pipeline.demo.target]
+catalog = "${GCP_PROJECT_ID}"
+schema  = "rocky_demo"
+"#,
+    )?;
+
+    let models_dir = dir.join("models");
+    std::fs::create_dir_all(&models_dir)?;
+
+    // Directory-level defaults so the demo model resolves a target
+    // catalog/schema without per-model duplication.
+    std::fs::write(
+        models_dir.join("_defaults.toml"),
+        r#"[target]
+catalog = "${GCP_PROJECT_ID}"
+schema  = "rocky_demo"
+"#,
+    )?;
+
+    // A self-contained demo model — selects from a literal so
+    // `rocky compile` succeeds without any seed data or external
+    // tables. Replace with a real query against your BigQuery datasets.
+    std::fs::write(
+        models_dir.join("welcome.sql"),
+        r#"-- Demo model: emits a single row so `rocky compile` validates
+-- without needing source datasets. Replace with a real query.
+SELECT
+    1 AS hello,
+    'rocky' AS name,
+    CURRENT_TIMESTAMP() AS generated_at
+"#,
+    )?;
+
+    std::fs::write(
+        models_dir.join("welcome.toml"),
+        r#"depends_on = []
+"#,
+    )?;
+
+    println!("Initialized Rocky project in {}", dir.display());
+    println!();
+    println!("  rocky.toml             — BigQuery pipeline");
+    println!("  models/_defaults.toml  — shared model defaults");
+    println!("  models/welcome.*       — demo transformation model");
+    println!();
+    println!("Next steps:");
+    println!("  1. export GCP_PROJECT_ID=<your-gcp-project>");
+    println!("  2. export GOOGLE_APPLICATION_CREDENTIALS=<path-to-sa-key.json>");
+    println!("  3. rocky validate");
+    println!("  4. rocky compile");
+    println!("  5. rocky run");
     Ok(())
 }
