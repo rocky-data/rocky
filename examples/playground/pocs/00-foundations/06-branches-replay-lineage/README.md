@@ -1,4 +1,4 @@
-# 06-branches-replay-lineage — Trust arc 1: branches, replay, column lineage
+# 06-branches-replay-lineage — branches, replay, column lineage
 
 ![Create a branch, run replication on it, then trace column lineage downstream](../../../../../docs/public/demo-branches-replay.gif)
 
@@ -9,8 +9,8 @@
 
 ## What it shows
 
-The four primitives that make up Rocky's **trust system** storage arc — all
-on a single 3-model DuckDB pipeline:
+The four primitives that make up Rocky's branch / replay / lineage
+surface — all on a single 3-model DuckDB pipeline:
 
 1. **Named branches** — `rocky branch create fix-revenue` registers a
    virtual branch in the state store; runs written against the branch

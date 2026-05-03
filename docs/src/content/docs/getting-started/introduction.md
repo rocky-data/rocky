@@ -5,9 +5,7 @@ sidebar:
   order: 1
 ---
 
-Rocky is the **trust system for your data**. Branches, replay, provable reproducibility, complete column-level lineage, compile-time safety, per-model cost attribution — things your current stack can't offer because it doesn't own the DAG.
-
-Keep Databricks or Snowflake. Bring Rocky for the DAG.
+Rocky is a Rust-based control plane for warehouse SQL pipelines. Branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution — primitives delivered through a single static binary that drives Databricks, Snowflake, BigQuery, or DuckDB. Things your current stack can't offer because it doesn't own the DAG.
 
 ## What Rocky is
 
@@ -26,7 +24,7 @@ A Rust-based control plane for warehouse-side data work. Storage and compute sta
 | Quality | ✅ | Inline assertions during `rocky run`; no separate test step |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` for small standalone teams |
 
-## The seven trust dimensions
+## What Rocky does
 
 1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
 2. **Cost attribution + budgets** — per-model cost on every run. `[budget]` block in `rocky.toml`; `budget_breach` hook event on exceed.

@@ -9,7 +9,7 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-The **trust system for your data**. A Rust-based control plane for warehouse pipelines: branches, replay, column-level lineage, compile-time safety, per-model cost attribution. Keep Databricks or Snowflake. Bring Rocky for the DAG.
+A Rust-based control plane for warehouse SQL pipelines: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Storage and compute stay with your warehouse — Databricks, Snowflake, BigQuery, or DuckDB. Apache 2.0.
 
 <p align="center">
   <img src="docs/public/demo-quickstart.gif" alt="Rocky quickstart — create a project, compile, and run 3 models in under 15s" width="900" />

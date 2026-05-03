@@ -8,7 +8,7 @@
 ## What it shows
 
 The end-to-end `rocky preview` workflow that turns a PR into a single
-trust-system surface — *"this PR will change these N rows / these M
+review surface — *"this PR will change these N rows / these M
 columns, costs $X more or less to run, here's the diff"* — on a 5-model
 DuckDB transformation pipeline:
 
