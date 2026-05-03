@@ -1524,8 +1524,9 @@ mod time_interval_e2e {
         // Step 1: render the bootstrap SQL and execute it.
         let plan = time_interval_plan("2026-04-07");
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&xform_ir(&plan), dialect)
-            .expect("bootstrap render");
+        let bootstrap_sql =
+            sql_gen::generate_time_interval_bootstrap_sql(&xform_ir(&plan), dialect)
+                .expect("bootstrap render");
         adapter
             .execute_statement(&bootstrap_sql)
             .await

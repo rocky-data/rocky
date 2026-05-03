@@ -292,7 +292,12 @@ fn bench_sql_generation(c: &mut Criterion) {
         // Only bench incremental plans
         let inc_irs: Vec<&ModelIr> = model_irs
             .iter()
-            .filter(|ir| matches!(ir.materialization, MaterializationStrategy::Incremental { .. }))
+            .filter(|ir| {
+                matches!(
+                    ir.materialization,
+                    MaterializationStrategy::Incremental { .. }
+                )
+            })
             .collect();
 
         group.bench_with_input(

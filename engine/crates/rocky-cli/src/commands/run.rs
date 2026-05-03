@@ -3601,9 +3601,8 @@ pub(crate) async fn execute_models(
             }
 
             let plan = model.to_plan();
-            let model_ir = rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(
-                plan.clone(),
-            ));
+            let model_ir =
+                rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(plan.clone()));
             let target_ref = dialect
                 .format_table_ref(
                     &plan.target.catalog,
@@ -3638,10 +3637,9 @@ pub(crate) async fn execute_models(
                     .await
                     .is_err()
                 {
-                    let initial_ddls =
-                        rocky_core::sql_gen::generate_transformation_initial_ddl(
-                            &model_ir, dialect,
-                        )?;
+                    let initial_ddls = rocky_core::sql_gen::generate_transformation_initial_ddl(
+                        &model_ir, dialect,
+                    )?;
                     info!(
                         model = model_name.as_str(),
                         target = target_ref.as_str(),
@@ -3658,8 +3656,7 @@ pub(crate) async fn execute_models(
                 }
             }
 
-            let exec_stmts =
-                rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect)?;
+            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect)?;
 
             info!(
                 model = model_name.as_str(),
@@ -3901,7 +3898,9 @@ async fn execute_time_interval_model(
             bootstrap_plan.clone(),
         ));
         let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_ir, dialect)
-            .with_context(|| format!("failed to render bootstrap SQL for model '{model_name}'"))?;
+            .with_context(|| {
+            format!("failed to render bootstrap SQL for model '{model_name}'")
+        })?;
         info!(
             model = model_name,
             target = target_table.as_str(),

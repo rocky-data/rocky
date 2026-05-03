@@ -1337,7 +1337,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             ..sample_transformation_plan()
         };
-        let sql = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "COMPUTE_WH", &dialect()).unwrap();
+        let sql = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "COMPUTE_WH", &dialect())
+            .unwrap();
 
         let expected = "\
 CREATE OR REPLACE DYNAMIC TABLE cat.silver.dim_accounts
@@ -1357,7 +1358,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             ..sample_transformation_plan()
         };
-        let result = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "WH; DROP TABLE", &dialect());
+        let result =
+            generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "WH; DROP TABLE", &dialect());
         assert!(result.is_err());
     }
 
@@ -1369,8 +1371,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             ..sample_transformation_plan()
         };
-        let result =
-            generate_dynamic_table_sql(&xform_ir(&plan), "1'; DROP TABLE --", "COMPUTE_WH", &dialect());
+        let result = generate_dynamic_table_sql(
+            &xform_ir(&plan),
+            "1'; DROP TABLE --",
+            "COMPUTE_WH",
+            &dialect(),
+        );
         assert!(result.is_err());
     }
 
