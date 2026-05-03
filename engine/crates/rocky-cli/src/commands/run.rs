@@ -3666,10 +3666,10 @@ pub(crate) async fn execute_models(
             );
             // Capture per-statement stats so derived models report the
             // same `bytes_scanned` / `bytes_written` shape that replication
-            // tables already have (Arc 2 wave 3 residual: plain
-            // transformation models were calling `execute_statement` and
-            // dropping the `ExecutionStats` reported by stats-aware
-            // adapters like BigQuery).
+            // tables already have (plain transformation models were
+            // calling `execute_statement` and dropping the
+            // `ExecutionStats` reported by stats-aware adapters like
+            // BigQuery).
             let model_started_at = Utc::now();
             let mut exec_error: Option<anyhow::Error> = None;
             let mut bytes_scanned_acc: Option<u64> = None;

@@ -37,7 +37,7 @@ class CostOutput(BaseModel):
     """
     JSON output for `rocky cost <run_id|latest>`.
 
-    Trust-system Arc 2 wave 2: historical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the "what did my last run cost?" question answerable from the recorded run alone, without re-materialising tables.
+    Historical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the "what did my last run cost?" question answerable from the recorded run alone, without re-materialising tables.
 
     # Adapter type resolution
 
