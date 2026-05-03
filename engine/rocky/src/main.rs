@@ -1087,6 +1087,9 @@ enum Command {
     },
 
     /// Generate shell completion script for the given shell
+    #[command(
+        long_about = "Generate shell completion script for the given shell.\n\nEXAMPLES\n    rocky completions zsh  > ~/.zsh/completions/_rocky\n    rocky completions bash > /etc/bash_completion.d/rocky\n    rocky completions fish > ~/.config/fish/completions/rocky.fish"
+    )]
     Completions {
         /// Target shell: bash, elvish, fish, powershell, or zsh
         shell: clap_complete::Shell,
@@ -2143,7 +2146,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
         Command::Completions { shell } => {
-            rocky_cli::commands::run_completions::<Cli>(shell);
+            rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
     };
