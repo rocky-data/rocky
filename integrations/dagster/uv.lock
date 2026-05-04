@@ -267,7 +267,7 @@ wheels = [
 
 [[package]]
 name = "dagster-rocky"
-version = "1.22.0"
+version = "1.23.0"
 source = { editable = "." }
 dependencies = [
     { name = "dagster" },

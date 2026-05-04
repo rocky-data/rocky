@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.22.0] — 2026-05-03
+## [1.23.0] — 2026-05-04
+
+Companion release to engine `v1.25.0`. Headline: **`RockyResource.branch_approve()` + `RockyResource.branch_promote()`** typed-resource methods that drive the engine's new file-based branch approval gate (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Dagster code can now mark a branch approved on disk and promote it via `RockyResource` without parsing JSON by hand — the regenerated `dagster_rocky.types_generated.{branch_approve_schema,branch_promote_schema}` exposes `BranchApproveOutput` and `BranchPromoteOutput` (with the typed `approval_required` / `approved` / `forced` fields) as Pydantic v2 models. Engine [#386](https://github.com/rocky-data/rocky/pull/386) (doc-comment Arc-framing strip) propagated through codegen as a small description-text diff on `cost_schema.py` — no shape change.
+
+### Added
+
+- **`RockyResource.branch_approve(...)` + `RockyResource.branch_promote(...)`** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Two new methods on `RockyResource` that drive the engine's `rocky branch approve` and `rocky branch promote` verbs and return parsed `BranchApproveOutput` / `BranchPromoteOutput`. `branch_promote(name, force=False)` surfaces the file-based approval gate in the typed return — consumers can branch on `result.approved` / `result.approval_required` / `result.forced` without re-parsing the CLI JSON. Tested in `tests/test_branch_approval.py` against fixture round-trips covering the approved-and-promoted, unapproved-blocked, and forced-promotion paths.
+- **`BranchApproveOutput` + `BranchPromoteOutput` in `dagster_rocky.types`** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). The regenerated `dagster_rocky.types_generated.branch_approve_schema` and `branch_promote_schema` expose the engine's new typed output structs as Pydantic v2 models. Re-exported from `dagster_rocky.types` for the soft-swap import path. The `__init__.py` barrel picks up both types.
+
 
 Companion release to engine `v1.24.0`. The `dagster_rocky.types_generated` layer is unchanged this cycle — engine [#365](https://github.com/rocky-data/rocky/pull/365) (OTel spans), [#366](https://github.com/rocky-data/rocky/pull/366) (catalog Parquet emit), [#367](https://github.com/rocky-data/rocky/pull/367) (typed-IR internals), and [#368](https://github.com/rocky-data/rocky/pull/368) (catalog state-store enrichment + scope) are all source-invisible to the dagster integration. **Observable downstream:** `RockyResource.catalog()` results now have fully-populated `last_run_id` and `last_materialized_at` fields where they were previously stubbed `None` — Dagster code that branches on `if asset.last_run_id is None` will see populated values for assets that have ever materialized successfully. The catalog artifact at `./.rocky/catalog/` now also includes `edges.parquet` + `assets.parquet` alongside `catalog.json`; the typed-resource layer continues to parse the JSON and the Parquet files are file-only artifacts for downstream BI / DuckDB consumption. Wheel re-cut against the v1.24.0 engine binary.
 
