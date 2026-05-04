@@ -150,7 +150,7 @@ notify = "8"
 
 # DataFusion
 datafusion = "45"
-arrow = "54"
+arrow = "56"
 parquet = "54"
 
 # WASM
