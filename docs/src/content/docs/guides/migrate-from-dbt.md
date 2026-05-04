@@ -22,7 +22,7 @@ Rocky does not require dbt to be installed. The importer reads `.sql` files dire
 Run `rocky import-dbt` pointing at your dbt project directory:
 
 ```bash
-rocky import-dbt --dbt-project ./my-dbt-project --output ./rocky-models
+rocky import-dbt --dbt-project ./my-dbt-project --output-dir ./rocky-models
 ```
 
 This scans `my-dbt-project/models/` for `.sql` files and produces Rocky sidecar files in `./rocky-models/`:
@@ -52,10 +52,10 @@ The importer handles these dbt patterns:
 
 ### JSON output
 
-For programmatic use, add `--output json`:
+For programmatic use, request JSON via the global `-o json` flag:
 
 ```bash
-rocky import-dbt --dbt-project ./my-dbt-project --output ./rocky-models -o json
+rocky -o json import-dbt --dbt-project ./my-dbt-project --output-dir ./rocky-models
 ```
 
 ```json

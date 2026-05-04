@@ -622,8 +622,8 @@ enum Command {
         #[arg(long)]
         dbt_project: PathBuf,
         /// Output directory for Rocky models
-        #[arg(long, default_value = "models")]
-        output: PathBuf,
+        #[arg(long = "output-dir", default_value = "models")]
+        output_dir: PathBuf,
         /// Path to manifest.json (auto-detected from target/ if omitted)
         #[arg(long)]
         manifest: Option<PathBuf>,
@@ -1818,12 +1818,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         ),
         Command::ImportDbt {
             dbt_project,
-            output,
+            output_dir,
             manifest,
             no_manifest,
         } => rocky_cli::commands::run_import_dbt(
             &dbt_project,
-            &output,
+            &output_dir,
             manifest.as_deref(),
             no_manifest,
             json,

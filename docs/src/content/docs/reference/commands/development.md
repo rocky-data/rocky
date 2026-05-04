@@ -129,7 +129,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 Import to a custom output directory:
 
 ```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output src/models
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir src/models
 ```
 
 Same shape. Import and then compile to verify in one step:
