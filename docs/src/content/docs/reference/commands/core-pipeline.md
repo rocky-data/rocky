@@ -299,8 +299,8 @@ rocky run --filter <key=value> [flags]
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous run from its last checkpoint. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed run from its last checkpoint. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
