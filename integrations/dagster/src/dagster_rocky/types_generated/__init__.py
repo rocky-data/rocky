@@ -184,6 +184,23 @@ from .branch_schema import BranchEntry, BranchOutput
 from .branch_list_schema import BranchListOutput
 from .branch_delete_schema import BranchDeleteOutput
 
+# Branch approval / promote — file-based approval gate for production writes
+from .branch_approve_schema import (
+    ApprovalArtifact,
+    ApprovalSignature,
+    ApproveOutput,
+    ApproverIdentity,
+)
+from .branch_approve_schema import ApproverSource as ApproverSource
+from .branch_approve_schema import SignatureAlgorithm as SignatureAlgorithm
+from .branch_promote_schema import (
+    AuditEvent,
+    BranchPromoteOutput,
+    PromoteTarget,
+    RejectedApproval,
+)
+from .branch_promote_schema import AuditEventKind1 as AuditEventKind
+
 # Catalog (project-wide column-lineage snapshot)
 from .catalog_schema import (
     AssetKind,
@@ -352,6 +369,18 @@ __all__ = [
     "BranchEntry",
     "BranchListOutput",
     "BranchDeleteOutput",
+    # branch approval / promote
+    "ApproveOutput",
+    "ApprovalArtifact",
+    "ApprovalSignature",
+    "ApproverIdentity",
+    "ApproverSource",
+    "SignatureAlgorithm",
+    "BranchPromoteOutput",
+    "AuditEvent",
+    "AuditEventKind",
+    "PromoteTarget",
+    "RejectedApproval",
     # catalog
     "CatalogOutput",
     "CatalogAsset",

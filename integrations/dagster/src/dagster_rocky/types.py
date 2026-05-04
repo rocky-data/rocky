@@ -956,11 +956,19 @@ from .types_generated import (  # noqa: E402, F401
     AiSyncOutput,
     AiTestOutput,
     AnomalyOutput,
+    ApprovalArtifact,
+    ApprovalSignature,
+    ApproveOutput,
+    ApproverIdentity,
+    ApproverSource,
     AssetKind,
+    AuditEvent,
+    AuditEventKind,
     BranchDeleteOutput,
     BranchEntry,
     BranchListOutput,
     BranchOutput,
+    BranchPromoteOutput,
     CatalogAsset,
     CatalogColumn,
     CatalogEdge,
@@ -1030,11 +1038,14 @@ from .types_generated import (  # noqa: E402, F401
     PreviewSampledRowDiff,
     PreviewSamplingWindow,
     PreviewStructuralDiff,
+    PromoteTarget,
+    RejectedApproval,
     ReplayModelOutput,
     ReplayOutput,
     RetentionStatusOutput,
     RunHistoryRecord,
     RunOutput,
+    SignatureAlgorithm,
     SourceOutput,
     StateOutput,
     TableCheckOutput,
@@ -1092,6 +1103,8 @@ RockyOutput = (
     | ComplianceOutput
     | RetentionStatusOutput
     | CatalogOutput
+    | ApproveOutput
+    | BranchPromoteOutput
 )
 
 
@@ -1124,6 +1137,8 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
     "catalog": CatalogOutput,
+    "branch approve": ApproveOutput,
+    "branch promote": BranchPromoteOutput,
 }
 
 

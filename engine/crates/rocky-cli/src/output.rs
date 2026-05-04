@@ -3531,6 +3531,173 @@ pub struct BranchDeleteOutput {
     pub removed: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Branch approval / promote — types
+// ---------------------------------------------------------------------------
+
+/// Identity of an approver, captured at sign time.
+///
+/// Email is sourced from `git config user.email`; name from
+/// `git config user.name`. Hostname is best-effort from the `hostname` crate
+/// and surfaced as an audit aid only — it is not part of the trust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApproverIdentity {
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub host: String,
+    pub source: ApproverSource,
+}
+
+/// Where the approval signature was produced.
+///
+/// Reserved for future CI / OIDC paths. Today only the `Local` variant is
+/// emitted by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproverSource {
+    Local,
+    CiOidc,
+    Pat,
+}
+
+/// Algorithm tag for an [`ApprovalSignature`].
+///
+/// The discriminator is on disk from day one so future "real" cryptographic
+/// signing variants slot in without migrating existing artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureAlgorithm {
+    /// blake3 over a canonical-JSON encoding of the artifact payload, with
+    /// the approver's git identity bound into the hashed bytes. Detects
+    /// tamper-after-write but is not asymmetric crypto — see the
+    /// approval-flow docs for the security model.
+    Blake3CanonicalJson,
+}
+
+/// Signature attached to an [`ApprovalArtifact`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalSignature {
+    pub algorithm: SignatureAlgorithm,
+    /// Hex-encoded digest. For `Blake3CanonicalJson`, this is the 32-byte
+    /// blake3 hash printed as 64 lowercase hex characters.
+    pub digest: String,
+}
+
+/// On-disk approval record for a single approver against a single branch.
+///
+/// One file per approver under `./.rocky/approvals/<branch>/<approval_id>.json`.
+/// `branch_state_hash` binds the approval to the branch's content-addressed
+/// state at sign time; if the branch's hash changes (config bytes change),
+/// every existing artifact for that branch becomes stale and `branch promote`
+/// will refuse to honour it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalArtifact {
+    /// Sortable monotonic identifier — timestamp prefix + random tail.
+    pub approval_id: String,
+    pub branch: String,
+    pub branch_state_hash: String,
+    pub approver: ApproverIdentity,
+    pub signed_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub signature: ApprovalSignature,
+}
+
+/// JSON output for `rocky branch approve`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ApproveOutput {
+    pub version: String,
+    pub command: String,
+    pub artifact: ApprovalArtifact,
+    /// Where the artifact landed on disk.
+    pub artifact_path: String,
+}
+
+/// Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventKind {
+    PromoteStarted,
+    PromoteCompleted,
+    PromoteFailed,
+    /// Emitted when the approval gate was bypassed via `--skip-approval` or
+    /// the `ROCKY_BRANCH_APPROVAL_SKIP` env-var override. The skip reason is
+    /// recorded so a future audit can tell flag-skip apart from env-skip.
+    ApprovalSkipped,
+}
+
+/// Single audit-trail event emitted during `branch promote`.
+///
+/// Routed to stdout JSON only in v1; persistent audit storage is a follow-up.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuditEvent {
+    pub kind: AuditEventKind,
+    pub at: DateTime<Utc>,
+    pub actor: ApproverIdentity,
+    pub branch: String,
+    pub branch_state_hash: String,
+    /// Free-form context. Populated for `ApprovalSkipped` to record the
+    /// origin of the skip ("--skip-approval CLI flag" or
+    /// "ROCKY_BRANCH_APPROVAL_SKIP=1"); empty for routine state events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One per-target promote step in [`BranchPromoteOutput::targets`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromoteTarget {
+    /// Fully-qualified production target (catalog.schema.table).
+    pub target: String,
+    /// Fully-qualified branch source the promote read from
+    /// (catalog.branch_schema.table).
+    pub source: String,
+    /// SQL statement dispatched to the adapter for this target.
+    pub statement: String,
+    /// Whether the per-target SQL succeeded. Failures abort the run; on a
+    /// failure this is `false` for the failing target and absent for any
+    /// targets that never started.
+    pub succeeded: bool,
+    /// Adapter / SQL error text when `succeeded` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// JSON output for `rocky branch promote`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BranchPromoteOutput {
+    pub version: String,
+    pub command: String,
+    pub branch: String,
+    pub branch_state_hash: String,
+    /// Approval artifacts that satisfied the gate at promote time. Empty when
+    /// the gate was disabled (`required = false`) or skipped.
+    pub approvals_used: Vec<ApprovalArtifact>,
+    /// Approval artifacts loaded from disk that failed verification, with
+    /// the reason for rejection. Surfaced even on a successful promote so
+    /// operators can spot stale artifacts to clean up.
+    pub approvals_rejected: Vec<RejectedApproval>,
+    /// One entry per managed target the promote attempted, in dispatch order.
+    pub targets: Vec<PromoteTarget>,
+    /// Audit-trail events emitted during this invocation, in order. At
+    /// minimum: `PromoteStarted` plus one of `PromoteCompleted` /
+    /// `PromoteFailed`. `ApprovalSkipped` precedes `PromoteStarted` when
+    /// the gate was bypassed.
+    pub audit: Vec<AuditEvent>,
+    /// True when every target's SQL succeeded.
+    pub success: bool,
+}
+
+/// An approval artifact that was loaded from disk but rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RejectedApproval {
+    pub approval_id: String,
+    /// One of: `bad_signature`, `state_hash_mismatch`, `expired`,
+    /// `signer_not_allowed`, `parse_error`.
+    pub reason: String,
+    pub detail: String,
+}
+
 /// JSON output for `rocky replay <run_id|latest>`.
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every

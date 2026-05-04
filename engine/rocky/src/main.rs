@@ -1206,6 +1206,41 @@ enum BranchAction {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Sign a content-addressed approval artifact for a branch.
+    ///
+    /// Writes one file per approver under
+    /// `./.rocky/approvals/<branch>/<approval_id>.json`. The artifact binds
+    /// the approver's git identity to the branch's current state hash;
+    /// `rocky branch promote` later refuses to run unless the on-disk
+    /// approvals satisfy `[branch.approval]`.
+    Approve {
+        /// Branch name
+        name: String,
+        /// Optional free-form note persisted in the artifact.
+        #[arg(long)]
+        message: Option<String>,
+        /// Override the destination path. Defaults to
+        /// `./.rocky/approvals/<branch>/<approval_id>.json`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Promote a branch's tables to their production targets.
+    ///
+    /// Enumerates the configured replication pipeline's production
+    /// targets, runs the optional `[branch.approval]` gate, and dispatches
+    /// `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM
+    /// branch__<name>.<x>` per target.
+    Promote {
+        /// Branch name
+        name: String,
+        /// Filter sources by component value (e.g., --filter client=acme)
+        #[arg(long)]
+        filter: Option<String>,
+        /// Bypass the approval gate. Always emits an `ApprovalSkipped`
+        /// audit event so the bypass leaves a paper trail.
+        #[arg(long)]
+        skip_approval: bool,
+    },
 }
 
 /// Subcommands under `rocky state`.
@@ -2000,6 +2035,31 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &cli.config,
                     &name,
                     filter.as_deref(),
+                    json,
+                )
+                .await
+            }
+            BranchAction::Approve { name, message, out } => {
+                rocky_cli::commands::run_branch_approve(
+                    &state_path,
+                    &cli.config,
+                    &name,
+                    message.as_deref(),
+                    out.as_deref(),
+                    json,
+                )
+            }
+            BranchAction::Promote {
+                name,
+                filter,
+                skip_approval,
+            } => {
+                rocky_cli::commands::run_branch_promote(
+                    &state_path,
+                    &cli.config,
+                    &name,
+                    filter.as_deref(),
+                    skip_approval,
                     json,
                 )
                 .await

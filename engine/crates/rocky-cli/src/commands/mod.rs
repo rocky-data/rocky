@@ -61,7 +61,8 @@ pub use archive::{run_archive, run_archive_catalog};
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
-    run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_show,
+    run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
+    run_branch_promote, run_branch_show,
 };
 pub use catalog::{CatalogFormat, default_out_dir as catalog_default_out_dir, run_catalog};
 #[cfg(feature = "duckdb")]

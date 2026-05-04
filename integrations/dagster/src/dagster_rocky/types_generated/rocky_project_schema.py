@@ -112,6 +112,55 @@ class BindingType(StrEnum):
     READ_ONLY = "READ_ONLY"
 
 
+class BranchApprovalConfig(BaseModel):
+    """
+    `[branch.approval]` configuration block.
+
+    Defaults are deliberately permissive — a project that doesn't add the section keeps the v0 `branch promote` behaviour. Flipping `required = true` opts in to the gate; the rest of the knobs tune the strictness once the gate is on.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    allowed_signers: list[str] | None = []
+    """
+    When non-empty, only approvals from these signer emails count toward `min_approvers`. Empty (default) accepts any signer.
+    """
+    max_age_seconds: conint(ge=0) | None = 86400
+    """
+    Approvals older than this many seconds are rejected even if their branch_state_hash still matches. Default 86400 (24h).
+    """
+    min_approvers: conint(ge=0) | None = 1
+    """
+    Minimum number of valid approvals required when `required = true`. "Valid" means: signature verifies, branch_state_hash matches the current state, signed within `max_age_seconds`, and (when `allowed_signers` is non-empty) the signer's email is in the list.
+    """
+    required: bool | None = False
+    """
+    When true, `branch promote` refuses to run unless at least `min_approvers` valid approval artifacts are on disk for the branch. When false (default), the gate is bypassed silently.
+    """
+
+
+class BranchSection(BaseModel):
+    """
+    Top-level `[branch]` configuration section.
+
+    Currently scopes the optional approval gate consumed by `rocky branch promote`. Default-constructed (no `[branch]` block in `rocky.toml`) leaves the gate disabled — `branch promote` skips the approval loop and behaves like the unguarded baseline.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    approval: BranchApprovalConfig | None = Field(
+        {
+            "allowed_signers": [],
+            "max_age_seconds": 86400,
+            "min_approvers": 1,
+            "required": False,
+        },
+        validate_default=True,
+    )
+
+
 class BudgetBreachAction(StrEnum):
     """
     What to do when a [`BudgetConfig`] limit is exceeded by an actual run.
@@ -2404,6 +2453,20 @@ class RockyConfig(BaseModel):
     ai: AiSection | None = Field({"max_tokens": 4096}, validate_default=True)
     """
     AI intent layer configuration. Currently scopes the per-request and cumulative-retry token budget for `rocky ai` / `ai-explain` / `ai-sync` / `ai-test`. See [`AiSection`].
+    """
+    branch: BranchSection | None = Field(
+        {
+            "approval": {
+                "allowed_signers": [],
+                "max_age_seconds": 86400,
+                "min_approvers": 1,
+                "required": False,
+            }
+        },
+        validate_default=True,
+    )
+    """
+    Branch-level configuration. Currently scopes the optional approval gate consumed by `rocky branch promote`. See [`BranchSection`].
     """
     budget: BudgetConfig | None = Field(
         {
