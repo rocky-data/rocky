@@ -1,3 +1,4 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
 import type { TestResult } from "./types/rockyJson";
@@ -112,9 +113,16 @@ async function runHandler(
       controller2.abort(),
     );
 
+    // `item.id` is the workspace-relative path (unique for dedup); the CLI
+    // and `TestFailure.name` use the model basename, so derive that from
+    // `item.uri` for the rocky invocation and the failure-name filter.
+    const modelName = item.uri
+      ? path.basename(item.uri.fsPath, ".rocky")
+      : item.id;
+
     try {
       const result = await runRockyJson<TestResult>(
-        ["test", "--model", item.id, "--output", "json"],
+        ["test", "--model", modelName, "--output", "json"],
         { signal: controller2.signal, timeoutMs: 120000 },
       );
       const elapsed = Date.now() - start;
@@ -123,7 +131,7 @@ async function runHandler(
         run.passed(item, elapsed);
       } else {
         const lines = (result.failures ?? [])
-          .filter((f) => f.name === item.id || f.name === undefined)
+          .filter((f) => f.name === modelName || f.name === undefined)
           .map((f) => f.error);
         const message = new vscode.TestMessage(
           lines.length > 0 ? lines.join("\n") : `${failed} test(s) failed`,
