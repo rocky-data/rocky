@@ -64,10 +64,35 @@
     ],
     "description": "Match expression (CASE WHEN)"
   },
-  "Window function": {
-    "prefix": "window",
-    "body": "${1|row_number,rank,dense_rank,lag,lead|}() over (partition by ${2:key} order by ${3:col} ${4|asc,desc|})",
-    "description": "Window function with OVER clause"
+  "Rank window function": {
+    "prefix": "window-rank",
+    "body": "${1|row_number,rank,dense_rank|}() over (partition ${2:key}, sort ${3:order_column})",
+    "description": "Rank-style window function (no args)"
+  },
+  "Offset window function": {
+    "prefix": "window-offset",
+    "body": "${1|lag,lead|}(${2:column}, ${3:1}) over (partition ${4:key}, sort ${5:order_column})",
+    "description": "Lag/lead window function with row offset"
+  },
+  "First value window": {
+    "prefix": "first-value",
+    "body": "first_value(${1:column}) over (partition ${2:key}, sort ${3:order_column})",
+    "description": "Return the first value in a window"
+  },
+  "Coalesce": {
+    "prefix": "coalesce",
+    "body": "coalesce(${1:column}, ${2:fallback})",
+    "description": "Return the first non-null expression"
+  },
+  "Nullif": {
+    "prefix": "nullif",
+    "body": "nullif(${1:column}, ${2:value})",
+    "description": "Return null when two expressions are equal"
+  },
+  "Concat": {
+    "prefix": "concat",
+    "body": "concat(${1:first}, ${2:second})",
+    "description": "Concatenate string expressions"
   },
   "Full model template": {
     "prefix": "model",
@@ -173,9 +198,9 @@
     "prefix": "agg-window",
     "body": [
       "${1:running_total}: sum(${2:amount}) over (",
-      "    partition by ${3:customer_id}",
-      "    order by ${4:order_date}",
-      "    rows between unbounded preceding and current row",
+      "    partition ${3:customer_id},",
+      "    sort ${4:order_date},",
+      "    rows unbounded..current",
       ")"
     ],
     "description": "Running aggregate window function"
