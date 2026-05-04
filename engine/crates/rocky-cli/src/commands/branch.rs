@@ -597,7 +597,6 @@ struct PlannedPromote {
     branch_source: TargetRef,
 }
 
-
 /// Build the v1 promote SQL for a single target.
 ///
 /// Uses dialect-specific identifier quoting so branches whose names contain
