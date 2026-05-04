@@ -22,7 +22,7 @@ If you edit a Rust output struct and forget to regenerate, the `codegen-drift` w
 engine/crates/rocky-cli/src/output.rs       (Rust source of truth)
         │
         ▼  cargo run -- export-schemas schemas/
-schemas/*.schema.json                        (37 JSON Schemas, committed)
+schemas/*.schema.json                        (55 JSON Schemas, committed)
         │
         ├──▶  integrations/dagster/src/dagster_rocky/types_generated/   (Pydantic v2)
         └──▶  editors/vscode/src/types/generated/                       (TypeScript)
@@ -59,7 +59,7 @@ Three recipes in `justfile`, runnable individually:
 
 | Recipe | What it does |
 |---|---|
-| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes 37 schemas to `schemas/`. |
+| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes 55 schemas to `schemas/`. |
 | `just codegen-dagster` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `integrations/dagster/src/dagster_rocky/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
 | `just codegen-vscode` | Runs `json2ts` per schema into `editors/vscode/src/types/generated/`. Self-heals the curated `index.ts` barrel via `git checkout`. |
 

@@ -232,7 +232,7 @@ To change a CLI output:
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The schemas/ directory contains 37 schema files (one per top-level command output, including alternate shapes like `model_history` for `rocky history --model`, `column_lineage` for `rocky lineage --column`, `dag_run` for `rocky dag --run`, `ci_diff` for `rocky ci --diff`, and the shared `adapter_config.schema.json`):
+Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The schemas/ directory contains 55 schema files. The table below is a non-exhaustive snapshot covering the original 37 — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. For the authoritative list, run `ls schemas/*.schema.json`.
 
 | Command | Output struct |
 |---|---|
