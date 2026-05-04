@@ -17,7 +17,7 @@ just codegen
 
 That runs the full three-step pipeline:
 
-1. `just codegen-rust` — builds the engine in release mode and runs `cargo run --bin rocky -- export-schemas schemas/`, writing 37 schema files here.
+1. `just codegen-rust` — builds the engine in release mode and runs `cargo run --bin rocky -- export-schemas schemas/`, writing 53 schema files here.
 2. `just codegen-dagster` — runs `datamodel-codegen` over `schemas/*.schema.json` into `integrations/dagster/src/dagster_rocky/types_generated/`.
 3. `just codegen-vscode` — runs `json2ts` per schema into `editors/vscode/src/types/generated/`.
 
@@ -32,7 +32,7 @@ cargo run --bin rocky -- export-schemas ../schemas
 
 ## What's covered
 
-All 37 schema files map to a typed Rust output struct. The full list, including the command each one backs, lives in `engine/CLAUDE.md` under "JSON Output Schema". Highlights:
+All 53 schema files map to a typed Rust output struct. The full list, including the command each one backs, lives in `engine/CLAUDE.md` under "JSON Output Schema". Highlights:
 
 | Schema | Command |
 |---|---|
