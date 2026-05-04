@@ -5,10 +5,12 @@
 //! and process-based adapters.
 
 use anyhow::{Context, Result};
-use rocky_adapter_sdk::WarehouseAdapter;
 use rocky_adapter_sdk::conformance::{self, ConformanceResult};
 use rocky_adapter_sdk::manifest::{AdapterCapabilities, AdapterManifest};
 use rocky_adapter_sdk::process::ProcessAdapter;
+use rocky_adapter_sdk::{
+    AdapterResult, ColumnSelection, MetadataColumn, SqlDialect, WarehouseAdapter,
+};
 
 use crate::output::{TestAdapterOutput, TestAdapterTestResult};
 
@@ -34,7 +36,7 @@ pub async fn run_test_adapter(
             let manifest = adapter.manifest().clone();
 
             // Run conformance suite.
-            let result = conformance::run_conformance(&manifest);
+            let result = conformance::run_conformance(&manifest, adapter.dialect());
 
             // Clean up.
             let _ = adapter.close().await;
@@ -56,7 +58,8 @@ pub async fn run_test_adapter(
                 config_schema: serde_json::Value::Null,
             };
 
-            let mut result = conformance::run_conformance(&manifest);
+            let dialect = FallbackDialect::new("unknown");
+            let mut result = conformance::run_conformance(&manifest, &dialect);
             // Override the first test (connect) as failed.
             if let Some(connect_test) = result.results.first_mut() {
                 connect_test.status = conformance::TestStatus::Failed;
@@ -131,10 +134,114 @@ pub async fn run_test_adapter_builtin(
         config_schema: serde_json::Value::Null,
     };
 
-    let result = conformance::run_conformance(&manifest);
+    let dialect = FallbackDialect::new(adapter_name);
+    let result = conformance::run_conformance(&manifest, &dialect);
     output_result(&result, json_output)?;
 
     Ok(())
+}
+
+struct FallbackDialect {
+    name: String,
+}
+
+impl FallbackDialect {
+    fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl SqlDialect for FallbackDialect {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
+        Ok(format!("{catalog}.{schema}.{table}"))
+    }
+
+    fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+        format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+    }
+
+    fn insert_into(&self, target: &str, select_sql: &str) -> String {
+        format!("INSERT INTO {target}\n{select_sql}")
+    }
+
+    fn merge_into(
+        &self,
+        target: &str,
+        source_sql: &str,
+        keys: &[String],
+        _update_cols: Option<&[String]>,
+    ) -> AdapterResult<String> {
+        Ok(format!(
+            "MERGE INTO {target} USING ({source_sql}) ON {}",
+            keys.join(", ")
+        ))
+    }
+
+    fn describe_table_sql(&self, table_ref: &str) -> String {
+        format!("DESCRIBE {table_ref}")
+    }
+
+    fn drop_table_sql(&self, table_ref: &str) -> String {
+        format!("DROP TABLE IF EXISTS {table_ref}")
+    }
+
+    fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+        Some(Ok(format!("CREATE CATALOG IF NOT EXISTS {name}")))
+    }
+
+    fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+        Some(Ok(format!(
+            "CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"
+        )))
+    }
+
+    fn row_hash_expr(&self, columns: &[String]) -> String {
+        format!("MD5(CONCAT({}))", columns.join(", "))
+    }
+
+    fn tablesample_clause(&self, percent: u32) -> Option<String> {
+        Some(format!("TABLESAMPLE ({percent} PERCENT)"))
+    }
+
+    fn select_clause(
+        &self,
+        columns: &ColumnSelection,
+        metadata: &[MetadataColumn],
+    ) -> AdapterResult<String> {
+        let mut sql = match columns {
+            ColumnSelection::All => "SELECT *".to_string(),
+            ColumnSelection::Explicit(cols) => format!("SELECT {}", cols.join(", ")),
+        };
+        for column in metadata {
+            sql.push_str(&format!(
+                ", CAST({} AS {}) AS {}",
+                column.value, column.data_type, column.name
+            ));
+        }
+        Ok(sql)
+    }
+
+    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+        Ok(format!(
+            "WHERE {timestamp_col} > (SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01') FROM {target_ref})"
+        ))
+    }
+
+    fn insert_overwrite_partition(
+        &self,
+        target: &str,
+        partition_filter: &str,
+        select_sql: &str,
+    ) -> AdapterResult<Vec<String>> {
+        Ok(vec![
+            format!("DELETE FROM {target} WHERE {partition_filter}"),
+            format!("INSERT INTO {target}\n{select_sql}"),
+        ])
+    }
 }
 
 fn output_result(result: &ConformanceResult, json_output: bool) -> Result<()> {
