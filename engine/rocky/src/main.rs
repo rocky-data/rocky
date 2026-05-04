@@ -259,8 +259,11 @@ enum Command {
         /// Execute both replication and compiled models
         #[arg(long)]
         all: bool,
-        /// Resume from a specific failed run ID
-        #[arg(long)]
+        /// Resume a failed run; mints a new run_id and records the prior one as resumed_from
+        #[arg(
+            long,
+            help = "Resume a failed run; mints a new run_id and records the prior one as resumed_from"
+        )]
         resume: Option<String>,
         /// Resume from the most recent failed run
         #[arg(long)]
