@@ -21,6 +21,7 @@ Tracks engine `v1.25.0`. Surfaces the new branch approval lifecycle in the VS Co
 - **Regenerated `src/types/generated/cost.ts` + `rocky_project.ts`** (engine [#386](https://github.com/rocky-data/rocky/pull/386)). Description-text diff propagated from the engine's doc-comment Arc-framing strip; no shape change.
 - **Regenerated `schemas/rocky-project.schema.json`** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Picks up the new branch lifecycle additions, syncing the bundled JSON schema with the engine.
 
+## [1.12.0] — 2026-05-02
 
 Tracks engine `v1.23.0`. Surfaces the new `rocky catalog` command in the VS Code extension and regenerates TypeScript bindings for the `CatalogOutput` family, the additive `sweep_interval_seconds` / `sweep_budget_ms` fields on `StateRetentionConfig`, and the additive `projected_per_model_budget_breaches` field plus `PerModelBudgetBreachOutput` interface from per-model `[budget]` blocks.
 
