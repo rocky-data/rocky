@@ -66,8 +66,33 @@
   },
   "Window function": {
     "prefix": "window",
-    "body": "${1|row_number,rank,dense_rank,lag,lead|}() over (partition by ${2:key} order by ${3:col} ${4|asc,desc|})",
+    "body": "${1|row_number,rank,dense_rank,lag,lead|}(${2:column}) over (partition ${3:key}, sort ${4:order_column})",
     "description": "Window function with OVER clause"
+  },
+  "Coalesce": {
+    "prefix": "coalesce",
+    "body": "coalesce(${1:column}, ${2:fallback})",
+    "description": "Return the first non-null expression"
+  },
+  "Nullif": {
+    "prefix": "nullif",
+    "body": "nullif(${1:column}, ${2:value})",
+    "description": "Return null when two expressions are equal"
+  },
+  "Cast": {
+    "prefix": "cast",
+    "body": "cast(${1:column}, \"${2|string,int,float,bool,date,timestamp|}\")",
+    "description": "Cast an expression to a target type"
+  },
+  "Concat": {
+    "prefix": "concat",
+    "body": "concat(${1:first}, ${2:second})",
+    "description": "Concatenate string expressions"
+  },
+  "First value window": {
+    "prefix": "first-value",
+    "body": "first_value(${1:column}) over (partition ${2:key}, sort ${3:order_column})",
+    "description": "Return the first value in a window"
   },
   "Full model template": {
     "prefix": "model",
@@ -173,9 +198,9 @@
     "prefix": "agg-window",
     "body": [
       "${1:running_total}: sum(${2:amount}) over (",
-      "    partition by ${3:customer_id}",
-      "    order by ${4:order_date}",
-      "    rows between unbounded preceding and current row",
+      "    partition ${3:customer_id},",
+      "    sort ${4:order_date},",
+      "    rows unbounded..current",
       ")"
     ],
     "description": "Running aggregate window function"
