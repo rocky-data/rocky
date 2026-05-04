@@ -28,6 +28,7 @@ Feature release closing out Typed-IR Option B Phase 2 and shipping the file-base
 
 - **Typed-IR contract spec + multi-dialect golden tests** ([#387](https://github.com/rocky-data/rocky/pull/387)). Documents the typed-IR invariants ratified during the Option B sign-off (mask resolution, watermark strip, partition-window invariants, type relocation) and adds golden-file tests covering the four warehouse dialects (`duckdb`, `databricks`, `snowflake`, `bigquery`) so the IR → SQL pipeline is pinned per-dialect.
 
+## [1.24.0] — 2026-05-03
 
 Feature release closing out the `rocky catalog` command and continuing the OTel + Typed-IR threads. Headline: **`rocky catalog` is now feature-complete** — Parquet emit (`edges.parquet` + `assets.parquet` alongside `catalog.json`) plus state-store enrichment that fills the previously-stubbed `last_run_id` / `last_materialized_at` fields, plus a `--catalog <name>` scope flag mirroring `compact` / `archive`. The artifact contract the AI review workflow consumes is now the full design-memo shape. **Per-adapter `statement.execute` spans land on BigQuery and Snowflake**, completing the OTel tracing surface where it was previously asymmetric — Databricks alone inherited statement-level spans via the `materialize.table` parent. Internal: **`ModelIr` + `ProjectIr` structs land in `rocky-core::ir`** as PR-2 of Typed-IR Option B Phase 1, coexisting with the existing `Plan` enum until Phase 2 migrates the construction sites.
 
