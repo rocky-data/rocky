@@ -407,7 +407,7 @@ pub(crate) async fn compute_measure_dedup(
             .validated_full_name()
             .map_err(|e| {
                 anyhow!(
-                    "rocky compact --measure-dedup could not validate table reference {table:?} \
+                    "rocky compact --measure-dedup could not validate table reference {table} \
                      before hashing; verify the warehouse returned catalog, schema, and table names \
                      that are valid SQL identifiers: {e}"
                 )
@@ -668,7 +668,7 @@ async fn hash_table(
 ) -> Result<Vec<PartitionChecksum>> {
     let table_ref_str = table.validated_full_name().map_err(|e| {
         anyhow!(
-            "rocky compact --measure-dedup could not validate table reference {table:?} before \
+            "rocky compact --measure-dedup could not validate table reference {table} before \
                  building the checksum query; verify the warehouse returned catalog, schema, and \
                  table names that are valid SQL identifiers: {e}"
         )
