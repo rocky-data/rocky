@@ -360,6 +360,60 @@
       ],
       "type": "string"
     },
+    "BranchApprovalConfig": {
+      "additionalProperties": false,
+      "description": "`[branch.approval]` configuration block.\n\nDefaults are deliberately permissive — a project that doesn't add the section keeps the v0 `branch promote` behaviour. Flipping `required = true` opts in to the gate; the rest of the knobs tune the strictness once the gate is on.",
+      "properties": {
+        "allowed_signers": {
+          "default": [],
+          "description": "When non-empty, only approvals from these signer emails count toward `min_approvers`. Empty (default) accepts any signer.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_age_seconds": {
+          "default": 86400,
+          "description": "Approvals older than this many seconds are rejected even if their branch_state_hash still matches. Default 86400 (24h).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "min_approvers": {
+          "default": 1,
+          "description": "Minimum number of valid approvals required when `required = true`. \"Valid\" means: signature verifies, branch_state_hash matches the current state, signed within `max_age_seconds`, and (when `allowed_signers` is non-empty) the signer's email is in the list.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "required": {
+          "default": false,
+          "description": "When true, `branch promote` refuses to run unless at least `min_approvers` valid approval artifacts are on disk for the branch. When false (default), the gate is bypassed silently.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BranchSection": {
+      "additionalProperties": false,
+      "description": "Top-level `[branch]` configuration section.\n\nCurrently scopes the optional approval gate consumed by `rocky branch promote`. Default-constructed (no `[branch]` block in `rocky.toml`) leaves the gate disabled — `branch promote` skips the approval loop and behaves like the unguarded baseline.",
+      "properties": {
+        "approval": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BranchApprovalConfig"
+            }
+          ],
+          "default": {
+            "allowed_signers": [],
+            "max_age_seconds": 86400,
+            "min_approvers": 1,
+            "required": false
+          }
+        }
+      },
+      "type": "object"
+    },
     "BudgetBreachAction": {
       "description": "What to do when a [`BudgetConfig`] limit is exceeded by an actual run.\n\n`Warn` always fires the `budget_breach` event; `Error` additionally causes `rocky run` to exit with a non-zero status so orchestrators can gate downstream work on the breach.",
       "enum": [
@@ -2900,6 +2954,22 @@
         "max_tokens": 4096
       },
       "description": "AI intent layer configuration. Currently scopes the per-request and cumulative-retry token budget for `rocky ai` / `ai-explain` / `ai-sync` / `ai-test`. See [`AiSection`]."
+    },
+    "branch": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BranchSection"
+        }
+      ],
+      "default": {
+        "approval": {
+          "allowed_signers": [],
+          "max_age_seconds": 86400,
+          "min_approvers": 1,
+          "required": false
+        }
+      },
+      "description": "Branch-level configuration. Currently scopes the optional approval gate consumed by `rocky branch promote`. See [`BranchSection`]."
     },
     "budget": {
       "allOf": [

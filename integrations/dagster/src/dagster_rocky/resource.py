@@ -43,6 +43,8 @@ from .types import (
     AiResult,
     AiSyncResult,
     AiTestResult,
+    ApproveOutput,
+    BranchPromoteOutput,
     CatalogOutput,
     CiResult,
     ColumnLineageResult,
@@ -1694,6 +1696,73 @@ class RockyResource(dg.ConfigurableResource):
     def state(self) -> StateResult:
         """Run ``rocky state`` and return the parsed result."""
         return _parse_rocky_json(self._run_rocky(["state"]), StateResult, command="state")
+
+    # ------------------------------------------------------------------ #
+    # Branch approval / promote                                          #
+    # ------------------------------------------------------------------ #
+
+    def branch_approve(
+        self,
+        name: str,
+        *,
+        message: str | None = None,
+        out: str | None = None,
+    ) -> ApproveOutput:
+        """Run ``rocky branch approve <name>`` and return the parsed artifact.
+
+        Writes a signed file artifact under ``./.rocky/approvals/<name>/`` (or
+        ``out`` when supplied) binding the local git identity to the branch's
+        current state hash.
+
+        Args:
+            name: Branch name to approve.
+            message: Optional free-form note persisted on the artifact.
+            out: Override the destination path for the artifact JSON.
+        """
+        args = ["branch", "approve", name]
+        if message is not None:
+            args.extend(["--message", message])
+        if out is not None:
+            args.extend(["--out", out])
+        return _parse_rocky_json(
+            self._run_rocky(args),
+            ApproveOutput,
+            command="branch approve",
+        )
+
+    def branch_promote(
+        self,
+        name: str,
+        *,
+        filter: str | None = None,
+        skip_approval: bool = False,
+    ) -> BranchPromoteOutput:
+        """Run ``rocky branch promote <name>`` and return the parsed result.
+
+        Enumerates the configured replication pipeline's production targets
+        and dispatches ``CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM
+        branch__<name>.<x>`` per target. When ``[branch.approval] required =
+        true`` in ``rocky.toml``, the gate runs first; failure raises
+        ``dg.Failure``.
+
+        Args:
+            name: Branch name to promote.
+            filter: Optional component filter (mirrors ``rocky branch
+                compare``'s ``--filter``).
+            skip_approval: Bypass the gate and emit an ``ApprovalSkipped``
+                audit event. The skip is logged and surfaces in the JSON
+                output's ``audit`` field.
+        """
+        args = ["branch", "promote", name]
+        if filter is not None:
+            args.extend(["--filter", filter])
+        if skip_approval:
+            args.append("--skip-approval")
+        return _parse_rocky_json(
+            self._run_rocky(args),
+            BranchPromoteOutput,
+            command="branch promote",
+        )
 
     # ------------------------------------------------------------------ #
     # Compiler (HTTP when server_url is set, CLI otherwise)              #

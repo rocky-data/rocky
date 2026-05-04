@@ -311,6 +311,7 @@ mod tests {
             classifications: Default::default(),
             roles: Default::default(),
             ai: Default::default(),
+            branch: Default::default(),
         }
     }
 

@@ -245,6 +245,16 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.branchApprove",
+        "title": "Rocky: Branch Approve",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.branchPromote",
+        "title": "Rocky: Branch Promote",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.refreshModels",
         "title": "Refresh Models",
         "category": "Rocky",
