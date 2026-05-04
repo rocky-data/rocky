@@ -259,13 +259,10 @@ enum Command {
         /// Execute both replication and compiled models
         #[arg(long)]
         all: bool,
-        /// Resume a failed run; mints a new run_id and records the prior one as resumed_from
-        #[arg(
-            long,
-            help = "Resume a failed run; mints a new run_id and records the prior one as resumed_from"
-        )]
+        /// Resume a failed run; mints a new `run_id` and records the prior one as `resumed_from`
+        #[arg(long)]
         resume: Option<String>,
-        /// Resume from the most recent failed run
+        /// Resume the most recent failed run; mints a new `run_id` and records the prior one as `resumed_from`
         #[arg(long)]
         resume_latest: bool,
         /// Run in shadow mode: write to shadow targets instead of production
