@@ -1,15 +1,14 @@
 <p align="center">
-  <img src="editors/vscode/icons/rocky-icon-512.png" alt="Rocky" width="128" />
+  <!-- <img src="editors/vscode/icons/rocky-icon-512-transparent.png" alt="Rocky" width="128" /> -->
+  <img src="docs/src/assets/rocky-social-banner.svg" alt="Rocky" width="auto" height="100%" />
 </p>
-
-<h1 align="center">Rocky</h1>
 
 [![Engine CI](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml)
 [![Dagster CI](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml)
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A Rust-based control plane for warehouse SQL pipelines: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Storage and compute stay with your warehouse — Databricks, Snowflake, BigQuery, or DuckDB. Apache 2.0.
+**Rocky** is a Rust-based control plane for warehouse SQL pipelines: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Storage and compute stay with your warehouse — Databricks, Snowflake, BigQuery, or DuckDB. Apache 2.0.
 
 <p align="center">
   <img src="docs/public/demo-quickstart.gif" alt="Rocky quickstart — create a project, compile, and run 3 models in under 15s" width="900" />
