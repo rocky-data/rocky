@@ -121,8 +121,7 @@ export async function importDbt(): Promise<void> {
     dbtPath,
     "--output",
     output,
-    "--output",
-    "json",
+    "--json",
   ];
   if (modePick.value === "regex") args.push("--no-manifest");
   if (manifestPath) args.push("--manifest", manifestPath);
