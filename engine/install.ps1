@@ -106,11 +106,21 @@ try {
                 exit 1
             }
             Write-Host "  Checksum verified."
+        } else {
+            Write-Error "checksums.txt did not contain an entry for $Archive."
+            exit 1
         }
     }
     catch {
-        # checksums.txt not available for this release — skip verification
-        Write-Host "  (Checksum file not available for this release — skipping verification)"
+        # checksums.txt is published alongside every engine release. If the
+        # download fails we must not silently skip verification — an attacker
+        # who can strip the file would otherwise bypass the integrity check.
+        Write-Error "Failed to download checksums.txt from $ChecksumsUrl."
+        Write-Host "  Refusing to install an unverified binary. Set ROCKY_SKIP_CHECKSUM=1 to override." -ForegroundColor Yellow
+        if ($env:ROCKY_SKIP_CHECKSUM -ne "1") {
+            exit 1
+        }
+        Write-Host "  (Checksum verification skipped - ROCKY_SKIP_CHECKSUM=1)"
     }
 
     # Extract
