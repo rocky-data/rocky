@@ -17,16 +17,16 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ArchiveOutput,
-    BranchDeleteOutput, BranchListOutput, BranchOutput, CatalogOutput, CiDiffOutput, CiOutput,
-    ClearSchemaCacheOutput, ColumnLineageOutput, CompactDedupOutput, CompactOutput, CompareOutput,
-    CompileOutput, ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput,
-    DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
-    LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput,
-    OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
-    ProfileStorageOutput, ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, RunOutput,
-    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
-    ValidateOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApproveOutput, ArchiveOutput,
+    BranchDeleteOutput, BranchListOutput, BranchOutput, BranchPromoteOutput, CatalogOutput,
+    CiDiffOutput, CiOutput, ClearSchemaCacheOutput, ColumnLineageOutput, CompactDedupOutput,
+    CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
+    DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
+    HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
+    ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
+    PreviewDiffOutput, ProfileStorageOutput, ReplayOutput, RetentionStatusOutput,
+    RetentionSweepOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
+    TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -89,6 +89,8 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<BranchOutput>("branch"),
         entry::<BranchListOutput>("branch_list"),
         entry::<BranchDeleteOutput>("branch_delete"),
+        entry::<ApproveOutput>("branch_approve"),
+        entry::<BranchPromoteOutput>("branch_promote"),
         entry::<ReplayOutput>("replay"),
         entry::<TraceOutput>("trace"),
         entry::<CostOutput>("cost"),

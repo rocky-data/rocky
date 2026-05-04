@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { restartLspClient } from "../lspClient";
 import { aiExplain, aiGenerate, aiSync, aiTest } from "./ai";
+import { branchApprove, branchPromote } from "./branch";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { hooksList, hooksTest } from "./hooks";
@@ -75,5 +76,9 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
     vscode.commands.registerCommand("rocky.previewDiff", previewDiff),
     vscode.commands.registerCommand("rocky.previewCost", previewCost),
+
+    // Branch approval / promote — gated production writes from a branch
+    vscode.commands.registerCommand("rocky.branchApprove", branchApprove),
+    vscode.commands.registerCommand("rocky.branchPromote", branchPromote),
   );
 }

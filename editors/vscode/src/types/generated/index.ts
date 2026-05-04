@@ -169,6 +169,29 @@ export type { BranchOutput, BranchEntry } from "./branch";
 export type { BranchListOutput } from "./branch_list";
 export type { BranchDeleteOutput } from "./branch_delete";
 
+// Branch approval / promote — file-based gate for production writes.
+// Several types (ApprovalArtifact / ApproverIdentity / ApprovalSignature /
+// ApproverSource / SignatureAlgorithm) appear in both generated modules
+// because they are referenced by both top-level outputs. Re-export from
+// branch_approve as the canonical source; downstream consumers can also
+// import the promote-only variants directly from branch_promote when
+// needed.
+export type {
+  ApprovalArtifact,
+  ApprovalSignature,
+  ApproveOutput,
+  ApproverIdentity,
+  ApproverSource,
+  SignatureAlgorithm,
+} from "./branch_approve";
+export type {
+  AuditEvent,
+  AuditEventKind,
+  BranchPromoteOutput,
+  PromoteTarget,
+  RejectedApproval,
+} from "./branch_promote";
+
 // Catalog (project-wide column-lineage snapshot)
 export type {
   AssetKind,

@@ -324,6 +324,10 @@ export interface RockyConfig {
    */
   ai?: AiSection;
   /**
+   * Branch-level configuration. Currently scopes the optional approval gate consumed by `rocky branch promote`. See [`BranchSection`].
+   */
+  branch?: BranchSection;
+  /**
    * Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
    */
   budget?: BudgetConfig;
@@ -521,6 +525,37 @@ export interface AiSection {
    * Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
    */
   max_tokens?: number;
+}
+/**
+ * Top-level `[branch]` configuration section.
+ *
+ * Currently scopes the optional approval gate consumed by `rocky branch promote`. Default-constructed (no `[branch]` block in `rocky.toml`) leaves the gate disabled — `branch promote` skips the approval loop and behaves like the unguarded baseline.
+ */
+export interface BranchSection {
+  approval?: BranchApprovalConfig;
+}
+/**
+ * `[branch.approval]` configuration block.
+ *
+ * Defaults are deliberately permissive — a project that doesn't add the section keeps the v0 `branch promote` behaviour. Flipping `required = true` opts in to the gate; the rest of the knobs tune the strictness once the gate is on.
+ */
+export interface BranchApprovalConfig {
+  /**
+   * When non-empty, only approvals from these signer emails count toward `min_approvers`. Empty (default) accepts any signer.
+   */
+  allowed_signers?: string[];
+  /**
+   * Approvals older than this many seconds are rejected even if their branch_state_hash still matches. Default 86400 (24h).
+   */
+  max_age_seconds?: number;
+  /**
+   * Minimum number of valid approvals required when `required = true`. "Valid" means: signature verifies, branch_state_hash matches the current state, signed within `max_age_seconds`, and (when `allowed_signers` is non-empty) the signer's email is in the list.
+   */
+  min_approvers?: number;
+  /**
+   * When true, `branch promote` refuses to run unless at least `min_approvers` valid approval artifacts are on disk for the branch. When false (default), the gate is bypassed silently.
+   */
+  required?: boolean;
 }
 /**
  * Declarative run-level budget for cost, duration, and data volume. All limits are optional; when unset the dimension is not enforced.

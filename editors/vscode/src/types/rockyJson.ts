@@ -15,7 +15,9 @@
 // hand-written interfaces.
 
 import type {
+  ApproveOutput,
   ArchiveOutput,
+  BranchPromoteOutput,
   CatalogOutput,
   CiOutput,
   CompactOutput,
@@ -101,3 +103,7 @@ export type HooksHookEntry = HookEntry;
 export type HooksTestResult = HooksTestOutput;
 
 export type CatalogResult = CatalogOutput;
+
+// Branch approval / promote — file-based gate for production writes.
+export type BranchApproveResult = ApproveOutput;
+export type BranchPromoteResult = BranchPromoteOutput;

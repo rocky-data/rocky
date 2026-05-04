@@ -1873,6 +1873,11 @@ pub struct RockyConfig {
     /// `ai-sync` / `ai-test`. See [`AiSection`].
     #[serde(default)]
     pub ai: AiSection,
+
+    /// Branch-level configuration. Currently scopes the optional approval
+    /// gate consumed by `rocky branch promote`. See [`BranchSection`].
+    #[serde(default)]
+    pub branch: BranchSection,
 }
 
 impl RockyConfig {
@@ -2009,6 +2014,80 @@ impl Default for AiSection {
 /// the schema generator and TOML parser don't need to depend on the AI
 /// crate (which would invert the dependency graph).
 pub const DEFAULT_AI_MAX_TOKENS: u32 = 4096;
+
+/// Default `max_age_seconds` for [`BranchApprovalConfig`]. 24 hours — long
+/// enough for a same-day approve/promote cycle, short enough that an
+/// abandoned approval doesn't sit on a stale branch indefinitely.
+pub const DEFAULT_APPROVAL_MAX_AGE_SECONDS: u64 = 86400;
+
+/// Default minimum number of valid approvals required when the gate is
+/// enabled.
+pub const DEFAULT_APPROVAL_MIN_APPROVERS: u32 = 1;
+
+/// Top-level `[branch]` configuration section.
+///
+/// Currently scopes the optional approval gate consumed by
+/// `rocky branch promote`. Default-constructed (no `[branch]` block in
+/// `rocky.toml`) leaves the gate disabled — `branch promote` skips the
+/// approval loop and behaves like the unguarded baseline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BranchSection {
+    #[serde(default)]
+    pub approval: BranchApprovalConfig,
+}
+
+/// `[branch.approval]` configuration block.
+///
+/// Defaults are deliberately permissive — a project that doesn't add the
+/// section keeps the v0 `branch promote` behaviour. Flipping
+/// `required = true` opts in to the gate; the rest of the knobs tune the
+/// strictness once the gate is on.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BranchApprovalConfig {
+    /// When true, `branch promote` refuses to run unless at least
+    /// `min_approvers` valid approval artifacts are on disk for the branch.
+    /// When false (default), the gate is bypassed silently.
+    #[serde(default)]
+    pub required: bool,
+
+    /// Minimum number of valid approvals required when `required = true`.
+    /// "Valid" means: signature verifies, branch_state_hash matches the
+    /// current state, signed within `max_age_seconds`, and (when
+    /// `allowed_signers` is non-empty) the signer's email is in the list.
+    #[serde(default = "default_approval_min_approvers")]
+    pub min_approvers: u32,
+
+    /// When non-empty, only approvals from these signer emails count toward
+    /// `min_approvers`. Empty (default) accepts any signer.
+    #[serde(default)]
+    pub allowed_signers: Vec<String>,
+
+    /// Approvals older than this many seconds are rejected even if their
+    /// branch_state_hash still matches. Default 86400 (24h).
+    #[serde(default = "default_approval_max_age_seconds")]
+    pub max_age_seconds: u64,
+}
+
+impl Default for BranchApprovalConfig {
+    fn default() -> Self {
+        Self {
+            required: false,
+            min_approvers: DEFAULT_APPROVAL_MIN_APPROVERS,
+            allowed_signers: Vec::new(),
+            max_age_seconds: DEFAULT_APPROVAL_MAX_AGE_SECONDS,
+        }
+    }
+}
+
+fn default_approval_min_approvers() -> u32 {
+    DEFAULT_APPROVAL_MIN_APPROVERS
+}
+
+fn default_approval_max_age_seconds() -> u64 {
+    DEFAULT_APPROVAL_MAX_AGE_SECONDS
+}
 
 fn default_ai_max_tokens() -> u32 {
     DEFAULT_AI_MAX_TOKENS
