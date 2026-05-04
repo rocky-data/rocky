@@ -64,10 +64,20 @@
     ],
     "description": "Match expression (CASE WHEN)"
   },
-  "Window function": {
-    "prefix": "window",
-    "body": "${1|row_number,rank,dense_rank,lag,lead|}(${2:column}) over (partition ${3:key}, sort ${4:order_column})",
-    "description": "Window function with OVER clause"
+  "Rank window function": {
+    "prefix": "window-rank",
+    "body": "${1|row_number,rank,dense_rank|}() over (partition ${2:key}, sort ${3:order_column})",
+    "description": "Rank-style window function (no args)"
+  },
+  "Offset window function": {
+    "prefix": "window-offset",
+    "body": "${1|lag,lead|}(${2:column}, ${3:1}) over (partition ${4:key}, sort ${5:order_column})",
+    "description": "Lag/lead window function with row offset"
+  },
+  "First value window": {
+    "prefix": "first-value",
+    "body": "first_value(${1:column}) over (partition ${2:key}, sort ${3:order_column})",
+    "description": "Return the first value in a window"
   },
   "Coalesce": {
     "prefix": "coalesce",
@@ -79,20 +89,10 @@
     "body": "nullif(${1:column}, ${2:value})",
     "description": "Return null when two expressions are equal"
   },
-  "Cast": {
-    "prefix": "cast",
-    "body": "cast(${1:column}, \"${2|string,int,float,bool,date,timestamp|}\")",
-    "description": "Cast an expression to a target type"
-  },
   "Concat": {
     "prefix": "concat",
     "body": "concat(${1:first}, ${2:second})",
     "description": "Concatenate string expressions"
-  },
-  "First value window": {
-    "prefix": "first-value",
-    "body": "first_value(${1:column}) over (partition ${2:key}, sort ${3:order_column})",
-    "description": "Return the first value in a window"
   },
   "Full model template": {
     "prefix": "model",
