@@ -674,8 +674,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
 
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         if "dag" not in raw:
-            # Graceful fallback: re-enter the non-DAG path.
-            return self.build_defs_from_state(context, state_path, _skip_dag=True)
+            # Graceful fallback: re-enter the non-DAG path. Call the helper
+            # directly rather than `build_defs_from_state` to avoid mutating
+            # `self.dag_mode` — that would persist across code-server reloads
+            # and poison subsequent `write_state_to_path` calls (line 564).
+            return self._build_defs_from_discover(context, state_path)
 
         # Use model_validate_json to correctly handle Pydantic field aliases
         # (e.g., "from" → from_, "schema" → schema_).
@@ -841,8 +844,6 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         self,
         context: dg.ComponentLoadContext,
         state_path: Path | None,
-        *,
-        _skip_dag: bool = False,
     ) -> dg.Definitions:
         """Build materializable assets from the cached discover/compile state."""
         if state_path is None:
@@ -857,9 +858,22 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             return dg.Definitions()
 
         # DAG-mode: build the full connected asset graph from ``rocky dag``.
-        if self.dag_mode and not _skip_dag:
+        if self.dag_mode:
             return self._build_defs_from_dag(context, state_path)
 
+        return self._build_defs_from_discover(context, state_path)
+
+    def _build_defs_from_discover(
+        self,
+        context: dg.ComponentLoadContext,
+        state_path: Path,
+    ) -> dg.Definitions:
+        """Build assets from the legacy discover/compile/optimize state shape.
+
+        Reached either when ``dag_mode`` is off, or via the
+        :meth:`_build_defs_from_dag` fallback when the cached state predates
+        DAG mode (no ``"dag"`` key).
+        """
         discover, compile_result, optimize_result = _load_state(state_path)
         if self.strict_build and not discover.sources:
             raise dg.Failure(

@@ -60,6 +60,26 @@ def test_build_defs_from_none_state():
     assert list(defs.assets or []) == []
 
 
+def test_dag_mode_fallback_does_not_mutate_config(discover_json: str, tmp_path: Path):
+    """When ``dag_mode=True`` but the cached state predates DAG mode (no ``dag``
+    key), ``build_defs_from_state`` must fall back without mutating
+    ``self.dag_mode`` — the mutation persists across code-server reloads and
+    poisons subsequent ``write_state_to_path`` calls (the dag payload skip at
+    component.py:564), permanently degrading the cache.
+    """
+    state = {"discover": json.loads(discover_json)}  # deliberately no "dag" key
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    # Fallback returned a populated definitions tree (matches the legacy path).
+    assert len(list(defs.assets or [])) > 0
+    # Crucially: the config attribute is unchanged after the fallback.
+    assert component.dag_mode is True
+
+
 def test_defs_state_config_key():
     """Test that the state key includes the config path."""
     component = RockyComponent(config_path="config/rocky.toml")
