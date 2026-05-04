@@ -405,7 +405,13 @@ pub(crate) async fn compute_measure_dedup(
     for table in &tables {
         let table_ref_str = table
             .validated_full_name()
-            .map_err(|e| anyhow!("invalid table reference: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "rocky compact --measure-dedup could not validate table reference {table:?} \
+                     before hashing; verify the warehouse returned catalog, schema, and table names \
+                     that are valid SQL identifiers: {e}"
+                )
+            })?;
 
         // One describe_table call per table, reused for both hash
         // passes. This also sidesteps `HASH(*)` — which isn't portable
@@ -554,7 +560,11 @@ async fn enumerate_tables(
             let mut skipped: Vec<(String, String)> = Vec::new();
             for catalog in catalog_list {
                 rocky_sql::validation::validate_identifier(catalog).map_err(|e| {
-                    anyhow!("invalid catalog identifier {catalog:?} in managed set: {e}")
+                    anyhow!(
+                        "rocky compact --measure-dedup could not enumerate managed catalog \
+                         {catalog:?} because it is not a valid SQL identifier; verify the Rocky \
+                         target catalog template resolves to a plain catalog name: {e}"
+                    )
                 })?;
                 let sql = format!(
                     "SELECT table_catalog, table_schema, table_name \
@@ -596,7 +606,13 @@ async fn enumerate_tables(
             let result = adapter
                 .execute_query(sql)
                 .await
-                .map_err(|e| anyhow!("failed to enumerate tables via information_schema: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "rocky compact --measure-dedup failed while enumerating user tables from \
+                         information_schema; verify the warehouse exposes information_schema.tables \
+                         and the configured credential can list tables in the active catalog/schema: {e}"
+                    )
+                })?;
             collect_table_rows(&result.rows, SYSTEM_SCHEMAS, &mut tables)?;
         }
     }
@@ -650,14 +666,21 @@ async fn hash_table(
     table: &TableRef,
     value_columns: &[String],
 ) -> Result<Vec<PartitionChecksum>> {
-    let table_ref_str = table
-        .validated_full_name()
-        .map_err(|e| anyhow!("invalid table reference: {e}"))?;
+    let table_ref_str = table.validated_full_name().map_err(|e| {
+        anyhow!(
+            "rocky compact --measure-dedup could not validate table reference {table:?} before \
+                 building the checksum query; verify the warehouse returned catalog, schema, and \
+                 table names that are valid SQL identifiers: {e}"
+        )
+    })?;
     let sql = generate_whole_table_checksum_sql(&table_ref_str, value_columns);
-    let result = adapter
-        .execute_query(&sql)
-        .await
-        .map_err(|e| anyhow!("checksum query failed for {table_ref_str}: {e}"))?;
+    let result = adapter.execute_query(&sql).await.map_err(|e| {
+        anyhow!(
+            "rocky compact --measure-dedup failed while running the checksum query for \
+                 {table_ref_str}; verify the table exists, the credential has SELECT access, and \
+                 the selected columns can be hashed by this warehouse adapter: {e}"
+        )
+    })?;
     parse_checksum_rows(&result)
         .with_context(|| format!("parsing checksum rows for {table_ref_str}"))
 }
@@ -1024,10 +1047,13 @@ async fn calibrate_byte_dedup(
 
     for table_name in &sample_tables {
         let sql = format!("SELECT * FROM {table_name} LIMIT {CALIBRATE_SAMPLE_ROWS}");
-        let result = adapter
-            .execute_query(&sql)
-            .await
-            .map_err(|e| anyhow!("calibrate-bytes: query failed for {table_name}: {e}"))?;
+        let result = adapter.execute_query(&sql).await.map_err(|e| {
+            anyhow!(
+                "rocky compact --measure-dedup --calibrate-bytes failed while sampling rows \
+                     from {table_name}; verify the table exists, the credential has SELECT access, \
+                     and the adapter can read rows from that table: {e}"
+            )
+        })?;
 
         for row in &result.rows {
             total_rows += 1;
