@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.12.0] — 2026-05-02
+## [1.13.0] — 2026-05-04
+
+Tracks engine `v1.25.0`. Surfaces the new branch approval lifecycle in the VS Code extension and regenerates TypeScript bindings for the `BranchApproveOutput` / `BranchPromoteOutput` families plus the small description-text changes propagated by engine [#386](https://github.com/rocky-data/rocky/pull/386).
+
+### Added
+
+- **`rocky.branchApprove` + `rocky.branchPromote` commands** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Two new commands registered in `package.json`'s `contributes.commands`, surfaced in the command palette under the Branch group, and implemented in `src/commands/branch.ts`. Wraps the engine's new file-based branch approval gate — `Approve Branch` writes the on-disk sentinel and `Promote Branch` renders an explicit confirmation dialog when the promote response carries `approved = false`, with a "Force Promote" affordance that re-runs with `--force` and stamps the audit trail. The commands consume the regenerated `BranchApproveOutput` / `BranchPromoteOutput` TypeScript interfaces so the typed surface matches the engine's JSON output exactly.
+- **TS interfaces for `rocky branch approve` + `rocky branch promote`** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Regenerated `src/types/generated/branch_approve.ts` + `branch_promote.ts` from engine v1.25.0 schemas — full typed surface (`BranchApproveOutput`, `BranchPromoteOutput`, plus the typed `approval_required` / `approved` / `forced` fields). Barrel `index.ts` updated; `src/types/rockyJson.ts` shim picks up the new types.
+
+### Changed
+
+- **Regenerated `src/types/generated/cost.ts` + `rocky_project.ts`** (engine [#386](https://github.com/rocky-data/rocky/pull/386)). Description-text diff propagated from the engine's doc-comment Arc-framing strip; no shape change.
+- **Regenerated `schemas/rocky-project.schema.json`** (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Picks up the new branch lifecycle additions, syncing the bundled JSON schema with the engine.
+
 
 Tracks engine `v1.23.0`. Surfaces the new `rocky catalog` command in the VS Code extension and regenerates TypeScript bindings for the `CatalogOutput` family, the additive `sweep_interval_seconds` / `sweep_budget_ms` fields on `StateRetentionConfig`, and the additive `projected_per_model_budget_breaches` field plus `PerModelBudgetBreachOutput` interface from per-model `[budget]` blocks.
 
