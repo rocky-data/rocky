@@ -507,7 +507,7 @@ fn is_transient(err: &ConnectorError) -> bool {
             let msg = message.to_uppercase();
             msg.contains("THROTTL")
                 || msg.contains("TEMPORARILY_UNAVAILABLE")
-                || msg.contains("WAREHOUSE")
+                || msg.contains("WAREHOUSE IS STARTING")
                 || msg.contains("TIMEOUT")
         }
         ConnectorError::Timeout { .. } => true,
