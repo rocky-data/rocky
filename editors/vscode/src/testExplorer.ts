@@ -1,4 +1,3 @@
-import * as path from "path";
 import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
 import type { TestResult } from "./types/rockyJson";
@@ -67,7 +66,7 @@ function removeModel(
 }
 
 function modelIdFor(uri: vscode.Uri): string {
-  return path.basename(uri.fsPath, ".rocky");
+  return vscode.workspace.asRelativePath(uri);
 }
 
 function makeTestItem(
