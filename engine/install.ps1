@@ -93,34 +93,48 @@ try {
     $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
     Write-Host "  SHA256: $ActualHash"
 
+    # checksums.txt is published alongside every engine release. If the
+    # download fails we must not silently skip verification — an attacker
+    # who can strip the file would otherwise downgrade us to no integrity
+    # check. Only the download leg is bypassable via ROCKY_SKIP_CHECKSUM;
+    # a missing entry or hash mismatch always aborts. Mirrors install.sh.
+    #
+    # The download attempt is the *only* call wrapped in try/catch. Under
+    # `$ErrorActionPreference = "Stop"` (set above), `Write-Error` becomes a
+    # terminating error — wrapping the verification logic in the same try
+    # would route mismatches/missing-entries through the catch and let
+    # ROCKY_SKIP_CHECKSUM=1 silently bypass them.
+    $ChecksumsResponse = $null
     try {
-        $ChecksumsContent = Invoke-WebRequest -Uri $ChecksumsUrl -UseBasicParsing -ErrorAction Stop
-        $ChecksumsText = [System.Text.Encoding]::UTF8.GetString($ChecksumsContent.Content)
-        $ExpectedLine = ($ChecksumsText -split "`n") |
-            Where-Object { $_ -match [regex]::Escape($Archive) } |
-            Select-Object -First 1
-        if ($ExpectedLine) {
-            $ExpectedHash = ($ExpectedLine.Trim() -split '\s+')[0].ToLower()
-            if ($ActualHash -ne $ExpectedHash) {
-                Write-Error "Checksum mismatch!`n  Expected: $ExpectedHash`n  Actual:   $ActualHash"
-                exit 1
-            }
-            Write-Host "  Checksum verified."
-        } else {
-            Write-Error "checksums.txt did not contain an entry for $Archive."
-            exit 1
-        }
+        $ChecksumsResponse = Invoke-WebRequest -Uri $ChecksumsUrl -UseBasicParsing -ErrorAction Stop
     }
     catch {
-        # checksums.txt is published alongside every engine release. If the
-        # download fails we must not silently skip verification — an attacker
-        # who can strip the file would otherwise bypass the integrity check.
-        Write-Error "Failed to download checksums.txt from $ChecksumsUrl."
-        Write-Host "  Refusing to install an unverified binary. Set ROCKY_SKIP_CHECKSUM=1 to override." -ForegroundColor Yellow
+        Write-Host "Error: Failed to download checksums.txt from $ChecksumsUrl." -ForegroundColor Red
+        Write-Host "  Refusing to install an unverified binary. Retry, or set" -ForegroundColor Yellow
+        Write-Host "  ROCKY_SKIP_CHECKSUM=1 if you intentionally want to skip." -ForegroundColor Yellow
         if ($env:ROCKY_SKIP_CHECKSUM -ne "1") {
             exit 1
         }
         Write-Host "  (Checksum verification skipped - ROCKY_SKIP_CHECKSUM=1)"
+    }
+
+    if ($null -ne $ChecksumsResponse) {
+        $ChecksumsText = [System.Text.Encoding]::UTF8.GetString($ChecksumsResponse.Content)
+        $ExpectedLine = ($ChecksumsText -split "`n") |
+            Where-Object { $_ -match [regex]::Escape($Archive) } |
+            Select-Object -First 1
+        if (-not $ExpectedLine) {
+            Write-Host "Error: checksums.txt did not contain an entry for $Archive." -ForegroundColor Red
+            exit 1
+        }
+        $ExpectedHash = ($ExpectedLine.Trim() -split '\s+')[0].ToLower()
+        if ($ActualHash -ne $ExpectedHash) {
+            Write-Host "Error: Checksum mismatch!" -ForegroundColor Red
+            Write-Host "  Expected: $ExpectedHash" -ForegroundColor Red
+            Write-Host "  Actual:   $ActualHash" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "  Checksum verified."
     }
 
     # Extract
