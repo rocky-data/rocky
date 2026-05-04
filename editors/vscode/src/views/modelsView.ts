@@ -44,7 +44,7 @@ export class ModelTreeItem extends vscode.TreeItem {
     const label = path.basename(resourceUri.fsPath, ".rocky");
     super(label, vscode.TreeItemCollapsibleState.None);
     this.label = label;
-    this.id = label;
+    this.id = vscode.workspace.asRelativePath(resourceUri);
     this.tooltip = resourceUri.fsPath;
     this.description = vscode.workspace.asRelativePath(resourceUri);
     this.command = {
