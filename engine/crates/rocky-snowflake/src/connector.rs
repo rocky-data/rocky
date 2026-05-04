@@ -505,9 +505,15 @@ fn is_transient(err: &ConnectorError) -> bool {
         ConnectorError::Http(e) => e.is_connect() || e.is_timeout(),
         ConnectorError::StatementFailed { message, .. } => {
             let msg = message.to_uppercase();
+            // Warehouse-related transient states only — match WAREHOUSE *together with*
+            // a transient-state keyword. Bare `WAREHOUSE` matches permanent errors like
+            // "warehouse not found" / "warehouse is suspended" / "you must specify the
+            // warehouse" (Snowflake codes 391920, 000606), which retrying cannot fix.
+            let warehouse_transient =
+                msg.contains("WAREHOUSE") && (msg.contains("RESUMING") || msg.contains("STARTING"));
             msg.contains("THROTTL")
                 || msg.contains("TEMPORARILY_UNAVAILABLE")
-                || msg.contains("WAREHOUSE IS STARTING")
+                || warehouse_transient
                 || msg.contains("TIMEOUT")
         }
         ConnectorError::Timeout { .. } => true,
@@ -651,6 +657,52 @@ mod tests {
             message: "Warehouse 'COMPUTE_WH' is suspended, resuming...".into(),
         };
         assert!(is_transient(&err));
+    }
+
+    #[test]
+    fn test_transient_warehouse_starting() {
+        // Defensive: cover the Databricks-style phrasing in case Snowflake
+        // ever emits it.
+        let err = ConnectorError::StatementFailed {
+            handle: "h-1".into(),
+            message: "WAREHOUSE IS STARTING".into(),
+        };
+        assert!(is_transient(&err));
+    }
+
+    #[test]
+    fn test_not_transient_warehouse_not_specified() {
+        // Snowflake code 391920 (sqlState 57P03) — warehouse name doesn't
+        // resolve. Retrying cannot fix this; captured live during review.
+        let err = ConnectorError::StatementFailed {
+            handle: "h-1".into(),
+            message: "Unable to run the command. You must specify the warehouse to use \
+                      by either setting the warehouse field in the body of the request \
+                      or by setting the DEFAULT_NAMESPACE property for the current user."
+                .into(),
+        };
+        assert!(!is_transient(&err));
+    }
+
+    #[test]
+    fn test_not_transient_warehouse_suspended_no_auto_resume() {
+        // Snowflake code 000606 — warehouse with AUTO_RESUME=FALSE is
+        // suspended. Permanent until human action.
+        let err = ConnectorError::StatementFailed {
+            handle: "h-1".into(),
+            message: "Cannot execute the query because the warehouse is suspended.".into(),
+        };
+        assert!(!is_transient(&err));
+    }
+
+    #[test]
+    fn test_not_transient_no_active_warehouse() {
+        // Snowflake code 000606 variant — session has no warehouse selected.
+        let err = ConnectorError::StatementFailed {
+            handle: "h-1".into(),
+            message: "No active warehouse selected in the current session.".into(),
+        };
+        assert!(!is_transient(&err));
     }
 
     #[test]
