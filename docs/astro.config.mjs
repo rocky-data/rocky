@@ -11,6 +11,7 @@ export default defineConfig({
         dark: "./src/assets/rocky-logo-dark.svg",
         light: "./src/assets/rocky-logo-light.svg",
         alt: "Rocky",
+        replacesTitle: true,
       },
       favicon: "/favicon.svg",
       social: [
