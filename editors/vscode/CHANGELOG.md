@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-05-05
+
+Tracks engine `v1.26.0`. Regenerated TypeScript bindings for the new `AiGenerateOutput.body_path` / `.sidecar_path` fields from engine [#414](https://github.com/rocky-data/rocky/pull/414) — `rocky ai` now writes both the body and a sidecar to disk and reports the resulting paths in the typed JSON output. Engine [#413](https://github.com/rocky-data/rocky/pull/413) (AI prompt tightening) and engine [#415](https://github.com/rocky-data/rocky/pull/415) (env-var substitution in model sidecars) are source-invisible to the extension. No extension feature changes this cycle.
+
+### Changed
+
+- **Regenerated `src/types/generated/ai_generate.ts`** (engine [#414](https://github.com/rocky-data/rocky/pull/414)) for the new `body_path` and `sidecar_path` fields on `AiGenerateOutput`. Both are optional (`string | null`) and only populated when the engine successfully wrote the generated body + sidecar to disk; strictly additive, so existing consumers of `AiGenerateOutput` continue to compile. Barrel `index.ts` updated; `src/types/rockyJson.ts` shim picks up the new fields.
+
 ## [1.13.0] — 2026-05-04
 
 Tracks engine `v1.25.0`. Surfaces the new branch approval lifecycle in the VS Code extension and regenerates TypeScript bindings for the `BranchApproveOutput` / `BranchPromoteOutput` families plus the small description-text changes propagated by engine [#386](https://github.com/rocky-data/rocky/pull/386).
