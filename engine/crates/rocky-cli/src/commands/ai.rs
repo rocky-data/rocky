@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use rocky_ai::client::{AiConfig, DEFAULT_MAX_TOKENS, LlmClient};
 use rocky_ai::generate;
+use rocky_ai::sidecar::{SidecarMaterialization, SidecarTarget, write_model_files};
 use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::redacted::RedactedString;
@@ -115,6 +116,7 @@ fn build_schema_context(result: &CompileResult) -> SchemaBuckets {
 /// matters for downstream models and contract validation. Rocky's
 /// typechecker is lenient on unresolved columns today, so schema grounding
 /// in the prompt is the primary mechanism preventing hallucinated columns.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ai(
     config_path: &Path,
     state_path: &Path,
@@ -123,9 +125,23 @@ pub async fn run_ai(
     models_dir: &str,
     output_json: bool,
     cache_ttl_override: Option<u64>,
+    materialization: &str,
+    watermark: Option<&str>,
+    target: Option<&str>,
+    overwrite: bool,
 ) -> Result<()> {
     let client = make_client(config_path)?;
     let fmt = format.unwrap_or("rocky");
+
+    // Validate sidecar inputs up-front — failing here costs no LLM tokens.
+    // Materialization parsing also enforces the `--watermark` requirement
+    // for `incremental` before we make the API call.
+    let parsed_materialization = SidecarMaterialization::parse(materialization, watermark)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let parsed_target_override = match target {
+        Some(value) => Some(SidecarTarget::parse(value).map_err(|e| anyhow::anyhow!("{e}"))?),
+        None => None,
+    };
 
     // Best-effort compile of the project to ground the prompt.
     // If it fails (missing dir, parse errors, etc.) we degrade to unschema'd
@@ -166,6 +182,28 @@ pub async fn run_ai(
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Resolve target. `--target` overrides the default; otherwise we
+    // mirror the in-memory default from `build_generated_model`
+    // (`generated.ai.<name>`) so the on-disk sidecar matches what AI
+    // validation already typechecked against.
+    let resolved_target =
+        parsed_target_override.unwrap_or_else(|| SidecarTarget::default_for(&result.name));
+
+    let dir = std::path::Path::new(models_dir);
+    let written = write_model_files(
+        dir,
+        &result.name,
+        &result.format,
+        &result.source,
+        &parsed_materialization,
+        &resolved_target,
+        overwrite,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let body_path = written.body_path.display().to_string();
+    let sidecar_path = written.sidecar_path.display().to_string();
+
     if output_json {
         let output = AiGenerateOutput {
             version: VERSION.to_string(),
@@ -175,11 +213,15 @@ pub async fn run_ai(
             name: result.name.clone(),
             source: result.source.clone(),
             attempts: result.attempts,
+            body_path: Some(body_path),
+            sidecar_path: Some(sidecar_path),
         };
         print_json(&output)?;
     } else {
         println!("Generated model: {} ({})", result.name, result.format);
         println!("Attempts: {}", result.attempts);
+        println!("Wrote: {body_path}");
+        println!("Wrote: {sidecar_path}");
         println!();
         println!("{}", result.source);
     }
