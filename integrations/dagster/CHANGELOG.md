@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.24.0] — 2026-05-05
+
+Companion release to engine `v1.26.0`. Headline: **regenerated `AiGenerateOutput` Pydantic model** picking up the new `body_path` + `sidecar_path` fields from engine [#414](https://github.com/rocky-data/rocky/pull/414) — `rocky ai "<intent>"` now writes both the body and a sidecar to disk and reports the resulting paths in the typed JSON output. Engine [#413](https://github.com/rocky-data/rocky/pull/413) (AI prompt tightening) and engine [#415](https://github.com/rocky-data/rocky/pull/415) (env-var substitution in model sidecars) are source-invisible to the dagster integration — the `dagster_rocky.types_generated` layer is otherwise unchanged this cycle. Wheel re-cut against the v1.26.0 engine binary.
+
+### Added
+
+- **`AiGenerateOutput.body_path` + `.sidecar_path`** (engine [#414](https://github.com/rocky-data/rocky/pull/414)). Two new `Optional[str]` fields on the regenerated `AiGenerateOutput` Pydantic model, populated only when `rocky ai` writes the generated model to disk (which is now the default surface — the previous stdout-only mode is gone). Consumers of `RockyResource` that drive `rocky ai` can read `result.body_path` / `result.sidecar_path` to locate the emitted files for downstream actions (e.g. opening them in an editor, kicking off a follow-up `rocky run` against the new model). Strictly additive — re-exported from `dagster_rocky.types` for the soft-swap import path.
+
 ## [1.23.0] — 2026-05-04
 
 Companion release to engine `v1.25.0`. Headline: **`RockyResource.branch_approve()` + `RockyResource.branch_promote()`** typed-resource methods that drive the engine's new file-based branch approval gate (engine [#388](https://github.com/rocky-data/rocky/pull/388)). Dagster code can now sign branch approvals and promote branches via `RockyResource` without parsing JSON by hand — the regenerated `dagster_rocky.types_generated.{branch_approve_schema,branch_promote_schema}` exposes `BranchApproveOutput` and `BranchPromoteOutput` (typed `branch_state_hash`, `approvals_used`, `approvals_rejected`, `targets`, `audit`, `success`) as Pydantic v2 models. Engine [#386](https://github.com/rocky-data/rocky/pull/386) (doc-comment Arc-framing strip) propagated through codegen as a small description-text diff on `cost_schema.py` — no shape change.
