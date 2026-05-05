@@ -3,8 +3,11 @@
   "type": "module",
   "version": "0.0.1",
   "scripts": {
+    "predev": "node scripts/count-pocs.mjs",
     "dev": "astro dev",
+    "prestart": "node scripts/count-pocs.mjs",
     "start": "astro dev",
+    "prebuild": "node scripts/count-pocs.mjs",
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro"
