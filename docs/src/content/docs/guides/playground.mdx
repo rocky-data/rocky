@@ -5,6 +5,8 @@ sidebar:
   order: 1
 ---
 
+import pocCounts from "../../../data/poc-counts.json";
+
 The Rocky playground creates a self-contained sample project that runs entirely on DuckDB. No warehouse credentials, no Fivetran account, no external services. It is the fastest way to experience Rocky's compiler, type system, lineage engine, and AI features.
 
 ## 1. Create the Playground
@@ -380,9 +382,9 @@ Exit code 0 means all checks passed. A non-zero exit code fails the CI job.
 
 ## 8. Explore the POC Catalog
 
-The playground includes a curated catalog of 61 POCs that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
+The playground includes a curated catalog of {pocCounts.total} POCs across {pocCounts.categoryCount} categories that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
 
-### Foundations (8 POCs)
+### Foundations ({pocCounts.perCategory["00-foundations"]} POCs)
 
 | POC | Feature |
 |---|---|
@@ -395,7 +397,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `06-branches-replay-lineage` | Trust arc 1: branches + replay + column lineage end-to-end |
 | `07-config-layering` | Three-layer config (`rocky.toml` + `_defaults.toml` + sidecar) with `${VAR}` substitution at every layer |
 
-### Quality (6 POCs)
+### Quality ({pocCounts.perCategory["01-quality"]} POCs)
 
 | POC | Feature |
 |---|---|
@@ -406,7 +408,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `05-snapshot-scd2` | Snapshot pipeline with SCD Type 2 history |
 | `06-quality-pipeline-standalone` | Standalone `pipeline.type = "quality"` (checks-only run) |
 
-### Performance (10 POCs)
+### Performance ({pocCounts.perCategory["02-performance"]} POCs)
 
 | POC | Feature |
 |---|---|
@@ -421,7 +423,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `09-adaptive-concurrency` | AIMD dynamic parallelism via the throttle module |
 | `10-cost-budgets` | Trust arc 2: per-run cost summary + `[budget]` breach |
 
-### AI (5 POCs, `ANTHROPIC_API_KEY` required)
+### AI ({pocCounts.perCategory["03-ai"]} POCs, `ANTHROPIC_API_KEY` required)
 
 | POC | Feature |
 |---|---|
@@ -431,7 +433,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `04-ai-test-generation` | `rocky ai-test --all --save` generates SQL assertions |
 | `05-schema-grounded-validation` | Trust arc 5: AI output is compiler-gated against the schema |
 
-### Governance (6 POCs, Databricks required)
+### Governance ({pocCounts.perCategory["04-governance"]} POCs, Databricks required)
 
 | POC | Feature |
 |---|---|
@@ -442,7 +444,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `05-classification-masking-compliance` | `[classification]` + `[mask]` + `rocky compliance` |
 | `06-retention-policies` | Declarative `retention = "<N>[dy]"` + `rocky retention-status --drift` |
 
-### Orchestration (9 POCs)
+### Orchestration ({pocCounts.perCategory["05-orchestration"]} POCs)
 
 | POC | Feature |
 |---|---|
@@ -456,7 +458,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `08-circuit-breaker` | Trust arc 3: retry policy + three-state circuit breaker |
 | `09-idempotency-key` | `rocky run --idempotency-key` dedup + skip semantics |
 
-### Developer Experience (11 POCs)
+### Developer Experience ({pocCounts.perCategory["06-developer-experience"]} POCs)
 
 | POC | Feature |
 |---|---|
@@ -472,7 +474,7 @@ The playground includes a curated catalog of 61 POCs that showcase Rocky's disti
 | `10-pr-preview-and-data-diff` | `rocky preview create / diff / cost` end-to-end PR bundle |
 | `11-lineage-diff` | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review |
 
-### Adapters (6 POCs)
+### Adapters ({pocCounts.perCategory["07-adapters"]} POCs)
 
 | POC | Feature |
 |---|---|
