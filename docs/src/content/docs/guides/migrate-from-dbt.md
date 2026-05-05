@@ -152,11 +152,15 @@ Notice several changes:
 
 The importer cannot convert all Jinja patterns. It produces warnings and failures for cases it cannot handle automatically.
 
+:::tip[Per-model env-var injection]
+For migrations that lean on `{{ var() }}` or `{{ target.* }}` to drive per-model `catalog` / `schema` / `table` values from an orchestrator, Rocky's three-layer config (pipeline `rocky.toml` + `models/_defaults.toml` + per-model sidecar `.toml`) supports `${VAR}` / `${VAR:-default}` substitution at every layer. See the worked example at [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) — particularly useful for Dagster asset factories that inject targets per asset via subprocess env.
+:::
+
 ### Common warnings
 
 | Pattern | Importer Behavior | Manual Fix |
 |---|---|---|
-| `{{ var('some_var') }}` | Replaced with a `TODO` placeholder | Replace with a hardcoded value or environment variable in `rocky.toml` |
+| `{{ var('some_var') }}` | Replaced with a `TODO` placeholder | Replace with a hardcoded value or `${VAR}` / `${VAR:-default}` substitution. Env vars resolve in `rocky.toml`, in `models/_defaults.toml`, and in per-model sidecar `.toml` files — letting an orchestrator inject `[target]` values per asset without templating. |
 | `{% if target.name == 'prod' %}` | Stripped, keeping the default branch | Remove environment branching or use separate `rocky.toml` files per environment |
 | `{% set ... %}` variable assignments | Stripped with a warning | Inline the value or refactor the query |
 

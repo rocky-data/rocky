@@ -91,6 +91,20 @@ Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **mater
 | `schema` | string | Yes | Source schema name. |
 | `table` | string | Yes | Source table name. |
 
+### Environment variables
+
+Sidecar `.toml` files (and `models/_defaults.toml`) go through the same `${VAR}` / `${VAR:-default}` substitution as `rocky.toml`. This lets an orchestrator inject per-model `[target]` values via subprocess env without templating the sidecar:
+
+```toml
+# models/customer_facts.toml
+[target]
+catalog = "${ROCKY_TARGET_CATALOG:-warehouse}"
+schema  = "${ROCKY_TARGET_SCHEMA:-marts}"
+table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
+```
+
+See [Environment Variables](/reference/configuration/#environment-variables) for the canonical syntax reference and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
+
 ### `[classification]`
 
 Per-column classification tags. Keys are column names, values are free-form classification strings. Rocky resolves each value against `[mask]` / `[mask.<env>]` in `rocky.toml` to pick the masking strategy, then applies both the column tag and the mask via the governance adapter after a successful DAG.
@@ -174,6 +188,8 @@ FROM raw_catalog.src__acme__us_west__shopify.orders
 ```
 
 The inline format uses the same fields as the sidecar TOML file. The SQL query follows the closing `---` marker.
+
+The frontmatter block supports the same `${VAR}` / `${VAR:-default}` substitution as sidecar `.toml` files (see [Environment Variables](/reference/configuration/#environment-variables)); the SQL body below the closing `---` is **not** substituted, so any `${VAR}` token in the query stays literal.
 
 This format is supported for backward compatibility. The sidecar format is preferred because it keeps SQL files portable and free of non-SQL syntax.
 

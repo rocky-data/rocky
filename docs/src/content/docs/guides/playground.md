@@ -380,9 +380,9 @@ Exit code 0 means all checks passed. A non-zero exit code fails the CI job.
 
 ## 8. Explore the POC Catalog
 
-The playground includes a curated catalog of 58 POCs that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
+The playground includes a curated catalog of 61 POCs that showcase Rocky's distinctive capabilities. Each POC is self-contained with its own `rocky.toml`, `models/`, and `run.sh`. Most run on local DuckDB with zero credentials.
 
-### Foundations (7 POCs)
+### Foundations (8 POCs)
 
 | POC | Feature |
 |---|---|
@@ -393,6 +393,7 @@ The playground includes a curated catalog of 58 POCs that showcase Rocky's disti
 | `04-window-functions` | DSL window syntax with partition + sort + frame |
 | `05-generic-adapter-exercise` | Full generic-adapter trait surface against DuckDB |
 | `06-branches-replay-lineage` | Trust arc 1: branches + replay + column lineage end-to-end |
+| `07-config-layering` | Three-layer config (`rocky.toml` + `_defaults.toml` + sidecar) with `${VAR}` substitution at every layer |
 
 ### Quality (6 POCs)
 
