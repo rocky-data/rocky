@@ -185,7 +185,7 @@ For adapters that talk to a REST API, the in-tree pattern is `wiremock`-based â€
 
 ### The conformance harness
 
-`rocky-adapter-sdk::conformance::run_conformance(&manifest)` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. Today this is a test plan, not a live runner â€” it prints the matrix but does not yet execute trait calls against your adapter. Treat it as a checklist of behaviors your unit tests should cover. Live execution will land in a future SDK release.
+`rocky-adapter-sdk::conformance::run_conformance(&manifest, adapter.dialect())` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. The harness now exercises one real dialect call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
 
 ## Distributing your adapter
 
