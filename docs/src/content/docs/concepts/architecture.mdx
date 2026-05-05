@@ -5,6 +5,8 @@ sidebar:
   order: 1
 ---
 
+import pocCounts from "../../../data/poc-counts.json";
+
 Rocky is a Cargo workspace composed of several crates, each with a focused responsibility. This page describes what each crate does and how they connect.
 
 ## Adapter model
@@ -36,9 +38,11 @@ rocky-data/
 ├── engine/                  # Rust CLI + engine (this section)
 ├── integrations/dagster/    # dagster-rocky Python package
 ├── editors/vscode/          # VS Code extension (LSP client)
-├── examples/playground/     # POC catalog (28 POCs) + benchmarks
+├── examples/playground/     # POC catalog + benchmarks
 └── docs/                    # Documentation site (Astro + Starlight)
 ```
+
+The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.categoryCount} categories — see the [playground guide](/guides/playground/) for the full list.
 
 ## Crate overview
 
