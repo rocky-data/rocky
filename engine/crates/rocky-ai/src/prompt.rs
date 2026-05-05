@@ -23,8 +23,17 @@ pub fn build_system_prompt(
 
     if format == "rocky" {
         prompt.push_str("# Rocky DSL Syntax\n\n");
+        prompt.push_str(
+            "A `.rocky` file is the bare pipeline body — a sequence of pipeline steps starting with `from` (or `replicate`). \
+             Do NOT wrap the pipeline in `model { ... }`, `rocky_model { ... }`, or any other block. \
+             Do NOT emit a `config(...)` call, header, or sidecar metadata. \
+             Target catalog/schema/table and materialization strategy live in the companion `.toml` sidecar, never in the `.rocky` body.\n\n",
+        );
         prompt.push_str("Rocky DSL is a pipeline-oriented language. Key constructs:\n");
         prompt.push_str("- `from <model>` — start pipeline from a model or source\n");
+        prompt.push_str(
+            "- `replicate <fully.qualified.source>` — replication model body; the entire `.rocky` file is just this single line. Target table + materialization live in the sidecar.\n",
+        );
         prompt.push_str(
             "- `where <predicate>` — filter rows (use == for equality, != for NULL-safe inequality)\n",
         );
@@ -37,10 +46,31 @@ pub fn build_system_prompt(
         prompt.push_str("- `distinct` — deduplicate\n");
         prompt.push_str("- `@2025-01-01` — date literal\n");
         prompt.push_str("- `!=` compiles to IS DISTINCT FROM (NULL-safe)\n\n");
+        prompt.push_str("# Examples\n\n");
+        prompt.push_str("Filter + project (transformation model):\n");
+        prompt.push_str("```\n");
+        prompt.push_str("from raw__demo.orders\n");
+        prompt.push_str("where status != null\n");
+        prompt.push_str("select { id, customer_id, total }\n");
+        prompt.push_str("```\n\n");
+        prompt.push_str("Join + project (transformation model):\n");
+        prompt.push_str("```\n");
+        prompt.push_str("from raw__demo.orders\n");
+        prompt.push_str("join raw__demo.customers as c on customer_id { keep email }\n");
+        prompt.push_str("select { id, customer_id, email, total }\n");
+        prompt.push_str("```\n\n");
     } else {
         prompt.push_str("# SQL Model Format\n\n");
-        prompt.push_str("Generate a standard SQL SELECT statement.\n");
-        prompt.push_str("Reference other models by bare name (e.g., FROM orders).\n\n");
+        prompt.push_str(
+            "Emit ONLY standard ANSI/Postgres SQL — a single `SELECT` statement (with optional CTEs). \
+             Do NOT emit Jinja templating: no `{{ ... }}` expressions, no `{% ... %}` blocks, \
+             no `{{ config(...) }}` headers, no `{{ ref('x') }}` or `{{ source('x', 'y') }}` calls, \
+             and no other dbt-style macros. Materialization, target table, and other model metadata \
+             live in the companion `.toml` sidecar, not in the SQL body.\n",
+        );
+        prompt.push_str(
+            "Reference upstream tables by their fully-qualified name (e.g., `catalog.schema.table` or `raw__demo.orders`) — not by bare name and not via templating.\n\n",
+        );
     }
 
     if !model_schemas.is_empty() {
@@ -122,6 +152,17 @@ mod tests {
         assert!(prompt.contains("orders: id: INT64, amount: DECIMAL(10,2)"));
         assert!(prompt.contains("source.raw.customers: id: INT64, email: STRING"));
         assert!(prompt.contains("warehouse execution"));
+        // `replicate <source>` must be advertised as DSL syntax (Exp 6 gap).
+        assert!(prompt.contains("replicate"));
+        // The prompt must tell the LLM not to wrap the body in a `model { ... }` block (Exp 6 gap).
+        assert!(
+            prompt.contains("Do NOT wrap"),
+            "expected wrapper-prohibition hint, got: {prompt}"
+        );
+        assert!(prompt.contains("model { ... }"));
+        // At least one few-shot example must be present.
+        assert!(prompt.contains("# Examples"));
+        assert!(prompt.contains("from raw__demo.orders"));
     }
 
     #[test]
@@ -129,6 +170,18 @@ mod tests {
         let prompt = build_system_prompt(&[], &[], "sql");
         assert!(prompt.contains("SQL Model Format"));
         assert!(!prompt.contains("Rocky DSL"));
+        // SQL prompt must explicitly forbid Jinja / dbt templating (Exp 6 fixture-06 gap).
+        assert!(
+            prompt.contains("Jinja"),
+            "expected Jinja prohibition, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("{{"),
+            "expected explicit `{{{{` no-emit instruction, got: {prompt}"
+        );
+        assert!(prompt.contains("config("));
+        // Fully-qualified table references must be required.
+        assert!(prompt.contains("fully-qualified"));
     }
 
     #[test]
