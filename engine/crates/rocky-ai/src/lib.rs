@@ -8,5 +8,6 @@ pub mod client;
 pub mod explain;
 pub mod generate;
 pub mod prompt;
+pub mod sidecar;
 pub mod sync;
 pub mod testgen;

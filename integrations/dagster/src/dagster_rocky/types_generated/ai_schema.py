@@ -12,9 +12,17 @@ class AiGenerateOutput(BaseModel):
     """
 
     attempts: conint(ge=0)
+    body_path: str | None = None
+    """
+    Path of the body file (`.rocky` or `.sql`) written to the models directory, when emission succeeded.
+    """
     command: str
     format: str
     intent: str
     name: str
+    sidecar_path: str | None = None
+    """
+    Path of the `.toml` sidecar written next to the body, when emission succeeded. The sidecar carries the materialization strategy and target coordinates so Rocky's model loader picks the generated model up without manual editing.
+    """
     source: str
     version: str

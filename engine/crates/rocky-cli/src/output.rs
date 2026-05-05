@@ -1347,6 +1347,16 @@ pub struct AiGenerateOutput {
     pub name: String,
     pub source: String,
     pub attempts: usize,
+    /// Path of the body file (`.rocky` or `.sql`) written to the models
+    /// directory, when emission succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_path: Option<String>,
+    /// Path of the `.toml` sidecar written next to the body, when emission
+    /// succeeded. The sidecar carries the materialization strategy and
+    /// target coordinates so Rocky's model loader picks the generated
+    /// model up without manual editing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar_path: Option<String>,
 }
 
 /// JSON output for `rocky ai sync`.

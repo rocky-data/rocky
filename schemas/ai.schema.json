@@ -7,6 +7,13 @@
       "minimum": 0.0,
       "type": "integer"
     },
+    "body_path": {
+      "description": "Path of the body file (`.rocky` or `.sql`) written to the models directory, when emission succeeded.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "command": {
       "type": "string"
     },
@@ -18,6 +25,13 @@
     },
     "name": {
       "type": "string"
+    },
+    "sidecar_path": {
+      "description": "Path of the `.toml` sidecar written next to the body, when emission succeeded. The sidecar carries the materialization strategy and target coordinates so Rocky's model loader picks the generated model up without manual editing.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "source": {
       "type": "string"

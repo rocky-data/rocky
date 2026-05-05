@@ -540,11 +540,39 @@ enum Command {
         /// Output format: "rocky" or "sql"
         #[arg(long)]
         format: Option<String>,
-        /// Models directory (compiled to ground the prompt in real schemas).
+        /// Models directory (compiled to ground the prompt in real schemas,
+        /// and the destination directory for the generated body + sidecar).
         /// If the directory doesn't exist or fails to compile, generation
         /// proceeds without schema context.
         #[arg(long, default_value = "models")]
         models: String,
+        /// Materialization strategy for the generated model. Written into
+        /// the emitted `.toml` sidecar's `[strategy]` block.
+        ///
+        /// Accepted: `full_refresh` (default), `incremental`, `merge`,
+        /// `ephemeral`. Other strategies in `StrategyConfig`
+        /// (`time_interval`, `delete_insert`, `microbatch`) require richer
+        /// flag plumbing and are deliberately out of scope for this first
+        /// cut.
+        #[arg(long, default_value = "full_refresh")]
+        materialization: String,
+        /// Watermark column for `--materialization=incremental`. Maps to
+        /// `[strategy] timestamp_column` in the emitted sidecar TOML.
+        /// Required when materialization is `incremental`; ignored
+        /// otherwise.
+        #[arg(long)]
+        watermark: Option<String>,
+        /// Target table coordinates as `catalog.schema.table`. Defaults to
+        /// `generated.ai.<model_name>`, matching the in-memory default
+        /// used during AI compile-verify.
+        #[arg(long)]
+        target: Option<String>,
+        /// Overwrite an existing body or sidecar file at the destination
+        /// path. Without this flag, an existing file fails the command
+        /// loudly so generated output never silently clobbers user-authored
+        /// models.
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Detect schema changes and propose intent-guided model updates
@@ -1737,6 +1765,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             intent,
             format,
             models,
+            materialization,
+            watermark,
+            target,
+            overwrite,
         } => {
             rocky_cli::commands::run_ai(
                 &cli.config,
@@ -1746,6 +1778,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 json,
                 cli.cache_ttl,
+                &materialization,
+                watermark.as_deref(),
+                target.as_deref(),
+                overwrite,
             )
             .await
         }
