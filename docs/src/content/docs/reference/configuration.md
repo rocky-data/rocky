@@ -80,6 +80,22 @@ token = "${DATABRICKS_TOKEN}"
 
 If a referenced variable is not set, Rocky returns a parse error listing the missing variable.
 
+The same substitution runs over every TOML config Rocky loads, not just `rocky.toml`:
+
+- **Per-model sidecars** (`models/<name>.toml`) — useful for orchestrator-injected `[target]` overrides.
+- **`models/_defaults.toml`** — directory-level defaults applied to every sibling sidecar.
+- **Inline `---toml` frontmatter** in `.sql` / `.rocky` files — only the frontmatter block is substituted; the SQL body below the closing `---` is left untouched, so `${VAR}` in SQL stays literal.
+
+```toml
+# models/customer_facts.toml — sidecar example
+[target]
+catalog = "${ROCKY_TARGET_CATALOG:-warehouse}"
+schema  = "${ROCKY_TARGET_SCHEMA:-marts}"
+table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
+```
+
+A worked example covering all three layers lives in `examples/playground/pocs/00-foundations/07-config-layering/`.
+
 ### Default Values
 
 Use `${VAR_NAME:-default}` to provide a fallback when a variable is unset or empty:
