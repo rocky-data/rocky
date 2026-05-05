@@ -1,0 +1,10 @@
+# Layer 2: directory-level defaults
+#
+# Every sibling sidecar inherits these unless it overrides.
+# Now goes through env-var substitution (FR-001 Option A).
+[target]
+catalog = "${ROCKY_CATALOG:-poc_warehouse}"
+schema  = "${ROCKY_DEFAULT_SCHEMA:-public}"
+
+[strategy]
+type = "full_refresh"

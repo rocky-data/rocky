@@ -1,0 +1,11 @@
+# customer_facts — overrides every target field via env-var substitution.
+#
+# This is the FR-001 Option A capability: ${VAR}/${VAR:-default} placeholders
+# in a per-model sidecar resolve at load time, the same way `rocky.toml`
+# already supports them. A Dagster asset factory can now point each asset
+# at its own catalog/schema/table by setting env vars on the subprocess.
+
+[target]
+catalog = "${ROCKY_CUSTOMER_CATALOG:-customer_warehouse}"
+schema  = "${ROCKY_CUSTOMER_SCHEMA:-marts}"
+table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"

@@ -1,0 +1,19 @@
+# 07-config-layering — three-layer env-var substitution demo
+#
+# Layer 1: rocky.toml             — pipeline-level config with ${VAR:-default}
+# Layer 2: models/_defaults.toml  — directory-level model defaults
+# Layer 3: models/<name>.toml     — per-model sidecar overrides
+
+[adapter]
+type = "duckdb"
+# Layer 1 substitution: ${ROCKY_DUCKDB_PATH} flows into the adapter path.
+# (Existing rocky.toml capability — kept here so all three layers are visible
+# in one example.)
+path = "${ROCKY_DUCKDB_PATH:-poc.duckdb}"
+
+[pipeline.layered]
+type = "transformation"
+
+[pipeline.layered.target]
+# Transformation pipelines defer catalog/schema/table to per-model sidecars
+# (Layer 2 + 3). The adapter reference is all that's needed here.

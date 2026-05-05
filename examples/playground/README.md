@@ -36,11 +36,11 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**47 of 60 POCs run with no external credentials.** See each POC's README for prerequisites.
+**48 of 61 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (7 POCs · DuckDB)
+### 00 — Foundations (8 POCs · DuckDB)
 
 DSL syntax, materialization basics, playground baseline, and the trust-arc 1 storage primitives.
 
@@ -53,6 +53,7 @@ DSL syntax, materialization basics, playground baseline, and the trust-arc 1 sto
 | [04-window-functions](pocs/00-foundations/04-window-functions) | DSL window syntax with partition + sort + frame |
 | [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Generic adapter exercise — building custom adapters via the process protocol |
 | [06-branches-replay-lineage](pocs/00-foundations/06-branches-replay-lineage) | **Trust arc 1** — `rocky branch create/list/show`, `rocky run --branch`, `rocky replay`, `rocky lineage --downstream` |
+| [07-config-layering](pocs/00-foundations/07-config-layering) | Three-layer config: `rocky.toml` + `_defaults.toml` + per-model sidecar, with env-var substitution at every layer |
 
 ### 01 — Quality (6 POCs · DuckDB)
 
