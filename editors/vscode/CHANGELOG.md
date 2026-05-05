@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.1] — 2026-05-05
+
+Companion patch release recovering the failed v1.14.0 publish. `vsce package` rejects SVG references in extension READMEs (even remote URLs) under the VS Code Marketplace's security policy, which blocked the v1.14.0 release at the package step before it reached publish. Rasterized the two `rocky-readme-{light,dark}.svg` brand assets to 2560×640 PNG counterparts via `rsvg-convert` (path-flattened source from #410, so rendering is deterministic) and swapped the references in `editors/vscode/README.md`. No extension feature changes.
+
+### Changed
+
+- **`editors/vscode/README.md` brand `<picture>` element switched from SVG to PNG** to satisfy `vsce package`'s SVG-restriction policy. The new PNGs sit alongside the SVGs at `editors/vscode/media/` (`rocky-readme-{light,dark}.png`); the SVG sources are kept in place for parity with the docs site, where browsers render them natively without the marketplace constraint.
+
 ## [1.14.0] — 2026-05-05
 
 Tracks engine `v1.26.0`. Regenerated TypeScript bindings for the new `AiGenerateOutput.body_path` / `.sidecar_path` fields from engine [#414](https://github.com/rocky-data/rocky/pull/414) — `rocky ai` now writes both the body and a sidecar to disk and reports the resulting paths in the typed JSON output. Engine [#413](https://github.com/rocky-data/rocky/pull/413) (AI prompt tightening) and engine [#415](https://github.com/rocky-data/rocky/pull/415) (env-var substitution in model sidecars) are source-invisible to the extension. No extension feature changes this cycle.
