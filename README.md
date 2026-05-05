@@ -1,6 +1,8 @@
 <p align="center">
-  <!-- <img src="editors/vscode/icons/rocky-icon-512-transparent.png" alt="Rocky" width="128" /> -->
-  <img src="docs/src/assets/rocky-social-banner.svg" alt="Rocky" width="auto" height="100%" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/rocky-readme-dark.svg" />
+    <img src="docs/rocky-readme-light.svg" alt="Rocky" />
+  </picture>
 </p>
 
 [![Engine CI](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml)

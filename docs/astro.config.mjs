@@ -12,7 +12,7 @@ export default defineConfig({
         light: "./src/assets/rocky-logo-light.svg",
         alt: "Rocky",
       },
-      favicon: "/favicon.png",
+      favicon: "/favicon.svg",
       social: [
         {
           icon: "github",

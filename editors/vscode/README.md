@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="media/rocky-readme-dark.svg" />
+    <img src="media/rocky-readme-light.svg" alt="Rocky" />
+  </picture>
+</p>
+
 # Rocky VS Code Extension
 
 Language support for the [Rocky](https://github.com/rocky-data/rocky) SQL transformation engine — full LSP, lineage visualization, and AI model generation.

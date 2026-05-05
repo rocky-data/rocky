@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320">
+  <rect width="1280" height="320" fill="#0F1518"></rect>
+  <g transform="translate(410, 80) scale(0.8)">
+  <path d="M64 50 L130 38 L162 70 L158 130 L120 162 L60 152 L36 108 Z" fill="#FF6A00"></path>
+  <path d="M64 50 L130 38 L162 70 L120 78 L70 80 Z" fill="#FFFFFF" fill-opacity="0.18"></path>
+  <path d="M162 70 L158 130 L120 162 L120 78 Z" fill="#D74F00" fill-opacity="0.55"></path>
+  </g>
+  <text x="606" y="160" dominant-baseline="central" font-family="&#39;Space Grotesk&#39;, sans-serif" font-weight="600" font-size="96" letter-spacing="-2.4000000000000004" fill="#FFFFFF">Rocky</text>
+</svg>
