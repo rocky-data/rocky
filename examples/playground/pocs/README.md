@@ -1,10 +1,10 @@
 # POC Catalog
 
-60 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
+61 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
 
 ## Categories
 
-- [00-foundations](00-foundations/) — DSL syntax + materialization basics + trust-arc 1 branches/replay/lineage (7 POCs · DuckDB)
+- [00-foundations](00-foundations/) — DSL syntax + materialization basics + trust-arc 1 branches/replay/lineage + config layering (8 POCs · DuckDB)
 - [01-quality](01-quality/) — Contracts, checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline (6 POCs · DuckDB)
 - [02-performance](02-performance/) — Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, trust-arc 2 cost+budgets (10 POCs · DuckDB)
 - [03-ai](03-ai/) — AI generation, sync, test generation, trust-arc 5 schema-grounded validation (5 POCs · `ANTHROPIC_API_KEY`)
@@ -17,7 +17,7 @@
 
 | POCs | Credentials |
 |---|---|
-| 47 of 60 | None — local DuckDB (or docker-compose for MinIO/Valkey) |
+| 48 of 61 | None — local DuckDB (or docker-compose for MinIO/Valkey) |
 | 5 (`03-ai/*`) | `ANTHROPIC_API_KEY` |
 | 4 (`04-governance/01..04`) + 1 (`07-adapters/02`) | Databricks host + token |
 | 1 (`07-adapters/01`) | Snowflake account + auth |

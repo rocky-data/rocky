@@ -1,0 +1,9 @@
+# orders_summary — minimal sidecar
+#
+# Demonstrates Layer 3 inheritance from Layer 2:
+#   * `target.catalog` / `target.schema` come from `_defaults.toml`
+#     (and resolve from ${ROCKY_CATALOG} / ${ROCKY_DEFAULT_SCHEMA})
+#   * `target.table` defaults to the filename stem (`orders_summary`)
+#   * `name` defaults to the filename stem
+#
+# This file is intentionally empty of overrides — that's the whole point.

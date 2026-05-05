@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::ModelBudgetConfig;
+use crate::config::{ModelBudgetConfig, substitute_env_vars};
 use crate::dag::DagNode;
 use crate::ir::{
     GovernanceConfig, MaterializationStrategy, ModelIr, Plan, SourceRef, TargetRef,
@@ -44,6 +44,13 @@ pub enum ModelError {
         model: String,
         value: String,
         reason: String,
+    },
+
+    #[error("failed to substitute env vars in '{path}': {source}")]
+    EnvSubstitution {
+        path: String,
+        #[source]
+        source: Box<crate::config::ConfigError>,
     },
 }
 
@@ -418,8 +425,18 @@ pub struct DirDefaultsTarget {
 }
 
 /// Validates and loads a `_defaults.toml` file. Rejects per-model fields.
+///
+/// `${VAR}` and `${VAR:-default}` placeholders are resolved before parsing,
+/// matching `rocky.toml` and per-model sidecar behavior. Lets directory-level
+/// defaults (e.g. `target.schema = "${ROCKY_SCHEMA:-public}"`) be set per
+/// orchestrator subprocess.
 pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
-    let content = std::fs::read_to_string(path)?;
+    let raw_content = std::fs::read_to_string(path)?;
+    let content =
+        substitute_env_vars(&raw_content).map_err(|source| ModelError::EnvSubstitution {
+            path: path.display().to_string(),
+            source: Box::new(source),
+        })?;
 
     // Check for per-model fields that shouldn't be in defaults
     let raw: toml::Value = toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
@@ -664,6 +681,12 @@ impl Model {
 /// `target.table` (defaults to name), and `target.catalog`/`target.schema`
 /// (inherited from `defaults` if provided).
 ///
+/// `${VAR}` and `${VAR:-default}` placeholders in the sidecar TOML are
+/// resolved before parsing, matching the substitution behavior of
+/// `rocky.toml`. This lets an orchestrator inject per-model
+/// `target.catalog` / `target.schema` / `target.table` via subprocess env
+/// without rewriting source files.
+///
 /// ```text
 /// models/
 /// ├── _defaults.toml      ← optional: target.catalog, target.schema
@@ -684,7 +707,12 @@ pub fn load_model_pair(
             trimmed.to_string()
         }
     };
-    let toml_content = std::fs::read_to_string(toml_path)?;
+    let raw_toml = std::fs::read_to_string(toml_path)?;
+    let toml_content =
+        substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
+            path: toml_path.display().to_string(),
+            source: Box::new(source),
+        })?;
     let raw: RawModelConfig =
         toml::from_str(&toml_content).map_err(|e| ModelError::ParseFrontmatter {
             path: toml_path.display().to_string(),
@@ -728,8 +756,14 @@ pub fn parse_model_inline(
             path: file_path.to_string(),
         })?;
 
+    let frontmatter =
+        substitute_env_vars(frontmatter).map_err(|source| ModelError::EnvSubstitution {
+            path: file_path.to_string(),
+            source: Box::new(source),
+        })?;
+
     let raw: RawModelConfig =
-        toml::from_str(frontmatter).map_err(|e| ModelError::ParseFrontmatter {
+        toml::from_str(&frontmatter).map_err(|e| ModelError::ParseFrontmatter {
             path: file_path.to_string(),
             source: e,
         })?;
@@ -1784,5 +1818,140 @@ ssn = "confidential"
             m.config.classification.get("ssn"),
             Some(&"confidential".to_string())
         );
+    }
+
+    /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a
+    /// model sidecar `.toml` resolve at load time, mirroring `rocky.toml`.
+    #[test]
+    fn test_sidecar_env_var_substitution() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // SAFETY: test-only, no concurrent reads of these variables.
+        unsafe {
+            std::env::set_var("ROCKY_TEST_SIDECAR_CATALOG", "warehouse_prod");
+            std::env::set_var("ROCKY_TEST_SIDECAR_SCHEMA", "silver");
+        }
+
+        std::fs::write(
+            dir.path().join("stg_events.toml"),
+            r#"
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "${ROCKY_TEST_SIDECAR_CATALOG}"
+schema  = "${ROCKY_TEST_SIDECAR_SCHEMA:-fallback_schema}"
+table   = "${ROCKY_TEST_SIDECAR_TABLE:-stg_events}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("stg_events.sql"), "SELECT 1 AS id").unwrap();
+
+        let model = load_model_pair(
+            &dir.path().join("stg_events.sql"),
+            &dir.path().join("stg_events.toml"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(model.config.target.catalog, "warehouse_prod");
+        assert_eq!(model.config.target.schema, "silver");
+        // Default branch: ROCKY_TEST_SIDECAR_TABLE not set, fallback wins.
+        assert_eq!(model.config.target.table, "stg_events");
+
+        unsafe {
+            std::env::remove_var("ROCKY_TEST_SIDECAR_CATALOG");
+            std::env::remove_var("ROCKY_TEST_SIDECAR_SCHEMA");
+        }
+    }
+
+    /// Missing `${VAR}` (no default) at sidecar load time surfaces as a
+    /// `ModelError::EnvSubstitution` — same shape `rocky.toml` already has.
+    #[test]
+    fn test_sidecar_env_var_missing_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // SAFETY: test-only.
+        unsafe { std::env::remove_var("ROCKY_TEST_SIDECAR_NEVER_SET") };
+
+        std::fs::write(
+            dir.path().join("bad.toml"),
+            r#"
+[target]
+catalog = "${ROCKY_TEST_SIDECAR_NEVER_SET}"
+schema  = "s"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("bad.sql"), "SELECT 1").unwrap();
+
+        let result = load_model_pair(
+            &dir.path().join("bad.sql"),
+            &dir.path().join("bad.toml"),
+            None,
+        );
+
+        assert!(matches!(result, Err(ModelError::EnvSubstitution { .. })));
+    }
+
+    /// `_defaults.toml` also goes through env-var substitution so the same
+    /// orchestrator-injected env values apply to directory-level defaults.
+    #[test]
+    fn test_dir_defaults_env_var_substitution() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // SAFETY: test-only.
+        unsafe {
+            std::env::set_var("ROCKY_TEST_DEFAULTS_CATALOG", "from_env_default");
+        }
+
+        std::fs::write(
+            dir.path().join("_defaults.toml"),
+            r#"
+[target]
+catalog = "${ROCKY_TEST_DEFAULTS_CATALOG}"
+schema  = "${ROCKY_TEST_DEFAULTS_SCHEMA:-public}"
+"#,
+        )
+        .unwrap();
+
+        let defaults = load_dir_defaults(&dir.path().join("_defaults.toml")).unwrap();
+        let target = defaults.target.expect("target should be set");
+        assert_eq!(target.catalog.as_deref(), Some("from_env_default"));
+        assert_eq!(target.schema.as_deref(), Some("public"));
+
+        unsafe {
+            std::env::remove_var("ROCKY_TEST_DEFAULTS_CATALOG");
+        }
+    }
+
+    /// Inline `---toml` frontmatter format also resolves env vars before
+    /// parsing — mirrors the sidecar path so legacy single-file models
+    /// stay in lockstep.
+    #[test]
+    fn test_inline_frontmatter_env_var_substitution() {
+        // SAFETY: test-only.
+        unsafe {
+            std::env::set_var("ROCKY_TEST_INLINE_CATALOG", "inline_warehouse");
+        }
+
+        let content = r#"---toml
+name = "inline_model"
+[target]
+catalog = "${ROCKY_TEST_INLINE_CATALOG}"
+schema  = "${ROCKY_TEST_INLINE_SCHEMA:-staging}"
+table   = "inline_model"
+---
+
+SELECT 1
+"#;
+
+        let model = parse_model_inline(content, "inline_model.sql", None).unwrap();
+        assert_eq!(model.config.target.catalog, "inline_warehouse");
+        assert_eq!(model.config.target.schema, "staging");
+
+        unsafe {
+            std::env::remove_var("ROCKY_TEST_INLINE_CATALOG");
+        }
     }
 }
