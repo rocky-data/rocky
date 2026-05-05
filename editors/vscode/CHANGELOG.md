@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.2] — 2026-05-05
+
+Patch release fixing a broken brand image on the VS Code Marketplace listing. v1.14.1 shipped successfully but rendered a broken image because `vsce` rewrites relative image URLs in the extension README to `<repo>/raw/HEAD/<README-relative-path>` and ignores `package.json`'s `repository.directory` field — so `media/rocky-readme-light.png` resolved to `https://github.com/rocky-data/rocky/raw/HEAD/media/rocky-readme-light.png` (404) instead of the actual file at `https://github.com/rocky-data/rocky/raw/HEAD/editors/vscode/media/rocky-readme-light.png`. Replaced the relative paths in `<picture>` with absolute `raw.githubusercontent.com` URLs that bypass `vsce`'s rewriter entirely. No extension feature changes.
+
+### Changed
+
+- **`editors/vscode/README.md` brand `<picture>` element switched to absolute URLs** (`https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/rocky-readme-{light,dark}.png`). `vsce` only rewrites relative URLs, so absolute ones pass through unchanged and the marketplace fetches the correct path. Both VS Code's in-extension README viewer and the marketplace web listing render fine against the raw GitHub URL.
+
 ## [1.14.1] — 2026-05-05
 
 Companion patch release recovering the failed v1.14.0 publish. `vsce package` rejects SVG references in extension READMEs (even remote URLs) under the VS Code Marketplace's security policy, which blocked the v1.14.0 release at the package step before it reached publish. Rasterized the two `rocky-readme-{light,dark}.svg` brand assets to 2560×640 PNG counterparts via `rsvg-convert` (path-flattened source from #410, so rendering is deterministic) and swapped the references in `editors/vscode/README.md`. No extension feature changes.

@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="media/rocky-readme-dark.png" />
-    <img src="media/rocky-readme-light.png" alt="Rocky" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/rocky-readme-dark.png" />
+    <img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/rocky-readme-light.png" alt="Rocky" />
   </picture>
 </p>
 
