@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="media/rocky-readme-dark.svg" />
-    <img src="media/rocky-readme-light.svg" alt="Rocky" />
+    <source media="(prefers-color-scheme: dark)" srcset="media/rocky-readme-dark.png" />
+    <img src="media/rocky-readme-light.png" alt="Rocky" />
   </picture>
 </p>
 
