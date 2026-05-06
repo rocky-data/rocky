@@ -2,6 +2,7 @@
 .rocky-state.redb
 .rocky_state
 .rocky_state.redb.lock
+.rocky/
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp/

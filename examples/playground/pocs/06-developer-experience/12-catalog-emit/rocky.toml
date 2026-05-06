@@ -1,0 +1,18 @@
+# 12-catalog-emit — emit a column-level lineage catalog with state-store enrichment.
+#
+# Transformation pipeline so `rocky run` actually materialises the three
+# models — that lets `rocky catalog` fill in `last_run_id` /
+# `last_materialized_at` per asset from the state store.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
