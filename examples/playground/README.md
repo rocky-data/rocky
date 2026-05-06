@@ -36,11 +36,11 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**48 of 61 POCs run with no external credentials.** See each POC's README for prerequisites.
+**50 of 63 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (8 POCs · DuckDB)
+### 00 — Foundations (9 POCs · DuckDB)
 
 DSL syntax, materialization basics, playground baseline, and the trust-arc 1 storage primitives.
 
@@ -54,6 +54,7 @@ DSL syntax, materialization basics, playground baseline, and the trust-arc 1 sto
 | [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Generic adapter exercise — building custom adapters via the process protocol |
 | [06-branches-replay-lineage](pocs/00-foundations/06-branches-replay-lineage) | **Trust arc 1** — `rocky branch create/list/show`, `rocky run --branch`, `rocky replay`, `rocky lineage --downstream` |
 | [07-config-layering](pocs/00-foundations/07-config-layering) | Three-layer config: `rocky.toml` + `_defaults.toml` + per-model sidecar, with env-var substitution at every layer |
+| [08-branch-approve-promote](pocs/00-foundations/08-branch-approve-promote) | **Trust arc 1** — `[branch.approval] required = true` gates `rocky branch promote`; `rocky branch approve` writes a content-addressed signed artifact bound to the branch state hash |
 
 ### 01 — Quality (6 POCs · DuckDB)
 
@@ -126,7 +127,7 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 
-### 06 — Developer Experience (11 POCs · DuckDB)
+### 06 — Developer Experience (12 POCs · DuckDB)
 
 Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff.
 
@@ -143,6 +144,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [09-sql-types-blast-radius](pocs/06-developer-experience/09-sql-types-blast-radius) | **Trust arc 7** — `rocky compile --with-seed` type grounding + blast-radius `SELECT *` lint |
 | [10-pr-preview-and-data-diff](pocs/06-developer-experience/10-pr-preview-and-data-diff) | `rocky preview create / diff / cost` — column-level pruned re-run + sampled row diff + cost delta on a 5-model DAG |
 | [11-lineage-diff](pocs/06-developer-experience/11-lineage-diff) | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review (Markdown drops into a PR comment) |
+| [12-catalog-emit](pocs/06-developer-experience/12-catalog-emit) | `rocky catalog --format both` — column-level lineage emitted as `catalog.json` + `edges.parquet` + `assets.parquet`; readable by any Parquet client without going through the engine |
 
 ### 07 — Adapters (6 POCs · mixed)
 

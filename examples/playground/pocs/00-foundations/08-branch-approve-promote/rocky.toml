@@ -1,0 +1,33 @@
+# Branch approve + promote — gated promotion of a branch into prod.
+#
+# `[branch.approval] required = true` flips on the gate; `branch promote` then
+# refuses to run unless at least `min_approvers` valid approval artifacts are
+# on disk (signed by an approver in `allowed_signers`, branch_state_hash still
+# current, signed within `max_age_seconds`).
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "prod__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
+[branch.approval]
+required = true
+min_approvers = 1
+max_age_seconds = 86400
