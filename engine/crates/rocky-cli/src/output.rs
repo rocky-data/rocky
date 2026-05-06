@@ -3040,9 +3040,29 @@ pub struct DagRunNodeOutput {
     pub error: Option<String>,
 }
 
+/// When set, [`print_json`] emits compact (single-line) JSON instead of
+/// pretty-printed. Used by `rocky run --watch` to honour its
+/// newline-delimited-stream contract: each iteration's `RunOutput` lands
+/// as one parseable line on stdout, with the human-readable banner
+/// (`[watch] watching ...`, `[watch] detected change`, `[watch] run
+/// completed in ...`) on stderr. Non-watch one-shot commands keep
+/// pretty-printing because they're read by humans.
+///
+/// Process-global because the streaming contract spans every `run()`
+/// call site reachable from the watch loop, and threading a flag through
+/// every helper that calls `print_json` would touch dozens of signatures
+/// for a behaviour that only one caller cares about today. If a future
+/// command needs both modes interleaved, swap this for a `&Renderer`
+/// passed explicitly down the call tree.
+pub static COMPACT_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Prints output as JSON or formatted table.
 pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(output)?;
+    let json = if COMPACT_JSON.load(std::sync::atomic::Ordering::Relaxed) {
+        serde_json::to_string(output)?
+    } else {
+        serde_json::to_string_pretty(output)?
+    };
     println!("{json}");
     Ok(())
 }

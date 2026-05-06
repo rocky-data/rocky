@@ -5,10 +5,14 @@
 //! whole pipeline on any change, with a 200 ms debounce window to coalesce
 //! editor save bursts into a single re-run.
 //!
-//! Stdout discipline matches the non-watch path: when `--output json` is
-//! set, each iteration emits one [`crate::output::RunOutput`] JSON object
-//! (newline-delimited stream); chatty banner / "detected change" lines go
-//! to stderr to keep stdout parseable.
+//! Stdout discipline: when `--output json` is set, each iteration emits
+//! one [`crate::output::RunOutput`] JSON object as a single compact line
+//! (NDJSON / newline-delimited-JSON stream). Chatty banner / "detected
+//! change" / "run completed" lines go to stderr so stdout stays
+//! parseable by piping tools (`jq`, `tail -f | jq -c '.command'`, etc.).
+//! This differs from non-watch one-shot commands, which pretty-print
+//! their single `RunOutput` for human readability — the streaming
+//! contract is the watch-specific add.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -143,6 +147,14 @@ pub async fn run_watch(
         watcher
             .watch(m, RecursiveMode::Recursive)
             .with_context(|| format!("failed to watch models dir: {}", m.display()))?;
+    }
+
+    // Honour the newline-delimited-stream contract: each iteration's
+    // `RunOutput` lands as one compact line on stdout. Non-watch
+    // commands stay on pretty-printed JSON because they're read by
+    // humans, not piped tools.
+    if output_json {
+        crate::output::COMPACT_JSON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Banner — stderr, never stdout. The non-JSON case still prints a

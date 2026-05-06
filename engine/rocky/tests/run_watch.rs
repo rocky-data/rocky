@@ -115,9 +115,11 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
     let stderr = child.stderr.take().expect("stderr piped");
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr_rx = spawn_line_reader(stderr);
-    // Drain stdout into a sink thread so the child's stdout pipe doesn't
-    // block on a full buffer.
-    drain_to_sink(stdout);
+    // Capture stdout per-line so we can assert the NDJSON contract: one
+    // compact JSON object per iteration, never pretty-printed across many
+    // lines. Without this, a regression that re-introduces pretty-print
+    // would silently break any tool piping `rocky run --watch -o json`.
+    let stdout_collector = spawn_collecting_reader(stdout);
 
     // Helper: wait for a line containing `needle` to arrive on stderr,
     // up to `budget`. Returns the buffered transcript on failure for
@@ -199,6 +201,39 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
         exit.success(),
         "expected clean exit (status 0) after SIGINT; got {exit:?}"
     );
+
+    // NDJSON contract: every non-empty stdout line must be a valid JSON
+    // object on its own (no pretty-printing across multiple lines), and
+    // we expect at least two — one per iteration that completed before
+    // SIGINT.
+    let stdout_lines = stdout_collector
+        .join()
+        .expect("stdout collector thread panicked");
+    let json_lines: Vec<&str> = stdout_lines
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    assert!(
+        json_lines.len() >= 2,
+        "expected ≥2 NDJSON lines on stdout (one per iteration); got {} lines:\n{}",
+        json_lines.len(),
+        stdout_lines.join("\n")
+    );
+    for (i, line) in json_lines.iter().enumerate() {
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "stdout line {} is not valid single-line JSON ({e}):\n{}",
+                i, line
+            );
+        });
+        let cmd = parsed.get("command").and_then(|c| c.as_str());
+        assert_eq!(
+            cmd,
+            Some("run"),
+            "expected `command: \"run\"` on every iteration line; got {cmd:?} on line {i}"
+        );
+    }
 }
 
 struct WaitResult {
@@ -227,21 +262,24 @@ fn spawn_line_reader<R: std::io::Read + Send + 'static>(reader: R) -> Receiver<S
     rx
 }
 
-/// Drain a Read source on a background thread so the child's pipe never
-/// fills up. The test asserts on stderr; stdout content isn't checked
-/// directly (it's parseable NDJSON when `--output json` is passed; the
-/// stderr summaries are the primary signal here).
-fn drain_to_sink<R: std::io::Read + Send + 'static>(reader: R) {
+/// Spawn a background thread that collects the reader's lines into a
+/// `Vec<String>` for later inspection. Used to assert the NDJSON
+/// contract on stdout — every iteration of `rocky run --watch -o json`
+/// must emit one compact JSON object per line.
+fn spawn_collecting_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+) -> thread::JoinHandle<Vec<String>> {
     thread::spawn(move || {
-        let mut r = reader;
-        let mut buf = [0u8; 4096];
-        loop {
-            match std::io::Read::read(&mut r, &mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => continue,
+        let buf = BufReader::new(reader);
+        let mut lines = Vec::new();
+        for line in buf.lines() {
+            match line {
+                Ok(s) => lines.push(s),
+                Err(_) => break,
             }
         }
-    });
+        lines
+    })
 }
 
 /// Wait up to `budget` for a child process to exit, polling every 50 ms.
