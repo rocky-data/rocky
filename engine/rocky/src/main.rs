@@ -349,6 +349,31 @@ enum Command {
         /// compliance --env`.
         #[arg(long)]
         env: Option<String>,
+
+        /// Re-run the pipeline whenever a watched model file changes;
+        /// Ctrl-C to stop.
+        ///
+        /// Watches the rocky.toml and the resolved models directory (when
+        /// present). Filesystem events are debounced for ~200 ms so a
+        /// quick burst of editor saves triggers exactly one re-run. With
+        /// `--output json`, each iteration emits one `RunOutput` JSON
+        /// object on stdout (newline-delimited stream); banner / change
+        /// notices are written to stderr.
+        ///
+        /// v0 limitations: incompatible with `--dag`, `--resume` /
+        /// `--resume-latest`, `--idempotency-key`, and `--model`. Each is
+        /// rejected at parse time.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "dag",
+                "resume",
+                "resume_latest",
+                "idempotency_key",
+                "model",
+            ],
+        )]
+        watch: bool,
     },
 
     /// Compare shadow tables against production tables
@@ -1511,6 +1536,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             dag,
             idempotency_key,
             env,
+            watch,
         } => {
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
@@ -1574,7 +1600,28 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 parallel,
             };
 
-            if dag {
+            if watch {
+                // `--watch` wraps the standard run path in a filesystem
+                // watcher loop. clap conflict declarations on the
+                // `--watch` arg already reject `--dag`, `--resume`,
+                // `--resume-latest`, `--idempotency-key`, and `--model`,
+                // so the watch wrapper can pass `None` for each.
+                rocky_cli::commands::run_with_watch(
+                    &cli.config,
+                    filter.as_deref(),
+                    pipeline.as_deref(),
+                    &state_path,
+                    gov_override.as_ref(),
+                    json,
+                    models_dir.as_deref(),
+                    run_all,
+                    shadow_config.as_ref(),
+                    &partition_opts,
+                    cli.cache_ttl,
+                    env.as_deref(),
+                )
+                .await
+            } else if dag {
                 let run_future = rocky_cli::commands::run_with_dag(&cli.config, json);
                 tokio::select! {
                     result = run_future => result,
