@@ -24,11 +24,19 @@ clap_complete = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
-# Used only to restore the kernel-default SIGPIPE handler on startup so the
+# Used to restore the kernel-default SIGPIPE handler on startup so the
 # CLI exits cleanly when its stdout is piped into `head`, `less`, `jq | head`,
-# etc. Scoped to Unix targets; Windows has no SIGPIPE.
+# etc. Also used by the `run --watch` integration test to deliver SIGINT
+# to the spawned binary. Scoped to Unix; Windows has no SIGPIPE / kill().
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Integration tests only — the `run --watch` test seeds a tiny DuckDB
+# fixture before spawning the binary. `duckdb` is already in the build
+# graph via `rocky-duckdb` so this is a no-op for compile time.
+[dev-dependencies]
+duckdb = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
