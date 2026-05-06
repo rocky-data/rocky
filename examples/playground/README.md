@@ -36,7 +36,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**50 of 63 POCs run with no external credentials.** See each POC's README for prerequisites.
+**51 of 64 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -127,7 +127,7 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 
-### 06 — Developer Experience (12 POCs · DuckDB)
+### 06 — Developer Experience (13 POCs · DuckDB)
 
 Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff.
 
@@ -145,6 +145,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [10-pr-preview-and-data-diff](pocs/06-developer-experience/10-pr-preview-and-data-diff) | `rocky preview create / diff / cost` — column-level pruned re-run + sampled row diff + cost delta on a 5-model DAG |
 | [11-lineage-diff](pocs/06-developer-experience/11-lineage-diff) | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review (Markdown drops into a PR comment) |
 | [12-catalog-emit](pocs/06-developer-experience/12-catalog-emit) | `rocky catalog --format both` — column-level lineage emitted as `catalog.json` + `edges.parquet` + `assets.parquet`; readable by any Parquet client without going through the engine |
+| [13-run-watch-inner-loop](pocs/06-developer-experience/13-run-watch-inner-loop) | `rocky run --watch` re-materialises on every save; 200 ms debounce window, FSEvents-safe directory watch, NDJSON-stream output, clean SIGINT exit |
 
 ### 07 — Adapters (6 POCs · mixed)
 
