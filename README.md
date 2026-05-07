@@ -137,6 +137,7 @@ Each subproject has its own README with detailed usage. The [`engine/README.md`]
 | Warehouse | Snowflake | Beta | REST connector · zero-copy `CLONE` for branches · masking policies |
 | Warehouse | BigQuery | Beta | REST connector · `CREATE TABLE … COPY` for branches |
 | Warehouse | DuckDB | Local / Testing | Embedded · powers `rocky playground` (no credentials needed) |
+| Warehouse | Trino | Experimental | REST `/v1/statement` polling client · Basic + JWT auth · `is_experimental: true` until the Docker conformance harness lands |
 | Source | Fivetran | Production | REST connector + table discovery |
 | Source | Airbyte | Beta | Catalog discovery |
 | Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |

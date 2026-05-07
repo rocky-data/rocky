@@ -90,6 +90,7 @@ Full reference: [CLI commands](https://rocky-data.dev/reference/cli/).
 | Warehouse | Snowflake | Beta | SQL execution via Snowflake connector |
 | Warehouse | BigQuery | Beta | SQL execution via BigQuery connector |
 | Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
+| Warehouse | Trino | Experimental | REST `/v1/statement` polling client; Basic + JWT auth; `is_experimental: true` until the Docker conformance harness lands |
 
 Build a custom adapter in Rust or any language: [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) — walks through a ClickHouse-shaped skeleton, the trait surface, auth, testing, and distribution. Concepts overview: [Adapter SDK](https://rocky-data.dev/concepts/adapters/).
 
