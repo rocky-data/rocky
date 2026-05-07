@@ -147,9 +147,9 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [12-catalog-emit](pocs/06-developer-experience/12-catalog-emit) | `rocky catalog --format both` — column-level lineage emitted as `catalog.json` + `edges.parquet` + `assets.parquet`; readable by any Parquet client without going through the engine |
 | [13-run-watch-inner-loop](pocs/06-developer-experience/13-run-watch-inner-loop) | `rocky run --watch` re-materialises on every save; 200 ms debounce window, FSEvents-safe directory watch, NDJSON-stream output, clean SIGINT exit |
 
-### 07 — Adapters (6 POCs · mixed)
+### 07 — Adapters (7 POCs · mixed)
 
-Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton.
+Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton, Trino-via-Docker.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -159,6 +159,7 @@ Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native a
 | [04-custom-process-adapter](pocs/07-adapters/04-custom-process-adapter) | ~80-line Python adapter speaking JSON-RPC over stdio, registered via `[adapter] type = "process"` | none |
 | [05-bigquery-native-queries](pocs/07-adapters/05-bigquery-native-queries) | BigQuery adapter — backtick quoting, time-interval partitions, DML transactions | GCP SA / ADC |
 | [06-rust-native-adapter-skeleton](pocs/07-adapters/06-rust-native-adapter-skeleton) | Out-of-tree warehouse adapter starter — `rocky-adapter-sdk` traits against an in-memory mock, ClickHouse-shaped (backtick quoting, no `MERGE`, partition replace) | none (Rust toolchain) |
+| [07-trino-docker](pocs/07-adapters/07-trino-docker) | `rocky-trino` v0 adapter against a single-node `trinodb/trino` container — full_refresh CTAS from `tpch.tiny.nation` into the `memory` catalog | none (Docker) |
 
 ## Benchmarks
 

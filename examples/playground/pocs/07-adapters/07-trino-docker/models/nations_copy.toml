@@ -1,0 +1,9 @@
+[strategy]
+type = "full_refresh"
+
+# Trino target: catalog `memory` (writable, pre-registered by the
+# trinodb/trino image), schema `rocky_demo` (created on first run when
+# `auto_create_schemas = true` is set on the pipeline target).
+[target]
+catalog = "memory"
+schema = "rocky_demo"

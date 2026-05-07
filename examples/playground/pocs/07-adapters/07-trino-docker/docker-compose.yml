@@ -1,0 +1,29 @@
+# Single-node Trino coordinator for the rocky-trino POC.
+#
+# `trinodb/trino` is the upstream image (Apache 2.0). Out-of-the-box it
+# ships:
+#   - the built-in `tpch` connector (read-only sample data, scale-factor
+#     `tiny` = 25 nations / 5 regions / 1500 customers, etc.) — the POC
+#     reads from `tpch.tiny.nation`.
+#   - the `memory` connector, registered as the writable `memory` catalog
+#     — the POC materializes its model into `memory.rocky_demo`.
+#   - no password-authenticator, so any `Authorization: Basic <...>`
+#     header is accepted. The POC sends dummy `trino:trino` credentials
+#     to exercise the full auth path through rocky-trino's connector.
+#
+# Health-check polls `/v1/info` until it returns `{"starting":false}`,
+# which is the signal the coordinator is ready to accept queries. The
+# image typically reaches that state in ~20-30s on a warm pull.
+
+services:
+  trino:
+    image: trinodb/trino:latest
+    container_name: rocky-trino-poc
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s

@@ -1,6 +1,6 @@
 # POC Catalog
 
-64 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
+65 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
 
 ## Categories
 
@@ -11,13 +11,13 @@
 - [04-governance](04-governance/) — Unity Catalog grants, isolation, tagging, classification + masking, retention (6 POCs · Databricks / DuckDB)
 - [05-orchestration](05-orchestration/) — Hooks, webhooks, state, resume, Valkey cache, trust-arc 3 circuit breaker, idempotency keys (9 POCs · DuckDB / docker)
 - [06-developer-experience](06-developer-experience/) — Lineage, serve, dbt migration, shadow, CI, hybrid dbt workflows, trust-arc 4 trace-Gantt, trust-arc 6 portability lint, trust-arc 7 SQL types, PR-preview, lineage-diff, catalog emit, watch inner-loop (13 POCs · DuckDB)
-- [07-adapters](07-adapters/) — Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton (6 POCs · mixed)
+- [07-adapters](07-adapters/) — Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton, Trino-Docker (7 POCs · mixed)
 
 ## Credentials at a glance
 
 | POCs | Credentials |
 |---|---|
-| 51 of 64 | None — local DuckDB (or docker-compose for MinIO/Valkey) |
+| 52 of 65 | None — local DuckDB (or docker-compose for MinIO / Valkey / Trino) |
 | 5 (`03-ai/*`) | `ANTHROPIC_API_KEY` |
 | 4 (`04-governance/01..04`) + 1 (`07-adapters/02`) | Databricks host + token |
 | 1 (`07-adapters/01`) | Snowflake account + auth |
