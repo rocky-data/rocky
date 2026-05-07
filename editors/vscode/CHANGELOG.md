@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.1] — 2026-05-07
+
+Patch release fixing the new "Run Health Check" leaf in the **Extension Info → Logs** sidebar section. Clicking it surfaced "Doctor failed: …" toasts and threw the doctor JSON away — `rocky doctor` exits 2 when any check is `critical` (see `engine/crates/rocky-cli/src/commands/doctor.rs`) and the vscode handler treated any non-zero exit as a hard failure. Same bug existed in 1.14.x but was harder to hit because doctor wasn't exposed in the sidebar.
+
+### Fixed
+
+- **`rocky.doctor` command recovers the JSON payload on exit 2.** `RockyCliError` now captures `stdout` alongside `stderr`, so callers that know certain commands signal status via exit code can re-read the payload from the thrown error. The doctor handler (`src/commands/ops.ts`) checks for `exitCode === 2`, parses `err.stdout` as `DoctorResult`, and renders the doctor webview just as it does on a healthy run — so users see exactly which checks failed instead of a generic "Doctor failed" notification. Falls through to the existing error path when the stdout payload is missing or unparseable (e.g., a true CLI panic).
+
 ## [1.15.0] — 2026-05-07
 
 Activity bar UX overhaul. The Rocky sidebar now leads with a **Get Started** welcome panel and a structured **Extension Info** tree (extension version, Rocky CLI version, language-server status, configuration, detected `rocky.toml`, log shortcuts), and ends with a **Help** panel linking out to docs / issues / marketplace / releases / source. Existing Models, Runs, and Sources panels stay in place but switch their inline empty-state messages to `viewsWelcome` markdown gated by a new `rocky.hasProject` context — so a workspace with no `rocky.toml` shows orientation instead of CLI errors.
