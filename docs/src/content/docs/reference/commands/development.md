@@ -73,10 +73,10 @@ Playground ready! Run:
 
 ## `rocky import-dbt`
 
-Import an existing dbt project and convert it to Rocky models. Translates dbt SQL (Jinja + ref/source macros) and YAML config into Rocky's `.sql` + `.toml` sidecar format.
+Import an existing dbt project as a **runnable Rocky repo**. Parses `dbt_project.yml` + `profiles.yml`, translates each `.sql` model body (expanding `{{ ref(...) }}` / `{{ source(...) }}` to plain identifiers; leaving other Jinja with a `# TODO: dbt-jinja-not-translated` comment), and writes a self-contained Rocky directory layout that `rocky compile` and `rocky run` can use directly.
 
 ```bash
-rocky import-dbt [flags]
+rocky import-dbt --dbt-project <PATH> [flags]
 ```
 
 ### Flags
@@ -84,11 +84,40 @@ rocky import-dbt [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dbt-project <PATH>` | `PathBuf` | **(required)** | Path to the dbt project directory (containing `dbt_project.yml`). |
-| `--output <PATH>` | `PathBuf` | `models` | Output directory for the generated Rocky model files. |
+| `--output-dir <PATH>` | `PathBuf` | `rocky-out` | Output directory for the emitted Rocky repo (`rocky.toml` + `models/` + `seeds/` + `MIGRATION-NOTES.md`). Refuses to write into a non-empty directory unless `--overwrite` is set. |
+| `--target-adapter <KIND>` | `string` | profile-derived | Override the Rocky adapter type. Accepts `duckdb`, `databricks`, `snowflake`, `bigquery`. Defaults to whatever `<dbt_project>/profiles.yml` declares — or `duckdb` when the profile can't be parsed or maps to an unsupported warehouse. |
+| `--overwrite` | `bool` | `false` | Replace contents of `--output-dir` if it already exists and is non-empty. Without this flag, the importer refuses to write into a non-empty directory so it never silently clobbers existing work. |
+| `--manifest <PATH>` | `PathBuf` | auto-detect | Path to `target/manifest.json`. When present, the importer uses dbt's compiled manifest (Jinja already resolved). Auto-detected from `<dbt_project>/target/` if omitted. |
+| `--no-manifest` | `bool` | `false` | Force regex-based import (skip `manifest.json` even if available). Useful when the manifest is stale or you want to verify the regex path. |
+
+### Emitted layout
+
+```
+<output-dir>/
+├── rocky.toml                  derived from dbt_project.yml + profiles.yml
+├── models/
+│   ├── _defaults.toml          catalog + schema defaults from dbt_project.yml
+│   ├── <name>.sql              translated dbt model body (Jinja stripped or commented)
+│   └── <name>.toml             [strategy] + [target] sidecar
+├── seeds/                      verbatim copy of <dbt_project>/seeds/
+└── MIGRATION-NOTES.md          summary: counts, v0 limitations, required env vars
+```
+
+Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky run`.
+
+`materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
+
+### v0 limitations
+
+Deferred to follow-up PRs and listed in every emitted `MIGRATION-NOTES.md`:
+
+- Generic-test mapping (`unique`, `not_null`, `accepted_values`, `relationships` → `[[checks]]`).
+- Singular dbt tests (custom SQL files in `tests/`).
+- Macros and `dbt_packages/` (skipped; the [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch for now).
 
 ### Examples
 
-Import a dbt project. The output includes counts of what was imported, converted, and skipped, plus detail arrays for warnings and failures:
+Import a dbt project end-to-end. The default output dir is `./rocky-out/`:
 
 ```bash
 rocky import-dbt --dbt-project ~/projects/acme-dbt
@@ -96,52 +125,56 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.27.0",
   "command": "import-dbt",
-  "import_method": "manifest",
-  "project_name": "acme_dbt",
-  "dbt_version": "1.9.2",
-  "imported": 24,
+  "import_method": "regex",
+  "project_name": "demo_project",
+  "imported": 1,
   "failed": 0,
-  "warnings": 2,
-  "sources_found": 6,
-  "sources_mapped": 6,
-  "tests_found": 18,
-  "tests_converted": 16,
-  "tests_converted_custom": 0,
-  "tests_skipped": 2,
-  "macros_detected": 3,
-  "imported_models": ["stg_orders", "stg_customers", "fct_revenue", "…"],
-  "warning_details": [
-    {
-      "model": "stg_payments",
-      "category": "macro",
-      "message": "custom Jinja macro 'cents_to_dollars' left as comment",
-      "suggestion": "Inline the macro body or rewrite as a CTE"
-    }
-  ],
-  "failed_details": []
+  "warnings": 0,
+  "imported_models": ["orders"],
+  "warning_details": [],
+  "failed_details": [],
+  "emission": {
+    "out_dir": "rocky-out",
+    "rocky_toml_path": "rocky-out/rocky.toml",
+    "migration_notes_path": "rocky-out/MIGRATION-NOTES.md",
+    "models_translated_count": 1,
+    "models_skipped_count": 0,
+    "seeds_copied_count": 0,
+    "adapter_type": "duckdb",
+    "original_dbt_adapter_type": "duckdb",
+    "required_env_vars": []
+  }
 }
 ```
 
-`import_method` is `"manifest"` when a compiled `target/manifest.json` is available (pre-resolved Jinja), or `"regex"` when Rocky parses the raw `.sql` files directly. Pass `--manifest <path>` or `--no-manifest` to force one mode.
+`import_method` is `"manifest"` when a compiled `target/manifest.json` was found (pre-resolved Jinja), or `"regex"` when Rocky parsed the raw `.sql` files directly. The `emission` block is populated whenever `--output-dir` writes succeeded.
 
-Import to a custom output directory:
+Import into a custom directory and override the target adapter (e.g. migrating a Postgres dbt project to Rocky-on-Snowflake):
 
 ```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir src/models
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --target-adapter snowflake
 ```
 
-Same shape. Import and then compile to verify in one step:
+Re-run after fixing the dbt source, replacing the previous emit:
 
 ```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt && rocky compile
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite
+```
+
+End-to-end migration in one shot — emit, then compile to verify the result is loadable:
+
+```bash
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite \
+    && rocky compile --models ./acme-rocky/models/
 ```
 
 ### Related Commands
 
-- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- compile the imported models
-- [`rocky init`](/reference/commands/core-pipeline/#rocky-init) -- create a new project first, then import
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- type-check the emitted models
+- [`rocky validate-migration`](/reference/commands/development/#rocky-validate-migration) -- cross-check a dbt project against its imported Rocky form
+- [`rocky init`](/reference/commands/core-pipeline/#rocky-init) -- scaffold a fresh Rocky project (alternative to importing)
 
 ---
 
