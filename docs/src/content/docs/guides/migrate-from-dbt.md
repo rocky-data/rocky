@@ -242,13 +242,14 @@ What v0 translates cleanly:
 - `{{ config(unique_key=...) }}` → `merge` strategy with `unique_key` array
 - `{{ this }}` → resolved against the sidecar `[target]`
 - `is_incremental()` branches → stripped (Rocky derives the watermark filter from `[strategy]`)
+- **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) — translated column-by-column to `[[tests]]` blocks in the model sidecar (see [Generic test mapping](#generic-test-mapping) below)
 - Top-level `dbt_project.yml` — used to detect project name and seeds path
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → mapped to a Rocky `[adapter]` block (DuckDB / Databricks / Snowflake / BigQuery), or a DuckDB stub when absent or unrecognised
 
 Not yet supported in v0 (the importer detects most of these and lists them under "Not Translated" in `MIGRATION-NOTES.md`, plus inserts `# TODO: dbt-jinja-not-translated` comments above any leftover Jinja in emitted SQL):
 
-- **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) — detected, counted, and reported, but not yet translated to Rocky `[[checks]]`. Planned as a follow-up extension.
+- **dbt tests outside the canonical four** — `dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, and model-level (non-column) tests are surfaced as structured warnings (`UnsupportedTest`) per occurrence and not stubbed in the emitted TOML. Rewrite as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
 - **dbt macros and `dbt_packages/`** — Rocky has no Jinja runtime; macro bodies do not expand.
 - **`{% if %}`, `{% for %}`, `{{ var() }}`** outside of `is_incremental()` — emitted verbatim with a TODO marker.
@@ -292,6 +293,7 @@ The importer handles these dbt patterns:
 | `{{ source('source_name', 'table') }}` | Fully qualified table reference (`source_name.table`) |
 | `{{ config(materialized='incremental', unique_key='id') }}` | `[strategy]` section in TOML |
 | `{{ this }}` | Target table reference from `[target]` in TOML |
+| `schema.yml` column tests (`unique`, `not_null`, `accepted_values`, `relationships`) | `[[tests]]` blocks in the model sidecar TOML — see [Section 9](#9-convert-dbt-tests-to-rocky-tests-and-contracts) below |
 
 ### JSON output
 
@@ -581,33 +583,73 @@ rocky run --pipeline bronze_test --filter tenant=acme
 
 Then compare row counts, column types, and data values between the dbt-generated tables and Rocky-generated tables.
 
-## 9. Convert dbt Tests to Contracts
+## 9. Convert dbt Tests to Rocky Tests and Contracts
 
-dbt tests in `schema.yml` map to Rocky data contracts. Here is how to convert common test patterns.
+`rocky import-dbt` already translates the four canonical dbt generic tests into Rocky `[[tests]]` blocks on each model sidecar. Anything beyond that — column-level type/nullability contracts, project-defined generics, singular tests — needs a manual step.
 
-### dbt schema.yml
+### Generic test mapping
+
+For these dbt tests in `schema.yml`:
 
 ```yaml
 models:
-  - name: stg_orders
+  - name: fct_orders
     columns:
       - name: order_id
         tests:
-          - not_null
           - unique
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['completed', 'pending', 'cancelled']
       - name: customer_id
         tests:
-          - not_null
-      - name: total_amount
-        tests:
-          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
 ```
 
-### Rocky contract
-
-Create `contracts/stg_orders.contract.toml`:
+The importer emits `[[tests]]` blocks directly into `models/fct_orders.toml`:
 
 ```toml
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[tests]]
+type = "not_null"
+column = "order_id"
+
+[[tests]]
+type = "accepted_values"
+values = ["completed", "pending", "cancelled"]
+column = "status"
+
+[[tests]]
+type = "relationships"
+to_table = "warehouse.main.dim_customers"
+to_column = "customer_id"
+column = "customer_id"
+```
+
+`relationships.to: ref('m')` resolves to the fully-qualified Rocky table via the importer's name → (catalog, schema) lookup over the imported model set; cross-project refs fall back to the importer defaults. These tests run as part of `rocky test` against the materialised tables.
+
+| dbt Test | Rocky `[[tests]]` |
+|---|---|
+| `not_null` | `type = "not_null"` + `column` |
+| `unique` | `type = "unique"` + `column` |
+| `accepted_values` | `type = "accepted_values"` + `values = [...]` + `column` |
+| `relationships` | `type = "relationships"` + `to_table` + `to_column` + `column` |
+
+Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined generics, model-level tests) is surfaced as an `UnsupportedTest` warning with the model, column, and test name. Rewrite those as a Rocky `expression` test or a quality-pipeline check — the importer does not stub them in the emitted TOML.
+
+### Column-level contracts (manual)
+
+If you want compile-time guarantees on column types and nullability — beyond the row-level test runtime — add a `.contract.toml` alongside the model. Contracts are not autogenerated from dbt; write them for the models that need the extra rigour:
+
+```toml
+# contracts/stg_orders.contract.toml
 [[columns]]
 name = "order_id"
 type = "Int64"
@@ -627,15 +669,6 @@ nullable = false
 required = ["order_id", "customer_id", "total_amount"]
 protected = ["order_id"]
 ```
-
-### Mapping dbt tests to Rocky contracts
-
-| dbt Test | Rocky Contract Rule |
-|---|---|
-| `not_null` | `nullable = false` on the column + add to `required` |
-| `unique` | Not enforced at compile time (use runtime checks) |
-| `accepted_values` | Use custom checks in `[pipeline.<name>.checks]` section |
-| `relationships` | Expressed via `depends_on` and `[[sources]]` |
 
 ### Compile with contracts
 
