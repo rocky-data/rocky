@@ -382,6 +382,42 @@ fn validate_adapter(
                 field: None,
             });
         }
+        "bigquery" => {
+            msgs.push(ValidateMessage {
+                severity: "ok".into(),
+                code: "V010".into(),
+                message: format!("adapter.{name}: bigquery"),
+                file: None,
+                field: None,
+            });
+        }
+        "trino" => {
+            msgs.push(ValidateMessage {
+                severity: "ok".into(),
+                code: "V010".into(),
+                message: format!("adapter.{name}: trino"),
+                file: None,
+                field: None,
+            });
+        }
+        "airbyte" => {
+            msgs.push(ValidateMessage {
+                severity: "ok".into(),
+                code: "V010".into(),
+                message: format!("adapter.{name}: airbyte"),
+                file: None,
+                field: None,
+            });
+        }
+        "iceberg" => {
+            msgs.push(ValidateMessage {
+                severity: "ok".into(),
+                code: "V010".into(),
+                message: format!("adapter.{name}: iceberg"),
+                file: None,
+                field: None,
+            });
+        }
         other => {
             ok = false;
             msgs.push(ValidateMessage {
@@ -1303,6 +1339,54 @@ table = "b"
             .collect();
         assert_eq!(dag_errors.len(), 1);
         assert!(dag_errors[0].message.contains("circular"));
+    }
+
+    #[test]
+    fn test_known_adapter_types_do_not_warn() {
+        // Every adapter type recognized by `registry::AdapterRegistry` must
+        // also be recognized by `validate_adapter`, otherwise a perfectly
+        // valid `rocky.toml` emits a cosmetic V017 warning. Keep this list
+        // in sync with the match arms in `engine/crates/rocky-cli/src/registry.rs`.
+        for adapter_type in [
+            "databricks",
+            "duckdb",
+            "snowflake",
+            "bigquery",
+            "trino",
+            "fivetran",
+            "airbyte",
+            "iceberg",
+            "manual",
+        ] {
+            let toml = format!(
+                r#"
+[adapter.x]
+type = "{adapter_type}"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "x"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "x"
+catalog_template = "poc"
+schema_template = "demo"
+"#
+            );
+            let out = validate_toml(&toml);
+            let v017: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
+            assert!(
+                v017.is_empty(),
+                "type '{adapter_type}' unexpectedly emitted V017: {v017:?}"
+            );
+        }
     }
 
     #[test]
