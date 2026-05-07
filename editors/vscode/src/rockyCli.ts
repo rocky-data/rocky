@@ -155,6 +155,46 @@ export async function runRockyJsonWithProgress<T = unknown>(
   }
 }
 
+interface VersionCache {
+  value: string | undefined;
+  fetchedAt: number;
+}
+
+let versionCache: VersionCache | undefined;
+const VERSION_TTL_MS = 60_000;
+
+/**
+ * Returns the installed Rocky CLI version string (e.g., `"1.26.0"`), or
+ * `undefined` when the binary is missing or fails to respond. The result is
+ * cached for 60 seconds so repeated tree refreshes don't fork+exec on every
+ * tick. Errors are swallowed — this helper is for display only.
+ */
+export async function getCliVersion(): Promise<string | undefined> {
+  const now = Date.now();
+  if (versionCache && now - versionCache.fetchedAt < VERSION_TTL_MS) {
+    return versionCache.value;
+  }
+  let value: string | undefined;
+  try {
+    const { stdout } = await runRocky(["--version"], { timeoutMs: 5_000 });
+    value = parseVersion(stdout);
+  } catch {
+    value = undefined;
+  }
+  versionCache = { value, fetchedAt: now };
+  return value;
+}
+
+/** Force the next {@link getCliVersion} call to re-shell. */
+export function clearCliVersionCache(): void {
+  versionCache = undefined;
+}
+
+function parseVersion(stdout: string): string | undefined {
+  const match = stdout.trim().match(/(\d+\.\d+\.\d+(?:[-.][\w.+-]+)?)/);
+  return match?.[1];
+}
+
 /**
  * Display a Rocky CLI error to the user with a "Show Logs" action that opens
  * the output channel containing the full stderr trace.

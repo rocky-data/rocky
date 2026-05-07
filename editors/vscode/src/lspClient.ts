@@ -18,6 +18,40 @@ interface DiagnosticTotals {
   warnings: number;
 }
 
+/**
+ * Current lifecycle state of the Rocky language server. Independent of
+ * diagnostics — those flow separately through the status bar.
+ */
+export type LspStatus =
+  | "Starting"
+  | "Restarting"
+  | "Ready"
+  | "Stopped"
+  | "Failed";
+
+export interface LspState {
+  status: LspStatus;
+  /** Last error message if `status === "Failed"`, otherwise undefined. */
+  error?: string;
+}
+
+let currentLspState: LspState = { status: "Stopped" };
+const lspStateEmitter = new vscode.EventEmitter<LspState>();
+
+/** Fires whenever the language server transitions between lifecycle states. */
+export const onDidChangeLspState: vscode.Event<LspState> =
+  lspStateEmitter.event;
+
+/** Returns the most recent lifecycle state. */
+export function getLspState(): LspState {
+  return currentLspState;
+}
+
+function setLspState(status: LspStatus, error?: string): void {
+  currentLspState = error !== undefined ? { status, error } : { status };
+  lspStateEmitter.fire(currentLspState);
+}
+
 export function getClient(): LanguageClient | undefined {
   return client;
 }
@@ -39,6 +73,8 @@ export function startLspClient(context: vscode.ExtensionContext): void {
   statusBarItem.tooltip = "Click to restart Rocky language server";
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+
+  setLspState("Starting");
 
   context.subscriptions.push(
     vscode.languages.onDidChangeDiagnostics(updateStatusBarFromDiagnostics),
@@ -115,6 +151,7 @@ async function launchClient(): Promise<void> {
     await client.start();
     statusBarItem.text = "$(check) Rocky: Ready";
     statusBarItem.backgroundColor = undefined;
+    setLspState("Ready");
   } catch (err) {
     handleStartupFailure(err as Error);
   }
@@ -185,6 +222,8 @@ function handleStartupFailure(err: Error): void {
     "statusBarItem.errorBackground",
   );
 
+  setLspState("Failed", err.message);
+
   const isMissingBinary =
     /ENOENT/i.test(err.message) ||
     /not found/i.test(err.message) ||
@@ -212,6 +251,7 @@ function handleStartupFailure(err: Error): void {
 
 export async function restartLspClient(): Promise<void> {
   statusBarItem.text = "$(loading~spin) Rocky: Restarting...";
+  setLspState("Restarting");
   if (client) {
     try {
       await client.stop();
@@ -230,6 +270,7 @@ export async function restartLspClient(): Promise<void> {
 export async function stopLspClient(): Promise<void> {
   await client?.stop();
   client = undefined;
+  setLspState("Stopped");
 }
 
 function updateStatusBarFromDiagnostics(): void {

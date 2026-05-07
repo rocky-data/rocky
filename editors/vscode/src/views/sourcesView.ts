@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { runRockyJson } from "../rockyCli";
 import type { DiscoverResult, DiscoverSource } from "../types/rockyJson";
+import { hasRockyProject, onDidChangeRockyProject } from "./getStartedView";
 
 type Table = NonNullable<DiscoverSource["tables"]>[number];
 
@@ -32,6 +33,12 @@ export class SourcesTreeProvider implements vscode.TreeDataProvider<Node> {
 
   async getChildren(node?: Node): Promise<Node[]> {
     if (!node) {
+      // Skip discovery when there's no Rocky project — the viewsWelcome
+      // already prompts the user to open one, and we don't want to flash an
+      // error from the CLI complaining about a missing rocky.toml.
+      if (!hasRockyProject()) {
+        return [];
+      }
       if (this.loading) {
         return [makeMessage("Discovering sources…", "loading~spin")];
       }
@@ -41,10 +48,9 @@ export class SourcesTreeProvider implements vscode.TreeDataProvider<Node> {
       if (this.loadError) {
         return [makeMessage(`Error: ${this.loadError}`, "error")];
       }
-      if (!this.cache || this.cache.length === 0) {
-        return [makeMessage("No sources discovered", "info")];
-      }
-      return this.cache.map((s) => new SourceNode(s));
+      // Empty cache: return [] so the viewsWelcome content for rocky.sources
+      // (with its "Discover Sources" CTA) takes over.
+      return (this.cache ?? []).map((s) => new SourceNode(s));
     }
 
     if (node instanceof SourceNode) {
@@ -135,6 +141,10 @@ export function registerSourcesView(
     vscode.commands.registerCommand("rocky.refreshSources", () =>
       provider.refresh(),
     ),
+  );
+
+  context.subscriptions.push(
+    onDidChangeRockyProject(() => provider.refresh()),
   );
 
   return provider;
