@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn is_experimental_is_true() {
         let cfg = TrinoClientConfig::new("http://localhost:8080");
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let adapter = TrinoAdapter::new(cfg, auth);
         assert!(adapter.is_experimental());
     }
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn dialect_round_trips() {
         let cfg = TrinoClientConfig::new("http://localhost:8080");
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let adapter = TrinoAdapter::new(cfg, auth);
         let r = adapter
             .dialect()
@@ -171,7 +171,7 @@ mod tests {
 
         let cfg =
             TrinoClientConfig::new(server.uri()).with_timeout(std::time::Duration::from_secs(5));
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let adapter = TrinoAdapter::new(cfg, auth);
         let table = TableRef {
             catalog: "iceberg".into(),

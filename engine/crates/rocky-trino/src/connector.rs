@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn build_headers_uses_basic_auth_user_when_unset() {
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let cfg = TrinoClientConfig::new("http://localhost:8080");
         let client = TrinoClient::new(cfg, auth);
         let headers = client.build_headers().unwrap();
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn build_headers_sets_catalog_and_schema_when_configured() {
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let cfg = TrinoClientConfig::new("http://localhost:8080")
             .with_default_catalog("iceberg")
             .with_default_schema("raw");
@@ -549,7 +549,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let cfg = TrinoClientConfig::new(server.uri()).with_timeout(Duration::from_secs(5));
         let client = TrinoClient::new(cfg, auth);
         let out = client.execute("SELECT id, name FROM users").await.unwrap();
@@ -581,7 +581,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         let cfg = TrinoClientConfig::new(server.uri()).with_timeout(Duration::from_secs(5));
         let client = TrinoClient::new(cfg, auth);
         let err = client
@@ -633,7 +633,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let auth = crate::test_helpers::test_basic_auth();
         // 1s timeout keeps the test fast.
         let cfg = TrinoClientConfig::new(server.uri()).with_timeout(Duration::from_secs(1));
         let client = TrinoClient::new(cfg, auth);

@@ -28,6 +28,9 @@ pub mod auth;
 pub mod connector;
 pub mod dialect;
 
+#[cfg(test)]
+mod test_helpers;
+
 pub use adapter::TrinoAdapter;
 pub use auth::{AuthError, TrinoAuth};
 pub use connector::{
