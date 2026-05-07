@@ -47,6 +47,26 @@ use rocky_bigquery::connector::BigQueryAdapter;
 
 use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 
+/// Adapter type strings recognised by [`AdapterRegistry::from_config`].
+///
+/// This is the **single source of truth** for "which adapter types does
+/// Rocky know about?". The dispatch arms in `from_config`, the
+/// "did you mean?" suggestions in [`crate::error_reporter`], and the
+/// `rocky validate` V017 ("unknown adapter type") check all read from
+/// this list — adding a new adapter only requires appending here and
+/// implementing the corresponding dispatch arm.
+pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
+    "databricks",
+    "duckdb",
+    "snowflake",
+    "bigquery",
+    "trino",
+    "fivetran",
+    "airbyte",
+    "iceberg",
+    "manual",
+];
+
 /// Holds constructed adapter instances, keyed by name from the config.
 pub struct AdapterRegistry {
     warehouse: HashMap<String, Arc<dyn WarehouseAdapter>>,
@@ -64,6 +84,23 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
+    /// Returns the list of adapter type strings the registry knows how
+    /// to construct.
+    ///
+    /// Drift-proofs callers (e.g. `rocky validate`'s V017 check, the
+    /// "did you mean?" suggester) against future adapter additions:
+    /// append to [`KNOWN_ADAPTER_TYPES`] and every consumer picks it up.
+    pub fn known_types() -> &'static [&'static str] {
+        KNOWN_ADAPTER_TYPES
+    }
+
+    /// Returns `true` if `adapter_type` is a recognised adapter type.
+    ///
+    /// Convenience wrapper over [`Self::known_types`].
+    pub fn is_known(adapter_type: &str) -> bool {
+        KNOWN_ADAPTER_TYPES.contains(&adapter_type)
+    }
+
     /// Build the registry from a `RockyConfig`.
     pub fn from_config(config: &RockyConfig) -> Result<Self> {
         let mut warehouse = HashMap::new();
@@ -363,11 +400,11 @@ impl AdapterRegistry {
                 other => {
                     let mut msg = format!(
                         "adapters.{name}: unsupported adapter type '{other}'. \
-                         Supported: databricks, duckdb, snowflake, bigquery, \
-                         trino, fivetran, airbyte, iceberg, manual"
+                         Supported: {}",
+                        KNOWN_ADAPTER_TYPES.join(", "),
                     );
                     if let Some(suggestion) =
-                        error_reporter::did_you_mean(other, error_reporter::KNOWN_ADAPTER_TYPES)
+                        error_reporter::did_you_mean(other, KNOWN_ADAPTER_TYPES)
                     {
                         msg.push_str(&format!(". Did you mean '{suggestion}'?"));
                     }

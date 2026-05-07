@@ -40,17 +40,11 @@ pub struct ConfigDiagnostic {
 }
 
 /// Known adapter type names for "did you mean?" suggestions.
-pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
-    "databricks",
-    "duckdb",
-    "snowflake",
-    "bigquery",
-    "trino",
-    "fivetran",
-    "airbyte",
-    "iceberg",
-    "manual",
-];
+///
+/// Re-exports the canonical list owned by [`crate::registry`] so the
+/// dispatch arms, the validator's V017 check, and these "did you mean?"
+/// suggestions all read from one source of truth.
+pub use crate::registry::KNOWN_ADAPTER_TYPES;
 
 /// Attempt to convert an `anyhow::Error` into a rich [`ConfigDiagnostic`].
 ///

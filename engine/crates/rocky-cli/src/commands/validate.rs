@@ -419,14 +419,31 @@ fn validate_adapter(
             });
         }
         other => {
-            ok = false;
-            msgs.push(ValidateMessage {
-                severity: "warn".into(),
-                code: "V017".into(),
-                message: format!("adapter.{name}: unknown type '{other}'"),
-                file: None,
-                field: Some(format!("adapter.{name}.type")),
-            });
+            // Catchall: types the registry knows how to construct but
+            // for which `validate_adapter` has no per-type credential
+            // checks (V011-V016) emit a generic V010 ok rather than a
+            // cosmetic V017. Genuinely unrecognised types still warn.
+            // Driving this off `AdapterRegistry::is_known` keeps V017
+            // drift-proof against future adapter additions — adding a
+            // new dispatch arm in `registry.rs` is enough.
+            if crate::registry::AdapterRegistry::is_known(other) {
+                msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: {other}"),
+                    file: None,
+                    field: None,
+                });
+            } else {
+                ok = false;
+                msgs.push(ValidateMessage {
+                    severity: "warn".into(),
+                    code: "V017".into(),
+                    message: format!("adapter.{name}: unknown type '{other}'"),
+                    file: None,
+                    field: Some(format!("adapter.{name}.type")),
+                });
+            }
         }
     }
 
@@ -1343,21 +1360,13 @@ table = "b"
 
     #[test]
     fn test_known_adapter_types_do_not_warn() {
-        // Every adapter type recognized by `registry::AdapterRegistry` must
-        // also be recognized by `validate_adapter`, otherwise a perfectly
-        // valid `rocky.toml` emits a cosmetic V017 warning. Keep this list
-        // in sync with the match arms in `engine/crates/rocky-cli/src/registry.rs`.
-        for adapter_type in [
-            "databricks",
-            "duckdb",
-            "snowflake",
-            "bigquery",
-            "trino",
-            "fivetran",
-            "airbyte",
-            "iceberg",
-            "manual",
-        ] {
+        // Every adapter type recognised by `AdapterRegistry` must also
+        // be recognised by `validate_adapter`, otherwise a perfectly
+        // valid `rocky.toml` emits a cosmetic V017 warning. Driving the
+        // loop directly off `AdapterRegistry::known_types()` keeps this
+        // test drift-proof — adding a new adapter to the registry
+        // automatically adds it to this regression set.
+        for adapter_type in crate::registry::AdapterRegistry::known_types() {
             let toml = format!(
                 r#"
 [adapter.x]
