@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  RockyCliError,
   runRockyJsonWithProgress,
   runRockyWithProgress,
   showRockyError,
@@ -19,6 +20,19 @@ export async function doctor(): Promise<void> {
     );
     showDoctorResult(result);
   } catch (err) {
+    // `rocky doctor` exits 2 when any check is `critical` (see
+    // engine/crates/rocky-cli/src/commands/doctor.rs). The JSON payload on
+    // stdout is still valid — surface it so users can see what's wrong
+    // instead of a generic "Doctor failed" toast.
+    if (err instanceof RockyCliError && err.exitCode === 2 && err.stdout) {
+      try {
+        const result = JSON.parse(err.stdout) as DoctorResult;
+        showDoctorResult(result);
+        return;
+      } catch {
+        // Fall through to the generic error path below.
+      }
+    }
     showRockyError("Doctor failed", err);
   }
 }

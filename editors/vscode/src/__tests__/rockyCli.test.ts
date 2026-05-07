@@ -100,6 +100,27 @@ describe("runRocky", () => {
     });
   });
 
+  it("captures stdout on RockyCliError so callers can recover JSON payloads", async () => {
+    // `rocky doctor` exits 2 when health is critical but still emits valid
+    // JSON on stdout. Callers (the doctor handler) read err.stdout to recover
+    // the payload instead of dropping it on the floor.
+    const doctorJson =
+      '{"command":"doctor","overall":"critical","checks":[],"suggestions":[]}';
+    execFileMock.mockImplementationOnce(
+      (_cmd: string, _args: string[], _opts: unknown, cb: ExecCallback) => {
+        const err = Object.assign(new Error("exit 2"), { code: 2 });
+        cb(err, doctorJson, "");
+        return fakeChild();
+      },
+    );
+    await expect(
+      runRocky(["doctor", "--output", "json"]),
+    ).rejects.toMatchObject({
+      exitCode: 2,
+      stdout: doctorJson,
+    });
+  });
+
   it("kills the child process when the abort signal fires", async () => {
     const killSpy = vi.fn();
     execFileMock.mockImplementationOnce(

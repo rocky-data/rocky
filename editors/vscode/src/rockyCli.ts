@@ -21,6 +21,11 @@ export interface RockyResult {
 /**
  * Error thrown by {@link runRocky} on non-zero exit, spawn failure, timeout,
  * or JSON-parse failure (when called via {@link runRockyJson}).
+ *
+ * `stdout` is captured even on non-zero exit because some Rocky commands
+ * (notably `rocky doctor`) signal status via the exit code while still
+ * emitting a valid JSON payload on stdout — callers that know to expect
+ * this can recover the payload from the thrown error.
  */
 export class RockyCliError extends Error {
   constructor(
@@ -28,6 +33,7 @@ export class RockyCliError extends Error {
     public readonly stderr: string,
     public readonly exitCode: number | string | null,
     cause?: Error,
+    public readonly stdout: string = "",
   ) {
     super(message, cause ? { cause } : undefined);
     this.name = "RockyCliError";
@@ -70,7 +76,13 @@ export function runRocky(
             `[${elapsed}ms] command failed (exit ${err.code ?? "?"}): ${err.message}`,
           );
           reject(
-            new RockyCliError(err.message, stderr ?? "", err.code ?? null, err),
+            new RockyCliError(
+              err.message,
+              stderr ?? "",
+              err.code ?? null,
+              err,
+              stdout ?? "",
+            ),
           );
           return;
         }
