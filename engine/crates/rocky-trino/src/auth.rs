@@ -134,10 +134,21 @@ mod tests {
 
     #[test]
     fn basic_auth_encodes_user_password() {
+        // Decode-and-compare instead of asserting against a base64 literal:
+        // a literal `Basic <base64-of-user:pass>` in source trips GitHub's
+        // secret scanner (it pattern-matches the encoded form regardless
+        // of whether the credential is real). The decoded round-trip below
+        // verifies the same property — `Basic <prefix>` + `base64(user:pass)`
+        // payload — without storing the encoded literal.
         let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
         let header = auth.authorization_header();
-        // base64("alice:s3cret") = YWxpY2U6czNjcmV0
-        assert_eq!(header, "Basic YWxpY2U6czNjcmV0");
+        let encoded = header
+            .strip_prefix("Basic ")
+            .expect("header should start with 'Basic '");
+        let decoded = BASE64_STANDARD
+            .decode(encoded)
+            .expect("payload should be valid base64");
+        assert_eq!(decoded, b"alice:s3cret");
     }
 
     #[test]
