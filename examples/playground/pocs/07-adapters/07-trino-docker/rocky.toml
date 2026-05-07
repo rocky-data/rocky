@@ -1,0 +1,43 @@
+# Trino adapter — Docker-backed full_refresh demo.
+#
+# Boots a single-node `trinodb/trino` container via docker-compose and
+# materializes a model directly against it. Seed data comes from Trino's
+# built-in `tpch` connector (no init script needed); the `memory` catalog
+# is writable and used as the materialization target.
+#
+# rocky-trino v0 registers as a WarehouseAdapter only — there is no
+# replication path (no DiscoveryAdapter), so the pipeline is a
+# transformation pipeline whose source-of-truth lives inside Trino itself
+# (the tpch catalog).
+
+[adapter]
+type = "trino"
+host = "${TRINO_HOST:-http://localhost:8080}"
+# Default catalog routed through `X-Trino-Catalog`. `database` is the
+# AdapterConfig field the registry repurposes for Trino's catalog
+# (registry.rs::327).
+database = "memory"
+# Single-node `trinodb/trino` ships with no password-authenticator
+# configured, so any user/password is accepted. Dummy credentials keep
+# the auth path exercised end-to-end.
+username = "${TRINO_USER:-trino}"
+password = "${TRINO_PASSWORD:-trino}"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+# Transformation-pipeline targets only carry `adapter` + governance —
+# catalog/schema live in each model's sidecar TOML.
+[pipeline.demo.target]
+adapter = "default"
+
+# Trino has no `CREATE CATALOG` SQL (catalogs are server-side connector
+# instances), so auto_create_catalogs MUST stay false (the dialect
+# returns None from create_catalog_sql). The `memory` catalog is
+# pre-registered by the trinodb/trino image.
+#
+# auto_create_schemas = true wires the planner to issue
+# `CREATE SCHEMA IF NOT EXISTS "memory"."rocky_demo"` on first run.
+[pipeline.demo.target.governance]
+auto_create_schemas = true
