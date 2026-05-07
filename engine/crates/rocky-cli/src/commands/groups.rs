@@ -147,7 +147,10 @@ fn commands_for_group(group: CommandGroup) -> &'static [(&'static str, &'static 
             ("fmt", "Format .rocky files"),
         ],
         CommandGroup::Migrate => &[
-            ("import-dbt", "Import a dbt project as a runnable Rocky repo"),
+            (
+                "import-dbt",
+                "Import a dbt project as a runnable Rocky repo",
+            ),
             ("validate-migration", "Validate a dbt-to-Rocky migration"),
             ("init-adapter", "Scaffold a new warehouse adapter crate"),
             ("test-adapter", "Run conformance tests against an adapter"),
