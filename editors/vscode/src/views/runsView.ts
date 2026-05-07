@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { runRockyJson } from "../rockyCli";
 import type { HistoryResult } from "../types/rockyJson";
 import type { RunModelRecord } from "../types/generated";
+import { hasRockyProject, onDidChangeRockyProject } from "./getStartedView";
 
 type Run = NonNullable<HistoryResult["runs"]>[number];
 
@@ -41,6 +42,13 @@ export class RunsTreeProvider implements vscode.TreeDataProvider<Node> {
     // Leaf nodes have no children
     if (element) return [];
 
+    // Skip the CLI call entirely when there's no Rocky project — the
+    // viewsWelcome handles the empty state and we don't want to flash an
+    // error from `rocky history` complaining about a missing rocky.toml.
+    if (!hasRockyProject()) {
+      return [];
+    }
+
     // Root: fetch runs
     if (this.cache === undefined) {
       try {
@@ -60,10 +68,8 @@ export class RunsTreeProvider implements vscode.TreeDataProvider<Node> {
       return [new MessageItem(`Error: ${this.loadError}`, "error")];
     }
 
-    if (this.cache.length === 0) {
-      return [new MessageItem("No runs found", "info")];
-    }
-
+    // Empty cache: return [] so the package.json viewsWelcome content for
+    // rocky.runs takes over instead of an inline tree row.
     return this.cache.map((run) => new RunTreeItem(run));
   }
 }
@@ -215,6 +221,10 @@ export function registerRunsView(
     vscode.commands.registerCommand("rocky.refreshRuns", () =>
       provider.refresh(),
     ),
+  );
+
+  context.subscriptions.push(
+    onDidChangeRockyProject(() => provider.refresh()),
   );
 
   return provider;

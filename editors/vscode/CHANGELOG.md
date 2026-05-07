@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-05-07
+
+Activity bar UX overhaul. The Rocky sidebar now leads with a **Get Started** welcome panel and a structured **Extension Info** tree (extension version, Rocky CLI version, language-server status, configuration, detected `rocky.toml`, log shortcuts), and ends with a **Help** panel linking out to docs / issues / marketplace / releases / source. Existing Models, Runs, and Sources panels stay in place but switch their inline empty-state messages to `viewsWelcome` markdown gated by a new `rocky.hasProject` context — so a workspace with no `rocky.toml` shows orientation instead of CLI errors.
+
+### Added
+
+- **Activity bar — `Get Started` panel** (markdown via `viewsWelcome`). Three context variants: empty workspace prompts to open a folder; workspace without `rocky.toml` shows `Initialize Rocky Project` / `Try Playground` / `Open Documentation`; workspace with a Rocky project shows quick actions (`Compile`, `Plan`, `Run`, `Discover Sources`, `Run Health Check`).
+- **Activity bar — `Extension Info` panel** (`src/views/extensionInfoView.ts`). Four sections: About (extension + CLI version, LSP status), Configuration (server path, inlay hints, extra args — each leaf opens its setting), Project (detected `rocky.toml` paths, workspace folder), Logs & Diagnostics (Show Output Channel / Run Doctor / Restart Language Server). LSP status updates live via a new lifecycle emitter; CLI version cached for 60s.
+- **Activity bar — `Help` panel** (`src/views/helpView.ts`). Five fixed leaves: Documentation, Report a Bug, View on Marketplace, Releases & Changelog, Source Code. Each opens the URL via the built-in `vscode.open` command.
+- **Empty-state `viewsWelcome` for Models / Runs / Sources** — gated by `rocky.hasProject` so the copy and CTAs match whether a workspace has a Rocky project. `rocky.runs` and `rocky.sources` no longer shell out to the CLI on workspaces with no `rocky.toml`.
+- **New commands**: `rocky.openOutputChannel`, `rocky.openDocumentation`, `rocky.reportBug`, `rocky.viewMarketplace`, `rocky.refreshInfo`, `rocky.init`, `rocky.playground`. The last two open an integrated terminal at the workspace root and run `rocky init` / `rocky playground`.
+- **`getCliVersion()` helper** (`src/rockyCli.ts`) — runs `rocky --version`, caches for 60s, swallows errors. Used by the Extension Info panel's About section.
+- **`onDidChangeLspState` emitter + `getLspState()`** (`src/lspClient.ts`). New `LspStatus` (`Starting | Restarting | Ready | Stopped | Failed`) fired from the actual lifecycle transitions (start, restart, stop, startup-failure) — independent of the diagnostic-driven status bar updates.
+
+### Changed
+
+- **`rocky.models` file watcher** debounced to 500ms; `onDidChange` removed (saves no longer trigger a refresh) since the file list is unaffected by content changes.
+- **Activity bar order**: `Get Started → Extension Info → Models → Runs → Sources → Help`. New informational panels start collapsed; Models stays expanded as the default landing target.
+
 ## [1.14.2] — 2026-05-05
 
 Patch release fixing a broken brand image on the VS Code Marketplace listing. v1.14.1 shipped successfully but rendered a broken image because `vsce` rewrites relative image URLs in the extension README to `<repo>/raw/HEAD/<README-relative-path>` and ignores `package.json`'s `repository.directory` field — so `media/rocky-readme-light.png` resolved to `https://github.com/rocky-data/rocky/raw/HEAD/media/rocky-readme-light.png` (404) instead of the actual file at `https://github.com/rocky-data/rocky/raw/HEAD/editors/vscode/media/rocky-readme-light.png`. Replaced the relative paths in `<picture>` with absolute `raw.githubusercontent.com` URLs that bypass `vsce`'s rewriter entirely. No extension feature changes.

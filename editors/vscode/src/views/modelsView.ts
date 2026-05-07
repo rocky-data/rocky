@@ -66,11 +66,28 @@ export function registerModelsView(
   });
   context.subscriptions.push(view);
 
+  // Debounce so rapid create/delete bursts (e.g. branch switches) don't
+  // trigger a refresh per file. `onDidChange` is intentionally skipped — the
+  // file list doesn't change on saves and the existing tree items don't
+  // display body contents.
+  let pending: NodeJS.Timeout | undefined;
+  const scheduleRefresh = (): void => {
+    if (pending) clearTimeout(pending);
+    pending = setTimeout(() => {
+      pending = undefined;
+      provider.refresh();
+    }, 500);
+  };
+
   const watcher = vscode.workspace.createFileSystemWatcher(MODELS_GLOB);
-  watcher.onDidCreate(() => provider.refresh());
-  watcher.onDidDelete(() => provider.refresh());
-  watcher.onDidChange(() => provider.refresh());
+  watcher.onDidCreate(scheduleRefresh);
+  watcher.onDidDelete(scheduleRefresh);
   context.subscriptions.push(watcher);
+  context.subscriptions.push({
+    dispose() {
+      if (pending) clearTimeout(pending);
+    },
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand("rocky.refreshModels", () =>

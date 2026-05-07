@@ -30,7 +30,13 @@ vi.mock("child_process", () => ({
 
 // Imports must follow vi.mock so the mocked modules are bound.
 import * as cp from "child_process";
-import { runRocky, runRockyJson, RockyCliError } from "../rockyCli";
+import {
+  RockyCliError,
+  clearCliVersionCache,
+  getCliVersion,
+  runRocky,
+  runRockyJson,
+} from "../rockyCli";
 
 type ExecCallback = (
   err: (Error & { code?: number }) | null,
@@ -128,5 +134,50 @@ describe("runRockyJson", () => {
   it("throws RockyCliError on invalid JSON", async () => {
     mockSuccess("not json at all");
     await expect(runRockyJson(["doctor"])).rejects.toBeInstanceOf(RockyCliError);
+  });
+});
+
+describe("getCliVersion", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    clearCliVersionCache();
+  });
+
+  it("parses the version number from `rocky --version` output", async () => {
+    mockSuccess("rocky 1.26.0\n");
+    const v = await getCliVersion();
+    expect(v).toBe("1.26.0");
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(execFileMock.mock.calls[0][1]).toEqual(["--version"]);
+  });
+
+  it("caches the result across consecutive calls", async () => {
+    mockSuccess("rocky 1.26.0");
+    const first = await getCliVersion();
+    const second = await getCliVersion();
+    expect(first).toBe("1.26.0");
+    expect(second).toBe("1.26.0");
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns undefined when the binary is missing", async () => {
+    mockFailure("ENOENT", "spawn rocky ENOENT", 0);
+    const v = await getCliVersion();
+    expect(v).toBeUndefined();
+  });
+
+  it("returns undefined when output has no recognizable version", async () => {
+    mockSuccess("?? something weird ??");
+    const v = await getCliVersion();
+    expect(v).toBeUndefined();
+  });
+
+  it("re-shells after the cache is cleared", async () => {
+    mockSuccess("rocky 1.26.0");
+    expect(await getCliVersion()).toBe("1.26.0");
+    clearCliVersionCache();
+    mockSuccess("rocky 1.27.0");
+    expect(await getCliVersion()).toBe("1.27.0");
+    expect(execFileMock).toHaveBeenCalledTimes(2);
   });
 });

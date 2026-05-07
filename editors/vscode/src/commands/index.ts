@@ -5,6 +5,14 @@ import { branchApprove, branchPromote } from "./branch";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { hooksList, hooksTest } from "./hooks";
+import {
+  init,
+  openDocumentation,
+  openOutputChannel,
+  playground,
+  reportBug,
+  viewMarketplace,
+} from "./info";
 import { catalog, history, metrics } from "./inspect";
 import { showLineage } from "./lineage";
 import { importDbt, validateMigration } from "./migration";
@@ -80,5 +88,13 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     // Branch approval / promote — gated production writes from a branch
     vscode.commands.registerCommand("rocky.branchApprove", branchApprove),
     vscode.commands.registerCommand("rocky.branchPromote", branchPromote),
+
+    // Sidebar / Get Started utilities
+    vscode.commands.registerCommand("rocky.openOutputChannel", openOutputChannel),
+    vscode.commands.registerCommand("rocky.openDocumentation", openDocumentation),
+    vscode.commands.registerCommand("rocky.reportBug", reportBug),
+    vscode.commands.registerCommand("rocky.viewMarketplace", viewMarketplace),
+    vscode.commands.registerCommand("rocky.init", init),
+    vscode.commands.registerCommand("rocky.playground", playground),
   );
 }

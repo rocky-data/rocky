@@ -2,7 +2,7 @@
   "name": "rocky",
   "displayName": "Rocky",
   "description": "Language support for Rocky SQL transformation engine",
-  "version": "1.14.2",
+  "version": "1.15.0",
   "publisher": "rocky-data",
   "license": "Apache-2.0",
   "repository": {
@@ -26,7 +26,10 @@
   "activationEvents": [
     "onLanguage:rocky",
     "workspaceContains:**/*.rocky",
-    "workspaceContains:rocky.toml"
+    "workspaceContains:rocky.toml",
+    "onView:rocky.getStarted",
+    "onView:rocky.info",
+    "onView:rocky.help"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -271,6 +274,42 @@
         "title": "Refresh Sources",
         "category": "Rocky",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "rocky.refreshInfo",
+        "title": "Refresh Extension Info",
+        "category": "Rocky",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rocky.openOutputChannel",
+        "title": "Show Output Channel",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.openDocumentation",
+        "title": "Open Documentation",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.reportBug",
+        "title": "Report a Bug",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.viewMarketplace",
+        "title": "View on Marketplace",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.init",
+        "title": "Initialize Project",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.playground",
+        "title": "Open Playground",
+        "category": "Rocky"
       }
     ],
     "semanticTokenScopes": [
@@ -338,6 +377,22 @@
     "views": {
       "rocky": [
         {
+          "id": "rocky.getStarted",
+          "name": "Get Started",
+          "type": "tree",
+          "icon": "icons/rocky-icon.svg",
+          "contextualTitle": "Get Started with Rocky",
+          "visibility": "visible"
+        },
+        {
+          "id": "rocky.info",
+          "name": "Extension Info",
+          "type": "tree",
+          "icon": "icons/rocky-icon.svg",
+          "contextualTitle": "Rocky Extension Info",
+          "visibility": "collapsed"
+        },
+        {
           "id": "rocky.models",
           "name": "Models",
           "icon": "icons/rocky-icon.svg",
@@ -347,16 +402,73 @@
           "id": "rocky.runs",
           "name": "Runs",
           "icon": "icons/rocky-icon.svg",
-          "contextualTitle": "Rocky Run History"
+          "contextualTitle": "Rocky Run History",
+          "visibility": "collapsed"
         },
         {
           "id": "rocky.sources",
           "name": "Sources",
           "icon": "icons/rocky-icon.svg",
-          "contextualTitle": "Rocky Sources"
+          "contextualTitle": "Rocky Sources",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "rocky.help",
+          "name": "Help",
+          "type": "tree",
+          "icon": "icons/rocky-icon.svg",
+          "contextualTitle": "Rocky Help",
+          "visibility": "collapsed"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "rocky.getStarted",
+        "contents": "Open a folder containing a Rocky project to get started.\n\n[Open Folder](command:vscode.openFolder)\n\nLearn more about Rocky in the [documentation](https://github.com/rocky-data/rocky#readme).",
+        "when": "workbenchState == empty"
+      },
+      {
+        "view": "rocky.getStarted",
+        "contents": "No Rocky project detected in this workspace.\n\n[Initialize Rocky Project](command:rocky.init)\n[Try the Playground](command:rocky.playground)\n[Open Documentation](command:rocky.openDocumentation)",
+        "when": "workbenchState != empty && !rocky.hasProject"
+      },
+      {
+        "view": "rocky.getStarted",
+        "contents": "Quick actions for your Rocky project.\n\n[Compile Models](command:rocky.compile)\n[Plan Pipeline (Dry Run)](command:rocky.plan)\n[Run Pipeline](command:rocky.run)\n[Discover Sources](command:rocky.discover)\n[Run Health Check](command:rocky.doctor)",
+        "when": "rocky.hasProject"
+      },
+      {
+        "view": "rocky.models",
+        "contents": "Open a Rocky project to see your models.\n\n[Initialize Rocky Project](command:rocky.init)\n[Open Documentation](command:rocky.openDocumentation)",
+        "when": "!rocky.hasProject"
+      },
+      {
+        "view": "rocky.models",
+        "contents": "No models found in this workspace.\n\nCreate a `.rocky` file under `models/`, or browse the [documentation](command:rocky.openDocumentation) for examples.",
+        "when": "rocky.hasProject"
+      },
+      {
+        "view": "rocky.runs",
+        "contents": "Open a Rocky project to see run history.",
+        "when": "!rocky.hasProject"
+      },
+      {
+        "view": "rocky.runs",
+        "contents": "No runs yet. Run your pipeline to see history here.\n\n[Run Pipeline](command:rocky.run)\n[Plan (Dry Run)](command:rocky.plan)",
+        "when": "rocky.hasProject"
+      },
+      {
+        "view": "rocky.sources",
+        "contents": "Open a Rocky project to discover sources.",
+        "when": "!rocky.hasProject"
+      },
+      {
+        "view": "rocky.sources",
+        "contents": "Sources are discovered from your configured adapter.\n\n[Discover Sources](command:rocky.discover)",
+        "when": "rocky.hasProject"
+      }
+    ],
     "menus": {
       "view/title": [
         {
@@ -372,6 +484,11 @@
         {
           "command": "rocky.refreshSources",
           "when": "view == rocky.sources",
+          "group": "navigation"
+        },
+        {
+          "command": "rocky.refreshInfo",
+          "when": "view == rocky.info",
           "group": "navigation"
         }
       ],
