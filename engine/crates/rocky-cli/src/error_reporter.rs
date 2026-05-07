@@ -45,6 +45,7 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "duckdb",
     "snowflake",
     "bigquery",
+    "trino",
     "fivetran",
     "airbyte",
     "iceberg",

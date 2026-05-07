@@ -20,6 +20,7 @@ rocky-databricks = { path = "../rocky-databricks" }
 rocky-duckdb = { path = "../rocky-duckdb", optional = true }
 rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-bigquery = { path = "../rocky-bigquery" }
+rocky-trino = { path = "../rocky-trino" }
 rocky-fivetran = { path = "../rocky-fivetran" }
 rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-iceberg = { path = "../rocky-iceberg" }

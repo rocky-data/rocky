@@ -3820,6 +3820,7 @@ dependencies = [
  "rocky-server",
  "rocky-snowflake",
  "rocky-sql",
+ "rocky-trino",
  "schemars",
  "serde",
  "serde_json",
@@ -4081,6 +4082,25 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "thiserror",
+]
+
+[[package]]
+name = "rocky-trino"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "reqwest",
+ "rocky-adapter-sdk",
+ "rocky-core",
+ "rocky-sql",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

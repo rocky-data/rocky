@@ -45,6 +45,8 @@ use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 use rocky_bigquery::batch::BigQueryBatchCheckAdapter;
 use rocky_bigquery::connector::BigQueryAdapter;
 
+use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
+
 /// Holds constructed adapter instances, keyed by name from the config.
 pub struct AdapterRegistry {
     warehouse: HashMap<String, Arc<dyn WarehouseAdapter>>,
@@ -322,11 +324,47 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), discovery_adapter as Arc<dyn DiscoveryAdapter>);
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
+                "trino" => {
+                    // Trino's coordinator URL lives in `host` (no Trino-
+                    // specific config field — reuses the Databricks slot
+                    // intentionally). Auth: `username` + `password` →
+                    // Basic; `token` → JWT bearer (caller must also
+                    // provide `username` to populate `X-Trino-User`).
+                    // `database` is repurposed as the default catalog;
+                    // schema is left to be supplied per-pipeline.
+                    let coordinator = adapter_cfg.host.as_deref().context(format!(
+                        "adapters.{name}: host (coordinator URL) required for trino"
+                    ))?;
+                    let auth = if let Some(token) = adapter_cfg.token.as_ref() {
+                        TrinoAuth::jwt(token.expose().to_string())
+                            .context(format!("adapters.{name}: invalid Trino JWT token"))?
+                    } else {
+                        let user = adapter_cfg.username.as_deref().context(format!(
+                            "adapters.{name}: username required for trino basic auth"
+                        ))?;
+                        let pw = adapter_cfg.password.as_ref().context(format!(
+                            "adapters.{name}: password required for trino basic auth"
+                        ))?;
+                        TrinoAuth::basic(user, pw.expose())
+                            .context(format!("adapters.{name}: invalid Trino basic auth"))?
+                    };
+                    let mut cfg = TrinoClientConfig::new(coordinator);
+                    if let Some(u) = adapter_cfg.username.as_deref() {
+                        cfg = cfg.with_user(u);
+                    }
+                    if let Some(c) = adapter_cfg.database.as_deref() {
+                        cfg = cfg.with_default_catalog(c);
+                    }
+                    cfg = cfg
+                        .with_timeout(Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)));
+                    let adapter = Arc::new(TrinoAdapter::new(cfg, auth));
+                    warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
                 other => {
                     let mut msg = format!(
                         "adapters.{name}: unsupported adapter type '{other}'. \
                          Supported: databricks, duckdb, snowflake, bigquery, \
-                         fivetran, airbyte, iceberg, manual"
+                         trino, fivetran, airbyte, iceberg, manual"
                     );
                     if let Some(suggestion) =
                         error_reporter::did_you_mean(other, error_reporter::KNOWN_ADAPTER_TYPES)

@@ -5,6 +5,7 @@ members = [
     "crates/rocky-compiler",
     "crates/rocky-lang",
     "crates/rocky-snowflake",
+    "crates/rocky-trino",
     "crates/rocky-ai",
     "crates/rocky-server",
     "crates/rocky-engine",
