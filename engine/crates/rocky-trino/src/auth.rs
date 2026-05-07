@@ -140,7 +140,7 @@ mod tests {
         // of whether the credential is real). The decoded round-trip below
         // verifies the same property — `Basic <prefix>` + `base64(user:pass)`
         // payload — without storing the encoded literal.
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let (user, pass, auth) = crate::test_helpers::test_basic_auth_inputs();
         let header = auth.authorization_header();
         let encoded = header
             .strip_prefix("Basic ")
@@ -148,7 +148,7 @@ mod tests {
         let decoded = BASE64_STANDARD
             .decode(encoded)
             .expect("payload should be valid base64");
-        assert_eq!(decoded, b"alice:s3cret");
+        assert_eq!(decoded, format!("{user}:{pass}").as_bytes());
     }
 
     #[test]
@@ -164,11 +164,11 @@ mod tests {
 
     #[test]
     fn debug_basic_redacts_password() {
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
+        let (user, pass, auth) = crate::test_helpers::test_basic_auth_inputs();
         let debug = format!("{auth:?}");
-        assert!(!debug.contains("s3cret"));
+        assert!(!debug.contains(&pass));
         assert!(debug.contains("***"));
-        assert!(debug.contains("alice"));
+        assert!(debug.contains(&user));
     }
 
     #[test]
@@ -181,8 +181,8 @@ mod tests {
 
     #[test]
     fn trino_user_default_returns_user_for_basic() {
-        let auth = TrinoAuth::basic("alice", "s3cret").unwrap();
-        assert_eq!(auth.trino_user_default(), Some("alice"));
+        let (user, _, auth) = crate::test_helpers::test_basic_auth_inputs();
+        assert_eq!(auth.trino_user_default(), Some(user.as_str()));
     }
 
     #[test]
