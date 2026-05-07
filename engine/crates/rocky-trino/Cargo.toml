@@ -1,0 +1,35 @@
+[package]
+name = "rocky-trino"
+version = "0.1.0"
+description = "Trino warehouse adapter for Rocky (v0, experimental)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-sql = { path = "../rocky-sql" }
+rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+[features]
+# Gates the Docker-Trino live test in `tests/docker_live.rs`. Requires a
+# locally running `trinodb/trino` coordinator (the crate's
+# `docker-compose.yml` brings one up). Off by default so unit-test runs
+# stay credential-free.
+trino-conformance = []
+
+[lints]
+workspace = true
