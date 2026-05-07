@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -315,6 +317,191 @@ pub fn tests_to_contracts(model: &DbtModelYaml) -> (Vec<ContractCheck>, usize) {
 
     (checks, skipped)
 }
+
+// ---------------------------------------------------------------------------
+// Test -> TestDecl conversion (canonical Rocky model `[[tests]]` mapping)
+// ---------------------------------------------------------------------------
+
+/// A dbt test that did not map to a canonical Rocky [`TestDecl`].
+///
+/// Surfaced as a structured import warning so callers can act on the
+/// long tail (e.g. `dbt_utils.*`, `dbt_expectations.*`, project-defined
+/// generic tests) without losing visibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedTest {
+    /// The dbt model name the test was attached to.
+    pub model: String,
+    /// The column the test was attached to. `None` means the test was
+    /// declared at model level (Rocky's canonical four are all
+    /// column-level; model-level tests always land here).
+    pub column: Option<String>,
+    /// Test name as it appeared in `schema.yml` (e.g. `dbt_utils.accepted_range`).
+    pub test_name: String,
+}
+
+/// How [`tests_to_test_decls`] resolves a `relationships.to: ref('m')`
+/// reference to a Rocky FQN (`catalog.schema.table`).
+pub trait RelationshipResolver {
+    /// Return the fully-qualified Rocky table name for `model_name`.
+    fn resolve(&self, model_name: &str) -> String;
+}
+
+/// Resolve via an explicit lookup map of imported model targets, with
+/// a default fallback for cross-project refs the importer didn't see.
+pub struct ImportedTargetResolver<'a> {
+    pub targets: &'a HashMap<String, (String, String)>,
+    pub default_catalog: &'a str,
+    pub default_schema: &'a str,
+}
+
+impl RelationshipResolver for ImportedTargetResolver<'_> {
+    fn resolve(&self, model_name: &str) -> String {
+        match self.targets.get(model_name) {
+            Some((catalog, schema)) => format!("{catalog}.{schema}.{model_name}"),
+            None => format!(
+                "{}.{}.{}",
+                self.default_catalog, self.default_schema, model_name
+            ),
+        }
+    }
+}
+
+/// Convert dbt model tests to canonical Rocky [`TestDecl`]s.
+///
+/// Mapping (v0 — the four canonical dbt built-ins only):
+///
+/// | dbt test | Rocky [`TestType`] |
+/// |---|---|
+/// | `not_null` | [`TestType::NotNull`] |
+/// | `unique` | [`TestType::Unique`] |
+/// | `accepted_values: { values: [...] }` | [`TestType::AcceptedValues`] |
+/// | `relationships: { to: ref('m'), field: 'c' }` | [`TestType::Relationships`] |
+///
+/// Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined
+/// generic tests, model-level tests) is returned in the [`UnsupportedTest`]
+/// list. The caller is expected to surface those as import warnings —
+/// the v0 emitter does **not** stub them as TODO comments in the
+/// generated rocky.toml.
+pub fn tests_to_test_decls(
+    model: &DbtModelYaml,
+    resolver: &dyn RelationshipResolver,
+) -> (Vec<TestDecl>, Vec<UnsupportedTest>) {
+    let mut decls = Vec::new();
+    let mut unsupported = Vec::new();
+
+    for col in &model.columns {
+        for test in &col.tests {
+            match test {
+                DbtTestDef::Simple(name) => match name.as_str() {
+                    "not_null" => {
+                        decls.push(TestDecl {
+                            test_type: TestType::NotNull,
+                            column: Some(col.name.clone()),
+                            severity: TestSeverity::Error,
+                            filter: None,
+                        });
+                    }
+                    "unique" => {
+                        decls.push(TestDecl {
+                            test_type: TestType::Unique,
+                            column: Some(col.name.clone()),
+                            severity: TestSeverity::Error,
+                            filter: None,
+                        });
+                    }
+                    other => {
+                        unsupported.push(UnsupportedTest {
+                            model: model.name.clone(),
+                            column: Some(col.name.clone()),
+                            test_name: other.to_string(),
+                        });
+                    }
+                },
+                DbtTestDef::Configured { name, config } => match name.as_str() {
+                    "accepted_values" => match accepted_values_decl(&col.name, config) {
+                        Some(decl) => decls.push(decl),
+                        None => unsupported.push(UnsupportedTest {
+                            model: model.name.clone(),
+                            column: Some(col.name.clone()),
+                            test_name: "accepted_values".to_string(),
+                        }),
+                    },
+                    "relationships" => match relationships_decl(&col.name, config, resolver) {
+                        Some(decl) => decls.push(decl),
+                        None => unsupported.push(UnsupportedTest {
+                            model: model.name.clone(),
+                            column: Some(col.name.clone()),
+                            test_name: "relationships".to_string(),
+                        }),
+                    },
+                    other => {
+                        unsupported.push(UnsupportedTest {
+                            model: model.name.clone(),
+                            column: Some(col.name.clone()),
+                            test_name: other.to_string(),
+                        });
+                    }
+                },
+            }
+        }
+    }
+
+    (decls, unsupported)
+}
+
+fn accepted_values_decl(
+    col_name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> Option<TestDecl> {
+    let raw = config.get("values")?;
+    let values: Vec<String> = match raw {
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| match v {
+                serde_yaml::Value::String(s) => Some(s.clone()),
+                serde_yaml::Value::Number(n) => Some(n.to_string()),
+                serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => return None,
+    };
+
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(TestDecl {
+        test_type: TestType::AcceptedValues { values },
+        column: Some(col_name.to_string()),
+        severity: TestSeverity::Error,
+        filter: None,
+    })
+}
+
+fn relationships_decl(
+    col_name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    resolver: &dyn RelationshipResolver,
+) -> Option<TestDecl> {
+    let to_raw = config.get("to")?.as_str()?;
+    let field = config.get("field")?.as_str()?;
+    let ref_model = extract_ref_model(to_raw).unwrap_or(to_raw);
+
+    Some(TestDecl {
+        test_type: TestType::Relationships {
+            to_table: resolver.resolve(ref_model),
+            to_column: field.to_string(),
+        },
+        column: Some(col_name.to_string()),
+        severity: TestSeverity::Error,
+        filter: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Legacy ContractCheck conversion (kept for `validate-migration`)
+// ---------------------------------------------------------------------------
 
 fn convert_accepted_values(
     model_name: &str,
@@ -956,6 +1143,273 @@ models:
     #[test]
     fn test_extract_ref_model_not_ref() {
         assert_eq!(extract_ref_model("dim_customers"), None);
+    }
+
+    // --- TestDecl mapper tests (canonical four built-ins) ---
+
+    fn default_resolver() -> ImportedTargetResolver<'static> {
+        // Empty target map — every relationships ref falls back to defaults.
+        // Use Box::leak to keep the lifetime simple in tests.
+        let map: &'static HashMap<String, (String, String)> = Box::leak(Box::new(HashMap::new()));
+        ImportedTargetResolver {
+            targets: map,
+            default_catalog: "warehouse",
+            default_schema: "main",
+        }
+    }
+
+    #[test]
+    fn test_decl_simple_unique_and_not_null() {
+        let model = DbtModelYaml {
+            name: "fct_orders".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "order_id".to_string(),
+                description: None,
+                tests: vec![
+                    DbtTestDef::Simple("unique".to_string()),
+                    DbtTestDef::Simple("not_null".to_string()),
+                ],
+            }],
+        };
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 2);
+        assert!(
+            decls.iter().any(|d| matches!(d.test_type, TestType::Unique)
+                && d.column.as_deref() == Some("order_id"))
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d.test_type, TestType::NotNull)
+                    && d.column.as_deref() == Some("order_id"))
+        );
+    }
+
+    #[test]
+    fn test_decl_accepted_values_string_and_number() {
+        let mut config = HashMap::new();
+        config.insert(
+            "values".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("active".to_string()),
+                serde_yaml::Value::String("inactive".to_string()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(7)),
+            ]),
+        );
+        let model = DbtModelYaml {
+            name: "users".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "status".to_string(),
+                description: None,
+                tests: vec![DbtTestDef::Configured {
+                    name: "accepted_values".to_string(),
+                    config,
+                }],
+            }],
+        };
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::AcceptedValues { values } => {
+                assert_eq!(values, &["active", "inactive", "7"]);
+            }
+            _ => panic!("expected AcceptedValues"),
+        }
+    }
+
+    #[test]
+    fn test_decl_relationships_uses_resolver() {
+        let mut config = HashMap::new();
+        config.insert(
+            "to".to_string(),
+            serde_yaml::Value::String("ref('dim_customers')".to_string()),
+        );
+        config.insert(
+            "field".to_string(),
+            serde_yaml::Value::String("customer_id".to_string()),
+        );
+        let model = DbtModelYaml {
+            name: "fct_orders".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "customer_id".to_string(),
+                description: None,
+                tests: vec![DbtTestDef::Configured {
+                    name: "relationships".to_string(),
+                    config,
+                }],
+            }],
+        };
+
+        // Build a resolver that knows where dim_customers lives.
+        let mut targets = HashMap::new();
+        targets.insert(
+            "dim_customers".to_string(),
+            ("analytics".to_string(), "marts".to_string()),
+        );
+        let resolver = ImportedTargetResolver {
+            targets: &targets,
+            default_catalog: "warehouse",
+            default_schema: "main",
+        };
+
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::Relationships {
+                to_table,
+                to_column,
+            } => {
+                assert_eq!(to_table, "analytics.marts.dim_customers");
+                assert_eq!(to_column, "customer_id");
+            }
+            _ => panic!("expected Relationships"),
+        }
+    }
+
+    #[test]
+    fn test_decl_relationships_falls_back_to_defaults_for_unknown_ref() {
+        let mut config = HashMap::new();
+        config.insert(
+            "to".to_string(),
+            serde_yaml::Value::String("ref('external_dim')".to_string()),
+        );
+        config.insert(
+            "field".to_string(),
+            serde_yaml::Value::String("id".to_string()),
+        );
+        let model = DbtModelYaml {
+            name: "fct".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "external_id".to_string(),
+                description: None,
+                tests: vec![DbtTestDef::Configured {
+                    name: "relationships".to_string(),
+                    config,
+                }],
+            }],
+        };
+        let resolver = default_resolver();
+        let (decls, _) = tests_to_test_decls(&model, &resolver);
+        match &decls[0].test_type {
+            TestType::Relationships { to_table, .. } => {
+                assert_eq!(to_table, "warehouse.main.external_dim");
+            }
+            _ => panic!("expected Relationships"),
+        }
+    }
+
+    #[test]
+    fn test_decl_unsupported_simple_and_configured() {
+        let mut config = HashMap::new();
+        config.insert(
+            "min_value".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(0)),
+        );
+        let model = DbtModelYaml {
+            name: "model".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "amount".to_string(),
+                description: None,
+                tests: vec![
+                    DbtTestDef::Simple("project_macro_test".to_string()),
+                    DbtTestDef::Configured {
+                        name: "dbt_utils.accepted_range".to_string(),
+                        config,
+                    },
+                ],
+            }],
+        };
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert!(decls.is_empty());
+        assert_eq!(unsupported.len(), 2);
+        assert!(
+            unsupported
+                .iter()
+                .any(|u| u.test_name == "project_macro_test")
+        );
+        assert!(
+            unsupported
+                .iter()
+                .any(|u| u.test_name == "dbt_utils.accepted_range")
+        );
+        for u in &unsupported {
+            assert_eq!(u.model, "model");
+            assert_eq!(u.column.as_deref(), Some("amount"));
+        }
+    }
+
+    #[test]
+    fn test_decl_accepted_values_empty_or_malformed_unsupported() {
+        // Empty list — unsupported.
+        let mut config = HashMap::new();
+        config.insert("values".to_string(), serde_yaml::Value::Sequence(vec![]));
+        let model = DbtModelYaml {
+            name: "m".to_string(),
+            description: None,
+            columns: vec![DbtColumnYaml {
+                name: "c".to_string(),
+                description: None,
+                tests: vec![DbtTestDef::Configured {
+                    name: "accepted_values".to_string(),
+                    config,
+                }],
+            }],
+        };
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert!(decls.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].test_name, "accepted_values");
+    }
+
+    #[test]
+    fn test_decl_mixed_canonical_and_unsupported() {
+        let mut av_cfg = HashMap::new();
+        av_cfg.insert(
+            "values".to_string(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("a".to_string())]),
+        );
+        let model = DbtModelYaml {
+            name: "users".to_string(),
+            description: None,
+            columns: vec![
+                DbtColumnYaml {
+                    name: "id".to_string(),
+                    description: None,
+                    tests: vec![
+                        DbtTestDef::Simple("unique".to_string()),
+                        DbtTestDef::Simple("not_null".to_string()),
+                    ],
+                },
+                DbtColumnYaml {
+                    name: "status".to_string(),
+                    description: None,
+                    tests: vec![
+                        DbtTestDef::Configured {
+                            name: "accepted_values".to_string(),
+                            config: av_cfg,
+                        },
+                        DbtTestDef::Simple("custom_check".to_string()),
+                    ],
+                },
+            ],
+        };
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
+        assert_eq!(decls.len(), 3);
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].test_name, "custom_check");
     }
 
     #[test]

@@ -1,0 +1,35 @@
+version: 2
+
+# Exercises every supported dbt → Rocky generic-test mapping plus one
+# non-canonical test that must be surfaced as a structured warning.
+models:
+  - name: stg_orders
+    description: Staged orders, one row per order line.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: amount
+        tests:
+          # Non-canonical: must surface as a warning, NOT stubbed in the toml.
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 1000000
+
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['active', 'inactive', 'pending']

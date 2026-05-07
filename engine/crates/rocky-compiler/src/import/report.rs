@@ -128,7 +128,9 @@ pub fn generate_report(
         },
         model_count: import_result.imported.len() + import_result.failed.len(),
         source_count: import_result.sources_found,
-        test_count: test_stats.map(|t| t.found).unwrap_or(0),
+        test_count: test_stats
+            .map(|t| t.found)
+            .unwrap_or(import_result.tests_found),
     };
 
     // Count models with warnings
@@ -178,6 +180,10 @@ pub fn generate_report(
             .saturating_sub(import_result.sources_mapped),
     };
 
+    // Prefer caller-supplied stats (richer `by_type` breakdown). Fall back
+    // to the per-import counters populated by the dbt-tests pass so that
+    // `rocky import-dbt` always surfaces test counts in the report, even
+    // when the caller doesn't track stats separately.
     let tests = test_stats
         .map(|t| TestsSummary {
             found: t.found,
@@ -187,10 +193,10 @@ pub fn generate_report(
             by_type: t.by_type.clone(),
         })
         .unwrap_or(TestsSummary {
-            found: 0,
-            converted: 0,
-            converted_custom: 0,
-            skipped: 0,
+            found: import_result.tests_found,
+            converted: import_result.tests_converted,
+            converted_custom: import_result.tests_converted_custom,
+            skipped: import_result.tests_skipped,
             by_type: HashMap::new(),
         });
 

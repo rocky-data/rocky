@@ -54,6 +54,9 @@ pub enum WarningCategory {
     StaleManifest,
     /// `{{ source() }}` reference with no matching source definition.
     MissingSource,
+    /// dbt generic test outside the four canonical built-ins
+    /// (`unique` / `not_null` / `accepted_values` / `relationships`).
+    UnsupportedTest,
 }
 
 /// A warning produced during import.
@@ -152,6 +155,93 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
     }
 
     result
+}
+
+/// Walk a dbt project's `models/` tree for `schema.yml` files, convert any
+/// `tests:` entries to canonical Rocky [`TestDecl`]s, attach them to the
+/// matching imported model, and emit structured warnings for tests outside
+/// the four canonical built-ins. Counter fields on [`ImportResult`] are
+/// updated in place.
+///
+/// The caller passes the dbt project root (or any directory the YAMLs live
+/// under). Both the `models/` regex path and the manifest path use this
+/// helper so test mapping works whether or not a manifest is present.
+pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: &mut ImportResult) {
+    let model_yamls = match super::dbt_tests::parse_model_yamls(yaml_root) {
+        Ok(map) if !map.is_empty() => map,
+        _ => return,
+    };
+
+    // Build a name → (catalog, schema) lookup for relationship FQN resolution.
+    let mut targets: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for m in &result.imported {
+        targets.insert(
+            m.config.name.clone(),
+            (
+                m.config.target.catalog.clone(),
+                m.config.target.schema.clone(),
+            ),
+        );
+    }
+    let resolver = super::dbt_tests::ImportedTargetResolver {
+        targets: &targets,
+        default_catalog: &default_target.catalog,
+        default_schema: &default_target.schema,
+    };
+
+    for (model_name, model_yaml) in &model_yamls {
+        let total_tests: usize = model_yaml.columns.iter().map(|c| c.tests.len()).sum();
+        if total_tests == 0 {
+            // Still let YAML descriptions seed `intent` for matching imported models.
+            attach_intent(result, model_name, model_yaml.description.as_deref());
+            continue;
+        }
+        result.tests_found += total_tests;
+
+        let (decls, unsupported) = super::dbt_tests::tests_to_test_decls(model_yaml, &resolver);
+
+        result.tests_converted += decls.len();
+        result.tests_skipped += unsupported.len();
+
+        // Attach the decls to the matching imported model (if present).
+        if let Some(imported) = result.imported.iter_mut().find(|m| &m.name == model_name) {
+            imported.config.tests.extend(decls);
+        }
+
+        // Surface every unsupported test as a structured warning. Skip
+        // model-level tests (column == None) — same rule today.
+        for u in unsupported {
+            let where_ = match &u.column {
+                Some(c) => format!("column '{c}'"),
+                None => "model-level".to_string(),
+            };
+            result.warnings.push(ImportWarning {
+                model: u.model.clone(),
+                category: WarningCategory::UnsupportedTest,
+                message: format!(
+                    "dbt test '{name}' on {where_} is outside the v0 canonical set (unique, not_null, accepted_values, relationships) — not translated",
+                    name = u.test_name,
+                ),
+                suggestion: Some(
+                    "rewrite as a Rocky `[[tests]]` of type `expression` or as a custom check in a quality pipeline".to_string(),
+                ),
+            });
+        }
+
+        attach_intent(result, model_name, model_yaml.description.as_deref());
+    }
+}
+
+fn attach_intent(result: &mut ImportResult, model_name: &str, description: Option<&str>) {
+    let Some(desc) = description else {
+        return;
+    };
+    if let Some(imported) = result.imported.iter_mut().find(|m| m.name == model_name) {
+        if imported.config.intent.is_none() {
+            imported.config.intent = Some(desc.to_string());
+        }
+    }
 }
 
 fn import_manifest_node(
@@ -371,36 +461,14 @@ pub fn import_dbt_project(
         }
     }
 
-    // Phase 2: Scan for model YAML test definitions and convert to contracts
+    // Phase 2: Scan model YAML files for test definitions and convert them
+    // to canonical Rocky `[[tests]]` (`TestDecl`) entries on each imported
+    // model. Tests outside the four canonical built-ins emit structured
+    // warnings; we deliberately do NOT stub them as TODO comments in the
+    // generated rocky.toml.
     for dir in &model_dirs {
         if dir.exists() {
-            if let Ok(model_yamls) = super::dbt_tests::parse_model_yamls(dir) {
-                for (model_name, model_yaml) in &model_yamls {
-                    let (checks, skipped) = super::dbt_tests::tests_to_contracts(model_yaml);
-                    let total_tests: usize = model_yaml.columns.iter().map(|c| c.tests.len()).sum();
-                    result.tests_found += total_tests;
-                    result.tests_skipped += skipped;
-
-                    for check in &checks {
-                        if check.custom_sql.is_some() {
-                            result.tests_converted_custom += 1;
-                        } else {
-                            result.tests_converted += 1;
-                        }
-                    }
-
-                    // Set model description as intent if available and model was imported
-                    if let Some(ref desc) = model_yaml.description {
-                        if let Some(imported) =
-                            result.imported.iter_mut().find(|m| &m.name == model_name)
-                        {
-                            if imported.config.intent.is_none() {
-                                imported.config.intent = Some(desc.clone());
-                            }
-                        }
-                    }
-                }
-            }
+            apply_dbt_tests(dir, default_target, &mut result);
         }
     }
 

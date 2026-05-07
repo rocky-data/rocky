@@ -253,7 +253,12 @@ fn run_importer(
 
     if let Some(ref mf) = manifest_file {
         let manifest = dbt_manifest::parse_manifest(mf).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(dbt::import_from_manifest(&manifest, default_target))
+        let mut result = dbt::import_from_manifest(&manifest, default_target);
+        // The manifest path doesn't itself walk schema.yml files for tests.
+        // Apply the dbt-tests pass against the project root so manifest
+        // imports also pick up the four canonical generic tests.
+        dbt::apply_dbt_tests(dbt_project, default_target, &mut result);
+        Ok(result)
     } else {
         dbt::import_dbt_project(dbt_project, default_target).map_err(|e| anyhow::anyhow!("{e}"))
     }
