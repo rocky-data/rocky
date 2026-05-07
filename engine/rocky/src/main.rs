@@ -669,13 +669,13 @@ enum Command {
         sample_size: Option<usize>,
     },
 
-    /// Import a dbt project as Rocky models
+    /// Import a dbt project as a runnable Rocky repo
     ImportDbt {
         /// Path to dbt project directory
         #[arg(long)]
         dbt_project: PathBuf,
-        /// Output directory for Rocky models
-        #[arg(long = "output-dir", default_value = "models")]
+        /// Output directory for the emitted Rocky repo (rocky.toml + models/ + seeds/)
+        #[arg(long = "output-dir", default_value = "rocky-out")]
         output_dir: PathBuf,
         /// Path to manifest.json (auto-detected from target/ if omitted)
         #[arg(long)]
@@ -683,6 +683,15 @@ enum Command {
         /// Force regex-based import (skip manifest.json even if available)
         #[arg(long)]
         no_manifest: bool,
+        /// Override the Rocky adapter type (`duckdb`, `databricks`, `snowflake`, `bigquery`).
+        /// Defaults to whatever `<dbt_project>/profiles.yml` declares — or `duckdb` when
+        /// the profile cannot be parsed or maps to an unsupported warehouse.
+        #[arg(long = "target-adapter")]
+        target_adapter: Option<String>,
+        /// Replace contents of `--output-dir` if it already exists and is non-empty.
+        /// Without this flag, the importer refuses to write into a non-empty directory.
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Interactive SQL shell against the configured warehouse
@@ -1904,11 +1913,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             output_dir,
             manifest,
             no_manifest,
+            target_adapter,
+            overwrite,
         } => rocky_cli::commands::run_import_dbt(
             &dbt_project,
             &output_dir,
             manifest.as_deref(),
             no_manifest,
+            target_adapter.as_deref(),
+            overwrite,
             json,
         ),
         Command::Shell { pipeline } => {

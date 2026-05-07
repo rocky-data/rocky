@@ -1,14 +1,45 @@
-//! `rocky import-dbt` — import a dbt project as Rocky models.
+//! `rocky import-dbt` — import a dbt project as a runnable Rocky repo.
+//!
+//! Walks the source dbt project, translates each model body to plain SQL +
+//! sidecar TOML, and emits a self-contained Rocky directory layout under
+//! `--output-dir`:
+//!
+//! ```text
+//! <out>/
+//! ├── rocky.toml
+//! ├── models/
+//! │   ├── _defaults.toml
+//! │   ├── <name>.sql
+//! │   └── <name>.toml
+//! ├── seeds/
+//! └── MIGRATION-NOTES.md
+//! ```
+//!
+//! v0 deliberately ships without test mapping (`unique`, `not_null`,
+//! `accepted_values`, `relationships`), macro expansion, or dbt_packages
+//! support — every limitation is listed under "Not Translated" in
+//! `MIGRATION-NOTES.md`. The goal is a `rocky compile`-clean repo, not a
+//! line-for-line dbt clone.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Result;
 
-use rocky_compiler::import::{dbt, dbt_manifest, dbt_tests, report};
+use rocky_compiler::import::{
+    dbt,
+    dbt::{ImportResult, WarningCategory},
+    dbt_manifest, dbt_profiles,
+    dbt_profiles::{AdapterKind, ProfileResolution, StubReason},
+    emit,
+    emit::{EmitInputs, OverwritePolicy},
+    report,
+};
 use rocky_core::models::TargetConfig;
 
-use crate::output::{ImportDbtFailure, ImportDbtOutput, ImportDbtWarning, print_json};
+use crate::output::{
+    ImportDbtEmission, ImportDbtFailure, ImportDbtOutput, ImportDbtWarning, print_json,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,90 +49,45 @@ pub fn run_import_dbt(
     output_dir: &Path,
     manifest_path: Option<&Path>,
     no_manifest: bool,
+    target_adapter: Option<&str>,
+    overwrite: bool,
     output_json: bool,
 ) -> Result<()> {
-    let default_target = TargetConfig {
-        catalog: "warehouse".to_string(),
-        schema: "staging".to_string(),
-        table: String::new(),
-    };
+    // Resolve adapter shape — profile detection unless --target-adapter overrides.
+    let profile = resolve_profile(dbt_project, target_adapter);
+    let adapter_override_label = target_adapter.map(std::string::ToString::to_string);
 
-    // Determine import path: manifest vs regex
-    let result = if no_manifest {
-        dbt::import_dbt_project(dbt_project, &default_target).map_err(|e| anyhow::anyhow!("{e}"))?
+    let default_target = default_target_from_profile(&profile);
+
+    // Run the existing importer to produce the per-model translation result.
+    let import_result = run_importer(dbt_project, &default_target, manifest_path, no_manifest)?;
+
+    // Capture which models had their `view` materialization flattened to
+    // FullRefresh by the importer — we re-rewrite those to Ephemeral at
+    // emit time per the v0 mapping rules.
+    let view_models = collect_view_flattened_models(&import_result);
+
+    let policy = if overwrite {
+        OverwritePolicy::ReplaceContents
     } else {
-        // Try manifest path
-        let manifest_file = match manifest_path {
-            Some(p) => {
-                if p.exists() {
-                    Some(p.to_path_buf())
-                } else {
-                    anyhow::bail!("manifest file not found: {}", p.display());
-                }
-            }
-            None => {
-                // Auto-detect: check <dbt_project>/target/manifest.json
-                let default = dbt_project.join("target/manifest.json");
-                if default.exists() {
-                    Some(default)
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(ref mf) = manifest_file {
-            let manifest = dbt_manifest::parse_manifest(mf).map_err(|e| anyhow::anyhow!("{e}"))?;
-            dbt::import_from_manifest(&manifest, &default_target)
-        } else {
-            dbt::import_dbt_project(dbt_project, &default_target)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        }
+        OverwritePolicy::Reject
     };
 
-    // Write imported models
-    if !result.imported.is_empty() {
-        dbt::write_imported_models(&result.imported, output_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-
-    // Phase 2: Parse model YAMLs and write contracts
-    let models_dir = dbt_project.join("models");
-    let mut test_stats = report::TestConversionStats {
-        found: result.tests_found,
-        converted: result.tests_converted,
-        converted_custom: result.tests_converted_custom,
-        skipped: result.tests_skipped,
-        by_type: HashMap::new(),
-    };
-
-    if models_dir.exists() {
-        if let Ok(model_yamls) = dbt_tests::parse_model_yamls(&models_dir) {
-            for (model_name, model_yaml) in &model_yamls {
-                // Count test types for reporting
-                for col in &model_yaml.columns {
-                    for test in &col.tests {
-                        let type_name = match test {
-                            dbt_tests::DbtTestDef::Simple(s) => s.clone(),
-                            dbt_tests::DbtTestDef::Configured { name, .. } => name.clone(),
-                        };
-                        *test_stats.by_type.entry(type_name).or_default() += 1;
-                    }
-                }
-
-                // Convert and write contracts
-                let (checks, _) = dbt_tests::tests_to_contracts(model_yaml);
-                if !checks.is_empty() {
-                    if let Err(e) = dbt_tests::write_contracts(model_name, &checks, output_dir) {
-                        tracing::warn!("failed to write contracts for {model_name}: {e}");
-                    }
-                }
-            }
-        }
-    }
+    let emission = emit::emit_repo(&EmitInputs {
+        dbt_project_dir: dbt_project,
+        out_dir: output_dir,
+        overwrite: policy,
+        profile: &profile,
+        default_catalog: &default_target.catalog,
+        default_schema: &default_target.schema,
+        import: &import_result,
+        view_models_to_make_ephemeral: view_models,
+        adapter_override_label,
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if output_json {
-        let warning_details: Vec<ImportDbtWarning> = result
+        let warning_details: Vec<ImportDbtWarning> = import_result
             .warnings
             .iter()
             .map(|w| ImportDbtWarning {
@@ -112,7 +98,7 @@ pub fn run_import_dbt(
             })
             .collect();
 
-        let failed_details: Vec<ImportDbtFailure> = result
+        let failed_details: Vec<ImportDbtFailure> = import_result
             .failed
             .iter()
             .map(|f| ImportDbtFailure {
@@ -121,47 +107,70 @@ pub fn run_import_dbt(
             })
             .collect();
 
-        let migration_report = report::generate_report(&result, Some(&test_stats), None);
+        let migration_report = report::generate_report(&import_result, None, None);
+
+        let emission_payload = ImportDbtEmission {
+            out_dir: emission.out_dir.display().to_string(),
+            rocky_toml_path: emission.rocky_toml_path.display().to_string(),
+            migration_notes_path: emission.migration_notes_path.display().to_string(),
+            models_translated_count: emission.models_translated,
+            models_skipped_count: emission.models_skipped,
+            seeds_copied_count: emission.seeds_copied,
+            adapter_type: profile.kind.rocky_type().to_string(),
+            original_dbt_adapter_type: profile.original_type.clone(),
+            required_env_vars: profile.env_vars.vars.clone(),
+        };
 
         let output = ImportDbtOutput {
             version: VERSION.to_string(),
             command: "import-dbt".to_string(),
-            import_method: format!("{:?}", result.import_method),
-            project_name: result.project_name.clone(),
-            dbt_version: result.dbt_version.clone(),
-            imported: result.imported.len(),
-            warnings: result.warnings.len(),
-            failed: result.failed.len(),
-            sources_found: result.sources_found,
-            sources_mapped: result.sources_mapped,
-            tests_found: result.tests_found,
-            tests_converted: result.tests_converted,
-            tests_converted_custom: result.tests_converted_custom,
-            tests_skipped: result.tests_skipped,
-            macros_detected: result.macros_detected,
-            imported_models: result.imported.iter().map(|m| m.name.clone()).collect(),
+            import_method: format!("{:?}", import_result.import_method),
+            project_name: import_result.project_name.clone(),
+            dbt_version: import_result.dbt_version.clone(),
+            imported: import_result.imported.len(),
+            warnings: import_result.warnings.len(),
+            failed: import_result.failed.len(),
+            sources_found: import_result.sources_found,
+            sources_mapped: import_result.sources_mapped,
+            tests_found: import_result.tests_found,
+            tests_converted: import_result.tests_converted,
+            tests_converted_custom: import_result.tests_converted_custom,
+            tests_skipped: import_result.tests_skipped,
+            macros_detected: import_result.macros_detected,
+            imported_models: import_result
+                .imported
+                .iter()
+                .map(|m| m.name.clone())
+                .collect(),
             warning_details,
             failed_details,
             report: serde_json::to_value(&migration_report).unwrap_or(serde_json::Value::Null),
+            emission: Some(emission_payload),
         };
         print_json(&output)?;
     } else {
-        // Use the migration report formatter for human-readable output
-        let migration_report = report::generate_report(&result, Some(&test_stats), None);
+        let migration_report = report::generate_report(&import_result, None, None);
         print!("{}", report::format_report(&migration_report));
 
-        if !result.imported.is_empty() {
-            println!(
-                "Output:  {} models written to {}",
-                result.imported.len(),
-                output_dir.display()
-            );
-            println!();
-        }
+        println!(
+            "Output:  {} models translated, {} seeds copied → {}",
+            emission.models_translated,
+            emission.seeds_copied,
+            emission.out_dir.display()
+        );
+        println!(
+            "         rocky.toml         → {}",
+            emission.rocky_toml_path.display()
+        );
+        println!(
+            "         MIGRATION-NOTES.md → {}",
+            emission.migration_notes_path.display()
+        );
+        println!();
 
-        if !result.warnings.is_empty() {
+        if !import_result.warnings.is_empty() {
             println!("Warnings:");
-            for w in &result.warnings {
+            for w in &import_result.warnings {
                 println!("  {}: {}", w.model, w.message);
                 if let Some(ref s) = w.suggestion {
                     println!("    -> {s}");
@@ -170,9 +179,9 @@ pub fn run_import_dbt(
             println!();
         }
 
-        if !result.failed.is_empty() {
+        if !import_result.failed.is_empty() {
             println!("Failed:");
-            for f in &result.failed {
+            for f in &import_result.failed {
                 println!("  {}: {}", f.name, f.reason);
             }
             println!();
@@ -180,4 +189,84 @@ pub fn run_import_dbt(
     }
 
     Ok(())
+}
+
+fn resolve_profile(dbt_project: &Path, target_adapter: Option<&str>) -> ProfileResolution {
+    if let Some(forced) = target_adapter {
+        let kind = AdapterKind::from_dbt_type(forced);
+        return match kind {
+            AdapterKind::DuckDb if forced.eq_ignore_ascii_case("duckdb") => {
+                dbt_profiles::stub_resolution(StubReason::ForcedDuckDb)
+            }
+            kind => dbt_profiles::resolution_for_kind(
+                kind,
+                &format!("{forced} (forced via --target-adapter)"),
+            ),
+        };
+    }
+
+    match dbt_profiles::resolve_from_project(dbt_project) {
+        Some(resolved) => resolved,
+        None => dbt_profiles::stub_resolution(StubReason::ProfilesAbsent),
+    }
+}
+
+fn default_target_from_profile(profile: &ProfileResolution) -> TargetConfig {
+    TargetConfig {
+        catalog: profile
+            .database
+            .clone()
+            .unwrap_or_else(|| "warehouse".to_string()),
+        schema: profile.schema.clone().unwrap_or_else(|| "main".to_string()),
+        table: String::new(),
+    }
+}
+
+fn run_importer(
+    dbt_project: &Path,
+    default_target: &TargetConfig,
+    manifest_path: Option<&Path>,
+    no_manifest: bool,
+) -> Result<ImportResult> {
+    if no_manifest {
+        return dbt::import_dbt_project(dbt_project, default_target)
+            .map_err(|e| anyhow::anyhow!("{e}"));
+    }
+
+    let manifest_file = match manifest_path {
+        Some(p) => {
+            if p.exists() {
+                Some(p.to_path_buf())
+            } else {
+                anyhow::bail!("manifest file not found: {}", p.display());
+            }
+        }
+        None => {
+            let default = dbt_project.join("target/manifest.json");
+            if default.exists() {
+                Some(default)
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(ref mf) = manifest_file {
+        let manifest = dbt_manifest::parse_manifest(mf).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(dbt::import_from_manifest(&manifest, default_target))
+    } else {
+        dbt::import_dbt_project(dbt_project, default_target).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+fn collect_view_flattened_models(result: &ImportResult) -> BTreeSet<String> {
+    result
+        .warnings
+        .iter()
+        .filter(|w| {
+            w.category == WarningCategory::UnsupportedMaterialization
+                && w.message.contains("'view'")
+        })
+        .map(|w| w.model.clone())
+        .collect()
 }

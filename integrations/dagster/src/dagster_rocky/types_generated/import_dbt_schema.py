@@ -8,6 +8,51 @@ from typing import Any
 from pydantic import BaseModel, conint
 
 
+class ImportDbtEmission(BaseModel):
+    """
+    Files-on-disk metadata for the runnable Rocky repo emitted by `rocky import-dbt --output-dir <out>`.
+
+    Consumers (Dagster, vscode) treat this block as the contract for "where the importer wrote things." Absence of the block on `ImportDbtOutput` means no repo was emitted (e.g. dry-run mode in a follow-up).
+    """
+
+    adapter_type: str
+    """
+    Rocky adapter type written into `[adapter]` (`duckdb` / `databricks` / …).
+    """
+    migration_notes_path: str
+    """
+    Path to the generated `MIGRATION-NOTES.md`.
+    """
+    models_skipped_count: conint(ge=0)
+    """
+    Number of dbt model files seen but not translated (failed entries).
+    """
+    models_translated_count: conint(ge=0)
+    """
+    Number of dbt models successfully translated and written under `models/`.
+    """
+    original_dbt_adapter_type: str
+    """
+    dbt profile `type` value the importer mapped from. Useful when the caller passed `--target-adapter` and we want to surface the original.
+    """
+    out_dir: str
+    """
+    Resolved output directory.
+    """
+    required_env_vars: list[str]
+    """
+    Env vars referenced by the emitted `[adapter]` block. Surfaced in `MIGRATION-NOTES.md` under "Required env vars".
+    """
+    rocky_toml_path: str
+    """
+    Path to the generated `rocky.toml`.
+    """
+    seeds_copied_count: conint(ge=0)
+    """
+    Number of files copied from `<dbt_project>/seeds/` into `<out>/seeds/`.
+    """
+
+
 class ImportDbtFailure(BaseModel):
     name: str
     reason: str
@@ -29,6 +74,10 @@ class ImportDbtOutput(BaseModel):
 
     command: str
     dbt_version: str | None = None
+    emission: ImportDbtEmission | None = None
+    """
+    Metadata about the emitted Rocky repo. Present when `--output-dir` triggered repo emission (the default for `rocky import-dbt`). Absent when emission was skipped or failed before disk writes.
+    """
     failed: conint(ge=0)
     failed_details: list[ImportDbtFailure]
     import_method: str

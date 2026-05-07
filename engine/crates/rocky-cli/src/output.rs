@@ -2117,6 +2117,41 @@ pub struct ImportDbtOutput {
     pub failed_details: Vec<ImportDbtFailure>,
     /// Free-form per-model migration report payload.
     pub report: serde_json::Value,
+    /// Metadata about the emitted Rocky repo. Present when `--output-dir`
+    /// triggered repo emission (the default for `rocky import-dbt`).
+    /// Absent when emission was skipped or failed before disk writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emission: Option<ImportDbtEmission>,
+}
+
+/// Files-on-disk metadata for the runnable Rocky repo emitted by
+/// `rocky import-dbt --output-dir <out>`.
+///
+/// Consumers (Dagster, vscode) treat this block as the contract for "where
+/// the importer wrote things." Absence of the block on `ImportDbtOutput`
+/// means no repo was emitted (e.g. dry-run mode in a follow-up).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ImportDbtEmission {
+    /// Resolved output directory.
+    pub out_dir: String,
+    /// Path to the generated `rocky.toml`.
+    pub rocky_toml_path: String,
+    /// Path to the generated `MIGRATION-NOTES.md`.
+    pub migration_notes_path: String,
+    /// Number of dbt models successfully translated and written under `models/`.
+    pub models_translated_count: usize,
+    /// Number of dbt model files seen but not translated (failed entries).
+    pub models_skipped_count: usize,
+    /// Number of files copied from `<dbt_project>/seeds/` into `<out>/seeds/`.
+    pub seeds_copied_count: usize,
+    /// Rocky adapter type written into `[adapter]` (`duckdb` / `databricks` / …).
+    pub adapter_type: String,
+    /// dbt profile `type` value the importer mapped from. Useful when the
+    /// caller passed `--target-adapter` and we want to surface the original.
+    pub original_dbt_adapter_type: String,
+    /// Env vars referenced by the emitted `[adapter]` block. Surfaced in
+    /// `MIGRATION-NOTES.md` under "Required env vars".
+    pub required_env_vars: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
