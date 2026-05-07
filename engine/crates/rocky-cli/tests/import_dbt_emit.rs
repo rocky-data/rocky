@@ -176,4 +176,72 @@ fn emit_runnable_repo_from_rich_fixture() {
     assert!(notes.contains("Not Translated"));
     assert!(notes.contains("Required env vars"));
     assert!(notes.contains("dbt generic tests"));
+
+    // Generic-test mapping: the four canonical built-ins land as
+    // `[[tests]]` blocks on each model sidecar. Non-canonical tests
+    // (e.g. `dbt_utils.accepted_range`) must NOT appear in the toml —
+    // they are surfaced as structured import warnings instead.
+    let stg_orders_toml = std::fs::read_to_string(models_dir.join("stg_orders.toml")).unwrap();
+    assert!(
+        stg_orders_toml.contains("[[tests]]"),
+        "stg_orders.toml should carry generic-test [[tests]] blocks"
+    );
+    assert!(stg_orders_toml.contains("type = \"unique\""));
+    assert!(stg_orders_toml.contains("type = \"not_null\""));
+    assert!(stg_orders_toml.contains("type = \"relationships\""));
+    assert!(stg_orders_toml.contains("to_column = \"customer_id\""));
+    // Relationships FQN should resolve via the imported-target map for
+    // stg_customers (which lives in the default schema).
+    assert!(
+        stg_orders_toml.contains("to_table = \""),
+        "relationships test must include a fully-qualified to_table"
+    );
+    // Non-canonical test must NOT be stubbed in the emitted toml.
+    assert!(
+        !stg_orders_toml.contains("dbt_utils"),
+        "non-canonical tests must not be stubbed as TODO entries; emitted toml should be clean"
+    );
+    assert!(
+        !stg_orders_toml.to_lowercase().contains("accepted_range"),
+        "non-canonical tests must not be stubbed as TODO entries"
+    );
+
+    let stg_customers_toml_again =
+        std::fs::read_to_string(models_dir.join("stg_customers.toml")).unwrap();
+    assert!(stg_customers_toml_again.contains("type = \"accepted_values\""));
+    assert!(stg_customers_toml_again.contains("\"active\""));
+
+    // Loaded via the canonical model loader, the tests round-trip into the
+    // typed TestDecl surface — confirming the emitted [[tests]] toml is
+    // wire-compatible with rocky-core.
+    let stg_orders = models
+        .iter()
+        .find(|m| m.config.name == "stg_orders")
+        .unwrap();
+    assert!(
+        !stg_orders.config.tests.is_empty(),
+        "stg_orders should carry at least one TestDecl after loading"
+    );
+
+    // The non-canonical test must surface as a structured warning whose
+    // category is `UnsupportedTest` (not silently dropped).
+    assert!(
+        result.warnings.iter().any(
+            |w| matches!(w.category, dbt::WarningCategory::UnsupportedTest)
+                && w.message.contains("dbt_utils.accepted_range")
+        ),
+        "expected an UnsupportedTest warning for dbt_utils.accepted_range"
+    );
+
+    // Counter check: the four canonical mappings flow through `tests_converted`
+    // (was misclassified as `tests_converted_custom` in v0). Total tests in
+    // the fixture: order_id × {unique, not_null}, customer_id × {not_null,
+    // relationships}, customer_id × {unique, not_null}, status × accepted_values,
+    // amount × dbt_utils.accepted_range.
+    assert_eq!(result.tests_found, 8, "all schema.yml tests are counted");
+    assert_eq!(result.tests_skipped, 1, "one non-canonical test skipped");
+    assert_eq!(
+        result.tests_converted, 7,
+        "seven canonical tests converted to TestDecls"
+    );
 }

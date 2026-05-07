@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rocky_core::models::{ModelConfig, StrategyConfig};
+use rocky_core::tests::{TestDecl, TestSeverity, TestType};
 
 use super::dbt::{ImportResult, ImportedModel, WarningCategory};
 use super::dbt_profiles::ProfileResolution;
@@ -295,6 +296,69 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
             out.push_str(&format!("table = \"{}\"\n", src.table));
         }
     }
+
+    if !config.tests.is_empty() {
+        for test in &config.tests {
+            out.push('\n');
+            out.push_str(&render_test_decl(test));
+        }
+    }
+    out
+}
+
+/// Serialise a [`TestDecl`] as a `[[tests]]` block matching the canonical
+/// Rocky model sidecar shape (`type = "..."`, `column = "..."`, plus
+/// type-specific fields). Mirrors the derived serde untagged shape used
+/// by `rocky-core::tests` so the emitted TOML round-trips through the
+/// model loader.
+fn render_test_decl(test: &TestDecl) -> String {
+    let mut out = String::new();
+    out.push_str("[[tests]]\n");
+    match &test.test_type {
+        TestType::NotNull => {
+            out.push_str("type = \"not_null\"\n");
+        }
+        TestType::Unique => {
+            out.push_str("type = \"unique\"\n");
+        }
+        TestType::AcceptedValues { values } => {
+            out.push_str("type = \"accepted_values\"\n");
+            let escaped: Vec<String> = values
+                .iter()
+                .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect();
+            out.push_str(&format!("values = [{}]\n", escaped.join(", ")));
+        }
+        TestType::Relationships {
+            to_table,
+            to_column,
+        } => {
+            out.push_str("type = \"relationships\"\n");
+            out.push_str(&format!("to_table = \"{to_table}\"\n"));
+            out.push_str(&format!("to_column = \"{to_column}\"\n"));
+        }
+        // The v0 dbt importer maps only the four canonical built-ins to
+        // `TestDecl`. Anything else here would be programmer error — emit
+        // toml that won't load is worse than a panic, so refuse to render.
+        other => {
+            unreachable!(
+                "rocky import-dbt only produces NotNull/Unique/AcceptedValues/Relationships TestDecls; got {:?}",
+                std::mem::discriminant(other)
+            );
+        }
+    }
+    if let Some(col) = &test.column {
+        out.push_str(&format!("column = \"{col}\"\n"));
+    }
+    if test.severity != TestSeverity::Error {
+        out.push_str("severity = \"warning\"\n");
+    }
+    if let Some(filter) = &test.filter {
+        out.push_str(&format!(
+            "filter = \"{}\"\n",
+            filter.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+    }
     out
 }
 
@@ -418,7 +482,7 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
     out.push_str(&format!("- Models skipped: {}\n", ctx.models_skipped));
     out.push_str(&format!("- Seeds copied: {}\n", ctx.seeds_copied));
     out.push_str(&format!(
-        "- dbt tests detected (NOT translated in v0): {}\n",
+        "- dbt tests detected (canonical four mapped to `[[tests]]`; non-canonical surfaced as warnings): {}\n",
         ctx.tests_skipped
     ));
     out.push_str(&format!(
@@ -439,9 +503,15 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
 
     out.push_str("## Not Translated (v0 limitations)\n\n");
     out.push_str(
-        "- **dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`)** ",
+        "- **dbt generic tests outside the canonical four** (`unique`, `not_null`, `accepted_values`, ",
     );
-    out.push_str("— map to Rocky `[[checks]]` blocks in a follow-up. Detected count above.\n");
+    out.push_str(
+        "`relationships` are translated to `[[tests]]` on each model sidecar). Anything else ",
+    );
+    out.push_str(
+        "(`dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, model-level tests) ",
+    );
+    out.push_str("is surfaced under the **Warnings** section below — not stubbed in the SQL.\n");
     out.push_str("- **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.\n");
     out.push_str("- **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. Hand-port any ");
     out.push_str("logic to plain SQL or to a Rocky AI prompt.\n");

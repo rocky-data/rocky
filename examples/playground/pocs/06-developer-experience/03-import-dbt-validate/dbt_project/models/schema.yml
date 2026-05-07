@@ -1,0 +1,37 @@
+version: 2
+
+# Demonstrates `rocky import-dbt` mapping each of dbt's four canonical
+# generic tests onto Rocky `[[tests]]` blocks plus surfacing one
+# non-canonical test as a structured warning.
+models:
+  - name: stg_orders
+    description: Staged orders, one row per order, with a normalised status.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['pending', 'completed', 'shipped']
+
+  - name: fct_revenue
+    description: Per-customer revenue rollup.
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+          - relationships:
+              to: ref('stg_orders')
+              field: customer_id
+      - name: total_revenue
+        tests:
+          # Non-canonical: must surface as an `UnsupportedTest` warning,
+          # not stubbed in the emitted rocky.toml.
+          - dbt_utils.accepted_range:
+              min_value: 0
