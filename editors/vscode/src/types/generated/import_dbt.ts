@@ -13,6 +13,10 @@
 export interface ImportDbtOutput {
   command: string;
   dbt_version?: string | null;
+  /**
+   * Metadata about the emitted Rocky repo. Present when `--output-dir` triggered repo emission (the default for `rocky import-dbt`). Absent when emission was skipped or failed before disk writes.
+   */
+  emission?: ImportDbtEmission | null;
   failed: number;
   failed_details: ImportDbtFailure[];
   import_method: string;
@@ -35,6 +39,50 @@ export interface ImportDbtOutput {
   version: string;
   warning_details: ImportDbtWarning[];
   warnings: number;
+  [k: string]: unknown;
+}
+/**
+ * Files-on-disk metadata for the runnable Rocky repo emitted by `rocky import-dbt --output-dir <out>`.
+ *
+ * Consumers (Dagster, vscode) treat this block as the contract for "where the importer wrote things." Absence of the block on `ImportDbtOutput` means no repo was emitted (e.g. dry-run mode in a follow-up).
+ */
+export interface ImportDbtEmission {
+  /**
+   * Rocky adapter type written into `[adapter]` (`duckdb` / `databricks` / …).
+   */
+  adapter_type: string;
+  /**
+   * Path to the generated `MIGRATION-NOTES.md`.
+   */
+  migration_notes_path: string;
+  /**
+   * Number of dbt model files seen but not translated (failed entries).
+   */
+  models_skipped_count: number;
+  /**
+   * Number of dbt models successfully translated and written under `models/`.
+   */
+  models_translated_count: number;
+  /**
+   * dbt profile `type` value the importer mapped from. Useful when the caller passed `--target-adapter` and we want to surface the original.
+   */
+  original_dbt_adapter_type: string;
+  /**
+   * Resolved output directory.
+   */
+  out_dir: string;
+  /**
+   * Env vars referenced by the emitted `[adapter]` block. Surfaced in `MIGRATION-NOTES.md` under "Required env vars".
+   */
+  required_env_vars: string[];
+  /**
+   * Path to the generated `rocky.toml`.
+   */
+  rocky_toml_path: string;
+  /**
+   * Number of files copied from `<dbt_project>/seeds/` into `<out>/seeds/`.
+   */
+  seeds_copied_count: number;
   [k: string]: unknown;
 }
 export interface ImportDbtFailure {
