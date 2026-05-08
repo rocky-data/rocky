@@ -1,0 +1,6 @@
+customer_id,name,email,country,created_at
+5,Alice Chen,alice@example.com,US,2025-11-02
+17,Bao Nguyen,bao@example.com,VN,2025-12-14
+42,Hugo Correia,hugo@example.com,PT,2026-01-08
+88,Sara Müller,sara@example.com,DE,2026-02-21
+201,Lin Zhao,lin@example.com,SG,2026-03-30
