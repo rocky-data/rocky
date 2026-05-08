@@ -71,9 +71,9 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 
-### 02 — Performance (10 POCs · DuckDB)
+### 02 — Performance (11 POCs · DuckDB)
 
-Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets.
+Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets, side-by-side strategy showcase.
 
 | POC | Feature |
 |---|---|
@@ -87,6 +87,7 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [08-delete-insert-partitioned](pocs/02-performance/08-delete-insert-partitioned) | `strategy = "delete_insert"` with `partition_by` — atomic partition replacement without MERGE |
 | [09-adaptive-concurrency](pocs/02-performance/09-adaptive-concurrency) | AIMD throttling — dynamic parallelism with `concurrency`, `error_rate_abort_pct`, `table_retries` |
 | [10-cost-budgets](pocs/02-performance/10-cost-budgets) | **Trust arc 2** — per-run `cost_summary` + `[budget]` block + `budget_breach` record |
+| [11-strategy-showcase](pocs/02-performance/11-strategy-showcase) | Three strategies side-by-side on one source: `full_refresh` + `incremental` + `merge`, with a cheat-sheet README |
 
 ### 03 — AI (5 POCs · `ANTHROPIC_API_KEY` required)
 

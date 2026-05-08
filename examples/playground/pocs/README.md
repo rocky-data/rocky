@@ -1,12 +1,12 @@
 # POC Catalog
 
-67 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
+68 small POCs across 8 categories. Each is self-contained — `cd` into a POC folder and run `./run.sh`.
 
 ## Categories
 
 - [00-foundations](00-foundations/) — DSL syntax + materialization basics + trust-arc 1 branches/replay/lineage + config layering + branch approve/promote + file-format ingest + per-tenant routing (11 POCs · DuckDB)
 - [01-quality](01-quality/) — Contracts, checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline (6 POCs · DuckDB)
-- [02-performance](02-performance/) — Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, trust-arc 2 cost+budgets (10 POCs · DuckDB)
+- [02-performance](02-performance/) — Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, trust-arc 2 cost+budgets, strategy showcase (11 POCs · DuckDB)
 - [03-ai](03-ai/) — AI generation, sync, test generation, trust-arc 5 schema-grounded validation (5 POCs · `ANTHROPIC_API_KEY`)
 - [04-governance](04-governance/) — Unity Catalog grants, isolation, tagging, classification + masking, retention (6 POCs · Databricks / DuckDB)
 - [05-orchestration](05-orchestration/) — Hooks, webhooks, state, resume, Valkey cache, trust-arc 3 circuit breaker, idempotency keys (9 POCs · DuckDB / docker)
