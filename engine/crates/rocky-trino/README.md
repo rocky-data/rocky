@@ -148,13 +148,12 @@ DropAndRecreate.
   broken SQL.
 - **OAuth 2.0 / Kerberos / SPNEGO auth.** Basic + JWT only.
 - **`rocky init trino` template** — no scaffold exists yet.
-- **Docker conformance harness.** The crate's `Cargo.toml` reserves a
-  `trino-conformance` feature for a future `tests/docker_live.rs`
-  driver against `trinodb/trino`. The driver and its `docker-compose.yml`
-  are not yet committed.
-- **Playground POC.** No `examples/playground/pocs/07-adapters/*-trino*`
-  POC exists yet — it lands in a separate small PR alongside the
-  Docker harness.
+- **Playground POC** (full `docker compose up` walkthrough with a
+  row-count assertion via the REST API) lives at
+  `examples/playground/pocs/07-adapters/07-trino-docker/`. The
+  feature-gated harness in `tests/conformance.rs` (see below) covers
+  the in-tree adapter contract; the POC covers the end-to-end pipeline
+  shape.
 - **Governance / loader / batch checks.** Trino's `GRANT` semantics
   depend on the underlying connector; deferred until there's a concrete
   ask. The crate exports no `TrinoGovernanceAdapter` /
@@ -170,9 +169,9 @@ DropAndRecreate.
 
 ## Testing
 
-Unit tests live alongside the source — no separate `tests/` directory
-yet. They use [`wiremock`](https://crates.io/crates/wiremock) to stand
-up a coordinator mock and assert against:
+Unit tests live alongside the source. They use
+[`wiremock`](https://crates.io/crates/wiremock) to stand up a
+coordinator mock and assert against:
 
 - the `Authorization: Basic ...` header *structure* (decoded round-trip
   rather than a base64 literal — committing the encoded form trips
@@ -199,9 +198,59 @@ unit-test inputs only.
 cargo test -p rocky-trino
 ```
 
-The `trino-conformance` Cargo feature is reserved for the future Docker
-live test and is off by default — no live Trino is required to run the
-unit suite.
+No live Trino is required for the unit suite. The Docker-backed
+harness lives behind the `trino-conformance` Cargo feature — see
+[Conformance harness](#conformance-harness) below.
+
+## Conformance harness
+
+The `trino-conformance` Cargo feature gates an opt-in integration test
+at [`tests/conformance.rs`](tests/conformance.rs) that drives the
+adapter against a real Trino coordinator. It's off by default so the
+default `cargo test -p rocky-trino` invocation stays credential- and
+network-free, and CI never tries to reach Docker on its own.
+
+What it covers:
+
+- `TrinoDialect::format_table_ref` round-trips against the live
+  coordinator (the dialect's identifier-quoting contract has to match
+  what Trino's parser actually accepts).
+- The full `WarehouseAdapter` round-trip via the writable `memory`
+  connector: `SELECT 1`, then `CREATE TABLE AS` / `INSERT INTO` /
+  `SELECT *` / `DROP TABLE` against `memory.default.<unique_table>`.
+  Every statement flows through the same `/v1/statement` polling state
+  machine the unit tests exercise via `wiremock`, but here it lands on
+  a real coordinator.
+
+The harness reads the coordinator URL from `${TRINO_HOST:-localhost}`
+and `${TRINO_PORT:-8080}` and authenticates via the JWT-bearer path
+with a dummy token. (The upstream `trinodb/trino:latest` image rejects
+non-empty Basic-auth passwords over plain HTTP — *"Password not
+allowed for insecure authentication"* — but doesn't validate JWT
+bearers against a JWKS in the default config, so any non-empty token
+threads through. `X-Trino-User` is supplied explicitly via
+`TrinoClientConfig::with_user` because JWT auth doesn't infer one,
+mirroring the production pattern in [Configuration](#configuration-rockytoml)
+above.) The test table name is salted with `SystemTime::now()` so
+re-runs against a long-lived container don't collide on the previous
+run's `memory.default` table.
+
+To run it locally:
+
+```bash
+docker run -d --rm -p 8080:8080 --name rocky-trino-conformance \
+    trinodb/trino:latest
+# Wait until the coordinator reports ready (~30-45s on a warm pull):
+until curl -fsS http://localhost:8080/v1/info | grep -q '"starting":false'; do
+    sleep 2
+done
+cargo test -p rocky-trino --features trino-conformance
+docker stop rocky-trino-conformance
+```
+
+For the end-to-end pipeline-shape walkthrough (full `docker compose up`
++ `rocky run` + row-count assertion), see
+`examples/playground/pocs/07-adapters/07-trino-docker/`.
 
 ## Crate layout
 

@@ -25,10 +25,10 @@ tokio = { workspace = true }
 wiremock = { workspace = true }
 
 [features]
-# Gates the Docker-Trino live test in `tests/docker_live.rs`. Requires a
-# locally running `trinodb/trino` coordinator (the crate's
-# `docker-compose.yml` brings one up). Off by default so unit-test runs
-# stay credential-free.
+# Gates the Docker-Trino conformance harness in `tests/conformance.rs`.
+# Requires a locally running `trinodb/trino` coordinator reachable at
+# `${TRINO_HOST:-localhost}:${TRINO_PORT:-8080}`. Off by default so
+# unit-test runs stay credential- and network-free.
 trino-conformance = []
 
 [lints]
