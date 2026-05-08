@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-05-08
+
+Companion release to engine `v1.28.0`. Source-invisible cycle — the `dagster_rocky.types_generated` layer is unchanged. Engine [#441](https://github.com/rocky-data/rocky/pull/441) (`rocky init --template trino`), [#442](https://github.com/rocky-data/rocky/pull/442) (Docker conformance harness behind `trino-conformance` cargo feature), [#443](https://github.com/rocky-data/rocky/pull/443) (`rocky-trino` drops `is_experimental` → adapter promoted from Experimental to Beta), and [#444](https://github.com/rocky-data/rocky/pull/444) (`#[ignore]` pairing for live-coordinator conformance tests under `--all-features`) are all transparent to the typed-resource layer. Wheel re-cut against the v1.28.0 engine binary.
+
 ## [1.25.0] — 2026-05-07
 
 Companion release to engine `v1.27.0`. Headline: **regenerated `ImportDbtOutput` Pydantic model** picking up the new optional `emission` block from engine [#428](https://github.com/rocky-data/rocky/pull/428) — `rocky import-dbt` now writes a runnable Rocky repo (`rocky.toml`, per-model SQL + sidecars, verbatim seeds, `MIGRATION-NOTES.md`) and reports the emitted paths + counts via `ImportDbtOutput.emission`. Engine [#433](https://github.com/rocky-data/rocky/pull/433) (dbt generic-test mapping → `[[checks]]`) flows through the same `ImportDbtOutput` shape. Engine [#427](https://github.com/rocky-data/rocky/pull/427) (rocky-trino v0 adapter), [#423](https://github.com/rocky-data/rocky/pull/423) (`rocky run --watch`), and [#435](https://github.com/rocky-data/rocky/pull/435)/[#436](https://github.com/rocky-data/rocky/pull/436) (validate known-types fix + registry-driven refactor) are source-invisible to the dagster integration — the `dagster_rocky.types_generated` layer is otherwise unchanged this cycle. Wheel re-cut against the v1.27.0 engine binary.
