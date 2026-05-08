@@ -17,7 +17,7 @@
 
 | POCs | Credentials |
 |---|---|
-| 52 of 65 | None — local DuckDB (or docker-compose for MinIO / Valkey / Trino) |
+| 55 of 68 | None — local DuckDB (or docker-compose for MinIO / Valkey / Trino) |
 | 5 (`03-ai/*`) | `ANTHROPIC_API_KEY` |
 | 4 (`04-governance/01..04`) + 1 (`07-adapters/02`) | Databricks host + token |
 | 1 (`07-adapters/01`) | Snowflake account + auth |

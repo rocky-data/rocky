@@ -15,6 +15,8 @@ Language support for the [Rocky](https://github.com/rocky-data/rocky) SQL transf
 
 **Syntax** — `.rocky` TextMate grammar + semantic tokens, plus code snippets for every DSL construct (`from`, `where`, `group`, `derive`, `select`, `join`, `sort`, `match`, `window`).
 
+**Activity bar sidebar** — Get Started, Extension Info, Models, Runs, Sources, and Help panels. Workspaces without a `rocky.toml` show orientation and one-click actions for Initialize Project, Try Playground, and Open Documentation instead of CLI errors.
+
 **Lineage view** — `Rocky: Show Model Lineage` renders the column-level DAG as an interactive graph.
 
 **AI generate** — `Rocky: Generate Model from Intent` creates a model from a natural language description using the Rocky AI intent layer.
@@ -46,11 +48,16 @@ The extension spawns `rocky lsp` on startup and attaches it as the language serv
 
 ## Commands
 
+A subset of the most common commands; see `Rocky: Open Command Palette` for the full list (44 commands across compile, run, AI, lineage, branch, preview, and ops).
+
 | Command | Description |
 |---------|-------------|
+| `Rocky: Initialize Rocky Project` | Scaffold a new Rocky project in the current workspace |
+| `Rocky: Try the Playground` | Create the self-contained DuckDB playground |
 | `Rocky: Restart Language Server` | Restart the LSP server |
 | `Rocky: Show Model Lineage` | Open lineage graph for the current model |
 | `Rocky: Generate Model from Intent` | Create a model from a natural language description |
+| `Rocky: Doctor` | Run health checks; results render in a webview |
 
 ## Contributing
 

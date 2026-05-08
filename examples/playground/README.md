@@ -36,13 +36,13 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**51 of 64 POCs run with no external credentials.** See each POC's README for prerequisites.
+**55 of 68 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (9 POCs · DuckDB)
+### 00 — Foundations (11 POCs · DuckDB)
 
-DSL syntax, materialization basics, playground baseline, and the trust-arc 1 storage primitives.
+DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage primitives, plus file-format ingest and per-tenant routing.
 
 | POC | Feature |
 |---|---|
