@@ -844,7 +844,16 @@ pub async fn run(
             .unwrap_or_else(|| "default".to_string());
 
         let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
-        let state_store = rocky_core::state::StateStore::open(state_path).ok();
+        // Propagate state-store open errors with context, matching the
+        // full-pipeline run path below. The previous `.ok()` silently
+        // disabled state persistence (lost watermarks, missing run history)
+        // whenever the state file was corrupted or unreadable.
+        let state_store =
+            rocky_core::state::StateStore::open(state_path).context(format!(
+                "failed to open state store at {}",
+                state_path.display()
+            ))?;
+        let state_store = Some(state_store);
         // `run_id` minted at the top of `run()` — model-only, replication,
         // and idempotency-claim paths all share one identifier.
         let mut output = RunOutput::new(
