@@ -1,0 +1,37 @@
+# 10-route-by-tenant — fan one Parquet file out to per-tenant DuckDB schemas
+#
+# Pipeline 1 (ingest, type="load") loads `data/events.parquet` (rows for many
+# accounts, mixed in one file) into `main.events`.
+#
+# Pipeline 2 (route, type="transformation") runs three SQL models, one per
+# account, each filtering `WHERE account_id = '<id>'` and writing to its own
+# schema (`account_acme.events`, `account_beta.events`, `account_ceres.events`).
+# The per-tenant schemas are pre-created in run.sh — transformation pipelines
+# don't auto-create schemas at run time today.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# --- 1. Load the Parquet file as one staging table ---
+
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+
+[pipeline.ingest.target]
+catalog = ""
+schema = "main"
+
+[pipeline.ingest.options]
+create_table = true
+truncate_first = true
+
+# --- 2. Fan out to per-tenant schemas via SQL models ---
+
+[pipeline.route]
+type = "transformation"
+depends_on = ["ingest"]
+
+[pipeline.route.target]
+adapter = "default"
