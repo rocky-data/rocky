@@ -56,6 +56,7 @@ DSL syntax, materialization basics, playground baseline, and the trust-arc 1 sto
 | [07-config-layering](pocs/00-foundations/07-config-layering) | Three-layer config: `rocky.toml` + `_defaults.toml` + per-model sidecar, with env-var substitution at every layer |
 | [08-branch-approve-promote](pocs/00-foundations/08-branch-approve-promote) | **Trust arc 1** — `[branch.approval] required = true` gates `rocky branch promote`; `rocky branch approve` writes a content-addressed signed artifact bound to the branch state hash |
 | [09-files-to-duckdb](pocs/00-foundations/09-files-to-duckdb) | `rocky load` ingests Parquet + CSV + JSONL from one `data/` directory into DuckDB — format auto-detected by extension |
+| [10-route-by-tenant](pocs/00-foundations/10-route-by-tenant) | One Parquet file with mixed-account rows is loaded then fanned out to per-tenant schemas (`account_acme.events`, `account_beta.events`, …) via per-model `target.schema` overrides |
 
 ### 01 — Quality (6 POCs · DuckDB)
 

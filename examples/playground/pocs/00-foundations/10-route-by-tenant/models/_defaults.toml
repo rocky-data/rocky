@@ -1,0 +1,8 @@
+# Shared defaults for the per-tenant routing models.
+# Each model below sets `target.schema = "account_<id>"` to override.
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
