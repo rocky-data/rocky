@@ -1,14 +1,16 @@
+# 02-merge-upsert — model-level MERGE strategy executed end-to-end against DuckDB
+
 [adapter]
 type = "duckdb"
+path = "poc.duckdb"
 
-[pipeline.poc]
-strategy = "full_refresh"
+[pipeline.transform]
+type = "transformation"
 
-[pipeline.poc.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
+[pipeline.transform.target]
+adapter = "default"
 
-[pipeline.poc.target]
-catalog_template = "poc"
-schema_template = "demo"
+# Lets `rocky run` auto-create poc.staging and poc.demo on first invocation
+# so the POC needs no manual `CREATE SCHEMA` step (added in PR #448).
+[pipeline.transform.target.governance]
+auto_create_schemas = true
