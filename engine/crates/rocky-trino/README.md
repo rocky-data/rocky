@@ -207,7 +207,9 @@ The `trino-conformance` Cargo feature gates an opt-in integration test
 at [`tests/conformance.rs`](tests/conformance.rs) that drives the
 adapter against a real Trino coordinator. It's off by default so the
 default `cargo test -p rocky-trino` invocation stays credential- and
-network-free, and CI never tries to reach Docker on its own.
+network-free. The two network-dependent tests are also marked
+`#[ignore]` so they stay skipped under `cargo test --all-features` (as
+CI runs) — execution requires both the feature flag and `-- --ignored`.
 
 What it covers:
 
@@ -243,7 +245,7 @@ docker run -d --rm -p 8080:8080 --name rocky-trino-conformance \
 until curl -fsS http://localhost:8080/v1/info | grep -q '"starting":false'; do
     sleep 2
 done
-cargo test -p rocky-trino --features trino-conformance
+cargo test -p rocky-trino --features trino-conformance -- --ignored
 docker stop rocky-trino-conformance
 ```
 
