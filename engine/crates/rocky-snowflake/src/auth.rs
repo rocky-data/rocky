@@ -300,9 +300,7 @@ impl Auth {
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| {
-                        AuthError::KeyPairInvalid(format!("system clock before unix epoch: {e}"))
-                    })?
+                    .unwrap()
                     .as_secs();
 
                 #[derive(serde::Serialize)]
