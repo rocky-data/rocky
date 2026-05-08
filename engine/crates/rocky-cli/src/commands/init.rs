@@ -9,6 +9,7 @@ use anyhow::Result;
 /// - `databricks-fivetran` — two-adapter setup (Databricks + Fivetran) with governance
 /// - `snowflake` — Snowflake adapter with key-pair auth
 /// - `bigquery` — BigQuery adapter with Service Account / ADC auth
+/// - `trino` — Trino coordinator with Basic or JWT auth
 pub fn init(path: &str, template: Option<&str>) -> Result<()> {
     let dir = Path::new(path);
 
@@ -28,8 +29,9 @@ pub fn init(path: &str, template: Option<&str>) -> Result<()> {
         "databricks-fivetran" => init_databricks_fivetran(dir)?,
         "snowflake" => init_snowflake(dir)?,
         "bigquery" => init_bigquery(dir)?,
+        "trino" => init_trino(dir)?,
         _ => anyhow::bail!(
-            "unknown template '{template_name}'. Available: duckdb, databricks-fivetran, snowflake, bigquery"
+            "unknown template '{template_name}'. Available: duckdb, databricks-fivetran, snowflake, bigquery, trino"
         ),
     }
 
@@ -348,4 +350,182 @@ SELECT
     println!("  4. rocky compile");
     println!("  5. rocky run");
     Ok(())
+}
+
+fn init_trino(dir: &Path) -> Result<()> {
+    // rocky.toml — Trino transformation pipeline.
+    //
+    // Auth: Trino supports two modes, selected by which credential
+    // env vars are populated. Basic auth (the self-hosted default)
+    // uses TRINO_USER + TRINO_PASSWORD; JWT bearer (Starburst Galaxy
+    // PATs and any JWKS-validated coordinator) uses TRINO_USER +
+    // TRINO_JWT. The two are mutually exclusive — leave the unused
+    // credential env var unset.
+    std::fs::write(
+        dir.join("rocky.toml"),
+        r#"# Rocky pipeline configuration — Trino
+# Docs: https://rocky-data.dev/
+#
+# Authentication: Trino supports two modes, selected by which env var
+# is populated:
+#
+#   Basic (self-hosted Trino with password-authenticator.properties):
+#     export TRINO_USER=alice
+#     export TRINO_PASSWORD=<password>
+#
+#   JWT bearer (Starburst Galaxy PATs, JWKS-validated coordinators):
+#     export TRINO_USER=alice
+#     export TRINO_JWT=<token>
+#
+# `username` is required in both modes — Trino populates the
+# `X-Trino-User` header on every request and the JWT path does not
+# infer it from the token's `sub` claim. Leave the unused credential
+# env var unset; if both `password` and `token` are set, JWT wins.
+#
+# `host` is the coordinator URL (https://...:8443). `database` maps
+# to Trino's catalog (X-Trino-Catalog header). Per-model catalog and
+# schema come from `models/_defaults.toml` — transformation targets
+# don't accept catalog/schema at the pipeline level.
+
+[adapter]
+type     = "trino"
+host     = "${TRINO_HOST}"
+username = "${TRINO_USER}"
+# Basic auth — set TRINO_PASSWORD; leave token unset.
+password = "${TRINO_PASSWORD:-}"
+# JWT auth — set TRINO_JWT; leave password unset. JWT wins if both set.
+# token  = "${TRINO_JWT}"
+database = "${TRINO_CATALOG:-memory}"
+
+[pipeline.demo]
+type   = "transformation"
+models = "models/**"
+
+[pipeline.demo.target]
+adapter = "default"
+"#,
+    )?;
+
+    let models_dir = dir.join("models");
+    std::fs::create_dir_all(&models_dir)?;
+
+    // Directory-level defaults so the demo model resolves a target
+    // catalog/schema without per-model duplication.
+    std::fs::write(
+        models_dir.join("_defaults.toml"),
+        r#"[target]
+catalog = "${TRINO_CATALOG:-memory}"
+schema  = "rocky_demo"
+"#,
+    )?;
+
+    // A self-contained demo model — selects from a literal so
+    // `rocky compile` succeeds without any source tables. Replace
+    // with a real query against your Trino catalogs.
+    std::fs::write(
+        models_dir.join("welcome.sql"),
+        r#"-- Demo model: emits a single row so `rocky compile` validates
+-- without needing source tables. Replace with a real query.
+SELECT
+    1 AS hello,
+    'rocky' AS name,
+    CURRENT_TIMESTAMP AS generated_at
+"#,
+    )?;
+
+    std::fs::write(
+        models_dir.join("welcome.toml"),
+        r#"depends_on = []
+"#,
+    )?;
+
+    println!("Initialized Rocky project in {}", dir.display());
+    println!();
+    println!("  rocky.toml             — Trino pipeline");
+    println!("  models/_defaults.toml  — shared model defaults");
+    println!("  models/welcome.*       — demo transformation model");
+    println!();
+    println!("Next steps:");
+    println!("  1. export TRINO_HOST=https://<coordinator>:8443");
+    println!("  2. export TRINO_USER=<user>");
+    println!("  3. export TRINO_PASSWORD=<password>   # or TRINO_JWT=<token>");
+    println!("  4. rocky validate");
+    println!("  5. rocky compile");
+    println!("  6. rocky run");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn init_trino_template_scaffolds_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("proj");
+
+        init(dir.to_str().unwrap(), Some("trino")).unwrap();
+
+        // rocky.toml + the demo model trio + sidecar defaults.
+        assert!(dir.join("rocky.toml").is_file());
+        assert!(dir.join("models").is_dir());
+        assert!(dir.join("models/_defaults.toml").is_file());
+        assert!(dir.join("models/welcome.sql").is_file());
+        assert!(dir.join("models/welcome.toml").is_file());
+
+        let cfg = std::fs::read_to_string(dir.join("rocky.toml")).unwrap();
+        assert!(cfg.contains("type     = \"trino\""));
+        // Both auth modes documented; one active (basic) by default.
+        assert!(cfg.contains("${TRINO_PASSWORD"));
+        assert!(cfg.contains("TRINO_JWT"));
+        // Env-var placeholders, never inline secrets — credentials
+        // must reference ${TRINO_*} only.
+        assert!(!cfg.contains("password = \"hunter2"));
+        assert!(!cfg.contains("token    = \"eyJ"));
+
+        let model = std::fs::read_to_string(dir.join("models/welcome.sql")).unwrap();
+        // Demo selects from literals only — `rocky compile` must not
+        // need source tables to validate.
+        assert!(model.contains("SELECT"));
+        assert!(!model.contains("FROM "));
+    }
+
+    #[test]
+    fn init_trino_generated_config_parses() {
+        // Substitute the env-var placeholders so the generated TOML
+        // round-trips through the canonical config loader. We don't
+        // actually need a live Trino — just proof the shape is valid.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("proj");
+        init(dir.to_str().unwrap(), Some("trino")).unwrap();
+
+        // Provide stand-ins for every required env var so the parse
+        // doesn't trip on unset substitutions.
+        // SAFETY: process-wide env mutation is fine here — tests in
+        // this crate run single-threaded inside `cargo test` and the
+        // values are scoped to the call below.
+        unsafe {
+            std::env::set_var("TRINO_HOST", "https://trino.example.com:8443");
+            std::env::set_var("TRINO_USER", "alice");
+            std::env::set_var("TRINO_PASSWORD", "test-password");
+        }
+
+        let cfg = rocky_core::config::load_rocky_config(&dir.join("rocky.toml"))
+            .expect("generated trino rocky.toml must parse");
+
+        assert!(cfg.adapters.contains_key("default"));
+        assert_eq!(cfg.adapters["default"].adapter_type, "trino");
+        assert_eq!(cfg.pipelines["demo"].pipeline_type_str(), "transformation");
+    }
+
+    #[test]
+    fn init_unknown_template_lists_trino() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("proj");
+        let err =
+            init(dir.to_str().unwrap(), Some("nope")).expect_err("unknown template must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("trino"), "error must list trino: {msg}");
+    }
 }
