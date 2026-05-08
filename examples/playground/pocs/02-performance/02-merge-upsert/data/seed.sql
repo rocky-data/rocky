@@ -1,3 +1,7 @@
+-- Initial customer master: 50 rows.
+-- run.sh applies this once, then mutates the table between rocky runs to
+-- exercise the MERGE upsert path (existing keys updated, new keys inserted).
+
 CREATE SCHEMA IF NOT EXISTS seeds;
 
 CREATE OR REPLACE TABLE seeds.customers AS

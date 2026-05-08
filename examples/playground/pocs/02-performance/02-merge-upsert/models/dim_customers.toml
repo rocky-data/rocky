@@ -1,3 +1,5 @@
+depends_on = ["raw_customers"]
+
 [strategy]
 type = "merge"
 unique_key = ["customer_id"]

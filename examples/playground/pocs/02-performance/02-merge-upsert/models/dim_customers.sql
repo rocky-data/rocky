@@ -1,1 +1,1 @@
-SELECT customer_id, name, email, tier FROM raw_customers
+SELECT customer_id, name, email, tier FROM poc.staging.raw_customers
