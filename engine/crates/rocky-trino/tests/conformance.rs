@@ -16,7 +16,7 @@
 //! docker run -d --rm -p 8080:8080 --name rocky-trino-conformance \
 //!     trinodb/trino:latest
 //! # wait until /v1/info reports {"starting":false}
-//! cargo test -p rocky-trino --features trino-conformance
+//! cargo test -p rocky-trino --features trino-conformance -- --ignored
 //! ```
 //!
 //! What it covers:
@@ -95,6 +95,7 @@ fn dialect_format_table_ref_matches_trino_quoting() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
 async fn round_trip_select_one() {
     // The simplest possible query — exercises POST /v1/statement +
     // nextUri polling without touching any catalog.
@@ -114,6 +115,7 @@ async fn round_trip_select_one() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
 async fn round_trip_create_insert_select_drop() {
     // Exercises the full `WarehouseAdapter` surface against the writable
     // `memory.default` schema:
