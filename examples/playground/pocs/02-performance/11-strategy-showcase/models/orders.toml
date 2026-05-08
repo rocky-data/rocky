@@ -1,0 +1,8 @@
+[strategy]
+type = "merge"
+unique_key = ["order_id"]
+update_columns = ["status", "amount"]
+
+[target]
+catalog = "poc"
+schema = "merge"

@@ -1,0 +1,66 @@
+# 11-strategy-showcase — three materialization strategies side-by-side on DuckDB
+#
+# Three pipelines, one source (raw__orders.orders), three target schemas:
+#
+#   pipeline.fr     replication / full_refresh   -> poc.fr.orders
+#   pipeline.inc    replication / incremental    -> poc.inc.orders
+#   pipeline.merge  transformation / merge       -> poc.merge.orders
+#
+# run.sh runs all three, mutates the source, then runs all three again to
+# show how each strategy treats the mutation differently.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# --- 1. FullRefresh: rebuild from scratch every run ----------------------------
+
+[pipeline.fr]
+strategy = "full_refresh"
+
+[pipeline.fr.source.discovery]
+adapter = "default"
+
+[pipeline.fr.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.fr.target]
+catalog_template = "poc"
+schema_template = "fr"
+
+[pipeline.fr.target.governance]
+auto_create_schemas = true
+
+# --- 2. Incremental: append by watermark on `ordered_at` ----------------------
+
+[pipeline.inc]
+strategy = "incremental"
+timestamp_column = "ordered_at"
+
+[pipeline.inc.source.discovery]
+adapter = "default"
+
+[pipeline.inc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.inc.target]
+catalog_template = "poc"
+schema_template = "inc"
+
+[pipeline.inc.target.governance]
+auto_create_schemas = true
+
+# --- 3. Merge: upsert on order_id, update_columns = [status, amount] ----------
+
+[pipeline.merge]
+type = "transformation"
+
+[pipeline.merge.target]
+adapter = "default"
+
+[pipeline.merge.target.governance]
+auto_create_schemas = true
