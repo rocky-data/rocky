@@ -1,0 +1,6 @@
+{"event_id":"e-0001","customer_id":42,"event_type":"page_view","page":"/pricing","occurred_at":"2026-04-01T09:10:00Z"}
+{"event_id":"e-0002","customer_id":42,"event_type":"add_to_cart","sku":"widget","occurred_at":"2026-04-01T09:13:42Z"}
+{"event_id":"e-0003","customer_id":17,"event_type":"page_view","page":"/products","occurred_at":"2026-04-01T09:18:01Z"}
+{"event_id":"e-0004","customer_id":88,"event_type":"checkout","amount":14.99,"occurred_at":"2026-04-02T13:45:00Z"}
+{"event_id":"e-0005","customer_id":5,"event_type":"page_view","page":"/blog/launch","occurred_at":"2026-04-03T15:08:11Z"}
+{"event_id":"e-0006","customer_id":201,"event_type":"signup","occurred_at":"2026-04-05T11:55:30Z"}

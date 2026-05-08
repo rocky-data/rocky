@@ -1,0 +1,20 @@
+# 09-files-to-duckdb — load Parquet, CSV, and JSONL into DuckDB via `rocky load`
+#
+# No `format = ...` is set, so `rocky load` auto-detects per file by extension:
+# .parquet → read_parquet, .csv → read_csv_auto, .jsonl → read_json_auto.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+
+[pipeline.ingest.target]
+catalog = ""
+schema = "main"
+
+[pipeline.ingest.options]
+create_table = true
+truncate_first = true
