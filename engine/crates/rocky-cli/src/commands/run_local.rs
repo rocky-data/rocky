@@ -76,6 +76,7 @@ pub async fn run_transformation(
             None, // run_local doesn't build a HookRegistry
             None,
             schema_cache_cfg,
+            pipeline.target.governance.auto_create_schemas,
         )
         .await?;
     } else {
