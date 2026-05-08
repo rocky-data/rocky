@@ -1,7 +1,7 @@
 [package]
 name = "rocky-trino"
 version = "0.1.0"
-description = "Trino warehouse adapter for Rocky (v0, experimental)"
+description = "Trino warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
