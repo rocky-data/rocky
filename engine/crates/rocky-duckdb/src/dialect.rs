@@ -70,11 +70,15 @@ impl SqlDialect for DuckDbSqlDialect {
                 ));
             }
             ColumnSelection::Explicit(cols) => {
+                // DuckDB rejects qualified column names on the left side of
+                // `UPDATE .. SET` (`Parser Error: Qualified column names in
+                // UPDATE .. SET not supported`), so the target column stays
+                // unqualified — `name = s.name` rather than `t.name = s.name`.
                 let sets = cols
                     .iter()
                     .map(|c| {
                         validation::validate_identifier(c).map_err(AdapterError::new)?;
-                        Ok(format!("t.{c} = s.{c}"))
+                        Ok(format!("{c} = s.{c}"))
                     })
                     .collect::<AdapterResult<Vec<_>>>()?;
                 format!("UPDATE SET {}", sets.join(", "))
@@ -315,7 +319,53 @@ mod tests {
                 &ColumnSelection::Explicit(vec!["name".into(), "status".into()]),
             )
             .unwrap();
-        assert!(sql.contains("UPDATE SET t.name = s.name, t.status = s.status"));
+        // DuckDB rejects qualified column names on the SET LHS — see
+        // `merge_into` for the parser-error rationale.
+        assert!(sql.contains("UPDATE SET name = s.name, status = s.status"));
+    }
+
+    /// Live regression: the MERGE SQL produced by `merge_into` must execute
+    /// successfully against a real DuckDB instance. The previous form
+    /// (`UPDATE SET t.<col> = s.<col>`) passed every string-content unit test
+    /// but failed at execute time with `Parser Error: Qualified column names
+    /// in UPDATE .. SET not supported`. This test catches that regression by
+    /// actually running the MERGE against an in-memory DuckDB.
+    #[test]
+    fn test_merge_executes_against_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+
+        // Target seeded with 2 rows (id=1 'old', id=2 'unchanged').
+        // Source delta: id=1 update + id=3 insert.
+        conn.execute_sql(
+            "CREATE TABLE tgt (id INTEGER, name VARCHAR, status VARCHAR);\n\
+             INSERT INTO tgt VALUES (1, 'old',  'active'), (2, 'keep', 'active');\n\
+             CREATE TABLE src (id INTEGER, name VARCHAR, status VARCHAR);\n\
+             INSERT INTO src VALUES (1, 'new', 'active'), (3, 'fresh', 'active');",
+        )
+        .expect("seed target+source");
+
+        let merge_sql = dialect()
+            .merge_into(
+                "tgt",
+                "SELECT id, name, status FROM src",
+                &["id".into()],
+                &ColumnSelection::Explicit(vec!["name".into(), "status".into()]),
+            )
+            .expect("build MERGE SQL");
+
+        // Pre-fix this fails with `Parser Error: Qualified column names in
+        // UPDATE .. SET not supported`. Post-fix it succeeds.
+        conn.execute_sql(&merge_sql).expect("MERGE must execute");
+
+        let after = conn
+            .execute_sql("SELECT id, name FROM tgt ORDER BY id")
+            .expect("query post-MERGE");
+        // Expected: id=1 updated to 'new', id=2 unchanged, id=3 inserted.
+        assert_eq!(after.rows.len(), 3, "MERGE should leave 3 rows in target");
+        assert_eq!(after.rows[0][1].as_str(), Some("new"));
+        assert_eq!(after.rows[1][1].as_str(), Some("keep"));
+        assert_eq!(after.rows[2][1].as_str(), Some("fresh"));
     }
 
     #[test]
