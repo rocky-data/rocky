@@ -8,15 +8,14 @@ Implements `rocky_core::traits::WarehouseAdapter` and
 HTTP API. Hand-rolled over `reqwest` — no high-level Trino client crate
 dependency.
 
-## Status — v0, experimental
+## Status — beta
 
-The adapter advertises `WarehouseAdapter::is_experimental() == true`, so
-the CLI's startup loop logs a warning whenever an `[adapters.<name>]
-type = "trino"` block is registered. Coverage is intentionally narrow:
-the v0 PR exercised `rocky-adapter-sdk` from outside the first-party
-adapters and surfaced gaps. It is not yet ready for production traffic.
-The experimental flag is scheduled to drop once the Docker conformance
-harness exercises the four pipeline strategies end-to-end.
+Coverage is intentionally narrow but the supported surface is exercised
+end-to-end by the Docker conformance harness behind the
+`trino-conformance` cargo feature (see [Conformance harness](#conformance-harness)
+below). Unsupported gaps — MERGE, OAuth/Kerberos, governance, loader,
+batch-checks — fail loudly at validate time rather than emitting broken
+SQL silently.
 
 ## Configuration (`rocky.toml`)
 

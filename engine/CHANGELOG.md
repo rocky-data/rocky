@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky-trino` drops the experimental flag.** With the Docker conformance harness landed (`trino-conformance` cargo feature), the adapter now advertises `is_experimental() == false` (the trait default) and the CLI no longer logs a startup warning when a `type = "trino"` block is registered. Adapter tables in the root and engine READMEs move from `Experimental` to `Beta`. No behavioral change for users beyond the warning suppression.
+
 ## [1.27.0] — 2026-05-07
 
 Feature release on three independent fronts. Headline: **`rocky import-dbt` now emits a runnable Rocky repo** ([#428](https://github.com/rocky-data/rocky/pull/428)) — the command was previously a validation report; it now writes `rocky.toml` (with `${VAR}` placeholders for connection fields, never inlined secrets), per-model `.sql` + `.toml` sidecars, a verbatim copy of `seeds/`, and a `MIGRATION-NOTES.md` under `--output-dir`. **Generic-test mapping** ([#433](https://github.com/rocky-data/rocky/pull/433)) lands in the same window, translating dbt's `unique` / `not_null` / `accepted_values` / `relationships` schema tests into Rocky `[[checks]]` blocks on the per-model sidecar. Bundles **`rocky-trino` v0** ([#427](https://github.com/rocky-data/rocky/pull/427)) — first warehouse adapter built natively against `rocky-adapter-sdk` (the four first-party adapters predated the SDK and were retrofitted), shipping the four core modules (REST connector + dialect + HTTP Basic / JWT auth + `WarehouseAdapter` impl) with v0 limits flagged at validate time (no MERGE, no OAuth/Kerberos, no governance, no checksum bisection). **`rocky run --watch`** ([#423](https://github.com/rocky-data/rocky/pull/423)) wraps the run path in a filesystem-watcher loop for the inner-loop editor workflow; under `--output json`, each iteration emits one `RunOutput` per line (newline-delimited stream).

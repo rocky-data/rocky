@@ -1,10 +1,10 @@
 //! Trino warehouse adapter — implements `rocky_core::traits::WarehouseAdapter`.
 //!
-//! v0 surface: `dialect`, `execute_statement`, `execute_query`,
-//! `describe_table`, `is_experimental` (returns `true`). Everything else
-//! falls back to the trait defaults: `merge_into` errors via the dialect
-//! ("v0 doesn't support MERGE"), `checksum_chunks` errors via the
-//! `row_hash_expr` default, governance / batch / loader are absent.
+//! Surface: `dialect`, `execute_statement`, `execute_query`,
+//! `describe_table`. Everything else falls back to the trait defaults:
+//! `merge_into` errors via the dialect ("v0 doesn't support MERGE"),
+//! `checksum_chunks` errors via the `row_hash_expr` default, governance /
+//! batch / loader are absent.
 
 use async_trait::async_trait;
 use rocky_core::ir::{ColumnInfo, TableRef};
@@ -15,9 +15,6 @@ use crate::connector::{TrinoClient, TrinoClientConfig};
 use crate::dialect::TrinoDialect;
 
 /// Trino warehouse adapter.
-///
-/// Marks itself as experimental — the registry's startup loop logs a
-/// warning when this adapter is selected.
 pub struct TrinoAdapter {
     client: TrinoClient,
     dialect: TrinoDialect,
@@ -51,14 +48,6 @@ impl TrinoAdapter {
 impl WarehouseAdapter for TrinoAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
         &self.dialect
-    }
-
-    fn is_experimental(&self) -> bool {
-        // The Trino adapter is v0 / experimental — coverage is intentionally
-        // narrow (no MERGE, no governance, no loader, no Docker-conformance
-        // harness). The registry's startup loop reads this to surface a
-        // warning to the operator.
-        true
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
@@ -125,11 +114,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_experimental_is_true() {
+    fn is_not_experimental() {
         let cfg = TrinoClientConfig::new("http://localhost:8080");
         let auth = crate::test_helpers::test_basic_auth();
         let adapter = TrinoAdapter::new(cfg, auth);
-        assert!(adapter.is_experimental());
+        assert!(!adapter.is_experimental());
     }
 
     #[test]

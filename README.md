@@ -137,13 +137,13 @@ Each subproject has its own README with detailed usage. The [`engine/README.md`]
 | Warehouse | Snowflake | Beta | REST connector · zero-copy `CLONE` for branches · masking policies |
 | Warehouse | BigQuery | Beta | REST connector · `CREATE TABLE … COPY` for branches |
 | Warehouse | DuckDB | Local / Testing | Embedded · powers `rocky playground` (no credentials needed) |
-| Warehouse | Trino | Experimental | REST `/v1/statement` polling client · Basic + JWT auth · `is_experimental: true` until the Docker conformance harness lands |
+| Warehouse | Trino | Beta | REST `/v1/statement` polling client · Basic + JWT auth · Docker conformance harness behind `trino-conformance` feature |
 | Source | Fivetran | Production | REST connector + table discovery |
 | Source | Airbyte | Beta | Catalog discovery |
 | Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |
 | Source | Manual | Production | Schema/table lists inline in `rocky.toml` |
 
-Building a warehouse Rocky doesn't ship in-tree (ClickHouse, Trino, Redshift, …)? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [Rust-native skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
+Building a warehouse Rocky doesn't ship in-tree (ClickHouse, Redshift, …)? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [Rust-native skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
 
 ## Building from source
 
