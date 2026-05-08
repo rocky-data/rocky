@@ -867,6 +867,7 @@ pub async fn run(
             None, // model-only run has no pipeline hooks
             None,
             &schema_cache_cfg,
+            false, // model-only entry point has no pipeline governance context
         )
         .await?;
 
@@ -2819,6 +2820,7 @@ pub async fn run(
                     Some(&hook_registry),
                     Some(pipeline_name),
                     &schema_cache_cfg,
+                    pipeline.target.governance.auto_create_schemas,
                 )
                 .await?;
                 Ok(())
@@ -3445,6 +3447,12 @@ pub(crate) async fn execute_models(
     pipeline_name: Option<&str>,
     // Honour `[cache.schemas]` for source-schema loading during compile.
     schema_cache_config: &rocky_core::config::SchemaCacheConfig,
+    // When true, issue `CREATE SCHEMA IF NOT EXISTS` for each unique
+    // model target schema before executing models. Mirrors the per-source
+    // pre-create on the replication path. Caller plumbs
+    // `pipeline.target.governance.auto_create_schemas` here; defaults to
+    // `false` for the model-only entry point that has no pipeline context.
+    auto_create_schemas: bool,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -3517,6 +3525,32 @@ pub(crate) async fn execute_models(
     }
 
     let dialect = warehouse.dialect();
+
+    // Pre-create target schemas when the caller requested auto-create.
+    // Mirrors the replication path's per-source loop (see the
+    // `governance.auto_create_schemas` block earlier in this file). Without
+    // this, transformation models targeting a non-existent schema fail at
+    // execute time with "Schema with name X does not exist".
+    if auto_create_schemas {
+        let mut targets: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for model in &compile_result.project.models {
+            targets.insert((
+                model.config.target.catalog.clone(),
+                model.config.target.schema.clone(),
+            ));
+        }
+        for (catalog, schema) in &targets {
+            if let Some(sql_result) = dialect.create_schema_sql(catalog, schema) {
+                let sql = sql_result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                warehouse
+                    .execute_statement(&sql)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+    }
+
     let mut models_executed = 0usize;
 
     // Bundle borrowed compile-time facts (typed schemas + per-model timings)
@@ -5466,6 +5500,96 @@ adapter = "default"
             "success-path finalize on the Transformation dispatch arm must stamp \
              Succeeded, not leave the InFlight claim for the TTL sweep to reap \
              (FR-004 F2 regression guard)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Transformation auto_create_schemas — pre-creates target schemas before
+    // executing models so a model targeting a fresh schema doesn't fail with
+    // "Schema with name X does not exist". Mirrors the per-source pre-create
+    // on the replication path (the `governance.auto_create_schemas` block
+    // earlier in this file).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn transformation_auto_create_schemas_materializes_fresh_schema() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let duckdb_path = config_dir.join("warehouse.duckdb");
+        let config_path = config_dir.join("rocky.toml");
+
+        // Transformation pipeline with `auto_create_schemas = true` and a
+        // model targeting `mart` — a schema that does not exist in the
+        // freshly-created DuckDB file. Without the fix, the model's
+        // `CREATE OR REPLACE TABLE warehouse.mart.summary AS SELECT ...`
+        // fails with "Schema with name mart does not exist".
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        let models_dir = config_dir.join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(
+            models_dir.join("summary.sql"),
+            "SELECT 1 AS one, 2 AS two\n",
+        )
+        .expect("write summary.sql");
+        std::fs::write(
+            models_dir.join("summary.toml"),
+            r#"
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "mart"
+"#,
+        )
+        .expect("write summary.toml");
+
+        let state_path = config_dir.join("state.redb");
+        let opts = PartitionRunOptions::default();
+
+        super::run(
+            &config_path,
+            None,
+            Some("t"),
+            &state_path,
+            None,
+            true, // output_json (suppresses pretty stdout in tests)
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect(
+            "transformation run with auto_create_schemas=true must succeed even when the \
+             target schema doesn't exist yet",
         );
     }
 
