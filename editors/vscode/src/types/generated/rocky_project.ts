@@ -703,9 +703,9 @@ export interface WebhookConfig {
    */
   retry_delay_ms?: number;
   /**
-   * HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header.
+   * HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header. Wrapped in [`RedactedString`] so a stray `Debug` print of the hook config doesn't leak the secret into logs.
    */
-  secret?: string | null;
+  secret?: RedactedString | null;
   /**
    * Request timeout in milliseconds (default: 10000).
    */

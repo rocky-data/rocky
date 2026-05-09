@@ -960,7 +960,7 @@ class WebhookConfig(BaseModel):
     """
     secret: str | None = None
     """
-    HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header.
+    HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header. Wrapped in [`RedactedString`] so a stray `Debug` print of the hook config doesn't leak the secret into logs.
     """
     timeout_ms: conint(ge=0) | None = 10000
     """
