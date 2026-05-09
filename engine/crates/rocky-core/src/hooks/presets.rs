@@ -328,7 +328,10 @@ mod tests {
 
         let resolved = resolve_preset("slack", &config).unwrap();
         assert_eq!(
-            resolved.secret.as_ref().map(|s| s.expose()),
+            resolved
+                .secret
+                .as_ref()
+                .map(crate::redacted::RedactedString::expose),
             Some("my_secret")
         );
         assert_eq!(resolved.timeout_ms, 5000);

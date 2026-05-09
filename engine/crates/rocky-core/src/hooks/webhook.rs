@@ -418,7 +418,10 @@ retry_delay_ms = 2000
             config.body_template.as_deref(),
             Some(r#"{"text": "{{model}} failed"}"#)
         );
-        assert_eq!(config.secret.as_ref().map(|s| s.expose()), Some("my_secret"));
+        assert_eq!(
+            config.secret.as_ref().map(RedactedString::expose),
+            Some("my_secret")
+        );
         assert_eq!(config.timeout_ms, 5000);
         assert!(config.async_mode);
         assert_eq!(config.on_failure, FailureAction::Abort);

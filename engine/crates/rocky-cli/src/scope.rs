@@ -147,21 +147,31 @@ pub(crate) fn resolve_transformation_managed_tables(
     // with `models = "../../etc"` (or a symlink-escape on the
     // filesystem) can read files outside the project tree and surface
     // them through `rocky list models`, LSP hovers, or error output.
-    // We canonicalize both sides so symlinks within the project are
-    // resolved before the prefix check.
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let canonical_models = models_dir
-        .canonicalize()
-        .unwrap_or_else(|_| models_dir.clone());
-    if !canonical_models.starts_with(&canonical_root) {
-        bail!(
-            "models directory '{}' resolves outside the project root '{}'. \
-             Refusing to load — adjust `models = \"...\"` in rocky.toml.",
-            canonical_models.display(),
-            canonical_root.display(),
-        );
+    //
+    // Both sides are canonicalized so symlinks within the project are
+    // resolved before the prefix check. Asymmetric resolution (one
+    // canonical, one not) would false-positive reject legitimate paths
+    // on platforms where the system tempdir or `/tmp` is itself a
+    // symlink (macOS: `/var/folders/...` -> `/private/var/folders/...`).
+    //
+    // The project root is required to canonicalize — if it doesn't
+    // exist we bail early with a useful error. The models directory
+    // is allowed to not exist yet (`load_models_from_dir` below will
+    // surface the natural error); we only run the containment check
+    // when both sides resolve.
+    let canonical_root = project_root.canonicalize().context(format!(
+        "project root '{}' could not be resolved",
+        project_root.display()
+    ))?;
+    if let Ok(canonical_models) = models_dir.canonicalize() {
+        if !canonical_models.starts_with(&canonical_root) {
+            bail!(
+                "models directory '{}' resolves outside the project root '{}'. \
+                 Refusing to load — adjust `models = \"...\"` in rocky.toml.",
+                canonical_models.display(),
+                canonical_root.display(),
+            );
+        }
     }
 
     // Load models the same way `rocky list models` does: top-level +
