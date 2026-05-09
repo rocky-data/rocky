@@ -28,6 +28,26 @@ const JWT_TTL_SECS: u64 = 59 * 60;
 /// wasteful.
 const REFRESH_SLACK: Duration = Duration::from_secs(60);
 
+/// Hard cap on the size of an upstream auth-error body that we surface
+/// in [`AuthError::ApiError`]. Snowflake's documented login errors are
+/// short, structured JSON; truncating defends against logging an
+/// unexpectedly large or attacker-shaped body if the upstream response
+/// ever changes.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
+
+/// Truncate `body` to at most [`MAX_ERROR_BODY_BYTES`] bytes on a UTF-8
+/// char boundary, appending `…(truncated)` when shortened.
+fn truncate_error_body(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &body[..end])
+}
+
 /// Snowflake auth token kind, used by the connector to set the
 /// `X-Snowflake-Authorization-Token-Type` header on REST API calls.
 ///
@@ -373,7 +393,10 @@ impl Auth {
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
                     let text = resp.text().await.unwrap_or_default();
-                    return Err(AuthError::ApiError { status, body: text });
+                    return Err(AuthError::ApiError {
+                        status,
+                        body: truncate_error_body(&text),
+                    });
                 }
 
                 let login_resp: LoginResponse = resp.json().await?;
@@ -691,6 +714,33 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(!debug.contains("super_secret_token"));
         assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn truncate_error_body_passes_short_body_through() {
+        assert_eq!(truncate_error_body("short"), "short");
+    }
+
+    #[test]
+    fn truncate_error_body_caps_long_body_with_marker() {
+        let big = "x".repeat(MAX_ERROR_BODY_BYTES * 2);
+        let out = truncate_error_body(&big);
+        assert!(out.ends_with("…(truncated)"));
+        assert!(out.len() < big.len());
+    }
+
+    #[test]
+    fn truncate_error_body_respects_utf8_boundary() {
+        // Build a body that, at MAX_ERROR_BODY_BYTES, lands in the
+        // middle of a multi-byte character. Truncation must not panic
+        // and must produce valid UTF-8.
+        let prefix = "a".repeat(MAX_ERROR_BODY_BYTES - 1);
+        let body = format!("{prefix}🚀{}", "y".repeat(64));
+        let out = truncate_error_body(&body);
+        assert!(out.ends_with("…(truncated)"));
+        // Must still be valid UTF-8 (the test would panic constructing
+        // an invalid &str otherwise).
+        let _ = out.chars().count();
     }
 
     #[test]

@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn test_user_config_preserved_through_resolution() {
         let mut config = base_config();
-        config.secret = Some("my_secret".to_string());
+        config.secret = Some(crate::redacted::RedactedString::new("my_secret".into()));
         config.timeout_ms = 5000;
         config.async_mode = true;
         config.on_failure = FailureAction::Abort;
@@ -327,7 +327,13 @@ mod tests {
         config.retry_delay_ms = 2000;
 
         let resolved = resolve_preset("slack", &config).unwrap();
-        assert_eq!(resolved.secret.as_deref(), Some("my_secret"));
+        assert_eq!(
+            resolved
+                .secret
+                .as_ref()
+                .map(crate::redacted::RedactedString::expose),
+            Some("my_secret")
+        );
         assert_eq!(resolved.timeout_ms, 5000);
         assert!(resolved.async_mode);
         assert_eq!(resolved.on_failure, FailureAction::Abort);

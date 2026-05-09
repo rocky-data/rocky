@@ -82,6 +82,31 @@ pub enum TrinoError {
 
     #[error("Trino response missing expected field: {0}")]
     MalformedResponse(String),
+
+    #[error(
+        "Trino coordinator returned a nextUri pointing at a different origin: {next} (coordinator: {coordinator}). Refusing to follow — the Authorization header would otherwise be sent to an unrelated host."
+    )]
+    UntrustedNextUri { coordinator: String, next: String },
+}
+
+/// Returns `true` when `candidate` is on the same scheme + host + port as
+/// `base`. Used to gate `nextUri` follow-up GETs so a malicious or
+/// compromised coordinator can't redirect the polling loop — and the
+/// `Authorization` header that travels with it — to an arbitrary host.
+///
+/// Both URLs must parse and carry a host. Default ports are normalized
+/// via [`url::Url::port_or_known_default`].
+fn same_origin(base: &str, candidate: &str) -> bool {
+    let Ok(base) = url::Url::parse(base) else {
+        return false;
+    };
+    let Ok(cand) = url::Url::parse(candidate) else {
+        return false;
+    };
+    base.scheme() == cand.scheme()
+        && base.host_str().is_some()
+        && base.host_str() == cand.host_str()
+        && base.port_or_known_default() == cand.port_or_known_default()
 }
 
 /// Static configuration for a [`TrinoClient`].
@@ -336,6 +361,13 @@ impl TrinoClient {
                     last_state,
                 });
             }
+            if !same_origin(&self.config.coordinator_url, &next) {
+                return Err(TrinoError::UntrustedNextUri {
+                    coordinator: self.config.coordinator_url.clone(),
+                    next,
+                });
+            }
+
             tokio::time::sleep(poll_delay(attempt)).await;
             attempt += 1;
 
@@ -441,6 +473,38 @@ struct QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_origin_accepts_matching_host_and_scheme() {
+        assert!(same_origin(
+            "https://trino.example.com:8080",
+            "https://trino.example.com:8080/v1/statement/queued/abc/1"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_different_host() {
+        assert!(!same_origin(
+            "https://trino.example.com:8080",
+            "https://evil.example.com:8080/v1/statement/queued/abc/1"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_different_port() {
+        assert!(!same_origin(
+            "https://trino.example.com:8080",
+            "https://trino.example.com:9090/v1/statement/queued/abc/1"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_scheme_downgrade() {
+        assert!(!same_origin(
+            "https://trino.example.com",
+            "http://trino.example.com/v1/statement/queued/abc/1"
+        ));
+    }
 
     #[test]
     fn poll_delay_steps_grow_then_cap() {

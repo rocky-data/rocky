@@ -54,6 +54,28 @@ pub enum AirbyteError {
 
     #[error("rate limited -- retry after backoff")]
     RateLimited,
+
+    #[error(
+        "Airbyte API returned a `next` cursor on a different origin: {next} (base: {base}). Refusing to follow — the Bearer token would otherwise be sent to an unrelated host."
+    )]
+    UntrustedNextUrl { base: String, next: String },
+}
+
+/// Returns `true` when `candidate` is on the same scheme + host + port as
+/// `base`. Used to gate paginated `next` URLs so a malicious or
+/// compromised API can't redirect the client — and the Bearer token that
+/// travels with it — to an arbitrary host.
+fn same_origin(base: &str, candidate: &str) -> bool {
+    let Ok(base) = url::Url::parse(base) else {
+        return false;
+    };
+    let Ok(cand) = url::Url::parse(candidate) else {
+        return false;
+    };
+    base.scheme() == cand.scheme()
+        && base.host_str().is_some()
+        && base.host_str() == cand.host_str()
+        && base.port_or_known_default() == cand.port_or_known_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +188,12 @@ impl AirbyteClient {
 
             match resp.next {
                 Some(next_url) if !next_url.is_empty() => {
+                    if !same_origin(&self.base_url, &next_url) {
+                        return Err(AirbyteError::UntrustedNextUrl {
+                            base: self.base_url.clone(),
+                            next: next_url,
+                        });
+                    }
                     url = next_url;
                 }
                 _ => break,
@@ -488,6 +516,44 @@ mod tests {
         let resp: ConnectionsListResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.data.len(), 1);
         assert!(resp.next.is_none());
+    }
+
+    #[test]
+    fn same_origin_accepts_matching_host_and_scheme() {
+        assert!(same_origin(
+            "https://api.airbyte.com",
+            "https://api.airbyte.com/v1/connections?after=x"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_different_host() {
+        assert!(!same_origin(
+            "https://api.airbyte.com",
+            "https://evil.example.com/v1/connections?after=x"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_scheme_downgrade() {
+        assert!(!same_origin(
+            "https://api.airbyte.com",
+            "http://api.airbyte.com/v1/connections?after=x"
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_unparseable() {
+        assert!(!same_origin("not a url", "https://api.airbyte.com"));
+        assert!(!same_origin("https://api.airbyte.com", "not a url"));
+    }
+
+    #[test]
+    fn same_origin_normalizes_default_port() {
+        assert!(same_origin(
+            "https://api.airbyte.com:443",
+            "https://api.airbyte.com/v1/connections"
+        ));
     }
 
     #[test]

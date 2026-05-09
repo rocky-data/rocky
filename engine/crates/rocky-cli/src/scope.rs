@@ -143,6 +143,37 @@ pub(crate) fn resolve_transformation_managed_tables(
         return Ok(None);
     }
 
+    // Confine `models_dir` to the project root. Without this, a config
+    // with `models = "../../etc"` (or a symlink-escape on the
+    // filesystem) can read files outside the project tree and surface
+    // them through `rocky list models`, LSP hovers, or error output.
+    //
+    // Both sides are canonicalized so symlinks within the project are
+    // resolved before the prefix check. Asymmetric resolution (one
+    // canonical, one not) would false-positive reject legitimate paths
+    // on platforms where the system tempdir or `/tmp` is itself a
+    // symlink (macOS: `/var/folders/...` -> `/private/var/folders/...`).
+    //
+    // The project root is required to canonicalize — if it doesn't
+    // exist we bail early with a useful error. The models directory
+    // is allowed to not exist yet (`load_models_from_dir` below will
+    // surface the natural error); we only run the containment check
+    // when both sides resolve.
+    let canonical_root = project_root.canonicalize().context(format!(
+        "project root '{}' could not be resolved",
+        project_root.display()
+    ))?;
+    if let Ok(canonical_models) = models_dir.canonicalize() {
+        if !canonical_models.starts_with(&canonical_root) {
+            bail!(
+                "models directory '{}' resolves outside the project root '{}'. \
+                 Refusing to load — adjust `models = \"...\"` in rocky.toml.",
+                canonical_models.display(),
+                canonical_root.display(),
+            );
+        }
+    }
+
     // Load models the same way `rocky list models` does: top-level +
     // immediate subdirectories.
     let mut all_models = rocky_core::models::load_models_from_dir(&models_dir).context(format!(
@@ -434,5 +465,54 @@ table = "customers"
         assert_eq!(managed.len(), 2);
         assert!(managed.contains("warehouse.staging.orders"));
         assert!(managed.contains("warehouse.marts.customers"));
+    }
+
+    /// Refuse to load a `models` directory that resolves outside the
+    /// project root. Prevents a stray (or hostile) `models = "../foo"`
+    /// in a checked-in `rocky.toml` from reaching files in a parent
+    /// directory of the project.
+    #[test]
+    fn resolve_transformation_managed_tables_rejects_path_outside_project() {
+        let outer = tempfile::tempdir().unwrap();
+        // Sibling dir alongside `project/` that we want to *prevent*
+        // being read.
+        let escape_dir = outer.path().join("escape_models");
+        std::fs::create_dir(&escape_dir).unwrap();
+        std::fs::write(
+            escape_dir.join("secret.toml"),
+            r#"
+name = "secret"
+[target]
+catalog = "warehouse"
+schema = "secret"
+table = "secret"
+"#,
+        )
+        .unwrap();
+        std::fs::write(escape_dir.join("secret.sql"), "SELECT 1").unwrap();
+
+        let project_dir = outer.path().join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+
+        let tx = rocky_core::config::TransformationPipelineConfig {
+            // Point at the sibling dir via `..`.
+            models: "../escape_models".to_string(),
+            target: rocky_core::config::TransformationTargetConfig {
+                adapter: "default".to_string(),
+                governance: Default::default(),
+            },
+            checks: Default::default(),
+            execution: Default::default(),
+            depends_on: vec![],
+        };
+
+        let config_path = project_dir.join("rocky.toml");
+        let err = resolve_transformation_managed_tables(&tx, &config_path)
+            .expect_err("traversal must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside the project root"),
+            "error mentions traversal: {msg}"
+        );
     }
 }
