@@ -1526,7 +1526,7 @@ retry_delay_ms = 2000
                     wh.body_template.as_deref(),
                     Some(r#"{"text": "error: {{error}}"}"#)
                 );
-                assert_eq!(wh.secret.as_deref(), Some("my_secret"));
+                assert_eq!(wh.secret.as_ref().map(|s| s.expose()), Some("my_secret"));
                 assert_eq!(wh.timeout_ms, 5000);
                 assert!(wh.async_mode);
                 assert_eq!(wh.on_failure, FailureAction::Abort);
@@ -1554,7 +1554,7 @@ async = true
             WebhookConfigOrList::Multiple(list) => {
                 assert_eq!(list.len(), 2);
                 assert_eq!(list[0].url, "https://api.company.com/rocky/complete");
-                assert_eq!(list[0].secret.as_deref(), Some("secret1"));
+                assert_eq!(list[0].secret.as_ref().map(|s| s.expose()), Some("secret1"));
                 assert_eq!(list[1].url, "https://hooks.slack.com/services/T/B/x");
                 assert!(list[1].async_mode);
             }

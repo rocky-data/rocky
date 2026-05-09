@@ -39,6 +39,37 @@ pub enum AuthError {
     NoAuth,
 }
 
+/// Logs a warning when the service-account key file is group- or
+/// world-readable. The file holds an RSA private key; mode `0600` (or
+/// `0400`) is the conventional setting. We don't refuse to load — that
+/// would break shared CI runners that mount keys as 0644 — but a noisy
+/// warning makes the misconfiguration visible.
+///
+/// On non-Unix platforms this is a no-op.
+fn warn_if_world_readable(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path,
+                mode = format!("{:o}", mode),
+                "GOOGLE_APPLICATION_CREDENTIALS file is group- or world-readable; \
+                 the RSA private key it holds should be `chmod 600` (or `0400`)"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Google Service Account key file format.
 ///
 /// The `private_key` field is wrapped in [`RedactedString`] so that
@@ -156,6 +187,7 @@ impl BigQueryAuth {
 
         // 2. Check for GOOGLE_APPLICATION_CREDENTIALS
         if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+            warn_if_world_readable(&path);
             let content = std::fs::read_to_string(&path)?;
             let key: ServiceAccountKey =
                 serde_json::from_str(&content).map_err(AuthError::ParseKey)?;

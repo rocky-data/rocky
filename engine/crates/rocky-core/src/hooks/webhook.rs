@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::template::{self, TemplateError};
 use super::{FailureAction, HookContext, HookResult};
+use crate::redacted::RedactedString;
 
 /// Hard cap on total time spent firing a single webhook (retries + delays
 /// included). Guards the pipeline from runaway retry storms; a misconfigured
@@ -83,7 +84,9 @@ pub struct WebhookConfig {
     pub body_template: Option<String>,
 
     /// HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header.
-    pub secret: Option<String>,
+    /// Wrapped in [`RedactedString`] so a stray `Debug` print of the
+    /// hook config doesn't leak the secret into logs.
+    pub secret: Option<RedactedString>,
 
     /// Request timeout in milliseconds (default: 10000).
     #[serde(default = "default_webhook_timeout_ms")]
@@ -305,7 +308,7 @@ async fn send_request(
 
     // Add HMAC signature if secret is configured
     if let Some(ref secret) = config.secret {
-        let sig = compute_signature(secret, body);
+        let sig = compute_signature(secret.expose(), body);
         builder = builder.header("X-Rocky-Signature", format!("sha256={sig}"));
     }
 
@@ -415,7 +418,7 @@ retry_delay_ms = 2000
             config.body_template.as_deref(),
             Some(r#"{"text": "{{model}} failed"}"#)
         );
-        assert_eq!(config.secret.as_deref(), Some("my_secret"));
+        assert_eq!(config.secret.as_ref().map(|s| s.expose()), Some("my_secret"));
         assert_eq!(config.timeout_ms, 5000);
         assert!(config.async_mode);
         assert_eq!(config.on_failure, FailureAction::Abort);

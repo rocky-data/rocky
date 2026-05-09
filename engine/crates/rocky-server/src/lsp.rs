@@ -40,6 +40,14 @@ struct SqlFuncInfo {
     doc: &'static str,
 }
 
+/// Maximum size of a single document the LSP server will cache from
+/// `textDocument/didOpen` or `textDocument/didChange`. tower-lsp does not
+/// bound JSON-RPC payload size, so a buggy or malicious client could
+/// otherwise OOM the server with one oversized notification. 100 MB is
+/// several orders of magnitude above realistic hand-written SQL/Rocky
+/// models — pathological inputs are dropped with a `tracing::warn`.
+const MAX_DOCUMENT_BYTES: usize = 100 * 1024 * 1024;
+
 const SQL_FUNC_CATALOG: &[SqlFuncInfo] = &[
     SqlFuncInfo {
         name: "COUNT",
@@ -849,6 +857,21 @@ impl LanguageServer for RockyLsp {
         // edits and undo→redo sequences where the editor replays
         // `didChange` with unchanged content.
         if let Some(change) = params.content_changes.into_iter().last() {
+            // Refuse to cache pathologically large documents. tower-lsp
+            // does not bound JSON-RPC payload size, so a buggy or
+            // malicious client can OOM the server with a single
+            // `didChange`. .rocky/.sql models in practice are < 1 MB;
+            // 100 MB is several orders of magnitude above realistic
+            // hand-written SQL.
+            if change.text.len() > MAX_DOCUMENT_BYTES {
+                tracing::warn!(
+                    uri = %uri_string,
+                    bytes = change.text.len(),
+                    limit = MAX_DOCUMENT_BYTES,
+                    "did_change text exceeds size limit; dropping update"
+                );
+                return;
+            }
             let mut docs = self.documents.write().await;
             let unchanged = docs
                 .get(&uri_string)

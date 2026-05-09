@@ -108,10 +108,16 @@ impl LlmClient {
         if config.api_key.expose().is_empty() {
             return Err(AiError::NoApiKey);
         }
-        Ok(Self {
-            config,
-            http: reqwest::Client::new(),
-        })
+        // Match the per-adapter timeout pair used elsewhere in the
+        // engine (Databricks/Snowflake/BigQuery/Trino/Fivetran/Airbyte).
+        // Without these, a stalled Anthropic connection would pin
+        // `rocky ai` indefinitely.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("reqwest client builder is infallible with these options");
+        Ok(Self { config, http })
     }
 
     /// `max_tokens` configured for this client. Used as the per-request cap

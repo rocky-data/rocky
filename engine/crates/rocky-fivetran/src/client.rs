@@ -17,6 +17,25 @@ pub(crate) fn encode_path_segment(segment: &str) -> String {
     utf8_percent_encode(segment, PATH_SAFE).to_string()
 }
 
+/// Hard cap on the size of an upstream error body that we surface in
+/// [`FivetranError::Api`]. Fivetran's documented errors are short
+/// structured messages; truncating defends logs against an unexpectedly
+/// large or attacker-shaped body if the upstream response ever changes.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
+
+/// Truncate `body` to at most [`MAX_ERROR_BODY_BYTES`] bytes on a UTF-8
+/// char boundary, appending `…(truncated)` when shortened.
+fn truncate_error_body(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &body[..end])
+}
+
 /// Build the shared `reqwest::Client` used for every Fivetran API call.
 /// `Client::new()` previously left both connect and request timeouts
 /// unset — a stalled connection would block `rocky run` forever. The
@@ -217,7 +236,7 @@ impl FivetranClient {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(FivetranError::Api {
                     code: status.to_string(),
-                    message: body,
+                    message: truncate_error_body(&body),
                 });
             }
 
@@ -228,7 +247,7 @@ impl FivetranClient {
             if envelope.code != "Success" {
                 return Err(FivetranError::Api {
                     code: envelope.code,
-                    message: envelope.message.unwrap_or_default(),
+                    message: truncate_error_body(&envelope.message.unwrap_or_default()),
                 });
             }
 
@@ -343,7 +362,7 @@ impl FivetranClient {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(FivetranError::Api {
                     code: status.to_string(),
-                    message: body,
+                    message: truncate_error_body(&body),
                 });
             }
 
@@ -354,7 +373,7 @@ impl FivetranClient {
             if envelope.code != "Success" {
                 return Err(FivetranError::Api {
                     code: envelope.code,
-                    message: envelope.message.unwrap_or_default(),
+                    message: truncate_error_body(&envelope.message.unwrap_or_default()),
                 });
             }
 

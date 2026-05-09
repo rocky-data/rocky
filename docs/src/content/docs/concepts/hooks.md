@@ -104,6 +104,12 @@ The script receives JSON like:
 
 Use `abort` for gating hooks (deploy freeze, approval gates). Use `warn` or `ignore` for notifications.
 
+### Security: trust the `command` source
+
+The `command` string is passed to `sh -c` verbatim. The event context is delivered to the script as JSON on **stdin** — it is not interpolated into the command line — so the runtime values Rocky exposes (`run_id`, `event`, etc.) cannot inject shell metacharacters into your command.
+
+That said, **never build a hook `command` by string-formatting untrusted input** (a webhook payload, a Fivetran response, a value pulled from a row, anything you don't fully control). Use only static commands or commands templated from values you control yourself. If you need to react to dynamic input, hand it off through the JSON context to a script you wrote, and let that script decide what to do with quoting / validation.
+
 ## Webhooks
 
 Webhooks send HTTP requests instead of running shell commands:
