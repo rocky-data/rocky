@@ -2873,11 +2873,15 @@
           "type": "integer"
         },
         "secret": {
-          "description": "HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RedactedString"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "HMAC-SHA256 signing secret. When set, adds `X-Rocky-Signature: sha256=<hex>` header. Wrapped in [`RedactedString`] so a stray `Debug` print of the hook config doesn't leak the secret into logs."
         },
         "timeout_ms": {
           "default": 10000,

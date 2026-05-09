@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.27.0] — 2026-05-09
+
+Companion release to engine `v1.29.0`. Source-invisible cycle — the `dagster_rocky.types_generated` layer is unchanged. Engine [#448](https://github.com/rocky-data/rocky/pull/448) (`auto_create_schemas` honoured on transformation pipelines), [#449](https://github.com/rocky-data/rocky/pull/449) (DuckDB MERGE unqualified-LHS), [#453](https://github.com/rocky-data/rocky/pull/453) (state-store error propagation on the model-only run path), and [#454](https://github.com/rocky-data/rocky/pull/454) (security audit fixes) are all transparent to the typed-resource layer — no JSON output struct touched. Wheel re-cut against the v1.29.0 engine binary.
+
 ## [1.26.0] — 2026-05-08
 
 Companion release to engine `v1.28.0`. Source-invisible cycle — the `dagster_rocky.types_generated` layer is unchanged. Engine [#441](https://github.com/rocky-data/rocky/pull/441) (`rocky init --template trino`), [#442](https://github.com/rocky-data/rocky/pull/442) (Docker conformance harness behind `trino-conformance` cargo feature), [#443](https://github.com/rocky-data/rocky/pull/443) (`rocky-trino` drops `is_experimental` → adapter promoted from Experimental to Beta), and [#444](https://github.com/rocky-data/rocky/pull/444) (`#[ignore]` pairing for live-coordinator conformance tests under `--all-features`) are all transparent to the typed-resource layer. Wheel re-cut against the v1.28.0 engine binary.
