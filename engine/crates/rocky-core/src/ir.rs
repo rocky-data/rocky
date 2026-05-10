@@ -587,6 +587,107 @@ impl ModelIr {
         blake3::hash(canonical.as_bytes())
     }
 
+    /// View this IR as a [`ReplicationPlan`] without round-tripping through
+    /// the [`Plan`] enum.
+    ///
+    /// Returns `Some` when the IR's variant-specific fields match a
+    /// replication shape — i.e. `columns` is `Some` and it is not a
+    /// snapshot (`unique_key` non-empty AND `updated_at` `Some`).
+    /// Returns `None` on any other variant.
+    ///
+    /// Variant inference matches [`Self::to_plan_compatible`]; the two stay
+    /// in lockstep. Prefer this method on hot paths (e.g. `sql_gen`) to
+    /// avoid materialising the [`Plan`] enum just to dispatch on its tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IR is variant-confirmed as a replication but is
+    /// missing `source`. The `From<&Plan>` impl always populates `source`
+    /// for replications; this only fires on a hand-built [`ModelIr`] that
+    /// violates the variant contract.
+    pub fn as_replication(&self) -> Option<ReplicationPlan> {
+        // Snapshot takes priority over replication in variant inference;
+        // bail out without cloning when this IR is snapshot-shaped.
+        if !self.unique_key.is_empty() && self.updated_at.is_some() {
+            return None;
+        }
+        let columns = self.columns.clone()?;
+        let source = self
+            .source
+            .clone()
+            .expect("Replication ModelIr must carry `source`");
+        Some(ReplicationPlan {
+            source,
+            target: self.target.clone(),
+            strategy: self.materialization.clone(),
+            columns,
+            metadata_columns: self.metadata_columns.clone(),
+            governance: self.governance.clone(),
+        })
+    }
+
+    /// View this IR as a [`TransformationPlan`] without round-tripping
+    /// through the [`Plan`] enum.
+    ///
+    /// Returns `Some` when the IR is neither snapshot-shaped
+    /// (`unique_key` non-empty AND `updated_at` `Some`) nor replication-
+    /// shaped (`columns` `Some`). Returns `None` otherwise.
+    ///
+    /// Variant inference matches [`Self::to_plan_compatible`].
+    pub fn as_transformation(&self) -> Option<TransformationPlan> {
+        if !self.unique_key.is_empty() && self.updated_at.is_some() {
+            return None;
+        }
+        if self.columns.is_some() {
+            return None;
+        }
+        Some(TransformationPlan {
+            sources: self.sources.clone(),
+            target: self.target.clone(),
+            strategy: self.materialization.clone(),
+            sql: self.sql.clone(),
+            governance: self.governance.clone(),
+            format: self.format.clone(),
+            format_options: self.format_options.clone(),
+        })
+    }
+
+    /// View this IR as a [`SnapshotPlan`] without round-tripping through
+    /// the [`Plan`] enum.
+    ///
+    /// Returns `Some` when the IR is snapshot-shaped (`unique_key`
+    /// non-empty AND `updated_at` `Some`). Returns `None` otherwise.
+    ///
+    /// Variant inference matches [`Self::to_plan_compatible`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IR is variant-confirmed as a snapshot but is missing
+    /// `source` or `updated_at`. The `From<&Plan>` impl always populates
+    /// both for snapshots; this only fires on a hand-built [`ModelIr`]
+    /// that violates the variant contract.
+    pub fn as_snapshot(&self) -> Option<SnapshotPlan> {
+        if self.unique_key.is_empty() || self.updated_at.is_none() {
+            return None;
+        }
+        let source = self
+            .source
+            .clone()
+            .expect("Snapshot ModelIr must carry `source`");
+        let updated_at = self
+            .updated_at
+            .clone()
+            .expect("Snapshot ModelIr must carry `updated_at`");
+        Some(SnapshotPlan {
+            source,
+            target: self.target.clone(),
+            unique_key: self.unique_key.clone(),
+            updated_at,
+            invalidate_hard_deletes: self.invalidate_hard_deletes,
+            governance: self.governance.clone(),
+        })
+    }
+
     /// Reconstruct a [`Plan`] from this `ModelIr`, mirroring the
     /// `From<&Plan> for ModelIr` conversion.
     ///
@@ -1623,5 +1724,126 @@ mod tests {
                 .contains("\"columns\":"),
             "snapshot ModelIr must omit `columns`"
         );
+    }
+
+    // ----- Direct variant accessors (`as_replication` / `as_transformation`
+    //       / `as_snapshot`) — bypass `Plan` materialisation on hot paths -----
+
+    #[test]
+    fn as_replication_returns_some_for_replication_shape() {
+        let ir = sample_replication_model();
+        assert!(
+            ir.as_replication().is_some(),
+            "replication-shaped IR must yield Some via as_replication"
+        );
+        assert!(ir.as_transformation().is_none());
+        assert!(ir.as_snapshot().is_none());
+    }
+
+    #[test]
+    fn as_transformation_returns_some_for_transformation_shape() {
+        let ir = sample_transformation_model();
+        assert!(
+            ir.as_transformation().is_some(),
+            "transformation-shaped IR must yield Some via as_transformation"
+        );
+        assert!(ir.as_replication().is_none());
+        assert!(ir.as_snapshot().is_none());
+    }
+
+    #[test]
+    fn as_snapshot_returns_some_for_snapshot_shape() {
+        let ir = sample_snapshot_model();
+        assert!(
+            ir.as_snapshot().is_some(),
+            "snapshot-shaped IR must yield Some via as_snapshot"
+        );
+        assert!(ir.as_replication().is_none());
+        assert!(ir.as_transformation().is_none());
+    }
+
+    /// The three accessors must yield byte-equivalent variants to
+    /// `to_plan_compatible()` for any IR built via `From<&Plan>`. This is
+    /// the load-bearing regression guard for `sql_gen` — both code paths
+    /// must produce identical SQL inputs.
+    #[test]
+    fn accessors_match_to_plan_compatible_for_replication() {
+        let plan = sample_replication_plan();
+        let ir = ModelIr::from(&plan);
+        let via_accessor = Plan::Replication(ir.as_replication().expect("replication"));
+        let via_round_trip = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&via_accessor, &via_round_trip),
+            "as_replication must produce a Plan canonical-JSON-equal to to_plan_compatible\n  accessor: {}\n  round-trip: {}",
+            canonical_json(&via_accessor),
+            canonical_json(&via_round_trip)
+        );
+    }
+
+    #[test]
+    fn accessors_match_to_plan_compatible_for_transformation() {
+        let plan = sample_transformation_plan();
+        let ir = ModelIr::from(&plan);
+        let via_accessor = Plan::Transformation(ir.as_transformation().expect("transformation"));
+        let via_round_trip = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&via_accessor, &via_round_trip),
+            "as_transformation must produce a Plan canonical-JSON-equal to to_plan_compatible"
+        );
+    }
+
+    #[test]
+    fn accessors_match_to_plan_compatible_for_snapshot() {
+        let plan = sample_snapshot_plan();
+        let ir = ModelIr::from(&plan);
+        let via_accessor = Plan::Snapshot(ir.as_snapshot().expect("snapshot"));
+        let via_round_trip = ir.to_plan_compatible();
+        assert!(
+            plans_canonical_eq(&via_accessor, &via_round_trip),
+            "as_snapshot must produce a Plan canonical-JSON-equal to to_plan_compatible"
+        );
+    }
+
+    /// Round-trip via the accessor: `From<&Plan> -> as_X` must be
+    /// canonical-JSON-equal to the original `Plan`. Mirrors the existing
+    /// `plan_to_model_ir_*_roundtrip` tests but exercises the accessor
+    /// rather than `to_plan_compatible`.
+    #[test]
+    fn plan_to_model_ir_via_accessor_replication_roundtrip() {
+        let plan = sample_replication_plan();
+        let ir = ModelIr::from(&plan);
+        let back = Plan::Replication(ir.as_replication().expect("replication"));
+        assert!(plans_canonical_eq(&plan, &back));
+    }
+
+    #[test]
+    fn plan_to_model_ir_via_accessor_transformation_roundtrip() {
+        let plan = sample_transformation_plan();
+        let ir = ModelIr::from(&plan);
+        let back = Plan::Transformation(ir.as_transformation().expect("transformation"));
+        assert!(plans_canonical_eq(&plan, &back));
+    }
+
+    #[test]
+    fn plan_to_model_ir_via_accessor_snapshot_roundtrip() {
+        let plan = sample_snapshot_plan();
+        let ir = ModelIr::from(&plan);
+        let back = Plan::Snapshot(ir.as_snapshot().expect("snapshot"));
+        assert!(plans_canonical_eq(&plan, &back));
+    }
+
+    /// Snapshot inference takes priority over replication: an IR that is
+    /// snapshot-shaped (unique_key + updated_at) must yield `None` from
+    /// `as_replication` even if `columns` is also populated. Matches the
+    /// inference order in `to_plan_compatible`.
+    #[test]
+    fn as_replication_rejects_snapshot_shape_even_if_columns_set() {
+        let mut ir = sample_snapshot_model();
+        ir.columns = Some(ColumnSelection::All);
+        assert!(
+            ir.as_replication().is_none(),
+            "snapshot-shape IR with stray `columns` must not view as replication"
+        );
+        assert!(ir.as_snapshot().is_some());
     }
 }

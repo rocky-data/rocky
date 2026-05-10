@@ -2,7 +2,7 @@ use rocky_sql::validation;
 use thiserror::Error;
 
 use crate::ir::{
-    MaterializationStrategy, ModelIr, PartitionWindow, Plan, ReplicationPlan, SnapshotPlan,
+    MaterializationStrategy, ModelIr, PartitionWindow, ReplicationPlan, SnapshotPlan,
     TransformationPlan,
 };
 use crate::lakehouse::{self, LakehouseError};
@@ -10,46 +10,42 @@ use crate::traits::{AdapterError, SqlDialect};
 
 /// Extract the variant-typed `ReplicationPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Replication`]. The check is shaped by which variant-
-/// specific fields are populated: replication carries an explicit
-/// [`crate::ir::ColumnSelection`] in `columns`.
+/// Dispatches directly on the IR's variant-specific fields via
+/// [`ModelIr::as_replication`] — no round-trip through the [`crate::ir::Plan`]
+/// enum. Returns [`SqlGenError::InvalidRequest`] when the IR was not
+/// constructed from a [`crate::ir::Plan::Replication`].
 fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Replication(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
+    model_ir.as_replication().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!(
             "expected Replication ModelIr for `{}`",
             model_ir.name
-        ))),
-    }
+        ))
+    })
 }
 
 /// Extract the variant-typed `TransformationPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Transformation`].
+/// Dispatches directly via [`ModelIr::as_transformation`]. Returns
+/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
+/// [`crate::ir::Plan::Transformation`].
 fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Transformation(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
+    model_ir.as_transformation().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!(
             "expected Transformation ModelIr for `{}`",
             model_ir.name
-        ))),
-    }
+        ))
+    })
 }
 
 /// Extract the variant-typed `SnapshotPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Snapshot`].
+/// Dispatches directly via [`ModelIr::as_snapshot`]. Returns
+/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
+/// [`crate::ir::Plan::Snapshot`].
 fn snapshot_from_ir(model_ir: &ModelIr) -> Result<SnapshotPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Snapshot(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
-            "expected Snapshot ModelIr for `{}`",
-            model_ir.name
-        ))),
-    }
+    model_ir.as_snapshot().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!("expected Snapshot ModelIr for `{}`", model_ir.name))
+    })
 }
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
@@ -92,7 +88,7 @@ pub enum SqlGenError {
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -150,7 +146,7 @@ fn generate_select_sql_no_watermark(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -170,7 +166,7 @@ pub fn generate_insert_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -192,7 +188,7 @@ pub fn generate_create_table_as_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -231,7 +227,7 @@ pub fn generate_merge_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -382,7 +378,7 @@ pub fn generate_transformation_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_time_interval_bootstrap_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -445,7 +441,7 @@ pub fn generate_time_interval_bootstrap_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_transformation_initial_ddl(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -491,7 +487,7 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_materialized_view_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -514,7 +510,7 @@ pub fn generate_materialized_view_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_dynamic_table_sql(
     model_ir: &ModelIr,
     target_lag: &str,
@@ -597,7 +593,7 @@ use std::fmt::Write;
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Snapshot`].
+/// constructed from a [`crate::ir::Plan::Snapshot`].
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
