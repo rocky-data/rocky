@@ -25,8 +25,12 @@ for run in pocs/*/*/run.sh; do
     poc_dir=$(dirname "$run")
     readme="$poc_dir/README.md"
 
-    # Skip POCs whose README explicitly lists credentials.
-    if grep -qiE '\*\*credentials:\*\*[^n]*(anthropic|databricks|snowflake|fivetran|gcp|google|bigquery)' "$readme" 2>/dev/null; then
+    # Skip credential-gated POCs by detecting the canonical fail-fast guard
+    # `: "${VAR:?...}"` (mandated by examples/playground/CLAUDE.md). Keying
+    # off the guard rather than a platform-name allowlist means new adapters
+    # don't have to update this script — and avoids the brittleness of the
+    # previous `[^n]*` README regex.
+    if grep -qE ': *"\$\{[A-Z_][A-Z0-9_]*:\?' "$run" 2>/dev/null; then
         echo "--- SKIP $poc_dir (credentials required)"
         skipped=$((skipped + 1))
         continue
