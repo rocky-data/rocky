@@ -5,4 +5,4 @@ SELECT
     amount,
     status,
     ordered_at
-FROM poc.staging__orders.orders
+FROM raw__orders.orders

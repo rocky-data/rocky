@@ -11,6 +11,9 @@ path = "poc.duckdb"
 [pipeline.exercise]
 strategy = "full_refresh"
 
+[pipeline.exercise.source.discovery]
+adapter = "default"
+
 [pipeline.exercise.source.schema_pattern]
 prefix = "raw__"
 separator = "__"

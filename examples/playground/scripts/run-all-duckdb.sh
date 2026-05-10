@@ -26,7 +26,7 @@ for run in pocs/*/*/run.sh; do
     readme="$poc_dir/README.md"
 
     # Skip POCs whose README explicitly lists credentials.
-    if grep -qiE '\*\*credentials:\*\*[^n]*(anthropic|databricks|snowflake|fivetran)' "$readme" 2>/dev/null; then
+    if grep -qiE '\*\*credentials:\*\*[^n]*(anthropic|databricks|snowflake|fivetran|gcp|google|bigquery)' "$readme" 2>/dev/null; then
         echo "--- SKIP $poc_dir (credentials required)"
         skipped=$((skipped + 1))
         continue
