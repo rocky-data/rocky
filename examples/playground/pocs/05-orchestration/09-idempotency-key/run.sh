@@ -10,10 +10,6 @@ duckdb poc.duckdb < data/seed.sql
 rocky validate
 
 # Scenario 1: fresh key → run claims it, proceeds.
-# Like POC 04, the DuckDB execution path hits "no discovery adapter"
-# before reaching materialization, so the run exits non-zero. The
-# idempotency claim still happens: the key enters `InFlight` state
-# inside the state store.
 KEY="fivetran_sync:demo_connector:2026-04-23T10:00:00Z"
 rocky -c rocky.toml -o json run \
   --filter source=orders \
@@ -23,15 +19,8 @@ KEY1=$(jq -r '.idempotency_key // "none"' expected/run1_fresh.json)
 echo "Run 1 (fresh key, orders)      status = $STATUS1  (key echoed: $KEY1)"
 
 # Scenario 2: same key again → idempotency short-circuit.
-# The claim step inspects the prior entry (InFlight from Run 1 since
-# the DuckDB path didn't finalize). The second caller sees an in-flight
-# claim that's still within TTL and exits with skipped_in_flight plus
-# the prior run_id.
-#
-# On a fully-successful Run 1 (tiered/valkey backend or real pipeline)
-# the entry would transition to Succeeded, and Run 2 would see
-# skipped_idempotent instead. The mechanism is identical; only the
-# state transition differs.
+# Run 1's entry transitioned to Succeeded, so the second caller sees a
+# completed claim and exits with skipped_idempotent plus the prior run_id.
 rocky -c rocky.toml -o json run \
   --filter source=orders \
   --idempotency-key "$KEY" > expected/run2_repeat.json || true

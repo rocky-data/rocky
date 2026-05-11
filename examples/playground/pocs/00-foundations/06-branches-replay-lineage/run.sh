@@ -5,7 +5,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-rm -f .rocky-state.redb poc.duckdb
+rm -f .rocky-state.redb .rocky-state.redb.lock poc.duckdb
+rm -f models/.rocky-state.redb models/.rocky-state.redb.lock
 mkdir -p expected
 
 echo "==> 1. Compile the 3-model DAG (type-check, no warehouse required)"

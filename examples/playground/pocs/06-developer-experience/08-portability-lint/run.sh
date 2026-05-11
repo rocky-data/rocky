@@ -34,6 +34,6 @@ echo "==> 4. Summary"
 echo "  portable.sql              — portable; clean under every dialect"
 echo "  non_portable_nvl.sql      — fires P001 under --target-dialect=bq"
 echo "  suppressed_via_pragma.sql — same NVL, suppressed per-file via '-- rocky-allow: NVL'"
-echo "  rocky.toml [portability]  — project-wide target + allowlist for 'QUALIFY'"
+echo "  rocky.toml [portability]  — project-wide allowlist for 'QUALIFY'"
 echo
 echo "POC complete."
