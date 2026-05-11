@@ -237,7 +237,10 @@ impl UniformWriter {
 }
 
 /// Scan `_delta_log/` for the highest `<20-digit>.json` and return that + 1.
-async fn next_commit_version<S: ObjectStore + ?Sized>(store: &S, prefix: &str) -> Result<u64> {
+pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+) -> Result<u64> {
     use futures::TryStreamExt;
     let log_prefix = Path::from(format!("{prefix}/_delta_log"));
     let mut max_version: Option<u64> = None;
