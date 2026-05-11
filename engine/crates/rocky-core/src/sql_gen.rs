@@ -2,7 +2,7 @@ use rocky_sql::validation;
 use thiserror::Error;
 
 use crate::ir::{
-    MaterializationStrategy, ModelIr, PartitionWindow, Plan, ReplicationPlan, SnapshotPlan,
+    MaterializationStrategy, ModelIr, PartitionWindow, ReplicationPlan, SnapshotPlan,
     TransformationPlan,
 };
 use crate::lakehouse::{self, LakehouseError};
@@ -10,46 +10,48 @@ use crate::traits::{AdapterError, SqlDialect};
 
 /// Extract the variant-typed `ReplicationPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Replication`]. The check is shaped by which variant-
-/// specific fields are populated: replication carries an explicit
-/// [`crate::ir::ColumnSelection`] in `columns`.
+/// Dispatches directly on the IR's variant-specific fields via
+/// [`ModelIr::as_replication`] — no round-trip through the [`crate::ir::Plan`]
+/// enum. Returns [`SqlGenError::InvalidRequest`] when the IR was not
+/// constructed from a [`crate::ir::Plan::Replication`].
 fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Replication(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
-            "expected Replication ModelIr for `{}`",
-            model_ir.name
-        ))),
-    }
+    model_ir.as_replication().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!(
+            "expected Replication ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
+        ))
+    })
 }
 
 /// Extract the variant-typed `TransformationPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Transformation`].
+/// Dispatches directly via [`ModelIr::as_transformation`]. Returns
+/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
+/// [`crate::ir::Plan::Transformation`].
 fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Transformation(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
-            "expected Transformation ModelIr for `{}`",
-            model_ir.name
-        ))),
-    }
+    model_ir.as_transformation().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!(
+            "expected Transformation ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
+        ))
+    })
 }
 
 /// Extract the variant-typed `SnapshotPlan` from a [`ModelIr`].
 ///
-/// Returns [`SqlGenError::InvalidRequest`] when the IR was not constructed
-/// from a [`Plan::Snapshot`].
+/// Dispatches directly via [`ModelIr::as_snapshot`]. Returns
+/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
+/// [`crate::ir::Plan::Snapshot`].
 fn snapshot_from_ir(model_ir: &ModelIr) -> Result<SnapshotPlan, SqlGenError> {
-    match model_ir.to_plan_compatible() {
-        Plan::Snapshot(plan) => Ok(plan),
-        _ => Err(SqlGenError::InvalidRequest(format!(
-            "expected Snapshot ModelIr for `{}`",
-            model_ir.name
-        ))),
-    }
+    model_ir.as_snapshot().ok_or_else(|| {
+        SqlGenError::InvalidRequest(format!(
+            "expected Snapshot ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
+        ))
+    })
 }
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
@@ -92,7 +94,7 @@ pub enum SqlGenError {
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -150,7 +152,7 @@ fn generate_select_sql_no_watermark(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -170,7 +172,7 @@ pub fn generate_insert_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -192,7 +194,7 @@ pub fn generate_create_table_as_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Replication`].
+/// constructed from a [`crate::ir::Plan::Replication`].
 pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -231,7 +233,7 @@ pub fn generate_merge_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -382,7 +384,7 @@ pub fn generate_transformation_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_time_interval_bootstrap_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -445,7 +447,7 @@ pub fn generate_time_interval_bootstrap_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_transformation_initial_ddl(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -491,7 +493,7 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_materialized_view_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -514,7 +516,7 @@ pub fn generate_materialized_view_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Transformation`].
+/// constructed from a [`crate::ir::Plan::Transformation`].
 pub fn generate_dynamic_table_sql(
     model_ir: &ModelIr,
     target_lag: &str,
@@ -597,7 +599,7 @@ use std::fmt::Write;
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`Plan::Snapshot`].
+/// constructed from a [`crate::ir::Plan::Snapshot`].
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -1932,5 +1934,61 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         let result = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect());
         assert!(result.is_err(), "should reject invalid partition column");
+    }
+
+    /// Mismatched-variant errors must include the actually-inferred variant
+    /// so callers can see *why* the IR didn't match. Regression guard for
+    /// the `variant_name()` wiring in `*_from_ir` — exercises the
+    /// `expected Replication, found transformation` template.
+    #[test]
+    fn variant_mismatch_error_names_the_actual_variant() {
+        let ir = xform_ir(&sample_transformation_plan());
+        let err = generate_select_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Replication ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found transformation"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
+    }
+
+    /// Symmetric coverage: replication IR passed to a transformation-only
+    /// generator. Exercises the `expected Transformation, found replication`
+    /// template.
+    #[test]
+    fn variant_mismatch_transformation_helper_names_replication_input() {
+        let ir = rep_ir(&sample_incremental_plan());
+        let err =
+            generate_transformation_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Transformation ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found replication"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
+    }
+
+    /// Symmetric coverage: transformation IR passed to a snapshot-only
+    /// generator. Exercises the `expected Snapshot, found transformation`
+    /// template — the third and final error-message shape.
+    #[test]
+    fn variant_mismatch_snapshot_helper_names_transformation_input() {
+        let ir = xform_ir(&sample_transformation_plan());
+        let err = generate_snapshot_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Snapshot ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found transformation"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
     }
 }
