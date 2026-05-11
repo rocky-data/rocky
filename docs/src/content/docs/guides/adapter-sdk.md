@@ -185,7 +185,7 @@ For adapters that talk to a REST API, the in-tree pattern is `wiremock`-based �
 
 ### The conformance harness
 
-`rocky-adapter-sdk::conformance::run_conformance(&manifest, adapter.dialect())` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. The harness now exercises one real dialect call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
+`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. When a live dialect is supplied, the harness exercises one real trait call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. Pass `None` when no live adapter is available — for example, `rocky test-adapter --builtin <name>`, which validates the test plan without a warehouse — and dialect-category checks are reported as skipped rather than run against a stub. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
 
 ## Distributing your adapter
 
