@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use object_store::ObjectStore;
 
+pub mod discover;
 pub mod errors;
 
 pub use errors::{Result, UniformWriterError};

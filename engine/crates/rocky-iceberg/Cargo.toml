@@ -26,6 +26,7 @@ parquet = { workspace = true }
 object_store = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
