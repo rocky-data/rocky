@@ -563,6 +563,42 @@ pub struct ModelIr {
     pub format_options: Option<LakehouseOptions>,
 }
 
+/// Inferred variant tag for a [`ModelIr`].
+///
+/// Returned by [`ModelIr::variant`]. The three values mirror the three
+/// [`Plan`] variants; the inference rule (snapshot wins over replication,
+/// replication wins over transformation) is centralised in
+/// [`ModelIr::variant`] and matches [`ModelIr::to_plan_compatible`].
+///
+/// Serialises as lowercase (`"replication"` / `"transformation"` /
+/// `"snapshot"`) so error messages and JSON output stay aligned with the
+/// pre-typed-enum string convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelIrVariant {
+    Replication,
+    Transformation,
+    Snapshot,
+}
+
+impl ModelIrVariant {
+    /// Lowercase wire name. Used by [`std::fmt::Display`] and by callers
+    /// that need the raw `&'static str` (e.g. error-template assertions).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replication => "replication",
+            Self::Transformation => "transformation",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelIrVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl ModelIr {
     /// Compute the recipe-hash of this model.
     ///
@@ -590,8 +626,8 @@ impl ModelIr {
     /// Predicate underlying variant inference for snapshot. The single
     /// source of truth shared by [`Self::as_replication`],
     /// [`Self::as_transformation`], [`Self::as_snapshot`], and
-    /// [`Self::variant_name`]. Snapshot takes priority over replication
-    /// in inference: if both `unique_key` (non-empty) and `updated_at`
+    /// [`Self::variant`]. Snapshot takes priority over replication in
+    /// inference: if both `unique_key` (non-empty) and `updated_at`
     /// (`Some`) are populated the IR is classified as a snapshot
     /// regardless of which other variant-specific fields are also set.
     fn is_snapshot_shaped(&self) -> bool {
@@ -694,30 +730,26 @@ impl ModelIr {
         })
     }
 
-    /// Human-readable name for this IR's inferred variant.
+    /// Inferred [`ModelIrVariant`] for this IR.
     ///
     /// Matches the inference rules used by [`Self::as_replication`],
     /// [`Self::as_transformation`], [`Self::as_snapshot`], and
     /// [`Self::to_plan_compatible`]: snapshot-shaped (`unique_key`
-    /// non-empty AND `updated_at` `Some`) → `"snapshot"`; replication-
-    /// shaped (`columns` `Some`) → `"replication"`; otherwise →
-    /// `"transformation"`.
+    /// non-empty AND `updated_at` `Some`) →
+    /// [`ModelIrVariant::Snapshot`]; replication-shaped (`columns` `Some`)
+    /// → [`ModelIrVariant::Replication`]; otherwise →
+    /// [`ModelIrVariant::Transformation`].
     ///
-    /// Used in error messages so callers can see *why* their IR didn't
-    /// match an expected variant.
-    ///
-    /// Crate-private: the only intended consumer is `sql_gen`'s
-    /// `*_from_ir` error formatting. Promote to `pub` only when an
-    /// external Rust caller needs it for their own diagnostic surface —
-    /// the JSON output schema is the external contract for everything
-    /// else.
-    pub(crate) fn variant_name(&self) -> &'static str {
+    /// Callers that need just the lowercase string form (e.g. error
+    /// message templating, JSON output) reach for [`ModelIrVariant::as_str`]
+    /// or the `Display` impl.
+    pub fn variant(&self) -> ModelIrVariant {
         if self.is_snapshot_shaped() {
-            "snapshot"
+            ModelIrVariant::Snapshot
         } else if self.columns.is_some() {
-            "replication"
+            ModelIrVariant::Replication
         } else {
-            "transformation"
+            ModelIrVariant::Transformation
         }
     }
 
@@ -1873,21 +1905,54 @@ mod tests {
     }
 
     #[test]
-    fn variant_name_matches_inferred_shape() {
-        assert_eq!(sample_replication_model().variant_name(), "replication");
+    fn variant_matches_inferred_shape() {
         assert_eq!(
-            sample_transformation_model().variant_name(),
-            "transformation"
+            sample_replication_model().variant(),
+            ModelIrVariant::Replication
         );
-        assert_eq!(sample_snapshot_model().variant_name(), "snapshot");
+        assert_eq!(
+            sample_transformation_model().variant(),
+            ModelIrVariant::Transformation
+        );
+        assert_eq!(sample_snapshot_model().variant(), ModelIrVariant::Snapshot);
     }
 
-    /// Variant-name inference must honour the same priority order as the
+    /// Variant inference must honour the same priority order as the
     /// accessors: snapshot wins over replication when both fields are set.
     #[test]
-    fn variant_name_follows_inference_priority() {
+    fn variant_follows_inference_priority() {
         let mut ir = sample_snapshot_model();
         ir.columns = Some(ColumnSelection::All);
-        assert_eq!(ir.variant_name(), "snapshot");
+        assert_eq!(ir.variant(), ModelIrVariant::Snapshot);
+    }
+
+    /// `variant()` must stay in lockstep with `to_plan_compatible()`: for any
+    /// `ModelIr` built via `From<&Plan>`, the inferred [`ModelIrVariant`]
+    /// matches the originating [`Plan`] tag. Guards against drift in the
+    /// shared [`ModelIr::is_snapshot_shaped`] inference root.
+    #[test]
+    fn variant_matches_to_plan_compatible_tag() {
+        let cases = [
+            (sample_replication_model(), ModelIrVariant::Replication),
+            (
+                sample_transformation_model(),
+                ModelIrVariant::Transformation,
+            ),
+            (sample_snapshot_model(), ModelIrVariant::Snapshot),
+        ];
+        for (ir, expected) in cases {
+            assert_eq!(ir.variant(), expected);
+            let plan = ir.to_plan_compatible();
+            let roundtripped = ModelIr::from(&plan);
+            assert_eq!(roundtripped.variant(), expected);
+        }
+    }
+
+    #[test]
+    fn variant_as_str_matches_display() {
+        assert_eq!(ModelIrVariant::Replication.as_str(), "replication");
+        assert_eq!(ModelIrVariant::Transformation.as_str(), "transformation");
+        assert_eq!(ModelIrVariant::Snapshot.as_str(), "snapshot");
+        assert_eq!(format!("{}", ModelIrVariant::Replication), "replication");
     }
 }
