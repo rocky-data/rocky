@@ -153,7 +153,7 @@ FROM raw.orders
 WHERE status != 'cancelled'
 ```
 
-`imported/models/stg_orders.toml` (note the `view → ephemeral` v0 mapping triggered by the warning above):
+`imported/models/stg_orders.toml` (note the `view → ephemeral` mapping triggered by the warning above):
 
 ```toml
 name = "stg_orders"
@@ -186,7 +186,7 @@ schema = "main"
 table = "fct_revenue"
 ```
 
-`imported/MIGRATION-NOTES.md` is the canonical record of what didn't translate — counts of skipped tests / macros, required env vars per adapter, and the explicit "Not Translated (v0 limitations)" list. Read it first.
+`imported/MIGRATION-NOTES.md` is the canonical record of what didn't translate — counts of skipped tests / macros, required env vars per adapter, and the explicit "Known limitations" list. Read it first.
 
 ### Verify the emitted repo loads
 
@@ -219,14 +219,14 @@ rocky -c rocky.toml validate
 Validation complete.
 ```
 
-A clean `rocky compile` + `rocky validate` is the v0 success criterion. The POC's `run.sh` stops here and then runs `rocky validate-migration` as an orthogonal cross-check that every dbt model has a matching Rocky model.
+A clean `rocky compile` + `rocky validate` is the success criterion. The POC's `run.sh` stops here and then runs `rocky validate-migration` as an orthogonal cross-check that every dbt model has a matching Rocky model.
 
 ### Running the emitted repo against real data
 
 `rocky -c rocky.toml run` will work once two preconditions are met, neither of which the importer can supply for you:
 
 1. **Source data exists in the warehouse.** The dbt project references `{{ source('raw', 'orders') }}`; the importer translates that to `FROM raw.orders` but does not create or populate the source. Load the source rows into the configured warehouse (`warehouse.duckdb` for the DuckDB stub, or your real Databricks/Snowflake target) before invoking `rocky run`.
-2. **Ephemeral models have a downstream-visible target.** In v0, `stg_orders` is emitted as `type = "ephemeral"` but `fct_revenue.sql` still reads `FROM stg_orders` verbatim — the importer does not rewrite the downstream body to inline the CTE. Until that inlining lands, you have two manual workarounds for any model the importer flattened from `view` to `ephemeral`:
+2. **Ephemeral models have a downstream-visible target.** When the importer flattens `view` → `ephemeral`, `stg_orders` is emitted as `type = "ephemeral"` but `fct_revenue.sql` still reads `FROM stg_orders` verbatim — the importer does not rewrite the downstream body to inline the CTE. For any model the importer flattened from `view` to `ephemeral`, you have two manual workarounds:
    - flip the strategy to `full_refresh` in the sidecar so `stg_orders` materialises as a real table; or
    - paste the upstream SELECT into the downstream model as a CTE.
 
@@ -234,7 +234,7 @@ Without (2), executing the pipeline ends with `Catalog Error: Table with name st
 
 ### What translates cleanly today, and what doesn't
 
-What v0 translates cleanly:
+What the importer translates cleanly:
 
 - `{{ ref('model') }}` → bare table reference + sidecar `depends_on`
 - `{{ source('s', 't') }}` → fully qualified reference + sidecar `[[sources]]`
@@ -247,7 +247,7 @@ What v0 translates cleanly:
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → mapped to a Rocky `[adapter]` block (DuckDB / Databricks / Snowflake / BigQuery), or a DuckDB stub when absent or unrecognised
 
-Not yet supported in v0 (the importer detects most of these and lists them under "Not Translated" in `MIGRATION-NOTES.md`, plus inserts `# TODO: dbt-jinja-not-translated` comments above any leftover Jinja in emitted SQL):
+By design, the importer does not translate the following — Rocky has no Jinja runtime, and these need a manual pass. Each item is detected and listed under "Known limitations" in `MIGRATION-NOTES.md`, with `# TODO: dbt-jinja-not-translated` comments above any leftover Jinja in emitted SQL:
 
 - **dbt tests outside the canonical four** — `dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, and model-level (non-column) tests are surfaced as structured warnings (`UnsupportedTest`) per occurrence and not stubbed in the emitted TOML. Rewrite as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
@@ -305,7 +305,7 @@ rocky -o json import-dbt --dbt-project ./my-dbt-project --output-dir ./rocky-mod
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "<rocky-version>",
   "command": "import-dbt",
   "imported": 42,
   "warnings": 3,

@@ -368,7 +368,7 @@ impl RelationshipResolver for ImportedTargetResolver<'_> {
 
 /// Convert dbt model tests to canonical Rocky [`TestDecl`]s.
 ///
-/// Mapping (v0 — the four canonical dbt built-ins only):
+/// Mapping (canonical dbt built-ins):
 ///
 /// | dbt test | Rocky [`TestType`] |
 /// |---|---|
@@ -380,7 +380,7 @@ impl RelationshipResolver for ImportedTargetResolver<'_> {
 /// Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined
 /// generic tests, model-level tests) is returned in the [`UnsupportedTest`]
 /// list. The caller is expected to surface those as import warnings —
-/// the v0 emitter does **not** stub them as TODO comments in the
+/// the emitter does **not** stub them as TODO comments in the
 /// generated rocky.toml.
 pub fn tests_to_test_decls(
     model: &DbtModelYaml,

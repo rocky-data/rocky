@@ -1,7 +1,7 @@
 //! Minimal `profiles.yml` parser for `rocky import-dbt`.
 //!
 //! Reads `<dbt_project>/profiles.yml` (we deliberately do not consult
-//! `~/.dbt/profiles.yml` in v0 — the importer is meant to operate on a
+//! `~/.dbt/profiles.yml` — the importer is meant to operate on a
 //! self-contained project directory) and extracts just enough information
 //! to drive Rocky's `[adapter]` block: the profile's active target name and
 //! the `type` field of that target's output (`duckdb` / `databricks` /
@@ -94,7 +94,7 @@ pub struct ProfileResolution {
 ///
 /// Tries `<dbt_project>/profiles.yml`. If absent or unparseable, returns
 /// `None` and the caller stubs a DuckDB adapter with a TODO note. We
-/// deliberately do **not** read `~/.dbt/profiles.yml` in v0 — the importer
+/// deliberately do **not** read `~/.dbt/profiles.yml` — the importer
 /// is meant to operate on a self-contained project tree.
 pub fn resolve_from_project(dbt_project: &Path) -> Option<ProfileResolution> {
     let profiles_path = dbt_project.join("profiles.yml");

@@ -15,11 +15,13 @@
 //! └── MIGRATION-NOTES.md
 //! ```
 //!
-//! v0 deliberately ships without test mapping (`unique`, `not_null`,
-//! `accepted_values`, `relationships`), macro expansion, or dbt_packages
-//! support — every limitation is listed under "Not Translated" in
-//! `MIGRATION-NOTES.md`. The goal is a `rocky compile`-clean repo, not a
-//! line-for-line dbt clone.
+//! By design, the importer translates models, refs/sources,
+//! `{{ config() }}`, the canonical dbt generic tests (`unique`, `not_null`,
+//! `accepted_values`, `relationships`), seeds, and `profiles.yml` adapter
+//! shape. It does **not** expand dbt macros, walk `dbt_packages/`, or port
+//! singular tests — Rocky has no Jinja runtime, so those need a manual
+//! pass. Known limitations are listed in `MIGRATION-NOTES.md`. The goal is
+//! a `rocky compile`-clean repo, not a line-for-line dbt clone.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -64,7 +66,7 @@ pub fn run_import_dbt(
 
     // Capture which models had their `view` materialization flattened to
     // FullRefresh by the importer — we re-rewrite those to Ephemeral at
-    // emit time per the v0 mapping rules.
+    // emit time per the importer's `view → ephemeral` mapping.
     let view_models = collect_view_flattened_models(&import_result);
 
     let policy = if overwrite {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 03-import-dbt-validate — exercise the full `rocky import-dbt` v0 flow:
+# 03-import-dbt-validate — exercise the full `rocky import-dbt` flow:
 # parse a real dbt project, emit a runnable Rocky repo to disk, then
 # verify it compiles + cross-check the migration.
 set -uo pipefail
@@ -25,7 +25,7 @@ echo "=== imported/MIGRATION-NOTES.md (head) ==="
 [ -f imported/MIGRATION-NOTES.md ] && head -40 imported/MIGRATION-NOTES.md || echo "(no MIGRATION-NOTES.md emitted — older rocky binary?)"
 
 echo
-echo "=== rocky compile against the emitted models — proves the v0 emission is loadable ==="
+echo "=== rocky compile against the emitted models — proves the emission is loadable ==="
 rocky compile --models imported/models 2>&1 | tee expected/compile.log
 
 echo
