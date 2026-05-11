@@ -705,7 +705,13 @@ impl ModelIr {
     ///
     /// Used in error messages so callers can see *why* their IR didn't
     /// match an expected variant.
-    pub fn variant_name(&self) -> &'static str {
+    ///
+    /// Crate-private: the only intended consumer is `sql_gen`'s
+    /// `*_from_ir` error formatting. Promote to `pub` only when an
+    /// external Rust caller needs it for their own diagnostic surface —
+    /// the JSON output schema is the external contract for everything
+    /// else.
+    pub(crate) fn variant_name(&self) -> &'static str {
         if self.is_snapshot_shaped() {
             "snapshot"
         } else if self.columns.is_some() {
@@ -740,20 +746,17 @@ impl ModelIr {
     /// `From<&Plan>` impl always populates them, so this only fires on a
     /// hand-built `ModelIr` that violates the variant contract.
     pub fn to_plan_compatible(&self) -> Plan {
-        if let Some(snap) = self.as_snapshot() {
-            return Plan::Snapshot(snap);
-        }
-        if let Some(rep) = self.as_replication() {
-            return Plan::Replication(rep);
-        }
-        // Transformation is the unconditional fallback: when neither
-        // snapshot nor replication match, `as_transformation` is `Some`
-        // by construction (its rejection conditions are exactly the
-        // entry conditions of the other two).
-        Plan::Transformation(
-            self.as_transformation()
-                .expect("transformation is the unconditional fallback variant"),
-        )
+        // Transformation is the unconditional fallback: its rejection
+        // conditions in `as_transformation` are exactly the entry
+        // conditions of the other two accessors, so one of the three
+        // is always `Some`.
+        self.as_snapshot()
+            .map(Plan::Snapshot)
+            .or_else(|| self.as_replication().map(Plan::Replication))
+            .or_else(|| self.as_transformation().map(Plan::Transformation))
+            .expect(
+                "at least one accessor must match — transformation is the unconditional fallback",
+            )
     }
 }
 

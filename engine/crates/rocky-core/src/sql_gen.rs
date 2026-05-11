@@ -1938,16 +1938,52 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     /// Mismatched-variant errors must include the actually-inferred variant
     /// so callers can see *why* the IR didn't match. Regression guard for
-    /// the `variant_name()` wiring in `*_from_ir`.
+    /// the `variant_name()` wiring in `*_from_ir` — exercises the
+    /// `expected Replication, found transformation` template.
     #[test]
     fn variant_mismatch_error_names_the_actual_variant() {
-        // Pass a transformation IR to `generate_select_sql`, which only
-        // accepts replication IRs. The error must mention "transformation".
         let ir = xform_ir(&sample_transformation_plan());
         let err = generate_select_sql(&ir, &dialect()).expect_err("expected variant mismatch");
         let msg = err.to_string();
         assert!(
             msg.contains("expected Replication ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found transformation"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
+    }
+
+    /// Symmetric coverage: replication IR passed to a transformation-only
+    /// generator. Exercises the `expected Transformation, found replication`
+    /// template.
+    #[test]
+    fn variant_mismatch_transformation_helper_names_replication_input() {
+        let ir = rep_ir(&sample_incremental_plan());
+        let err =
+            generate_transformation_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Transformation ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found replication"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
+    }
+
+    /// Symmetric coverage: transformation IR passed to a snapshot-only
+    /// generator. Exercises the `expected Snapshot, found transformation`
+    /// template — the third and final error-message shape.
+    #[test]
+    fn variant_mismatch_snapshot_helper_names_transformation_input() {
+        let ir = xform_ir(&sample_transformation_plan());
+        let err = generate_snapshot_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Snapshot ModelIr"),
             "error should name the expected variant, got: {msg}"
         );
         assert!(
