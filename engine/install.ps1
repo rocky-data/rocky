@@ -48,10 +48,10 @@ if (-not $ResolvedVersion) {
         # and lexical sort places v1.10.0 before v1.9.0 — cast the stripped
         # version to [version] and sort descending so 1.10.0 wins.
         $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=30" -ErrorAction Stop
-        $ResolvedVersion = ($Releases
-            | Where-Object { $_.tag_name -match "^$TagPrefix\d+\.\d+\.\d+$" }
-            | Sort-Object -Property @{Expression = { [version]($_.tag_name -replace "^$TagPrefix", "") }} -Descending
-            | Select-Object -First 1).tag_name
+        $ResolvedVersion = ($Releases |
+            Where-Object { $_.tag_name -match "^$TagPrefix\d+\.\d+\.\d+$" } |
+            Sort-Object -Property @{Expression = { [version]($_.tag_name -replace "^$TagPrefix", "") }} -Descending |
+            Select-Object -First 1).tag_name
         if (-not $ResolvedVersion) {
             Write-Error "Failed to find an engine release (tag prefix '$TagPrefix'). Set ROCKY_VERSION manually."
             exit 1
