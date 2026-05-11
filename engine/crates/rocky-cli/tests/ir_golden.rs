@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use rocky_core::ir::{
     ColumnMask, ColumnSelection, GovernanceConfig, MaterializationStrategy, MetadataColumn,
-    ModelIr, Plan, ReplicationPlan, SnapshotPlan, SourceRef, TargetRef, TransformationPlan,
+    ModelIr, SourceRef, TargetRef,
 };
 use rocky_core::lakehouse::{LakehouseFormat, LakehouseOptions};
 use rocky_core::lineage::{LineageEdge, QualifiedColumn};
@@ -339,40 +339,38 @@ fn raw_source(table: &str) -> SourceRef {
 }
 
 fn build_01_replication_full_refresh() -> ModelIr {
-    let plan = Plan::Replication(ReplicationPlan {
-        source: raw_source("orders"),
-        target: raw_target("orders"),
-        strategy: MaterializationStrategy::FullRefresh,
-        columns: ColumnSelection::All,
-        metadata_columns: vec![],
-        governance: baseline_governance(),
-    });
-    let mut ir = ModelIr::from(&plan);
+    let mut ir = ModelIr::replication(
+        raw_target("orders"),
+        MaterializationStrategy::FullRefresh,
+        raw_source("orders"),
+        ColumnSelection::All,
+        vec![],
+        baseline_governance(),
+    );
     ir.name = Arc::from("orders");
     ir
 }
 
 fn build_02_replication_incremental() -> ModelIr {
-    let plan = Plan::Replication(ReplicationPlan {
-        source: raw_source("events"),
-        target: raw_target("events"),
-        strategy: MaterializationStrategy::Incremental {
+    let mut ir = ModelIr::replication(
+        raw_target("events"),
+        MaterializationStrategy::Incremental {
             timestamp_column: "_synced_at".into(),
         },
-        columns: ColumnSelection::Explicit(vec![
+        raw_source("events"),
+        ColumnSelection::Explicit(vec![
             Arc::from("id"),
             Arc::from("event_type"),
             Arc::from("payload"),
             Arc::from("_synced_at"),
         ]),
-        metadata_columns: vec![MetadataColumn {
+        vec![MetadataColumn {
             name: "_loaded_by".into(),
             data_type: "STRING".into(),
             value: "'rocky'".into(),
         }],
-        governance: baseline_governance(),
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+    );
     ir.name = Arc::from("events");
     ir
 }
@@ -386,10 +384,9 @@ fn build_03_replication_merge() -> ModelIr {
     // `update_columns` is explicit (not `ColumnSelection::All`) so the
     // DuckDB dialect produces a valid `UPDATE SET name = source.name, ...`
     // — DuckDB MERGE rejects the `UPDATE SET *` shorthand.
-    let plan = Plan::Replication(ReplicationPlan {
-        source: raw_source("customers"),
-        target: raw_target("customers"),
-        strategy: MaterializationStrategy::Merge {
+    let mut ir = ModelIr::replication(
+        raw_target("customers"),
+        MaterializationStrategy::Merge {
             unique_key: vec![Arc::from("customer_id")],
             update_columns: ColumnSelection::Explicit(vec![
                 Arc::from("name"),
@@ -397,30 +394,29 @@ fn build_03_replication_merge() -> ModelIr {
                 Arc::from("updated_at"),
             ]),
         },
-        columns: ColumnSelection::All,
-        metadata_columns: vec![],
-        governance: baseline_governance(),
-    });
-    let mut ir = ModelIr::from(&plan);
+        raw_source("customers"),
+        ColumnSelection::All,
+        vec![],
+        baseline_governance(),
+    );
     ir.name = Arc::from("customers");
     ir
 }
 
 fn build_04_transformation_full_refresh() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
+    let mut ir = ModelIr::transformation(
+        marts_target("fct_orders"),
+        MaterializationStrategy::FullRefresh,
+        vec![SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "raw__demo".into(),
             table: "orders".into(),
         }],
-        target: marts_target("fct_orders"),
-        strategy: MaterializationStrategy::FullRefresh,
-        sql: "SELECT id, customer_id, total FROM tgtwarehouse.raw__demo.orders".into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        "SELECT id, customer_id, total FROM tgtwarehouse.raw__demo.orders".into(),
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("fct_orders");
     ir.typed_columns = vec![
         TypedColumn {
@@ -443,14 +439,9 @@ fn build_04_transformation_full_refresh() -> ModelIr {
 }
 
 fn build_05_transformation_merge() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
-            catalog: TGT_CATALOG.into(),
-            schema: "raw__demo".into(),
-            table: "customers".into(),
-        }],
-        target: marts_target("dim_customers"),
-        strategy: MaterializationStrategy::Merge {
+    let mut ir = ModelIr::transformation(
+        marts_target("dim_customers"),
+        MaterializationStrategy::Merge {
             unique_key: vec![Arc::from("customer_id")],
             update_columns: ColumnSelection::Explicit(vec![
                 Arc::from("name"),
@@ -458,14 +449,18 @@ fn build_05_transformation_merge() -> ModelIr {
                 Arc::from("updated_at"),
             ]),
         },
-        sql: "SELECT customer_id, name, email, updated_at \
+        vec![SourceRef {
+            catalog: TGT_CATALOG.into(),
+            schema: "raw__demo".into(),
+            table: "customers".into(),
+        }],
+        "SELECT customer_id, name, email, updated_at \
               FROM tgtwarehouse.raw__demo.customers"
             .into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("dim_customers");
     // Resolved column mask: email gets HASH for the active env.
     ir.column_masks = vec![ColumnMask {
@@ -488,67 +483,64 @@ fn build_05_transformation_merge() -> ModelIr {
 }
 
 fn build_06_transformation_ephemeral() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
+    let mut ir = ModelIr::transformation(
+        marts_target("active_orders"),
+        MaterializationStrategy::Ephemeral,
+        vec![SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "marts__demo".into(),
             table: "fct_orders".into(),
         }],
-        target: marts_target("active_orders"),
-        strategy: MaterializationStrategy::Ephemeral,
-        sql: "SELECT * FROM tgtwarehouse.marts__demo.fct_orders WHERE status = 'active'".into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        "SELECT * FROM tgtwarehouse.marts__demo.fct_orders WHERE status = 'active'".into(),
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("active_orders");
     ir
 }
 
 fn build_07_transformation_materialized_view() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
+    let mut ir = ModelIr::transformation(
+        marts_target("mv_orders_daily"),
+        MaterializationStrategy::MaterializedView,
+        vec![SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "marts__demo".into(),
             table: "fct_orders".into(),
         }],
-        target: marts_target("mv_orders_daily"),
-        strategy: MaterializationStrategy::MaterializedView,
-        sql: "SELECT DATE(created_at) AS day, COUNT(*) AS order_count, SUM(total) AS revenue \
+        "SELECT DATE(created_at) AS day, COUNT(*) AS order_count, SUM(total) AS revenue \
               FROM tgtwarehouse.marts__demo.fct_orders GROUP BY 1"
             .into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("mv_orders_daily");
     ir
 }
 
 fn build_08_transformation_dynamic_table() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
+    // Note: target_lag also sits on the strategy enum, but
+    // generate_dynamic_table_sql consumes it from the call args (see Entry::DynamicTable).
+    let mut ir = ModelIr::transformation(
+        marts_target("dt_orders_recent"),
+        MaterializationStrategy::DynamicTable {
+            target_lag: "1 hour".into(),
+        },
+        vec![SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "marts__demo".into(),
             table: "fct_orders".into(),
         }],
-        target: marts_target("dt_orders_recent"),
-        // Note: target_lag also sits on the strategy enum, but
-        // generate_dynamic_table_sql consumes it from the call args (see Entry::DynamicTable).
-        strategy: MaterializationStrategy::DynamicTable {
-            target_lag: "1 hour".into(),
-        },
-        sql: "SELECT id, customer_id, total \
+        "SELECT id, customer_id, total \
               FROM tgtwarehouse.marts__demo.fct_orders \
               WHERE created_at > CURRENT_DATE - INTERVAL '7' DAY"
             .into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("dt_orders_recent");
     ir
 }
@@ -556,59 +548,59 @@ fn build_08_transformation_dynamic_table() -> ModelIr {
 fn build_09_transformation_time_interval_bootstrap() -> ModelIr {
     // Static plan emits window=None per the recipe-hash invariant
     // documented in SPEC.md §5.
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
-            catalog: TGT_CATALOG.into(),
-            schema: "raw__demo".into(),
-            table: "events".into(),
-        }],
-        target: marts_target("events_daily"),
-        strategy: MaterializationStrategy::TimeInterval {
+    let mut ir = ModelIr::transformation(
+        marts_target("events_daily"),
+        MaterializationStrategy::TimeInterval {
             time_column: "event_date".into(),
             granularity: TimeGrain::Day,
             window: None,
         },
-        sql: "SELECT event_date, COUNT(*) AS event_count \
+        vec![SourceRef {
+            catalog: TGT_CATALOG.into(),
+            schema: "raw__demo".into(),
+            table: "events".into(),
+        }],
+        "SELECT event_date, COUNT(*) AS event_count \
               FROM tgtwarehouse.raw__demo.events \
               WHERE event_date >= '@start_date' AND event_date < '@end_date' \
               GROUP BY 1"
             .into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("events_daily");
     ir
 }
 
 fn build_10_transformation_lakehouse_delta() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![SourceRef {
+    let mut ir = ModelIr::transformation(
+        marts_target("fct_events_delta"),
+        MaterializationStrategy::FullRefresh,
+        vec![SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "raw__demo".into(),
             table: "events".into(),
         }],
-        target: marts_target("fct_events_delta"),
-        strategy: MaterializationStrategy::FullRefresh,
-        sql: "SELECT id, event_type, event_date, payload \
+        "SELECT id, event_type, event_date, payload \
               FROM tgtwarehouse.raw__demo.events"
             .into(),
-        governance: baseline_governance(),
-        format: Some(LakehouseFormat::DeltaTable),
-        format_options: Some(LakehouseOptions {
+        baseline_governance(),
+        Some(LakehouseFormat::DeltaTable),
+        Some(LakehouseOptions {
             partition_by: vec!["event_date".into()],
             ..Default::default()
         }),
-    });
-    let mut ir = ModelIr::from(&plan);
+    );
     ir.name = Arc::from("fct_events_delta");
     ir
 }
 
 fn build_11_transformation_multi_source_join() -> ModelIr {
-    let plan = Plan::Transformation(TransformationPlan {
-        sources: vec![
+    let mut ir = ModelIr::transformation(
+        marts_target("fct_order_lines"),
+        MaterializationStrategy::FullRefresh,
+        vec![
             SourceRef {
                 catalog: TGT_CATALOG.into(),
                 schema: "raw__demo".into(),
@@ -625,36 +617,32 @@ fn build_11_transformation_multi_source_join() -> ModelIr {
                 table: "products".into(),
             },
         ],
-        target: marts_target("fct_order_lines"),
-        strategy: MaterializationStrategy::FullRefresh,
-        sql: "SELECT o.id AS order_id, c.name AS customer_name, p.sku, o.total \
+        "SELECT o.id AS order_id, c.name AS customer_name, p.sku, o.total \
               FROM tgtwarehouse.raw__demo.orders o \
               JOIN tgtwarehouse.raw__demo.customers c ON o.customer_id = c.id \
               JOIN tgtwarehouse.raw__demo.products p ON o.product_id = p.id"
             .into(),
-        governance: baseline_governance(),
-        format: None,
-        format_options: None,
-    });
-    let mut ir = ModelIr::from(&plan);
+        baseline_governance(),
+        None,
+        None,
+    );
     ir.name = Arc::from("fct_order_lines");
     ir
 }
 
 fn build_12_snapshot_scd2() -> ModelIr {
-    let plan = Plan::Snapshot(SnapshotPlan {
-        source: SourceRef {
+    let mut ir = ModelIr::snapshot(
+        snapshot_target("dim_customers_history"),
+        SourceRef {
             catalog: TGT_CATALOG.into(),
             schema: "marts__demo".into(),
             table: "dim_customers".into(),
         },
-        target: snapshot_target("dim_customers_history"),
-        unique_key: vec![Arc::from("customer_id")],
-        updated_at: "updated_at".into(),
-        invalidate_hard_deletes: true,
-        governance: baseline_governance(),
-    });
-    let mut ir = ModelIr::from(&plan);
+        vec![Arc::from("customer_id")],
+        "updated_at".into(),
+        true,
+        baseline_governance(),
+    );
     ir.name = Arc::from("dim_customers_history");
     ir
 }

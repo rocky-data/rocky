@@ -902,18 +902,40 @@ mod tests {
 
     /// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
     fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
-        ModelIr::from(&Plan::Replication(plan.clone()))
+        ModelIr::replication(
+            plan.target.clone(),
+            plan.strategy.clone(),
+            plan.source.clone(),
+            plan.columns.clone(),
+            plan.metadata_columns.clone(),
+            plan.governance.clone(),
+        )
     }
 
     /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
     fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-        ModelIr::from(&Plan::Transformation(plan.clone()))
+        ModelIr::transformation(
+            plan.target.clone(),
+            plan.strategy.clone(),
+            plan.sources.clone(),
+            plan.sql.clone(),
+            plan.governance.clone(),
+            plan.format.clone(),
+            plan.format_options.clone(),
+        )
     }
 
     /// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
     #[allow(dead_code)]
     fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
-        ModelIr::from(&Plan::Snapshot(plan.clone()))
+        ModelIr::snapshot(
+            plan.target.clone(),
+            plan.source.clone(),
+            plan.unique_key.clone(),
+            plan.updated_at.clone(),
+            plan.invalidate_hard_deletes,
+            plan.governance.clone(),
+        )
     }
 
     fn sample_incremental_plan() -> ReplicationPlan {
