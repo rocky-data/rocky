@@ -1,0 +1,15 @@
+name: failure_modes
+version: '1.0.0'
+config-version: 2
+
+profile: failure_modes
+
+model-paths: ["models"]
+test-paths: ["tests"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+
+models:
+  failure_modes:
+    +materialized: table
