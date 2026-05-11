@@ -3954,6 +3954,7 @@ dependencies = [
  "percent-encoding",
  "reqwest",
  "rocky-core",
+ "rocky-databricks",
  "serde",
  "serde_json",
  "thiserror",

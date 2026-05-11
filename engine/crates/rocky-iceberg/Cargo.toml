@@ -30,6 +30,10 @@ futures = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+# Live round-trip test wraps a real DatabricksConnector behind the writer's
+# SqlClient trait. Production wire-up will move to the CLI surface in a
+# follow-up; today this dep is dev-only.
+rocky-databricks = { path = "../rocky-databricks" }
 
 [lints]
 workspace = true
