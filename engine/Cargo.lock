@@ -3948,6 +3948,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "futures",
  "object_store",
  "parquet",
  "percent-encoding",
