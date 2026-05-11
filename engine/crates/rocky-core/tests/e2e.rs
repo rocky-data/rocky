@@ -5,7 +5,7 @@
 
 use rocky_core::ir::{
     ColumnInfo, ColumnSelection, DriftAction, GovernanceConfig, MaterializationStrategy,
-    MetadataColumn, ModelIr, Plan, ReplicationPlan, SnapshotPlan, SourceRef, TableRef, TargetRef,
+    MetadataColumn, ModelIr, ReplicationPlan, SnapshotPlan, SourceRef, TableRef, TargetRef,
     TransformationPlan, WatermarkState,
 };
 use rocky_core::state::StateStore;
@@ -15,18 +15,40 @@ use tempfile::TempDir;
 
 /// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
 fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
-    ModelIr::from(&Plan::Replication(plan.clone()))
+    ModelIr::replication(
+        plan.target.clone(),
+        plan.strategy.clone(),
+        plan.source.clone(),
+        plan.columns.clone(),
+        plan.metadata_columns.clone(),
+        plan.governance.clone(),
+    )
 }
 
 /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
 fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-    ModelIr::from(&Plan::Transformation(plan.clone()))
+    ModelIr::transformation(
+        plan.target.clone(),
+        plan.strategy.clone(),
+        plan.sources.clone(),
+        plan.sql.clone(),
+        plan.governance.clone(),
+        plan.format.clone(),
+        plan.format_options.clone(),
+    )
 }
 
 /// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
 #[allow(dead_code)]
 fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
-    ModelIr::from(&Plan::Snapshot(plan.clone()))
+    ModelIr::snapshot(
+        plan.target.clone(),
+        plan.source.clone(),
+        plan.unique_key.clone(),
+        plan.updated_at.clone(),
+        plan.invalidate_hard_deletes,
+        plan.governance.clone(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,7 +1148,7 @@ WHERE _fivetran_synced > (
 mod time_interval_e2e {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus, partition_key_to_window};
     use rocky_core::ir::{
-        GovernanceConfig, MaterializationStrategy, ModelIr, Plan, SourceRef, TargetRef,
+        GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef,
         TransformationPlan,
     };
     use rocky_core::models::TimeGrain;
@@ -1138,7 +1160,15 @@ mod time_interval_e2e {
 
     /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
     fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-        ModelIr::from(&Plan::Transformation(plan.clone()))
+        ModelIr::transformation(
+            plan.target.clone(),
+            plan.strategy.clone(),
+            plan.sources.clone(),
+            plan.sql.clone(),
+            plan.governance.clone(),
+            plan.format.clone(),
+            plan.format_options.clone(),
+        )
     }
 
     /// SQL to seed a stg_orders table with rows across 5 partitions

@@ -642,6 +642,50 @@ impl ModelIr {
         }
     }
 
+    /// Construct a transformation-shaped [`ModelIr`] directly, bypassing
+    /// the [`Plan`] enum.
+    ///
+    /// Variant inference (see [`Self::variant`]) returns
+    /// [`ModelIrVariant::Transformation`] for any IR built by this
+    /// constructor — `columns` stays `None` and snapshot-shape fields
+    /// stay empty.
+    ///
+    /// `name` defaults to `target.table`. Callers that have a richer
+    /// project-unique identifier (e.g. the compiler-side
+    /// [`crate::models::Model::to_model_ir`]) should mutate `name` after
+    /// construction. `typed_columns`, `lineage_edges`, `column_masks`,
+    /// `source`, `metadata_columns`, `unique_key`, `updated_at`, and
+    /// `invalidate_hard_deletes` default to their zero values.
+    pub fn transformation(
+        target: TargetRef,
+        strategy: MaterializationStrategy,
+        sources: Vec<SourceRef>,
+        sql: String,
+        governance: GovernanceConfig,
+        format: Option<LakehouseFormat>,
+        format_options: Option<LakehouseOptions>,
+    ) -> Self {
+        Self {
+            name: Arc::from(target.table.as_str()),
+            sql,
+            typed_columns: Vec::new(),
+            lineage_edges: Vec::new(),
+            materialization: strategy,
+            governance,
+            target,
+            column_masks: Vec::new(),
+            source: None,
+            sources,
+            columns: None,
+            metadata_columns: Vec::new(),
+            unique_key: Vec::new(),
+            updated_at: None,
+            invalidate_hard_deletes: false,
+            format,
+            format_options,
+        }
+    }
+
     /// Construct a snapshot-shaped [`ModelIr`] directly, bypassing the
     /// [`Plan`] enum.
     ///
