@@ -305,7 +305,7 @@ rocky -o json import-dbt --dbt-project ./my-dbt-project --output-dir ./rocky-mod
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "<rocky-version>",
   "command": "import-dbt",
   "imported": 42,
   "warnings": 3,
