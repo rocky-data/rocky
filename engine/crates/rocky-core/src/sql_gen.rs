@@ -1,57 +1,20 @@
 use rocky_sql::validation;
 use thiserror::Error;
 
-use crate::ir::{
-    MaterializationStrategy, ModelIr, PartitionWindow, ReplicationPlan, SnapshotPlan,
-    TransformationPlan,
-};
+use crate::ir::{MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
 
-/// Extract the variant-typed `ReplicationPlan` from a [`ModelIr`].
-///
-/// Dispatches directly on the IR's variant-specific fields via
-/// [`ModelIr::as_replication`] — no round-trip through the [`crate::ir::Plan`]
-/// enum. Returns [`SqlGenError::InvalidRequest`] when the IR was not
-/// constructed from a [`crate::ir::Plan::Replication`].
-fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenError> {
-    model_ir.as_replication().ok_or_else(|| {
-        SqlGenError::InvalidRequest(format!(
-            "expected Replication ModelIr for `{}`, found {}",
-            model_ir.name,
-            model_ir.variant_name()
-        ))
-    })
-}
-
-/// Extract the variant-typed `TransformationPlan` from a [`ModelIr`].
-///
-/// Dispatches directly via [`ModelIr::as_transformation`]. Returns
-/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
-/// [`crate::ir::Plan::Transformation`].
-fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlGenError> {
-    model_ir.as_transformation().ok_or_else(|| {
-        SqlGenError::InvalidRequest(format!(
-            "expected Transformation ModelIr for `{}`, found {}",
-            model_ir.name,
-            model_ir.variant_name()
-        ))
-    })
-}
-
-/// Extract the variant-typed `SnapshotPlan` from a [`ModelIr`].
-///
-/// Dispatches directly via [`ModelIr::as_snapshot`]. Returns
-/// [`SqlGenError::InvalidRequest`] when the IR was not constructed from a
-/// [`crate::ir::Plan::Snapshot`].
-fn snapshot_from_ir(model_ir: &ModelIr) -> Result<SnapshotPlan, SqlGenError> {
-    model_ir.as_snapshot().ok_or_else(|| {
-        SqlGenError::InvalidRequest(format!(
-            "expected Snapshot ModelIr for `{}`, found {}",
-            model_ir.name,
-            model_ir.variant_name()
-        ))
-    })
+/// Build the canonical `expected X ModelIr for \`name\`, found <actual>` error
+/// returned by every `generate_*` entry point when its variant guard rejects
+/// the input. Centralising the template keeps the three regression tests in
+/// this file's test module asserting one canonical string shape.
+fn variant_mismatch(model_ir: &ModelIr, expected: &'static str) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "expected {expected} ModelIr for `{}`, found {}",
+        model_ir.name,
+        model_ir.variant()
+    ))
 }
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
@@ -99,25 +62,31 @@ pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = replication_from_ir(model_ir)?;
-    let select = dialect.select_clause(&plan.columns, &plan.metadata_columns)?;
+    if model_ir.variant() != ModelIrVariant::Replication {
+        return Err(variant_mismatch(model_ir, "Replication"));
+    }
+    let columns = model_ir
+        .columns
+        .as_ref()
+        .expect("Replication variant guarantees `columns` is Some");
+    let source = model_ir
+        .source
+        .as_ref()
+        .expect("Replication variant guarantees `source` is Some");
 
-    let source = dialect.format_table_ref(
-        &plan.source.catalog,
-        &plan.source.schema,
-        &plan.source.table,
-    )?;
+    let select = dialect.select_clause(columns, &model_ir.metadata_columns)?;
+    let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
 
-    let mut sql = format!("{select}\nFROM {source}");
+    let mut sql = format!("{select}\nFROM {source_ref}");
 
     if let MaterializationStrategy::Incremental {
         timestamp_column, ..
-    } = &plan.strategy
+    } = &model_ir.materialization
     {
         let target = dialect.format_table_ref(
-            &plan.target.catalog,
-            &plan.target.schema,
-            &plan.target.table,
+            &model_ir.target.catalog,
+            &model_ir.target.schema,
+            &model_ir.target.table,
         )?;
 
         let where_clause = dialect.watermark_where(timestamp_column, &target)?;
@@ -126,25 +95,6 @@ pub fn generate_select_sql(
     }
 
     Ok(sql)
-}
-
-/// Generate SELECT SQL without any watermark filter (full refresh semantics).
-///
-/// Used by `generate_create_table_as_sql` and `generate_merge_sql` to avoid
-/// cloning the entire `ReplicationPlan` just to override the strategy.
-fn generate_select_sql_no_watermark(
-    plan: &ReplicationPlan,
-    dialect: &dyn SqlDialect,
-) -> Result<String, SqlGenError> {
-    let select = dialect.select_clause(&plan.columns, &plan.metadata_columns)?;
-
-    let source = dialect.format_table_ref(
-        &plan.source.catalog,
-        &plan.source.schema,
-        &plan.source.table,
-    )?;
-
-    Ok(format!("{select}\nFROM {source}"))
 }
 
 /// Generates `INSERT INTO <target> SELECT ...` using the given dialect.
@@ -157,11 +107,13 @@ pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = replication_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Replication {
+        return Err(variant_mismatch(model_ir, "Replication"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
     let select = generate_select_sql(model_ir, dialect)?;
     Ok(dialect.insert_into(&target, &select))
@@ -177,14 +129,27 @@ pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = replication_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Replication {
+        return Err(variant_mismatch(model_ir, "Replication"));
+    }
+    let columns = model_ir
+        .columns
+        .as_ref()
+        .expect("Replication variant guarantees `columns` is Some");
+    let source = model_ir
+        .source
+        .as_ref()
+        .expect("Replication variant guarantees `source` is Some");
+
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
-    let select = generate_select_sql_no_watermark(&plan, dialect)?;
+    let select_clause = dialect.select_clause(columns, &model_ir.metadata_columns)?;
+    let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+    let select = format!("{select_clause}\nFROM {source_ref}");
 
     Ok(dialect.create_table_as(&target, &select))
 }
@@ -199,14 +164,11 @@ pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = replication_from_ir(model_ir)?;
-    let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
-    )?;
+    if model_ir.variant() != ModelIrVariant::Replication {
+        return Err(variant_mismatch(model_ir, "Replication"));
+    }
 
-    let (unique_key, update_columns) = match &plan.strategy {
+    let (unique_key, update_columns) = match &model_ir.materialization {
         MaterializationStrategy::Merge {
             unique_key,
             update_columns,
@@ -216,7 +178,24 @@ pub fn generate_merge_sql(
         }
     };
 
-    let select = generate_select_sql_no_watermark(&plan, dialect)?;
+    let columns = model_ir
+        .columns
+        .as_ref()
+        .expect("Replication variant guarantees `columns` is Some");
+    let source = model_ir
+        .source
+        .as_ref()
+        .expect("Replication variant guarantees `source` is Some");
+
+    let target = dialect.format_table_ref(
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
+    )?;
+
+    let select_clause = dialect.select_clause(columns, &model_ir.metadata_columns)?;
+    let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+    let select = format!("{select_clause}\nFROM {source_ref}");
 
     Ok(dialect.merge_into(&target, &select, unique_key, update_columns)?)
 }
@@ -238,15 +217,17 @@ pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let plan = transformation_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
     // Validate all source references
-    for source in &plan.sources {
+    for source in &model_ir.sources {
         dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
     }
 
@@ -257,27 +238,38 @@ pub fn generate_transformation_sql(
     // `generate_transformation_initial_ddl` when missing (Merge today;
     // Incremental / DeleteInsert / Microbatch wired in as their live smoke
     // tests land). Here we handle FullRefresh which always does CTAS.
-    if let Some(ref format) = plan.format {
-        if matches!(plan.strategy, MaterializationStrategy::FullRefresh) {
-            let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
+    if let Some(ref format) = model_ir.format {
+        if matches!(
+            model_ir.materialization,
+            MaterializationStrategy::FullRefresh
+        ) {
+            let opts = model_ir
+                .format_options
+                .as_ref()
+                .cloned()
+                .unwrap_or_default();
             return Ok(lakehouse::generate_lakehouse_ddl(
-                format, &target, &plan.sql, &opts, dialect,
+                format,
+                &target,
+                &model_ir.sql,
+                &opts,
+                dialect,
             )?);
         }
     }
 
-    match &plan.strategy {
+    match &model_ir.materialization {
         MaterializationStrategy::FullRefresh => {
-            Ok(vec![dialect.create_table_as(&target, &plan.sql)])
+            Ok(vec![dialect.create_table_as(&target, &model_ir.sql)])
         }
         MaterializationStrategy::Incremental { .. } => {
-            Ok(vec![dialect.insert_into(&target, &plan.sql)])
+            Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
         MaterializationStrategy::Merge {
             unique_key,
             update_columns,
         } => {
-            let stmt = dialect.merge_into(&target, &plan.sql, unique_key, update_columns)?;
+            let stmt = dialect.merge_into(&target, &model_ir.sql, unique_key, update_columns)?;
             Ok(vec![stmt])
         }
         MaterializationStrategy::MaterializedView => {
@@ -322,7 +314,7 @@ pub fn generate_transformation_sql(
                 end = window.end.format("%Y-%m-%d %H:%M:%S"),
             );
 
-            let substituted = substitute_partition_placeholders(&plan.sql, window);
+            let substituted = substitute_partition_placeholders(&model_ir.sql, window);
 
             Ok(dialect.insert_overwrite_partition(&target, &filter, &substituted)?)
         }
@@ -344,9 +336,9 @@ pub fn generate_transformation_sql(
                 "DELETE FROM {target} WHERE ({partition_cols}) IN (\
                  SELECT DISTINCT {partition_cols} FROM ({source_sql}) AS _rocky_incoming\
                  )",
-                source_sql = plan.sql,
+                source_sql = model_ir.sql,
             );
-            let insert_sql = dialect.insert_into(&target, &plan.sql);
+            let insert_sql = dialect.insert_into(&target, &model_ir.sql);
             Ok(vec![delete_sql, insert_sql])
         }
         MaterializationStrategy::Microbatch {
@@ -356,7 +348,7 @@ pub fn generate_transformation_sql(
             // the timestamp column. The runtime handles batch windowing;
             // SQL gen emits a simple INSERT with watermark filter.
             validation::validate_identifier(timestamp_column)?;
-            Ok(vec![dialect.insert_into(&target, &plan.sql)])
+            Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
     }
 }
@@ -389,11 +381,13 @@ pub fn generate_time_interval_bootstrap_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = transformation_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
     // Sentinel window: start == end → half-open [start, end) is empty.
@@ -411,14 +405,18 @@ pub fn generate_time_interval_bootstrap_sql(
         end: sentinel,
     };
 
-    let body = substitute_partition_placeholders(&plan.sql, &bootstrap_window);
+    let body = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
 
     // When a lakehouse format is specified, the bootstrap table must be
     // created using format-specific DDL (e.g., USING DELTA / USING ICEBERG)
     // so the partitioning, clustering, and table properties are applied from
     // the very first creation.
-    if let Some(ref format) = plan.format {
-        let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
+    if let Some(ref format) = model_ir.format {
+        let opts = model_ir
+            .format_options
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
         let stmts = lakehouse::generate_lakehouse_ddl(format, &target, &body, &opts, dialect)?;
         // generate_lakehouse_ddl returns Vec<String>; join into a single
         // statement since the bootstrap function returns String.
@@ -452,21 +450,31 @@ pub fn generate_transformation_initial_ddl(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let plan = transformation_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
-    if let Some(ref format) = plan.format {
-        let opts = plan.format_options.as_ref().cloned().unwrap_or_default();
+    if let Some(ref format) = model_ir.format {
+        let opts = model_ir
+            .format_options
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
         return Ok(lakehouse::generate_lakehouse_ddl(
-            format, &target, &plan.sql, &opts, dialect,
+            format,
+            &target,
+            &model_ir.sql,
+            &opts,
+            dialect,
         )?);
     }
 
-    Ok(vec![dialect.create_table_as(&target, &plan.sql)])
+    Ok(vec![dialect.create_table_as(&target, &model_ir.sql)])
 }
 
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
@@ -498,16 +506,18 @@ pub fn generate_materialized_view_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = transformation_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
     Ok(format!(
         "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{sql}",
-        sql = plan.sql
+        sql = model_ir.sql
     ))
 }
 
@@ -523,11 +533,13 @@ pub fn generate_dynamic_table_sql(
     warehouse: &str,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
-    let plan = transformation_from_ir(model_ir)?;
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
     // Validate target_lag and warehouse to prevent injection
@@ -536,7 +548,7 @@ pub fn generate_dynamic_table_sql(
 
     Ok(format!(
         "CREATE OR REPLACE DYNAMIC TABLE {target}\n  TARGET_LAG = '{target_lag}'\n  WAREHOUSE = {warehouse}\nAS\n{sql}",
-        sql = plan.sql
+        sql = model_ir.sql
     ))
 }
 
@@ -604,29 +616,37 @@ pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, SqlGenError> {
-    let plan = snapshot_from_ir(model_ir)?;
-    let source = dialect.format_table_ref(
-        &plan.source.catalog,
-        &plan.source.schema,
-        &plan.source.table,
-    )?;
+    if model_ir.variant() != ModelIrVariant::Snapshot {
+        return Err(variant_mismatch(model_ir, "Snapshot"));
+    }
+    let source_ref = model_ir
+        .source
+        .as_ref()
+        .expect("Snapshot variant guarantees `source` is Some");
+    let updated_at = model_ir
+        .updated_at
+        .as_ref()
+        .expect("Snapshot variant guarantees `updated_at` is Some");
+
+    let source =
+        dialect.format_table_ref(&source_ref.catalog, &source_ref.schema, &source_ref.table)?;
     let target = dialect.format_table_ref(
-        &plan.target.catalog,
-        &plan.target.schema,
-        &plan.target.table,
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
     )?;
 
-    if plan.unique_key.is_empty() {
+    if model_ir.unique_key.is_empty() {
         return Err(SqlGenError::MergeNoKey);
     }
 
     // Validate identifiers
-    for k in &plan.unique_key {
+    for k in &model_ir.unique_key {
         validation::validate_identifier(k)?;
     }
-    validation::validate_identifier(&plan.updated_at)?;
+    validation::validate_identifier(updated_at)?;
 
-    let join_cond = plan
+    let join_cond = model_ir
         .unique_key
         .iter()
         .map(|k| format!("target.{k} = source.{k}"))
@@ -654,7 +674,6 @@ pub fn generate_snapshot_sql(
            UPDATE SET valid_to = CURRENT_TIMESTAMP \
          WHEN NOT MATCHED THEN \
            INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)",
-        updated_at = plan.updated_at,
     );
     stmts.push(merge);
 
@@ -675,13 +694,13 @@ pub fn generate_snapshot_sql(
            SELECT 1 FROM {target} AS existing \
            WHERE {existing_join_cond} AND existing.valid_to IS NULL\
          )",
-        self_join_cond = plan
+        self_join_cond = model_ir
             .unique_key
             .iter()
             .map(|k| format!("t2.{k} = source.{k}"))
             .collect::<Vec<_>>()
             .join(" AND "),
-        existing_join_cond = plan
+        existing_join_cond = model_ir
             .unique_key
             .iter()
             .map(|k| format!("existing.{k} = source.{k}"))
@@ -691,7 +710,7 @@ pub fn generate_snapshot_sql(
     stmts.push(insert_new);
 
     // Statement 4 (optional): Invalidate hard-deleted rows
-    if plan.invalidate_hard_deletes {
+    if model_ir.invalidate_hard_deletes {
         let invalidate = format!(
             "UPDATE {target} SET valid_to = CURRENT_TIMESTAMP \
              WHERE valid_to IS NULL \
