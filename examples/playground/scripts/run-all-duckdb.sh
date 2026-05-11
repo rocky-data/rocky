@@ -47,7 +47,8 @@ for run in pocs/*/*/run.sh; do
     # standalone POC crate (resolving deps from crates.io and compiling
     # tokio/serde/etc.) consistently exceeds the 60s smoke timeout. These
     # POCs are still verified by their own `cargo test` invocation.
-    if grep -qE 'cargo\s+(check|build|test|run)' "$run" 2>/dev/null; then
+    # Anchor at line start so `echo "=== cargo check ..."` doesn't match.
+    if grep -qE '^[[:space:]]*cargo[[:space:]]+(check|build|test|run)\b' "$run" 2>/dev/null; then
         echo "--- SKIP $poc_dir (Rust toolchain — cold cargo build exceeds smoke timeout)"
         skipped=$((skipped + 1))
         continue
