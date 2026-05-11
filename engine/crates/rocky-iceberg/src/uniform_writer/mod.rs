@@ -213,6 +213,23 @@ impl UniformWriter {
             "exhausted {COND_PUT_RETRY_BUDGET} retries chasing next_commit_version"
         )))
     }
+
+    /// Trigger `MSCK REPAIR TABLE <fqtn> SYNC METADATA` on the warehouse so
+    /// UniForm regenerates the Iceberg metadata next to the table.
+    ///
+    /// Callers should run this after every successful [`Self::write_batch`]
+    /// so cross-engine readers (DuckDB iceberg_scan, Iceberg-aware Trino,
+    /// etc.) see the new commit. Photon reads via the Delta surface
+    /// directly and does not need MSCK.
+    ///
+    /// Phase 1 makes this a separate call so callers can batch multiple
+    /// writes and trigger one MSCK at the end. The default `write_batch`
+    /// path does not call it implicitly.
+    pub async fn sync_iceberg_metadata(&self) -> Result<()> {
+        let sql = format!("MSCK REPAIR TABLE {} SYNC METADATA", self.config.fqtn());
+        tracing::debug!(sql = %sql, "issuing MSCK REPAIR to sync iceberg metadata");
+        self.sql.execute(&sql).await
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +259,40 @@ mod tests {
         async fn execute(&self, _sql: &str) -> Result<()> {
             panic!("write_batch must not call SqlClient::execute");
         }
+    }
+
+    /// Records every SQL statement issued for assertion in tests.
+    #[derive(Default)]
+    struct RecordingSqlClient {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SqlClient for RecordingSqlClient {
+        async fn execute(&self, sql: &str) -> Result<()> {
+            self.log.lock().unwrap().push(sql.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_iceberg_metadata_issues_msck_repair() {
+        let recorder = Arc::new(RecordingSqlClient::default());
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "tbl".into(),
+                prefix: "p".into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+            recorder.clone(),
+        );
+        writer.sync_iceberg_metadata().await.unwrap();
+        let log = recorder.log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], "MSCK REPAIR TABLE cat.sch.tbl SYNC METADATA");
     }
 
     /// Seed an `InMemory` object store with a minimal Phase-1-compatible
