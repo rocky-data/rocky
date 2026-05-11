@@ -18,6 +18,15 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = { workspace = true }
 
+# Wave 2 — content-addressed UniForm writer. Storage abstraction (portable
+# across S3 / GCS / Azure), in-memory Arrow / Parquet construction, and
+# blake3 for content-addressing the Parquet bytes.
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+
 [dev-dependencies]
 wiremock = { workspace = true }
 

@@ -3943,8 +3943,13 @@ dependencies = [
 name = "rocky-iceberg"
 version = "1.29.0"
 dependencies = [
+ "arrow 58.3.0",
  "async-trait",
+ "blake3",
+ "bytes",
  "chrono",
+ "object_store",
+ "parquet",
  "percent-encoding",
  "reqwest",
  "rocky-core",
