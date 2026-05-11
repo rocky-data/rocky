@@ -3643,14 +3643,12 @@ pub(crate) async fn execute_models(
                 continue;
             }
 
-            let plan = model.to_plan();
-            let model_ir =
-                rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(plan.clone()));
+            let model_ir = model.to_model_ir();
             let target_ref = dialect
                 .format_table_ref(
-                    &plan.target.catalog,
-                    &plan.target.schema,
-                    &plan.target.table,
+                    &model_ir.target.catalog,
+                    &model_ir.target.schema,
+                    &model_ir.target.table,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -3667,13 +3665,13 @@ pub(crate) async fn execute_models(
             // gets bootstrapped only when a live smoke test for that
             // strategy lands and verifies the fix end-to-end.
             if matches!(
-                plan.strategy,
+                model_ir.materialization,
                 rocky_core::ir::MaterializationStrategy::Merge { .. }
             ) {
                 let target_table_struct = rocky_core::ir::TableRef {
-                    catalog: plan.target.catalog.clone(),
-                    schema: plan.target.schema.clone(),
-                    table: plan.target.table.clone(),
+                    catalog: model_ir.target.catalog.clone(),
+                    schema: model_ir.target.schema.clone(),
+                    table: model_ir.target.table.clone(),
                 };
                 if warehouse
                     .describe_table(&target_table_struct)
@@ -3755,12 +3753,12 @@ pub(crate) async fn execute_models(
             let model_duration_ms = model_start.elapsed().as_millis() as u64;
             let target_table_full_name = format!(
                 "{}.{}.{}",
-                plan.target.catalog, plan.target.schema, plan.target.table
+                model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
             );
             let asset_key = vec![
-                plan.target.catalog.clone(),
-                plan.target.schema.clone(),
-                plan.target.table.clone(),
+                model_ir.target.catalog.clone(),
+                model_ir.target.schema.clone(),
+                model_ir.target.table.clone(),
             ];
             output.materializations.push(MaterializationOutput {
                 asset_key,
@@ -3768,7 +3766,7 @@ pub(crate) async fn execute_models(
                 duration_ms: model_duration_ms,
                 started_at: model_started_at,
                 metadata: MaterializationMetadata {
-                    strategy: transformation_strategy_name(&plan.strategy).to_string(),
+                    strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
                     watermark: None,
                     target_table_full_name: Some(target_table_full_name),
                     sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
@@ -3936,10 +3934,7 @@ async fn execute_time_interval_model(
     };
     let target_exists = warehouse.describe_table(&target_ref_struct).await.is_ok();
     if !target_exists {
-        let bootstrap_plan = model.to_plan();
-        let bootstrap_ir = rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(
-            bootstrap_plan.clone(),
-        ));
+        let bootstrap_ir = model.to_model_ir();
         let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_ir, dialect)
             .with_context(|| {
             format!("failed to render bootstrap SQL for model '{model_name}'")
@@ -4104,18 +4099,16 @@ async fn run_one_partition(
         };
     }
 
-    // Build the per-partition plan: clone the base TransformationPlan and
-    // inject the PartitionWindow into the strategy.
-    let mut tplan = model.to_plan();
-    if let MaterializationStrategy::TimeInterval { window, .. } = &mut tplan.strategy {
+    // Build the per-partition IR: take the base ModelIr and inject the
+    // PartitionWindow into the TimeInterval strategy.
+    let mut tplan_ir = model.to_model_ir();
+    if let MaterializationStrategy::TimeInterval { window, .. } = &mut tplan_ir.materialization {
         *window = Some(partition_plan.window.clone());
     }
 
     // Generate SQL — this is where dialect.insert_overwrite_partition() gets
     // called and the @start_date / @end_date placeholders are substituted
     // (Phase 2D).
-    let tplan_ir =
-        rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(tplan.clone()));
     let stmts = match sql_gen::generate_transformation_sql(&tplan_ir, dialect) {
         Ok(s) => s,
         Err(e) => {
@@ -4426,43 +4419,41 @@ async fn process_table(
         }
     }
 
-    // Build replication plan
-    let replication = ReplicationPlan {
-        source: SourceRef {
-            catalog: task.source_catalog.clone(),
-            schema: task.source_schema.clone(),
-            table: task.table_name.clone(),
-        },
-        target: TargetRef {
+    // Build replication IR directly.
+    let strategy = if pipeline.strategy == "incremental" {
+        MaterializationStrategy::Incremental {
+            timestamp_column: pipeline.timestamp_column.clone(),
+        }
+    } else {
+        MaterializationStrategy::FullRefresh
+    };
+    let model_ir = ModelIr::replication(
+        TargetRef {
             catalog: task.target_catalog.clone(),
             schema: task.target_schema.clone(),
             table: task.table_name.clone(),
         },
-        strategy: if pipeline.strategy == "incremental" {
-            MaterializationStrategy::Incremental {
-                timestamp_column: pipeline.timestamp_column.clone(),
-            }
-        } else {
-            MaterializationStrategy::FullRefresh
+        strategy.clone(),
+        SourceRef {
+            catalog: task.source_catalog.clone(),
+            schema: task.source_schema.clone(),
+            table: task.table_name.clone(),
         },
-        columns: ColumnSelection::All,
-        metadata_columns: task.metadata_columns.clone(),
-        governance: GovernanceConfig {
+        ColumnSelection::All,
+        task.metadata_columns.clone(),
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
             auto_create_schemas: pipeline.target.governance.auto_create_schemas,
         },
-    };
-
-    // sql_gen consumes the typed IR directly.
-    let model_ir = ModelIr::from(&Plan::Replication(replication.clone()));
+    );
 
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
         sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
     } else {
-        match &replication.strategy {
+        match &strategy {
             MaterializationStrategy::FullRefresh => {
                 strategy_name = "full_refresh";
                 sql_gen::generate_create_table_as_sql(&model_ir, dialect)?

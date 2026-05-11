@@ -238,43 +238,40 @@ fn bench_sql_generation(c: &mut Criterion) {
     let dialect = DuckDbSqlDialect;
 
     for size in [10, 100, 500] {
-        // Pre-build replication plans
-        let plans: Vec<ReplicationPlan> = (0..size)
-            .map(|i| ReplicationPlan {
-                source: SourceRef {
-                    catalog: String::new(),
-                    schema: "source".into(),
-                    table: format!("table_{i}"),
-                },
-                target: TargetRef {
-                    catalog: String::new(),
-                    schema: "target".into(),
-                    table: format!("table_{i}"),
-                },
-                strategy: if i % 3 == 0 {
-                    MaterializationStrategy::FullRefresh
-                } else {
-                    MaterializationStrategy::Incremental {
-                        timestamp_column: "_fivetran_synced".into(),
-                    }
-                },
-                columns: ColumnSelection::All,
-                metadata_columns: vec![MetadataColumn {
-                    name: "_loaded_by".into(),
-                    data_type: "VARCHAR".into(),
-                    value: "NULL".into(),
-                }],
-                governance: GovernanceConfig {
-                    permissions_file: None,
-                    auto_create_catalogs: false,
-                    auto_create_schemas: false,
-                },
+        // Pre-build replication IRs directly (no Plan intermediate).
+        let model_irs: Vec<ModelIr> = (0..size)
+            .map(|i| {
+                ModelIr::replication(
+                    TargetRef {
+                        catalog: String::new(),
+                        schema: "target".into(),
+                        table: format!("table_{i}"),
+                    },
+                    if i % 3 == 0 {
+                        MaterializationStrategy::FullRefresh
+                    } else {
+                        MaterializationStrategy::Incremental {
+                            timestamp_column: "_fivetran_synced".into(),
+                        }
+                    },
+                    SourceRef {
+                        catalog: String::new(),
+                        schema: "source".into(),
+                        table: format!("table_{i}"),
+                    },
+                    ColumnSelection::All,
+                    vec![MetadataColumn {
+                        name: "_loaded_by".into(),
+                        data_type: "VARCHAR".into(),
+                        value: "NULL".into(),
+                    }],
+                    GovernanceConfig {
+                        permissions_file: None,
+                        auto_create_catalogs: false,
+                        auto_create_schemas: false,
+                    },
+                )
             })
-            .collect();
-
-        let model_irs: Vec<ModelIr> = plans
-            .iter()
-            .map(|plan| ModelIr::from(&Plan::Replication(plan.clone())))
             .collect();
 
         group.bench_with_input(

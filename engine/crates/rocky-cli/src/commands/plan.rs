@@ -144,29 +144,27 @@ pub async fn plan(
                 _ => (MaterializationStrategy::FullRefresh, "full_refresh_copy"),
             };
 
-            let plan = ReplicationPlan {
-                source: SourceRef {
-                    catalog: effective_source_catalog.clone(),
-                    schema: conn.schema.clone(),
-                    table: table.name.clone(),
-                },
-                target: TargetRef {
+            // sql_gen consumes the typed IR directly.
+            let model_ir = ModelIr::replication(
+                TargetRef {
                     catalog: effective_target_catalog.clone(),
                     schema: target_schema.clone(),
                     table: table.name.clone(),
                 },
-                strategy: strategy.clone(),
-                columns: ColumnSelection::All,
+                strategy.clone(),
+                SourceRef {
+                    catalog: effective_source_catalog.clone(),
+                    schema: conn.schema.clone(),
+                    table: table.name.clone(),
+                },
+                ColumnSelection::All,
                 metadata_columns,
-                governance: GovernanceConfig {
+                GovernanceConfig {
                     permissions_file: None,
                     auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
                     auto_create_schemas: pipeline.target.governance.auto_create_schemas,
                 },
-            };
-
-            // sql_gen consumes the typed IR directly.
-            let model_ir = ModelIr::from(&Plan::Replication(plan.clone()));
+            );
 
             // Pick the right SQL generator for the materialization strategy.
             // Full refresh uses CREATE OR REPLACE TABLE AS so the target doesn't

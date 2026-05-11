@@ -9,8 +9,7 @@ use thiserror::Error;
 use crate::config::{ModelBudgetConfig, substitute_env_vars};
 use crate::dag::DagNode;
 use crate::ir::{
-    GovernanceConfig, MaterializationStrategy, ModelIr, Plan, SourceRef, TargetRef,
-    TransformationPlan,
+    GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TransformationPlan,
 };
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
@@ -658,9 +657,9 @@ impl Model {
 
     /// Construct the per-model [`ModelIr`] for this transformation model.
     ///
-    /// Reuses [`Self::to_plan`] so the materialization-strategy lowering
-    /// stays in one place; the resulting [`Plan::Transformation`] is fed to
-    /// [`From<&Plan> for ModelIr`] and the model's own `name` overrides the
+    /// Reuses [`Self::to_plan`] to share the materialization-strategy
+    /// lowering, then assembles the IR directly without round-tripping
+    /// through [`Plan`]. The model's own `name` overrides the
     /// `target.table`-derived default so the IR carries the project-unique
     /// identifier rather than the warehouse table name.
     ///
@@ -668,10 +667,26 @@ impl Model {
     /// — they are populated by the compiler / governance layers downstream
     /// when richer typed data is available.
     pub fn to_model_ir(&self) -> ModelIr {
-        let plan = Plan::Transformation(self.to_plan());
-        let mut ir = ModelIr::from(&plan);
-        ir.name = std::sync::Arc::from(self.config.name.as_str());
-        ir
+        let plan = self.to_plan();
+        ModelIr {
+            name: std::sync::Arc::from(self.config.name.as_str()),
+            sql: plan.sql,
+            typed_columns: Vec::new(),
+            lineage_edges: Vec::new(),
+            materialization: plan.strategy,
+            governance: plan.governance,
+            target: plan.target,
+            column_masks: Vec::new(),
+            source: None,
+            sources: plan.sources,
+            columns: None,
+            metadata_columns: Vec::new(),
+            unique_key: Vec::new(),
+            updated_at: None,
+            invalidate_hard_deletes: false,
+            format: plan.format,
+            format_options: plan.format_options,
+        }
     }
 }
 
