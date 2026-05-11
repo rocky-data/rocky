@@ -220,7 +220,7 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
                 model: u.model.clone(),
                 category: WarningCategory::UnsupportedTest,
                 message: format!(
-                    "dbt test '{name}' on {where_} is outside the v0 canonical set (unique, not_null, accepted_values, relationships) — not translated",
+                    "dbt test '{name}' on {where_} is outside the supported set (unique, not_null, accepted_values, relationships) — not translated",
                     name = u.test_name,
                 ),
                 suggestion: Some(
@@ -585,7 +585,9 @@ fn import_single_model(
         model: name.to_string(),
         category: WarningCategory::UnsupportedMaterialization,
         message: msg,
-        suggestion: None,
+        suggestion: Some(
+            "set `type = \"full_refresh\"` (or `\"ephemeral\"` for staging models) in the emitted sidecar".to_string(),
+        ),
     }));
 
     // If is_incremental() was detected and config didn't already set incremental,
@@ -616,7 +618,9 @@ fn import_single_model(
                         category: WarningCategory::UnsupportedMaterialization,
                         message: "project config materialized='view' — using full_refresh"
                             .to_string(),
-                        suggestion: None,
+                        suggestion: Some(
+                            "override per-model with `type = \"full_refresh\"` or `\"ephemeral\"` in the sidecar".to_string(),
+                        ),
                     });
                 }
                 _ => {}

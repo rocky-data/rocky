@@ -7,9 +7,12 @@
 //! - `rocky.toml` exists and parses as a valid Rocky config.
 //! - `models/` contains a `_defaults.toml` and one sidecar pair per dbt model.
 //! - `seeds/` mirrors the source `seeds/` verbatim.
-//! - `MIGRATION-NOTES.md` exists and lists the v0 limitations.
-//! - The translated model sidecars use the documented v0 mapping
+//! - `MIGRATION-NOTES.md` exists and lists the known limitations.
+//! - The translated model sidecars use the documented mapping
 //!   (`view → ephemeral`, `incremental → merge|incremental`, default → full_refresh).
+//! - `dbt_packages/` and `snapshots/` trees are left untouched (no models, no failures).
+//! - A model with `{% if target.name %}` lands as imported + JinjaControlFlow warning
+//!   with the `dbt-jinja-not-translated` marker in the emitted SQL.
 //! - The translated models pass `rocky-core` model loading (the closest "compiles"
 //!   signal we get without spinning up DuckDB, and what `rocky compile` walks first).
 
@@ -108,17 +111,55 @@ fn emit_runnable_repo_from_rich_fixture() {
         "seeds copied verbatim"
     );
     assert_eq!(emission.seeds_copied, 1);
-    assert!(emission.models_translated >= 3);
+    assert!(emission.models_translated >= 4);
+
+    // GA regression: `dbt_packages/` and `snapshots/` trees sit outside the
+    // walked `models/` directory; the importer must leave them alone — no
+    // ghost model imports, no failure entries.
+    assert!(
+        !result.imported.iter().any(|m| m.name == "some_macro"),
+        "dbt_packages/.../some_macro.sql must not surface as an imported model"
+    );
+    assert!(
+        !result.failed.iter().any(|f| f.name == "some_macro"),
+        "dbt_packages/.../some_macro.sql must not surface as a failure"
+    );
+    assert!(
+        !result.imported.iter().any(|m| m.name == "orders_snapshot"),
+        "snapshots/orders_snapshot.sql must not surface as an imported model"
+    );
+    assert!(
+        !result.failed.iter().any(|f| f.name == "orders_snapshot"),
+        "snapshots/orders_snapshot.sql must not surface as a failure"
+    );
+
+    // GA regression: a model with `{% if target.name == 'prod' %}` must
+    // import cleanly, surface a JinjaControlFlow warning, and carry the
+    // documented TODO marker in the emitted SQL.
+    assert!(
+        result.imported.iter().any(|m| m.name == "env_branched"),
+        "env_branched.sql must be in imported models"
+    );
+    assert!(
+        result.warnings.iter().any(|w| w.model == "env_branched"
+            && matches!(w.category, dbt::WarningCategory::JinjaControlFlow)),
+        "env_branched must surface a JinjaControlFlow warning for `{{% if target.name %}}`"
+    );
+    let env_branched_sql = std::fs::read_to_string(models_dir.join("env_branched.sql")).unwrap();
+    assert!(
+        env_branched_sql.contains("TODO: dbt-jinja-not-translated"),
+        "env_branched.sql must carry the dbt-jinja-not-translated marker"
+    );
 
     // Each model has a sidecar pair.
-    for name in ["stg_customers", "stg_orders", "fct_orders"] {
+    for name in ["stg_customers", "stg_orders", "fct_orders", "env_branched"] {
         let sql = models_dir.join(format!("{name}.sql"));
         let toml = models_dir.join(format!("{name}.toml"));
         assert!(sql.exists(), "{name}.sql exists");
         assert!(toml.exists(), "{name}.toml exists");
     }
 
-    // v0 strategy mapping check.
+    // Strategy mapping check.
     let stg_customers_toml =
         std::fs::read_to_string(models_dir.join("stg_customers.toml")).unwrap();
     assert!(
@@ -173,7 +214,14 @@ fn emit_runnable_repo_from_rich_fixture() {
 
     // MIGRATION-NOTES content checks.
     let notes = std::fs::read_to_string(&migration_notes).unwrap();
-    assert!(notes.contains("Not Translated"));
+    assert!(
+        notes.contains("Known limitations"),
+        "GA framing: MIGRATION-NOTES must use 'Known limitations' heading"
+    );
+    assert!(
+        !notes.to_lowercase().contains("v0"),
+        "GA framing: MIGRATION-NOTES must not reference 'v0'"
+    );
     assert!(notes.contains("Required env vars"));
     assert!(notes.contains("dbt generic tests"));
 
@@ -233,11 +281,10 @@ fn emit_runnable_repo_from_rich_fixture() {
         "expected an UnsupportedTest warning for dbt_utils.accepted_range"
     );
 
-    // Counter check: the four canonical mappings flow through `tests_converted`
-    // (was misclassified as `tests_converted_custom` in v0). Total tests in
-    // the fixture: order_id × {unique, not_null}, customer_id × {not_null,
-    // relationships}, customer_id × {unique, not_null}, status × accepted_values,
-    // amount × dbt_utils.accepted_range.
+    // Counter check: the four canonical mappings flow through `tests_converted`.
+    // Total tests in the fixture: order_id × {unique, not_null}, customer_id ×
+    // {not_null, relationships}, customer_id × {unique, not_null}, status ×
+    // accepted_values, amount × dbt_utils.accepted_range.
     assert_eq!(result.tests_found, 8, "all schema.yml tests are counted");
     assert_eq!(result.tests_skipped, 1, "one non-canonical test skipped");
     assert_eq!(
