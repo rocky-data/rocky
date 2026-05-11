@@ -151,8 +151,8 @@ notify = "8"
 
 # DataFusion
 datafusion = "45"
-arrow = "54"
-parquet = "54"
+arrow = "58"
+parquet = "58"
 
 # WASM
 wasm-bindgen = "0.2"
