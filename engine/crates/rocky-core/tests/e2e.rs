@@ -5,51 +5,12 @@
 
 use rocky_core::ir::{
     ColumnInfo, ColumnSelection, DriftAction, GovernanceConfig, MaterializationStrategy,
-    MetadataColumn, ModelIr, ReplicationPlan, SnapshotPlan, SourceRef, TableRef, TargetRef,
-    TransformationPlan, WatermarkState,
+    MetadataColumn, ModelIr, SourceRef, TableRef, TargetRef, WatermarkState,
 };
 use rocky_core::state::StateStore;
 use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
 use rocky_core::{drift, sql_gen};
 use tempfile::TempDir;
-
-/// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
-fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
-    ModelIr::replication(
-        plan.target.clone(),
-        plan.strategy.clone(),
-        plan.source.clone(),
-        plan.columns.clone(),
-        plan.metadata_columns.clone(),
-        plan.governance.clone(),
-    )
-}
-
-/// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
-fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-    ModelIr::transformation(
-        plan.target.clone(),
-        plan.strategy.clone(),
-        plan.sources.clone(),
-        plan.sql.clone(),
-        plan.governance.clone(),
-        plan.format.clone(),
-        plan.format_options.clone(),
-    )
-}
-
-/// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
-#[allow(dead_code)]
-fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
-    ModelIr::snapshot(
-        plan.target.clone(),
-        plan.source.clone(),
-        plan.unique_key.clone(),
-        plan.updated_at.clone(),
-        plan.invalidate_hard_deletes,
-        plan.governance.clone(),
-    )
-}
 
 // ---------------------------------------------------------------------------
 // Test dialect (mirrors Databricks behavior for integration tests)
@@ -208,32 +169,32 @@ fn temp_state() -> (StateStore, TempDir) {
     (store, dir)
 }
 
-/// Returns a standard replication plan for testing.
-fn sample_replication_plan(strategy: MaterializationStrategy) -> ReplicationPlan {
-    ReplicationPlan {
-        source: SourceRef {
-            catalog: "source_catalog".into(),
-            schema: "src__acme__us_west__shopify".into(),
-            table: "orders".into(),
-        },
-        target: TargetRef {
+/// Returns a standard replication [`ModelIr`] for testing.
+fn sample_replication_ir(strategy: MaterializationStrategy) -> ModelIr {
+    ModelIr::replication(
+        TargetRef {
             catalog: "acme_warehouse".into(),
             schema: "staging__us_west__shopify".into(),
             table: "orders".into(),
         },
         strategy,
-        columns: ColumnSelection::All,
-        metadata_columns: vec![MetadataColumn {
+        SourceRef {
+            catalog: "source_catalog".into(),
+            schema: "src__acme__us_west__shopify".into(),
+            table: "orders".into(),
+        },
+        ColumnSelection::All,
+        vec![MetadataColumn {
             name: "_loaded_by".into(),
             data_type: "STRING".into(),
             value: "NULL".into(),
         }],
-        governance: GovernanceConfig {
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-    }
+    )
 }
 
 // ===========================================================================
@@ -245,10 +206,10 @@ fn test_full_refresh_pipeline() {
     let (store, _dir) = temp_state();
     let dialect = TestDialect;
 
-    let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
+    let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
 
     // Generate CREATE TABLE AS SELECT SQL (full refresh)
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
 
     // Verify SQL structure
     assert!(
@@ -303,12 +264,12 @@ fn test_incremental_pipeline_with_watermark() {
     // Build an incremental plan; the watermark itself is read from the
     // state store at SQL-generation time, not carried on the strategy.
     let _wm = store.get_watermark(table_key).unwrap();
-    let plan = sample_replication_plan(MaterializationStrategy::Incremental {
+    let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
 
     // Generate INSERT INTO ... SELECT SQL (incremental append)
-    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
 
     // Verify incremental SQL structure
     assert!(
@@ -559,29 +520,30 @@ fn test_run_history_flow() {
 fn test_transformation_full_refresh() {
     let dialect = TestDialect;
 
-    let plan = TransformationPlan {
-        sources: vec![SourceRef {
-            catalog: "source".into(),
-            schema: "raw".into(),
-            table: "orders".into(),
-        }],
-        target: TargetRef {
+    let plan = ModelIr::transformation(
+        TargetRef {
             catalog: "analytics".into(),
             schema: "marts".into(),
             table: "order_summary".into(),
         },
-        strategy: MaterializationStrategy::FullRefresh,
-        sql: "SELECT customer_id, COUNT(*) as order_count FROM source.raw.orders GROUP BY customer_id".into(),
-        governance: GovernanceConfig {
+        MaterializationStrategy::FullRefresh,
+        vec![SourceRef {
+            catalog: "source".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        }],
+        "SELECT customer_id, COUNT(*) as order_count FROM source.raw.orders GROUP BY customer_id"
+            .into(),
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-        format: None,
-        format_options: None,
-    };
+        None,
+        None,
+    );
 
-    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
 
@@ -604,31 +566,31 @@ fn test_transformation_full_refresh() {
 fn test_transformation_incremental() {
     let dialect = TestDialect;
 
-    let plan = TransformationPlan {
-        sources: vec![SourceRef {
-            catalog: "cat".into(),
-            schema: "raw".into(),
-            table: "events".into(),
-        }],
-        target: TargetRef {
+    let plan = ModelIr::transformation(
+        TargetRef {
             catalog: "cat".into(),
             schema: "silver".into(),
             table: "fct_events".into(),
         },
-        strategy: MaterializationStrategy::Incremental {
+        MaterializationStrategy::Incremental {
             timestamp_column: "updated_at".into(),
         },
-        sql: "SELECT * FROM cat.raw.events WHERE updated_at > '2026-01-01'".into(),
-        governance: GovernanceConfig {
+        vec![SourceRef {
+            catalog: "cat".into(),
+            schema: "raw".into(),
+            table: "events".into(),
+        }],
+        "SELECT * FROM cat.raw.events WHERE updated_at > '2026-01-01'".into(),
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-        format: None,
-        format_options: None,
-    };
+        None,
+        None,
+    );
 
-    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
     assert!(
@@ -641,32 +603,32 @@ fn test_transformation_incremental() {
 fn test_transformation_merge() {
     let dialect = TestDialect;
 
-    let plan = TransformationPlan {
-        sources: vec![SourceRef {
-            catalog: "cat".into(),
-            schema: "raw".into(),
-            table: "users".into(),
-        }],
-        target: TargetRef {
+    let plan = ModelIr::transformation(
+        TargetRef {
             catalog: "cat".into(),
             schema: "silver".into(),
             table: "dim_users".into(),
         },
-        strategy: MaterializationStrategy::Merge {
+        MaterializationStrategy::Merge {
             unique_key: vec!["user_id".into()],
             update_columns: ColumnSelection::All,
         },
-        sql: "SELECT user_id, name, email FROM cat.raw.users".into(),
-        governance: GovernanceConfig {
+        vec![SourceRef {
+            catalog: "cat".into(),
+            schema: "raw".into(),
+            table: "users".into(),
+        }],
+        "SELECT user_id, name, email FROM cat.raw.users".into(),
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-        format: None,
-        format_options: None,
-    };
+        None,
+        None,
+    );
 
-    let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), &dialect).unwrap();
+    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
     assert_eq!(stmts.len(), 1);
     let sql = &stmts[0];
     assert!(
@@ -687,31 +649,31 @@ fn test_transformation_merge() {
 fn test_merge_sql_generation() {
     let dialect = TestDialect;
 
-    let plan = ReplicationPlan {
-        source: SourceRef {
-            catalog: "source_catalog".into(),
-            schema: "src__acme__us_west__shopify".into(),
-            table: "customers".into(),
-        },
-        target: TargetRef {
+    let plan = ModelIr::replication(
+        TargetRef {
             catalog: "acme_warehouse".into(),
             schema: "staging__us_west__shopify".into(),
             table: "customers".into(),
         },
-        strategy: MaterializationStrategy::Merge {
+        MaterializationStrategy::Merge {
             unique_key: vec!["customer_id".into()],
             update_columns: ColumnSelection::All,
         },
-        columns: ColumnSelection::All,
-        metadata_columns: vec![],
-        governance: GovernanceConfig {
+        SourceRef {
+            catalog: "source_catalog".into(),
+            schema: "src__acme__us_west__shopify".into(),
+            table: "customers".into(),
+        },
+        ColumnSelection::All,
+        vec![],
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-    };
+    );
 
-    let sql = sql_gen::generate_merge_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_merge_sql(&plan, &dialect).unwrap();
 
     assert!(sql.contains("MERGE INTO"), "expected MERGE INTO: {sql}");
     assert!(
@@ -732,31 +694,31 @@ fn test_merge_sql_generation() {
 fn test_merge_composite_key() {
     let dialect = TestDialect;
 
-    let plan = ReplicationPlan {
-        source: SourceRef {
-            catalog: "source_catalog".into(),
-            schema: "src__acme__us_west__shopify".into(),
-            table: "order_items".into(),
-        },
-        target: TargetRef {
+    let plan = ModelIr::replication(
+        TargetRef {
             catalog: "acme_warehouse".into(),
             schema: "staging__us_west__shopify".into(),
             table: "order_items".into(),
         },
-        strategy: MaterializationStrategy::Merge {
+        MaterializationStrategy::Merge {
             unique_key: vec!["order_id".into(), "line_id".into()],
             update_columns: ColumnSelection::Explicit(vec!["status".into(), "amount".into()]),
         },
-        columns: ColumnSelection::All,
-        metadata_columns: vec![],
-        governance: GovernanceConfig {
+        SourceRef {
+            catalog: "source_catalog".into(),
+            schema: "src__acme__us_west__shopify".into(),
+            table: "order_items".into(),
+        },
+        ColumnSelection::All,
+        vec![],
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-    };
+    );
 
-    let sql = sql_gen::generate_merge_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_merge_sql(&plan, &dialect).unwrap();
     assert!(
         sql.contains("ON t.order_id = s.order_id AND t.line_id = s.line_id"),
         "expected composite ON clause: {sql}"
@@ -871,44 +833,38 @@ fn test_sql_injection_prevention() {
     let dialect = TestDialect;
 
     // Unsafe catalog name
-    let bad_plan = ReplicationPlan {
-        source: SourceRef {
-            catalog: "catalog; DROP TABLE users--".into(),
-            schema: "schema".into(),
-            table: "table".into(),
-        },
-        ..sample_replication_plan(MaterializationStrategy::FullRefresh)
-    };
+    let mut bad_plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    bad_plan.source = Some(SourceRef {
+        catalog: "catalog; DROP TABLE users--".into(),
+        schema: "schema".into(),
+        table: "table".into(),
+    });
     assert!(
-        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
         "should reject SQL injection in catalog name"
     );
 
     // Unsafe schema name
-    let bad_plan = ReplicationPlan {
-        source: SourceRef {
-            catalog: "cat".into(),
-            schema: "sch' OR '1'='1".into(),
-            table: "tbl".into(),
-        },
-        ..sample_replication_plan(MaterializationStrategy::FullRefresh)
-    };
+    let mut bad_plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    bad_plan.source = Some(SourceRef {
+        catalog: "cat".into(),
+        schema: "sch' OR '1'='1".into(),
+        table: "tbl".into(),
+    });
     assert!(
-        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
         "should reject SQL injection in schema name"
     );
 
     // Unsafe metadata column name
-    let bad_plan = ReplicationPlan {
-        metadata_columns: vec![MetadataColumn {
-            name: "col; DROP TABLE".into(),
-            data_type: "STRING".into(),
-            value: "NULL".into(),
-        }],
-        ..sample_replication_plan(MaterializationStrategy::FullRefresh)
-    };
+    let mut bad_plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    bad_plan.metadata_columns = vec![MetadataColumn {
+        name: "col; DROP TABLE".into(),
+        data_type: "STRING".into(),
+        value: "NULL".into(),
+    }];
     assert!(
-        sql_gen::generate_select_sql(&rep_ir(&bad_plan), &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
         "should reject SQL injection in metadata column name"
     );
 
@@ -942,8 +898,8 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let wm = store.get_watermark(table_key).unwrap();
     assert!(wm.is_none(), "no watermark on first run");
 
-    let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
+    let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
     assert!(sql.contains("CREATE OR REPLACE TABLE"));
     assert!(!sql.contains("WHERE"));
 
@@ -966,10 +922,10 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     // The watermark value lives in the state store and is consulted by the
     // SQL generator at execution time; the strategy itself no longer
     // carries it.
-    let plan = sample_replication_plan(MaterializationStrategy::Incremental {
+    let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
     assert!(sql.contains("INSERT INTO"));
     assert!(sql.contains("WHERE _fivetran_synced > ("));
 
@@ -1012,8 +968,8 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let drop_sql = drift::generate_drop_table_sql(&table, &dialect).unwrap();
     assert!(drop_sql.contains("DROP TABLE IF EXISTS"));
 
-    let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let ctas_sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
+    let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    let ctas_sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
     assert!(ctas_sql.contains("CREATE OR REPLACE TABLE"));
 }
 
@@ -1057,11 +1013,11 @@ fn test_anomaly_detection_with_state() {
 fn test_exact_incremental_sql_output() {
     let dialect = TestDialect;
 
-    let plan = sample_replication_plan(MaterializationStrategy::Incremental {
+    let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
 
-    let sql = sql_gen::generate_select_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1078,8 +1034,8 @@ WHERE _fivetran_synced > (
 fn test_exact_full_refresh_sql_output() {
     let dialect = TestDialect;
 
-    let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_select_sql(&rep_ir(&plan), &dialect).unwrap();
+    let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1092,8 +1048,8 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
 fn test_exact_ctas_sql_output() {
     let dialect = TestDialect;
 
-    let plan = sample_replication_plan(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &dialect).unwrap();
+    let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &dialect).unwrap();
 
     let expected = "\
 CREATE OR REPLACE TABLE acme_warehouse.staging__us_west__shopify.orders AS
@@ -1107,10 +1063,10 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
 fn test_exact_insert_sql_output() {
     let dialect = TestDialect;
 
-    let plan = sample_replication_plan(MaterializationStrategy::Incremental {
+    let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&rep_ir(&plan), &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
 
     let expected = "\
 INSERT INTO acme_warehouse.staging__us_west__shopify.orders
@@ -1149,7 +1105,6 @@ mod time_interval_e2e {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus, partition_key_to_window};
     use rocky_core::ir::{
         GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef,
-        TransformationPlan,
     };
     use rocky_core::models::TimeGrain;
     use rocky_core::sql_gen;
@@ -1157,19 +1112,6 @@ mod time_interval_e2e {
     use rocky_core::traits::{SqlDialect, WarehouseAdapter};
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
     use tempfile::TempDir;
-
-    /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
-    fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-        ModelIr::transformation(
-            plan.target.clone(),
-            plan.strategy.clone(),
-            plan.sources.clone(),
-            plan.sql.clone(),
-            plan.governance.clone(),
-            plan.format.clone(),
-            plan.format_options.clone(),
-        )
-    }
 
     /// SQL to seed a stg_orders table with rows across 5 partitions
     /// (2026-04-04 through 2026-04-08), 2 customers, varying revenue.
@@ -1222,29 +1164,29 @@ mod time_interval_e2e {
         adapter
     }
 
-    /// Build the TransformationPlan for the fct_daily_orders model with the
+    /// Build the [`ModelIr`] for the fct_daily_orders model with the
     /// given partition window populated.
-    fn time_interval_plan(window_key: &str) -> TransformationPlan {
+    fn time_interval_ir(window_key: &str) -> ModelIr {
         let window = partition_key_to_window(TimeGrain::Day, window_key).expect("valid daily key");
-        TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: String::new(),
-                schema: "main".into(),
-                table: "stg_orders".into(),
-            }],
-            target: TargetRef {
+        ModelIr::transformation(
+            TargetRef {
                 catalog: String::new(),
                 schema: "main".into(),
                 table: "fct_daily_orders".into(),
             },
-            strategy: MaterializationStrategy::TimeInterval {
+            MaterializationStrategy::TimeInterval {
                 time_column: "order_date".into(),
                 granularity: TimeGrain::Day,
                 window: Some(window),
             },
+            vec![SourceRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "stg_orders".into(),
+            }],
             // The model SQL: aggregate by date + customer, with the
             // @start_date / @end_date placeholders gating the upstream scan.
-            sql: "SELECT \
+            "SELECT \
                 CAST(order_at AS DATE) AS order_date, \
                 customer_id, \
                 COUNT(*) AS order_count, \
@@ -1253,14 +1195,14 @@ mod time_interval_e2e {
               WHERE order_at >= @start_date AND order_at < @end_date \
               GROUP BY 1, 2"
                 .into(),
-            governance: GovernanceConfig {
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        }
+            None,
+            None,
+        )
     }
 
     /// Extract a JSON value as u64. Used to parse COUNT(*) results, which
@@ -1287,9 +1229,9 @@ mod time_interval_e2e {
 
     /// Execute the Vec<String> from generate_transformation_sql against the
     /// adapter, in order. Returns the number of rows in the target afterward.
-    async fn execute_partition(adapter: &DuckDbWarehouseAdapter, plan: &TransformationPlan) -> u64 {
+    async fn execute_partition(adapter: &DuckDbWarehouseAdapter, plan: &ModelIr) -> u64 {
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let stmts = sql_gen::generate_transformation_sql(&xform_ir(plan), dialect)
+        let stmts = sql_gen::generate_transformation_sql(plan, dialect)
             .expect("generate time_interval SQL");
         // Sanity: the duckdb dialect emits 4 statements
         // (BEGIN/DELETE/INSERT/COMMIT) per Phase 2C.
@@ -1310,7 +1252,7 @@ mod time_interval_e2e {
     #[tokio::test]
     async fn test_time_interval_single_partition_writes_only_window() {
         let adapter = setup_with_seeds().await;
-        let plan = time_interval_plan("2026-04-07");
+        let plan = time_interval_ir("2026-04-07");
         let total_rows = execute_partition(&adapter, &plan).await;
 
         // 04-07 has 3 raw rows: customer 1 at 08:00 + 13:00 → 1 group,
@@ -1344,7 +1286,7 @@ mod time_interval_e2e {
     #[tokio::test]
     async fn test_time_interval_idempotent_rerun() {
         let adapter = setup_with_seeds().await;
-        let plan = time_interval_plan("2026-04-07");
+        let plan = time_interval_ir("2026-04-07");
 
         // Run partition 04-07 twice. Idempotency: row count must NOT
         // double on the second run.
@@ -1365,7 +1307,7 @@ mod time_interval_e2e {
         // partition's rows without disturbing the others.
         let mut total = 0u64;
         for key in ["2026-04-04", "2026-04-05", "2026-04-06", "2026-04-07"] {
-            let plan = time_interval_plan(key);
+            let plan = time_interval_ir(key);
             total = execute_partition(&adapter, &plan).await;
         }
 
@@ -1393,7 +1335,7 @@ mod time_interval_e2e {
     #[tokio::test]
     async fn test_time_interval_rerun_with_new_upstream_data_picks_up_changes() {
         let adapter = setup_with_seeds().await;
-        let plan = time_interval_plan("2026-04-07");
+        let plan = time_interval_ir("2026-04-07");
 
         // First run with the original seed → 2 output rows.
         let count_before = execute_partition(&adapter, &plan).await;
@@ -1486,10 +1428,10 @@ mod time_interval_e2e {
         // is the SQL-level proof that the placeholder substitution from
         // Phase 2D works against a real warehouse.
         let adapter = setup_with_seeds().await;
-        let plan = time_interval_plan("2026-04-05"); // expect 1 customer, 1 order
+        let plan = time_interval_ir("2026-04-05"); // expect 1 customer, 1 order
 
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let stmts = sql_gen::generate_transformation_sql(&xform_ir(&plan), dialect).unwrap();
+        let stmts = sql_gen::generate_transformation_sql(&plan, dialect).unwrap();
 
         // The INSERT statement (index 2 in the BEGIN/DELETE/INSERT/COMMIT vec)
         // should contain the substituted timestamp literals, not the
@@ -1552,11 +1494,10 @@ mod time_interval_e2e {
             .expect("insert seeds");
 
         // Step 1: render the bootstrap SQL and execute it.
-        let plan = time_interval_plan("2026-04-07");
+        let plan = time_interval_ir("2026-04-07");
         let dialect: &dyn SqlDialect = adapter.dialect();
-        let bootstrap_sql =
-            sql_gen::generate_time_interval_bootstrap_sql(&xform_ir(&plan), dialect)
-                .expect("bootstrap render");
+        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&plan, dialect)
+            .expect("bootstrap render");
         adapter
             .execute_statement(&bootstrap_sql)
             .await
@@ -1620,7 +1561,7 @@ mod time_interval_e2e {
             .await
             .unwrap();
 
-        let plan = time_interval_plan("2026-04-07");
+        let plan = time_interval_ir("2026-04-07");
         execute_partition(&adapter, &plan).await;
 
         // The 04-07 00:00:00 row is INSIDE the window. The 04-08 00:00:00

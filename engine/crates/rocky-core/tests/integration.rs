@@ -21,45 +21,6 @@ use tempfile::TempDir;
 // Helpers
 // ===========================================================================
 
-/// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
-fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
-    ModelIr::replication(
-        plan.target.clone(),
-        plan.strategy.clone(),
-        plan.source.clone(),
-        plan.columns.clone(),
-        plan.metadata_columns.clone(),
-        plan.governance.clone(),
-    )
-}
-
-/// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
-#[allow(dead_code)]
-fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-    ModelIr::transformation(
-        plan.target.clone(),
-        plan.strategy.clone(),
-        plan.sources.clone(),
-        plan.sql.clone(),
-        plan.governance.clone(),
-        plan.format.clone(),
-        plan.format_options.clone(),
-    )
-}
-
-/// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
-#[allow(dead_code)]
-fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
-    ModelIr::snapshot(
-        plan.target.clone(),
-        plan.source.clone(),
-        plan.unique_key.clone(),
-        plan.updated_at.clone(),
-        plan.invalidate_hard_deletes,
-        plan.governance.clone(),
-    )
-}
-
 fn dialect() -> DuckDbSqlDialect {
     DuckDbSqlDialect
 }
@@ -71,36 +32,36 @@ fn temp_state() -> (StateStore, TempDir) {
     (store, dir)
 }
 
-/// Build a replication plan for DuckDB (flat tables, no catalog prefixes).
-fn duckdb_replication_plan(
+/// Build a replication [`ModelIr`] for DuckDB (flat tables, no catalog prefixes).
+fn duckdb_replication_ir(
     source_table: &str,
     target_table: &str,
     strategy: MaterializationStrategy,
-) -> ReplicationPlan {
-    ReplicationPlan {
-        source: SourceRef {
-            catalog: String::new(),
-            schema: "source".into(),
-            table: source_table.into(),
-        },
-        target: TargetRef {
+) -> ModelIr {
+    ModelIr::replication(
+        TargetRef {
             catalog: String::new(),
             schema: "target".into(),
             table: target_table.into(),
         },
         strategy,
-        columns: ColumnSelection::All,
-        metadata_columns: vec![MetadataColumn {
+        SourceRef {
+            catalog: String::new(),
+            schema: "source".into(),
+            table: source_table.into(),
+        },
+        ColumnSelection::All,
+        vec![MetadataColumn {
             name: "_loaded_by".into(),
             data_type: "VARCHAR".into(),
             value: "NULL".into(),
         }],
-        governance: GovernanceConfig {
+        GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
             auto_create_schemas: false,
         },
-    }
+    )
 }
 
 // ===========================================================================
@@ -137,8 +98,8 @@ async fn test_full_pipeline_lifecycle() {
     .unwrap();
 
     // Generate and execute full refresh SQL
-    let plan = duckdb_replication_plan("orders", "orders", MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
+    let plan = duckdb_replication_ir("orders", "orders", MaterializationStrategy::FullRefresh);
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     // Verify data was copied
@@ -188,8 +149,8 @@ async fn test_incremental_pipeline_two_runs() {
     .unwrap();
 
     // Run 1: full refresh (no watermark)
-    let plan1 = duckdb_replication_plan("events", "events", MaterializationStrategy::FullRefresh);
-    let sql1 = sql_gen::generate_create_table_as_sql(&rep_ir(&plan1), &d).unwrap();
+    let plan1 = duckdb_replication_ir("events", "events", MaterializationStrategy::FullRefresh);
+    let sql1 = sql_gen::generate_create_table_as_sql(&plan1, &d).unwrap();
     p.execute(&sql1).await.unwrap();
     assert_eq!(p.row_count("target.events").await.unwrap(), 2);
 
@@ -215,14 +176,14 @@ async fn test_incremental_pipeline_two_runs() {
     // from the state store at SQL-generation time, not carried on the
     // strategy.
     let _wm = store.get_watermark("target.events").unwrap();
-    let plan2 = duckdb_replication_plan(
+    let plan2 = duckdb_replication_ir(
         "events",
         "events",
         MaterializationStrategy::Incremental {
             timestamp_column: "_fivetran_synced".into(),
         },
     );
-    let sql2 = sql_gen::generate_insert_sql(&rep_ir(&plan2), &d).unwrap();
+    let sql2 = sql_gen::generate_insert_sql(&plan2, &d).unwrap();
     p.execute(&sql2).await.unwrap();
 
     // Should now have 4 rows (2 original + 2 new)
@@ -337,8 +298,8 @@ async fn test_pipeline_with_metadata_columns() {
         .await
         .unwrap();
 
-    let plan = duckdb_replication_plan("items", "items", MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
+    let plan = duckdb_replication_ir("items", "items", MaterializationStrategy::FullRefresh);
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     // Verify _loaded_by column exists and is NULL
@@ -795,12 +756,12 @@ async fn test_full_refresh_on_seeded_data() {
         .unwrap();
 
     // Full refresh from seeded source
-    let plan = duckdb_replication_plan(
+    let plan = duckdb_replication_ir(
         "raw_orders",
         "raw_orders",
         MaterializationStrategy::FullRefresh,
     );
-    let sql = sql_gen::generate_create_table_as_sql(&rep_ir(&plan), &d).unwrap();
+    let sql = sql_gen::generate_create_table_as_sql(&plan, &d).unwrap();
     p.execute(&sql).await.unwrap();
 
     let source_count = p.row_count("source.raw_orders").await.unwrap();

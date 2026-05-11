@@ -2875,11 +2875,10 @@ pub async fn run(
             if let Ok(gov_compile) = governance_compile {
                 let tag_to_strategy = rocky_cfg.resolve_mask_for_env(env);
                 for model in &gov_compile.project.models {
-                    let plan = model.to_plan();
                     let table_ref = TableRef {
-                        catalog: plan.target.catalog.clone(),
-                        schema: plan.target.schema.clone(),
-                        table: plan.target.table.clone(),
+                        catalog: model.config.target.catalog.clone(),
+                        schema: model.config.target.schema.clone(),
+                        table: model.config.target.table.clone(),
                     };
 
                     // --- Classification tags + masking (Wave A) ---

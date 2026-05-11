@@ -287,12 +287,12 @@ fn populate_governance_actions(
         // Snowflake ALTER TABLE) or `None` on adapters without a
         // first-class retention knob.
         if let Some(retention) = model.config.retention {
-            let plan = model.to_plan();
+            let target = &model.config.target;
             let warehouse_preview = render_retention_preview(
                 adapter_type,
-                &plan.target.catalog,
-                &plan.target.schema,
-                &plan.target.table,
+                &target.catalog,
+                &target.schema,
+                &target.table,
                 retention.duration_days,
             );
             output.retention_actions.push(RetentionAction {
