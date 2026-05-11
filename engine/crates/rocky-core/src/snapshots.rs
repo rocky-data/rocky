@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::SnapshotPipelineConfig;
-use crate::ir::{GovernanceConfig, SnapshotPlan, SourceRef, TargetRef};
+use crate::ir::{SourceRef, TargetRef};
 use crate::sql_gen::SqlGenError;
 use crate::traits::SqlDialect;
 
@@ -54,9 +54,9 @@ pub enum SnapshotStrategy {
 
 /// Parsed snapshot configuration ready for SQL generation.
 ///
-/// Bridges [`SnapshotPipelineConfig`] (TOML-level) to [`SnapshotPlan`]
-/// (IR-level) and carries the additional metadata needed by the SQL
-/// generators in this module.
+/// Bridges [`SnapshotPipelineConfig`] (TOML-level) to the SQL generators
+/// in this module, carrying the additional metadata they need
+/// (`unique_key`, change-detection strategy, hard-delete handling).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
     /// Source table (three-part reference).
@@ -94,33 +94,6 @@ impl SnapshotConfig {
                 updated_at: cfg.updated_at.clone(),
             },
             invalidate_hard_deletes: cfg.invalidate_hard_deletes,
-        }
-    }
-
-    /// Convert to the IR-level [`SnapshotPlan`] consumed by the existing
-    /// `sql_gen::generate_snapshot_sql` path.
-    pub fn to_plan(&self) -> SnapshotPlan {
-        let updated_at = match &self.strategy {
-            SnapshotStrategy::Timestamp { updated_at } => updated_at.clone(),
-            // For check strategy, the updated_at field in SnapshotPlan is
-            // unused — the check-strategy SQL generator bypasses it.
-            SnapshotStrategy::Check { .. } => String::new(),
-        };
-        SnapshotPlan {
-            source: self.source.clone(),
-            target: self.target.clone(),
-            unique_key: self
-                .unique_key
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str()))
-                .collect(),
-            updated_at,
-            invalidate_hard_deletes: self.invalidate_hard_deletes,
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
         }
     }
 }

@@ -31,59 +31,6 @@ use serde::{Deserialize, Serialize};
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::models::TimeGrain;
 
-/// A transformation plan that compiles to warehouse-specific SQL.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Plan {
-    Replication(ReplicationPlan),
-    Transformation(TransformationPlan),
-    Snapshot(SnapshotPlan),
-}
-
-/// Silver layer: custom SQL transformations with multiple sources.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransformationPlan {
-    /// Multiple input tables (for joins).
-    pub sources: Vec<SourceRef>,
-    pub target: TargetRef,
-    pub strategy: MaterializationStrategy,
-    /// User-written SQL (loaded from file or inline).
-    pub sql: String,
-    pub governance: GovernanceConfig,
-    /// Optional lakehouse table format (Delta, Iceberg, etc.).
-    /// When set, SQL generation uses format-specific DDL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<LakehouseFormat>,
-    /// Format-specific options (partitioning, clustering, properties).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format_options: Option<LakehouseOptions>,
-}
-
-/// Raw layer: 1:1 copy with incremental watermark.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplicationPlan {
-    pub source: SourceRef,
-    pub target: TargetRef,
-    pub strategy: MaterializationStrategy,
-    pub columns: ColumnSelection,
-    pub metadata_columns: Vec<MetadataColumn>,
-    pub governance: GovernanceConfig,
-}
-
-/// SCD Type 2 snapshot: tracks historical changes via valid_from / valid_to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotPlan {
-    pub source: SourceRef,
-    pub target: TargetRef,
-    /// Columns that uniquely identify a row.
-    pub unique_key: Vec<Arc<str>>,
-    /// Column used to detect changes.
-    pub updated_at: String,
-    /// When true, invalidate rows deleted from source.
-    pub invalidate_hard_deletes: bool,
-    pub governance: GovernanceConfig,
-}
-
 /// How to materialize the target table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "strategy")]
@@ -466,8 +413,7 @@ pub struct ColumnMask {
 /// materialization strategy, governance metadata, the resolved
 /// column-masking plan for the active environment, and the source / target
 /// table refs plus variant-specific metadata (column selection, metadata
-/// columns, snapshot key/timestamp, lakehouse format) needed to losslessly
-/// represent any [`Plan`] variant.
+/// columns, snapshot key/timestamp, lakehouse format).
 ///
 /// `ModelIr` is an internal contract. It does not derive `JsonSchema` and
 /// is not part of the public CLI output schema; consumers outside the
@@ -482,9 +428,9 @@ pub struct ColumnMask {
 /// canonical-JSON convention (skip `None`, skip empty `Vec`, skip default
 /// `bool`) keeps the per-variant JSON shape compact, and a single struct
 /// makes the recipe-hash easier to reason about — there is no enum
-/// discriminant to canonicalise. Compile-time variant exhaustiveness is
-/// retained via the still-present [`Plan`] enum, which converts to /
-/// from [`ModelIr`] losslessly.
+/// discriminant to canonicalise. Variant inference happens via
+/// [`Self::variant`], which classifies the IR by which variant-specific
+/// fields are populated.
 ///
 /// All optional fields follow the canonical-JSON rule documented at the
 /// top of this module.
@@ -514,7 +460,7 @@ pub struct ModelIr {
     pub materialization: MaterializationStrategy,
     /// Governance metadata (catalog/schema lifecycle policy).
     pub governance: GovernanceConfig,
-    /// Target table reference. Required on every [`Plan`] variant.
+    /// Target table reference. Required on every variant.
     pub target: TargetRef,
     /// Resolved column masks for the active environment. Populated at IR
     /// construction by reading
@@ -523,52 +469,52 @@ pub struct ModelIr {
     /// [`crate::traits::MaskStrategy::None`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_masks: Vec<ColumnMask>,
-    /// Single-source ref. `Some` for [`Plan::Replication`] and
-    /// [`Plan::Snapshot`]; `None` for [`Plan::Transformation`] (which uses
-    /// [`Self::sources`]).
+    /// Single-source ref. `Some` for [`ModelIrVariant::Replication`] and
+    /// [`ModelIrVariant::Snapshot`]; `None` for
+    /// [`ModelIrVariant::Transformation`] (which uses [`Self::sources`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceRef>,
-    /// Multi-source refs (joins). Populated for [`Plan::Transformation`];
-    /// empty for [`Plan::Replication`] and [`Plan::Snapshot`].
+    /// Multi-source refs (joins). Populated for
+    /// [`ModelIrVariant::Transformation`]; empty for
+    /// [`ModelIrVariant::Replication`] and [`ModelIrVariant::Snapshot`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceRef>,
-    /// Column selection. `Some` for [`Plan::Replication`]; `None` for
-    /// other variants (which select via the `sql` field).
+    /// Column selection. `Some` for [`ModelIrVariant::Replication`]; `None`
+    /// for other variants (which select via the `sql` field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub columns: Option<ColumnSelection>,
     /// Extra columns added during replication (e.g.
     /// `CAST(NULL AS STRING) AS _loaded_by`). Populated for
-    /// [`Plan::Replication`]; empty otherwise.
+    /// [`ModelIrVariant::Replication`]; empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_columns: Vec<MetadataColumn>,
     /// Columns that uniquely identify a snapshot row. Populated for
-    /// [`Plan::Snapshot`]; empty otherwise.
+    /// [`ModelIrVariant::Snapshot`]; empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unique_key: Vec<Arc<str>>,
     /// Column used to detect changes for SCD2 snapshots. `Some` for
-    /// [`Plan::Snapshot`]; `None` otherwise.
+    /// [`ModelIrVariant::Snapshot`]; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
     /// When true, invalidate rows deleted from source. Only meaningful
-    /// for [`Plan::Snapshot`]; `false` otherwise.
+    /// for [`ModelIrVariant::Snapshot`]; `false` otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalidate_hard_deletes: bool,
-    /// Optional lakehouse table format (Delta, Iceberg, ...). Lifted from
-    /// [`TransformationPlan::format`]; `None` for non-transformation plans.
+    /// Optional lakehouse table format (Delta, Iceberg, ...). `None` for
+    /// non-transformation models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<LakehouseFormat>,
     /// Format-specific options (partitioning, clustering, properties).
-    /// Lifted from [`TransformationPlan::format_options`].
+    /// `None` for non-transformation models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_options: Option<LakehouseOptions>,
 }
 
 /// Inferred variant tag for a [`ModelIr`].
 ///
-/// Returned by [`ModelIr::variant`]. The three values mirror the three
-/// [`Plan`] variants; the inference rule (snapshot wins over replication,
-/// replication wins over transformation) is centralised in
-/// [`ModelIr::variant`] and matches [`ModelIr::to_plan_compatible`].
+/// Returned by [`ModelIr::variant`]. The inference rule (snapshot wins
+/// over replication, replication wins over transformation) is centralised
+/// in [`ModelIr::variant`].
 ///
 /// Serialises as lowercase (`"replication"` / `"transformation"` /
 /// `"snapshot"`) so error messages and JSON output stay aligned with the
@@ -600,8 +546,7 @@ impl std::fmt::Display for ModelIrVariant {
 }
 
 impl ModelIr {
-    /// Construct a replication-shaped [`ModelIr`] directly, bypassing the
-    /// [`Plan`] enum.
+    /// Construct a replication-shaped [`ModelIr`] directly.
     ///
     /// Variant inference (see [`Self::variant`]) returns
     /// [`ModelIrVariant::Replication`] for any IR built by this constructor,
@@ -642,8 +587,7 @@ impl ModelIr {
         }
     }
 
-    /// Construct a transformation-shaped [`ModelIr`] directly, bypassing
-    /// the [`Plan`] enum.
+    /// Construct a transformation-shaped [`ModelIr`] directly.
     ///
     /// Variant inference (see [`Self::variant`]) returns
     /// [`ModelIrVariant::Transformation`] for any IR built by this
@@ -686,8 +630,7 @@ impl ModelIr {
         }
     }
 
-    /// Construct a snapshot-shaped [`ModelIr`] directly, bypassing the
-    /// [`Plan`] enum.
+    /// Construct a snapshot-shaped [`ModelIr`] directly.
     ///
     /// `materialization` is fixed at [`MaterializationStrategy::FullRefresh`]
     /// to match the existing snapshot SQL-gen contract — SCD2 logic is
@@ -751,121 +694,21 @@ impl ModelIr {
     }
 
     /// Predicate underlying variant inference for snapshot. The single
-    /// source of truth shared by [`Self::as_replication`],
-    /// [`Self::as_transformation`], [`Self::as_snapshot`], and
-    /// [`Self::variant`]. Snapshot takes priority over replication in
-    /// inference: if both `unique_key` (non-empty) and `updated_at`
-    /// (`Some`) are populated the IR is classified as a snapshot
-    /// regardless of which other variant-specific fields are also set.
+    /// source of truth shared by [`Self::variant`]. Snapshot takes
+    /// priority over replication in inference: if both `unique_key`
+    /// (non-empty) and `updated_at` (`Some`) are populated the IR is
+    /// classified as a snapshot regardless of which other variant-
+    /// specific fields are also set.
     fn is_snapshot_shaped(&self) -> bool {
         !self.unique_key.is_empty() && self.updated_at.is_some()
     }
 
-    /// View this IR as a [`ReplicationPlan`] without round-tripping through
-    /// the [`Plan`] enum.
-    ///
-    /// Returns `Some` when the IR's variant-specific fields match a
-    /// replication shape — i.e. `columns` is `Some` and it is not a
-    /// snapshot (`unique_key` non-empty AND `updated_at` `Some`).
-    /// Returns `None` on any other variant.
-    ///
-    /// Variant inference matches [`Self::to_plan_compatible`]; the two stay
-    /// in lockstep. Prefer this method on hot paths (e.g. `sql_gen`) to
-    /// avoid materialising the [`Plan`] enum just to dispatch on its tag.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IR is variant-confirmed as a replication but is
-    /// missing `source`. The `From<&Plan>` impl always populates `source`
-    /// for replications; this only fires on a hand-built [`ModelIr`] that
-    /// violates the variant contract.
-    pub fn as_replication(&self) -> Option<ReplicationPlan> {
-        if self.is_snapshot_shaped() {
-            return None;
-        }
-        let columns = self.columns.clone()?;
-        let source = self
-            .source
-            .clone()
-            .expect("Replication ModelIr must carry `source`");
-        Some(ReplicationPlan {
-            source,
-            target: self.target.clone(),
-            strategy: self.materialization.clone(),
-            columns,
-            metadata_columns: self.metadata_columns.clone(),
-            governance: self.governance.clone(),
-        })
-    }
-
-    /// View this IR as a [`TransformationPlan`] without round-tripping
-    /// through the [`Plan`] enum.
-    ///
-    /// Returns `Some` when the IR is neither snapshot-shaped
-    /// (`unique_key` non-empty AND `updated_at` `Some`) nor replication-
-    /// shaped (`columns` `Some`). Returns `None` otherwise.
-    ///
-    /// Variant inference matches [`Self::to_plan_compatible`].
-    pub fn as_transformation(&self) -> Option<TransformationPlan> {
-        if self.is_snapshot_shaped() || self.columns.is_some() {
-            return None;
-        }
-        Some(TransformationPlan {
-            sources: self.sources.clone(),
-            target: self.target.clone(),
-            strategy: self.materialization.clone(),
-            sql: self.sql.clone(),
-            governance: self.governance.clone(),
-            format: self.format.clone(),
-            format_options: self.format_options.clone(),
-        })
-    }
-
-    /// View this IR as a [`SnapshotPlan`] without round-tripping through
-    /// the [`Plan`] enum.
-    ///
-    /// Returns `Some` when the IR is snapshot-shaped (`unique_key`
-    /// non-empty AND `updated_at` `Some`). Returns `None` otherwise.
-    ///
-    /// Variant inference matches [`Self::to_plan_compatible`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IR is variant-confirmed as a snapshot but is missing
-    /// `source`. The `From<&Plan>` impl always populates `source` for
-    /// snapshots; this only fires on a hand-built [`ModelIr`] that
-    /// violates the variant contract.
-    pub fn as_snapshot(&self) -> Option<SnapshotPlan> {
-        if !self.is_snapshot_shaped() {
-            return None;
-        }
-        let updated_at = self
-            .updated_at
-            .clone()
-            .expect("is_snapshot_shaped guarantees `updated_at` is `Some`");
-        let source = self
-            .source
-            .clone()
-            .expect("Snapshot ModelIr must carry `source`");
-        Some(SnapshotPlan {
-            source,
-            target: self.target.clone(),
-            unique_key: self.unique_key.clone(),
-            updated_at,
-            invalidate_hard_deletes: self.invalidate_hard_deletes,
-            governance: self.governance.clone(),
-        })
-    }
-
     /// Inferred [`ModelIrVariant`] for this IR.
     ///
-    /// Matches the inference rules used by [`Self::as_replication`],
-    /// [`Self::as_transformation`], [`Self::as_snapshot`], and
-    /// [`Self::to_plan_compatible`]: snapshot-shaped (`unique_key`
-    /// non-empty AND `updated_at` `Some`) →
-    /// [`ModelIrVariant::Snapshot`]; replication-shaped (`columns` `Some`)
-    /// → [`ModelIrVariant::Replication`]; otherwise →
-    /// [`ModelIrVariant::Transformation`].
+    /// Inference rules: snapshot-shaped (`unique_key` non-empty AND
+    /// `updated_at` `Some`) → [`ModelIrVariant::Snapshot`]; replication-
+    /// shaped (`columns` `Some`) → [`ModelIrVariant::Replication`];
+    /// otherwise → [`ModelIrVariant::Transformation`].
     ///
     /// Callers that need just the lowercase string form (e.g. error
     /// message templating, JSON output) reach for [`ModelIrVariant::as_str`]
@@ -877,128 +720,6 @@ impl ModelIr {
             ModelIrVariant::Replication
         } else {
             ModelIrVariant::Transformation
-        }
-    }
-
-    /// Reconstruct a [`Plan`] from this `ModelIr`, mirroring the
-    /// `From<&Plan> for ModelIr` conversion.
-    ///
-    /// Delegates to the three accessors ([`Self::as_snapshot`],
-    /// [`Self::as_replication`], [`Self::as_transformation`]) so the
-    /// variant-inference rule lives in a single place. The variant is
-    /// inferred from which variant-specific fields are populated:
-    ///
-    /// - `unique_key` non-empty AND `updated_at` `Some` → [`Plan::Snapshot`]
-    /// - `columns` `Some` (replication carries an explicit
-    ///   [`ColumnSelection`]) → [`Plan::Replication`]
-    /// - otherwise → [`Plan::Transformation`]
-    ///
-    /// Round-trip property: `ModelIr::from(&plan).to_plan_compatible()` is
-    /// canonical-JSON-equal to `plan` for any well-formed input. Used by
-    /// the test suite to verify the conversion is lossless.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a [`ModelIr`] inferred to be a Snapshot or Replication
-    /// is missing `source` (via the accessor's panic contract). These
-    /// fields are required on the corresponding [`Plan`] variant; the
-    /// `From<&Plan>` impl always populates them, so this only fires on a
-    /// hand-built `ModelIr` that violates the variant contract.
-    pub fn to_plan_compatible(&self) -> Plan {
-        // Transformation is the unconditional fallback: its rejection
-        // conditions in `as_transformation` are exactly the entry
-        // conditions of the other two accessors, so one of the three
-        // is always `Some`.
-        self.as_snapshot()
-            .map(Plan::Snapshot)
-            .or_else(|| self.as_replication().map(Plan::Replication))
-            .or_else(|| self.as_transformation().map(Plan::Transformation))
-            .expect(
-                "at least one accessor must match — transformation is the unconditional fallback",
-            )
-    }
-}
-
-impl From<&Plan> for ModelIr {
-    /// Lossless structural conversion from a [`Plan`] to a [`ModelIr`].
-    ///
-    /// Variant-specific fields are mapped onto the flat [`ModelIr`] shape:
-    ///
-    /// - [`Plan::Replication`] populates `source`, `columns`,
-    ///   `metadata_columns`.
-    /// - [`Plan::Transformation`] populates `sources`, `format`,
-    ///   `format_options`.
-    /// - [`Plan::Snapshot`] populates `source`, `unique_key`, `updated_at`,
-    ///   `invalidate_hard_deletes`.
-    ///
-    /// `name`, `typed_columns`, `lineage_edges`, and `column_masks` are not
-    /// carried by [`Plan`]; they default to the table's own name and empty
-    /// vectors. Callers that have richer typed-column or lineage data
-    /// should populate those fields after construction.
-    fn from(plan: &Plan) -> Self {
-        match plan {
-            Plan::Replication(p) => ModelIr {
-                name: Arc::from(p.target.table.as_str()),
-                sql: String::new(),
-                typed_columns: Vec::new(),
-                lineage_edges: Vec::new(),
-                materialization: p.strategy.clone(),
-                governance: p.governance.clone(),
-                target: p.target.clone(),
-                column_masks: Vec::new(),
-                source: Some(p.source.clone()),
-                sources: Vec::new(),
-                columns: Some(p.columns.clone()),
-                metadata_columns: p.metadata_columns.clone(),
-                unique_key: Vec::new(),
-                updated_at: None,
-                invalidate_hard_deletes: false,
-                format: None,
-                format_options: None,
-            },
-            Plan::Transformation(p) => ModelIr {
-                name: Arc::from(p.target.table.as_str()),
-                sql: p.sql.clone(),
-                typed_columns: Vec::new(),
-                lineage_edges: Vec::new(),
-                materialization: p.strategy.clone(),
-                governance: p.governance.clone(),
-                target: p.target.clone(),
-                column_masks: Vec::new(),
-                source: None,
-                sources: p.sources.clone(),
-                columns: None,
-                metadata_columns: Vec::new(),
-                unique_key: Vec::new(),
-                updated_at: None,
-                invalidate_hard_deletes: false,
-                format: p.format.clone(),
-                format_options: p.format_options.clone(),
-            },
-            Plan::Snapshot(p) => ModelIr {
-                name: Arc::from(p.target.table.as_str()),
-                sql: String::new(),
-                typed_columns: Vec::new(),
-                lineage_edges: Vec::new(),
-                // Snapshots don't have a MaterializationStrategy on the
-                // SnapshotPlan; the SCD2 logic is implicit in
-                // `sql_gen::generate_snapshot_sql`. FullRefresh is the
-                // closest neutral default and matches how snapshot SQL is
-                // generated today.
-                materialization: MaterializationStrategy::FullRefresh,
-                governance: p.governance.clone(),
-                target: p.target.clone(),
-                column_masks: Vec::new(),
-                source: Some(p.source.clone()),
-                sources: Vec::new(),
-                columns: None,
-                metadata_columns: Vec::new(),
-                unique_key: p.unique_key.clone(),
-                updated_at: Some(p.updated_at.clone()),
-                invalidate_hard_deletes: p.invalidate_hard_deletes,
-                format: None,
-                format_options: None,
-            },
         }
     }
 }
@@ -1092,69 +813,6 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_replication_plan_serialization() {
-        let plan = ReplicationPlan {
-            source: SourceRef {
-                catalog: "source_catalog".into(),
-                schema: "src__acme__us_west__shopify".into(),
-                table: "orders".into(),
-            },
-            target: TargetRef {
-                catalog: "acme_warehouse".into(),
-                schema: "staging__us_west__shopify".into(),
-                table: "orders".into(),
-            },
-            strategy: MaterializationStrategy::Incremental {
-                timestamp_column: "_fivetran_synced".into(),
-            },
-            columns: ColumnSelection::All,
-            metadata_columns: vec![MetadataColumn {
-                name: "_loaded_by".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            }],
-            governance: GovernanceConfig {
-                permissions_file: Some("config/catalog_permissions.yaml".into()),
-                auto_create_catalogs: true,
-                auto_create_schemas: true,
-            },
-        };
-
-        let json = serde_json::to_string_pretty(&plan).unwrap();
-        let deserialized: ReplicationPlan = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.source.catalog, "source_catalog");
-        assert_eq!(deserialized.target.table, "orders");
-    }
-
-    #[test]
-    fn test_plan_enum_serialization() {
-        let plan = Plan::Replication(ReplicationPlan {
-            source: SourceRef {
-                catalog: "cat".into(),
-                schema: "sch".into(),
-                table: "tbl".into(),
-            },
-            target: TargetRef {
-                catalog: "tcat".into(),
-                schema: "tsch".into(),
-                table: "tbl".into(),
-            },
-            strategy: MaterializationStrategy::FullRefresh,
-            columns: ColumnSelection::All,
-            metadata_columns: vec![],
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
-        });
-
-        let json = serde_json::to_string(&plan).unwrap();
-        let deserialized: Plan = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, Plan::Replication(_)));
-    }
 
     #[test]
     fn test_table_ref_display() {
@@ -1594,181 +1252,6 @@ mod tests {
         );
     }
 
-    // ----- Plan ↔ ModelIr conversion + variant-coverage tests -----
-
-    fn sample_replication_plan() -> Plan {
-        Plan::Replication(ReplicationPlan {
-            source: SourceRef {
-                catalog: "source_catalog".into(),
-                schema: "src__acme__shopify".into(),
-                table: "orders".into(),
-            },
-            target: TargetRef {
-                catalog: "acme_warehouse".into(),
-                schema: "raw__shopify".into(),
-                table: "orders".into(),
-            },
-            strategy: MaterializationStrategy::Incremental {
-                timestamp_column: "_fivetran_synced".into(),
-            },
-            columns: ColumnSelection::Explicit(vec![Arc::from("id"), Arc::from("customer_id")]),
-            metadata_columns: vec![MetadataColumn {
-                name: "_loaded_by".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            }],
-            governance: GovernanceConfig {
-                permissions_file: Some("perms.yaml".into()),
-                auto_create_catalogs: true,
-                auto_create_schemas: true,
-            },
-        })
-    }
-
-    fn sample_transformation_plan() -> Plan {
-        Plan::Transformation(TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: "acme_warehouse".into(),
-                schema: "staging".into(),
-                table: "stg_customers".into(),
-            }],
-            target: TargetRef {
-                catalog: "acme_warehouse".into(),
-                schema: "marts".into(),
-                table: "dim_customers".into(),
-            },
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec![Arc::from("customer_id")],
-                update_columns: ColumnSelection::All,
-            },
-            sql: "SELECT customer_id, email FROM stg_customers".into(),
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
-            format: None,
-            format_options: None,
-        })
-    }
-
-    fn sample_snapshot_plan() -> Plan {
-        Plan::Snapshot(SnapshotPlan {
-            source: SourceRef {
-                catalog: "acme_warehouse".into(),
-                schema: "marts".into(),
-                table: "dim_users".into(),
-            },
-            target: TargetRef {
-                catalog: "acme_warehouse".into(),
-                schema: "snapshots".into(),
-                table: "dim_users_history".into(),
-            },
-            unique_key: vec![Arc::from("user_id")],
-            updated_at: "updated_at".into(),
-            invalidate_hard_deletes: true,
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
-        })
-    }
-
-    /// Canonical-JSON-equality is the equivalence relation used to verify
-    /// the [`Plan`] ↔ [`ModelIr`] round-trip — none of the [`Plan`]
-    /// component types derive `PartialEq`, and adding the derive cascade
-    /// was deemed out of scope for this PR.
-    fn plans_canonical_eq(a: &Plan, b: &Plan) -> bool {
-        canonical_json(a) == canonical_json(b)
-    }
-
-    #[test]
-    fn plan_to_model_ir_replication_roundtrip() {
-        let plan = sample_replication_plan();
-        let ir = ModelIr::from(&plan);
-        let back = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&plan, &back),
-            "replication round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
-            canonical_json(&plan),
-            canonical_json(&back)
-        );
-        assert!(matches!(back, Plan::Replication(_)));
-    }
-
-    #[test]
-    fn plan_to_model_ir_replication_with_merge_strategy_roundtrip() {
-        // Discrimination guardrail: `MaterializationStrategy::Merge` carries
-        // its own `unique_key` field on the strategy enum. The top-level
-        // `ModelIr::unique_key` field must stay empty for a Replication —
-        // otherwise `to_plan_compatible` would mis-classify it as a
-        // [`Plan::Snapshot`] (since updated_at would still be None this
-        // wouldn't actually trigger today, but the test pins the contract).
-        let plan = Plan::Replication(ReplicationPlan {
-            source: SourceRef {
-                catalog: "src".into(),
-                schema: "raw".into(),
-                table: "users".into(),
-            },
-            target: TargetRef {
-                catalog: "tgt".into(),
-                schema: "raw".into(),
-                table: "users".into(),
-            },
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec![Arc::from("id")],
-                update_columns: ColumnSelection::All,
-            },
-            columns: ColumnSelection::All,
-            metadata_columns: vec![],
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
-        });
-        let ir = ModelIr::from(&plan);
-        assert!(
-            ir.unique_key.is_empty(),
-            "Merge-strategy unique_key must NOT leak into top-level ModelIr.unique_key"
-        );
-        let back = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&plan, &back),
-            "replication-with-merge round-trip must be canonical-JSON-equal"
-        );
-        assert!(matches!(back, Plan::Replication(_)));
-    }
-
-    #[test]
-    fn plan_to_model_ir_transformation_roundtrip() {
-        let plan = sample_transformation_plan();
-        let ir = ModelIr::from(&plan);
-        let back = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&plan, &back),
-            "transformation round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
-            canonical_json(&plan),
-            canonical_json(&back)
-        );
-        assert!(matches!(back, Plan::Transformation(_)));
-    }
-
-    #[test]
-    fn plan_to_model_ir_snapshot_roundtrip() {
-        let plan = sample_snapshot_plan();
-        let ir = ModelIr::from(&plan);
-        let back = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&plan, &back),
-            "snapshot round-trip must be canonical-JSON-equal\n  before: {}\n  after:  {}",
-            canonical_json(&plan),
-            canonical_json(&back)
-        );
-        assert!(matches!(back, Plan::Snapshot(_)));
-    }
-
     #[test]
     fn recipe_hash_changes_when_replication_source_changes() {
         let mut m = sample_replication_model();
@@ -1822,12 +1305,11 @@ mod tests {
     }
 
     #[test]
-    fn recipe_hash_replication_plan_round_trips_into_model_ir_deterministically() {
-        // Same plan input → same ModelIr → same recipe-hash.
-        let plan = sample_replication_plan();
-        let h1 = ModelIr::from(&plan).recipe_hash();
-        let h2 = ModelIr::from(&plan).recipe_hash();
-        assert_eq!(h1, h2, "From<&Plan> must produce a deterministic ModelIr");
+    fn recipe_hash_is_deterministic_for_identical_sample_models() {
+        // Same ModelIr inputs → same recipe-hash.
+        let h1 = sample_replication_model().recipe_hash();
+        let h2 = sample_replication_model().recipe_hash();
+        assert_eq!(h1, h2, "identical ModelIr inputs must hash identically");
     }
 
     #[test]
@@ -1889,148 +1371,6 @@ mod tests {
         );
     }
 
-    // ----- Direct variant accessors (`as_replication` / `as_transformation`
-    //       / `as_snapshot`) — bypass `Plan` materialisation on hot paths -----
-
-    #[test]
-    fn as_replication_returns_some_for_replication_shape() {
-        let ir = sample_replication_model();
-        assert!(
-            ir.as_replication().is_some(),
-            "replication-shaped IR must yield Some via as_replication"
-        );
-        assert!(ir.as_transformation().is_none());
-        assert!(ir.as_snapshot().is_none());
-    }
-
-    #[test]
-    fn as_transformation_returns_some_for_transformation_shape() {
-        let ir = sample_transformation_model();
-        assert!(
-            ir.as_transformation().is_some(),
-            "transformation-shaped IR must yield Some via as_transformation"
-        );
-        assert!(ir.as_replication().is_none());
-        assert!(ir.as_snapshot().is_none());
-    }
-
-    #[test]
-    fn as_snapshot_returns_some_for_snapshot_shape() {
-        let ir = sample_snapshot_model();
-        assert!(
-            ir.as_snapshot().is_some(),
-            "snapshot-shaped IR must yield Some via as_snapshot"
-        );
-        assert!(ir.as_replication().is_none());
-        assert!(ir.as_transformation().is_none());
-    }
-
-    /// The three accessors must yield byte-equivalent variants to
-    /// `to_plan_compatible()` for any IR built via `From<&Plan>`. This is
-    /// the load-bearing regression guard for `sql_gen` — both code paths
-    /// must produce identical SQL inputs.
-    #[test]
-    fn accessors_match_to_plan_compatible_for_replication() {
-        let plan = sample_replication_plan();
-        let ir = ModelIr::from(&plan);
-        let via_accessor = Plan::Replication(ir.as_replication().expect("replication"));
-        let via_round_trip = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&via_accessor, &via_round_trip),
-            "as_replication must produce a Plan canonical-JSON-equal to to_plan_compatible\n  accessor: {}\n  round-trip: {}",
-            canonical_json(&via_accessor),
-            canonical_json(&via_round_trip)
-        );
-    }
-
-    #[test]
-    fn accessors_match_to_plan_compatible_for_transformation() {
-        let plan = sample_transformation_plan();
-        let ir = ModelIr::from(&plan);
-        let via_accessor = Plan::Transformation(ir.as_transformation().expect("transformation"));
-        let via_round_trip = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&via_accessor, &via_round_trip),
-            "as_transformation must produce a Plan canonical-JSON-equal to to_plan_compatible"
-        );
-    }
-
-    #[test]
-    fn accessors_match_to_plan_compatible_for_snapshot() {
-        let plan = sample_snapshot_plan();
-        let ir = ModelIr::from(&plan);
-        let via_accessor = Plan::Snapshot(ir.as_snapshot().expect("snapshot"));
-        let via_round_trip = ir.to_plan_compatible();
-        assert!(
-            plans_canonical_eq(&via_accessor, &via_round_trip),
-            "as_snapshot must produce a Plan canonical-JSON-equal to to_plan_compatible"
-        );
-    }
-
-    /// Round-trip via the accessor: `From<&Plan> -> as_X` must be
-    /// canonical-JSON-equal to the original `Plan`. Mirrors the existing
-    /// `plan_to_model_ir_*_roundtrip` tests but exercises the accessor
-    /// rather than `to_plan_compatible`.
-    #[test]
-    fn plan_to_model_ir_via_accessor_replication_roundtrip() {
-        let plan = sample_replication_plan();
-        let ir = ModelIr::from(&plan);
-        let back = Plan::Replication(ir.as_replication().expect("replication"));
-        assert!(plans_canonical_eq(&plan, &back));
-    }
-
-    #[test]
-    fn plan_to_model_ir_via_accessor_transformation_roundtrip() {
-        let plan = sample_transformation_plan();
-        let ir = ModelIr::from(&plan);
-        let back = Plan::Transformation(ir.as_transformation().expect("transformation"));
-        assert!(plans_canonical_eq(&plan, &back));
-    }
-
-    #[test]
-    fn plan_to_model_ir_via_accessor_snapshot_roundtrip() {
-        let plan = sample_snapshot_plan();
-        let ir = ModelIr::from(&plan);
-        let back = Plan::Snapshot(ir.as_snapshot().expect("snapshot"));
-        assert!(plans_canonical_eq(&plan, &back));
-    }
-
-    /// Snapshot inference takes priority over replication: an IR that is
-    /// snapshot-shaped (unique_key + updated_at) must yield `None` from
-    /// `as_replication` even if `columns` is also populated. Matches the
-    /// inference order in `to_plan_compatible`.
-    #[test]
-    fn as_replication_rejects_snapshot_shape_even_if_columns_set() {
-        let mut ir = sample_snapshot_model();
-        ir.columns = Some(ColumnSelection::All);
-        assert!(
-            ir.as_replication().is_none(),
-            "snapshot-shape IR with stray `columns` must not view as replication"
-        );
-        assert!(ir.as_snapshot().is_some());
-    }
-
-    /// Replication accessor panics if `columns` is `Some` but `source` is
-    /// `None` — the IR is variant-confirmed but violates the contract that
-    /// `From<&Plan>` always populates.
-    #[test]
-    #[should_panic(expected = "Replication ModelIr must carry `source`")]
-    fn as_replication_panics_when_columns_set_but_source_missing() {
-        let mut ir = sample_replication_model();
-        ir.source = None;
-        let _ = ir.as_replication();
-    }
-
-    /// Snapshot accessor panics if the IR is snapshot-shaped (`unique_key`
-    /// non-empty AND `updated_at` `Some`) but `source` is `None`.
-    #[test]
-    #[should_panic(expected = "Snapshot ModelIr must carry `source`")]
-    fn as_snapshot_panics_when_snapshot_shaped_but_source_missing() {
-        let mut ir = sample_snapshot_model();
-        ir.source = None;
-        let _ = ir.as_snapshot();
-    }
-
     #[test]
     fn variant_matches_inferred_shape() {
         assert_eq!(
@@ -2053,12 +1393,11 @@ mod tests {
         assert_eq!(ir.variant(), ModelIrVariant::Snapshot);
     }
 
-    /// `variant()` must stay in lockstep with `to_plan_compatible()`: for any
-    /// `ModelIr` built via `From<&Plan>`, the inferred [`ModelIrVariant`]
-    /// matches the originating [`Plan`] tag. Guards against drift in the
-    /// shared [`ModelIr::is_snapshot_shaped`] inference root.
+    /// Sample fixtures must each map to their expected variant — guards
+    /// against drift in the shared [`ModelIr::is_snapshot_shaped`]
+    /// inference root.
     #[test]
-    fn variant_matches_to_plan_compatible_tag() {
+    fn variant_matches_sample_fixtures() {
         let cases = [
             (sample_replication_model(), ModelIrVariant::Replication),
             (
@@ -2069,9 +1408,6 @@ mod tests {
         ];
         for (ir, expected) in cases {
             assert_eq!(ir.variant(), expected);
-            let plan = ir.to_plan_compatible();
-            let roundtripped = ModelIr::from(&plan);
-            assert_eq!(roundtripped.variant(), expected);
         }
     }
 

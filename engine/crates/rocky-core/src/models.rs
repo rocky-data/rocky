@@ -8,9 +8,7 @@ use thiserror::Error;
 
 use crate::config::{ModelBudgetConfig, substitute_env_vars};
 use crate::dag::DagNode;
-use crate::ir::{
-    GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TransformationPlan,
-};
+use crate::ir::{GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef};
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
@@ -572,8 +570,17 @@ impl Model {
         }
     }
 
-    /// Converts to a TransformationPlan for SQL generation.
-    pub fn to_plan(&self) -> TransformationPlan {
+    /// Construct the per-model [`ModelIr`] for this transformation model.
+    ///
+    /// Lowers the [`StrategyConfig`] to a [`MaterializationStrategy`] and
+    /// assembles the IR directly. The model's own `name` overrides the
+    /// `target.table`-derived default so the IR carries the project-unique
+    /// identifier rather than the warehouse table name.
+    ///
+    /// `typed_columns`, `lineage_edges`, and `column_masks` stay empty here
+    /// — they are populated by the compiler / governance layers downstream
+    /// when richer typed data is available.
+    pub fn to_model_ir(&self) -> ModelIr {
         let strategy = match &self.config.strategy {
             StrategyConfig::FullRefresh => MaterializationStrategy::FullRefresh,
             StrategyConfig::Incremental { timestamp_column } => {
@@ -627,7 +634,24 @@ impl Model {
             },
         };
 
-        TransformationPlan {
+        ModelIr {
+            name: std::sync::Arc::from(self.config.name.as_str()),
+            sql: self.sql.clone(),
+            typed_columns: Vec::new(),
+            lineage_edges: Vec::new(),
+            materialization: strategy,
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            target: TargetRef {
+                catalog: self.config.target.catalog.clone(),
+                schema: self.config.target.schema.clone(),
+                table: self.config.target.table.clone(),
+            },
+            column_masks: Vec::new(),
+            source: None,
             sources: self
                 .config
                 .sources
@@ -638,54 +662,13 @@ impl Model {
                     table: s.table.clone(),
                 })
                 .collect(),
-            target: TargetRef {
-                catalog: self.config.target.catalog.clone(),
-                schema: self.config.target.schema.clone(),
-                table: self.config.target.table.clone(),
-            },
-            strategy,
-            sql: self.sql.clone(),
-            governance: GovernanceConfig {
-                permissions_file: None,
-                auto_create_catalogs: false,
-                auto_create_schemas: false,
-            },
-            format: self.config.format.clone(),
-            format_options: self.config.format_options.clone(),
-        }
-    }
-
-    /// Construct the per-model [`ModelIr`] for this transformation model.
-    ///
-    /// Reuses [`Self::to_plan`] to share the materialization-strategy
-    /// lowering, then assembles the IR directly without round-tripping
-    /// through [`Plan`]. The model's own `name` overrides the
-    /// `target.table`-derived default so the IR carries the project-unique
-    /// identifier rather than the warehouse table name.
-    ///
-    /// `typed_columns`, `lineage_edges`, and `column_masks` stay empty here
-    /// — they are populated by the compiler / governance layers downstream
-    /// when richer typed data is available.
-    pub fn to_model_ir(&self) -> ModelIr {
-        let plan = self.to_plan();
-        ModelIr {
-            name: std::sync::Arc::from(self.config.name.as_str()),
-            sql: plan.sql,
-            typed_columns: Vec::new(),
-            lineage_edges: Vec::new(),
-            materialization: plan.strategy,
-            governance: plan.governance,
-            target: plan.target,
-            column_masks: Vec::new(),
-            source: None,
-            sources: plan.sources,
             columns: None,
             metadata_columns: Vec::new(),
             unique_key: Vec::new(),
             updated_at: None,
             invalidate_hard_deletes: false,
-            format: plan.format,
-            format_options: plan.format_options,
+            format: self.config.format.clone(),
+            format_options: self.config.format_options.clone(),
         }
     }
 }
@@ -959,9 +942,9 @@ JOIN analytics.marts.dim_customers c ON o.customer_id = c.customer_id
         assert_eq!(model.config.depends_on.len(), 2);
         assert_eq!(model.config.sources.len(), 2);
 
-        let plan = model.to_plan();
-        assert_eq!(plan.sources.len(), 2);
-        assert!(plan.sql.contains("JOIN"));
+        let ir = model.to_model_ir();
+        assert_eq!(ir.sources.len(), 2);
+        assert!(ir.sql.contains("JOIN"));
     }
 
     #[test]
@@ -1010,12 +993,12 @@ SELECT id, name, status FROM raw.src
             None,
         )
         .unwrap();
-        let plan = model.to_plan();
+        let ir = model.to_model_ir();
         assert!(matches!(
-            plan.strategy,
+            ir.materialization,
             MaterializationStrategy::Merge { .. }
         ));
-        if let MaterializationStrategy::Merge { update_columns, .. } = &plan.strategy {
+        if let MaterializationStrategy::Merge { update_columns, .. } = &ir.materialization {
             assert!(matches!(
                 update_columns,
                 crate::ir::ColumnSelection::Explicit(_)
@@ -1055,56 +1038,6 @@ SELECT 1
         let ir = model.to_model_ir();
         assert_eq!(&*ir.name, "fct_orders");
         assert_eq!(ir.target.table, "fct_orders_v2");
-    }
-
-    #[test]
-    fn test_to_model_ir_lowering_matches_to_plan() {
-        // The strategy / sql / sources / governance / format lowering MUST
-        // match `to_plan` exactly — `to_model_ir` reuses `to_plan` internally
-        // and threads it through `From<&Plan> for ModelIr`. This guards the
-        // contract that the two views agree.
-        let model = parse_model_inline(
-            r#"---toml
-name = "dim"
-depends_on = ["raw.src"]
-[strategy]
-type = "merge"
-unique_key = ["id"]
-update_columns = ["name", "status"]
-[[sources]]
-catalog = "raw"
-schema = "ext"
-table = "src"
-[target]
-catalog = "c"
-schema = "s"
-table = "t"
----
-SELECT id, name, status FROM raw.ext.src
-"#,
-            "dim.sql",
-            None,
-        )
-        .unwrap();
-
-        let plan = model.to_plan();
-        let ir = model.to_model_ir();
-
-        assert_eq!(ir.sql, plan.sql);
-        // SourceRef / TargetRef / MaterializationStrategy do not derive
-        // `PartialEq`; compare by canonical JSON instead.
-        assert_eq!(
-            serde_json::to_value(&ir.sources).unwrap(),
-            serde_json::to_value(&plan.sources).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&ir.target).unwrap(),
-            serde_json::to_value(&plan.target).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&ir.materialization).unwrap(),
-            serde_json::to_value(&plan.strategy).unwrap()
-        );
     }
 
     // --- Sidecar format tests ---
@@ -1406,8 +1339,8 @@ granularity = "day"
             file_path: "fake.sql".into(),
             contract_path: None,
         };
-        let plan = model.to_plan();
-        match plan.strategy {
+        let ir = model.to_model_ir();
+        match ir.materialization {
             MaterializationStrategy::TimeInterval {
                 time_column,
                 granularity,

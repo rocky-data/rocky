@@ -57,7 +57,7 @@ pub enum SqlGenError {
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Replication`].
+/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -102,7 +102,7 @@ pub fn generate_select_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Replication`].
+/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -124,7 +124,7 @@ pub fn generate_insert_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Replication`].
+/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -159,7 +159,7 @@ pub fn generate_create_table_as_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Replication`].
+/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -212,7 +212,7 @@ pub fn generate_merge_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Transformation`].
+/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -376,7 +376,7 @@ pub fn generate_transformation_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Transformation`].
+/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_time_interval_bootstrap_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -445,7 +445,7 @@ pub fn generate_time_interval_bootstrap_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Transformation`].
+/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_transformation_initial_ddl(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -501,7 +501,7 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Transformation`].
+/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_materialized_view_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -526,7 +526,7 @@ pub fn generate_materialized_view_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Transformation`].
+/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_dynamic_table_sql(
     model_ir: &ModelIr,
     target_lag: &str,
@@ -611,7 +611,7 @@ use std::fmt::Write;
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// constructed from a [`crate::ir::Plan::Snapshot`].
+/// a snapshot-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -900,84 +900,44 @@ mod tests {
         TestDialect
     }
 
-    /// Lift a [`ReplicationPlan`] into a [`ModelIr`] for testing.
-    fn rep_ir(plan: &ReplicationPlan) -> ModelIr {
+    fn sample_incremental_ir() -> ModelIr {
         ModelIr::replication(
-            plan.target.clone(),
-            plan.strategy.clone(),
-            plan.source.clone(),
-            plan.columns.clone(),
-            plan.metadata_columns.clone(),
-            plan.governance.clone(),
-        )
-    }
-
-    /// Lift a [`TransformationPlan`] into a [`ModelIr`] for testing.
-    fn xform_ir(plan: &TransformationPlan) -> ModelIr {
-        ModelIr::transformation(
-            plan.target.clone(),
-            plan.strategy.clone(),
-            plan.sources.clone(),
-            plan.sql.clone(),
-            plan.governance.clone(),
-            plan.format.clone(),
-            plan.format_options.clone(),
-        )
-    }
-
-    /// Lift a [`SnapshotPlan`] into a [`ModelIr`] for testing.
-    #[allow(dead_code)]
-    fn snap_ir(plan: &SnapshotPlan) -> ModelIr {
-        ModelIr::snapshot(
-            plan.target.clone(),
-            plan.source.clone(),
-            plan.unique_key.clone(),
-            plan.updated_at.clone(),
-            plan.invalidate_hard_deletes,
-            plan.governance.clone(),
-        )
-    }
-
-    fn sample_incremental_plan() -> ReplicationPlan {
-        ReplicationPlan {
-            source: SourceRef {
-                catalog: "source_catalog".into(),
-                schema: "src__acme__us_west__shopify".into(),
-                table: "orders".into(),
-            },
-            target: TargetRef {
+            TargetRef {
                 catalog: "acme_warehouse".into(),
                 schema: "staging__us_west__shopify".into(),
                 table: "orders".into(),
             },
-            strategy: MaterializationStrategy::Incremental {
+            MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
             },
-            columns: ColumnSelection::All,
-            metadata_columns: vec![MetadataColumn {
+            SourceRef {
+                catalog: "source_catalog".into(),
+                schema: "src__acme__us_west__shopify".into(),
+                table: "orders".into(),
+            },
+            ColumnSelection::All,
+            vec![MetadataColumn {
                 name: "_loaded_by".into(),
                 data_type: "STRING".into(),
                 value: "NULL".into(),
             }],
-            governance: GovernanceConfig {
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: true,
                 auto_create_schemas: true,
             },
-        }
+        )
     }
 
-    fn sample_full_refresh_plan() -> ReplicationPlan {
-        ReplicationPlan {
-            strategy: MaterializationStrategy::FullRefresh,
-            ..sample_incremental_plan()
-        }
+    fn sample_full_refresh_ir() -> ModelIr {
+        let mut ir = sample_incremental_ir();
+        ir.materialization = MaterializationStrategy::FullRefresh;
+        ir
     }
 
     #[test]
     fn test_incremental_select() {
-        let plan = sample_incremental_plan();
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog.src__acme__us_west__shopify.orders"));
@@ -988,8 +948,7 @@ mod tests {
 
     #[test]
     fn test_full_refresh_select() {
-        let plan = sample_full_refresh_plan();
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog"));
@@ -998,8 +957,7 @@ mod tests {
 
     #[test]
     fn test_insert_into_sql() {
-        let plan = sample_incremental_plan();
-        let sql = generate_insert_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_insert_sql(&sample_incremental_ir(), &dialect()).unwrap();
 
         assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
         assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
@@ -1008,8 +966,7 @@ mod tests {
 
     #[test]
     fn test_create_table_as_sql() {
-        let plan = sample_incremental_plan();
-        let sql = generate_create_table_as_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_create_table_as_sql(&sample_incremental_ir(), &dialect()).unwrap();
 
         // CTAS always does full refresh (no WHERE clause)
         assert!(sql.starts_with(
@@ -1021,12 +978,14 @@ mod tests {
 
     #[test]
     fn test_explicit_columns() {
-        let plan = ReplicationPlan {
-            columns: ColumnSelection::Explicit(vec!["id".into(), "name".into(), "status".into()]),
-            metadata_columns: vec![],
-            ..sample_full_refresh_plan()
-        };
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let mut ir = sample_full_refresh_ir();
+        ir.columns = Some(ColumnSelection::Explicit(vec![
+            "id".into(),
+            "name".into(),
+            "status".into(),
+        ]));
+        ir.metadata_columns = vec![];
+        let sql = generate_select_sql(&ir, &dialect()).unwrap();
 
         assert!(sql.starts_with("SELECT id, name, status"));
         assert!(!sql.contains("*"));
@@ -1034,11 +993,9 @@ mod tests {
 
     #[test]
     fn test_no_metadata_columns() {
-        let plan = ReplicationPlan {
-            metadata_columns: vec![],
-            ..sample_full_refresh_plan()
-        };
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let mut ir = sample_full_refresh_ir();
+        ir.metadata_columns = vec![];
+        let sql = generate_select_sql(&ir, &dialect()).unwrap();
 
         assert_eq!(sql.lines().next().unwrap().trim(), "SELECT *");
         assert!(!sql.contains("CAST"));
@@ -1046,22 +1003,20 @@ mod tests {
 
     #[test]
     fn test_multiple_metadata_columns() {
-        let plan = ReplicationPlan {
-            metadata_columns: vec![
-                MetadataColumn {
-                    name: "_loaded_by".into(),
-                    data_type: "STRING".into(),
-                    value: "NULL".into(),
-                },
-                MetadataColumn {
-                    name: "load_id".into(),
-                    data_type: "INT".into(),
-                    value: "42".into(),
-                },
-            ],
-            ..sample_full_refresh_plan()
-        };
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let mut ir = sample_full_refresh_ir();
+        ir.metadata_columns = vec![
+            MetadataColumn {
+                name: "_loaded_by".into(),
+                data_type: "STRING".into(),
+                value: "NULL".into(),
+            },
+            MetadataColumn {
+                name: "load_id".into(),
+                data_type: "INT".into(),
+                value: "42".into(),
+            },
+        ];
+        let sql = generate_select_sql(&ir, &dialect()).unwrap();
 
         assert!(sql.contains("CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("CAST(42 AS INT) AS load_id"));
@@ -1069,86 +1024,74 @@ mod tests {
 
     #[test]
     fn test_rejects_unsafe_identifier_in_source() {
-        let plan = ReplicationPlan {
-            source: SourceRef {
-                catalog: "catalog; DROP TABLE".into(),
-                schema: "schema".into(),
-                table: "table".into(),
-            },
-            ..sample_full_refresh_plan()
-        };
-        assert!(generate_select_sql(&rep_ir(&plan), &dialect()).is_err());
+        let mut ir = sample_full_refresh_ir();
+        ir.source = Some(SourceRef {
+            catalog: "catalog; DROP TABLE".into(),
+            schema: "schema".into(),
+            table: "table".into(),
+        });
+        assert!(generate_select_sql(&ir, &dialect()).is_err());
     }
 
     #[test]
     fn test_rejects_unsafe_metadata_name() {
-        let plan = ReplicationPlan {
-            metadata_columns: vec![MetadataColumn {
-                name: "col; DROP TABLE".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            }],
-            ..sample_full_refresh_plan()
-        };
-        assert!(generate_select_sql(&rep_ir(&plan), &dialect()).is_err());
+        let mut ir = sample_full_refresh_ir();
+        ir.metadata_columns = vec![MetadataColumn {
+            name: "col; DROP TABLE".into(),
+            data_type: "STRING".into(),
+            value: "NULL".into(),
+        }];
+        assert!(generate_select_sql(&ir, &dialect()).is_err());
     }
 
     #[test]
     fn test_rejects_unsafe_metadata_value() {
-        let plan = ReplicationPlan {
-            metadata_columns: vec![MetadataColumn {
-                name: "col".into(),
-                data_type: "STRING".into(),
-                value: "1; DROP TABLE users".into(),
-            }],
-            ..sample_full_refresh_plan()
-        };
+        let mut ir = sample_full_refresh_ir();
+        ir.metadata_columns = vec![MetadataColumn {
+            name: "col".into(),
+            data_type: "STRING".into(),
+            value: "1; DROP TABLE users".into(),
+        }];
         // Note: metadata value validation is delegated to the dialect's select_clause.
         // The test dialect writes the value verbatim. The SQL gen layer itself does not
         // validate literal values anymore (that was in the removed non-dialect code).
         // This test now checks that the dialect produces output (it does, since TestDialect
         // doesn't validate literal values). In production, the DatabricksSqlDialect should
         // validate literal values.
-        let _ = generate_select_sql(&rep_ir(&plan), &dialect());
+        let _ = generate_select_sql(&ir, &dialect());
     }
 
     #[test]
     fn test_rejects_unsafe_data_type() {
-        let plan = ReplicationPlan {
-            metadata_columns: vec![MetadataColumn {
-                name: "col".into(),
-                data_type: "STRING); DROP TABLE users--".into(),
-                value: "NULL".into(),
-            }],
-            ..sample_full_refresh_plan()
-        };
+        let mut ir = sample_full_refresh_ir();
+        ir.metadata_columns = vec![MetadataColumn {
+            name: "col".into(),
+            data_type: "STRING); DROP TABLE users--".into(),
+            value: "NULL".into(),
+        }];
         // Same as above: data type validation is delegated to the dialect.
-        let _ = generate_select_sql(&rep_ir(&plan), &dialect());
+        let _ = generate_select_sql(&ir, &dialect());
     }
 
     #[test]
     fn test_merge_select_is_full_scan() {
-        let plan = ReplicationPlan {
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec!["id".into()],
-                update_columns: ColumnSelection::All,
-            },
-            ..sample_full_refresh_plan()
+        let mut ir = sample_full_refresh_ir();
+        ir.materialization = MaterializationStrategy::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: ColumnSelection::All,
         };
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_select_sql(&ir, &dialect()).unwrap();
         assert!(!sql.contains("WHERE")); // merge SELECT is a full scan
     }
 
     #[test]
     fn test_merge_sql() {
-        let plan = ReplicationPlan {
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec!["id".into()],
-                update_columns: ColumnSelection::All,
-            },
-            ..sample_full_refresh_plan()
+        let mut ir = sample_full_refresh_ir();
+        ir.materialization = MaterializationStrategy::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: ColumnSelection::All,
         };
-        let sql = generate_merge_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_merge_sql(&ir, &dialect()).unwrap();
         assert!(sql.contains("MERGE INTO"));
         assert!(sql.contains("ON t.id = s.id"));
         assert!(sql.contains("WHEN MATCHED THEN UPDATE SET *"));
@@ -1157,55 +1100,51 @@ mod tests {
 
     #[test]
     fn test_merge_composite_key() {
-        let plan = ReplicationPlan {
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec!["id".into(), "date".into()],
-                update_columns: ColumnSelection::Explicit(vec!["status".into(), "amount".into()]),
-            },
-            ..sample_full_refresh_plan()
+        let mut ir = sample_full_refresh_ir();
+        ir.materialization = MaterializationStrategy::Merge {
+            unique_key: vec!["id".into(), "date".into()],
+            update_columns: ColumnSelection::Explicit(vec!["status".into(), "amount".into()]),
         };
-        let sql = generate_merge_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_merge_sql(&ir, &dialect()).unwrap();
         assert!(sql.contains("ON t.id = s.id AND t.date = s.date"));
         assert!(sql.contains("UPDATE SET t.status = s.status, t.amount = s.amount"));
     }
 
     #[test]
     fn test_merge_no_key_fails() {
-        let plan = ReplicationPlan {
-            strategy: MaterializationStrategy::Merge {
-                unique_key: vec![],
-                update_columns: ColumnSelection::All,
-            },
-            ..sample_full_refresh_plan()
+        let mut ir = sample_full_refresh_ir();
+        ir.materialization = MaterializationStrategy::Merge {
+            unique_key: vec![],
+            update_columns: ColumnSelection::All,
         };
         // The dialect returns an error for empty keys, which sql_gen maps to UnsafeFragment
-        assert!(generate_merge_sql(&rep_ir(&plan), &dialect()).is_err());
+        assert!(generate_merge_sql(&ir, &dialect()).is_err());
     }
 
     #[test]
     fn test_transformation_full_refresh() {
-        let plan = TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: "cat".into(),
-                schema: "sch".into(),
-                table: "src".into(),
-            }],
-            target: TargetRef {
+        let ir = ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "silver".into(),
                 table: "dim_accounts".into(),
             },
-            strategy: MaterializationStrategy::FullRefresh,
-            sql: "SELECT id, name, email FROM cat.sch.src WHERE active = true".into(),
-            governance: GovernanceConfig {
+            MaterializationStrategy::FullRefresh,
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "src".into(),
+            }],
+            "SELECT id, name, email FROM cat.sch.src WHERE active = true".into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        };
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+            None,
+            None,
+        );
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.starts_with("CREATE OR REPLACE TABLE cat.silver.dim_accounts AS"));
@@ -1214,53 +1153,53 @@ mod tests {
 
     #[test]
     fn test_transformation_incremental() {
-        let plan = TransformationPlan {
-            sources: vec![],
-            target: TargetRef {
+        let ir = ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "silver".into(),
                 table: "fct_orders".into(),
             },
-            strategy: MaterializationStrategy::Incremental {
+            MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
             },
-            sql: "SELECT * FROM cat.sch.raw_orders WHERE updated_at > '2026-01-01'".into(),
-            governance: GovernanceConfig {
+            vec![],
+            "SELECT * FROM cat.sch.raw_orders WHERE updated_at > '2026-01-01'".into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        };
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+            None,
+            None,
+        );
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].starts_with("INSERT INTO cat.silver.fct_orders"));
     }
 
     #[test]
     fn test_transformation_merge() {
-        let plan = TransformationPlan {
-            sources: vec![],
-            target: TargetRef {
+        let ir = ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "silver".into(),
                 table: "dim_users".into(),
             },
-            strategy: MaterializationStrategy::Merge {
+            MaterializationStrategy::Merge {
                 unique_key: vec!["user_id".into()],
                 update_columns: ColumnSelection::All,
             },
-            sql: "SELECT user_id, name, email FROM cat.sch.raw_users".into(),
-            governance: GovernanceConfig {
+            vec![],
+            "SELECT user_id, name, email FROM cat.sch.raw_users".into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        };
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+            None,
+            None,
+        );
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.contains("MERGE INTO cat.silver.dim_users AS t"));
@@ -1294,8 +1233,7 @@ mod tests {
 
     #[test]
     fn test_sample_incremental_sql_matches_expected() {
-        let plan = sample_incremental_plan();
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect()).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1310,8 +1248,7 @@ WHERE _fivetran_synced > (
 
     #[test]
     fn test_sample_full_refresh_sql_matches_expected() {
-        let plan = sample_full_refresh_plan();
-        let sql = generate_select_sql(&rep_ir(&plan), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect()).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1320,37 +1257,35 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
         assert_eq!(sql, expected);
     }
 
-    fn sample_transformation_plan() -> TransformationPlan {
-        TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: "cat".into(),
-                schema: "sch".into(),
-                table: "src".into(),
-            }],
-            target: TargetRef {
+    fn sample_transformation_ir() -> ModelIr {
+        ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "silver".into(),
                 table: "dim_accounts".into(),
             },
-            strategy: MaterializationStrategy::FullRefresh,
-            sql: "SELECT id, name, email FROM cat.sch.src WHERE active = true".into(),
-            governance: GovernanceConfig {
+            MaterializationStrategy::FullRefresh,
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "src".into(),
+            }],
+            "SELECT id, name, email FROM cat.sch.src WHERE active = true".into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        }
+            None,
+            None,
+        )
     }
 
     #[test]
     fn test_generate_materialized_view_sql() {
-        let plan = TransformationPlan {
-            strategy: MaterializationStrategy::MaterializedView,
-            ..sample_transformation_plan()
-        };
-        let sql = generate_materialized_view_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let mut ir = sample_transformation_ir();
+        ir.materialization = MaterializationStrategy::MaterializedView;
+        let sql = generate_materialized_view_sql(&ir, &dialect()).unwrap();
 
         let expected = "\
 CREATE OR REPLACE MATERIALIZED VIEW cat.silver.dim_accounts AS
@@ -1361,11 +1296,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_generate_materialized_view_via_transformation() {
-        let plan = TransformationPlan {
-            strategy: MaterializationStrategy::MaterializedView,
-            ..sample_transformation_plan()
-        };
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let mut ir = sample_transformation_ir();
+        ir.materialization = MaterializationStrategy::MaterializedView;
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("CREATE OR REPLACE MATERIALIZED VIEW cat.silver.dim_accounts AS")
@@ -1374,14 +1307,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_generate_dynamic_table_sql() {
-        let plan = TransformationPlan {
-            strategy: MaterializationStrategy::DynamicTable {
-                target_lag: "1 hour".into(),
-            },
-            ..sample_transformation_plan()
+        let mut ir = sample_transformation_ir();
+        ir.materialization = MaterializationStrategy::DynamicTable {
+            target_lag: "1 hour".into(),
         };
-        let sql = generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "COMPUTE_WH", &dialect())
-            .unwrap();
+        let sql = generate_dynamic_table_sql(&ir, "1 hour", "COMPUTE_WH", &dialect()).unwrap();
 
         let expected = "\
 CREATE OR REPLACE DYNAMIC TABLE cat.silver.dim_accounts
@@ -1395,31 +1325,21 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_dynamic_table_rejects_bad_warehouse() {
-        let plan = TransformationPlan {
-            strategy: MaterializationStrategy::DynamicTable {
-                target_lag: "1 hour".into(),
-            },
-            ..sample_transformation_plan()
+        let mut ir = sample_transformation_ir();
+        ir.materialization = MaterializationStrategy::DynamicTable {
+            target_lag: "1 hour".into(),
         };
-        let result =
-            generate_dynamic_table_sql(&xform_ir(&plan), "1 hour", "WH; DROP TABLE", &dialect());
+        let result = generate_dynamic_table_sql(&ir, "1 hour", "WH; DROP TABLE", &dialect());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_dynamic_table_rejects_bad_target_lag() {
-        let plan = TransformationPlan {
-            strategy: MaterializationStrategy::DynamicTable {
-                target_lag: "1 hour".into(),
-            },
-            ..sample_transformation_plan()
+        let mut ir = sample_transformation_ir();
+        ir.materialization = MaterializationStrategy::DynamicTable {
+            target_lag: "1 hour".into(),
         };
-        let result = generate_dynamic_table_sql(
-            &xform_ir(&plan),
-            "1'; DROP TABLE --",
-            "COMPUTE_WH",
-            &dialect(),
-        );
+        let result = generate_dynamic_table_sql(&ir, "1'; DROP TABLE --", "COMPUTE_WH", &dialect());
         assert!(result.is_err());
     }
 
@@ -1429,36 +1349,32 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     use crate::models::TimeGrain;
     use chrono::TimeZone;
 
-    fn time_interval_plan(
-        time_column: &str,
-        sql: &str,
-        window: Option<PartitionWindow>,
-    ) -> TransformationPlan {
-        TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: "cat".into(),
-                schema: "raw".into(),
-                table: "stg_orders".into(),
-            }],
-            target: TargetRef {
+    fn time_interval_ir(time_column: &str, sql: &str, window: Option<PartitionWindow>) -> ModelIr {
+        ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "marts".into(),
                 table: "fct_daily_orders".into(),
             },
-            strategy: MaterializationStrategy::TimeInterval {
+            MaterializationStrategy::TimeInterval {
                 time_column: time_column.into(),
                 granularity: TimeGrain::Day,
                 window,
             },
-            sql: sql.into(),
-            governance: GovernanceConfig {
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "raw".into(),
+                table: "stg_orders".into(),
+            }],
+            sql.into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: None,
-            format_options: None,
-        }
+            None,
+            None,
+        )
     }
 
     fn april_7_window() -> PartitionWindow {
@@ -1474,23 +1390,23 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // Static planning leaves window=None; calling generate_transformation_sql
         // without populating it must fail loudly so the runtime executor isn't
         // confused into emitting an unbounded statement.
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order_date",
             "SELECT order_date FROM cat.raw.stg_orders WHERE order_date >= @start_date AND order_date < @end_date",
             None,
         );
-        let result = generate_transformation_sql(&xform_ir(&plan), &dialect());
+        let result = generate_transformation_sql(&plan, &dialect());
         assert!(matches!(result, Err(SqlGenError::MissingPartitionWindow)));
     }
 
     #[test]
     fn test_time_interval_substitutes_placeholders() {
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order_date",
             "SELECT order_date FROM cat.raw.stg_orders WHERE order_date >= @start_date AND order_date < @end_date",
             Some(april_7_window()),
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1, "test dialect emits a single REPLACE WHERE");
         let sql = &stmts[0];
         // Both placeholders substituted with quoted timestamp literals.
@@ -1519,12 +1435,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // SECURITY: even though the compiler validates time_column at
         // typecheck time (E023), sql_gen re-validates at the planning
         // boundary so a bad column name can never reach format!().
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order date", // contains a space → invalid identifier
             "SELECT 1 FROM cat.raw.stg_orders WHERE 1=1 AND @start_date < @end_date",
             Some(april_7_window()),
         );
-        let result = generate_transformation_sql(&xform_ir(&plan), &dialect());
+        let result = generate_transformation_sql(&plan, &dialect());
         assert!(matches!(result, Err(SqlGenError::UnsafeFragment { .. })));
     }
 
@@ -1546,13 +1462,13 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // AS statement with both placeholders substituted to the same
         // sentinel timestamp ('1900-01-01 00:00:00'), making the half-open
         // [start, end) window empty so the model SELECT returns zero rows.
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order_date",
             "SELECT order_date FROM cat.raw.stg_orders \
              WHERE order_at >= @start_date AND order_at < @end_date",
             None,
         );
-        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
 
         // Wrapped in CREATE OR REPLACE TABLE AS by the test dialect.
         assert!(
@@ -1580,12 +1496,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // The bootstrap helper does NOT need PartitionWindow to be populated
         // on the plan — it ignores plan.strategy entirely and just uses the
         // model SQL + target. Verify that a plan with window=None still works.
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order_date",
             "SELECT order_date FROM cat.raw.x WHERE x.t >= @start_date AND x.t < @end_date",
             None, // window = None
         );
-        let result = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect());
+        let result = generate_time_interval_bootstrap_sql(&plan, &dialect());
         assert!(
             result.is_ok(),
             "bootstrap should not error on missing window: {result:?}"
@@ -1596,37 +1512,37 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 
-    fn lakehouse_plan(
+    fn lakehouse_ir(
         format: LakehouseFormat,
         options: LakehouseOptions,
         strategy: MaterializationStrategy,
-    ) -> TransformationPlan {
-        TransformationPlan {
-            sources: vec![SourceRef {
-                catalog: "cat".into(),
-                schema: "raw".into(),
-                table: "stg_orders".into(),
-            }],
-            target: TargetRef {
+    ) -> ModelIr {
+        ModelIr::transformation(
+            TargetRef {
                 catalog: "cat".into(),
                 schema: "silver".into(),
                 table: "fct_orders".into(),
             },
             strategy,
-            sql: "SELECT id, amount, region FROM cat.raw.stg_orders".into(),
-            governance: GovernanceConfig {
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "raw".into(),
+                table: "stg_orders".into(),
+            }],
+            "SELECT id, amount, region FROM cat.raw.stg_orders".into(),
+            GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: false,
                 auto_create_schemas: false,
             },
-            format: Some(format),
-            format_options: Some(options),
-        }
+            Some(format),
+            Some(options),
+        )
     }
 
     #[test]
     fn test_lakehouse_full_refresh_delta() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions {
                 partition_by: vec!["region".into()],
@@ -1636,7 +1552,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(sql.contains("USING DELTA"), "expected USING DELTA: {sql}");
@@ -1664,7 +1580,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_full_refresh_iceberg() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::IcebergTable,
             LakehouseOptions {
                 partition_by: vec!["region".into()],
@@ -1672,7 +1588,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1687,12 +1603,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_full_refresh_streaming_table() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::StreamingTable,
             LakehouseOptions::default(),
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].contains("CREATE OR REPLACE STREAMING TABLE"),
@@ -1703,12 +1619,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_full_refresh_view() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::View,
             LakehouseOptions::default(),
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].contains("CREATE OR REPLACE VIEW"),
@@ -1719,7 +1635,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_full_refresh_materialized_view() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::MaterializedView,
             LakehouseOptions {
                 comment: Some("MV test".into()),
@@ -1727,7 +1643,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1741,7 +1657,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     fn test_lakehouse_full_refresh_plain_table() {
         // LakehouseFormat::Table with options should still apply partitioning
         // and properties even though it's a "plain" table.
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::Table,
             LakehouseOptions {
                 cluster_by: vec!["id".into()],
@@ -1749,7 +1665,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1772,14 +1688,14 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // Incremental INSERT should not emit lakehouse DDL — that's for
         // initial table creation. The format field is silently ignored for
         // the INSERT path, since the table already exists.
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
             MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
             },
         );
-        let stmts = generate_transformation_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("INSERT INTO"),
@@ -1790,7 +1706,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_initial_ddl_delta() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions {
                 partition_by: vec!["region".into()],
@@ -1801,7 +1717,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 timestamp_column: "updated_at".into(),
             },
         );
-        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1820,7 +1736,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     #[test]
     fn test_lakehouse_initial_ddl_iceberg() {
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::IcebergTable,
             LakehouseOptions {
                 cluster_by: vec!["user_id".into()],
@@ -1831,7 +1747,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 update_columns: ColumnSelection::All,
             },
         );
-        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1848,16 +1764,14 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     fn test_lakehouse_initial_ddl_fallback_no_format() {
         // When format is None, generate_transformation_initial_ddl should
         // fall back to the plain dialect.create_table_as.
-        let plan = TransformationPlan {
-            format: None,
-            format_options: None,
-            ..lakehouse_plan(
-                LakehouseFormat::DeltaTable,
-                LakehouseOptions::default(),
-                MaterializationStrategy::FullRefresh,
-            )
-        };
-        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
+        let mut plan = lakehouse_ir(
+            LakehouseFormat::DeltaTable,
+            LakehouseOptions::default(),
+            MaterializationStrategy::FullRefresh,
+        );
+        plan.format = None;
+        plan.format_options = None;
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("CREATE OR REPLACE TABLE"),
@@ -1874,7 +1788,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn test_lakehouse_time_interval_bootstrap_with_delta_format() {
         // Time-interval bootstrap should use lakehouse DDL when format is set.
-        let mut plan = time_interval_plan(
+        let mut plan = time_interval_ir(
             "order_date",
             "SELECT order_date, amount FROM cat.raw.stg_orders \
              WHERE order_date >= @start_date AND order_date < @end_date",
@@ -1887,7 +1801,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             ..LakehouseOptions::default()
         });
 
-        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
         assert!(
             sql.contains("USING DELTA"),
             "bootstrap should use DELTA: {sql}"
@@ -1919,13 +1833,13 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn test_lakehouse_time_interval_bootstrap_without_format() {
         // Without format, bootstrap should use plain CTAS as before.
-        let plan = time_interval_plan(
+        let plan = time_interval_ir(
             "order_date",
             "SELECT order_date FROM cat.raw.stg_orders \
              WHERE order_date >= @start_date AND order_date < @end_date",
             None,
         );
-        let sql = generate_time_interval_bootstrap_sql(&xform_ir(&plan), &dialect()).unwrap();
+        let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
         assert!(
             sql.starts_with("CREATE OR REPLACE TABLE"),
             "should use plain CTAS: {sql}"
@@ -1939,7 +1853,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn test_lakehouse_initial_ddl_with_delete_insert_strategy() {
         // DeleteInsert strategy should also get lakehouse DDL on initial creation.
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions {
                 partition_by: vec!["date_key".into()],
@@ -1949,7 +1863,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 partition_by: vec!["date_key".into()],
             },
         );
-        let stmts = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect()).unwrap();
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         let sql = &stmts[0];
         assert!(
@@ -1965,7 +1879,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn test_lakehouse_initial_ddl_invalid_option_rejected() {
         // Ensure invalid lakehouse options propagate as LakehouseError.
-        let plan = lakehouse_plan(
+        let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions {
                 partition_by: vec!["DROP TABLE --".into()],
@@ -1973,7 +1887,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             },
             MaterializationStrategy::FullRefresh,
         );
-        let result = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect());
+        let result = generate_transformation_initial_ddl(&plan, &dialect());
         assert!(result.is_err(), "should reject invalid partition column");
     }
 
@@ -1983,7 +1897,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     /// `expected Replication, found transformation` template.
     #[test]
     fn variant_mismatch_error_names_the_actual_variant() {
-        let ir = xform_ir(&sample_transformation_plan());
+        let ir = sample_transformation_ir();
         let err = generate_select_sql(&ir, &dialect()).expect_err("expected variant mismatch");
         let msg = err.to_string();
         assert!(
@@ -1992,7 +1906,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         assert!(
             msg.contains("found transformation"),
-            "error should name the actual variant via `variant_name()`, got: {msg}"
+            "error should name the actual variant via `variant()`, got: {msg}"
         );
     }
 
@@ -2001,7 +1915,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     /// template.
     #[test]
     fn variant_mismatch_transformation_helper_names_replication_input() {
-        let ir = rep_ir(&sample_incremental_plan());
+        let ir = sample_incremental_ir();
         let err =
             generate_transformation_sql(&ir, &dialect()).expect_err("expected variant mismatch");
         let msg = err.to_string();
@@ -2011,7 +1925,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         assert!(
             msg.contains("found replication"),
-            "error should name the actual variant via `variant_name()`, got: {msg}"
+            "error should name the actual variant via `variant()`, got: {msg}"
         );
     }
 
@@ -2020,7 +1934,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     /// template — the third and final error-message shape.
     #[test]
     fn variant_mismatch_snapshot_helper_names_transformation_input() {
-        let ir = xform_ir(&sample_transformation_plan());
+        let ir = sample_transformation_ir();
         let err = generate_snapshot_sql(&ir, &dialect()).expect_err("expected variant mismatch");
         let msg = err.to_string();
         assert!(
@@ -2029,7 +1943,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         assert!(
             msg.contains("found transformation"),
-            "error should name the actual variant via `variant_name()`, got: {msg}"
+            "error should name the actual variant via `variant()`, got: {msg}"
         );
     }
 }

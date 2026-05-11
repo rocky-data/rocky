@@ -182,11 +182,11 @@ async fn probe_model_retention(
         .unwrap_or(&ctx.default_adapter);
     let governance: Box<dyn GovernanceAdapter> = ctx.registry.governance_adapter(adapter_name);
 
-    let plan = model.to_plan();
+    let target = &model.config.target;
     let table = TableRef {
-        catalog: plan.target.catalog,
-        schema: plan.target.schema,
-        table: plan.target.table,
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: target.table.clone(),
     };
 
     match governance.read_retention_days(&table).await {
