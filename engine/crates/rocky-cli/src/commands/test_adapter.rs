@@ -34,7 +34,7 @@ pub async fn run_test_adapter(
             let manifest = adapter.manifest().clone();
 
             // Run conformance suite.
-            let result = conformance::run_conformance(&manifest);
+            let result = conformance::run_conformance(&manifest, Some(adapter.dialect()));
 
             // Clean up.
             let _ = adapter.close().await;
@@ -56,7 +56,9 @@ pub async fn run_test_adapter(
                 config_schema: serde_json::Value::Null,
             };
 
-            let mut result = conformance::run_conformance(&manifest);
+            // No live dialect available — let the harness skip dialect-category
+            // checks and override `connect` as failed below.
+            let mut result = conformance::run_conformance(&manifest, None);
             // Override the first test (connect) as failed.
             if let Some(connect_test) = result.results.first_mut() {
                 connect_test.status = conformance::TestStatus::Failed;
@@ -131,7 +133,9 @@ pub async fn run_test_adapter_builtin(
         config_schema: serde_json::Value::Null,
     };
 
-    let result = conformance::run_conformance(&manifest);
+    // No live adapter is constructed for the builtin path, so the harness
+    // reports dialect-category checks as skipped.
+    let result = conformance::run_conformance(&manifest, None);
     output_result(&result, json_output)?;
 
     Ok(())

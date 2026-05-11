@@ -7,15 +7,20 @@
 //! # Usage
 //!
 //! ```ignore
-//! let result = run_conformance(&adapter, &manifest, adapter.dialect()).await;
+//! let result = run_conformance(&manifest, Some(adapter.dialect()));
 //! assert_eq!(result.tests_failed, 0);
 //! ```
+//!
+//! Pass `None` for the dialect when no live adapter is available (for example,
+//! `rocky test-adapter --builtin`). Dialect-category tests are reported as
+//! skipped in that mode rather than executed against a stub.
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::AdapterManifest;
+use crate::traits::SqlDialect;
 
 /// Result of running the conformance test suite against an adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +157,16 @@ struct TestSpec {
     /// If set, the test is skipped when this capability is false.
     requires_capability: Option<fn(&AdapterManifest) -> bool>,
 }
+
+/// Outcome of a single spec dispatch. Mapped to `TestStatus` by the runner.
+enum TestOutcome {
+    Pass,
+    Fail(String),
+    Skip(String),
+}
+
+/// Message used when a dialect-category spec is asked to run without a dialect.
+const NO_DIALECT_SKIP_MESSAGE: &str = "dialect not available in this run mode";
 
 /// Build the full list of conformance test specifications.
 fn test_specs() -> Vec<TestSpec> {
@@ -300,17 +315,25 @@ fn test_specs() -> Vec<TestSpec> {
 
 /// Run the conformance test suite against an adapter.
 ///
-/// This builds the test plan based on the adapter's manifest, runs each test,
-/// and collects results. Tests for unsupported capabilities are skipped.
+/// Builds the test plan from the adapter's manifest, executes each spec, and
+/// collects results. Specs whose required capability is missing are reported
+/// as `Skipped`.
 ///
-/// Currently this returns a plan with all tests marked as skipped or with
-/// placeholder timing. Actual test execution will be wired up when adapters
-/// implement the traits against live warehouses.
-pub fn run_conformance(manifest: &AdapterManifest) -> ConformanceResult {
+/// When `dialect` is `Some`, the harness executes one real trait call
+/// (`SqlDialect::format_table_ref`) as the first incremental live check.
+/// When `dialect` is `None` — for example in `rocky test-adapter --builtin`,
+/// which validates the test plan without a live warehouse — that spec is
+/// reported as `Skipped` rather than executed against a stub. Remaining
+/// specs return placeholder passes; broader live execution lands in future
+/// SDK releases.
+pub fn run_conformance(
+    manifest: &AdapterManifest,
+    dialect: Option<&dyn SqlDialect>,
+) -> ConformanceResult {
     let specs = test_specs();
     let mut results = Vec::with_capacity(specs.len());
     let mut passed = 0usize;
-    let failed = 0usize;
+    let mut failed = 0usize;
     let mut skipped = 0usize;
 
     for spec in &specs {
@@ -334,16 +357,27 @@ pub fn run_conformance(manifest: &AdapterManifest) -> ConformanceResult {
             continue;
         }
 
-        // Placeholder: in a real run, each test would execute against the adapter.
-        // For now, mark all supported tests as passed with zero duration,
-        // indicating the test plan is valid but no live execution occurred.
+        let outcome = run_test_spec(spec, dialect);
         let elapsed = start.elapsed();
-        passed += 1;
+        let (status, message) = match outcome {
+            TestOutcome::Pass => {
+                passed += 1;
+                (TestStatus::Passed, None)
+            }
+            TestOutcome::Fail(msg) => {
+                failed += 1;
+                (TestStatus::Failed, Some(msg))
+            }
+            TestOutcome::Skip(msg) => {
+                skipped += 1;
+                (TestStatus::Skipped, Some(msg))
+            }
+        };
         results.push(TestResult {
             name: spec.name.to_string(),
             category: spec.category.clone(),
-            status: TestStatus::Passed,
-            message: None,
+            status,
+            message,
             duration_ms: elapsed.as_millis() as u64,
         });
     }
@@ -359,10 +393,145 @@ pub fn run_conformance(manifest: &AdapterManifest) -> ConformanceResult {
     }
 }
 
+fn run_test_spec(spec: &TestSpec, dialect: Option<&dyn SqlDialect>) -> TestOutcome {
+    match spec.name {
+        "format_table_ref" => {
+            let Some(dialect) = dialect else {
+                return TestOutcome::Skip(NO_DIALECT_SKIP_MESSAGE.into());
+            };
+            match dialect.format_table_ref("c", "s", "t") {
+                Ok(formatted) if formatted.trim().is_empty() => {
+                    TestOutcome::Fail("format_table_ref returned an empty table reference".into())
+                }
+                Ok(_) => TestOutcome::Pass,
+                Err(e) => TestOutcome::Fail(e.to_string()),
+            }
+        }
+        _ => TestOutcome::Pass,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::{AdapterCapabilities, AdapterManifest};
+    use crate::traits::{AdapterError, AdapterResult, ColumnSelection, MetadataColumn};
+
+    /// In-crate `SqlDialect` stub. `format_table_ref` is delegated through a
+    /// function pointer so individual tests can swap in empty-string or `Err`
+    /// behavior without duplicating the rest of the trait surface.
+    struct TestDialect {
+        format_table_ref_impl: fn(&str, &str, &str) -> AdapterResult<String>,
+    }
+
+    impl Default for TestDialect {
+        fn default() -> Self {
+            Self {
+                format_table_ref_impl: |c, s, t| Ok(format!("{c}.{s}.{t}")),
+            }
+        }
+    }
+
+    impl TestDialect {
+        fn with_format_table_ref(f: fn(&str, &str, &str) -> AdapterResult<String>) -> Self {
+            Self {
+                format_table_ref_impl: f,
+            }
+        }
+    }
+
+    impl SqlDialect for TestDialect {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            (self.format_table_ref_impl)(catalog, schema, table)
+        }
+
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE TABLE {target} AS {select_sql}")
+        }
+
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            format!("INSERT INTO {target} {select_sql}")
+        }
+
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            _keys: &[String],
+            _update_cols: Option<&[String]>,
+        ) -> AdapterResult<String> {
+            Ok(format!("MERGE INTO {target} USING {source_sql}"))
+        }
+
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            format!("DESCRIBE {table_ref}")
+        }
+
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            format!("DROP TABLE {table_ref}")
+        }
+
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            Some(Ok(format!("CREATE CATALOG {name}")))
+        }
+
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            Some(Ok(format!("CREATE SCHEMA {catalog}.{schema}")))
+        }
+
+        fn row_hash_expr(&self, columns: &[String]) -> String {
+            format!("hash({})", columns.join(", "))
+        }
+
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            Some(format!("TABLESAMPLE ({percent})"))
+        }
+
+        fn select_clause(
+            &self,
+            columns: &ColumnSelection,
+            metadata: &[MetadataColumn],
+        ) -> AdapterResult<String> {
+            let mut sql = match columns {
+                ColumnSelection::All => "SELECT *".to_string(),
+                ColumnSelection::Explicit(cols) => format!("SELECT {}", cols.join(", ")),
+            };
+            for column in metadata {
+                sql.push_str(&format!(", {} AS {}", column.value, column.name));
+            }
+            Ok(sql)
+        }
+
+        fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+            Ok(format!(
+                "WHERE {timestamp_col} > (SELECT max({timestamp_col}) FROM {target_ref})"
+            ))
+        }
+
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            Ok(vec![format!(
+                "INSERT OVERWRITE {target} WHERE {partition_filter} {select_sql}"
+            )])
+        }
+    }
+
+    fn run_test_conformance(manifest: &AdapterManifest) -> ConformanceResult {
+        run_conformance(manifest, Some(&TestDialect::default()))
+    }
 
     fn test_manifest(caps: AdapterCapabilities) -> AdapterManifest {
         AdapterManifest {
@@ -376,10 +545,18 @@ mod tests {
         }
     }
 
+    fn find_result<'a>(result: &'a ConformanceResult, name: &str) -> &'a TestResult {
+        result
+            .results
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing {name} result"))
+    }
+
     #[test]
     fn test_conformance_full_capabilities() {
         let manifest = test_manifest(AdapterCapabilities::full());
-        let result = run_conformance(&manifest);
+        let result = run_test_conformance(&manifest);
 
         assert_eq!(result.adapter, "test-adapter");
         assert_eq!(result.tests_skipped, 0);
@@ -389,9 +566,59 @@ mod tests {
     }
 
     #[test]
+    fn test_conformance_executes_format_table_ref_pass() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&TestDialect::default()));
+
+        let format_result = find_result(&result, "format_table_ref");
+        assert_eq!(format_result.status, TestStatus::Passed);
+    }
+
+    #[test]
+    fn test_conformance_fails_format_table_ref_when_empty() {
+        let dialect = TestDialect::with_format_table_ref(|_, _, _| Ok(String::new()));
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&dialect));
+
+        let format_result = find_result(&result, "format_table_ref");
+        assert_eq!(format_result.status, TestStatus::Failed);
+        assert_eq!(result.tests_failed, 1);
+    }
+
+    #[test]
+    fn test_conformance_fails_format_table_ref_on_err() {
+        let dialect =
+            TestDialect::with_format_table_ref(|_, _, _| Err(AdapterError::msg("dialect blew up")));
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&dialect));
+
+        let format_result = find_result(&result, "format_table_ref");
+        assert_eq!(format_result.status, TestStatus::Failed);
+        assert_eq!(
+            format_result.message.as_deref(),
+            Some("dialect blew up"),
+            "expected the adapter error message to propagate into the test result"
+        );
+    }
+
+    #[test]
+    fn test_conformance_skips_format_table_ref_when_no_dialect() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, None);
+
+        let format_result = find_result(&result, "format_table_ref");
+        assert_eq!(format_result.status, TestStatus::Skipped);
+        assert_eq!(
+            format_result.message.as_deref(),
+            Some(NO_DIALECT_SKIP_MESSAGE)
+        );
+        assert_eq!(result.tests_failed, 0);
+    }
+
+    #[test]
     fn test_conformance_warehouse_only() {
         let manifest = test_manifest(AdapterCapabilities::warehouse_only());
-        let result = run_conformance(&manifest);
+        let result = run_test_conformance(&manifest);
 
         // Optional tests should be skipped
         assert!(result.tests_skipped > 0);
@@ -418,7 +645,7 @@ mod tests {
     #[test]
     fn test_conformance_result_serialization() {
         let manifest = test_manifest(AdapterCapabilities::warehouse_only());
-        let result = run_conformance(&manifest);
+        let result = run_test_conformance(&manifest);
 
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: ConformanceResult = serde_json::from_str(&json).unwrap();
@@ -429,7 +656,7 @@ mod tests {
     #[test]
     fn test_conformance_report_formatting() {
         let manifest = test_manifest(AdapterCapabilities::warehouse_only());
-        let result = run_conformance(&manifest);
+        let result = run_test_conformance(&manifest);
         let report = result.report();
 
         assert!(report.contains("Adapter Conformance: test-adapter"));
