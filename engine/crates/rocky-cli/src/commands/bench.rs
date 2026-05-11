@@ -349,37 +349,32 @@ fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
     let mut results = Vec::new();
 
     for size in [10, 100, 500, 1000, 5000, 10000] {
-        let plans: Vec<ReplicationPlan> = (0..size)
-            .map(|i| ReplicationPlan {
-                source: SourceRef {
-                    catalog: String::new(),
-                    schema: "source".into(),
-                    table: format!("table_{i}"),
-                },
-                target: TargetRef {
-                    catalog: String::new(),
-                    schema: "target".into(),
-                    table: format!("table_{i}"),
-                },
-                strategy: MaterializationStrategy::FullRefresh,
-                columns: ColumnSelection::All,
-                metadata_columns: vec![MetadataColumn {
-                    name: "_loaded_by".into(),
-                    data_type: "VARCHAR".into(),
-                    value: "NULL".into(),
-                }],
-                governance: GovernanceConfig {
-                    permissions_file: None,
-                    auto_create_catalogs: false,
-                    auto_create_schemas: false,
-                },
-            })
-            .collect();
-
-        let model_irs: Vec<_> = plans
-            .iter()
-            .map(|plan| {
-                rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Replication(plan.clone()))
+        let model_irs: Vec<_> = (0..size)
+            .map(|i| {
+                rocky_core::ir::ModelIr::replication(
+                    TargetRef {
+                        catalog: String::new(),
+                        schema: "target".into(),
+                        table: format!("table_{i}"),
+                    },
+                    MaterializationStrategy::FullRefresh,
+                    SourceRef {
+                        catalog: String::new(),
+                        schema: "source".into(),
+                        table: format!("table_{i}"),
+                    },
+                    ColumnSelection::All,
+                    vec![MetadataColumn {
+                        name: "_loaded_by".into(),
+                        data_type: "VARCHAR".into(),
+                        value: "NULL".into(),
+                    }],
+                    GovernanceConfig {
+                        permissions_file: None,
+                        auto_create_catalogs: false,
+                        auto_create_schemas: false,
+                    },
+                )
             })
             .collect();
         let times = measure(iterations, || {

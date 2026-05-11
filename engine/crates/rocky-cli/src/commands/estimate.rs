@@ -65,9 +65,7 @@ pub async fn run_estimate(
     // 3. For each model, generate SQL and run EXPLAIN.
     let mut estimates = Vec::new();
     for model in &models_to_estimate {
-        let plan = model.to_plan();
-        let model_ir =
-            rocky_core::ir::ModelIr::from(&rocky_core::ir::Plan::Transformation(plan.clone()));
+        let model_ir = model.to_model_ir();
         let dialect = warehouse_adapter.dialect();
 
         let sql_result = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect);

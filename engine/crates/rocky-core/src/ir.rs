@@ -600,6 +600,89 @@ impl std::fmt::Display for ModelIrVariant {
 }
 
 impl ModelIr {
+    /// Construct a replication-shaped [`ModelIr`] directly, bypassing the
+    /// [`Plan`] enum.
+    ///
+    /// Variant inference (see [`Self::variant`]) returns
+    /// [`ModelIrVariant::Replication`] for any IR built by this constructor,
+    /// since `columns` is `Some` and snapshot-shape fields stay empty.
+    ///
+    /// `name` defaults to `target.table`; `sql`, `typed_columns`,
+    /// `lineage_edges`, `sources`, `column_masks`, `unique_key`,
+    /// `updated_at`, `invalidate_hard_deletes`, `format`, and
+    /// `format_options` default to their zero values. Callers that need
+    /// richer typed-column or lineage data should mutate those fields
+    /// after construction.
+    pub fn replication(
+        target: TargetRef,
+        strategy: MaterializationStrategy,
+        source: SourceRef,
+        columns: ColumnSelection,
+        metadata_columns: Vec<MetadataColumn>,
+        governance: GovernanceConfig,
+    ) -> Self {
+        Self {
+            name: Arc::from(target.table.as_str()),
+            sql: String::new(),
+            typed_columns: Vec::new(),
+            lineage_edges: Vec::new(),
+            materialization: strategy,
+            governance,
+            target,
+            column_masks: Vec::new(),
+            source: Some(source),
+            sources: Vec::new(),
+            columns: Some(columns),
+            metadata_columns,
+            unique_key: Vec::new(),
+            updated_at: None,
+            invalidate_hard_deletes: false,
+            format: None,
+            format_options: None,
+        }
+    }
+
+    /// Construct a snapshot-shaped [`ModelIr`] directly, bypassing the
+    /// [`Plan`] enum.
+    ///
+    /// `materialization` is fixed at [`MaterializationStrategy::FullRefresh`]
+    /// to match the existing snapshot SQL-gen contract — SCD2 logic is
+    /// implicit in [`crate::sql_gen::generate_snapshot_sql`] and does not
+    /// depend on a strategy variant.
+    ///
+    /// `name` defaults to `target.table`. `sql`, `typed_columns`,
+    /// `lineage_edges`, `sources`, `column_masks`, `columns`,
+    /// `metadata_columns`, `format`, and `format_options` default to their
+    /// zero values.
+    pub fn snapshot(
+        target: TargetRef,
+        source: SourceRef,
+        unique_key: Vec<Arc<str>>,
+        updated_at: String,
+        invalidate_hard_deletes: bool,
+        governance: GovernanceConfig,
+    ) -> Self {
+        Self {
+            name: Arc::from(target.table.as_str()),
+            sql: String::new(),
+            typed_columns: Vec::new(),
+            lineage_edges: Vec::new(),
+            materialization: MaterializationStrategy::FullRefresh,
+            governance,
+            target,
+            column_masks: Vec::new(),
+            source: Some(source),
+            sources: Vec::new(),
+            columns: None,
+            metadata_columns: Vec::new(),
+            unique_key,
+            updated_at: Some(updated_at),
+            invalidate_hard_deletes,
+            format: None,
+            format_options: None,
+        }
+    }
+
     /// Compute the recipe-hash of this model.
     ///
     /// The hash is `blake3` over a canonical JSON encoding of `self`: keys

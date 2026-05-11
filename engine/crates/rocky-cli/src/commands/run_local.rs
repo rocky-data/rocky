@@ -630,33 +630,31 @@ pub async fn run_snapshot(
     let mut output = RunOutput::new(String::new(), 0, 1);
     output.pipeline_type = Some("snapshot".to_string());
 
-    let plan = rocky_core::ir::SnapshotPlan {
-        source: SourceRef {
-            catalog: pipeline.source.catalog.clone(),
-            schema: pipeline.source.schema.clone(),
-            table: pipeline.source.table.clone(),
-        },
-        target: TargetRef {
+    // sql_gen consumes the typed IR directly.
+    let model_ir = ModelIr::snapshot(
+        TargetRef {
             catalog: pipeline.target.catalog.clone(),
             schema: pipeline.target.schema.clone(),
             table: pipeline.target.table.clone(),
         },
-        unique_key: pipeline
+        SourceRef {
+            catalog: pipeline.source.catalog.clone(),
+            schema: pipeline.source.schema.clone(),
+            table: pipeline.source.table.clone(),
+        },
+        pipeline
             .unique_key
             .iter()
             .map(|s| std::sync::Arc::from(s.as_str()))
             .collect(),
-        updated_at: pipeline.updated_at.clone(),
-        invalidate_hard_deletes: pipeline.invalidate_hard_deletes,
-        governance: rocky_core::ir::GovernanceConfig {
+        pipeline.updated_at.clone(),
+        pipeline.invalidate_hard_deletes,
+        rocky_core::ir::GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
             auto_create_schemas: pipeline.target.governance.auto_create_schemas,
         },
-    };
-
-    // sql_gen consumes the typed IR directly.
-    let model_ir = ModelIr::from(&Plan::Snapshot(plan.clone()));
+    );
 
     let dialect = warehouse_adapter.dialect();
     let stmts = sql_gen::generate_snapshot_sql(&model_ir, dialect)?;
