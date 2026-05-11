@@ -27,31 +27,31 @@ export default defineConfig({
       sidebar: [
         {
           label: "Getting Started",
-          autogenerate: { directory: "getting-started" },
+          items: [{ autogenerate: { directory: "getting-started" } }],
         },
         {
           label: "Guides",
-          autogenerate: { directory: "guides" },
+          items: [{ autogenerate: { directory: "guides" } }],
         },
         {
           label: "Concepts",
-          autogenerate: { directory: "concepts" },
+          items: [{ autogenerate: { directory: "concepts" } }],
         },
         {
           label: "Features",
-          autogenerate: { directory: "features" },
+          items: [{ autogenerate: { directory: "features" } }],
         },
         {
           label: "Reference",
-          autogenerate: { directory: "reference" },
+          items: [{ autogenerate: { directory: "reference" } }],
         },
         {
           label: "Dagster Integration",
-          autogenerate: { directory: "dagster" },
+          items: [{ autogenerate: { directory: "dagster" } }],
         },
         {
           label: "Advanced",
-          autogenerate: { directory: "advanced" },
+          items: [{ autogenerate: { directory: "advanced" } }],
         },
       ],
     }),
