@@ -587,6 +587,17 @@ impl ModelIr {
         blake3::hash(canonical.as_bytes())
     }
 
+    /// Predicate underlying variant inference for snapshot. The single
+    /// source of truth shared by [`Self::as_replication`],
+    /// [`Self::as_transformation`], [`Self::as_snapshot`], and
+    /// [`Self::variant_name`]. Snapshot takes priority over replication
+    /// in inference: if both `unique_key` (non-empty) and `updated_at`
+    /// (`Some`) are populated the IR is classified as a snapshot
+    /// regardless of which other variant-specific fields are also set.
+    fn is_snapshot_shaped(&self) -> bool {
+        !self.unique_key.is_empty() && self.updated_at.is_some()
+    }
+
     /// View this IR as a [`ReplicationPlan`] without round-tripping through
     /// the [`Plan`] enum.
     ///
@@ -606,9 +617,7 @@ impl ModelIr {
     /// for replications; this only fires on a hand-built [`ModelIr`] that
     /// violates the variant contract.
     pub fn as_replication(&self) -> Option<ReplicationPlan> {
-        // Snapshot takes priority over replication in variant inference;
-        // bail out without cloning when this IR is snapshot-shaped.
-        if !self.unique_key.is_empty() && self.updated_at.is_some() {
+        if self.is_snapshot_shaped() {
             return None;
         }
         let columns = self.columns.clone()?;
@@ -635,10 +644,7 @@ impl ModelIr {
     ///
     /// Variant inference matches [`Self::to_plan_compatible`].
     pub fn as_transformation(&self) -> Option<TransformationPlan> {
-        if !self.unique_key.is_empty() && self.updated_at.is_some() {
-            return None;
-        }
-        if self.columns.is_some() {
+        if self.is_snapshot_shaped() || self.columns.is_some() {
             return None;
         }
         Some(TransformationPlan {
@@ -663,21 +669,21 @@ impl ModelIr {
     /// # Panics
     ///
     /// Panics if the IR is variant-confirmed as a snapshot but is missing
-    /// `source` or `updated_at`. The `From<&Plan>` impl always populates
-    /// both for snapshots; this only fires on a hand-built [`ModelIr`]
-    /// that violates the variant contract.
+    /// `source`. The `From<&Plan>` impl always populates `source` for
+    /// snapshots; this only fires on a hand-built [`ModelIr`] that
+    /// violates the variant contract.
     pub fn as_snapshot(&self) -> Option<SnapshotPlan> {
-        if self.unique_key.is_empty() || self.updated_at.is_none() {
+        if !self.is_snapshot_shaped() {
             return None;
         }
+        let updated_at = self
+            .updated_at
+            .clone()
+            .expect("is_snapshot_shaped guarantees `updated_at` is `Some`");
         let source = self
             .source
             .clone()
             .expect("Snapshot ModelIr must carry `source`");
-        let updated_at = self
-            .updated_at
-            .clone()
-            .expect("Snapshot ModelIr must carry `updated_at`");
         Some(SnapshotPlan {
             source,
             target: self.target.clone(),
@@ -688,11 +694,34 @@ impl ModelIr {
         })
     }
 
+    /// Human-readable name for this IR's inferred variant.
+    ///
+    /// Matches the inference rules used by [`Self::as_replication`],
+    /// [`Self::as_transformation`], [`Self::as_snapshot`], and
+    /// [`Self::to_plan_compatible`]: snapshot-shaped (`unique_key`
+    /// non-empty AND `updated_at` `Some`) → `"snapshot"`; replication-
+    /// shaped (`columns` `Some`) → `"replication"`; otherwise →
+    /// `"transformation"`.
+    ///
+    /// Used in error messages so callers can see *why* their IR didn't
+    /// match an expected variant.
+    pub fn variant_name(&self) -> &'static str {
+        if self.is_snapshot_shaped() {
+            "snapshot"
+        } else if self.columns.is_some() {
+            "replication"
+        } else {
+            "transformation"
+        }
+    }
+
     /// Reconstruct a [`Plan`] from this `ModelIr`, mirroring the
     /// `From<&Plan> for ModelIr` conversion.
     ///
-    /// The variant is inferred from which variant-specific fields are
-    /// populated:
+    /// Delegates to the three accessors ([`Self::as_snapshot`],
+    /// [`Self::as_replication`], [`Self::as_transformation`]) so the
+    /// variant-inference rule lives in a single place. The variant is
+    /// inferred from which variant-specific fields are populated:
     ///
     /// - `unique_key` non-empty AND `updated_at` `Some` → [`Plan::Snapshot`]
     /// - `columns` `Some` (replication carries an explicit
@@ -705,54 +734,26 @@ impl ModelIr {
     ///
     /// # Panics
     ///
-    /// Panics if a [`ModelIr`] inferred to be a Snapshot is missing
-    /// `source` or if a Replication ModelIr is missing `source`. These
+    /// Panics if a [`ModelIr`] inferred to be a Snapshot or Replication
+    /// is missing `source` (via the accessor's panic contract). These
     /// fields are required on the corresponding [`Plan`] variant; the
     /// `From<&Plan>` impl always populates them, so this only fires on a
     /// hand-built `ModelIr` that violates the variant contract.
     pub fn to_plan_compatible(&self) -> Plan {
-        // Snapshot has both unique_key and updated_at; replication has columns.
-        if !self.unique_key.is_empty() && self.updated_at.is_some() {
-            let source = self
-                .source
-                .clone()
-                .expect("Snapshot ModelIr must carry `source`");
-            let updated_at = self
-                .updated_at
-                .clone()
-                .expect("Snapshot ModelIr must carry `updated_at`");
-            Plan::Snapshot(SnapshotPlan {
-                source,
-                target: self.target.clone(),
-                unique_key: self.unique_key.clone(),
-                updated_at,
-                invalidate_hard_deletes: self.invalidate_hard_deletes,
-                governance: self.governance.clone(),
-            })
-        } else if let Some(columns) = self.columns.clone() {
-            let source = self
-                .source
-                .clone()
-                .expect("Replication ModelIr must carry `source`");
-            Plan::Replication(ReplicationPlan {
-                source,
-                target: self.target.clone(),
-                strategy: self.materialization.clone(),
-                columns,
-                metadata_columns: self.metadata_columns.clone(),
-                governance: self.governance.clone(),
-            })
-        } else {
-            Plan::Transformation(TransformationPlan {
-                sources: self.sources.clone(),
-                target: self.target.clone(),
-                strategy: self.materialization.clone(),
-                sql: self.sql.clone(),
-                governance: self.governance.clone(),
-                format: self.format.clone(),
-                format_options: self.format_options.clone(),
-            })
+        if let Some(snap) = self.as_snapshot() {
+            return Plan::Snapshot(snap);
         }
+        if let Some(rep) = self.as_replication() {
+            return Plan::Replication(rep);
+        }
+        // Transformation is the unconditional fallback: when neither
+        // snapshot nor replication match, `as_transformation` is `Some`
+        // by construction (its rejection conditions are exactly the
+        // entry conditions of the other two).
+        Plan::Transformation(
+            self.as_transformation()
+                .expect("transformation is the unconditional fallback variant"),
+        )
     }
 }
 
@@ -1845,5 +1846,45 @@ mod tests {
             "snapshot-shape IR with stray `columns` must not view as replication"
         );
         assert!(ir.as_snapshot().is_some());
+    }
+
+    /// Replication accessor panics if `columns` is `Some` but `source` is
+    /// `None` — the IR is variant-confirmed but violates the contract that
+    /// `From<&Plan>` always populates.
+    #[test]
+    #[should_panic(expected = "Replication ModelIr must carry `source`")]
+    fn as_replication_panics_when_columns_set_but_source_missing() {
+        let mut ir = sample_replication_model();
+        ir.source = None;
+        let _ = ir.as_replication();
+    }
+
+    /// Snapshot accessor panics if the IR is snapshot-shaped (`unique_key`
+    /// non-empty AND `updated_at` `Some`) but `source` is `None`.
+    #[test]
+    #[should_panic(expected = "Snapshot ModelIr must carry `source`")]
+    fn as_snapshot_panics_when_snapshot_shaped_but_source_missing() {
+        let mut ir = sample_snapshot_model();
+        ir.source = None;
+        let _ = ir.as_snapshot();
+    }
+
+    #[test]
+    fn variant_name_matches_inferred_shape() {
+        assert_eq!(sample_replication_model().variant_name(), "replication");
+        assert_eq!(
+            sample_transformation_model().variant_name(),
+            "transformation"
+        );
+        assert_eq!(sample_snapshot_model().variant_name(), "snapshot");
+    }
+
+    /// Variant-name inference must honour the same priority order as the
+    /// accessors: snapshot wins over replication when both fields are set.
+    #[test]
+    fn variant_name_follows_inference_priority() {
+        let mut ir = sample_snapshot_model();
+        ir.columns = Some(ColumnSelection::All);
+        assert_eq!(ir.variant_name(), "snapshot");
     }
 }

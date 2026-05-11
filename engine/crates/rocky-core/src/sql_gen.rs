@@ -17,8 +17,9 @@ use crate::traits::{AdapterError, SqlDialect};
 fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenError> {
     model_ir.as_replication().ok_or_else(|| {
         SqlGenError::InvalidRequest(format!(
-            "expected Replication ModelIr for `{}`",
-            model_ir.name
+            "expected Replication ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
         ))
     })
 }
@@ -31,8 +32,9 @@ fn replication_from_ir(model_ir: &ModelIr) -> Result<ReplicationPlan, SqlGenErro
 fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlGenError> {
     model_ir.as_transformation().ok_or_else(|| {
         SqlGenError::InvalidRequest(format!(
-            "expected Transformation ModelIr for `{}`",
-            model_ir.name
+            "expected Transformation ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
         ))
     })
 }
@@ -44,7 +46,11 @@ fn transformation_from_ir(model_ir: &ModelIr) -> Result<TransformationPlan, SqlG
 /// [`crate::ir::Plan::Snapshot`].
 fn snapshot_from_ir(model_ir: &ModelIr) -> Result<SnapshotPlan, SqlGenError> {
     model_ir.as_snapshot().ok_or_else(|| {
-        SqlGenError::InvalidRequest(format!("expected Snapshot ModelIr for `{}`", model_ir.name))
+        SqlGenError::InvalidRequest(format!(
+            "expected Snapshot ModelIr for `{}`, found {}",
+            model_ir.name,
+            model_ir.variant_name()
+        ))
     })
 }
 
@@ -1928,5 +1934,25 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         let result = generate_transformation_initial_ddl(&xform_ir(&plan), &dialect());
         assert!(result.is_err(), "should reject invalid partition column");
+    }
+
+    /// Mismatched-variant errors must include the actually-inferred variant
+    /// so callers can see *why* the IR didn't match. Regression guard for
+    /// the `variant_name()` wiring in `*_from_ir`.
+    #[test]
+    fn variant_mismatch_error_names_the_actual_variant() {
+        // Pass a transformation IR to `generate_select_sql`, which only
+        // accepts replication IRs. The error must mention "transformation".
+        let ir = xform_ir(&sample_transformation_plan());
+        let err = generate_select_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected Replication ModelIr"),
+            "error should name the expected variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("found transformation"),
+            "error should name the actual variant via `variant_name()`, got: {msg}"
+        );
     }
 }
