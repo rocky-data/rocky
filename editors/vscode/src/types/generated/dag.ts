@@ -71,6 +71,18 @@ export type StrategyConfig =
       timestamp_column: string;
       type: "microbatch";
       [k: string]: unknown;
+    }
+  | {
+      /**
+       * Logical partition column names. Empty for unpartitioned tables. The runtime asserts this matches the table's declared partition columns at materialization time.
+       */
+      partition_columns?: string[];
+      /**
+       * Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
+       */
+      storage_prefix: string;
+      type: "content_addressed";
+      [k: string]: unknown;
     };
 /**
  * Partition granularity for `time_interval` materialization.

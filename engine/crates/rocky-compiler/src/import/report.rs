@@ -153,6 +153,7 @@ pub fn generate_report(
             rocky_core::models::StrategyConfig::Ephemeral => "ephemeral",
             rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
             rocky_core::models::StrategyConfig::Microbatch { .. } => "microbatch",
+            rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
         };
         *by_materialization.entry(mat.to_string()).or_default() += 1;
 

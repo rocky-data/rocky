@@ -74,6 +74,7 @@ fn strategy_label(strategy: &StrategyConfig) -> String {
         StrategyConfig::Ephemeral => "ephemeral".into(),
         StrategyConfig::DeleteInsert { .. } => "delete_insert".into(),
         StrategyConfig::Microbatch { .. } => "microbatch".into(),
+        StrategyConfig::ContentAddressed { .. } => "content_addressed".into(),
     }
 }
 
