@@ -2,7 +2,7 @@
 title: Quickstart
 description: Get a Rocky pipeline running in 5 minutes
 sidebar:
-  order: 3
+  order: 4
 ---
 
 This walks through a Rocky pipeline that replicates Fivetran-landed sources into Databricks. No credentials? The [Playground guide](/guides/playground/) runs the same flow against a local DuckDB file.

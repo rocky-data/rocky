@@ -2,7 +2,7 @@
 title: Installation
 description: Install the Rocky CLI on macOS, Linux, or Windows
 sidebar:
-  order: 2
+  order: 3
 ---
 
 ## macOS / Linux
