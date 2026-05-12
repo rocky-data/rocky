@@ -104,44 +104,11 @@ fn parse_log_jsonl(body: &[u8]) -> Result<Vec<LogAction>> {
     Ok(out)
 }
 
-/// Build a [`UniformTableState`] from the actions of `_delta_log/00…0.json`.
-///
-/// `next_commit_version` is left as 1 on the assumption that bootstrap-only
-/// state has v=0 already written. Callers that read additional commits patch
-/// it from the listing.
-fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableState> {
-    let mut protocol: Option<&Protocol> = None;
-    let mut metadata: Option<&MetaData> = None;
-    for a in actions {
-        match a {
-            LogAction::Protocol(p) => protocol = Some(p),
-            LogAction::MetaData(m) => metadata = Some(m),
-            LogAction::Other => {}
-        }
-    }
-    let protocol = protocol.ok_or_else(|| {
-        UniformWriterError::DeltaLog("bootstrap commit has no protocol action".into())
-    })?;
-    let metadata = metadata.ok_or_else(|| {
-        UniformWriterError::DeltaLog("bootstrap commit has no metaData action".into())
-    })?;
-
-    let row_tracking_enabled = protocol.writer_features.iter().any(|f| f == "rowTracking")
-        || metadata
-            .configuration
-            .get("delta.enableRowTracking")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-    let deletion_vectors_enabled = protocol
-        .writer_features
-        .iter()
-        .any(|f| f == "deletionVectors")
-        || metadata
-            .configuration
-            .get("delta.enableDeletionVectors")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
+/// Extract `(physical, field_id)` maps from a metaData action's
+/// `schemaString`.
+fn parse_columns_from_metadata(
+    metadata: &MetaData,
+) -> Result<(HashMap<String, String>, HashMap<String, i32>)> {
     let schema: SchemaString = serde_json::from_str(&metadata.schema_string).map_err(|e| {
         UniformWriterError::DeltaLog(format!("malformed metaData.schemaString: {e}"))
     })?;
@@ -181,6 +148,50 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
             )));
         }
     }
+    Ok((physical, field_id))
+}
+
+/// Build a [`UniformTableState`] from the actions of `_delta_log/00…0.json`.
+///
+/// `next_commit_version` is left as 1 on the assumption that bootstrap-only
+/// state has v=0 already written. Callers that read additional commits patch
+/// it from the listing. Likewise `physical` / `field_id` /
+/// `partition_columns` reflect bootstrap; `discover()` overrides them from
+/// the latest post-bootstrap metaData if a later `ALTER TABLE` has fired.
+fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableState> {
+    let mut protocol: Option<&Protocol> = None;
+    let mut metadata: Option<&MetaData> = None;
+    for a in actions {
+        match a {
+            LogAction::Protocol(p) => protocol = Some(p),
+            LogAction::MetaData(m) => metadata = Some(m),
+            LogAction::Other => {}
+        }
+    }
+    let protocol = protocol.ok_or_else(|| {
+        UniformWriterError::DeltaLog("bootstrap commit has no protocol action".into())
+    })?;
+    let metadata = metadata.ok_or_else(|| {
+        UniformWriterError::DeltaLog("bootstrap commit has no metaData action".into())
+    })?;
+
+    let row_tracking_enabled = protocol.writer_features.iter().any(|f| f == "rowTracking")
+        || metadata
+            .configuration
+            .get("delta.enableRowTracking")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+    let deletion_vectors_enabled = protocol
+        .writer_features
+        .iter()
+        .any(|f| f == "deletionVectors")
+        || metadata
+            .configuration
+            .get("delta.enableDeletionVectors")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+    let (physical, field_id) = parse_columns_from_metadata(metadata)?;
 
     Ok(UniformTableState {
         physical,
@@ -196,6 +207,72 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
         // value.
         row_tracking_next_id: 0,
     })
+}
+
+/// Walk `_delta_log/*.json` newest → oldest looking for the highest commit
+/// version that carries a `metaData` action. Returns the parsed schema +
+/// partition columns from that commit, or `None` if no post-bootstrap
+/// commit has emitted a metaData (i.e. no `ALTER TABLE` since CREATE).
+///
+/// `ALTER ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, and
+/// `SET TBLPROPERTIES` all emit a fresh metaData action. The writer must
+/// reflect the latest one — using the bootstrap schema would silently emit
+/// Parquet files referencing UUIDs that no longer exist (DROP) or missing
+/// new columns (ADD).
+pub(super) async fn discover_latest_metadata<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    bootstrap_version: u64,
+) -> Result<Option<MetaDataSnapshot>> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        if let Some((_, last)) = key.rsplit_once('/')
+            && let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+            // Only walk commits AFTER the bootstrap — the bootstrap's
+            // metaData is already in the state.
+            && v > bootstrap_version
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+    for (_, path) in versions {
+        let body = store.get(&path).await?.bytes().await?;
+        let actions = parse_log_jsonl(&body)?;
+        // Take the last metaData in this commit (commits emit at most one
+        // metaData per the Delta protocol; defense in depth).
+        let mut latest = None;
+        for a in &actions {
+            if let LogAction::MetaData(m) = a {
+                latest = Some(m);
+            }
+        }
+        if let Some(metadata) = latest {
+            let (physical, field_id) = parse_columns_from_metadata(metadata)?;
+            return Ok(Some(MetaDataSnapshot {
+                physical,
+                field_id,
+                partition_columns: metadata.partition_columns.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Subset of metaData fields the writer cares about, surfaced by
+/// [`discover_latest_metadata`] for `discover()` to overlay onto the
+/// bootstrap-derived state.
+#[derive(Debug)]
+pub(super) struct MetaDataSnapshot {
+    pub physical: HashMap<String, String>,
+    pub field_id: HashMap<String, i32>,
+    pub partition_columns: Vec<String>,
 }
 
 /// Reject states the writer cannot serve.
@@ -307,6 +384,17 @@ impl UniformWriter {
         // bootstrap's v=0 and append a new versioned JSON.
         state.next_commit_version = next_commit_version(self.store(), &prefix).await?;
 
+        // Phase 5: overlay the latest post-bootstrap metaData if any
+        // `ALTER TABLE` has fired since CREATE. The bootstrap schema is
+        // only authoritative when no schema-changing DDL has run.
+        if let Some(latest) =
+            discover_latest_metadata(self.store(), &prefix, /* bootstrap_version = */ 0).await?
+        {
+            state.physical = latest.physical;
+            state.field_id = latest.field_id;
+            state.partition_columns = latest.partition_columns;
+        }
+
         // For rowTracking-enabled tables, scan the log for the latest
         // watermark. For everything else this stays 0 (and is unused).
         if state.row_tracking_enabled {
@@ -401,6 +489,112 @@ mod tests {
             "partition column physical UUID must appear in the `physical` map",
         );
         enforce_supported(&state).expect("partitioned tables are supported in phase 2");
+    }
+
+    #[tokio::test]
+    async fn discover_latest_metadata_returns_none_for_bootstrap_only() {
+        use bytes::Bytes;
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        let store = InMemory::new();
+        store
+            .put(
+                &Path::from("tbl/_delta_log/00000000000000000000.json"),
+                PutPayload::from(Bytes::copy_from_slice(EXP04_BOOTSTRAP)),
+            )
+            .await
+            .unwrap();
+        let latest = discover_latest_metadata(&store, "tbl", 0).await.unwrap();
+        assert!(latest.is_none(), "no post-bootstrap metaData → None");
+    }
+
+    #[tokio::test]
+    async fn discover_latest_metadata_finds_post_alter_schema() {
+        use bytes::Bytes;
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        let store = InMemory::new();
+        // Bootstrap = exp-04 (id, name, ts).
+        store
+            .put(
+                &Path::from("tbl/_delta_log/00000000000000000000.json"),
+                PutPayload::from(Bytes::copy_from_slice(EXP04_BOOTSTRAP)),
+            )
+            .await
+            .unwrap();
+        // v=1: a WRITE (no metaData) — discover should walk past this.
+        let v1 = "{\"commitInfo\":{\"timestamp\":1,\"operation\":\"WRITE\"}}\n\
+                  {\"add\":{\"path\":\"abc.parquet\",\"partitionValues\":{},\"size\":1,\"modificationTime\":1,\"dataChange\":true,\"stats\":\"{\\\"numRecords\\\":1}\"}}\n";
+        store
+            .put(
+                &Path::from("tbl/_delta_log/00000000000000000001.json"),
+                PutPayload::from(Bytes::from(v1.as_bytes().to_vec())),
+            )
+            .await
+            .unwrap();
+        // v=2: ALTER ADD COLUMN `extra` — emits a new metaData with the
+        // pre-existing UUIDs preserved + a fresh UUID for `extra`.
+        let alter_metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        // id + name + ts retain their pre-ALTER UUIDs.
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-764ab664-41c1-43df-91d3-0a26f1a2804a"
+                        }},
+                        {"name": "name", "type": "string", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 2,
+                            "delta.columnMapping.physicalName": "col-6a00f493-6967-4191-9447-0d19f8db9868"
+                        }},
+                        {"name": "ts", "type": "timestamp", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 3,
+                            "delta.columnMapping.physicalName": "col-a789db88-c380-4a59-87a3-45e324ffa1a8"
+                        }},
+                        // `extra` is brand new; gets a fresh UUID + id=4.
+                        {"name": "extra", "type": "string", "nullable": true, "metadata": {
+                            "delta.columnMapping.id": 4,
+                            "delta.columnMapping.physicalName": "col-a13f2930-65e1-46ce-aec4-224f8e484c43"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": [],
+                "configuration": {"delta.columnMapping.mode": "name"},
+                "createdTime": 0
+            }
+        });
+        let v2 = format!(
+            "{}\n{}\n",
+            serde_json::json!({"commitInfo": {"operation": "ADD COLUMNS"}}),
+            serde_json::to_string(&alter_metadata).unwrap(),
+        );
+        store
+            .put(
+                &Path::from("tbl/_delta_log/00000000000000000002.json"),
+                PutPayload::from(Bytes::from(v2.into_bytes())),
+            )
+            .await
+            .unwrap();
+
+        let latest = discover_latest_metadata(&store, "tbl", 0)
+            .await
+            .unwrap()
+            .expect("latest metaData should be the v=2 ALTER commit");
+        // Pre-existing columns kept their UUIDs.
+        assert_eq!(
+            latest.physical.get("id").map(String::as_str),
+            Some("col-764ab664-41c1-43df-91d3-0a26f1a2804a")
+        );
+        // New column appears with its fresh UUID.
+        assert_eq!(
+            latest.physical.get("extra").map(String::as_str),
+            Some("col-a13f2930-65e1-46ce-aec4-224f8e484c43")
+        );
+        assert_eq!(latest.field_id.get("extra"), Some(&4));
+        assert_eq!(latest.physical.len(), 4, "id, name, ts, extra");
     }
 
     #[test]
