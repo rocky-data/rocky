@@ -7,6 +7,18 @@ sidebar:
 
 This walks through a Rocky pipeline that replicates Fivetran-landed sources into Databricks. No credentials? The [Playground guide](/guides/playground/) runs the same flow against a local DuckDB file.
 
+## 0. The fastest path: local playground
+
+If you just want to see Rocky run end-to-end, the bundled DuckDB playground takes about 60 seconds and needs no credentials:
+
+```bash
+rocky playground my-first-project
+cd my-first-project
+rocky compile && rocky test && rocky run
+```
+
+That gives you a real pipeline against a local DuckDB file. The rest of this page is the **production** path — wiring Fivetran sources into Databricks. Pick this up when you're ready to point Rocky at a real warehouse.
+
 ## 1. Scaffold
 
 ```bash

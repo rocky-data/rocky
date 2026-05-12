@@ -14,7 +14,7 @@ sidebar:
 | **BigQuery** | Beta | Service account, application default |
 | **DuckDB** | Production | Embedded (local dev/test, no credentials) |
 
-Source adapters: **Fivetran** (REST API discovery), **DuckDB** (information_schema), **Manual** (config-defined).
+Source adapters: **Fivetran** (REST API discovery), **Airbyte** (catalog discovery), **Iceberg** (REST catalog), **DuckDB** (information_schema), **Manual** (config-defined inline in `rocky.toml`).
 
 ## Materialization Strategies (7)
 
@@ -135,7 +135,7 @@ Pipeline-oriented syntax that compiles to standard SQL:
 
 Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expressions (→ CASE WHEN), date literals (`@2025-01-01`), IS NULL / IS NOT NULL, IN lists.
 
-## CLI Commands (38+)
+## CLI Commands (55+)
 
 ### Core Pipeline
 `init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch` · `preview create` · `preview diff` · `preview cost`
@@ -190,7 +190,7 @@ Published VS Code extension with TextMate grammar + semantic tokens.
 - **dagster-rocky** package with `RockyResource` and `RockyComponent`
 - **Auto-discovery**: Rocky discover → Dagster asset definitions
 - **Dagster Pipes protocol**: Hand-rolled emitter (no external dependency) — reports materializations, check results, drift observations, anomaly alerts
-- **38 typed JSON output schemas** with auto-generated Pydantic v2 models and TypeScript interfaces via `rocky export-schemas`
+- **55 typed JSON output schemas** with auto-generated Pydantic v2 models and TypeScript interfaces via `rocky export-schemas`
 - **Freshness policies** auto-attached from `[checks.freshness]` config
 - **Column lineage** attached to derived model asset metadata
 
