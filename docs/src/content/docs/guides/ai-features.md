@@ -49,7 +49,7 @@ Error: ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.
 
 ## 2. Generate a Model from Intent
 
-The `rocky ai` command generates a model from a natural language description:
+The `rocky ai` command generates a model from a natural language description and **writes both the body file and a matching `.toml` sidecar to the models directory**. The emitted sidecar carries the materialization strategy + target coordinates, so Rocky's loader picks the generated model up on the next `rocky run` without manual editing.
 
 ```bash
 rocky ai "monthly revenue by product category from orders and products, completed orders only"
@@ -60,21 +60,15 @@ Output:
 ```
 Generated model: monthly_category_revenue (rocky)
 Attempts: 1
-
-from orders
-join products on orders.product_id = products.product_id
-where status = "completed"
-group extract(month from order_date), category {
-    month: extract(month from order_date),
-    category: category,
-    total_revenue: sum(quantity * unit_price),
-    order_count: count()
-}
+Wrote: models/monthly_category_revenue.rocky
+Wrote: models/monthly_category_revenue.toml
 ```
+
+The emitted sidecar defaults to `[strategy] type = "full_refresh"` and `[target] = generated.ai.<model_name>`. Override either with the flags below.
 
 ### Choose the output format
 
-By default, Rocky generates Rocky DSL. Use `--format sql` for standard SQL:
+By default, Rocky generates Rocky DSL. Use `--format sql` for standard SQL (still emits both a `.sql` body and a `.toml` sidecar):
 
 ```bash
 rocky ai "monthly revenue by product category" --format sql
@@ -92,6 +86,33 @@ WHERE o.status = 'completed'
 GROUP BY DATE_TRUNC('month', o.order_date), p.category
 ```
 
+### Pick a materialization + target
+
+Pair `--materialization` with `--watermark` for incremental models, and `--target` to land the output in a real catalog/schema rather than the `generated.ai.*` default:
+
+```bash
+rocky ai "daily order facts from stg_orders" \
+  --materialization incremental --watermark order_date \
+  --target analytics.marts.fct_orders_daily
+```
+
+The emitted sidecar (`models/fct_orders_daily.toml`) then carries the parsed materialization, watermark, and target:
+
+```toml
+name = "fct_orders_daily"
+
+[strategy]
+type = "incremental"
+timestamp_column = "order_date"
+
+[target]
+catalog = "analytics"
+schema  = "marts"
+table   = "fct_orders_daily"
+```
+
+Pass `--overwrite` to replace an existing body or sidecar at the destination — without it, the command fails loudly rather than silently clobber user-authored models. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
+
 ### JSON output
 
 For programmatic use:
@@ -102,13 +123,15 @@ rocky ai "monthly revenue by category" -o json
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai",
   "intent": "monthly revenue by category",
   "format": "rocky",
   "name": "monthly_category_revenue",
   "source": "from orders\njoin products on ...",
-  "attempts": 1
+  "attempts": 1,
+  "body_path": "models/monthly_category_revenue.rocky",
+  "sidecar_path": "models/monthly_category_revenue.toml"
 }
 ```
 

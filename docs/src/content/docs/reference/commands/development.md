@@ -100,20 +100,21 @@ rocky import-dbt --dbt-project <PATH> [flags]
 │   ├── <name>.sql              translated dbt model body (Jinja stripped or commented)
 │   └── <name>.toml             [strategy] + [target] sidecar
 ├── seeds/                      verbatim copy of <dbt_project>/seeds/
-└── MIGRATION-NOTES.md          summary: counts, v0 limitations, required env vars
+└── MIGRATION-NOTES.md          summary: counts, known limitations, required env vars
 ```
 
 Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky run`.
 
 `materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
 
-### v0 limitations
+### Known limitations
 
-Deferred to follow-up PRs and listed in every emitted `MIGRATION-NOTES.md`:
+Listed in every emitted `MIGRATION-NOTES.md`:
 
-- Generic-test mapping (`unique`, `not_null`, `accepted_values`, `relationships` → `[[checks]]`).
-- Singular dbt tests (custom SQL files in `tests/`).
-- Macros and `dbt_packages/` (skipped; the [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch for now).
+- Singular dbt tests (custom SQL files in `tests/`) — not translated.
+- Macros and `dbt_packages/` — skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
+
+The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[checks]]` on the matching per-model sidecar (shipped in engine v1.27.0). Tests referencing columns Rocky didn't translate are listed in `MIGRATION-NOTES.md` under "Not Translated" rather than silently dropped.
 
 ### Examples
 
@@ -125,7 +126,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 
 ```json
 {
-  "version": "1.27.0",
+  "version": "1.30.0",
   "command": "import-dbt",
   "import_method": "regex",
   "project_name": "demo_project",

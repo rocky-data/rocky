@@ -368,12 +368,12 @@ For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders
 
 ### `[pipeline.NAME.target.governance]`
 
-Catalog/schema lifecycle, tagging, grants, and isolation. These features are implemented against Databricks Unity Catalog APIs and apply only when the target adapter is Databricks.
+Catalog/schema lifecycle, tagging, grants, and isolation. Tagging, grants, and workspace isolation are implemented against Databricks Unity Catalog APIs and apply only when the target adapter is Databricks. The two `auto_create_*` lifecycle flags work on every adapter that emits `CREATE SCHEMA` SQL.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `auto_create_catalogs` | bool | `false` | Create target catalogs if they do not exist. |
-| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. |
+| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. Honored on **both** replication and transformation pipeline targets (transformation parity landed in engine v1.29.0 — prior versions silently no-op'd on transformation pipelines, surfacing as a "Schema with name X does not exist" execute-time error). |
 | `tags` | table | `{}` | Tags applied to managed catalogs, schemas, and tables. |
 | `grants` | list | `[]` | Catalog-level grants. Each entry has `principal` (string) and `permissions` (list of strings). |
 | `schema_grants` | list | `[]` | Schema-level grants. Same format as `grants`. |
