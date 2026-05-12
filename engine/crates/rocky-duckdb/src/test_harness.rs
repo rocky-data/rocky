@@ -6,9 +6,9 @@
 
 use std::path::PathBuf;
 
-use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::state::StateStore;
 use rocky_core::traits::WarehouseAdapter;
+use rocky_ir::{ColumnInfo, TableRef};
 use tempfile::TempDir;
 
 use crate::DuckDbConnector;

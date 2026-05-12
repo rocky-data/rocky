@@ -24,7 +24,7 @@ use crate::diagnostic::{
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
 use rocky_core::column_map::{CiKey, CiStr};
-use rocky_core::dag::{self, DagNode};
+use rocky_ir::dag::{self, DagNode};
 
 /// A reference location: which file and where in the source.
 #[derive(Debug, Clone)]
@@ -597,7 +597,8 @@ fn check_time_interval_strategy(
     model: &rocky_core::models::Model,
     typed_cols: &[crate::types::TypedColumn],
 ) -> Vec<Diagnostic> {
-    use rocky_core::models::{StrategyConfig, TimeGrain};
+    use rocky_core::models::StrategyConfig;
+    use rocky_ir::TimeGrain;
 
     let mut diagnostics = Vec::new();
     let model_name = model.config.name.as_str();
@@ -798,7 +799,7 @@ fn contains_placeholder(sql: &str, placeholder: &str) -> bool {
 /// the model's granularity (e.g. `"2024-01-01"` for `Day`, `"2024"` for `Year`).
 fn check_first_partition(
     model_name: &str,
-    grain: rocky_core::models::TimeGrain,
+    grain: rocky_ir::TimeGrain,
     first_partition: &str,
 ) -> Vec<Diagnostic> {
     match rocky_core::incremental::validate_partition_key(grain, first_partition) {
@@ -1999,12 +2000,12 @@ mod tests {
         external.insert(
             "source.raw.users".to_string(),
             vec![
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "id".to_string(),
                     data_type: "BIGINT".to_string(),
                     nullable: false,
                 },
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "name".to_string(),
                     data_type: "STRING".to_string(),
                     nullable: true,
@@ -2078,12 +2079,12 @@ mod tests {
         external.insert(
             "source.raw.t1".to_string(),
             vec![
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "id".into(),
                     data_type: "BIGINT".into(),
                     nullable: false,
                 },
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "value".into(),
                     data_type: "STRING".into(),
                     nullable: true,
@@ -2093,12 +2094,12 @@ mod tests {
         external.insert(
             "source.raw.t2".to_string(),
             vec![
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "id".into(),
                     data_type: "STRING".into(),
                     nullable: false,
                 },
-                rocky_core::ir::ColumnInfo {
+                rocky_ir::ColumnInfo {
                     name: "label".into(),
                     data_type: "STRING".into(),
                     nullable: true,
@@ -2149,7 +2150,7 @@ mod tests {
         let mut external = HashMap::new();
         external.insert(
             "source.raw.t1".to_string(),
-            vec![rocky_core::ir::ColumnInfo {
+            vec![rocky_ir::ColumnInfo {
                 name: "id".into(),
                 data_type: "INT".into(),
                 nullable: false,
@@ -2157,7 +2158,7 @@ mod tests {
         );
         external.insert(
             "source.raw.t2".to_string(),
-            vec![rocky_core::ir::ColumnInfo {
+            vec![rocky_ir::ColumnInfo {
                 name: "id".into(),
                 data_type: "BIGINT".into(),
                 nullable: false,
@@ -2614,7 +2615,7 @@ mod tests {
 
     // ----- time_interval validation tests (Phase 1.5) -----
 
-    use rocky_core::models::TimeGrain;
+    use rocky_ir::TimeGrain;
     use std::num::NonZeroU32;
 
     /// Build a `Model` whose strategy is `time_interval` with the given fields,
@@ -2860,7 +2861,7 @@ mod tests {
         env_overrides: &[(&str, &[&str])],
     ) -> std::collections::BTreeMap<String, rocky_core::config::MaskEntry> {
         use rocky_core::config::MaskEntry;
-        use rocky_core::traits::MaskStrategy;
+        use rocky_ir::MaskStrategy;
 
         let mut out = std::collections::BTreeMap::new();
         for tag in defaults {

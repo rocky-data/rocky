@@ -1158,7 +1158,7 @@ mod tests {
         store
             .set_watermark(
                 "cat.sch.tbl",
-                &crate::ir::WatermarkState {
+                &rocky_ir::WatermarkState {
                     last_value: now,
                     updated_at: now,
                 },

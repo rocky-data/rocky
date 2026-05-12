@@ -66,7 +66,7 @@ pub mod types;
 //!
 //! TODO: Implement each method for {name}-specific SQL syntax.
 
-use rocky_core::ir::{{ColumnSelection, MetadataColumn}};
+use rocky_ir::{{ColumnSelection, MetadataColumn}};
 use rocky_core::traits::{{AdapterError, AdapterResult, SqlDialect}};
 
 /// {name} SQL dialect.

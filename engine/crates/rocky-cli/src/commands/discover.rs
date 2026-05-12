@@ -416,9 +416,9 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use rocky_core::ir::ColumnInfo;
     use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
     use rocky_core::traits::{AdapterError, AdapterResult, BatchCheckAdapter};
+    use rocky_ir::ColumnInfo;
 
     /// Alias for the describe-response payload — keeps the stub's field
     /// type under clippy's `type_complexity` limit.
@@ -468,14 +468,14 @@ mod tests {
     impl BatchCheckAdapter for StubBatchAdapter {
         async fn batch_row_counts(
             &self,
-            _tables: &[rocky_core::ir::TableRef],
+            _tables: &[rocky_ir::TableRef],
         ) -> AdapterResult<Vec<rocky_core::traits::RowCountResult>> {
             Err(AdapterError::msg("not needed in tests"))
         }
 
         async fn batch_freshness(
             &self,
-            _tables: &[rocky_core::ir::TableRef],
+            _tables: &[rocky_ir::TableRef],
             _timestamp_col: &str,
         ) -> AdapterResult<Vec<rocky_core::traits::FreshnessResult>> {
             Err(AdapterError::msg("not needed in tests"))

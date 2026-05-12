@@ -27,10 +27,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::TableRef;
 use crate::traits::{
     AdapterError, AdapterResult, ChunkChecksum, PkRange, SplitStrategy, WarehouseAdapter,
 };
+use rocky_ir::TableRef;
 
 /// Default chunk fanout. `K = 32` matches Datafold's data-diff: at higher
 /// fanout the per-level checksum query has too many predicates and the

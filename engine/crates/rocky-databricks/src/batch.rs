@@ -99,7 +99,7 @@ pub fn generate_batch_columns_sql(catalog: &str, schemas: &[String]) -> Result<S
 pub struct ColumnDescribeResult {
     pub schema: String,
     pub table: String,
-    pub columns: Vec<rocky_core::ir::ColumnInfo>,
+    pub columns: Vec<rocky_ir::ColumnInfo>,
 }
 
 /// Generates a batched column describe query including data types.
@@ -133,11 +133,11 @@ pub async fn execute_batch_describe(
     connector: &DatabricksConnector,
     catalog: &str,
     schema: &str,
-) -> Result<std::collections::HashMap<String, Vec<rocky_core::ir::ColumnInfo>>, BatchError> {
+) -> Result<std::collections::HashMap<String, Vec<rocky_ir::ColumnInfo>>, BatchError> {
     let sql = generate_batch_describe_sql(catalog, schema)?;
     let result = connector.execute_sql(&sql).await?;
 
-    let mut map: std::collections::HashMap<String, Vec<rocky_core::ir::ColumnInfo>> =
+    let mut map: std::collections::HashMap<String, Vec<rocky_ir::ColumnInfo>> =
         std::collections::HashMap::new();
 
     for row in &result.rows {
@@ -161,13 +161,11 @@ pub async fn execute_batch_describe(
             continue;
         }
 
-        map.entry(table)
-            .or_default()
-            .push(rocky_core::ir::ColumnInfo {
-                name: col_name,
-                data_type,
-                nullable: true,
-            });
+        map.entry(table).or_default().push(rocky_ir::ColumnInfo {
+            name: col_name,
+            data_type,
+            nullable: true,
+        });
     }
 
     Ok(map)

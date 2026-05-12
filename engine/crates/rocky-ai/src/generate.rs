@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use rocky_compiler::types::TypedColumn;
-use rocky_core::ir::ColumnInfo;
 use rocky_core::models::Model;
+use rocky_ir::ColumnInfo;
 
 use crate::client::{AiError, LlmClient, LlmResponse};
 use crate::prompt;

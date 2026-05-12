@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 use rocky_core::config::{MaskEntry, RockyConfig};
 use rocky_core::models::Model;
-use rocky_core::traits::MaskStrategy;
+use rocky_ir::MaskStrategy;
 
 use crate::output::{
     ColumnClassificationStatus, ComplianceException, ComplianceOutput, ComplianceSummary,
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     use rocky_core::config::RockyConfig;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
-    use rocky_core::traits::MaskStrategy;
+    use rocky_ir::MaskStrategy;
     use std::collections::BTreeMap;
 
     fn make_model(name: &str, classifications: &[(&str, &str)]) -> Model {

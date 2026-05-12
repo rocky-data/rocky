@@ -22,8 +22,8 @@ use thiserror::Error;
 
 use crate::bridge;
 use crate::config::{PipelineConfig, RockyConfig};
-use crate::dag::{self, DagNode};
 use crate::models::Model;
+use rocky_ir::dag::{self, DagNode};
 
 // ---------------------------------------------------------------------------
 // Types

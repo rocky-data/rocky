@@ -849,15 +849,15 @@ id = "INTEGER"
             _target: &str,
             _source_sql: &str,
             _keys: &[std::sync::Arc<str>],
-            _update_cols: &crate::ir::ColumnSelection,
+            _update_cols: &rocky_ir::ColumnSelection,
         ) -> crate::traits::AdapterResult<String> {
             Ok(String::new())
         }
 
         fn select_clause(
             &self,
-            _columns: &crate::ir::ColumnSelection,
-            _metadata: &[crate::ir::MetadataColumn],
+            _columns: &rocky_ir::ColumnSelection,
+            _metadata: &[rocky_ir::MetadataColumn],
         ) -> crate::traits::AdapterResult<String> {
             Ok(String::new())
         }

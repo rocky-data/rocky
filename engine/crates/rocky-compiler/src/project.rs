@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
-use rocky_core::dag::{self, DagNode};
 use rocky_core::models::{self, Model, ModelConfig, TargetConfig};
 use rocky_core::unified_dag::UnifiedDag;
+use rocky_ir::dag::{self, DagNode};
 use rocky_sql::lineage;
 use thiserror::Error;
 use tracing::info;

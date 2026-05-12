@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::config::RoleConfig;
-use crate::ir::{Permission, ResolvedRole};
+use rocky_ir::{Permission, ResolvedRole};
 
 /// Things that can go wrong when flattening `[role.*]` into a resolved
 /// map.

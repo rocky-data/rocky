@@ -12,10 +12,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, FreshnessResult, RowCountResult,
 };
+use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::connector::{ConnectorError, SnowflakeConnector};

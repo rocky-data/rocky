@@ -9,11 +9,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rocky_core::ir::TableRef;
 use rocky_core::traits::WarehouseAdapter;
 use rocky_databricks::adapter::DatabricksWarehouseAdapter;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+use rocky_ir::TableRef;
 
 fn connector_from_env() -> Option<DatabricksConnector> {
     let host = std::env::var("DATABRICKS_HOST").ok()?;

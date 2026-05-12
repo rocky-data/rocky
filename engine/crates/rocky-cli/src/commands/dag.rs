@@ -13,9 +13,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use rocky_core::models::{Model, StrategyConfig, TimeGrain};
+use rocky_core::models::{Model, StrategyConfig};
 use rocky_core::seeds::SeedFile;
 use rocky_core::unified_dag::{self, NodeKind, UnifiedDag};
+use rocky_ir::TimeGrain;
 
 use crate::output::*;
 

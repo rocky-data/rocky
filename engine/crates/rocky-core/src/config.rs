@@ -1084,7 +1084,7 @@ pub struct GrantConfig {
 /// structured [`crate::role_graph::RoleGraphError`] values.
 ///
 /// Permission strings must match the canonical uppercase spellings of
-/// [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+/// [`rocky_ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleConfig {
@@ -1114,10 +1114,10 @@ pub struct RoleConfig {
 #[serde(untagged)]
 pub enum MaskEntry {
     /// Default masking strategy for a classification tag.
-    Strategy(crate::traits::MaskStrategy),
+    Strategy(rocky_ir::MaskStrategy),
     /// Per-env override map: `[mask.<env>]` section with
     /// `<classification> = "<strategy>"` pairs.
-    EnvOverride(std::collections::BTreeMap<String, crate::traits::MaskStrategy>),
+    EnvOverride(std::collections::BTreeMap<String, rocky_ir::MaskStrategy>),
 }
 
 /// Advisory settings for column classification.
@@ -1896,7 +1896,7 @@ impl RockyConfig {
     pub fn resolve_mask_for_env(
         &self,
         env: Option<&str>,
-    ) -> std::collections::BTreeMap<String, crate::traits::MaskStrategy> {
+    ) -> std::collections::BTreeMap<String, rocky_ir::MaskStrategy> {
         let mut out = std::collections::BTreeMap::new();
 
         // Pass 1: every scalar entry is a workspace-default.
@@ -1929,7 +1929,7 @@ impl RockyConfig {
     pub fn role_graph(
         &self,
     ) -> Result<
-        std::collections::BTreeMap<String, crate::ir::ResolvedRole>,
+        std::collections::BTreeMap<String, rocky_ir::ResolvedRole>,
         crate::role_graph::RoleGraphError,
     > {
         crate::role_graph::flatten_role_graph(&self.roles)
@@ -6084,11 +6084,11 @@ max_rows = 1000
         let resolved = cfg.resolve_mask_for_env(None);
         assert_eq!(
             resolved.get("pii").copied(),
-            Some(crate::traits::MaskStrategy::Hash)
+            Some(rocky_ir::MaskStrategy::Hash)
         );
         assert_eq!(
             resolved.get("confidential").copied(),
-            Some(crate::traits::MaskStrategy::Redact)
+            Some(rocky_ir::MaskStrategy::Redact)
         );
     }
 
@@ -6112,25 +6112,22 @@ max_rows = 1000
         let default = cfg.resolve_mask_for_env(None);
         assert_eq!(
             default.get("pii").copied(),
-            Some(crate::traits::MaskStrategy::Hash)
+            Some(rocky_ir::MaskStrategy::Hash)
         );
 
         // prod env: overrides win.
         let prod = cfg.resolve_mask_for_env(Some("prod"));
-        assert_eq!(
-            prod.get("pii").copied(),
-            Some(crate::traits::MaskStrategy::None)
-        );
+        assert_eq!(prod.get("pii").copied(), Some(rocky_ir::MaskStrategy::None));
         assert_eq!(
             prod.get("confidential").copied(),
-            Some(crate::traits::MaskStrategy::Partial)
+            Some(rocky_ir::MaskStrategy::Partial)
         );
 
         // Non-matching env ignores the override table.
         let staging = cfg.resolve_mask_for_env(Some("staging"));
         assert_eq!(
             staging.get("pii").copied(),
-            Some(crate::traits::MaskStrategy::Hash)
+            Some(rocky_ir::MaskStrategy::Hash)
         );
     }
 
@@ -6152,12 +6149,12 @@ max_rows = 1000
         let prod = cfg.resolve_mask_for_env(Some("prod"));
         assert_eq!(
             prod.get("pii").copied(),
-            Some(crate::traits::MaskStrategy::Hash),
+            Some(rocky_ir::MaskStrategy::Hash),
             "prod should inherit the default pii"
         );
         assert_eq!(
             prod.get("confidential").copied(),
-            Some(crate::traits::MaskStrategy::Partial),
+            Some(rocky_ir::MaskStrategy::Partial),
             "prod should gain confidential from its override"
         );
 

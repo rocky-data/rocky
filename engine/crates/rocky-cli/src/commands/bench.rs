@@ -13,10 +13,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use rocky_compiler::compile::{CompilerConfig, compile};
-use rocky_core::dag::{DagNode, execution_layers, topological_sort};
-use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
+use rocky_ir::dag::{DagNode, execution_layers, topological_sort};
+use rocky_ir::*;
 
 // ---------------------------------------------------------------------------
 // Output types
@@ -351,7 +351,7 @@ fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
     for size in [10, 100, 500, 1000, 5000, 10000] {
         let model_irs: Vec<_> = (0..size)
             .map(|i| {
-                rocky_core::ir::ModelIr::replication(
+                rocky_ir::ModelIr::replication(
                     TargetRef {
                         catalog: String::new(),
                         schema: "target".into(),

@@ -170,7 +170,7 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
                         .iter()
                         .map(rocky_core::models::Model::to_dag_node)
                         .collect();
-                    match rocky_core::dag::topological_sort(&dag_nodes) {
+                    match rocky_ir::dag::topological_sort(&dag_nodes) {
                         Ok(order) => {
                             out.models = ValidateModelsStatus {
                                 found: true,
@@ -757,16 +757,16 @@ fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
 
     // Check for cycles using the existing DAG module
     if has_deps {
-        let dag_nodes: Vec<rocky_core::dag::DagNode> = cfg
+        let dag_nodes: Vec<rocky_ir::dag::DagNode> = cfg
             .pipelines
             .iter()
-            .map(|(name, pc)| rocky_core::dag::DagNode {
+            .map(|(name, pc)| rocky_ir::dag::DagNode {
                 name: name.clone(),
                 depends_on: pc.depends_on().to_vec(),
             })
             .collect();
 
-        match rocky_core::dag::topological_sort(&dag_nodes) {
+        match rocky_ir::dag::topological_sort(&dag_nodes) {
             Ok(order) => {
                 out.push(ValidateMessage {
                     severity: "ok".into(),
@@ -779,7 +779,7 @@ fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
                     field: None,
                 });
             }
-            Err(rocky_core::dag::DagError::CyclicDependency { nodes }) => {
+            Err(rocky_ir::dag::DagError::CyclicDependency { nodes }) => {
                 out.push(ValidateMessage {
                     severity: "error".into(),
                     code: "V030".into(),

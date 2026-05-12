@@ -16,9 +16,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{ColumnInfo, ColumnSelection, Grant, GrantTarget, MetadataColumn, TableRef};
 use crate::retention::RetentionPolicy;
 use crate::source::DiscoveryResult;
+use rocky_ir::{
+    ColumnInfo, ColumnSelection, Grant, GrantTarget, MaskStrategy, MetadataColumn, TableRef,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -896,11 +898,6 @@ pub enum TagTarget {
     },
 }
 
-// `MaskStrategy` moved to `rocky_ir::mask` — re-exported below for in-crate
-// backward compatibility. External consumers should reach for
-// `rocky_ir::MaskStrategy` directly.
-pub use rocky_ir::MaskStrategy;
-
 /// A concrete masking policy resolved for a specific environment.
 ///
 /// The pipeline config supplies a default `[mask]` block keyed by
@@ -1073,7 +1070,7 @@ pub trait GovernanceAdapter: Send + Sync {
     /// role/group system, scoped to the given `catalogs`.
     ///
     /// `roles` is the post-[`crate::role_graph::flatten_role_graph`]
-    /// map: each [`crate::ir::ResolvedRole`] carries its own permissions
+    /// map: each [`rocky_ir::ResolvedRole`] carries its own permissions
     /// plus every transitive ancestor's, deduped and sorted. `catalogs`
     /// is the set of Unity Catalog / warehouse catalogs the current
     /// `rocky run` touched — the adapter emits per-catalog GRANT
@@ -1103,7 +1100,7 @@ pub trait GovernanceAdapter: Send + Sync {
     /// the no-op application.
     async fn reconcile_role_graph(
         &self,
-        _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+        _roles: &BTreeMap<String, rocky_ir::ResolvedRole>,
         _catalogs: &[&str],
     ) -> AdapterResult<()> {
         Err(AdapterError::msg(
@@ -1263,7 +1260,7 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
 
     async fn reconcile_role_graph(
         &self,
-        _roles: &BTreeMap<String, crate::ir::ResolvedRole>,
+        _roles: &BTreeMap<String, rocky_ir::ResolvedRole>,
         _catalogs: &[&str],
     ) -> AdapterResult<()> {
         // Same rationale as `apply_column_tags` / `apply_masking_policy`:

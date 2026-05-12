@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use tracing::warn;
 
-use rocky_core::ir::{Grant, GrantTarget};
 use rocky_core::traits::{
     AdapterError, AdapterResult, GovernanceAdapter, TagTarget, WarehouseAdapter,
 };
+use rocky_ir::{Grant, GrantTarget};
 use rocky_sql::validation;
 
 use crate::connector::BigQueryAdapter;

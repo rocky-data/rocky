@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
-use crate::ir::ColumnInfo;
+use rocky_ir::ColumnInfo;
 
 /// Data contract configuration — enforced at copy time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

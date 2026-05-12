@@ -5,8 +5,8 @@ use fs4::FileExt;
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
-use crate::ir::WatermarkState;
 use crate::schema_cache::SchemaCacheEntry;
+use rocky_ir::WatermarkState;
 
 const WATERMARKS: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
 const CHECK_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("check_history");

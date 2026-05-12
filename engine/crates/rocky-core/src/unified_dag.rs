@@ -721,7 +721,7 @@ pub fn infer_runtime_dependencies(
 /// Returns groups of node references that can execute concurrently. Within
 /// each phase, all upstream dependencies (across all edge types) have been
 /// satisfied by previous phases. This is the unified-DAG equivalent of
-/// [`crate::dag::execution_layers`].
+/// [`rocky_ir::dag::execution_layers`].
 ///
 /// Returns an error if the DAG contains a cycle.
 pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, UnifiedDagError> {

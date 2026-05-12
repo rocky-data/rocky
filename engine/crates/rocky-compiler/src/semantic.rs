@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use rocky_core::ir::ColumnInfo;
+use rocky_ir::ColumnInfo;
 use rocky_sql::lineage::{self, TransformKind};
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use crate::project::Project;
 // can reference them without inducing a dependency cycle (rocky-compiler
 // already depends on rocky-core, one-way). They are re-exported here so that
 // `rocky_compiler::semantic::{LineageEdge, QualifiedColumn}` keeps resolving.
-pub use rocky_core::lineage::{LineageEdge, QualifiedColumn};
+pub use rocky_ir::lineage::{LineageEdge, QualifiedColumn};
 
 /// Definition of a column in a model's output schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]

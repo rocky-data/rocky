@@ -29,9 +29,9 @@ use chrono::{DateTime, Utc};
 
 use rocky_core::compare::ComparisonThresholds;
 use rocky_core::config::BranchApprovalConfig;
-use rocky_core::ir::TargetRef;
 use rocky_core::shadow::{self, ShadowConfig};
 use rocky_core::state::{BranchRecord, StateStore};
+use rocky_ir::TargetRef;
 
 use crate::output::{
     ApprovalArtifact, ApprovalSignature, ApproveOutput, ApproverIdentity, ApproverSource,

@@ -9,8 +9,8 @@
 
 use std::fmt::Write;
 
-use rocky_core::ir::{ColumnSelection, MetadataColumn};
 use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
 /// Snowflake SQL dialect.

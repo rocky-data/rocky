@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ir::PartitionWindow;
-use crate::models::TimeGrain;
+use rocky_ir::PartitionWindow;
+use rocky_ir::TimeGrain;
 
 /// Checksum for a single partition of a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]

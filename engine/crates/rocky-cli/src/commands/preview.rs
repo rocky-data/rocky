@@ -422,12 +422,12 @@ async fn apply_bisection_to_models(
             continue;
         };
 
-        let base_table = rocky_core::ir::TableRef {
+        let base_table = rocky_ir::TableRef {
             catalog: model.config.target.catalog.clone(),
             schema: model.config.target.schema.clone(),
             table: model.config.target.table.clone(),
         };
-        let branch_table = rocky_core::ir::TableRef {
+        let branch_table = rocky_ir::TableRef {
             catalog: model.config.target.catalog.clone(),
             schema: branch_schema.clone(),
             table: model.config.target.table.clone(),
@@ -570,8 +570,8 @@ async fn bisect_one_model(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
     model_name: &str,
     pk_column: &str,
-    base_table: &rocky_core::ir::TableRef,
-    branch_table: &rocky_core::ir::TableRef,
+    base_table: &rocky_ir::TableRef,
+    branch_table: &rocky_ir::TableRef,
 ) -> Result<BisectionOutcome> {
     use rocky_core::compare::bisection::{BisectionConfig, BisectionTarget, bisection_diff};
 
@@ -614,8 +614,8 @@ async fn bisect_one_model(
 /// sides are empty.
 async fn pk_window(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
-    base: &rocky_core::ir::TableRef,
-    branch: &rocky_core::ir::TableRef,
+    base: &rocky_ir::TableRef,
+    branch: &rocky_ir::TableRef,
     pk_column: &str,
 ) -> Result<(i128, i128)> {
     rocky_sql::validation::validate_identifier(pk_column)
@@ -684,8 +684,8 @@ fn parse_optional_i128(cell: Option<&serde_json::Value>) -> Option<i128> {
 /// columns); fall back to base if branch is missing or empty.
 async fn describe_value_columns(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
-    primary: &rocky_core::ir::TableRef,
-    fallback: &rocky_core::ir::TableRef,
+    primary: &rocky_ir::TableRef,
+    fallback: &rocky_ir::TableRef,
     pk_column: &str,
 ) -> Result<Vec<String>> {
     let cols = match adapter.describe_table(primary).await {
@@ -1586,7 +1586,7 @@ fn changed_models_under(paths: &[String], models_dir: &Path) -> BTreeSet<String>
 /// Lightweight DAG built from `models/` sidecars. Keys are model
 /// filename stems; edges are forward (a → b means "a feeds b").
 ///
-/// This is intentionally not the full `rocky_core::dag::DependencyGraph`
+/// This is intentionally not the full `rocky_ir::dag::DependencyGraph`
 /// — preview only needs reachability, not type-checked schemas. Building
 /// from sidecars keeps the dependency on the compiler off the preview
 /// hot path. If the sidecar is malformed, the model is still tracked
@@ -1891,7 +1891,7 @@ async fn execute_copy_from_base(
         let source_schema = model.config.target.schema.clone();
         let table = model.config.target.table.clone();
         let source_catalog = model.config.target.catalog.clone();
-        let source_ref = rocky_core::ir::TableRef {
+        let source_ref = rocky_ir::TableRef {
             catalog: source_catalog,
             schema: source_schema.clone(),
             table: table.clone(),
@@ -3235,9 +3235,9 @@ table = "plain"
     /// until the schema swap lands).
     #[tokio::test]
     async fn bisect_one_model_finds_planted_change() {
-        use rocky_core::ir::TableRef;
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::TableRef;
 
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
         adapter
@@ -3289,9 +3289,9 @@ table = "plain"
     /// invocation, no error.
     #[tokio::test]
     async fn bisect_one_model_empty_window_short_circuits() {
-        use rocky_core::ir::TableRef;
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::TableRef;
 
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
         adapter

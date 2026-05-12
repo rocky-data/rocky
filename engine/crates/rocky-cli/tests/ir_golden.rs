@@ -41,16 +41,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rocky_core::ir::{
+use rocky_core::lakehouse::{LakehouseFormat, LakehouseOptions};
+use rocky_core::sql_gen;
+use rocky_core::traits::SqlDialect;
+use rocky_ir::MaskStrategy;
+use rocky_ir::TimeGrain;
+use rocky_ir::lineage::{LineageEdge, QualifiedColumn};
+use rocky_ir::types::{RockyType, TypedColumn};
+use rocky_ir::{
     ColumnMask, ColumnSelection, GovernanceConfig, MaterializationStrategy, MetadataColumn,
     ModelIr, SourceRef, TargetRef,
 };
-use rocky_core::lakehouse::{LakehouseFormat, LakehouseOptions};
-use rocky_core::lineage::{LineageEdge, QualifiedColumn};
-use rocky_core::models::TimeGrain;
-use rocky_core::sql_gen;
-use rocky_core::traits::{MaskStrategy, SqlDialect};
-use rocky_core::types::{RockyType, TypedColumn};
 use rocky_sql::lineage::TransformKind;
 
 use rocky_bigquery::dialect::BigQueryDialect;

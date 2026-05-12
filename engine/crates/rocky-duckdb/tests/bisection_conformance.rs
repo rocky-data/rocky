@@ -19,9 +19,9 @@
 use rocky_core::compare::bisection::{
     BisectionConfig, BisectionTarget, LeafRowKind, bisection_diff,
 };
-use rocky_core::ir::TableRef;
 use rocky_core::traits::{SplitStrategy, WarehouseAdapter};
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+use rocky_ir::TableRef;
 
 /// Seed a `(id INTEGER, name VARCHAR, value INTEGER)` table with N rows.
 /// `id` runs `0..N`. `name` is `"row_<id>"`. `value` defaults to `id * 7`.

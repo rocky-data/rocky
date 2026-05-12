@@ -239,8 +239,8 @@ fn generate_view_ddl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::ColumnSelection;
     use crate::traits::{AdapterError, AdapterResult};
+    use rocky_ir::ColumnSelection;
 
     /// Minimal test dialect for lakehouse DDL tests (mirrors sql_gen::tests::TestDialect).
     struct TestDialect;
@@ -277,7 +277,7 @@ mod tests {
         fn select_clause(
             &self,
             _columns: &ColumnSelection,
-            _metadata: &[crate::ir::MetadataColumn],
+            _metadata: &[rocky_ir::MetadataColumn],
         ) -> AdapterResult<String> {
             unimplemented!("not needed for lakehouse tests")
         }

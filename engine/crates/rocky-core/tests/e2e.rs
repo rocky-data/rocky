@@ -3,13 +3,13 @@
 //! These tests verify the full pipeline flow (SQL generation -> execution -> state)
 //! using an in-memory DuckDB database. No warehouse credentials required.
 
-use rocky_core::ir::{
-    ColumnInfo, ColumnSelection, DriftAction, GovernanceConfig, MaterializationStrategy,
-    MetadataColumn, ModelIr, SourceRef, TableRef, TargetRef, WatermarkState,
-};
 use rocky_core::state::StateStore;
 use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
 use rocky_core::{drift, sql_gen};
+use rocky_ir::{
+    ColumnInfo, ColumnSelection, DriftAction, GovernanceConfig, MaterializationStrategy,
+    MetadataColumn, ModelIr, SourceRef, TableRef, TargetRef, WatermarkState,
+};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -1103,14 +1103,12 @@ WHERE _fivetran_synced > (
 
 mod time_interval_e2e {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus, partition_key_to_window};
-    use rocky_core::ir::{
-        GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef,
-    };
-    use rocky_core::models::TimeGrain;
     use rocky_core::sql_gen;
     use rocky_core::state::StateStore;
     use rocky_core::traits::{SqlDialect, WarehouseAdapter};
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_ir::TimeGrain;
+    use rocky_ir::{GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef};
     use tempfile::TempDir;
 
     /// SQL to seed a stg_orders table with rows across 5 partitions
