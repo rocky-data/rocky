@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-05-12
+
+Companion release to engine `v1.30.0`. Headline: **regenerated `MaterializationStrategy` enum picks up `content_addressed`** — the new strategy added to the engine IR ([#496](https://github.com/rocky-data/rocky/pull/496)) and accepted by the TOML sidecar ([#497](https://github.com/rocky-data/rocky/pull/497)) flows through codegen into `dagster_rocky.types_generated.adapter_config_schema` and `dagster_rocky.types_generated.rocky_project_schema`, so consumers parsing Rocky JSON output via Pydantic now see `content_addressed` as a valid discriminator without overriding `extra = "forbid"`. The rest of the engine cycle (rocky-iceberg writer Phases 1–5, `rocky-ir` crate extraction, Plan enum deletion, dbt importer GA framing, arrow+parquet 54→58) is source-invisible to the dagster integration — no JSON output struct shape changed. Wheel re-cut against the v1.30.0 engine binary.
+
+### Added
+
+- **`MaterializationStrategy = "content_addressed"`** (engine [#496](https://github.com/rocky-data/rocky/pull/496) + [#497](https://github.com/rocky-data/rocky/pull/497)). New literal value on the regenerated `MaterializationStrategy` enum surfaced by `dagster_rocky.types_generated.adapter_config_schema` / `rocky_project_schema`. Strictly additive — existing strategy values are unchanged and re-exported from `dagster_rocky.types` under both generated and legacy names.
+
+### Changed
+
+- **`uv lock --upgrade`** ([#474](https://github.com/rocky-data/rocky/pull/474)). Lockfile refresh across transitive dependencies; no direct dependency floor moved.
+
 ## [1.27.0] — 2026-05-09
 
 Companion release to engine `v1.29.0`. Source-invisible cycle — the `dagster_rocky.types_generated` layer is unchanged. Engine [#448](https://github.com/rocky-data/rocky/pull/448) (`auto_create_schemas` honoured on transformation pipelines), [#449](https://github.com/rocky-data/rocky/pull/449) (DuckDB MERGE unqualified-LHS), [#453](https://github.com/rocky-data/rocky/pull/453) (state-store error propagation on the model-only run path), and [#454](https://github.com/rocky-data/rocky/pull/454) (security audit fixes) are all transparent to the typed-resource layer — no JSON output struct touched. Wheel re-cut against the v1.29.0 engine binary.

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.2] — 2026-05-12
+
+Companion release to engine `v1.30.0`. Patch cycle: the regenerated TypeScript interfaces in `src/types/generated/` pick up the new `content_addressed` value on the `MaterializationStrategy` union (engine [#496](https://github.com/rocky-data/rocky/pull/496) + [#497](https://github.com/rocky-data/rocky/pull/497)), so any extension code that destructures a model sidecar via `rockyJson.ts` now type-checks against the full strategy surface. No extension feature changes — no new commands, no UI changes, no setting changes. Dev-dependency refresh: vitest `4.1.5 → 4.1.6` ([#462](https://github.com/rocky-data/rocky/pull/462)), typescript-eslint bump ([#461](https://github.com/rocky-data/rocky/pull/461)), `@types/node` bump ([#460](https://github.com/rocky-data/rocky/pull/460)).
+
 ## [1.15.1] — 2026-05-07
 
 Patch release fixing the new "Run Health Check" leaf in the **Extension Info → Logs** sidebar section. Clicking it surfaced "Doctor failed: …" toasts and threw the doctor JSON away — `rocky doctor` exits 2 when any check is `critical` (see `engine/crates/rocky-cli/src/commands/doctor.rs`) and the vscode handler treated any non-zero exit as a hard failure. Same bug existed in 1.14.x but was harder to hit because doctor wasn't exposed in the sidebar.
