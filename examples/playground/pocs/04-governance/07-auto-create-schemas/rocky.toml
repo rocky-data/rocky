@@ -1,0 +1,21 @@
+# 07-auto-create-schemas — transformation-pipeline schema autocreate (v1.29.0)
+#
+# A transformation pipeline whose models target a schema (`poc.mart`) that
+# does NOT exist in the warehouse. With `auto_create_schemas = true` set on
+# the pipeline target governance block, Rocky creates the schema between
+# compile and execute — pre-v1.29 this was silently a no-op on the
+# transformation path, so the run failed at execute time with
+# "Schema with name mart does not exist".
+#
+# Per-model catalog/schema live on each model's sidecar `[target]`; the
+# pipeline target only carries adapter + governance.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.transform]
+type = "transformation"
+
+[pipeline.transform.target.governance]
+auto_create_schemas = true

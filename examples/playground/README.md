@@ -36,7 +36,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**55 of 68 POCs run with no external credentials.** See each POC's README for prerequisites.
+**57 of 70 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -101,9 +101,9 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [04-ai-test-generation](pocs/03-ai/04-ai-test-generation) | `rocky ai-test --all --save` generates SQL assertions from intent + schema |
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 
-### 04 — Governance (6 POCs · Databricks / DuckDB)
+### 04 — Governance (7 POCs · Databricks / DuckDB)
 
-Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention.
+Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention, auto-create schemas.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -113,6 +113,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [04-tagging-lifecycle](pocs/04-governance/04-tagging-lifecycle) | `[governance.tags]` propagated via `ALTER ... SET TAGS` | Databricks |
 | [05-classification-masking-compliance](pocs/04-governance/05-classification-masking-compliance) | `[classification]` + `[mask]` policy + `rocky compliance --fail-on exception` for CI gating on unmasked PII | none |
 | [06-retention-policies](pocs/04-governance/06-retention-policies) | Declarative `retention = "<N>[dy]"` sidecars + `rocky retention-status --drift` | none |
+| [07-auto-create-schemas](pocs/04-governance/07-auto-create-schemas) | `[…target.governance] auto_create_schemas = true` on a transformation pipeline targeting a fresh schema (v1.29.0 parity fix) | none |
 
 ### 05 — Orchestration (9 POCs · DuckDB / docker)
 
@@ -130,9 +131,9 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 
-### 06 — Developer Experience (13 POCs · DuckDB)
+### 06 — Developer Experience (14 POCs · DuckDB)
 
-Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff.
+Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes.
 
 | POC | Feature |
 |---|---|
@@ -149,6 +150,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [11-lineage-diff](pocs/06-developer-experience/11-lineage-diff) | `rocky lineage-diff <base_ref>` — per-changed-column downstream blast-radius for PR review (Markdown drops into a PR comment) |
 | [12-catalog-emit](pocs/06-developer-experience/12-catalog-emit) | `rocky catalog --format both` — column-level lineage emitted as `catalog.json` + `edges.parquet` + `assets.parquet`; readable by any Parquet client without going through the engine |
 | [13-run-watch-inner-loop](pocs/06-developer-experience/13-run-watch-inner-loop) | `rocky run --watch` re-materialises on every save; 200 ms debounce window, FSEvents-safe directory watch, NDJSON-stream output, clean SIGINT exit |
+| [14-import-dbt-failure-modes](pocs/06-developer-experience/14-import-dbt-failure-modes) | `rocky import-dbt` against malformed inputs (missing files, invalid YAML, unknown adapters) — exercises every diagnostic path the importer emits |
 
 ### 07 — Adapters (7 POCs · mixed)
 
