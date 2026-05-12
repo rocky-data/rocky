@@ -115,6 +115,7 @@ pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
                 rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
                 rocky_core::models::StrategyConfig::Ephemeral => "ephemeral",
                 rocky_core::models::StrategyConfig::Microbatch { .. } => "microbatch",
+                rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
             }
             .to_string();
             ListModelEntry {

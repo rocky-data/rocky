@@ -251,6 +251,24 @@ pub enum StrategyConfig {
         #[serde(default = "default_microbatch_granularity")]
         granularity: TimeGrain,
     },
+    /// Content-addressed write to a Delta UniForm table via the
+    /// `rocky-iceberg` writer. The runtime executes the model SQL,
+    /// converts the result to Arrow, blake3-hashes the Parquet bytes,
+    /// uploads to `storage_prefix`, and emits a Delta log commit.
+    /// Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK
+    /// REPAIR after each commit; the runtime issues this automatically.
+    #[serde(rename = "content_addressed")]
+    ContentAddressed {
+        /// Object-store key prefix that holds `_delta_log/` + Parquet
+        /// files for the target table. Typically
+        /// `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
+        storage_prefix: String,
+        /// Logical partition column names. Empty for unpartitioned
+        /// tables. The runtime asserts this matches the table's
+        /// declared partition columns at materialization time.
+        #[serde(default)]
+        partition_columns: Vec<String>,
+    },
 }
 
 fn default_batch_size() -> NonZeroU32 {
@@ -555,6 +573,13 @@ impl Model {
                 timestamp_column: timestamp_column.clone(),
                 granularity: *granularity,
             },
+            StrategyConfig::ContentAddressed {
+                storage_prefix,
+                partition_columns,
+            } => MaterializationStrategy::ContentAddressed {
+                storage_prefix: storage_prefix.clone(),
+                partition_columns: partition_columns.clone(),
+            },
         };
 
         ModelIr {
@@ -828,6 +853,81 @@ FROM analytics.staging.customers
             model.config.strategy,
             StrategyConfig::Merge { .. }
         ));
+    }
+
+    #[test]
+    fn test_parse_model_content_addressed() {
+        let content = r#"---toml
+name = "fct_events"
+
+[strategy]
+type = "content_addressed"
+storage_prefix = "s3://example-bucket/dataset/fct_events"
+partition_columns = ["region"]
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "fct_events"
+---
+
+SELECT id, payload, region FROM raw.events
+"#;
+        let model = parse_model_inline(content, "fct_events.sql", None).unwrap();
+        match &model.config.strategy {
+            StrategyConfig::ContentAddressed {
+                storage_prefix,
+                partition_columns,
+            } => {
+                assert_eq!(storage_prefix, "s3://example-bucket/dataset/fct_events");
+                assert_eq!(partition_columns, &vec!["region".to_string()]);
+            }
+            other => panic!("expected ContentAddressed, got {other:?}"),
+        }
+
+        // Lowering must produce the IR variant with the same fields.
+        let ir = model.to_model_ir();
+        match &ir.materialization {
+            rocky_ir::MaterializationStrategy::ContentAddressed {
+                storage_prefix,
+                partition_columns,
+            } => {
+                assert_eq!(storage_prefix, "s3://example-bucket/dataset/fct_events");
+                assert_eq!(partition_columns, &vec!["region".to_string()]);
+            }
+            other => panic!("expected IR ContentAddressed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_content_addressed_unpartitioned() {
+        // partition_columns is optional in the TOML; default is an empty vec.
+        let content = r#"---toml
+name = "fct_events"
+
+[strategy]
+type = "content_addressed"
+storage_prefix = "s3://example-bucket/dataset/fct_events"
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "fct_events"
+---
+
+SELECT id, payload FROM raw.events
+"#;
+        let model = parse_model_inline(content, "fct_events.sql", None).unwrap();
+        match &model.config.strategy {
+            StrategyConfig::ContentAddressed {
+                storage_prefix,
+                partition_columns,
+            } => {
+                assert_eq!(storage_prefix, "s3://example-bucket/dataset/fct_events");
+                assert!(partition_columns.is_empty());
+            }
+            other => panic!("expected ContentAddressed, got {other:?}"),
+        }
     }
 
     #[test]

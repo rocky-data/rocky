@@ -379,6 +379,7 @@ fn strategy_label(s: &StrategyConfig) -> &'static str {
         StrategyConfig::Ephemeral => "ephemeral",
         StrategyConfig::DeleteInsert { .. } => "delete_insert",
         StrategyConfig::Microbatch { .. } => "microbatch",
+        StrategyConfig::ContentAddressed { .. } => "content_addressed",
     }
 }
 

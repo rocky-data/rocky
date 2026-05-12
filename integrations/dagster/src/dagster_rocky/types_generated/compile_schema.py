@@ -210,6 +210,26 @@ class Type6(StrEnum):
     microbatch = "microbatch"
 
 
+class Type7(StrEnum):
+    content_addressed = "content_addressed"
+
+
+class StrategyConfig8(BaseModel):
+    """
+    Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.
+    """
+
+    partition_columns: list[str] | None = []
+    """
+    Logical partition column names. Empty for unpartitioned tables. The runtime asserts this matches the table's declared partition columns at materialization time.
+    """
+    storage_prefix: str
+    """
+    Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
+    """
+    type: Type7
+
+
 class TargetConfig(BaseModel):
     """
     Target table coordinates for a model.
@@ -348,6 +368,7 @@ class ModelDetail(BaseModel):
         | StrategyConfig5
         | StrategyConfig6
         | StrategyConfig7
+        | StrategyConfig8
     )
     """
     Materialization strategy as the wire-shape `StrategyConfig` (`{"type": "...", ...}`).

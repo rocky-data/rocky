@@ -75,7 +75,7 @@ class Type(StrEnum):
     full_refresh = "full_refresh"
 
 
-class StrategyConfig8(BaseModel):
+class StrategyConfig9(BaseModel):
     """
     Materialization strategy for a model, defaulting to full refresh.
     """
@@ -83,21 +83,8 @@ class StrategyConfig8(BaseModel):
     type: Type
 
 
-class Type8(StrEnum):
-    incremental = "incremental"
-
-
-class StrategyConfig9(BaseModel):
-    """
-    Materialization strategy for a model, defaulting to full refresh.
-    """
-
-    timestamp_column: str
-    type: Type8
-
-
 class Type9(StrEnum):
-    merge = "merge"
+    incremental = "incremental"
 
 
 class StrategyConfig10(BaseModel):
@@ -105,32 +92,45 @@ class StrategyConfig10(BaseModel):
     Materialization strategy for a model, defaulting to full refresh.
     """
 
+    timestamp_column: str
     type: Type9
+
+
+class Type10(StrEnum):
+    merge = "merge"
+
+
+class StrategyConfig11(BaseModel):
+    """
+    Materialization strategy for a model, defaulting to full refresh.
+    """
+
+    type: Type10
     unique_key: list[str]
     update_columns: list[str] | None = None
 
 
-class Type10(StrEnum):
+class Type11(StrEnum):
     time_interval = "time_interval"
 
 
-class Type11(StrEnum):
+class Type12(StrEnum):
     ephemeral = "ephemeral"
 
 
-class StrategyConfig12(BaseModel):
+class StrategyConfig13(BaseModel):
     """
     Ephemeral model — inlined as CTE in downstream queries, no table created.
     """
 
-    type: Type11
+    type: Type12
 
 
-class Type12(StrEnum):
+class Type13(StrEnum):
     delete_insert = "delete_insert"
 
 
-class StrategyConfig13(BaseModel):
+class StrategyConfig14(BaseModel):
     """
     Delete+Insert: delete matching rows by partition key, then insert.
     """
@@ -139,11 +139,31 @@ class StrategyConfig13(BaseModel):
     """
     Column(s) used to identify the partition to delete.
     """
-    type: Type12
+    type: Type13
 
 
-class Type13(StrEnum):
+class Type14(StrEnum):
     microbatch = "microbatch"
+
+
+class Type15(StrEnum):
+    content_addressed = "content_addressed"
+
+
+class StrategyConfig16(BaseModel):
+    """
+    Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.
+    """
+
+    partition_columns: list[str] | None = []
+    """
+    Logical partition column names. Empty for unpartitioned tables. The runtime asserts this matches the table's declared partition columns at materialization time.
+    """
+    storage_prefix: str
+    """
+    Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
+    """
+    type: Type15
 
 
 class TargetConfig(BaseModel):
@@ -178,7 +198,7 @@ class LineageEdgeRecord(BaseModel):
     """
 
 
-class StrategyConfig11(BaseModel):
+class StrategyConfig12(BaseModel):
     """
     Partition-keyed materialization. Each run targets specific partitions rather than appending past a watermark. Idempotent and backfill-friendly.
 
@@ -205,10 +225,10 @@ class StrategyConfig11(BaseModel):
     """
     Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.
     """
-    type: Type10
+    type: Type11
 
 
-class StrategyConfig14(BaseModel):
+class StrategyConfig15(BaseModel):
     """
     Microbatch: alias for time_interval with hourly defaults. dbt-compatible naming for partition-based incremental processing.
     """
@@ -221,7 +241,7 @@ class StrategyConfig14(BaseModel):
     """
     Timestamp column for micro-batch boundaries.
     """
-    type: Type13
+    type: Type14
 
 
 class DagNodeOutput(BaseModel):
@@ -260,13 +280,14 @@ class DagNodeOutput(BaseModel):
     Pipeline name from `rocky.toml`, if applicable.
     """
     strategy: (
-        StrategyConfig8
-        | StrategyConfig9
+        StrategyConfig9
         | StrategyConfig10
         | StrategyConfig11
         | StrategyConfig12
         | StrategyConfig13
         | StrategyConfig14
+        | StrategyConfig15
+        | StrategyConfig16
         | None
     ) = None
     """
