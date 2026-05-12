@@ -48,9 +48,7 @@ export type MaskEntry =
       [k: string]: MaskStrategy;
     };
 /**
- * Column-masking strategy applied to a classified column at materialization time.
- *
- * Rocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.
+ * How a column is masked at apply time.
  *
  * Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`, `"partial"`, `"none"`).
  */
@@ -1306,7 +1304,7 @@ export interface RunRetryConfig {
  *
  * Resolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.
  *
- * Permission strings must match the canonical uppercase spellings of [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+ * Permission strings must match the canonical uppercase spellings of [`rocky_ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
  */
 export interface RoleConfig {
   /**

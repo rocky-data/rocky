@@ -706,7 +706,7 @@ class RoleConfig(BaseModel):
 
     Resolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.
 
-    Permission strings must match the canonical uppercase spellings of [`crate::ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
+    Permission strings must match the canonical uppercase spellings of [`rocky_ir::Permission`] (`"SELECT"`, `"USE CATALOG"`, ...).
     """
 
     model_config = ConfigDict(

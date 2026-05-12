@@ -1210,7 +1210,7 @@
       "description": "One entry in the top-level `[mask]` block. A scalar value (`pii = \"hash\"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = \"none\"`) overrides strategies for a specific environment.\n\nSerde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `\"mask\"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for."
     },
     "MaskStrategy": {
-      "description": "Column-masking strategy applied to a classified column at materialization time.\n\nRocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.\n\nSerialized in lowercase to match the TOML spelling (`\"hash\"`, `\"redact\"`, `\"partial\"`, `\"none\"`).",
+      "description": "How a column is masked at apply time.\n\nSerialized in lowercase to match the TOML spelling (`\"hash\"`, `\"redact\"`, `\"partial\"`, `\"none\"`).",
       "oneOf": [
         {
           "description": "SHA-256 hex digest of the column value. Deterministic, one-way.",
@@ -2165,7 +2165,7 @@
     },
     "RoleConfig": {
       "additionalProperties": false,
-      "description": "A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.\n\n```toml [role.reader] permissions = [\"SELECT\", \"USE CATALOG\", \"USE SCHEMA\"]\n\n[role.analytics_engineer] inherits = [\"reader\"] permissions = [\"MODIFY\"]\n\n[role.admin] inherits = [\"analytics_engineer\"] permissions = [\"MANAGE\"] ```\n\nResolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.\n\nPermission strings must match the canonical uppercase spellings of [`crate::ir::Permission`] (`\"SELECT\"`, `\"USE CATALOG\"`, ...).",
+      "description": "A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.\n\n```toml [role.reader] permissions = [\"SELECT\", \"USE CATALOG\", \"USE SCHEMA\"]\n\n[role.analytics_engineer] inherits = [\"reader\"] permissions = [\"MODIFY\"]\n\n[role.admin] inherits = [\"analytics_engineer\"] permissions = [\"MANAGE\"] ```\n\nResolution happens at reconcile time via [`crate::role_graph::flatten_role_graph`], which walks the `inherits` DAG and unions permissions from the role and every transitive ancestor. Cycles and unknown parents are caught as structured [`crate::role_graph::RoleGraphError`] values.\n\nPermission strings must match the canonical uppercase spellings of [`rocky_ir::Permission`] (`\"SELECT\"`, `\"USE CATALOG\"`, ...).",
       "properties": {
         "inherits": {
           "default": [],
