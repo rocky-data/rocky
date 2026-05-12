@@ -3852,6 +3852,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rocky-duckdb",
+ "rocky-ir",
  "rocky-sql",
  "schemars",
  "serde",
@@ -3961,6 +3962,19 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "rocky-ir"
+version = "1.29.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "rocky-sql",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

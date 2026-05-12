@@ -1,0 +1,19 @@
+[package]
+name = "rocky-ir"
+version = "1.29.0"
+description = "Typed intermediate representation (IR) for Rocky transformation pipelines"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-sql = { path = "../rocky-sql" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

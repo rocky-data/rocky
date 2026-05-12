@@ -16,8 +16,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use schemars::JsonSchema;
-
 use crate::ir::{ColumnInfo, ColumnSelection, Grant, GrantTarget, MetadataColumn, TableRef};
 use crate::retention::RetentionPolicy;
 use crate::source::DiscoveryResult;
@@ -898,51 +896,10 @@ pub enum TagTarget {
     },
 }
 
-/// Column-masking strategy applied to a classified column at materialization
-/// time.
-///
-/// Rocky translates a classification tag (e.g., `pii`) into one of these
-/// strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The
-/// adapter renders each strategy as a warehouse-native function:
-/// Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`;
-/// other adapters default-unsupported until demand.
-///
-/// Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`,
-/// `"partial"`, `"none"`).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum MaskStrategy {
-    /// SHA-256 hex digest of the column value. Deterministic, one-way.
-    Hash,
-    /// Replace the column value with the literal string `'***'`.
-    Redact,
-    /// Keep the first and last two characters; replace the middle with `***`.
-    /// Short values (<5 chars) are fully replaced with `'***'`.
-    Partial,
-    /// Explicit identity — no masking applied. Useful as a per-env override
-    /// to "unmask" a column that defaults to masked at the workspace level.
-    None,
-}
-
-impl MaskStrategy {
-    /// Wire name used in `rocky.toml` and JSON schemas.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            MaskStrategy::Hash => "hash",
-            MaskStrategy::Redact => "redact",
-            MaskStrategy::Partial => "partial",
-            MaskStrategy::None => "none",
-        }
-    }
-}
-
-impl std::fmt::Display for MaskStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// `MaskStrategy` moved to `rocky_ir::mask` — re-exported below for in-crate
+// backward compatibility. External consumers should reach for
+// `rocky_ir::MaskStrategy` directly.
+pub use rocky_ir::MaskStrategy;
 
 /// A concrete masking policy resolved for a specific environment.
 ///
