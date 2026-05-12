@@ -264,9 +264,9 @@ pub(crate) fn query_result_to_record_batch(
 /// Materialize a single model whose strategy is
 /// [`MaterializationStrategy::ContentAddressed`].
 ///
-/// **Phase 1 of the runner integration:** unpartitioned tables only. If
-/// the model declares `partition_columns`, the function returns an error
-/// pointing at the follow-up PR that will add partitioned support.
+/// Handles both unpartitioned (single `write_batch` commit) and
+/// partitioned (one `write_partitioned_batch` commit per partition tuple)
+/// targets.
 pub async fn execute_content_addressed_model(
     model_ir: &ModelIr,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -281,24 +281,14 @@ pub async fn execute_content_addressed_model(
         ));
     };
 
-    if !partition_columns.is_empty() {
-        return Err(anyhow!(
-            "content_addressed strategy with partition_columns={:?} is not yet implemented \
-             in the runner; partitioned support lands in a follow-up PR. The writer library \
-             already exposes UniformWriter::write_partitioned_batch — the work is wiring the \
-             row-grouping step here.",
-            partition_columns
-        ));
-    }
-
     // 1. Build the object store.
     let store = build_object_store(storage_prefix)?;
 
     // 2. Build the writer. SqlClient is a NoOp because the runner calls
-    // MSCK directly via the warehouse adapter (see step 7) — wrapping a
-    // borrowed `&dyn WarehouseAdapter` as `Arc<dyn SqlClient + 'static>`
-    // would force a `'static` lifetime on the borrow which the caller
-    // cannot satisfy.
+    // MSCK directly via the warehouse adapter (see the MSCK call below) —
+    // wrapping a borrowed `&dyn WarehouseAdapter` as
+    // `Arc<dyn SqlClient + 'static>` would force a `'static` lifetime on
+    // the borrow which the caller cannot satisfy.
     let sql_client: Arc<dyn SqlClient> = Arc::new(NoOpSqlClient);
     // Strip the bucket from the storage_prefix to derive the key prefix
     // the writer uses for `_delta_log/` etc.
@@ -316,7 +306,7 @@ pub async fn execute_content_addressed_model(
     );
 
     // 3. Discover state + assert partition_columns match.
-    let state = writer
+    let mut state = writer
         .discover()
         .await
         .with_context(|| format!("discover() failed for {:?}", model_ir.target))?;
@@ -336,19 +326,64 @@ pub async fn execute_content_addressed_model(
 
     // 5. Convert rows → Arrow.
     let batch = query_result_to_record_batch(&model_ir.typed_columns, &result)?;
-    let num_rows = batch.num_rows();
+    let total_rows = batch.num_rows();
 
-    // 6. Write the batch.
-    let write_result = writer
-        .write_batch_with_state(batch, state)
-        .await
-        .map_err(|e| anyhow!("write_batch failed: {e}"))?;
+    // 6. Write — split path on partitioned vs unpartitioned.
+    let (last_blake3, last_commit_version, last_file_path, total_size_bytes) =
+        if partition_columns.is_empty() {
+            let write_result = writer
+                .write_batch_with_state(batch, state)
+                .await
+                .map_err(|e| anyhow!("write_batch failed: {e}"))?;
+            (
+                write_result.blake3_hash,
+                write_result.commit_version,
+                write_result.file_path,
+                write_result.size_bytes,
+            )
+        } else {
+            // Partitioned: group rows by partition tuple and emit one
+            // commit per group. Bump `state.next_commit_version` manually
+            // between groups so the cond-put loop in the writer doesn't
+            // burn a retry per group on the already-claimed version.
+            let groups =
+                group_batch_by_partition_tuple(&batch, partition_columns, &model_ir.typed_columns)?;
+            if groups.is_empty() {
+                return Err(anyhow!(
+                    "partitioned content_addressed: model SQL returned 0 rows; \
+                     no commits emitted (this is likely a bug in the model — fail loud rather \
+                     than silent no-op)"
+                ));
+            }
+            let mut last_blake3 = String::new();
+            let mut last_commit_version = 0_u64;
+            let mut last_file_path = String::new();
+            let mut total_size_bytes = 0_u64;
+            for (pv_map, sub_batch) in groups {
+                let write_result = writer
+                    .write_partitioned_batch_with_state(sub_batch, pv_map, state.clone())
+                    .await
+                    .map_err(|e| anyhow!("write_partitioned_batch failed: {e}"))?;
+                state.next_commit_version = write_result.commit_version + 1;
+                last_blake3 = write_result.blake3_hash;
+                last_commit_version = write_result.commit_version;
+                last_file_path = write_result.file_path;
+                total_size_bytes = total_size_bytes.saturating_add(write_result.size_bytes);
+            }
+            (
+                last_blake3,
+                last_commit_version,
+                last_file_path,
+                total_size_bytes,
+            )
+        };
 
     // 7. Sync iceberg metadata so cross-engine readers see the new
-    // commit. Issued directly via the warehouse adapter rather than
+    // commit(s). Issued directly via the warehouse adapter rather than
     // through `UniformWriter::sync_iceberg_metadata` to avoid the
     // `'static` lifetime requirement on `Arc<dyn SqlClient>` (see the
-    // NoOpSqlClient docstring above).
+    // NoOpSqlClient docstring above). One MSCK call covers all the
+    // commits the partitioned loop just emitted.
     let msck_sql = format!(
         "MSCK REPAIR TABLE {}.{}.{} SYNC METADATA",
         model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
@@ -359,12 +394,144 @@ pub async fn execute_content_addressed_model(
         .map_err(|e| anyhow!("MSCK REPAIR failed: {e}"))?;
 
     Ok(ContentAddressedRunSummary {
-        num_rows,
-        blake3_hash: write_result.blake3_hash,
-        commit_version: write_result.commit_version,
-        file_path: write_result.file_path,
-        size_bytes: write_result.size_bytes,
+        num_rows: total_rows,
+        blake3_hash: last_blake3,
+        commit_version: last_commit_version,
+        file_path: last_file_path,
+        size_bytes: total_size_bytes,
     })
+}
+
+/// Group a `RecordBatch` by partition tuple.
+///
+/// Returns a `Vec` of `(partition_values_map, sub_batch)` pairs where each
+/// `sub_batch` contains only the rows whose partition values match
+/// `partition_values_map`. The map is keyed by logical partition column
+/// name with stringified values, the shape
+/// [`UniformWriter::write_partitioned_batch`] expects.
+///
+/// Partition columns stay in the sub-batch — `write_partitioned_batch`'s
+/// internal `build_parquet` drops them before writing the Parquet file.
+fn group_batch_by_partition_tuple(
+    batch: &RecordBatch,
+    partition_columns: &[String],
+    typed_columns: &[TypedColumn],
+) -> Result<Vec<(std::collections::HashMap<String, String>, RecordBatch)>> {
+    use arrow::compute::take;
+    use std::collections::HashMap;
+
+    // Map each partition column name → its index in the batch + its type.
+    let mut partition_meta: Vec<(usize, &RockyType)> = Vec::with_capacity(partition_columns.len());
+    for pcol in partition_columns {
+        let (idx, tc) = typed_columns
+            .iter()
+            .enumerate()
+            .find(|(_, tc)| &tc.name == pcol)
+            .ok_or_else(|| {
+                anyhow!(
+                    "partition column {:?} is not in the model's typed_columns",
+                    pcol
+                )
+            })?;
+        partition_meta.push((idx, &tc.data_type));
+    }
+
+    // Bucket row indices by partition tuple. Use a Vec of (key, indices)
+    // pairs instead of a HashMap so iteration order is deterministic
+    // across runs (matters for `next_commit_version` allocation and for
+    // golden-test outputs in downstream consumers).
+    let mut buckets: Vec<(Vec<String>, Vec<u32>)> = Vec::new();
+    for row in 0..batch.num_rows() {
+        let mut key: Vec<String> = Vec::with_capacity(partition_columns.len());
+        for &(col_idx, ty) in &partition_meta {
+            let array = batch.column(col_idx);
+            let s = stringify_partition_value(array.as_ref(), row, ty, partition_columns)?;
+            key.push(s);
+        }
+        let row_u32 = u32::try_from(row).map_err(|_| anyhow!("batch too large for u32 index"))?;
+        match buckets.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => idxs.push(row_u32),
+            None => buckets.push((key, vec![row_u32])),
+        }
+    }
+
+    // For each bucket, build the partition-values map + the sub-batch.
+    let mut out: Vec<(HashMap<String, String>, RecordBatch)> = Vec::with_capacity(buckets.len());
+    for (key, indices) in buckets {
+        let indices_array = arrow::array::UInt32Array::from(indices);
+        let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for col in batch.columns() {
+            let taken = take(col.as_ref(), &indices_array, None)
+                .map_err(|e| anyhow!("arrow::compute::take failed: {e}"))?;
+            new_columns.push(taken);
+        }
+        let sub_batch = RecordBatch::try_new(batch.schema(), new_columns)
+            .map_err(|e| anyhow!("RecordBatch::try_new for partition sub-batch: {e}"))?;
+        let mut pv_map: HashMap<String, String> = HashMap::with_capacity(partition_columns.len());
+        for (pcol, value) in partition_columns.iter().zip(key) {
+            pv_map.insert(pcol.clone(), value);
+        }
+        out.push((pv_map, sub_batch));
+    }
+    Ok(out)
+}
+
+/// Stringify a single Arrow scalar value for use as a Delta partition value.
+///
+/// Delta partition values are always strings on the wire. The
+/// stringification is RockyType-aware so reads + diffs are stable
+/// (numerics formatted canonically, timestamps in ISO 8601 with `Z`).
+fn stringify_partition_value(
+    array: &dyn arrow::array::Array,
+    row: usize,
+    ty: &RockyType,
+    partition_columns: &[String],
+) -> Result<String> {
+    if array.is_null(row) {
+        return Err(anyhow!(
+            "partition columns {:?} cannot contain NULL values (row {row})",
+            partition_columns
+        ));
+    }
+    match ty {
+        RockyType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .ok_or_else(|| anyhow!("partition column type mismatch: expected Int32"))?;
+            Ok(arr.value(row).to_string())
+        }
+        RockyType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow!("partition column type mismatch: expected Int64"))?;
+            Ok(arr.value(row).to_string())
+        }
+        RockyType::String => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| anyhow!("partition column type mismatch: expected Utf8"))?;
+            Ok(arr.value(row).to_string())
+        }
+        RockyType::Timestamp | RockyType::TimestampNtz => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    anyhow!("partition column type mismatch: expected Timestamp(Microsecond)")
+                })?;
+            let micros = arr.value(row);
+            let dt = chrono::DateTime::from_timestamp_micros(micros)
+                .ok_or_else(|| anyhow!("timestamp {micros} out of range"))?;
+            Ok(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+        }
+        other => Err(anyhow!(
+            "partition column type {other:?} is not supported as a partition key (Phase 6a \
+             supports Int32 / Int64 / String / Timestamp / TimestampNtz)"
+        )),
+    }
 }
 
 /// Summary returned by [`execute_content_addressed_model`].
@@ -493,6 +660,140 @@ mod tests {
         assert!(format!("{err}").contains("Int32 / Int64 / String / Timestamp"));
     }
 
+    fn make_partitioned_batch_3rows() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from(vec![1_i64, 2, 3]);
+        let payload = StringArray::from(vec!["a", "b", "c"]);
+        let region = StringArray::from(vec!["eu", "us", "eu"]);
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(payload), Arc::new(region)],
+        )
+        .unwrap()
+    }
+
+    fn pcols() -> Vec<TypedColumn> {
+        vec![
+            col("id", RockyType::Int64, false),
+            col("payload", RockyType::String, false),
+            col("region", RockyType::String, false),
+        ]
+    }
+
+    #[test]
+    fn group_single_column_partition_splits_into_two_buckets() {
+        let batch = make_partitioned_batch_3rows();
+        let groups =
+            group_batch_by_partition_tuple(&batch, &["region".to_string()], &pcols()).unwrap();
+        assert_eq!(groups.len(), 2, "two distinct region values → two buckets");
+
+        // Bucket order is the first-seen order (eu then us).
+        let (pv0, b0) = &groups[0];
+        let (pv1, b1) = &groups[1];
+        assert_eq!(pv0.get("region").map(String::as_str), Some("eu"));
+        assert_eq!(pv1.get("region").map(String::as_str), Some("us"));
+        assert_eq!(b0.num_rows(), 2);
+        assert_eq!(b1.num_rows(), 1);
+        assert_eq!(b0.num_columns(), 3);
+    }
+
+    #[test]
+    fn group_preserves_first_seen_partition_order() {
+        // Rows order: us, eu, us, eu — buckets should be us-first, then eu.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from(vec![1_i64, 2, 3, 4]);
+        let region = StringArray::from(vec!["us", "eu", "us", "eu"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(region)]).unwrap();
+        let typed = vec![
+            col("id", RockyType::Int64, false),
+            col("region", RockyType::String, false),
+        ];
+        let groups =
+            group_batch_by_partition_tuple(&batch, &["region".to_string()], &typed).unwrap();
+        assert_eq!(groups[0].0.get("region").map(String::as_str), Some("us"));
+        assert_eq!(groups[1].0.get("region").map(String::as_str), Some("eu"));
+    }
+
+    #[test]
+    fn group_int64_partition_stringifies_correctly() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("year", DataType::Int64, false),
+        ]));
+        let payload = StringArray::from(vec!["a", "b", "c"]);
+        let year = Int64Array::from(vec![2024_i64, 2025, 2024]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload), Arc::new(year)]).unwrap();
+        let typed = vec![
+            col("payload", RockyType::String, false),
+            col("year", RockyType::Int64, false),
+        ];
+        let groups = group_batch_by_partition_tuple(&batch, &["year".to_string()], &typed).unwrap();
+        assert_eq!(groups.len(), 2);
+        // First-seen year=2024 → bucket 0.
+        assert_eq!(groups[0].0.get("year").map(String::as_str), Some("2024"));
+        assert_eq!(groups[1].0.get("year").map(String::as_str), Some("2025"));
+    }
+
+    #[test]
+    fn group_multi_column_partition() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("year", DataType::Int64, false),
+        ]));
+        let payload = StringArray::from(vec!["a", "b", "c", "d"]);
+        let region = StringArray::from(vec!["eu", "us", "eu", "eu"]);
+        let year = Int64Array::from(vec![2024_i64, 2024, 2025, 2024]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(payload), Arc::new(region), Arc::new(year)],
+        )
+        .unwrap();
+        let typed = vec![
+            col("payload", RockyType::String, false),
+            col("region", RockyType::String, false),
+            col("year", RockyType::Int64, false),
+        ];
+        let groups = group_batch_by_partition_tuple(
+            &batch,
+            &["region".to_string(), "year".to_string()],
+            &typed,
+        )
+        .unwrap();
+        // 3 distinct (region, year) tuples: (eu, 2024), (us, 2024), (eu, 2025).
+        assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn group_rejects_null_partition_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
+        let region = StringArray::from(vec![Some("eu"), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(region)]).unwrap();
+        let typed = vec![col("region", RockyType::String, true)];
+        let err =
+            group_batch_by_partition_tuple(&batch, &["region".to_string()], &typed).unwrap_err();
+        assert!(format!("{err}").contains("cannot contain NULL"));
+    }
+
+    #[test]
+    fn group_rejects_unknown_partition_column() {
+        let batch = make_partitioned_batch_3rows();
+        let err =
+            group_batch_by_partition_tuple(&batch, &["nope".to_string()], &pcols()).unwrap_err();
+        assert!(format!("{err}").contains("not in the model's typed_columns"));
+    }
+
     #[test]
     fn convert_nullable_columns_carry_nulls() {
         let typed_cols = vec![col("name", RockyType::String, true)];
@@ -603,6 +904,110 @@ mod live_tests {
         cell.as_i64()
             .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
             .expect("count parses as i64")
+    }
+
+    /// Live end-to-end test for partitioned content-addressed materialization.
+    ///
+    /// Requires the same env vars as `content_addressed_e2e_live_sandbox`,
+    /// except `ROCKY_TEST_*` should point at a **partitioned** UniForm
+    /// table with the `(id BIGINT, payload STRING, region STRING)`
+    /// PARTITIONED BY (region) shape. The test writes 3 rows split across
+    /// `region='eu'` (2) + `region='us'` (1) and asserts Photon GROUP BY
+    /// counts bump by the right amounts.
+    #[tokio::test]
+    #[ignore]
+    async fn content_addressed_partitioned_e2e_live_sandbox() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        // Group-by counts BEFORE the write.
+        let count_eu_before = read_region_count(warehouse_dyn, &fqtn, "eu").await;
+        let count_us_before = read_region_count(warehouse_dyn, &fqtn, "us").await;
+
+        let model_sql = "SELECT * FROM VALUES \
+             (CAST(900501 AS BIGINT), CAST('runner-eu-1' AS STRING), CAST('eu' AS STRING)), \
+             (CAST(900502 AS BIGINT), CAST('runner-eu-2' AS STRING), CAST('eu' AS STRING)), \
+             (CAST(900503 AS BIGINT), CAST('runner-us-1' AS STRING), CAST('us' AS STRING)) \
+             AS t(id, payload, region)"
+            .to_string();
+
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: env.catalog.clone(),
+                schema: env.schema.clone(),
+                table: env.table.clone(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: env.storage_prefix.clone(),
+                partition_columns: vec!["region".to_string()],
+            },
+            vec![],
+            model_sql,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = Arc::from("live_runner_partitioned_test");
+        model_ir.typed_columns = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "payload".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "region".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+        ];
+
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn)
+            .await
+            .expect("partitioned end-to-end must succeed");
+        assert_eq!(
+            summary.num_rows, 3,
+            "total rows across all partition groups"
+        );
+
+        let count_eu_after = read_region_count(warehouse_dyn, &fqtn, "eu").await;
+        let count_us_after = read_region_count(warehouse_dyn, &fqtn, "us").await;
+        assert_eq!(
+            count_eu_after,
+            count_eu_before + 2,
+            "eu partition must bump by 2 (before={count_eu_before}, after={count_eu_after})"
+        );
+        assert_eq!(
+            count_us_after,
+            count_us_before + 1,
+            "us partition must bump by 1 (before={count_us_before}, after={count_us_after})"
+        );
+    }
+
+    async fn read_region_count(warehouse: &dyn WarehouseAdapter, fqtn: &str, region: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {fqtn} WHERE region = '{region}'");
+        let result = warehouse.execute_query(&sql).await.expect("count query");
+        result.rows[0][0]
+            .as_i64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .expect("count i64")
     }
 
     #[tokio::test]
