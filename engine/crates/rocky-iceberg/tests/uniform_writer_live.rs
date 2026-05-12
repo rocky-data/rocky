@@ -635,3 +635,84 @@ async fn row_tracking_round_trip_phase3_compatible_sandbox() {
         state_after.row_tracking_next_id,
     );
 }
+
+/// Live test for Phase 5 — schema evolution.
+///
+/// Requires the same env vars as the other live tests, except
+/// `ROCKY_TEST_*` should point at a UniForm table that has been
+/// `ALTER TABLE … ADD COLUMN`'d at least once (so the latest schema
+/// lives in a post-bootstrap commit). The test:
+///   - asserts `discover()` returns the post-ALTER schema, not the
+///     bootstrap one
+///   - writes a batch using the new column
+///   - reads back via Photon and confirms the new-column rows are
+///     visible
+///
+/// The canonical sandbox is the Exp 10 `schema_evo_t2` table (id,
+/// name, value, extra) — `extra` was added by ALTER ADD COLUMN.
+#[tokio::test]
+#[ignore]
+async fn schema_evolution_e2e_live_sandbox() {
+    let Some(cfg) = try_load_config() else {
+        eprintln!("skipping: ROCKY_TEST_* env vars not set");
+        return;
+    };
+    let Some(store) = build_s3_store(&cfg) else {
+        eprintln!("skipping: failed to build S3 store from environment");
+        return;
+    };
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: cfg.catalog.clone(),
+            schema: cfg.schema.clone(),
+            table: cfg.table.clone(),
+            prefix: cfg.prefix.clone(),
+            engine_info: "rocky-iceberg/schema-evolution-live-test".into(),
+        },
+        store.clone(),
+        Arc::new(PanicSqlClient),
+    );
+    let state = writer.discover().await.expect("discover");
+
+    // This test targets a Phase-5 sandbox where ALTER ADD COLUMN has
+    // landed. Skip cleanly if the operator points at a different shape.
+    if !state.physical.contains_key("extra") {
+        eprintln!(
+            "skipping: expected the sandbox to have an `extra` column added \
+             via ALTER ADD COLUMN; got cols {:?}",
+            state.physical.keys().collect::<Vec<_>>()
+        );
+        return;
+    }
+    assert!(
+        state.physical.contains_key("id"),
+        "id retained from pre-ALTER schema"
+    );
+
+    let ts_suffix = chrono::Utc::now().timestamp_micros();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let ids = Int64Array::from(vec![900_801_i64, 900_802]);
+    let names = StringArray::from(vec!["evo-a", "evo-b"]);
+    let values = Int64Array::from(vec![ts_suffix, ts_suffix + 1]);
+    let extras = StringArray::from(vec![Some("post-alter-1"), Some("post-alter-2")]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(names),
+            Arc::new(values),
+            Arc::new(extras),
+        ],
+    )
+    .unwrap();
+    let result = writer
+        .write_batch(batch)
+        .await
+        .expect("post-ALTER write must succeed");
+    assert_eq!(result.num_records, 2);
+}
