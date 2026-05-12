@@ -7,21 +7,26 @@
 //!    `discover()` reports for the table.
 //! 3. Execute the model SQL via the warehouse adapter to obtain rows.
 //! 4. Convert rows + typed columns into an Arrow `RecordBatch`.
-//! 5. Call `UniformWriter::write_batch` (unpartitioned this PR; partitioned
-//!    follows in a sub-PR after this).
-//! 6. Trigger `MSCK REPAIR TABLE ... SYNC METADATA` via
-//!    [`rocky_iceberg::uniform_writer::UniformWriter::sync_iceberg_metadata`]
-//!    so DuckDB iceberg_scan + Iceberg-aware Trino can see the new commit.
+//! 5. For unpartitioned targets: one `UniformWriter::write_batch` commit.
+//!    For partitioned targets: group rows by partition tuple and emit one
+//!    `write_partitioned_batch` commit per group.
+//! 6. Trigger `MSCK REPAIR TABLE ... SYNC METADATA` directly via the
+//!    warehouse adapter so DuckDB iceberg_scan + Iceberg-aware Trino can
+//!    see the new commit(s).
 //!
-//! Phase 1 + 2 of the writer support `Int64`, `Utf8`, and
-//! `Timestamp(Microsecond, UTC)` columns; other typed-column types return a
-//! `DeltaLog` error from the writer and propagate up as an anyhow.
+//! Supported `typed_columns` types:
+//! - `Boolean`, `Int32`, `Int64`, `Float32`, `Float64`, `Decimal{precision, scale}`
+//! - `String`, `Date`, `Timestamp`, `TimestampNtz`, `Binary`
+//!
+//! Unsupported types (`Array`, `Map`, `Struct`, `Variant`, `Unknown`)
+//! surface a typed error pointing at the limitation.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{
-    ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use object_store::ObjectStore;
@@ -208,6 +213,184 @@ pub(crate) fn query_result_to_record_batch(
                     Arc::new(StringArray::from(values)) as ArrayRef,
                 )
             }
+            RockyType::Boolean => {
+                let values: Vec<Option<bool>> = result
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let v = &r[col_idx];
+                        if v.is_null() {
+                            Ok(None)
+                        } else if let Some(b) = v.as_bool() {
+                            Ok(Some(b))
+                        } else if let Some(s) = v.as_str() {
+                            // Some adapters serialize booleans as "true" / "false".
+                            match s {
+                                "true" | "TRUE" | "True" | "1" => Ok(Some(true)),
+                                "false" | "FALSE" | "False" | "0" => Ok(Some(false)),
+                                _ => Err(anyhow!(
+                                    "column {:?}: boolean value {s:?} not recognised",
+                                    tc.name
+                                )),
+                            }
+                        } else {
+                            Err(anyhow!("column {:?}: value {v} not a Boolean", tc.name))
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                (
+                    Field::new(&tc.name, DataType::Boolean, tc.nullable),
+                    Arc::new(BooleanArray::from(values)) as ArrayRef,
+                )
+            }
+            RockyType::Float32 => {
+                let values: Vec<Option<f32>> = result
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let v = &r[col_idx];
+                        if v.is_null() {
+                            Ok(None)
+                        } else {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                .map(|x| x as f32)
+                                .map(Some)
+                                .ok_or_else(|| {
+                                    anyhow!("column {:?}: value {v} not Float32", tc.name)
+                                })
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                (
+                    Field::new(&tc.name, DataType::Float32, tc.nullable),
+                    Arc::new(Float32Array::from(values)) as ArrayRef,
+                )
+            }
+            RockyType::Float64 => {
+                let values: Vec<Option<f64>> = result
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let v = &r[col_idx];
+                        if v.is_null() {
+                            Ok(None)
+                        } else {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                .map(Some)
+                                .ok_or_else(|| {
+                                    anyhow!("column {:?}: value {v} not Float64", tc.name)
+                                })
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                (
+                    Field::new(&tc.name, DataType::Float64, tc.nullable),
+                    Arc::new(Float64Array::from(values)) as ArrayRef,
+                )
+            }
+            RockyType::Decimal { precision, scale } => {
+                // Decimals come back from most warehouses as JSON strings
+                // (Databricks, Snowflake) — preserves the full precision
+                // that JS numbers can't hold. Parse them to i128 by
+                // dropping the decimal point, then convert to
+                // Decimal128Array with the table's precision + scale.
+                let prec = *precision;
+                let scl = *scale;
+                let values: Vec<Option<i128>> =
+                    result
+                        .rows
+                        .iter()
+                        .map(|r| {
+                            let v = &r[col_idx];
+                            if v.is_null() {
+                                return Ok(None);
+                            }
+                            let raw = match v.as_str() {
+                                Some(s) => s.to_string(),
+                                None => v.as_f64().map(|f| f.to_string()).ok_or_else(|| {
+                                    anyhow!(
+                                        "column {:?}: decimal value {v} not a string/number",
+                                        tc.name
+                                    )
+                                })?,
+                            };
+                            Ok(Some(parse_decimal_to_i128(&raw, scl).with_context(|| {
+                            format!(
+                                "column {:?}: cannot parse {raw:?} as Decimal({prec}, {scl})",
+                                tc.name
+                            )
+                        })?))
+                        })
+                        .collect::<Result<_>>()?;
+                let arr = Decimal128Array::from(values)
+                    .with_precision_and_scale(prec, scl as i8)
+                    .map_err(|e| {
+                        anyhow!(
+                            "column {:?}: Decimal128Array::with_precision_and_scale failed: {e}",
+                            tc.name
+                        )
+                    })?;
+                (
+                    Field::new(&tc.name, DataType::Decimal128(prec, scl as i8), tc.nullable),
+                    Arc::new(arr) as ArrayRef,
+                )
+            }
+            RockyType::Date => {
+                let values: Vec<Option<i32>> = result
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let v = &r[col_idx];
+                        if v.is_null() {
+                            return Ok(None);
+                        }
+                        let s = v.as_str().ok_or_else(|| {
+                            anyhow!("column {:?}: date value {v} not a string", tc.name)
+                        })?;
+                        let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").with_context(
+                            || format!("column {:?}: failed to parse date {s:?}", tc.name),
+                        )?;
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        Ok(Some((date - epoch).num_days() as i32))
+                    })
+                    .collect::<Result<_>>()?;
+                (
+                    Field::new(&tc.name, DataType::Date32, tc.nullable),
+                    Arc::new(Date32Array::from(values)) as ArrayRef,
+                )
+            }
+            RockyType::Binary => {
+                // Warehouses typically base64-encode binary columns in
+                // JSON. Decode each row.
+                use base64::Engine;
+                let values: Vec<Option<Vec<u8>>> = result
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let v = &r[col_idx];
+                        if v.is_null() {
+                            return Ok(None);
+                        }
+                        let s = v.as_str().ok_or_else(|| {
+                            anyhow!("column {:?}: binary value {v} not a base64 string", tc.name)
+                        })?;
+                        Ok(Some(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(s)
+                                .with_context(|| {
+                                    format!("column {:?}: failed to decode base64 {s:?}", tc.name)
+                                })?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+                let refs: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
+                (
+                    Field::new(&tc.name, DataType::Binary, tc.nullable),
+                    Arc::new(BinaryArray::from(refs)) as ArrayRef,
+                )
+            }
             RockyType::Timestamp | RockyType::TimestampNtz => {
                 let values: Vec<Option<i64>> = result
                     .rows
@@ -248,7 +431,8 @@ pub(crate) fn query_result_to_record_batch(
             other => {
                 return Err(anyhow!(
                     "column {:?} has type {other:?}; the content-addressed writer supports \
-                     Int32 / Int64 / String / Timestamp / TimestampNtz in this slice",
+                     Int32 / Int64 / Boolean / Float32 / Float64 / Decimal / String / Date / \
+                     Timestamp / TimestampNtz / Binary in this slice",
                     tc.name
                 ));
             }
@@ -259,6 +443,38 @@ pub(crate) fn query_result_to_record_batch(
 
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, columns).map_err(|e| anyhow!("RecordBatch::try_new: {e}"))
+}
+
+/// Parse a decimal string (e.g. `"123.45"`) into an `i128` scaled by the
+/// table's declared `scale`. Returns an error if the value has more
+/// fractional digits than the column's scale (the writer would silently
+/// truncate, which is the wrong thing).
+fn parse_decimal_to_i128(s: &str, scale: u8) -> Result<i128> {
+    let trimmed = s.trim();
+    let (sign, rest) = match trimmed.strip_prefix('-') {
+        Some(r) => (-1_i128, r),
+        None => (1_i128, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    if frac_part.len() > scale as usize {
+        return Err(anyhow!(
+            "value {s:?} has {} fractional digits but column scale is {scale}",
+            frac_part.len()
+        ));
+    }
+    let mut int_only = String::with_capacity(int_part.len() + scale as usize);
+    int_only.push_str(int_part);
+    int_only.push_str(frac_part);
+    for _ in frac_part.len()..scale as usize {
+        int_only.push('0');
+    }
+    let magnitude: i128 = int_only
+        .parse()
+        .with_context(|| format!("decimal {s:?} could not be parsed to i128"))?;
+    Ok(sign * magnitude)
 }
 
 /// Materialize a single model whose strategy is
@@ -651,13 +867,18 @@ mod tests {
 
     #[test]
     fn convert_errors_on_unsupported_type() {
-        let typed_cols = vec![col("v", RockyType::Boolean, false)];
+        // Array(Int64) is unsupported in the current slice.
+        let typed_cols = vec![col(
+            "v",
+            RockyType::Array(Box::new(RockyType::Int64)),
+            false,
+        )];
         let result = QueryResult {
             columns: vec!["v".into()],
-            rows: vec![vec![serde_json::json!(true)]],
+            rows: vec![vec![serde_json::json!([1, 2, 3])]],
         };
         let err = query_result_to_record_batch(&typed_cols, &result).unwrap_err();
-        assert!(format!("{err}").contains("Int32 / Int64 / String / Timestamp"));
+        assert!(format!("{err}").contains("Int32 / Int64"));
     }
 
     fn make_partitioned_batch_3rows() -> RecordBatch {
@@ -792,6 +1013,156 @@ mod tests {
         let err =
             group_batch_by_partition_tuple(&batch, &["nope".to_string()], &pcols()).unwrap_err();
         assert!(format!("{err}").contains("not in the model's typed_columns"));
+    }
+
+    #[test]
+    fn convert_boolean_from_bool_and_string() {
+        let typed_cols = vec![col("flag", RockyType::Boolean, true)];
+        let result = QueryResult {
+            columns: vec!["flag".into()],
+            rows: vec![
+                vec![serde_json::json!(true)],
+                vec![serde_json::json!("false")],
+                vec![serde_json::json!("TRUE")],
+                vec![serde_json::Value::Null],
+            ],
+        };
+        let batch = query_result_to_record_batch(&typed_cols, &result).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+        assert!(arr.value(2));
+        assert!(arr.is_null(3));
+    }
+
+    #[test]
+    fn convert_float64_from_number_and_string() {
+        let typed_cols = vec![col("x", RockyType::Float64, false)];
+        let result = QueryResult {
+            columns: vec!["x".into()],
+            rows: vec![vec![serde_json::json!(1.5)], vec![serde_json::json!("2.5")]],
+        };
+        let batch = query_result_to_record_batch(&typed_cols, &result).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr.value(0) - 1.5).abs() < 1e-9);
+        assert!((arr.value(1) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn convert_decimal_from_string() {
+        let typed_cols = vec![col(
+            "price",
+            RockyType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            false,
+        )];
+        let result = QueryResult {
+            columns: vec!["price".into()],
+            rows: vec![
+                vec![serde_json::json!("123.45")],
+                vec![serde_json::json!("-99.99")],
+                vec![serde_json::json!("0.01")],
+                vec![serde_json::json!("100")], // no decimal point
+            ],
+        };
+        let batch = query_result_to_record_batch(&typed_cols, &result).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 12345_i128);
+        assert_eq!(arr.value(1), -9999_i128);
+        assert_eq!(arr.value(2), 1_i128);
+        assert_eq!(arr.value(3), 10000_i128);
+    }
+
+    #[test]
+    fn convert_decimal_rejects_overflowing_scale() {
+        let typed_cols = vec![col(
+            "x",
+            RockyType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            false,
+        )];
+        let result = QueryResult {
+            columns: vec!["x".into()],
+            rows: vec![vec![serde_json::json!("1.234")]], // 3 fractional digits, scale=2
+        };
+        let err = query_result_to_record_batch(&typed_cols, &result).unwrap_err();
+        // The "fractional digits" detail comes from the underlying
+        // `parse_decimal_to_i128` error, which is attached as a source on
+        // the outer "cannot parse ... as Decimal(...)" context wrapper.
+        // `{err:#}` prints the full chain.
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("fractional digits"),
+            "expected error chain to mention fractional digits, got: {full}"
+        );
+    }
+
+    #[test]
+    fn convert_date_from_iso_string() {
+        let typed_cols = vec![col("d", RockyType::Date, false)];
+        let result = QueryResult {
+            columns: vec!["d".into()],
+            rows: vec![
+                vec![serde_json::json!("2026-05-12")],
+                vec![serde_json::json!("1970-01-01")],
+                vec![serde_json::json!("1969-12-31")],
+            ],
+        };
+        let batch = query_result_to_record_batch(&typed_cols, &result).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let may_12_2026 = chrono::NaiveDate::from_ymd_opt(2026, 5, 12).unwrap();
+        assert_eq!(arr.value(0) as i64, (may_12_2026 - epoch).num_days());
+        assert_eq!(arr.value(1), 0);
+        assert_eq!(arr.value(2), -1);
+    }
+
+    #[test]
+    fn convert_binary_from_base64() {
+        let typed_cols = vec![col("payload", RockyType::Binary, false)];
+        // Base64 of bytes [1, 2, 3] is "AQID".
+        let result = QueryResult {
+            columns: vec!["payload".into()],
+            rows: vec![vec![serde_json::json!("AQID")]],
+        };
+        let batch = query_result_to_record_batch(&typed_cols, &result).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_decimal_to_i128_basics() {
+        assert_eq!(parse_decimal_to_i128("0", 2).unwrap(), 0);
+        assert_eq!(parse_decimal_to_i128("1.00", 2).unwrap(), 100);
+        assert_eq!(parse_decimal_to_i128("-1.50", 2).unwrap(), -150);
+        assert_eq!(parse_decimal_to_i128("1", 2).unwrap(), 100);
+        assert_eq!(parse_decimal_to_i128("0.01", 2).unwrap(), 1);
+        // Trailing zeros vs scale.
+        assert_eq!(parse_decimal_to_i128("1.5", 4).unwrap(), 15000);
     }
 
     #[test]
