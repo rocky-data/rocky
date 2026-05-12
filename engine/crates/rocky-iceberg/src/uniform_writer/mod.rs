@@ -6,15 +6,18 @@
 //! `MSCK REPAIR TABLE ... SYNC METADATA` via the warehouse SQL surface so
 //! UniForm regenerates the corresponding Iceberg metadata.
 //!
-//! Phase 1 scope (locked, see `rocky-arc1-wave2-phase1-uniform-writer.md`):
-//! - Single writer (no cross-writer coordination beyond conditional-put on
-//!   the log entry).
+//! Scope today (Phase 1 + Phase 2):
+//! - Single writer; conditional-put on the log entry covers contention.
 //! - External Delta UniForm table on an object store the writer can `PUT`.
-//! - Unpartitioned, no schema evolution, no rowTracking, no deletion
-//!   vectors. The writer errors loudly if it discovers any of those at
-//!   table-init time; later phases lift each restriction.
+//! - Unpartitioned tables via [`UniformWriter::write_batch`].
+//! - Partitioned tables via [`UniformWriter::write_partitioned_batch`]
+//!   (caller pre-groups rows per partition tuple). `add.partitionValues`
+//!   is keyed by physical-name UUID, not logical name (Exp 11).
+//! - No schema evolution, no rowTracking, no deletion vectors. The writer
+//!   errors loudly if it discovers any of those at table-init time; later
+//!   phases lift each restriction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -129,6 +132,12 @@ impl UniformWriter {
     /// Write a single Arrow [`RecordBatch`] as a content-addressed Parquet
     /// file plus a `_delta_log/{N:020}.json` commit referencing it.
     ///
+    /// **Unpartitioned tables only.** For partitioned tables, callers
+    /// pre-group rows by partition tuple and invoke
+    /// [`UniformWriter::write_partitioned_batch`] once per partition.
+    /// Mixing this entry point with a partitioned target returns
+    /// [`UniformWriterError::PartitionedUnsupported`].
+    ///
     /// Calls [`UniformWriter::discover`] first to read the current table
     /// state. To skip the discover round-trip (e.g. when the caller has a
     /// fresh state from a prior call), use
@@ -147,15 +156,112 @@ impl UniformWriter {
     pub async fn write_batch_with_state(
         &self,
         batch: RecordBatch,
+        state: UniformTableState,
+    ) -> Result<WriteResult> {
+        if !state.partition_columns.is_empty() {
+            return Err(UniformWriterError::PartitionedUnsupported(
+                state.partition_columns.clone(),
+            ));
+        }
+        let empty = HashMap::new();
+        self.write_internal(batch, state, &empty, |hash| format!("{hash}.parquet"))
+            .await
+    }
+
+    /// Write a single Arrow [`RecordBatch`] to a partitioned UniForm table.
+    ///
+    /// The caller has pre-grouped rows so that every row in `batch`
+    /// belongs to the same partition tuple, and supplies that tuple as
+    /// `partition_values` keyed by logical column name. Stringification is
+    /// the caller's responsibility (Delta partition values are always
+    /// strings on the wire).
+    ///
+    /// The Parquet file is uploaded to a Hive-style prefix
+    /// (`<col1>=<val1>/<col2>=<val2>/.../<hash>.parquet`); the emitted
+    /// `add.partitionValues` is keyed by **physical** column name UUID, as
+    /// required by Delta column-mapping (Exp 11 finding).
+    ///
+    /// Errors:
+    /// - the target is unpartitioned → `DeltaLog` (caller should use
+    ///   [`Self::write_batch`])
+    /// - `partition_values` is missing a column or carries an unknown key
+    ///   → `DeltaLog`
+    pub async fn write_partitioned_batch(
+        &self,
+        batch: RecordBatch,
+        partition_values: HashMap<String, String>,
+    ) -> Result<WriteResult> {
+        let state = self.discover().await?;
+        self.write_partitioned_batch_with_state(batch, partition_values, state)
+            .await
+    }
+
+    /// [`Self::write_partitioned_batch`] against a state the caller
+    /// already obtained.
+    pub async fn write_partitioned_batch_with_state(
+        &self,
+        batch: RecordBatch,
+        partition_values: HashMap<String, String>,
+        state: UniformTableState,
+    ) -> Result<WriteResult> {
+        if state.partition_columns.is_empty() {
+            return Err(UniformWriterError::DeltaLog(
+                "write_partitioned_batch called against unpartitioned table; \
+                 use write_batch instead"
+                    .to_string(),
+            ));
+        }
+        // Validate keys match the table's partition columns.
+        let table_partitions: HashSet<&str> =
+            state.partition_columns.iter().map(String::as_str).collect();
+        for col in &state.partition_columns {
+            if !partition_values.contains_key(col) {
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "missing partition value for column `{col}` (table partition columns: {:?})",
+                    state.partition_columns
+                )));
+            }
+        }
+        for k in partition_values.keys() {
+            if !table_partitions.contains(k.as_str()) {
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "unexpected partition value for column `{k}` (table partition columns: {:?})",
+                    state.partition_columns
+                )));
+            }
+        }
+
+        // Pre-compute the Hive-style partition path prefix; iteration in
+        // table's partition_columns order keeps it deterministic.
+        let mut partition_prefix = String::new();
+        for col in &state.partition_columns {
+            let v = partition_values.get(col).expect("checked above");
+            partition_prefix.push_str(&format!("{col}={v}/"));
+        }
+        let pv_for_closure = partition_values.clone();
+        self.write_internal(batch, state, &pv_for_closure, move |hash| {
+            format!("{partition_prefix}{hash}.parquet")
+        })
+        .await
+    }
+
+    /// Shared write pipeline used by both unpartitioned and partitioned
+    /// entry points. `path_for_hash` produces the `add.path` (relative to
+    /// the table prefix) given the blake3 hash of the Parquet bytes.
+    async fn write_internal(
+        &self,
+        batch: RecordBatch,
         mut state: UniformTableState,
+        partition_values: &HashMap<String, String>,
+        path_for_hash: impl FnOnce(&str) -> String,
     ) -> Result<WriteResult> {
         // 1. Build deterministic Parquet bytes from the input batch.
         let parquet_bytes = parquet_builder::build_parquet(&batch, &state)?;
         let hash = blake3::hash(&parquet_bytes).to_hex().to_string();
-        let file_name = format!("{hash}.parquet");
+        let add_file_path = path_for_hash(&hash);
         let file_size = parquet_bytes.len() as u64;
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let parquet_path = Path::from(format!("{prefix}/{file_name}"));
+        let parquet_path = Path::from(format!("{prefix}/{add_file_path}"));
 
         // 2. PUT the Parquet. Same content → same hash → same key → idempotent.
         self.store
@@ -169,10 +275,11 @@ impl UniformWriter {
             let inputs = commit::CommitInputs {
                 batch: &batch,
                 state: &state,
-                file_name: &file_name,
+                add_file_path: &add_file_path,
                 file_size,
                 modification_time_millis,
                 engine_info: &self.config.engine_info,
+                partition_values,
             };
             let commit_body = commit::build_commit_jsonl(&inputs)?;
             let log_path = Path::from(format!("{prefix}/_delta_log/{target_version:020}.json"));
@@ -195,8 +302,6 @@ impl UniformWriter {
                     });
                 }
                 Err(object_store::Error::AlreadyExists { .. }) => {
-                    // Another writer (or a stale state) won the v=target_version
-                    // race. Refetch the next version and try again.
                     let observed = discover::next_commit_version(&*self.store, &prefix).await?;
                     state.next_commit_version = observed.max(target_version.saturating_add(1));
                     tracing::warn!(
@@ -272,6 +377,183 @@ mod tests {
         async fn execute(&self, sql: &str) -> Result<()> {
             self.log.lock().unwrap().push(sql.to_string());
             Ok(())
+        }
+    }
+
+    /// Seed an `InMemory` object store with a partitioned bootstrap commit
+    /// (`region` as the lone partition column).
+    async fn seed_partitioned_bootstrap(store: &InMemory, prefix: &str) {
+        let bootstrap = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+            }
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-id-uuid"
+                        }},
+                        {"name": "payload", "type": "string", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 2,
+                            "delta.columnMapping.physicalName": "col-payload-uuid"
+                        }},
+                        {"name": "region", "type": "string", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 3,
+                            "delta.columnMapping.physicalName": "col-region-uuid"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": ["region"],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.universalFormat.enabledFormats": "iceberg",
+                    "delta.enableIcebergCompatV2": "true"
+                },
+                "createdTime": 0
+            }
+        });
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bootstrap).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "{prefix}/_delta_log/00000000000000000000.json"
+                )),
+                PutPayload::from(Bytes::from(body.into_bytes())),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn make_partitioned_batch(region: &str, rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+        let payload = StringArray::from(
+            (0..rows)
+                .map(|i| format!("{region}-{i}"))
+                .collect::<Vec<_>>(),
+        );
+        let region_col = StringArray::from(vec![region; rows]);
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(payload), Arc::new(region_col)],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_partitioned_batch_round_trip_against_in_memory_store() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let prefix = "tbl";
+        seed_partitioned_bootstrap(&store, prefix).await;
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(PanicSqlClient),
+        );
+
+        let batch = make_partitioned_batch("eu", 5);
+        let mut pv = HashMap::new();
+        pv.insert("region".to_string(), "eu".to_string());
+        let result = writer
+            .write_partitioned_batch(batch, pv)
+            .await
+            .expect("partitioned write must succeed");
+
+        assert_eq!(result.commit_version, 1);
+        assert_eq!(result.num_records, 5);
+        // Hive-style path includes the partition column.
+        assert!(
+            result.file_path.contains("/region=eu/"),
+            "file path must carry partition prefix: {}",
+            result.file_path
+        );
+
+        // The commit must encode partitionValues by physical UUID.
+        let log_path = object_store::path::Path::from(format!(
+            "{prefix}/_delta_log/00000000000000000001.json"
+        ));
+        let log = store.get(&log_path).await.unwrap().bytes().await.unwrap();
+        let log_text = std::str::from_utf8(&log).unwrap();
+        let add_line = log_text.lines().nth(1).unwrap();
+        let add: Value = serde_json::from_str(add_line).unwrap();
+        assert_eq!(
+            add["add"]["partitionValues"],
+            serde_json::json!({"col-region-uuid": "eu"})
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_rejects_partitioned_table() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let prefix = "tbl";
+        seed_partitioned_bootstrap(&store, prefix).await;
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(PanicSqlClient),
+        );
+        match writer.write_batch(make_partitioned_batch("eu", 1)).await {
+            Err(UniformWriterError::PartitionedUnsupported(cols)) => {
+                assert_eq!(cols, vec!["region".to_string()]);
+            }
+            other => panic!("expected PartitionedUnsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_partitioned_batch_rejects_unpartitioned_table() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let prefix = "tbl";
+        seed_bootstrap(&store, prefix).await;
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(PanicSqlClient),
+        );
+        let mut pv = HashMap::new();
+        pv.insert("region".to_string(), "eu".to_string());
+        match writer.write_partitioned_batch(make_batch(1), pv).await {
+            Err(UniformWriterError::DeltaLog(msg)) => {
+                assert!(
+                    msg.contains("unpartitioned"),
+                    "error must mention unpartitioned table: {msg}"
+                );
+            }
+            other => panic!("expected DeltaLog error, got {other:?}"),
         }
     }
 
