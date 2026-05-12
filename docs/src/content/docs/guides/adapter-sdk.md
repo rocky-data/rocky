@@ -5,9 +5,9 @@ sidebar:
   order: 9
 ---
 
-Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter — the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, and `rocky-duckdb` are wired today.
+Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter — the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, and `rocky-duckdb` are wired today.
 
-This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Trino, Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree.
+This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree. (Trino is in-tree as of engine v1.28.0 — see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino).)
 
 ## When to reach for the SDK
 

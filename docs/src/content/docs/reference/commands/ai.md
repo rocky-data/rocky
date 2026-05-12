@@ -11,7 +11,7 @@ The AI commands use large language models to generate Rocky models from natural 
 
 ## `rocky ai`
 
-Generate a model from a natural language description. Produces a complete Rocky model (SQL + TOML sidecar) or raw SQL.
+Generate a model from a natural language description and write **both the body file and a matching `.toml` sidecar** to the models directory. The emitted sidecar carries the materialization strategy and target coordinates, so Rocky's model loader picks the generated model up on the next `rocky run` without manual editing.
 
 ```bash
 rocky ai <intent> [flags]
@@ -27,7 +27,16 @@ rocky ai <intent> [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--format <FORMAT>` | `string` | | Output format: `rocky` (SQL + TOML) or `sql` (raw SQL only). |
+| `--format <FORMAT>` | `string` | `rocky` | Output format: `rocky` (`.rocky` body + `.toml` sidecar) or `sql` (`.sql` body + `.toml` sidecar). |
+| `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
+| `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh`, `incremental`, `merge`, `ephemeral`. |
+| `--watermark <COLUMN>` | `string` | | Watermark column for `--materialization=incremental`. Maps to `[strategy].timestamp_column` in the sidecar. Required when materialization is `incremental`; ignored otherwise. |
+| `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
+| `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
+
+:::note[Merge limitation]
+`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky run` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization` — they need richer flag plumbing or live in the IR-only surface.
+:::
 
 ### Examples
 
@@ -39,17 +48,42 @@ rocky ai "monthly revenue by customer, joining orders and refunds"
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai",
   "intent": "monthly revenue by customer, joining orders and refunds",
   "format": "rocky",
   "name": "fct_monthly_revenue_by_customer",
   "source": "from stg_orders\njoin stg_refunds on order_id {\n    keep stg_refunds.refund_amount\n}\nderive {\n    revenue_month: date_trunc('month', order_date),\n    net_revenue: total_amount - coalesce(refund_amount, 0)\n}\ngroup customer_id, revenue_month {\n    customer_id,\n    revenue_month,\n    net_revenue: sum(net_revenue)\n}",
-  "attempts": 1
+  "attempts": 1,
+  "body_path": "models/fct_monthly_revenue_by_customer.rocky",
+  "sidecar_path": "models/fct_monthly_revenue_by_customer.toml"
 }
 ```
 
-Generate raw SQL instead:
+Generate an incremental model with a watermark, into a non-default target:
+
+```bash
+rocky ai "daily order facts from stg_orders" \
+  --materialization incremental --watermark order_date \
+  --target analytics.marts.fct_orders_daily
+```
+
+The emitted sidecar (`models/fct_orders_daily.toml`) carries the parsed materialization + watermark + target:
+
+```toml
+name = "fct_orders_daily"
+
+[strategy]
+type = "incremental"
+timestamp_column = "order_date"
+
+[target]
+catalog = "analytics"
+schema  = "marts"
+table   = "fct_orders_daily"
+```
+
+Generate raw SQL instead (still emits both `.sql` body and `.toml` sidecar):
 
 ```bash
 rocky ai "top 10 customers by lifetime value" --format sql
@@ -107,7 +141,7 @@ rocky ai-sync
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai-sync",
   "proposals": [
     {
@@ -176,7 +210,7 @@ rocky ai-explain fct_revenue
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai-explain",
   "explanations": [
     {
@@ -196,7 +230,7 @@ rocky ai-explain --all --save
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai-explain",
   "explanations": [
     { "model": "fct_revenue",   "intent": "Calculates monthly net revenue per customer by joining orders with refunds.", "saved": true },
@@ -252,7 +286,7 @@ rocky ai-test fct_revenue
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai-test",
   "results": [
     {
@@ -290,7 +324,7 @@ rocky ai-test --all --save
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.30.0",
   "command": "ai-test",
   "results": [
     { "model": "fct_revenue",   "saved": true, "tests": [ /* 3 assertions */ ] },

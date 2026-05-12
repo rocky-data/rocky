@@ -59,7 +59,7 @@ Full side-by-side comparison: [features/comparison](/features/comparison/).
 
 ## Design principles
 
-1. **Adapter-based.** Source adapters (Fivetran, DuckDB, manual) handle discovery. Warehouse adapters (Databricks, Snowflake, BigQuery, DuckDB) handle execution. The core engine is warehouse-agnostic.
+1. **Adapter-based.** Source adapters (Fivetran, Airbyte, DuckDB, Iceberg, manual) handle discovery. Warehouse adapters (Databricks, Snowflake, BigQuery, Trino, DuckDB) handle execution. The core engine is warehouse-agnostic.
 2. **Config over code.** Bronze layer replication needs no SQL — just TOML.
 3. **Pure SQL models.** Silver-layer transformations use standard SQL plus a `.toml` sidecar.
 4. **Inline quality checks.** Data checks run during replication, not as a separate step.
@@ -70,11 +70,14 @@ Full side-by-side comparison: [features/comparison](/features/comparison/).
 | Role | Adapter | Notes |
 |---|---|---|
 | Source | Fivetran | REST API discovery; metadata only |
+| Source | Airbyte | REST API discovery; metadata only |
 | Source | DuckDB | `information_schema` discovery |
+| Source | Iceberg | Catalog/manifest discovery for content-addressed reads |
 | Source | Manual | Tables declared in `rocky.toml` |
 | Warehouse | Databricks | SQL Statement API, Unity Catalog, adaptive concurrency |
 | Warehouse | Snowflake | REST API; OAuth / JWT / password (Beta) |
 | Warehouse | BigQuery | REST API; service account / ADC (Beta) |
+| Warehouse | Trino | `/v1/statement` REST polling; HTTP Basic / JWT (Beta) |
 | Warehouse | DuckDB | In-process; powers the playground and `rocky test` |
 
 Source adapters are metadata-only — they identify what exists. Actual data already lives in the warehouse, or is loaded via `rocky load` for files. A single DuckDB instance can serve as both source and warehouse, which is how the credential-free playground works end-to-end.
@@ -85,7 +88,7 @@ New adapters plug in via the [Adapter SDK](/concepts/adapters/) without modifyin
 
 | Path | Artifact | Language |
 |---|---|---|
-| `engine/` | `rocky` CLI | Rust (20-crate workspace) |
+| `engine/` | `rocky` CLI | Rust (21-crate workspace) |
 | `integrations/dagster/` | `dagster-rocky` wheel | Python |
 | `editors/vscode/` | Rocky VSIX | TypeScript |
 | `examples/playground/` | POC catalog | TOML / SQL |

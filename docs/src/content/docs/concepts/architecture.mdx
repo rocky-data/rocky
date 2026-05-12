@@ -23,11 +23,15 @@ Rocky separates concerns through two adapter types:
 
 - `rocky-databricks` — Executes via the Databricks SQL Statement API and manages Unity Catalog, with adaptive concurrency (AIMD algorithm)
 - `rocky-snowflake` — Executes via the Snowflake REST API with OAuth, key-pair JWT, and password auth
+- `rocky-bigquery` — Executes via the BigQuery REST API with service account / ADC auth
+- `rocky-trino` — Executes via Trino's `/v1/statement` REST polling state machine with HTTP Basic / JWT bearer auth (Beta as of engine v1.28.0)
 - `rocky-duckdb` — Local in-process execution for development, testing, and CI
 
-**rocky-core** sits between them. It defines the Intermediate Representation (IR) and all warehouse-agnostic logic (DAG resolution, schema pattern parsing, SQL generation templates, checks, contracts, state management). rocky-core has no knowledge of Databricks, Fivetran, or any specific system.
+**rocky-ir** defines the typed Intermediate Representation (`ModelIr`, `MaterializationStrategy`, source/target descriptors). It was extracted from `rocky-core` in engine v1.30.0 so adapter crates can depend on the IR without pulling in the SQL-generation surface.
 
-This architecture means adding a new warehouse (e.g., Snowflake) or a new source (e.g., Airbyte) requires implementing an adapter crate without modifying the core engine.
+**rocky-core** sits between adapters and IR. It owns warehouse-agnostic logic (DAG resolution, schema pattern parsing, SQL generation templates, checks, contracts, state management) and depends on `rocky-ir`. rocky-core has no knowledge of Databricks, Fivetran, or any specific system.
+
+This architecture means adding a new warehouse (e.g., Snowflake, Trino) or a new source (e.g., Airbyte) requires implementing an adapter crate without modifying the core engine.
 
 ## Monorepo
 
@@ -49,7 +53,8 @@ The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.
 ```
 engine/
 ├── crates/
-│   ├── rocky-core/          # Generic SQL transformation engine
+│   ├── rocky-ir/            # Typed Intermediate Representation (ModelIr, MaterializationStrategy)
+│   ├── rocky-core/          # Generic SQL transformation engine (depends on rocky-ir)
 │   ├── rocky-sql/           # SQL parsing + typed AST
 │   ├── rocky-lang/          # Rocky DSL parser (.rocky files)
 │   ├── rocky-compiler/      # Type checking + semantic analysis
@@ -57,9 +62,10 @@ engine/
 │   ├── rocky-databricks/    # Databricks warehouse adapter
 │   ├── rocky-snowflake/     # Snowflake warehouse adapter
 │   ├── rocky-bigquery/      # BigQuery warehouse adapter (Beta)
+│   ├── rocky-trino/         # Trino warehouse adapter (Beta as of v1.28.0)
 │   ├── rocky-fivetran/      # Fivetran source adapter
 │   ├── rocky-airbyte/       # Airbyte source adapter
-│   ├── rocky-iceberg/       # Apache Iceberg table format adapter
+│   ├── rocky-iceberg/       # Iceberg + content-addressed Delta UniForm writer
 │   ├── rocky-duckdb/        # DuckDB local execution adapter
 │   ├── rocky-engine/        # Local query engine (DataFusion + Arrow)
 │   ├── rocky-server/        # HTTP API + LSP server
@@ -71,13 +77,20 @@ engine/
 └── rocky/                   # Binary crate
 ```
 
+### rocky-ir
+
+The typed Intermediate Representation. Extracted from `rocky-core` in engine v1.30.0 (Phase G1) so adapter crates can depend on the IR without pulling in the SQL-generation surface.
+
+- **`ModelIr`** — single in-memory plan representation; replaced the legacy `Plan` enum + `ReplicationPlan` / `TransformationPlan` structs (deleted in v1.30.0).
+- **`MaterializationStrategy`** — `FullRefresh`, `Incremental`, `Merge`, `MaterializedView`, `DynamicTable`, `TimeInterval`, `Ephemeral`, `DeleteInsert`, `Microbatch`, `ContentAddressed`.
+- Source / target descriptors and partition windows.
+
 ### rocky-core
 
-The warehouse-agnostic transformation engine. This crate has no knowledge of specific warehouses or sources — it works entirely through adapter abstractions, producing IR that warehouse adapters consume.
+The warehouse-agnostic transformation engine. This crate has no knowledge of specific warehouses or sources — it works entirely through adapter abstractions, consuming IR from `rocky-ir` and producing dialect-specific SQL.
 
 Key modules:
 
-- **ir.rs** — Intermediate Representation types: `Plan`, `ReplicationPlan`, `TransformationPlan`, `MaterializationStrategy`
 - **schema.rs** — Configurable schema pattern parsing (e.g., `src__acme__us_west__shopify` into structured components)
 - **drift.rs** — Schema drift detection (compares column types between source and target)
 - **sql_gen.rs** — IR to dialect-specific SQL generation
@@ -175,6 +188,30 @@ Snowflake warehouse adapter.
 - **connector.rs** — Snowflake REST API client
 - **dialect.rs** — Snowflake SQL dialect (dynamic tables, multi-statement transactions)
 
+### rocky-trino
+
+Trino warehouse adapter (Beta as of engine v1.28.0). First first-party warehouse adapter built natively against `rocky-adapter-sdk`.
+
+- **connector.rs** — Async REST client driving Trino's `POST /v1/statement` + `nextUri` polling state machine. Same-origin guard on every `nextUri` follow-up (same scheme + host + port as the configured coordinator).
+- **dialect.rs** — Double-quoted identifiers, three-part `<catalog>.<schema>.<table>` references, `DESCRIBE <table>` column introspection, ANSI `INSERT INTO` / `CREATE TABLE AS`, `TABLESAMPLE BERNOULLI`.
+- **auth.rs** — HTTP Basic + JWT bearer with `RedactedString`-wrapped credentials.
+- **adapter.rs** — `WarehouseAdapter` impl: `dialect`, `execute_statement`, `execute_query`, `describe_table`.
+
+A Docker conformance harness is gated behind the `trino-conformance` cargo feature: `cargo test -p rocky-trino --features trino-conformance -- --ignored` drives the adapter end-to-end against a real `trinodb/trino` coordinator. The default `cargo test -p rocky-trino` run stays credential- and network-free.
+
+v0 limitations: no MERGE (Trino's MERGE is connector-dependent), no OAuth/Kerberos, no governance, no checksum-bisection support.
+
+### rocky-iceberg
+
+Apache Iceberg + Delta UniForm writer surface. Powers `materialization = "content_addressed"` (engine v1.30.0, Phases 1–5):
+
+- `discover()` reads the bootstrap Delta commit and surfaces schema + partition spec + rowTracking config.
+- `write_batch()` emits content-addressed Parquet files (blake3-hashed file names) and a Delta log commit referencing them.
+- `sync_iceberg_metadata()` keeps Iceberg-compatible readers in sync after each commit.
+- Partitioned + rowTracking + post-ALTER schema evolution all supported.
+
+See [Content-Addressed Materialization](/concepts/content-addressed/) for the user-facing model.
+
 ### rocky-engine
 
 Local query engine built on DataFusion + Arrow. Powers `rocky test` and type inference without a warehouse connection.
@@ -207,59 +244,28 @@ The `rocky` binary crate. Contains only `main.rs`, which wires all the library c
 
 ## Intermediate Representation (IR)
 
-Rocky compiles configuration and SQL into an intermediate representation before generating executable SQL. This separation means the core engine never deals with raw strings — everything is typed and validated.
+Rocky compiles configuration and SQL into an intermediate representation before generating executable SQL. This separation means the core engine never deals with raw strings — everything is typed and validated. The IR lives in the [`rocky-ir`](#rocky-ir) crate.
 
-### Plan
+### ModelIr
 
-The top-level `Plan` enum represents what Rocky will execute:
-
-```rust
-enum Plan {
-    Replication(ReplicationPlan),
-    Transformation(TransformationPlan),
-}
-```
-
-- **ReplicationPlan** — A config-driven copy from source to target (the bronze layer). Contains source/target table references, the incremental strategy, metadata columns, and quality checks.
-- **TransformationPlan** — A user-written SQL model (the silver layer). Contains the parsed SQL, target table, materialization strategy, and dependency references.
+`ModelIr` is the single in-memory plan representation. As of engine v1.30.0, the legacy `Plan` enum (and the `ReplicationPlan` / `TransformationPlan` / `From<&Plan>` bridge layer) is gone — `ModelIr` directly carries the source/target descriptors, the materialization strategy, and any dependency / sources / contracts / checks the model declares. Both replication and transformation pipelines compile to the same `ModelIr` shape, with the kind discriminated by which descriptors are populated.
 
 ### MaterializationStrategy
 
-Controls how data is written to the target table:
-
-```rust
-enum MaterializationStrategy {
-    FullRefresh,
-    Incremental {
-        timestamp_column: String,
-        watermark: Option<DateTime>,
-    },
-    Merge {
-        unique_key: Vec<String>,
-        update_columns: Option<Vec<String>>,
-    },
-    MaterializedView,
-    DynamicTable {
-        target_lag: String,
-    },
-    TimeInterval {
-        time_column: String,
-        granularity: String,  // hour, day, month, year
-        lookback: Option<u32>,
-        batch_size: Option<u32>,
-        first_partition: Option<String>,
-    },
-}
-```
+Controls how data is written to the target table. Variants:
 
 - **FullRefresh** — `CREATE OR REPLACE TABLE ... AS SELECT ...`. Rebuilds the entire table on every run.
-- **Incremental** — `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store.
+- **Incremental** — `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store at SQL-generation time (not carried on the strategy itself, so recipe-hash inputs stay runtime-state-free).
 - **Merge** — `MERGE INTO ... USING (...) ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`. Upserts based on a unique key.
 - **MaterializedView** — `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...`. Databricks-specific.
 - **DynamicTable** — `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ...`. Snowflake-specific.
 - **TimeInterval** — Partition-keyed materialization. The model SQL uses `@start_date` and `@end_date` placeholders; the runtime substitutes per-partition timestamps. Supports `--partition`, `--from/--to`, `--latest`, `--missing` CLI flags.
+- **Ephemeral** — Not materialized; inlined as a CTE in downstream consumers.
+- **DeleteInsert** — Delete rows matching the partition key, then insert fresh data. Cheaper alternative to `Merge` when the partition key identifies the rows being rewritten.
+- **Microbatch** — Alias for `TimeInterval` with `hour`-granularity defaults; dbt-compatible naming.
+- **ContentAddressed** — Content-addressed Parquet + Delta log commit via the `rocky-iceberg` writer. Designed for cross-engine reads (DuckDB `iceberg_scan`, Trino, Spark). SQL generation does not run for this strategy — the runtime drives `rocky-iceberg::uniform_writer` directly. See [Content-Addressed Materialization](/concepts/content-addressed/).
 
-The IR is generated by rocky-core and consumed by `sql_gen.rs`, which produces dialect-specific SQL strings ready for execution.
+The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (where applicable) lives in `rocky-core::sql_gen`.
 
 ### Adapter SDK
 

@@ -24,7 +24,7 @@ These flags apply to all commands and are documented in the [CLI Reference](/ref
 Initialize a new Rocky project with starter configuration and directory structure.
 
 ```bash
-rocky init [path]
+rocky init [path] [flags]
 ```
 
 ### Arguments
@@ -33,9 +33,15 @@ rocky init [path]
 |----------|------|---------|-------------|
 | `path` | `string` | `.` | Directory where the project will be created. |
 
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--template <NAME>` | `string` | `duckdb` | Scaffold template. One of `duckdb`, `databricks-fivetran`, `snowflake`, `bigquery`, `trino`. Each template emits a runnable `rocky.toml` with the matching adapter wired up via `${VAR}` env-var placeholders (never inline secrets) plus a `models/welcome.{sql,toml}` that compiles with no source tables. |
+
 ### Examples
 
-Create a project in the current directory:
+Create a project in the current directory (default DuckDB template):
 
 ```bash
 rocky init
@@ -47,17 +53,13 @@ Created models/
 Rocky project initialized.
 ```
 
-Create a project in a new directory:
+Create a Trino-targeted project in a new directory:
 
 ```bash
-rocky init acme-pipeline
+rocky init acme-trino --template trino
 ```
 
-```
-Created acme-pipeline/rocky.toml
-Created acme-pipeline/models/
-Rocky project initialized in acme-pipeline/
-```
+The emitted `rocky.toml` wires the `trino` adapter to `${TRINO_HOST}` / `${TRINO_USER}` / `${TRINO_PASSWORD}` (HTTP Basic) or `${TRINO_JWT}` (JWT bearer), with inline TOML comments documenting both auth modes.
 
 ### Related Commands
 
@@ -83,7 +85,7 @@ No command-specific flags. Uses [global flags](#global-flags) only.
 | Check | Description |
 |-------|-------------|
 | TOML syntax | The config file parses without errors as v2 (named adapters + named pipelines). |
-| Adapters | Each `[adapter.NAME]` is a recognized type (`databricks`, `snowflake`, `duckdb`, `fivetran`, `manual`) with the required fields populated. For Databricks, at least one of `token` or `client_id`/`client_secret` must be set. |
+| Adapters | Each `[adapter.NAME]` is a recognized type (`databricks`, `snowflake`, `duckdb`, `fivetran`, `bigquery`, `trino`, `airbyte`, `iceberg`, `manual`) with the required fields populated. For Databricks, at least one of `token` or `client_id`/`client_secret` must be set. The known-types list is driven directly off the adapter registry, so new first-party adapters propagate without a follow-up edit. |
 | Pipelines | Each `[pipeline.NAME]` references existing adapters for source, target, and (optional) discovery, and its `schema_pattern` parses. |
 | DAG validation | If `models/` exists, loads all models and checks for dependency cycles. |
 

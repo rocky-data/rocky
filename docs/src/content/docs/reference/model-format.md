@@ -60,7 +60,7 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`. |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. |
 | `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"` or `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -70,6 +70,8 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 | `lookback` | integer | `0` | Number of past partitions to reprocess. Optional for `"time_interval"`. |
 | `batch_size` | integer | `1` | Max partitions per batch. Optional for `"time_interval"`. |
 | `first_partition` | string | | Earliest partition key (e.g., `"2024-01-01"`). Optional for `"time_interval"`. |
+| `storage_prefix` | string | | Object-store key prefix that holds `_delta_log/` + Parquet files for the target table (e.g. `"s3://bucket/path/table"`). Required when `type = "content_addressed"`. |
+| `partition_columns` | list of strings | `[]` | Logical partition columns for content-addressed tables. Empty for unpartitioned tables. Optional for `"content_addressed"`. |
 
 :::note[Lakehouse formats]
 Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views** — are modeled as a separate `format` axis on the `LakehouseFormat` enum. `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
@@ -442,6 +444,31 @@ catalog = "analytics"
 schema = "warehouse"
 table = "fct_hourly_events"
 ```
+
+---
+
+### Content-Addressed
+
+Writes the model's SELECT result to a Delta UniForm table as content-addressed Parquet (blake3-hashed file names) plus a Delta log commit. Designed for cross-engine reads from DuckDB, Trino, Spark, and any Iceberg-compatible reader — Rocky owns the writer, the consumers read directly from the object store. See [Content-Addressed Materialization](/concepts/content-addressed/) for the why and when.
+
+**Config** (`models/fct_events.toml`):
+
+```toml
+name = "fct_events"
+depends_on = []
+
+[strategy]
+type = "content_addressed"
+storage_prefix = "s3://${ROCKY_BUCKET}/marts/fct_events"
+partition_columns = ["event_date"]
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "fct_events"
+```
+
+The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer (shipped in engine v1.30.0 across Phases 1–5: discover, write, sync, partitioned, rowTracking, schema evolution).
 
 ---
 
