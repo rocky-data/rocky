@@ -17,16 +17,27 @@ before writing it. If compile fails, Rocky retries with the error context
 The output is a pair of files under `models/`:
 
 - `<name>.rocky` — the model body
-- `<name>.toml` — sidecar with `[strategy]` (from `--materialization`) and
-  `[target]` (from `--target`)
+- `<name>.toml` — sidecar with `[strategy]` (from `--materialization` +
+  `--watermark`) and `[target]` (from `--target`)
+
+The POC runs `rocky ai` twice to cover both flag paths:
+
+1. **Default `full_refresh`** — `monthly_revenue.{rocky,toml}` lands with
+   `[strategy] type = "full_refresh"`.
+2. **`--materialization incremental --watermark ordered_at`** —
+   `orders_daily.{rocky,toml}` lands with `[strategy] type = "incremental"`
+   and `timestamp_column = "ordered_at"` (engine v1.26.0 sidecar unlock).
 
 ## Why it's distinctive
 
 - **Self-correcting AI** — the compile-verify loop closes the gap between
   "model that looks right" and "model that actually works".
 - **No copy-paste step** — body + sidecar land on disk, ready to `rocky run`.
+- **All materializations on the same flag surface** — `full_refresh`,
+  `incremental` (+ `--watermark`), `merge` (v1 limitation: no `--unique-key`
+  yet, so the sidecar needs a hand-edit), `ephemeral`.
 - Different from `rocky/examples/ai-intent` (which ships pre-generated tests).
-  This POC generates a fresh model live.
+  This POC generates fresh models live.
 
 ## Run
 
