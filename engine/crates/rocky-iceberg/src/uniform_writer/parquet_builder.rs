@@ -17,11 +17,19 @@
 //! schema; this module rebuilds the schema with each column renamed to its
 //! `delta.columnMapping.physicalName` UUID + a `PARQUET:field_id` metadata
 //! entry, then writes that batch to a buffer.
+//!
+//! Partition columns (members of `state.partition_columns`) are skipped —
+//! they are NOT physically present in the Parquet file. Delta + Iceberg
+//! reconstruct the partition column from `add.partitionValues` + the file's
+//! Hive-style path prefix; storing them in the file would be redundant and
+//! breaks the partition-aware reader contract.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use std::collections::HashSet;
+
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -29,10 +37,20 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 
 use super::{Result, UniformTableState, UniformWriterError};
 
-/// Rebuild the schema with physical-UUID column names + field-id metadata.
-fn rebuild_schema(logical_schema: &Schema, state: &UniformTableState) -> Result<Arc<Schema>> {
-    let mut fields = Vec::with_capacity(logical_schema.fields().len());
-    for f in logical_schema.fields() {
+/// Project + rename the batch: drop partition columns, rename the remaining
+/// columns to their physical UUIDs, attach `PARQUET:field_id` metadata.
+fn project_to_physical(
+    batch: &RecordBatch,
+    state: &UniformTableState,
+) -> Result<(Arc<Schema>, Vec<ArrayRef>)> {
+    let partitions: HashSet<&str> = state.partition_columns.iter().map(String::as_str).collect();
+    let logical_schema = batch.schema();
+    let mut fields: Vec<Field> = Vec::with_capacity(logical_schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(logical_schema.fields().len());
+    for (i, f) in logical_schema.fields().iter().enumerate() {
+        if partitions.contains(f.name().as_str()) {
+            continue;
+        }
         let physical = state.physical.get(f.name()).ok_or_else(|| {
             UniformWriterError::DeltaLog(format!(
                 "column `{}` not in discovered table schema",
@@ -47,17 +65,22 @@ fn rebuild_schema(logical_schema: &Schema, state: &UniformTableState) -> Result<
         })?;
         let mut metadata = HashMap::new();
         metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
-        let new_field =
-            Field::new(physical, f.data_type().clone(), f.is_nullable()).with_metadata(metadata);
-        fields.push(new_field);
+        fields.push(
+            Field::new(physical, f.data_type().clone(), f.is_nullable()).with_metadata(metadata),
+        );
+        columns.push(batch.column(i).clone());
     }
-    Ok(Arc::new(Schema::new(fields)))
+    Ok((Arc::new(Schema::new(fields)), columns))
 }
 
 /// Build Parquet bytes from an Arrow `RecordBatch`.
+///
+/// Any columns whose name is in `state.partition_columns` are dropped from
+/// the Parquet output (partition values live in `add.partitionValues` +
+/// the file's Hive-style path prefix, not the file itself).
 pub fn build_parquet(batch: &RecordBatch, state: &UniformTableState) -> Result<Vec<u8>> {
-    let new_schema = rebuild_schema(&batch.schema(), state)?;
-    let new_batch = RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec())?;
+    let (new_schema, columns) = project_to_physical(batch, state)?;
+    let new_batch = RecordBatch::try_new(new_schema.clone(), columns)?;
 
     let props = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)

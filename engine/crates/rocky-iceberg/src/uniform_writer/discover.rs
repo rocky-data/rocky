@@ -194,21 +194,20 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
     })
 }
 
-/// Reject states the Phase 1 writer cannot serve.
+/// Reject states the writer cannot serve.
 ///
 /// Each branch surfaces a typed error pointing at the wave 2 phase that
 /// will eventually lift the restriction.
-fn enforce_phase1_constraints(state: &UniformTableState) -> Result<()> {
+///
+/// As of Phase 2, partitioned tables are supported (callers route through
+/// [`UniformWriter::write_partitioned_batch`]); the partitioned check has
+/// been lifted from discover.
+fn enforce_supported(state: &UniformTableState) -> Result<()> {
     if state.deletion_vectors_enabled {
         return Err(UniformWriterError::DeletionVectorsUnsupported);
     }
     if state.row_tracking_enabled {
         return Err(UniformWriterError::RowTrackingUnsupported);
-    }
-    if !state.partition_columns.is_empty() {
-        return Err(UniformWriterError::PartitionedUnsupported(
-            state.partition_columns.clone(),
-        ));
     }
     Ok(())
 }
@@ -217,9 +216,9 @@ impl UniformWriter {
     /// Read `_delta_log/00…0.json` from the configured prefix, parse it, and
     /// list `_delta_log/` to compute the next commit version.
     ///
-    /// Returns an error if Phase 1 cannot serve the table (DV, rowTracking,
-    /// partitioned). The error names the wave 2 phase that will lift the
-    /// restriction.
+    /// Returns an error if the writer cannot serve the table (DV or
+    /// rowTracking). The error names the wave 2 phase that will lift the
+    /// restriction. Partitioned tables are supported as of Phase 2.
     pub async fn discover(&self) -> Result<UniformTableState> {
         let prefix = self.config().prefix.trim_end_matches('/').to_string();
         let bootstrap_path = Path::from(format!("{prefix}/_delta_log/{BOOTSTRAP_COMMIT_FILENAME}"));
@@ -227,11 +226,11 @@ impl UniformWriter {
         let actions = parse_log_jsonl(&body)?;
         let mut state = state_from_bootstrap_actions(&actions)?;
 
-        // Compute next_commit_version from the log listing. Phase 1 writers
-        // skip bootstrap's v=0 and append a new versioned JSON.
+        // Compute next_commit_version from the log listing. Writers skip
+        // bootstrap's v=0 and append a new versioned JSON.
         state.next_commit_version = next_commit_version(self.store(), &prefix).await?;
 
-        enforce_phase1_constraints(&state)?;
+        enforce_supported(&state)?;
         Ok(state)
     }
 }
@@ -285,7 +284,7 @@ mod tests {
         assert!(!state.row_tracking_enabled);
         assert!(!state.deletion_vectors_enabled);
 
-        enforce_phase1_constraints(&state).expect("exp 4 must satisfy phase 1");
+        enforce_supported(&state).expect("exp 4 must satisfy phase 1");
     }
 
     #[test]
@@ -298,26 +297,25 @@ mod tests {
         );
         assert!(!state.deletion_vectors_enabled);
 
-        match enforce_phase1_constraints(&state) {
+        match enforce_supported(&state) {
             Err(UniformWriterError::RowTrackingUnsupported) => {}
             other => panic!("expected RowTrackingUnsupported, got {other:?}"),
         }
     }
 
     #[test]
-    fn exp11_partitioned_is_rejected() {
+    fn exp11_partitioned_is_accepted() {
+        // As of Phase 2 partitioned tables are supported. discover() must
+        // surface partition_columns + the partition column's physical UUID
+        // alongside the non-partition column UUIDs.
         let actions = parse_log_jsonl(EXP11_PARTITIONED_BOOTSTRAP).unwrap();
         let state = state_from_bootstrap_actions(&actions).unwrap();
         assert_eq!(state.partition_columns, vec!["region"]);
-        // Partition column UUIDs land in `physical` like any other column.
-        assert!(state.physical.contains_key("region"));
-
-        match enforce_phase1_constraints(&state) {
-            Err(UniformWriterError::PartitionedUnsupported(cols)) => {
-                assert_eq!(cols, vec!["region"]);
-            }
-            other => panic!("expected PartitionedUnsupported, got {other:?}"),
-        }
+        assert!(
+            state.physical.contains_key("region"),
+            "partition column physical UUID must appear in the `physical` map",
+        );
+        enforce_supported(&state).expect("partitioned tables are supported in phase 2");
     }
 
     #[test]
@@ -339,7 +337,7 @@ mod tests {
         let state = state_from_bootstrap_actions(&actions).unwrap();
         assert!(state.deletion_vectors_enabled);
 
-        match enforce_phase1_constraints(&state) {
+        match enforce_supported(&state) {
             Err(UniformWriterError::DeletionVectorsUnsupported) => {}
             other => panic!("expected DeletionVectorsUnsupported, got {other:?}"),
         }

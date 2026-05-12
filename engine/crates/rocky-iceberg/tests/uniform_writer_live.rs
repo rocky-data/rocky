@@ -410,3 +410,109 @@ async fn round_trip_phase1_compatible_sandbox() {
         "MSCK must have written at least one *.metadata.json file under metadata/"
     );
 }
+
+/// Live test for `write_partitioned_batch()`.
+///
+/// Requires the same env vars as the other live tests, except
+/// `ROCKY_TEST_*` should point at a **partitioned** UniForm table with
+/// the canonical `(id BIGINT, payload STRING, region STRING)` schema and
+/// `region` as the partition column. The test writes 3 rows into the
+/// `region=eu` partition and verifies the new Parquet appears at
+/// `<prefix>/region=eu/<hash>.parquet`.
+#[tokio::test]
+#[ignore]
+async fn write_partitioned_batch_phase2_compatible_sandbox() {
+    let Some(cfg) = try_load_config() else {
+        eprintln!("skipping: ROCKY_TEST_* env vars not set");
+        return;
+    };
+    let Some(store) = build_s3_store(&cfg) else {
+        eprintln!("skipping: failed to build S3 store from environment");
+        return;
+    };
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: cfg.catalog.clone(),
+            schema: cfg.schema.clone(),
+            table: cfg.table.clone(),
+            prefix: cfg.prefix.clone(),
+            engine_info: "rocky-iceberg/write-partitioned-live-test".into(),
+        },
+        store.clone(),
+        Arc::new(PanicSqlClient),
+    );
+    let state = writer.discover().await.expect("discover");
+
+    if state.partition_columns.is_empty() {
+        eprintln!(
+            "skipping: this test expects a partitioned table; the target table is unpartitioned"
+        );
+        return;
+    }
+    let expected_cols: std::collections::BTreeSet<&str> =
+        ["id", "payload", "region"].into_iter().collect();
+    let actual_cols: std::collections::BTreeSet<&str> =
+        state.physical.keys().map(String::as_str).collect();
+    if expected_cols != actual_cols || state.partition_columns != vec!["region".to_string()] {
+        eprintln!(
+            "skipping: this test expects (id, payload, region) PARTITIONED BY (region); \
+             got cols={actual_cols:?}, partitions={:?}",
+            state.partition_columns,
+        );
+        return;
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let ts_suffix = chrono::Utc::now().timestamp_micros();
+    let ids = Int64Array::from(vec![900_201_i64, 900_202, 900_203]);
+    let payload = StringArray::from(vec![
+        format!("part-a-{ts_suffix}"),
+        format!("part-b-{ts_suffix}"),
+        format!("part-c-{ts_suffix}"),
+    ]);
+    let region = StringArray::from(vec!["eu", "eu", "eu"]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(payload), Arc::new(region)],
+    )
+    .unwrap();
+
+    let mut pv = std::collections::HashMap::new();
+    pv.insert("region".to_string(), "eu".to_string());
+    let result = writer
+        .write_partitioned_batch(batch, pv)
+        .await
+        .expect("partitioned write must succeed");
+
+    assert_eq!(result.num_records, 3);
+    assert!(
+        result.file_path.contains("/region=eu/"),
+        "file path must carry partition prefix: {}",
+        result.file_path
+    );
+
+    // Verify the Parquet landed in S3 at the Hive-style key.
+    use futures::TryStreamExt;
+    let part_prefix = object_store::path::Path::from(format!("{}/region=eu", cfg.prefix));
+    let mut found = false;
+    let mut stream = store.list(Some(&part_prefix));
+    while let Some(item) = stream.try_next().await.expect("list partition prefix") {
+        if item
+            .location
+            .as_ref()
+            .ends_with(&format!("{}.parquet", result.blake3_hash))
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "Parquet must exist at <prefix>/region=eu/{}.parquet",
+        result.blake3_hash
+    );
+}
