@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::column_map;
 
-use crate::ir::{ColumnInfo, TableRef};
 use crate::sql_gen::SqlGenError;
 use crate::tests::TestSeverity;
 use crate::traits::SqlDialect;
+use rocky_ir::{ColumnInfo, TableRef};
 
 /// Result of a single data quality check.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -264,9 +264,9 @@ pub fn check_freshness(lag_seconds: u64, threshold_seconds: u64) -> CheckResult 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::ColumnSelection;
-    use crate::ir::MetadataColumn;
     use crate::traits::{AdapterError, AdapterResult, SqlDialect};
+    use rocky_ir::ColumnSelection;
+    use rocky_ir::MetadataColumn;
 
     /// Test dialect that mirrors Databricks behavior for rocky-core tests.
     struct TestDialect;

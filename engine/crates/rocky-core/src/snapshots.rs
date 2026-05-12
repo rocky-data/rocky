@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::SnapshotPipelineConfig;
-use crate::ir::{SourceRef, TargetRef};
 use crate::sql_gen::SqlGenError;
 use crate::traits::SqlDialect;
+use rocky_ir::{SourceRef, TargetRef};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -365,8 +365,8 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
-    use crate::ir::{ColumnSelection, MetadataColumn};
     use crate::traits::{AdapterError, AdapterResult};
+    use rocky_ir::{ColumnSelection, MetadataColumn};
 
     /// Test dialect mirroring Databricks behavior (three-part table refs).
     struct TestDialect;

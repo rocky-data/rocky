@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rocky_core::dag::DagNode;
 use rocky_core::models::Model;
+use rocky_ir::dag::DagNode;
 use rocky_sql::lineage;
 use thiserror::Error;
 

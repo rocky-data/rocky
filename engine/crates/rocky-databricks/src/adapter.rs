@@ -5,11 +5,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats, FreshnessResult,
     PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
 };
+use rocky_ir::{ColumnInfo, TableRef};
 
 use crate::batch::{self, BatchTableRef};
 use crate::connector::DatabricksConnector;

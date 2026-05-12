@@ -20,9 +20,9 @@ use thiserror::Error;
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
-use crate::ir::TableRef;
 use crate::tests::{TestSeverity, TestType};
 use crate::traits::{AdapterError, SqlDialect};
+use rocky_ir::TableRef;
 
 /// Errors from quarantine SQL compilation.
 #[derive(Debug, Error)]
@@ -499,9 +499,9 @@ fn suffixed_table_name(table: &str, suffix: &str) -> Result<String, QuarantineEr
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::ir::{ColumnSelection, MetadataColumn};
     use crate::tests::TestDecl;
     use crate::traits::{AdapterError, AdapterResult};
+    use rocky_ir::{ColumnSelection, MetadataColumn};
 
     struct TestDialect;
 

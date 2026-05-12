@@ -597,8 +597,8 @@ mod tests {
 
         async fn describe_table(
             &self,
-            _table: &rocky_core::ir::TableRef,
-        ) -> rocky_core::traits::AdapterResult<Vec<rocky_core::ir::ColumnInfo>> {
+            _table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
             Err(rocky_core::traits::AdapterError::msg("connection refused"))
         }
     }

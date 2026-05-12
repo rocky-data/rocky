@@ -11,9 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::RockyConfig;
-use crate::ir::ColumnInfo;
 use crate::models::{Model, StrategyConfig};
 use crate::tests::TestDecl;
+use rocky_ir::ColumnInfo;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(
             strategy_label(&StrategyConfig::TimeInterval {
                 time_column: "dt".into(),
-                granularity: crate::models::TimeGrain::Day,
+                granularity: rocky_ir::TimeGrain::Day,
                 lookback: 0,
                 batch_size: std::num::NonZeroU32::new(1).unwrap(),
                 first_partition: None,
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(
             strategy_label(&StrategyConfig::Microbatch {
                 timestamp_column: "ts".into(),
-                granularity: crate::models::TimeGrain::Hour,
+                granularity: rocky_ir::TimeGrain::Hour,
             }),
             "microbatch"
         );
@@ -779,8 +779,8 @@ mod tests {
     #[test]
     fn build_doc_index_attaches_columns_from_map() {
         use crate::config::RockyConfig;
-        use crate::ir::ColumnInfo;
         use indexmap::IndexMap;
+        use rocky_ir::ColumnInfo;
         use std::collections::HashMap;
 
         let config = RockyConfig {

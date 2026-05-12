@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 
 use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
-use rocky_core::ir::TableRef;
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
+use rocky_ir::TableRef;
 use rocky_sql::validation::validate_identifier;
 
 use crate::output::{

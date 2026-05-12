@@ -2,10 +2,10 @@ use chrono::{DateTime, Duration, Utc};
 use tracing::warn;
 
 use crate::column_map;
-use crate::ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, GracePeriodColumn, TableRef};
 use crate::sql_gen::SqlGenError;
 use crate::state::GracePeriodRecord;
 use crate::traits::SqlDialect;
+use rocky_ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, GracePeriodColumn, TableRef};
 
 /// Compares source and target column types to detect schema drift.
 ///
@@ -367,9 +367,9 @@ pub fn generate_drop_column_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::ColumnSelection;
-    use crate::ir::MetadataColumn;
     use crate::traits::{AdapterError, AdapterResult, SqlDialect};
+    use rocky_ir::ColumnSelection;
+    use rocky_ir::MetadataColumn;
 
     /// Test dialect that mirrors Databricks behavior for rocky-core tests.
     struct TestDialect;

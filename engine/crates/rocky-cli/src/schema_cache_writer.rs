@@ -31,9 +31,9 @@ use chrono::Utc;
 use tracing::{debug, warn};
 
 use rocky_core::config::SchemaCacheConfig;
-use rocky_core::ir::ColumnInfo;
 use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
 use rocky_core::state::StateStore;
+use rocky_ir::ColumnInfo;
 
 /// State tracked across a single `rocky run` so repeated writes of the same
 /// `(catalog, schema, table)` key are suppressed after the first successful

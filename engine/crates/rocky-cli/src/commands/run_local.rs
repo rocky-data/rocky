@@ -12,9 +12,9 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::warn;
 
-use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
+use rocky_ir::*;
 
 use crate::output::*;
 use crate::registry::AdapterRegistry;
@@ -366,7 +366,7 @@ pub async fn run_quality(
                 if let Some(ref q_cfg) = pipeline.checks.quarantine
                     && q_cfg.enabled
                 {
-                    let ir_ref = rocky_core::ir::TableRef {
+                    let ir_ref = rocky_ir::TableRef {
                         catalog: table_ref.catalog.clone(),
                         schema: table_ref.schema.clone(),
                         table: table_name.clone(),
@@ -649,7 +649,7 @@ pub async fn run_snapshot(
             .collect(),
         pipeline.updated_at.clone(),
         pipeline.invalidate_hard_deletes,
-        rocky_core::ir::GovernanceConfig {
+        rocky_ir::GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
             auto_create_schemas: pipeline.target.governance.auto_create_schemas,

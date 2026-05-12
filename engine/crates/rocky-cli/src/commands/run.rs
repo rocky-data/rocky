@@ -15,13 +15,13 @@ use rocky_core::checks;
 use rocky_core::config::{GovernanceOverride, ReplicationPipelineConfig};
 use rocky_core::drift;
 use rocky_core::hooks::{HookContext, HookRegistry};
-use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
 use rocky_core::traits::{
-    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskStrategy,
-    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
+    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
+use rocky_ir::*;
 
 use crate::output::*;
 use crate::registry::{self, AdapterRegistry};
@@ -3665,9 +3665,9 @@ pub(crate) async fn execute_models(
             // strategy lands and verifies the fix end-to-end.
             if matches!(
                 model_ir.materialization,
-                rocky_core::ir::MaterializationStrategy::Merge { .. }
+                rocky_ir::MaterializationStrategy::Merge { .. }
             ) {
-                let target_table_struct = rocky_core::ir::TableRef {
+                let target_table_struct = rocky_ir::TableRef {
                     catalog: model_ir.target.catalog.clone(),
                     schema: model_ir.target.schema.clone(),
                     table: model_ir.target.table.clone(),
@@ -3926,7 +3926,7 @@ async fn execute_time_interval_model(
     // and wrap in CREATE OR REPLACE TABLE AS to materialize an empty table
     // with the right output schema. Subsequent partition runs use the
     // normal DELETE+INSERT path.
-    let target_ref_struct = rocky_core::ir::TableRef {
+    let target_ref_struct = rocky_ir::TableRef {
         catalog: model.config.target.catalog.clone(),
         schema: model.config.target.schema.clone(),
         table: model.config.target.table.clone(),

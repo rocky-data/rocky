@@ -8,11 +8,11 @@ use thiserror::Error;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, info_span};
 
-use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{
     AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, PkRange, QueryResult, SqlDialect,
     WarehouseAdapter,
 };
+use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::auth::BigQueryAuth;

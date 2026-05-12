@@ -24,9 +24,10 @@ use crate::incremental::{
     self, PartitionError, PartitionStatus, expected_partitions, partition_key_to_window,
     validate_partition_key,
 };
-use crate::ir::PartitionWindow;
-use crate::models::{Model, StrategyConfig, TimeGrain};
+use crate::models::{Model, StrategyConfig};
 use crate::state::StateStore;
+use rocky_ir::PartitionWindow;
+use rocky_ir::TimeGrain;
 
 /// One unit of work for the runtime executor.
 ///

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use rocky_core::catalog as catalog_sql;
-use rocky_core::ir::TableRef;
+use rocky_ir::TableRef;
 use tracing::{debug, warn};
 
 use crate::connector::{ConnectorError, DatabricksConnector};
@@ -215,7 +215,7 @@ impl<'a> CatalogManager<'a> {
     pub async fn describe_table(
         &self,
         table: &TableRef,
-    ) -> Result<Vec<rocky_core::ir::ColumnInfo>, CatalogManagerError> {
+    ) -> Result<Vec<rocky_ir::ColumnInfo>, CatalogManagerError> {
         let dialect = crate::dialect::DatabricksSqlDialect;
         let sql = rocky_core::drift::generate_describe_table_sql(table, &dialect)
             .map_err(SqlGenError::from)?;
@@ -231,7 +231,7 @@ impl<'a> CatalogManager<'a> {
                 if name.is_empty() || name.starts_with('#') {
                     return None;
                 }
-                Some(rocky_core::ir::ColumnInfo {
+                Some(rocky_ir::ColumnInfo {
                     name,
                     data_type,
                     nullable: true, // DESCRIBE TABLE doesn't reliably report nullability

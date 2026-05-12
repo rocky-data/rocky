@@ -759,9 +759,9 @@ fn test_token_type_header_mapping() {
 /// `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = <N>`.
 #[tokio::test]
 async fn test_apply_retention_policy_emits_alter_table() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
+    use rocky_ir::TableRef;
     use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
     let server = MockServer::start().await;
@@ -800,9 +800,9 @@ async fn test_apply_retention_policy_emits_alter_table() {
 /// adapter layer never sees the `"1y"` string.
 #[tokio::test]
 async fn test_apply_retention_policy_year_equivalent() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
+    use rocky_ir::TableRef;
     use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
     let server = MockServer::start().await;
@@ -840,9 +840,9 @@ async fn test_apply_retention_policy_year_equivalent() {
 /// runtime can warn!.
 #[tokio::test]
 async fn test_apply_retention_policy_cap_exceeded_surfaces_error() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
+    use rocky_ir::TableRef;
     use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
     let server = MockServer::start().await;
@@ -879,8 +879,8 @@ async fn test_apply_retention_policy_cap_exceeded_surfaces_error() {
 /// Snowflake response and assert the adapter parses out `Some(90)`.
 #[tokio::test]
 async fn test_read_retention_days_parses_show_parameters() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
+    use rocky_ir::TableRef;
     use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
     let server = MockServer::start().await;
@@ -937,8 +937,8 @@ async fn test_read_retention_days_parses_show_parameters() {
 /// `Ok(None)` — the CLI treats that as "no warehouse observation".
 #[tokio::test]
 async fn test_read_retention_days_empty_rows_returns_none() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
+    use rocky_ir::TableRef;
     use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
     let server = MockServer::start().await;

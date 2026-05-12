@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::TargetRef;
+use rocky_ir::TargetRef;
 
 /// Configuration for shadow mode target rewriting.
 #[derive(Debug, Clone, Serialize, Deserialize)]

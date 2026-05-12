@@ -8,13 +8,13 @@ use chrono::Utc;
 
 use rocky_core::compare;
 use rocky_core::drift;
-use rocky_core::ir::*;
 use rocky_core::shadow::{self, ShadowConfig};
 use rocky_core::sql_gen;
 use rocky_core::state::StateStore;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_duckdb::seed::SeedScale;
 use rocky_duckdb::test_harness::TestPipeline;
+use rocky_ir::*;
 use tempfile::TempDir;
 
 // ===========================================================================
@@ -635,7 +635,7 @@ fn test_checkpoint_state_persisted() {
 
 #[test]
 fn test_dag_topological_sort() {
-    use rocky_core::dag::{DagNode, topological_sort};
+    use rocky_ir::dag::{DagNode, topological_sort};
 
     let nodes = vec![
         DagNode {
@@ -663,7 +663,7 @@ fn test_dag_topological_sort() {
 
 #[test]
 fn test_dag_cycle_detection() {
-    use rocky_core::dag::{DagNode, topological_sort};
+    use rocky_ir::dag::{DagNode, topological_sort};
 
     let nodes = vec![
         DagNode {
@@ -684,7 +684,7 @@ fn test_dag_cycle_detection() {
 
 #[test]
 fn test_dag_parallel_layers() {
-    use rocky_core::dag::{DagNode, execution_layers};
+    use rocky_ir::dag::{DagNode, execution_layers};
 
     // Diamond: a -> {b, c} -> d
     let nodes = vec![

@@ -9,9 +9,9 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 use rocky_core::compare::{self, ComparisonResult, ComparisonThresholds, ComparisonVerdict};
-use rocky_core::ir::TargetRef;
 use rocky_core::shadow::ShadowConfig;
 use rocky_core::traits::WarehouseAdapter;
+use rocky_ir::TargetRef;
 
 use crate::output::{CompareOutput, TableCompareResult, print_json};
 use crate::registry::{self, AdapterRegistry};
@@ -104,12 +104,12 @@ pub async fn compare(
                 compare::compare_row_counts(shadow_count, prod_count);
 
             // Get schemas
-            let prod_table_ref = rocky_core::ir::TableRef {
+            let prod_table_ref = rocky_ir::TableRef {
                 catalog: prod_target.catalog.clone(),
                 schema: prod_target.schema.clone(),
                 table: prod_target.table.clone(),
             };
-            let shadow_table_ref = rocky_core::ir::TableRef {
+            let shadow_table_ref = rocky_ir::TableRef {
                 catalog: shadow_target.catalog.clone(),
                 schema: shadow_target.schema.clone(),
                 table: shadow_target.table.clone(),

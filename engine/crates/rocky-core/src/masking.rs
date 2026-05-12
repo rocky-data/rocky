@@ -14,12 +14,12 @@
 //! [`GovernanceAdapter::apply_masking_policy`] in v1.
 //!
 //! [`GovernanceAdapter::apply_masking_policy`]: crate::traits::GovernanceAdapter::apply_masking_policy
-//! [`MaskStrategy`]: crate::traits::MaskStrategy
+//! [`MaskStrategy`]: rocky_ir::MaskStrategy
 
 use rocky_sql::validation::{self, ValidationError};
 use thiserror::Error;
 
-use crate::traits::MaskStrategy;
+use rocky_ir::MaskStrategy;
 
 /// Errors from masking-policy SQL generation.
 #[derive(Debug, Error)]

@@ -1,9 +1,9 @@
 use rocky_sql::validation;
 use thiserror::Error;
 
-use crate::ir::{MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
+use rocky_ir::{MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
 
 /// Build the canonical `expected X ModelIr for \`name\`, found <actual>` error
 /// returned by every `generate_*` entry point when its variant guard rejects
@@ -57,7 +57,7 @@ pub enum SqlGenError {
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -102,7 +102,7 @@ pub fn generate_select_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -124,7 +124,7 @@ pub fn generate_insert_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -159,7 +159,7 @@ pub fn generate_create_table_as_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a replication-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -212,7 +212,7 @@ pub fn generate_merge_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -376,7 +376,7 @@ pub fn generate_transformation_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_time_interval_bootstrap_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -445,7 +445,7 @@ pub fn generate_time_interval_bootstrap_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_transformation_initial_ddl(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -501,7 +501,7 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_materialized_view_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -526,7 +526,7 @@ pub fn generate_materialized_view_sql(
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a transformation-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_dynamic_table_sql(
     model_ir: &ModelIr,
     target_lag: &str,
@@ -611,7 +611,7 @@ use std::fmt::Write;
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a snapshot-variant [`ModelIr`] (see [`crate::ir::ModelIrVariant`]).
+/// a snapshot-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -742,8 +742,8 @@ pub fn generate_transformations_parallel(
 
 #[cfg(test)]
 mod tests {
-    use crate::ir::*;
     use crate::traits::{AdapterError, AdapterResult, SqlDialect};
+    use rocky_ir::*;
 
     use super::*;
 
@@ -1345,9 +1345,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
 
     // ----- time_interval generation tests (Phase 2D) -----
 
-    use crate::ir::PartitionWindow;
-    use crate::models::TimeGrain;
     use chrono::TimeZone;
+    use rocky_ir::PartitionWindow;
+    use rocky_ir::TimeGrain;
 
     fn time_interval_ir(time_column: &str, sql: &str, window: Option<PartitionWindow>) -> ModelIr {
         ModelIr::transformation(

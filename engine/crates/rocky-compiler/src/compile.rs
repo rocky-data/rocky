@@ -64,7 +64,7 @@ pub struct CompilerConfig {
     /// Keys are fully qualified table names (e.g., "catalog.schema.table").
     pub source_schemas: HashMap<String, Vec<TypedColumn>>,
     /// Known source column info for semantic graph (name, type string, nullable).
-    pub source_column_info: HashMap<String, Vec<rocky_core::ir::ColumnInfo>>,
+    pub source_column_info: HashMap<String, Vec<rocky_ir::ColumnInfo>>,
     /// Project `[mask]` table from `rocky.toml` — used by the W004
     /// classification-tag completeness check. Empty by default; callers
     /// that don't load a `RockyConfig` get the status quo (no W004).

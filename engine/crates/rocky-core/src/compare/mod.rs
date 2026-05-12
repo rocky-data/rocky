@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::ColumnInfo;
+use rocky_ir::ColumnInfo;
 
 // ---------------------------------------------------------------------------
 // Comparison result

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
 rocky-observe = { path = "../rocky-observe" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
@@ -29,6 +30,7 @@ required-features = ["test-support"]
 
 [dev-dependencies]
 rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
 tokio = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }

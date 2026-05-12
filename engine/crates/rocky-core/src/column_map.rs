@@ -7,7 +7,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::ir::ColumnInfo;
+use rocky_ir::ColumnInfo;
 
 // ---------------------------------------------------------------------------
 // Case-insensitive key (§P1.9)

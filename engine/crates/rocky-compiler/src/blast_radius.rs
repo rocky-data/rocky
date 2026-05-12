@@ -115,8 +115,8 @@ mod tests {
     use crate::diagnostic::Severity;
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
-    use rocky_core::ir::ColumnInfo;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
+    use rocky_ir::ColumnInfo;
 
     fn make_model(name: &str, sql: &str) -> Model {
         Model {

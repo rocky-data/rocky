@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rocky_bigquery::auth::BigQueryAuth;
 use rocky_bigquery::connector::BigQueryAdapter;
-use rocky_core::ir::TableRef;
 use rocky_core::traits::WarehouseAdapter;
+use rocky_ir::TableRef;
 
 /// Build an adapter from env vars. Returns `None` when the required
 /// vars aren't present, so the `#[ignore]`d test silently skips on a

@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use rocky_core::ir::*;
 use rocky_core::sql_gen;
+use rocky_ir::*;
 
 use crate::output::*;
 use crate::registry;
@@ -391,7 +391,7 @@ fn render_governance_preview_text(output: &PlanOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocky_core::traits::MaskStrategy;
+    use rocky_ir::MaskStrategy;
 
     // ------------------------------------------------------------------
     // render_retention_preview — warehouse dispatch

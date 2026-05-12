@@ -11,12 +11,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use rocky_core::ir::{Grant, GrantTarget, Permission, PermissionDiff, ResolvedRole, TableRef};
 use rocky_core::masking;
 use rocky_core::retention::RetentionPolicy;
 use rocky_core::traits::{
-    AdapterError, AdapterResult, GovernanceAdapter, MaskStrategy, MaskingPolicy, TagTarget,
+    AdapterError, AdapterResult, GovernanceAdapter, MaskingPolicy, TagTarget,
 };
+use rocky_ir::MaskStrategy;
+use rocky_ir::{Grant, GrantTarget, Permission, PermissionDiff, ResolvedRole, TableRef};
 
 use crate::auth::Auth;
 use crate::catalog::CatalogManager;
@@ -563,7 +564,7 @@ fn format_role_grant_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocky_core::ir::Permission;
+    use rocky_ir::Permission;
 
     #[test]
     fn role_group_name_prefixes_rocky_role() {

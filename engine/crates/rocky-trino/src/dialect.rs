@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use rocky_core::ir::{ColumnSelection, MetadataColumn};
 use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
 /// Trino SQL dialect.

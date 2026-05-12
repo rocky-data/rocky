@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 rocky-ai = { path = "../rocky-ai" }
 rocky-compiler = { path = "../rocky-compiler" }

@@ -384,7 +384,7 @@ pub fn estimate_aggregate_cost(
 
 use std::collections::HashMap;
 
-use crate::dag::DagNode;
+use rocky_ir::dag::DagNode;
 
 /// Per-model table statistics used as seed data for cost propagation.
 ///
@@ -426,8 +426,8 @@ pub fn propagate_costs(
     nodes: &[DagNode],
     base_stats: &HashMap<String, TableStats>,
     warehouse_type: WarehouseType,
-) -> Result<HashMap<String, CostEstimate>, crate::dag::DagError> {
-    let sorted = crate::dag::topological_sort(nodes)?;
+) -> Result<HashMap<String, CostEstimate>, rocky_ir::dag::DagError> {
+    let sorted = rocky_ir::dag::topological_sort(nodes)?;
     let mut estimates: HashMap<String, CostEstimate> = HashMap::with_capacity(nodes.len());
 
     let deps_map: HashMap<&str, &[String]> = nodes

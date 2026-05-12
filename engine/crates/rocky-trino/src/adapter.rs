@@ -7,8 +7,8 @@
 //! batch / loader are absent.
 
 use async_trait::async_trait;
-use rocky_core::ir::{ColumnInfo, TableRef};
 use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+use rocky_ir::{ColumnInfo, TableRef};
 
 use crate::auth::TrinoAuth;
 use crate::connector::{TrinoClient, TrinoClientConfig};

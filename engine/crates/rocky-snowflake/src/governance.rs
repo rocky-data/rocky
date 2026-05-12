@@ -22,9 +22,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use rocky_core::ir::{Grant, GrantTarget, Permission, TableRef};
 use rocky_core::retention::RetentionPolicy;
 use rocky_core::traits::{AdapterError, AdapterResult, GovernanceAdapter, TagTarget};
+use rocky_ir::{Grant, GrantTarget, Permission, TableRef};
 use rocky_sql::validation;
 
 use crate::connector::SnowflakeConnector;

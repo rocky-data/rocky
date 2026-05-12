@@ -1,4 +1,4 @@
-use rocky_core::ir::{Grant, GrantTarget, Permission, PermissionDiff};
+use rocky_ir::{Grant, GrantTarget, Permission, PermissionDiff};
 use rocky_sql::validation;
 use tracing::debug;
 

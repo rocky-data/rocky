@@ -41,8 +41,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rocky_core::compare::bisection::{BisectionConfig, BisectionTarget, bisection_diff};
 use rocky_core::config::RetryConfig;
-use rocky_core::ir::TableRef;
 use rocky_core::traits::WarehouseAdapter;
+use rocky_ir::TableRef;
 use rocky_snowflake::adapter::SnowflakeWarehouseAdapter;
 use rocky_snowflake::auth::{Auth, AuthConfig};
 use rocky_snowflake::connector::{ConnectorConfig, SnowflakeConnector};

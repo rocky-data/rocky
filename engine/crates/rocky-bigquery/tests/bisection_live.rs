@@ -19,8 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rocky_bigquery::auth::BigQueryAuth;
 use rocky_bigquery::connector::BigQueryAdapter;
 use rocky_core::compare::bisection::{BisectionConfig, BisectionTarget, bisection_diff};
-use rocky_core::ir::TableRef;
 use rocky_core::traits::WarehouseAdapter;
+use rocky_ir::TableRef;
 
 fn adapter_from_env() -> Option<(BigQueryAdapter, String)> {
     let project = std::env::var("BIGQUERY_TEST_PROJECT").ok()?;

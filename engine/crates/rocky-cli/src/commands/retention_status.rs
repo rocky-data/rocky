@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rocky_core::ir::TableRef;
 use rocky_core::traits::GovernanceAdapter;
+use rocky_ir::TableRef;
 
 use crate::output::{ModelRetentionStatus, RetentionStatusOutput, print_json};
 use crate::registry::AdapterRegistry;

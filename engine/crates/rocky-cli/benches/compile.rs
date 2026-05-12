@@ -11,10 +11,10 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use rocky_compiler::compile::{CompilerConfig, compile};
-use rocky_core::dag::{DagNode, execution_layers, topological_sort};
-use rocky_core::ir::*;
 use rocky_core::sql_gen;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
+use rocky_ir::dag::{DagNode, execution_layers, topological_sort};
+use rocky_ir::*;
 
 // ---------------------------------------------------------------------------
 // Synthetic project generation

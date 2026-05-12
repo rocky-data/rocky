@@ -5,10 +5,10 @@ use std::path::Path;
 use anyhow::Result;
 
 use rocky_core::cost::downstream_counts;
-use rocky_core::dag::DagNode;
 use rocky_core::models;
 use rocky_core::optimize::{CostConfig, MaterializationCost, ModelStats, recommend_strategy};
 use rocky_core::state::StateStore;
+use rocky_ir::dag::DagNode;
 
 use crate::output::{OptimizeOutput, OptimizeRecommendation, print_json};
 

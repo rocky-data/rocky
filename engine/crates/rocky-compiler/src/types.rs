@@ -9,4 +9,4 @@
 //! depends on `rocky-core` (one-way), so the typed-column primitives must
 //! live in `rocky-core` for that to work.
 
-pub use rocky_core::types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};
+pub use rocky_ir::types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};

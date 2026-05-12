@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{ModelBudgetConfig, substitute_env_vars};
-use crate::dag::DagNode;
-use crate::ir::{GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef};
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
+use rocky_ir::dag::DagNode;
+use rocky_ir::{
+    GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TimeGrain,
+};
 
 /// Errors from loading and parsing model files.
 #[derive(Debug, Error)]
@@ -258,11 +260,6 @@ fn default_batch_size() -> NonZeroU32 {
 fn default_microbatch_granularity() -> TimeGrain {
     TimeGrain::Hour
 }
-
-// `TimeGrain` moved to `rocky_ir::time_grain` — re-exported below for
-// in-crate backward compatibility. External consumers should reach for
-// `rocky_ir::TimeGrain` directly.
-pub use rocky_ir::TimeGrain;
 
 // ---------------------------------------------------------------------------
 // Raw deserialization types (all fields optional for inference)
@@ -523,12 +520,12 @@ impl Model {
                     .map(|s| std::sync::Arc::from(s.as_str()))
                     .collect(),
                 update_columns: match update_columns {
-                    Some(cols) => crate::ir::ColumnSelection::Explicit(
+                    Some(cols) => rocky_ir::ColumnSelection::Explicit(
                         cols.iter()
                             .map(|s| std::sync::Arc::from(s.as_str()))
                             .collect(),
                     ),
-                    None => crate::ir::ColumnSelection::All,
+                    None => rocky_ir::ColumnSelection::All,
                 },
             },
             StrategyConfig::TimeInterval {
@@ -927,7 +924,7 @@ SELECT id, name, status FROM raw.src
         if let MaterializationStrategy::Merge { update_columns, .. } = &ir.materialization {
             assert!(matches!(
                 update_columns,
-                crate::ir::ColumnSelection::Explicit(_)
+                rocky_ir::ColumnSelection::Explicit(_)
             ));
         }
     }

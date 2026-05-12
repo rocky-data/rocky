@@ -752,8 +752,8 @@ async fn test_update_bindings_single_patch_for_add_and_remove() {
 /// the desired state.
 #[tokio::test]
 async fn test_reconcile_access_combined_grants_and_bindings() {
-    use rocky_core::ir::{Grant, GrantTarget, Permission};
     use rocky_databricks::permissions::{PermissionManager, WorkspaceBindingDesired};
+    use rocky_ir::{Grant, GrantTarget, Permission};
 
     let server = MockServer::start().await;
 
@@ -950,9 +950,9 @@ async fn test_scim_create_group_idempotent_on_409() {
 ///   Total: 6 `POST /api/2.0/sql/statements`.
 #[tokio::test]
 async fn test_reconcile_role_graph_end_to_end_scim_plus_grants() {
-    use rocky_core::ir::{Permission, ResolvedRole};
     use rocky_core::traits::GovernanceAdapter as _;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::{Permission, ResolvedRole};
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1036,9 +1036,9 @@ async fn test_reconcile_role_graph_end_to_end_scim_plus_grants() {
 /// behaviour.
 #[tokio::test]
 async fn test_reconcile_role_graph_empty_catalogs_still_creates_groups() {
-    use rocky_core::ir::{Permission, ResolvedRole};
     use rocky_core::traits::GovernanceAdapter as _;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::{Permission, ResolvedRole};
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1086,9 +1086,9 @@ async fn test_reconcile_role_graph_empty_catalogs_still_creates_groups() {
 /// touched. Early-return path through the trait dispatch.
 #[tokio::test]
 async fn test_reconcile_role_graph_empty_is_ok() {
-    use rocky_core::ir::ResolvedRole;
     use rocky_core::traits::GovernanceAdapter as _;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::ResolvedRole;
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1109,9 +1109,9 @@ async fn test_reconcile_role_graph_empty_is_ok() {
 /// reconciler. No HTTP traffic should fire.
 #[tokio::test]
 async fn test_reconcile_role_graph_log_only_without_scim() {
-    use rocky_core::ir::{Permission, ResolvedRole};
     use rocky_core::traits::GovernanceAdapter as _;
     use rocky_databricks::governance::{DatabricksGovernanceAdapter, role_group_name};
+    use rocky_ir::{Permission, ResolvedRole};
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1147,10 +1147,10 @@ async fn test_reconcile_role_graph_log_only_without_scim() {
 /// Delta TBLPROPERTIES and executes a single ALTER TABLE.
 #[tokio::test]
 async fn test_apply_retention_policy_emits_paired_tblproperties() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1190,10 +1190,10 @@ async fn test_apply_retention_policy_emits_paired_tblproperties() {
 /// shape — adapters never see the raw string.
 #[tokio::test]
 async fn test_apply_retention_policy_year_equivalent_emits_days() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1239,9 +1239,9 @@ async fn test_apply_retention_policy_year_equivalent_emits_days() {
 /// multi-column tag DDL in a single statement.
 #[tokio::test]
 async fn test_apply_column_tags_fires_one_request_per_column() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1303,9 +1303,9 @@ async fn test_apply_column_tags_fires_one_request_per_column() {
 /// because the `?` on `set_column_tags` returns immediately.
 #[tokio::test]
 async fn test_apply_column_tags_short_circuits_on_column_failure() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
     use std::collections::BTreeMap;
 
     let server = MockServer::start().await;
@@ -1393,9 +1393,10 @@ async fn test_apply_column_tags_short_circuits_on_column_failure() {
 /// `SET MASKING POLICY`. See `rocky_core::masking` for the exact shapes.
 #[tokio::test]
 async fn test_apply_masking_policy_happy_path_hash_plus_redact() {
-    use rocky_core::ir::TableRef;
-    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_core::traits::{GovernanceAdapter, MaskingPolicy};
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::MaskStrategy;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1495,9 +1496,10 @@ async fn test_apply_masking_policy_happy_path_hash_plus_redact() {
 /// bug against the drop.
 #[tokio::test]
 async fn test_apply_masking_policy_none_emits_drop_mask_to_clear_prior_state() {
-    use rocky_core::ir::TableRef;
-    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_core::traits::{GovernanceAdapter, MaskingPolicy};
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::MaskStrategy;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1589,9 +1591,10 @@ async fn test_apply_masking_policy_none_emits_drop_mask_to_clear_prior_state() {
 /// does not get quoted/escaped and slip through.
 #[tokio::test]
 async fn test_apply_masking_policy_rejects_injection_in_column_identifier() {
-    use rocky_core::ir::TableRef;
-    use rocky_core::traits::{GovernanceAdapter, MaskStrategy, MaskingPolicy};
+    use rocky_core::traits::{GovernanceAdapter, MaskingPolicy};
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::MaskStrategy;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1657,10 +1660,10 @@ async fn test_apply_masking_policy_rejects_injection_in_column_identifier() {
 /// etc.) propagates as an AdapterError so the runtime can warn!.
 #[tokio::test]
 async fn test_apply_retention_policy_propagates_api_error() {
-    use rocky_core::ir::TableRef;
     use rocky_core::retention::RetentionPolicy;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1698,9 +1701,9 @@ async fn test_apply_retention_policy_propagates_api_error() {
 /// `"interval 90 days"`. The parse collapses the difference.
 #[tokio::test]
 async fn test_read_retention_days_parses_interval_form() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
@@ -1754,9 +1757,9 @@ async fn test_read_retention_days_parses_interval_form() {
 /// probe reports `Ok(None)` rather than faking an observation.
 #[tokio::test]
 async fn test_read_retention_days_empty_rows_returns_none() {
-    use rocky_core::ir::TableRef;
     use rocky_core::traits::GovernanceAdapter;
     use rocky_databricks::governance::DatabricksGovernanceAdapter;
+    use rocky_ir::TableRef;
 
     let server = MockServer::start().await;
 
