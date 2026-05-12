@@ -3810,6 +3810,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
         MaterializationStrategy::Ephemeral => "ephemeral",
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
+        MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
     }
 }
 
@@ -4498,6 +4499,15 @@ async fn process_table(
                 strategy_name = "microbatch";
                 // Microbatch on replication tables falls back to incremental insert.
                 sql_gen::generate_insert_sql(&model_ir, dialect)?
+            }
+            MaterializationStrategy::ContentAddressed { .. } => {
+                // content_addressed is a transformation strategy backed by
+                // rocky-iceberg::uniform_writer; the replication pipeline
+                // does not synthesise this variant from rocky.toml.
+                anyhow::bail!(
+                    "content_addressed strategy is not supported on replication tables — \
+                     it only applies to transformation models"
+                );
             }
         }
     };

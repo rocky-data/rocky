@@ -350,6 +350,17 @@ pub fn generate_transformation_sql(
             validation::validate_identifier(timestamp_column)?;
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
+        MaterializationStrategy::ContentAddressed { .. } => {
+            // Content-addressed materializations go through the
+            // `rocky-iceberg::uniform_writer` library, not SQL generation.
+            // The runtime detects this strategy in `rocky run` and routes
+            // execution accordingly; sql_gen should never be reached.
+            Err(SqlGenError::InvalidRequest(
+                "ContentAddressed strategy is handled by the runtime via \
+                 rocky-iceberg::uniform_writer; sql_gen does not emit SQL for it"
+                    .to_string(),
+            ))
+        }
     }
 }
 
