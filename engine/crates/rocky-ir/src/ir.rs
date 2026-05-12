@@ -90,6 +90,33 @@ pub enum MaterializationStrategy {
         /// Batch granularity (default: Hour).
         granularity: TimeGrain,
     },
+    /// Content-addressed write to a Delta UniForm table.
+    ///
+    /// The model's SELECT is executed by the runtime; the resulting rows
+    /// are written as a content-hash-named Parquet file via the
+    /// `rocky_iceberg::uniform_writer` library, and a `_delta_log/{N}.json`
+    /// commit references it. Cross-engine reads (DuckDB iceberg_scan,
+    /// Iceberg-aware Trino, ...) require `MSCK REPAIR TABLE ... SYNC
+    /// METADATA` after each commit; the runtime issues this automatically.
+    ///
+    /// SQL generation does not run for this strategy — `sql_gen` returns
+    /// an error, and the runner takes over the materialization path. See
+    /// `rocky_iceberg::uniform_writer` for the writer surface.
+    ContentAddressed {
+        /// Object-store key prefix containing `_delta_log/` and the
+        /// table's Parquet files. Typically `s3://<bucket>/<path>/<table>`
+        /// for AWS-backed deployments. Resolved at config-parse time; the
+        /// runtime constructs an `ObjectStore` from this.
+        storage_prefix: String,
+        /// If non-empty, the model's SELECT must produce exactly these
+        /// partition columns. The runtime pre-groups rows by partition
+        /// tuple and emits one `add` action per group. Empty means the
+        /// target is unpartitioned.
+        ///
+        /// At runtime, this list is asserted equal to what
+        /// `UniformWriter::discover()` returns; mismatch is a hard error.
+        partition_columns: Vec<String>,
+    },
 }
 
 /// A single partition's time window, used to substitute `@start_date` /
@@ -1250,6 +1277,79 @@ mod tests {
             !json.contains("column_masks"),
             "empty column_masks must be skipped per the canonical-JSON rule, got: {json}"
         );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_switching_to_content_addressed() {
+        let mut m = sample_transformation_model();
+        let h_before = m.recipe_hash();
+        m.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset/dim_customers".into(),
+            partition_columns: vec![],
+        };
+        let h_after = m.recipe_hash();
+        assert_ne!(
+            h_before, h_after,
+            "switching to ContentAddressed must change the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_content_addressed_storage_prefix_changes() {
+        let mut m = sample_transformation_model();
+        m.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset/dim_customers".into(),
+            partition_columns: vec![],
+        };
+        let h1 = m.recipe_hash();
+        m.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset_v2/dim_customers".into(),
+            partition_columns: vec![],
+        };
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "changing the content-addressed storage prefix must change the recipe hash"
+        );
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_content_addressed_partition_columns_change() {
+        let mut m = sample_transformation_model();
+        m.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset/dim_customers".into(),
+            partition_columns: vec![],
+        };
+        let h1 = m.recipe_hash();
+        m.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset/dim_customers".into(),
+            partition_columns: vec!["region".to_string()],
+        };
+        let h2 = m.recipe_hash();
+        assert_ne!(
+            h1, h2,
+            "adding a partition column must change the recipe hash"
+        );
+    }
+
+    #[test]
+    fn content_addressed_serde_round_trip() {
+        let strategy = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://example-bucket/dataset/t".into(),
+            partition_columns: vec!["region".to_string(), "year".to_string()],
+        };
+        let json = serde_json::to_string(&strategy).unwrap();
+        let back: MaterializationStrategy = serde_json::from_str(&json).unwrap();
+        match back {
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix,
+                partition_columns,
+            } => {
+                assert_eq!(storage_prefix, "s3://example-bucket/dataset/t");
+                assert_eq!(partition_columns, vec!["region", "year"]);
+            }
+            other => panic!("expected ContentAddressed, got {other:?}"),
+        }
     }
 
     #[test]

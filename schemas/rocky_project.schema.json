@@ -1210,7 +1210,7 @@
       "description": "One entry in the top-level `[mask]` block. A scalar value (`pii = \"hash\"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = \"none\"`) overrides strategies for a specific environment.\n\nSerde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `\"mask\"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for."
     },
     "MaskStrategy": {
-      "description": "Column-masking strategy applied to a classified column at materialization time.\n\nRocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.\n\nSerialized in lowercase to match the TOML spelling (`\"hash\"`, `\"redact\"`, `\"partial\"`, `\"none\"`).",
+      "description": "How a column is masked at apply time.\n\nSerialized in lowercase to match the TOML spelling (`\"hash\"`, `\"redact\"`, `\"partial\"`, `\"none\"`).",
       "oneOf": [
         {
           "description": "SHA-256 hex digest of the column value. Deterministic, one-way.",

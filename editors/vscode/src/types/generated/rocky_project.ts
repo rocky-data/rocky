@@ -48,9 +48,7 @@ export type MaskEntry =
       [k: string]: MaskStrategy;
     };
 /**
- * Column-masking strategy applied to a classified column at materialization time.
- *
- * Rocky translates a classification tag (e.g., `pii`) into one of these strategies via the `[mask]` / `[mask.<env>]` block in `rocky.toml`. The adapter renders each strategy as a warehouse-native function: Databricks uses `CREATE MASK ... RETURN <expr>` + `SET MASKING POLICY`; other adapters default-unsupported until demand.
+ * How a column is masked at apply time.
  *
  * Serialized in lowercase to match the TOML spelling (`"hash"`, `"redact"`, `"partial"`, `"none"`).
  */
