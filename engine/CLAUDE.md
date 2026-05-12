@@ -6,7 +6,7 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 ## Project Structure
 
-Cargo workspace with 20 crates (Rust edition 2024, MSRV 1.85):
+Cargo workspace with 23 crates (Rust edition 2024, MSRV 1.85):
 
 ```
 engine/                         # this directory, inside the rocky monorepo

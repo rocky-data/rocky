@@ -112,7 +112,7 @@ table = "fct_orders"
 
 ## Crate Architecture
 
-20-crate Cargo workspace (Rust edition 2024, MSRV 1.85):
+23-crate Cargo workspace (Rust edition 2024, MSRV 1.85):
 
 ```
 rocky-core         — Warehouse-agnostic engine: IR, adapter traits, DAG, models, checks, contracts, config, state
