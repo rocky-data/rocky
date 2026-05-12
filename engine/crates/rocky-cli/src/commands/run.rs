@@ -3594,11 +3594,98 @@ pub(crate) async fn execute_models(
             }
             let model_start = Instant::now();
 
-            // Dispatch on the materialization strategy. time_interval models
-            // take the per-partition path so the runtime can iterate
-            // partitions, populate the window per partition, and record
-            // state-store rows. Other strategies use the single-statement
-            // path via generate_transformation_sql.
+            // Dispatch on the materialization strategy. Three special
+            // paths:
+            //
+            // - `time_interval` takes the per-partition path so the
+            //   runtime can iterate partitions, populate the window per
+            //   partition, and record state-store rows.
+            // - `content_addressed` writes the model's SELECT result
+            //   through `rocky_iceberg::uniform_writer` (content-hash
+            //   Parquet + Delta log commit) instead of generating SQL.
+            // - All other strategies use the single-statement path via
+            //   `generate_transformation_sql`.
+            if matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::ContentAddressed { .. }
+            ) {
+                let model_ir = model.to_model_ir();
+                let model_started_at = Utc::now();
+                let target_table_full_name = format!(
+                    "{}.{}.{}",
+                    model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
+                );
+                let asset_key = vec![
+                    model_ir.target.catalog.clone(),
+                    model_ir.target.schema.clone(),
+                    model_ir.target.table.clone(),
+                ];
+                let summary = super::run_content_addressed::execute_content_addressed_model(
+                    &model_ir, warehouse,
+                )
+                .await
+                .with_context(|| format!("model '{model_name}' failed"));
+                match summary {
+                    Ok(summary) => {
+                        let duration_ms = model_start.elapsed().as_millis() as u64;
+                        output.materializations.push(MaterializationOutput {
+                            asset_key,
+                            rows_copied: Some(summary.num_rows as u64),
+                            duration_ms,
+                            started_at: model_started_at,
+                            metadata: MaterializationMetadata {
+                                strategy: "content_addressed".to_string(),
+                                watermark: None,
+                                target_table_full_name: Some(target_table_full_name.clone()),
+                                sql_hash: Some(crate::output::sql_fingerprint(
+                                    std::slice::from_ref(&model_ir.sql),
+                                )),
+                                column_count: exec_ctx.column_count_for(model_name),
+                                compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
+                            },
+                            partition: None,
+                            cost_usd: None,
+                            bytes_scanned: None,
+                            bytes_written: Some(summary.size_bytes),
+                            job_ids: vec![],
+                        });
+                        info!(
+                            model = model_name.as_str(),
+                            target = target_table_full_name.as_str(),
+                            num_rows = summary.num_rows,
+                            commit_version = summary.commit_version,
+                            blake3 = summary.blake3_hash.as_str(),
+                            file_path = summary.file_path.as_str(),
+                            "content_addressed model materialized"
+                        );
+                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                            let _ = reg
+                                .fire(&HookContext::after_model_run(
+                                    run_id,
+                                    pipe,
+                                    model_name,
+                                    duration_ms,
+                                ))
+                                .await;
+                        }
+                        models_executed += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                            let _ = reg
+                                .fire(&HookContext::model_error(
+                                    run_id,
+                                    pipe,
+                                    model_name,
+                                    &format!("{e:#}"),
+                                ))
+                                .await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             if matches!(
                 model.config.strategy,
                 rocky_core::models::StrategyConfig::TimeInterval { .. }

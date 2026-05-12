@@ -3766,6 +3766,7 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
@@ -3775,6 +3776,7 @@ dependencies = [
  "indexmap",
  "miette",
  "notify",
+ "object_store",
  "parquet",
  "rocky-adapter-sdk",
  "rocky-ai",
@@ -3804,6 +3806,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
