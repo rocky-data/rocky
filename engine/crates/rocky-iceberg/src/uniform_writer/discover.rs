@@ -188,9 +188,13 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
         partition_columns: metadata.partition_columns.clone(),
         row_tracking_enabled,
         deletion_vectors_enabled,
-        // Bootstrap commit is v=0; the next write is v=1. PR 2's discover()
+        // Bootstrap commit is v=0; the next write is v=1. discover()
         // patches this from the actual log listing.
         next_commit_version: 1,
+        // 0 until a write emits a domainMetadata that bumps the
+        // watermark. discover() scans the full log for the latest
+        // value.
+        row_tracking_next_id: 0,
     })
 }
 
@@ -198,18 +202,91 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
 ///
 /// Each branch surfaces a typed error pointing at the wave 2 phase that
 /// will eventually lift the restriction.
-///
-/// As of Phase 2, partitioned tables are supported (callers route through
-/// [`UniformWriter::write_partitioned_batch`]); the partitioned check has
-/// been lifted from discover.
 fn enforce_supported(state: &UniformTableState) -> Result<()> {
     if state.deletion_vectors_enabled {
         return Err(UniformWriterError::DeletionVectorsUnsupported);
     }
-    if state.row_tracking_enabled {
-        return Err(UniformWriterError::RowTrackingUnsupported);
-    }
     Ok(())
+}
+
+/// Scan all `_delta_log/*.json` entries (in version order) for the
+/// latest `domainMetadata` action with domain `delta.rowTracking` and
+/// return its `rowIdHighWaterMark + 1` — the next row-id the writer
+/// should allocate.
+///
+/// Returns 0 for a freshly-created rowTracking table (no writes yet —
+/// no domainMetadata actions emitted).
+pub(super) async fn discover_row_tracking_next_id<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+) -> Result<u64> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        if let Some((_, last)) = key.rsplit_once('/')
+            && let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    // Walk newest → oldest; first commit carrying the rowTracking
+    // domainMetadata is the authoritative one.
+    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+    for (_, path) in versions {
+        let body = store.get(&path).await?.bytes().await?;
+        let text = std::str::from_utf8(&body)
+            .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| UniformWriterError::DeltaLog(format!("scan domainMetadata: {e}")))?;
+            let Some(dm) = value.get("domainMetadata") else {
+                continue;
+            };
+            let domain = dm.get("domain").and_then(|v| v.as_str());
+            if domain != Some("delta.rowTracking") {
+                continue;
+            }
+            // `configuration` is a JSON-encoded string. Inside it,
+            // `rowIdHighWaterMark` is the largest already-allocated
+            // row-id; the next write starts at +1.
+            let cfg_raw = dm
+                .get("configuration")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    UniformWriterError::DeltaLog(
+                        "delta.rowTracking domainMetadata is missing configuration".into(),
+                    )
+                })?;
+            let cfg: serde_json::Value = serde_json::from_str(cfg_raw).map_err(|e| {
+                UniformWriterError::DeltaLog(format!(
+                    "delta.rowTracking configuration is not JSON: {e}"
+                ))
+            })?;
+            let high = cfg
+                .get("rowIdHighWaterMark")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    UniformWriterError::DeltaLog(
+                        "delta.rowTracking configuration is missing rowIdHighWaterMark".into(),
+                    )
+                })?;
+            // Delta uses i64 in the wire format; row-ids start at 0 so
+            // a non-negative value is required.
+            if high < 0 {
+                return Ok(0);
+            }
+            return Ok((high as u64).saturating_add(1));
+        }
+    }
+    Ok(0)
 }
 
 impl UniformWriter {
@@ -229,6 +306,13 @@ impl UniformWriter {
         // Compute next_commit_version from the log listing. Writers skip
         // bootstrap's v=0 and append a new versioned JSON.
         state.next_commit_version = next_commit_version(self.store(), &prefix).await?;
+
+        // For rowTracking-enabled tables, scan the log for the latest
+        // watermark. For everything else this stays 0 (and is unused).
+        if state.row_tracking_enabled {
+            state.row_tracking_next_id =
+                discover_row_tracking_next_id(self.store(), &prefix).await?;
+        }
 
         enforce_supported(&state)?;
         Ok(state)
@@ -288,7 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn exp09_rowtracking_is_rejected() {
+    fn exp09_rowtracking_is_accepted() {
+        // As of Phase 3 rowTracking-enabled tables are supported. discover()
+        // detects the flag; the writer's commit path emits baseRowId +
+        // defaultRowCommitVersion + a domainMetadata watermark bump.
         let actions = parse_log_jsonl(EXP09_ROWTRACKING_BOOTSTRAP).unwrap();
         let state = state_from_bootstrap_actions(&actions).unwrap();
         assert!(
@@ -296,11 +383,9 @@ mod tests {
             "rowTracking flag must be detected"
         );
         assert!(!state.deletion_vectors_enabled);
-
-        match enforce_supported(&state) {
-            Err(UniformWriterError::RowTrackingUnsupported) => {}
-            other => panic!("expected RowTrackingUnsupported, got {other:?}"),
-        }
+        // Bootstrap has no prior writes; watermark is 0.
+        assert_eq!(state.row_tracking_next_id, 0);
+        enforce_supported(&state).expect("rowTracking tables are supported in phase 3");
     }
 
     #[test]

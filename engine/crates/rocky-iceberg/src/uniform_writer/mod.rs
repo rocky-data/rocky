@@ -6,16 +6,20 @@
 //! `MSCK REPAIR TABLE ... SYNC METADATA` via the warehouse SQL surface so
 //! UniForm regenerates the corresponding Iceberg metadata.
 //!
-//! Scope today (Phase 1 + Phase 2):
+//! Scope today (Phase 1 + Phase 2 + Phase 3):
 //! - Single writer; conditional-put on the log entry covers contention.
 //! - External Delta UniForm table on an object store the writer can `PUT`.
 //! - Unpartitioned tables via [`UniformWriter::write_batch`].
 //! - Partitioned tables via [`UniformWriter::write_partitioned_batch`]
 //!   (caller pre-groups rows per partition tuple). `add.partitionValues`
 //!   is keyed by physical-name UUID, not logical name (Exp 11).
-//! - No schema evolution, no rowTracking, no deletion vectors. The writer
-//!   errors loudly if it discovers any of those at table-init time; later
-//!   phases lift each restriction.
+//! - Row-tracking-enabled tables: every `add` action emits
+//!   `baseRowId` + `defaultRowCommitVersion`, and each commit appends a
+//!   `domainMetadata` action that bumps the `rowIdHighWaterMark` (Exp 9
+//!   finding — reads projecting `_metadata.row_id` fail without these).
+//! - No schema evolution, no deletion vectors. The writer errors loudly
+//!   if it discovers DV at table-init time; UniForm + DV is forbidden
+//!   by Delta itself anyway.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +82,19 @@ pub struct UniformTableState {
     pub row_tracking_enabled: bool,
     pub deletion_vectors_enabled: bool,
     pub next_commit_version: u64,
+    /// Next row-id to allocate when writing to a row-tracking-enabled
+    /// table (the "high water mark" + 1).
+    ///
+    /// Delta requires every `add` action on a rowTracking table to carry
+    /// a `baseRowId` (the smallest row-id in the file), and a
+    /// `domainMetadata` action that bumps `rowIdHighWaterMark` to cover
+    /// the newly written rows. Without these, reads that project
+    /// `_metadata.row_id` fail with `Missing base_row_id value` (see
+    /// Exp 9 finding).
+    ///
+    /// `0` for tables without rowTracking, and for rowTracking-enabled
+    /// tables that have not yet been written to.
+    pub row_tracking_next_id: u64,
 }
 
 /// Result of a successful `write_batch()` call.
@@ -270,8 +287,33 @@ impl UniformWriter {
 
         // 3. Loop: build commit, PUT with `If-None-Match: *`, retry on 412.
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
+        let num_records = batch.num_rows();
         for attempt in 0..COND_PUT_RETRY_BUDGET {
             let target_version = state.next_commit_version;
+            // For rowTracking-enabled tables, allocate a contiguous range
+            // of row-ids for this commit's rows. `base` = current
+            // watermark; `new_high` = watermark + num_records - 1.
+            // Re-computed on every retry because state.row_tracking_next_id
+            // may advance between retries if the cond-put loser refreshes.
+            let row_tracking = if state.row_tracking_enabled {
+                if num_records == 0 {
+                    None
+                } else {
+                    let base = state.row_tracking_next_id;
+                    let new_high = base.checked_add(num_records as u64 - 1).ok_or_else(|| {
+                        UniformWriterError::DeltaLog(format!(
+                            "row_tracking_next_id={base} + {num_records} rows overflows u64"
+                        ))
+                    })?;
+                    Some(commit::RowTrackingCommit {
+                        base_row_id: base,
+                        default_row_commit_version: target_version,
+                        new_high_water_mark: new_high,
+                    })
+                }
+            } else {
+                None
+            };
             let inputs = commit::CommitInputs {
                 batch: &batch,
                 state: &state,
@@ -280,6 +322,7 @@ impl UniformWriter {
                 modification_time_millis,
                 engine_info: &self.config.engine_info,
                 partition_values,
+                row_tracking,
             };
             let commit_body = commit::build_commit_jsonl(&inputs)?;
             let log_path = Path::from(format!("{prefix}/_delta_log/{target_version:020}.json"));
@@ -304,10 +347,19 @@ impl UniformWriter {
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     let observed = discover::next_commit_version(&*self.store, &prefix).await?;
                     state.next_commit_version = observed.max(target_version.saturating_add(1));
+                    // The cond-put loser may also be racing on the
+                    // row-tracking watermark — re-scan the log so the
+                    // retry doesn't allocate row-ids that the winner
+                    // already claimed.
+                    if state.row_tracking_enabled {
+                        state.row_tracking_next_id =
+                            discover::discover_row_tracking_next_id(&*self.store, &prefix).await?;
+                    }
                     tracing::warn!(
                         attempt = attempt + 1,
                         previous_target = target_version,
                         new_target = state.next_commit_version,
+                        new_row_tracking_next_id = state.row_tracking_next_id,
                         "cond-put 412 on _delta_log entry; retrying"
                     );
                 }
@@ -555,6 +607,122 @@ mod tests {
             }
             other => panic!("expected DeltaLog error, got {other:?}"),
         }
+    }
+
+    async fn seed_row_tracking_bootstrap(store: &InMemory, prefix: &str) {
+        let bootstrap = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": [
+                    "columnMapping", "icebergCompatV2", "invariants",
+                    "appendOnly", "rowTracking", "domainMetadata"
+                ],
+            }
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-id-uuid"
+                        }},
+                        {"name": "name", "type": "string", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 2,
+                            "delta.columnMapping.physicalName": "col-name-uuid"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.universalFormat.enabledFormats": "iceberg",
+                    "delta.enableIcebergCompatV2": "true",
+                    "delta.enableRowTracking": "true"
+                },
+                "createdTime": 0
+            }
+        });
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bootstrap).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "{prefix}/_delta_log/00000000000000000000.json"
+                )),
+                PutPayload::from(Bytes::from(body.into_bytes())),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn row_tracking_round_trip_emits_base_row_id_and_watermark() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let prefix = "rt";
+        seed_row_tracking_bootstrap(&store, prefix).await;
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(PanicSqlClient),
+        );
+
+        let result = writer.write_batch(make_batch(10)).await.unwrap();
+        assert_eq!(result.num_records, 10);
+
+        // Inspect the commit. Lines: commitInfo, add, domainMetadata.
+        let log_path = object_store::path::Path::from(format!(
+            "{prefix}/_delta_log/00000000000000000001.json"
+        ));
+        let log = store.get(&log_path).await.unwrap().bytes().await.unwrap();
+        let log_text = std::str::from_utf8(&log).unwrap();
+        let lines: Vec<&str> = log_text.lines().collect();
+        assert_eq!(lines.len(), 3, "rowTracking commit must have 3 actions");
+
+        let add: Value = serde_json::from_str(lines[1]).unwrap();
+        let add_obj = add.get("add").unwrap();
+        assert_eq!(add_obj["baseRowId"], 0, "first write starts at row-id 0");
+        assert_eq!(add_obj["defaultRowCommitVersion"], 1);
+
+        let dm: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(dm["domainMetadata"]["domain"], "delta.rowTracking");
+        let cfg_raw = dm["domainMetadata"]["configuration"].as_str().unwrap();
+        let cfg: Value = serde_json::from_str(cfg_raw).unwrap();
+        // 10 rows starting at 0 → high water mark = 9.
+        assert_eq!(cfg["rowIdHighWaterMark"], 9);
+
+        // A second discover() should pick the watermark up.
+        let state2 = writer.discover().await.unwrap();
+        assert_eq!(state2.row_tracking_next_id, 10);
+
+        // A second write should allocate row-ids 10..19.
+        let result2 = writer.write_batch(make_batch(5)).await.unwrap();
+        assert_eq!(result2.num_records, 5);
+        let log_path2 = object_store::path::Path::from(format!(
+            "{prefix}/_delta_log/00000000000000000002.json"
+        ));
+        let log2 = store.get(&log_path2).await.unwrap().bytes().await.unwrap();
+        let lines2: Vec<&str> = std::str::from_utf8(&log2).unwrap().lines().collect();
+        let add2: Value = serde_json::from_str(lines2[1]).unwrap();
+        assert_eq!(add2["add"]["baseRowId"], 10);
+        let dm2: Value = serde_json::from_str(lines2[2]).unwrap();
+        let cfg2_raw = dm2["domainMetadata"]["configuration"].as_str().unwrap();
+        let cfg2: Value = serde_json::from_str(cfg2_raw).unwrap();
+        // Existing 10 rows + new 5 → high water mark = 14.
+        assert_eq!(cfg2["rowIdHighWaterMark"], 14);
     }
 
     #[tokio::test]

@@ -40,14 +40,38 @@ pub struct CommitInputs<'a> {
     /// Logical-name → stringified partition value. Empty for unpartitioned
     /// tables.
     pub partition_values: &'a HashMap<String, String>,
+    /// Row-tracking commit fields. `Some(..)` when the table has
+    /// `delta.enableRowTracking=true`; `None` otherwise. Without it,
+    /// reads that project `_metadata.row_id` against a rowTracking table
+    /// fail with `Missing base_row_id value` (Exp 9 finding).
+    pub row_tracking: Option<RowTrackingCommit>,
+}
+
+/// Row-tracking fields required on every `add` action of a
+/// rowTracking-enabled Delta table, plus the next watermark value the
+/// commit advances to.
+#[derive(Debug, Clone, Copy)]
+pub struct RowTrackingCommit {
+    /// The smallest row-id in the file written by this commit.
+    pub base_row_id: u64,
+    /// The commit version being written (for `defaultRowCommitVersion`).
+    pub default_row_commit_version: u64,
+    /// The new `rowIdHighWaterMark` after this commit — the largest
+    /// row-id allocated so far (inclusive).
+    pub new_high_water_mark: u64,
 }
 
 /// Serialize a Delta commit as JSONL bytes ready to PUT at
 /// `_delta_log/{N:020}.json`.
 ///
-/// Single `commitInfo` + single `add` action. Multi-`add` commits (e.g.
-/// writing several partitions atomically) are not Phase 2 — callers issue
-/// one commit per partition write.
+/// Lines emitted in order:
+/// 1. `commitInfo` (always)
+/// 2. `add` action (always — the new content-addressed Parquet file)
+/// 3. `domainMetadata` for `delta.rowTracking` (only when
+///    `inputs.row_tracking` is `Some`)
+///
+/// Multi-`add` commits (e.g. writing several partitions atomically) are
+/// not in scope — callers issue one commit per partition write.
 pub fn build_commit_jsonl(inputs: &CommitInputs) -> Result<Vec<u8>> {
     let stats = compute_stats(inputs.batch, inputs.state)?;
     let stats_json = serde_json::to_string(&stats)?;
@@ -68,22 +92,53 @@ pub fn build_commit_jsonl(inputs: &CommitInputs) -> Result<Vec<u8>> {
             "engineInfo": inputs.engine_info,
         }
     });
-    let add_action = json!({
-        "add": {
-            "path": inputs.add_file_path,
-            "partitionValues": partition_values_physical,
-            "size": inputs.file_size,
-            "modificationTime": inputs.modification_time_millis,
-            "dataChange": true,
-            "stats": stats_json,
-        }
-    });
+    let mut add_obj = serde_json::Map::new();
+    add_obj.insert("path".into(), Value::String(inputs.add_file_path.into()));
+    add_obj.insert(
+        "partitionValues".into(),
+        Value::Object(partition_values_physical),
+    );
+    add_obj.insert("size".into(), Value::from(inputs.file_size));
+    add_obj.insert(
+        "modificationTime".into(),
+        Value::from(inputs.modification_time_millis),
+    );
+    add_obj.insert("dataChange".into(), Value::Bool(true));
+    add_obj.insert("stats".into(), Value::String(stats_json));
+    if let Some(rt) = inputs.row_tracking {
+        // Exp 9 finding: Delta rowTracking requires every add action to
+        // carry baseRowId + defaultRowCommitVersion. Reads that project
+        // _metadata.row_id fail with `Missing base_row_id value`
+        // otherwise. Values are i64 on the wire.
+        add_obj.insert("baseRowId".into(), Value::from(rt.base_row_id as i64));
+        add_obj.insert(
+            "defaultRowCommitVersion".into(),
+            Value::from(rt.default_row_commit_version as i64),
+        );
+    }
+    let add_action = json!({ "add": Value::Object(add_obj) });
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(serde_json::to_string(&commit_info)?.as_bytes());
     out.push(b'\n');
     out.extend_from_slice(serde_json::to_string(&add_action)?.as_bytes());
     out.push(b'\n');
+
+    if let Some(rt) = inputs.row_tracking {
+        // Bump the rowIdHighWaterMark so subsequent writes (and Delta's
+        // own materialised row-id column) see the right next-id.
+        let cfg = json!({ "rowIdHighWaterMark": rt.new_high_water_mark as i64 });
+        let domain = json!({
+            "domainMetadata": {
+                "domain": "delta.rowTracking",
+                "configuration": serde_json::to_string(&cfg)?,
+                "removed": false,
+            }
+        });
+        out.extend_from_slice(serde_json::to_string(&domain)?.as_bytes());
+        out.push(b'\n');
+    }
+
     Ok(out)
 }
 
@@ -226,6 +281,7 @@ mod tests {
             row_tracking_enabled: false,
             deletion_vectors_enabled: false,
             next_commit_version: 1,
+            row_tracking_next_id: 0,
         }
     }
 
@@ -259,6 +315,7 @@ mod tests {
             modification_time_millis: 1_000_000_000_000,
             engine_info: "rocky-iceberg/test",
             partition_values: &pv,
+            row_tracking: None,
         };
         let body = build_commit_jsonl(&inputs).unwrap();
         let s = std::str::from_utf8(&body).unwrap();
@@ -289,6 +346,7 @@ mod tests {
             row_tracking_enabled: false,
             deletion_vectors_enabled: false,
             next_commit_version: 1,
+            row_tracking_next_id: 0,
         }
     }
 
@@ -322,6 +380,7 @@ mod tests {
             modification_time_millis: 0,
             engine_info: "rocky-iceberg/test",
             partition_values: &pv,
+            row_tracking: None,
         };
         let body = build_commit_jsonl(&inputs).unwrap();
         let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().collect();
@@ -361,6 +420,7 @@ mod tests {
             modification_time_millis: 0,
             engine_info: "t",
             partition_values: &pv,
+            row_tracking: None,
         };
         match build_commit_jsonl(&inputs) {
             Err(UniformWriterError::DeltaLog(msg)) => {
@@ -371,6 +431,87 @@ mod tests {
             }
             other => panic!("expected DeltaLog error, got {other:?}"),
         }
+    }
+
+    fn make_rt_state() -> UniformTableState {
+        let mut state = make_state_3col();
+        state.row_tracking_enabled = true;
+        state.row_tracking_next_id = 100;
+        state
+    }
+
+    #[test]
+    fn row_tracking_commit_adds_base_row_id_and_watermark_action() {
+        let state = make_rt_state();
+        let batch = make_batch_3col();
+        let pv = HashMap::new();
+        let inputs = CommitInputs {
+            batch: &batch,
+            state: &state,
+            add_file_path: "abc.parquet",
+            file_size: 123,
+            modification_time_millis: 0,
+            engine_info: "t",
+            partition_values: &pv,
+            row_tracking: Some(RowTrackingCommit {
+                base_row_id: 100,
+                default_row_commit_version: 7,
+                new_high_water_mark: 102,
+            }),
+        };
+        let body = build_commit_jsonl(&inputs).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "rowTracking commit is commitInfo + add + domainMetadata"
+        );
+        let add: Value = serde_json::from_str(lines[1]).unwrap();
+        let add_obj = add.get("add").unwrap();
+        // Exp 9 finding: both fields required on every add action.
+        assert_eq!(add_obj["baseRowId"], 100);
+        assert_eq!(add_obj["defaultRowCommitVersion"], 7);
+
+        let dm: Value = serde_json::from_str(lines[2]).unwrap();
+        let dm_obj = dm.get("domainMetadata").unwrap();
+        assert_eq!(dm_obj["domain"], "delta.rowTracking");
+        assert_eq!(dm_obj["removed"], false);
+        // configuration is a JSON-encoded string holding rowIdHighWaterMark.
+        let cfg_raw = dm_obj["configuration"].as_str().unwrap();
+        let cfg: Value = serde_json::from_str(cfg_raw).unwrap();
+        assert_eq!(cfg["rowIdHighWaterMark"], 102);
+    }
+
+    #[test]
+    fn unpartitioned_commit_with_no_row_tracking_emits_two_lines() {
+        // Regression: a non-rowTracking commit on an unpartitioned table
+        // still emits exactly commitInfo + add (no trailing
+        // domainMetadata).
+        let state = make_state_3col();
+        let batch = make_batch_3col();
+        let pv = HashMap::new();
+        let inputs = CommitInputs {
+            batch: &batch,
+            state: &state,
+            add_file_path: "abc.parquet",
+            file_size: 1,
+            modification_time_millis: 0,
+            engine_info: "t",
+            partition_values: &pv,
+            row_tracking: None,
+        };
+        let body = build_commit_jsonl(&inputs).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2);
+        let add: Value = serde_json::from_str(lines[1]).unwrap();
+        let add_obj = add.get("add").unwrap();
+        assert!(!add_obj.as_object().unwrap().contains_key("baseRowId"));
+        assert!(
+            !add_obj
+                .as_object()
+                .unwrap()
+                .contains_key("defaultRowCommitVersion")
+        );
     }
 
     #[test]
@@ -388,6 +529,7 @@ mod tests {
             modification_time_millis: 0,
             engine_info: "t",
             partition_values: &pv,
+            row_tracking: None,
         };
         match build_commit_jsonl(&inputs) {
             Err(UniformWriterError::DeltaLog(msg)) => {
