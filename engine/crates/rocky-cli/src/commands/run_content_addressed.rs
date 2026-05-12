@@ -515,3 +515,210 @@ mod tests {
         assert!(!arr.is_null(2));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Live integration test
+// ---------------------------------------------------------------------------
+//
+// Gated on `#[ignore]` + env vars. Exercises the full end-to-end runner
+// path against a real Databricks UniForm table. To run:
+//
+//   eval $(aws configure export-credentials --profile <profile> --format env)
+//   export AWS_DEFAULT_REGION=<region>
+//   export ROCKY_TEST_S3_BUCKET=<bucket>
+//   export ROCKY_TEST_S3_PREFIX=<path/to/table>
+//   export ROCKY_TEST_CATALOG=<catalog>
+//   export ROCKY_TEST_SCHEMA=<schema>
+//   export ROCKY_TEST_TABLE=<table>
+//   export DATABRICKS_HOST=<host>
+//   export DATABRICKS_HTTP_PATH=<http-path>
+//   export DATABRICKS_CLIENT_ID=<oauth-m2m-id>
+//   export DATABRICKS_CLIENT_SECRET=<oauth-m2m-secret>
+//   cargo test -p rocky-cli content_addressed_e2e -- --ignored
+//
+// The target table must be an external Delta UniForm table with
+// `delta.columnMapping.mode = 'name'`, unpartitioned, no rowTracking,
+// no deletion vectors, and the canonical `(id BIGINT, name STRING,
+// ts TIMESTAMP)` schema. The test is idempotent — it adds N rows per
+// run and asserts Photon `SELECT COUNT(*)` bumps by N.
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+    use rocky_databricks::auth::{Auth, AuthConfig};
+    use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+    use rocky_ir::{GovernanceConfig, ModelIr, TargetRef, TypedColumn};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct LiveEnv {
+        catalog: String,
+        schema: String,
+        table: String,
+        storage_prefix: String,
+    }
+
+    fn try_load_env() -> Option<LiveEnv> {
+        let bucket = std::env::var("ROCKY_TEST_S3_BUCKET").ok()?;
+        let prefix = std::env::var("ROCKY_TEST_S3_PREFIX").ok()?;
+        Some(LiveEnv {
+            catalog: std::env::var("ROCKY_TEST_CATALOG").ok()?,
+            schema: std::env::var("ROCKY_TEST_SCHEMA").ok()?,
+            table: std::env::var("ROCKY_TEST_TABLE").ok()?,
+            storage_prefix: format!("s3://{bucket}/{prefix}"),
+        })
+    }
+
+    fn try_load_connector() -> Option<DatabricksConnector> {
+        let host = std::env::var("DATABRICKS_HOST").ok()?;
+        let http_path = std::env::var("DATABRICKS_HTTP_PATH").ok()?;
+        let warehouse_id = ConnectorConfig::warehouse_id_from_http_path(&http_path)?;
+        let auth = Auth::from_config(AuthConfig {
+            host: host.clone(),
+            token: std::env::var("DATABRICKS_TOKEN").ok(),
+            client_id: std::env::var("DATABRICKS_CLIENT_ID").ok(),
+            client_secret: std::env::var("DATABRICKS_CLIENT_SECRET").ok(),
+        })
+        .ok()?;
+        Some(DatabricksConnector::new(
+            ConnectorConfig {
+                host,
+                warehouse_id,
+                timeout: Duration::from_secs(120),
+                retry: Default::default(),
+            },
+            auth,
+        ))
+    }
+
+    fn count_rows(warehouse: &dyn WarehouseAdapter, fqtn: &str) -> i64 {
+        let rt = tokio::runtime::Handle::current();
+        let sql = format!("SELECT COUNT(*) AS n FROM {fqtn}");
+        let result = rt
+            .block_on(warehouse.execute_query(&sql))
+            .expect("count query");
+        let cell = &result.rows[0][0];
+        cell.as_i64()
+            .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
+            .expect("count parses as i64")
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn content_addressed_e2e_live_sandbox() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        // Pre-count via a synchronous SELECT through the warehouse adapter.
+        let n_before = warehouse_dyn
+            .execute_query(&format!("SELECT COUNT(*) AS n FROM {fqtn}"))
+            .await
+            .expect("pre-count");
+        let n_before: i64 = n_before.rows[0][0]
+            .as_i64()
+            .or_else(|| n_before.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .expect("pre-count i64");
+        let _ = count_rows; // silence unused warning in non-ignored builds
+
+        // Build a 3-row batch via a SELECT … FROM VALUES that produces the
+        // canonical (id, name, ts) schema the Exp-4 sandbox expects.
+        // Different `ts` per run prevents blake3 collisions on re-runs.
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let ts_a = chrono::DateTime::from_timestamp_micros(now_micros)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.6f")
+            .to_string();
+        let ts_b = chrono::DateTime::from_timestamp_micros(now_micros + 1)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.6f")
+            .to_string();
+        let ts_c = chrono::DateTime::from_timestamp_micros(now_micros + 2)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.6f")
+            .to_string();
+        let model_sql = format!(
+            "SELECT * FROM VALUES \
+             (CAST(900401 AS BIGINT), CAST('live-runner-a' AS STRING), TIMESTAMP'{ts_a}'), \
+             (CAST(900402 AS BIGINT), CAST('live-runner-b' AS STRING), TIMESTAMP'{ts_b}'), \
+             (CAST(900403 AS BIGINT), CAST('live-runner-c' AS STRING), TIMESTAMP'{ts_c}') \
+             AS t(id, name, ts)"
+        );
+
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: env.catalog.clone(),
+                schema: env.schema.clone(),
+                table: env.table.clone(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: env.storage_prefix.clone(),
+                partition_columns: vec![],
+            },
+            vec![],
+            model_sql,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = Arc::from("live_runner_test");
+        model_ir.typed_columns = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "name".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "ts".into(),
+                data_type: RockyType::Timestamp,
+                nullable: false,
+            },
+        ];
+
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn)
+            .await
+            .expect("end-to-end runner must succeed");
+        assert_eq!(summary.num_rows, 3);
+        assert!(summary.size_bytes > 0);
+        assert_eq!(
+            summary.blake3_hash.len(),
+            64,
+            "blake3 hex digest is 64 chars"
+        );
+
+        // Post-count via Photon — the MSCK + Delta-log commit must be
+        // visible to subsequent SELECTs.
+        let n_after = warehouse_dyn
+            .execute_query(&format!("SELECT COUNT(*) AS n FROM {fqtn}"))
+            .await
+            .expect("post-count");
+        let n_after: i64 = n_after.rows[0][0]
+            .as_i64()
+            .or_else(|| n_after.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .expect("post-count i64");
+        assert_eq!(
+            n_after,
+            n_before + 3,
+            "Photon count must bump by 3 (before={n_before}, after={n_after})"
+        );
+    }
+}
