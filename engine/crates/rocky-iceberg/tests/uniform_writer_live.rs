@@ -516,3 +516,122 @@ async fn write_partitioned_batch_phase2_compatible_sandbox() {
         result.blake3_hash
     );
 }
+
+/// Live test for Phase 3 — rowTracking writer surface.
+///
+/// Requires the same env vars as the other live tests, except
+/// `ROCKY_TEST_*` must point at a **rowTracking-enabled** UniForm table.
+/// The test writes a small batch, then projects `_metadata.row_id` via
+/// Databricks SQL — this projection is what fails (`Missing base_row_id
+/// value`) when the writer omits `baseRowId` on the add action. A
+/// successful projection proves the rowTracking write path is wired
+/// correctly.
+#[tokio::test]
+#[ignore]
+async fn row_tracking_round_trip_phase3_compatible_sandbox() {
+    let Some(cfg) = try_load_config() else {
+        eprintln!("skipping: ROCKY_TEST_* env vars not set");
+        return;
+    };
+    let Some(store) = build_s3_store(&cfg) else {
+        eprintln!("skipping: failed to build S3 store from environment");
+        return;
+    };
+    let Some(connector) = connector_from_env() else {
+        eprintln!("skipping: DATABRICKS_* env vars not set");
+        return;
+    };
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: cfg.catalog.clone(),
+            schema: cfg.schema.clone(),
+            table: cfg.table.clone(),
+            prefix: cfg.prefix.clone(),
+            engine_info: "rocky-iceberg/row-tracking-live-test".into(),
+        },
+        store.clone(),
+        Arc::new(PanicSqlClient),
+    );
+    let state = writer.discover().await.expect("discover");
+    if !state.row_tracking_enabled {
+        eprintln!(
+            "skipping: this test expects a rowTracking-enabled table; \
+             target table has rowTracking off"
+        );
+        return;
+    }
+    let expected_cols: std::collections::BTreeSet<&str> =
+        ["id", "name", "ts"].into_iter().collect();
+    let actual_cols: std::collections::BTreeSet<&str> =
+        state.physical.keys().map(String::as_str).collect();
+    if expected_cols != actual_cols {
+        eprintln!("skipping: this test expects schema (id, name, ts); table has {actual_cols:?}");
+        return;
+    }
+
+    let watermark_before = state.row_tracking_next_id;
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let ids = Int64Array::from(vec![900_701_i64, 900_702, 900_703]);
+    let names = StringArray::from(vec!["rt-a", "rt-b", "rt-c"]);
+    let ts = TimestampMicrosecondArray::from(vec![now_micros, now_micros + 1, now_micros + 2])
+        .with_timezone("UTC");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names), Arc::new(ts)]).unwrap();
+
+    let written = writer.write_batch(batch).await.expect("write_batch");
+    assert_eq!(written.num_records, 3);
+
+    // MSCK so cross-engine readers see the new commit. Uses the
+    // connector we built up-front (and reuses it for the row_id read
+    // below).
+    let msck = format!(
+        "MSCK REPAIR TABLE {}.{}.{} SYNC METADATA",
+        cfg.catalog, cfg.schema, cfg.table
+    );
+    connector.execute_statement(&msck).await.expect("MSCK");
+
+    // The load-bearing assertion: `SELECT _metadata.row_id` succeeds on
+    // the new rows. This is exactly what fails ("Missing base_row_id
+    // value") when the writer omits baseRowId — Exp 9 documented it.
+    let fqtn = format!("{}.{}.{}", cfg.catalog, cfg.schema, cfg.table);
+    let sql = format!(
+        "SELECT id, _metadata.row_id AS row_id FROM {fqtn} WHERE id >= 900701 AND id <= 900703 \
+         ORDER BY id"
+    );
+    let result = connector
+        .execute_sql(&sql)
+        .await
+        .expect("row_id projection");
+    assert_eq!(result.rows.len(), 3);
+    for (i, row) in result.rows.iter().enumerate() {
+        // row_id is a BIGINT — Databricks returns it as a JSON string.
+        let row_id: i64 = row[1]
+            .as_i64()
+            .or_else(|| row[1].as_str().and_then(|s| s.parse().ok()))
+            .expect("row_id parses as i64");
+        assert_eq!(
+            row_id as u64,
+            watermark_before + i as u64,
+            "row {i}: expected row_id={}, got {row_id}",
+            watermark_before + i as u64,
+        );
+    }
+
+    // Re-discover should report watermark = watermark_before + 3.
+    let state_after = writer.discover().await.expect("re-discover");
+    assert_eq!(
+        state_after.row_tracking_next_id,
+        watermark_before + 3,
+        "watermark must advance by 3 (before={watermark_before}, after={})",
+        state_after.row_tracking_next_id,
+    );
+}

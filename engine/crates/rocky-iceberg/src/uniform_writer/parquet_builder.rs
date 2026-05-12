@@ -118,6 +118,7 @@ mod tests {
             row_tracking_enabled: false,
             deletion_vectors_enabled: false,
             next_commit_version: 1,
+            row_tracking_next_id: 0,
         }
     }
 
