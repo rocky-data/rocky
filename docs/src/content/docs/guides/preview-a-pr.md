@@ -9,6 +9,8 @@ sidebar:
 
 For the design — how Rocky picks the prune set, why CTAS today and clones tomorrow, how the sampling window works — see the [How Preview Works](/concepts/preview-internals/) concept page. For the full output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
 
+Preview surfaces the data and cost shape of a PR. For typed schema-level breaking-change detection on the same PR, pair preview with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) — and rely on the hard semantic gate that fires when the branch is promoted via `rocky branch promote`. The full flow (PR-time detection → promote-time gate → audited override) is documented in the [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
+
 ## Prerequisites
 
 You'll need:

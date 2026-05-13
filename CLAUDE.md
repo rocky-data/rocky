@@ -6,7 +6,7 @@ Single repository for the Rocky data platform — a Rust-based control plane for
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 20-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 21-crate Cargo workspace. |
 | `integrations/dagster/` | Python | Dagster integration — wraps the `rocky` binary as a `ConfigurableResource`, parses JSON output into Pydantic models. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
 | `examples/playground/` | Config only | Self-contained DuckDB sample pipeline. Used as a smoke test and a benchmark fixture. No credentials needed. |
@@ -60,7 +60,7 @@ Every Rocky CLI command that emits `--output json` is backed by a typed Rust out
 
 The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
 
-**Status:** The codegen migration is complete — all 37 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen`, enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The dagster `types.py` re-exports generated Pydantic models (soft swap) — see [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
+**Status:** The codegen migration is complete — all 55 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen`, enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The dagster `types.py` re-exports generated Pydantic models (soft swap) — see [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)

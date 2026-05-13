@@ -6,18 +6,31 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 ## Project Structure
 
-Cargo workspace with 20 crates (Rust edition 2024, MSRV 1.85):
+Cargo workspace with 21 crates (Rust edition 2024, MSRV 1.85):
+
+The `Plan` enum was deleted in the Phase 3 typed-IR migration; `ModelIr` is now the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
 ```
 engine/                         # this directory, inside the rocky monorepo
 ├── Cargo.toml                  # Workspace manifest
 ├── crates/
+│   ├── rocky-ir/               # Typed IR (data only — no runtime traits)
+│   │   └── src/
+│   │       ├── ir.rs           # ModelIr, ModelIrVariant, ProjectIr, MaterializationStrategy (FullRefresh, Incremental, Merge, MaterializedView, DynamicTable, TimeInterval), TargetRef, SourceRef, ColumnSelection, governance, grants, masks
+│   │       ├── lakehouse.rs    # LakehouseFormat, LakehouseOptions, LakehouseError (data types — DDL gen lives in rocky-core)
+│   │       ├── lineage.rs      # LineageEdge, QualifiedColumn
+│   │       ├── mask.rs         # MaskStrategy
+│   │       ├── time_grain.rs   # TimeGrain
+│   │       ├── types.rs        # RockyType, StructField, TypedColumn, common_supertype, is_assignable
+│   │       └── dag.rs          # DagNode, topological_sort, execution_layers
 │   ├── rocky-core/             # Generic SQL transformation engine
 │   │   ├── src/
-│   │   │   ├── ir.rs           # Plan, MaterializationStrategy (FullRefresh, Incremental, Merge, MaterializedView, DynamicTable, TimeInterval)
+│   │   │   ├── breaking_change.rs # Typed-IR semantic breaking-change classifier (BreakingFinding / BreakingChange / BreakingSeverity)
+│   │   │   ├── ci_diff.rs      # Structural diff used by `rocky ci-diff`
 │   │   │   ├── schema.rs       # Configurable schema pattern parsing
 │   │   │   ├── drift.rs        # Schema drift detection + graduated evolution (ALTER TABLE for safe widenings)
 │   │   │   ├── sql_gen.rs      # IR → dialect-specific SQL generation (incl. MV, dynamic table)
+│   │   │   ├── lakehouse.rs    # Dialect-aware lakehouse DDL generator (depends on the SqlDialect trait)
 │   │   │   ├── state.rs        # Embedded state store (redb): watermarks, run history, checkpoint/resume progress
 │   │   │   ├── state_sync.rs   # Remote state persistence (S3, Valkey, tiered)
 │   │   │   ├── catalog.rs      # Catalog/schema lifecycle management

@@ -474,9 +474,36 @@ rocky branch delete <name>
 rocky branch list
 rocky branch show <name>
 rocky branch compare <name> [--filter <key=value>]
+rocky branch approve <name> [--message <text>] [--out <path>]
+rocky branch promote <name> [--allow-breaking] [--base-ref <ref>]
+                            [--models <path>] [--skip-approval]
+                            [--filter <key=value>]
 ```
 
 Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
+
+### `branch approve` flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--message <text>` | `string` | (none) | Optional free-form note persisted in the approval artifact. |
+| `--out <path>` | `PathBuf` | `./.rocky/approvals/<branch>/<approval_id>.json` | Override the artifact destination path. |
+
+Writes a content-addressed approval artifact that binds the approver's git identity to the branch's current state hash. `rocky branch promote` later refuses to run unless the on-disk approvals satisfy the [`[branch.approval]`](/reference/configuration/#branchapproval) policy.
+
+### `branch promote` flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--allow-breaking` | flag | off | Bypass the semantic breaking-change gate. Always emits a `breaking_changes_allowed` audit event so the override leaves a paper trail. |
+| `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
+| `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
+| `--skip-approval` | flag | off | Bypass the approval gate. Always emits an `approval_skipped` audit event so the bypass leaves a paper trail. |
+| `--filter <key=value>` | `string` | (none) | Filter sources by component value (e.g. `--filter client=acme`). |
+
+Enumerates the configured replication pipeline's production targets, runs the optional `[branch.approval]` gate, runs the semantic breaking-change gate against `--base-ref`, then dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>` per target.
+
+The breaking-change gate vetoes the promote (exit nonzero) when any finding has `severity == "breaking"` unless `--allow-breaking` is passed. Every gate decision — block, allow-via-override, or fail-open when the gate couldn't run — is recorded in the audit trail. See [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) to surface the same findings informationally on every PR.
 
 ### Examples
 

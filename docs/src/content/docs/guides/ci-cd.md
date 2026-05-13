@@ -54,6 +54,31 @@ In GitHub Actions, post the pre-rendered Markdown block to the PR directly:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+### Semantic breaking-change findings and the promote gate
+
+`rocky ci-diff --semantic` runs the typed-IR breaking-change classifier on top of the structural diff and surfaces classified findings under `breaking_findings` in the JSON output:
+
+```bash
+rocky ci-diff --semantic --output json | jq '.breaking_findings'
+```
+
+Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking` / `warning` / `info`). `ci-diff --semantic` is **informational** — even a `breaking` finding does not change `ci-diff`'s exit code. Use it on every PR to make breaking changes visible to reviewers before promotion.
+
+The hard gate lives on `rocky branch promote`. When promoting a branch to production, Rocky runs the same classifier against `--base-ref` (default `main`); any finding with `severity == "breaking"` blocks the promote and the command exits nonzero. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking`. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
+
+```bash
+# PR-time: detect (informational)
+rocky ci-diff --semantic
+
+# Promote-time: gate (blocks on `breaking` findings)
+rocky branch promote fix-price --base-ref main
+
+# Promote-time override (audited)
+rocky branch promote fix-price --base-ref main --allow-breaking
+```
+
+See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list and the audit-event reference under [`rocky branch promote` in the JSON output reference](/reference/json-output/#rocky-branch-promote).
+
 ## 2. GitHub Actions
 
 ### Basic setup
