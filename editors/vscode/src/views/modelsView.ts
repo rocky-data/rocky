@@ -1,7 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 
-const MODELS_GLOB = "**/models/**/*.rocky";
+const MODELS_GLOB = "**/models/**/*.{rocky,sql}";
 
 /**
  * Tree view for the Rocky models in the workspace. Items are discovered by
@@ -41,7 +41,10 @@ export class ModelTreeItem extends vscode.TreeItem {
   override readonly contextValue = "rockyModel";
 
   constructor(public readonly resourceUri: vscode.Uri) {
-    const label = path.basename(resourceUri.fsPath, ".rocky");
+    const label = path.basename(
+      resourceUri.fsPath,
+      path.extname(resourceUri.fsPath),
+    );
     super(label, vscode.TreeItemCollapsibleState.None);
     this.label = label;
     this.id = vscode.workspace.asRelativePath(resourceUri);
