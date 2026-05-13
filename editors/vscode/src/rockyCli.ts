@@ -26,6 +26,10 @@ export interface RockyResult {
  * (notably `rocky doctor`) signal status via the exit code while still
  * emitting a valid JSON payload on stdout — callers that know to expect
  * this can recover the payload from the thrown error.
+ *
+ * `kind` distinguishes the error origin:
+ * - `"exit"` — the CLI exited with a non-zero code or the spawn failed.
+ * - `"parse"` — `stdout` was not valid JSON; `stderr` is `""`.
  */
 export class RockyCliError extends Error {
   constructor(
@@ -34,6 +38,7 @@ export class RockyCliError extends Error {
     public readonly exitCode: number | string | null,
     cause?: Error,
     public readonly stdout: string = "",
+    public readonly kind: "exit" | "parse" = "exit",
   ) {
     super(message, cause ? { cause } : undefined);
     this.name = "RockyCliError";
@@ -59,6 +64,8 @@ export function runRocky(
   channel.appendLine(`$ ${serverPath} ${args.join(" ")}`);
 
   return new Promise((resolve, reject) => {
+    let removeAbortListener: (() => void) | undefined;
+
     const child = execFile(
       serverPath,
       args,
@@ -69,6 +76,9 @@ export function runRocky(
         encoding: "utf8",
       },
       (err: ExecFileException | null, stdout: string, stderr: string) => {
+        // Always clean up the abort listener, regardless of success or failure.
+        removeAbortListener?.();
+
         const elapsed = Date.now() - start;
         if (err) {
           if (stderr) channel.appendLine(stderr.trimEnd());
@@ -92,13 +102,16 @@ export function runRocky(
     );
 
     if (opts.signal) {
-      const onAbort = (): void => {
-        child.kill("SIGTERM");
-      };
       if (opts.signal.aborted) {
         child.kill("SIGTERM");
       } else {
+        const onAbort = (): void => {
+          child.kill("SIGTERM");
+        };
         opts.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = (): void => {
+          opts.signal!.removeEventListener("abort", onAbort);
+        };
       }
     }
   });
@@ -117,10 +130,12 @@ export async function runRockyJson<T = unknown>(
     return JSON.parse(stdout) as T;
   } catch (err) {
     throw new RockyCliError(
-      `failed to parse rocky JSON output: ${(err as Error).message}`,
-      stdout,
+      `Rocky CLI returned malformed JSON: ${(err as Error).message}`,
+      "",
       0,
       err as Error,
+      stdout,
+      "parse",
     );
   }
 }
@@ -159,10 +174,12 @@ export async function runRockyJsonWithProgress<T = unknown>(
     return JSON.parse(stdout) as T;
   } catch (err) {
     throw new RockyCliError(
-      `failed to parse rocky JSON output: ${(err as Error).message}`,
-      stdout,
+      `Rocky CLI returned malformed JSON: ${(err as Error).message}`,
+      "",
       0,
       err as Error,
+      stdout,
+      "parse",
     );
   }
 }
