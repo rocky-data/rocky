@@ -62,6 +62,60 @@ function toVscodeDiagnostic(d: Diagnostic): vscode.Diagnostic {
 }
 
 /**
+ * Code-action provider for Rocky drift diagnostics.
+ *
+ * For every Rocky diagnostic in scope it offers:
+ * - "Rocky: Run compile to refresh" — re-runs compile on the current model
+ * - "Rocky: Accept schema change" — runs `rocky.acceptDrift` if registered,
+ *   otherwise shows an informational placeholder message.
+ */
+export class DriftCodeActionProvider implements vscode.CodeActionProvider {
+  static readonly metadata: vscode.CodeActionProviderMetadata = {
+    providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
+  };
+
+  provideCodeActions(
+    document: vscode.TextDocument,
+    _range: vscode.Range | vscode.Selection,
+    context: vscode.CodeActionContext,
+  ): vscode.CodeAction[] {
+    const rockyDiags = context.diagnostics.filter(
+      (d) => d.source === "rocky",
+    );
+    if (rockyDiags.length === 0) return [];
+
+    const actions: vscode.CodeAction[] = [];
+
+    // Quick fix 1: re-run compile
+    const compileAction = new vscode.CodeAction(
+      "Rocky: Run compile to refresh",
+      vscode.CodeActionKind.QuickFix,
+    );
+    compileAction.command = {
+      command: "rocky.compile",
+      title: "Run compile to refresh",
+    };
+    compileAction.diagnostics = rockyDiags;
+    actions.push(compileAction);
+
+    // Quick fix 2: accept drift (placeholder if the command isn't registered)
+    const acceptAction = new vscode.CodeAction(
+      "Rocky: Accept schema change",
+      vscode.CodeActionKind.QuickFix,
+    );
+    acceptAction.command = {
+      command: "rocky.acceptDrift",
+      title: "Accept schema change",
+      arguments: [document.uri],
+    };
+    acceptAction.diagnostics = rockyDiags;
+    actions.push(acceptAction);
+
+    return actions;
+  }
+}
+
+/**
  * Run `rocky compile --model <name> --output json` and update the
  * diagnostic collection for the given document.
  */
@@ -103,13 +157,16 @@ async function refreshDiagnostics(
 }
 
 /**
- * Register the drift diagnostics provider.
+ * Register the drift diagnostics provider and code-action quick fixes.
  *
  * Diagnostics are refreshed:
  * - When a model file is opened
  * - When a model file is saved (debounced to avoid rapid-fire compiles)
  *
  * The diagnostic collection is disposed when the extension deactivates.
+ *
+ * When `rocky.diagnostics.enabled` is `false` the provider is registered but
+ * immediately no-ops so existing diagnostics are cleared and no new ones fire.
  */
 export function registerDriftDiagnostics(
   context: vscode.ExtensionContext,
@@ -117,12 +174,45 @@ export function registerDriftDiagnostics(
   const collection = vscode.languages.createDiagnosticCollection("rocky-drift");
   context.subscriptions.push(collection);
 
+  // Register the code-action provider for Rocky diagnostics.
+  context.subscriptions.push(
+    vscode.languages.registerCodeActionsProvider(
+      [
+        { scheme: "file", language: "rocky" },
+        { scheme: "file", language: "sql", pattern: "**/models/**/*.sql" },
+      ],
+      new DriftCodeActionProvider(),
+      DriftCodeActionProvider.metadata,
+    ),
+  );
+
+  // Register a placeholder `rocky.acceptDrift` command so the code action
+  // never throws "command not found" when selected by the user.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("rocky.acceptDrift", () => {
+      void vscode.window.showInformationMessage(
+        "Rocky: Accept schema change is not yet implemented. Run `rocky compile` after manually updating your schema.",
+      );
+    }),
+  );
+
   // Track pending debounce timers per document URI so we can cancel on
   // rapid successive saves.
   const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /** Returns `true` when drift diagnostics are enabled in settings. */
+  function isDiagnosticsEnabled(): boolean {
+    return vscode.workspace
+      .getConfiguration("rocky")
+      .get<boolean>("diagnostics.enabled", true);
+  }
+
   /** Schedule a debounced diagnostic refresh (500ms). */
   function scheduleRefresh(document: vscode.TextDocument): void {
+    if (!isDiagnosticsEnabled()) {
+      collection.clear();
+      return;
+    }
     const key = document.uri.toString();
     const existing = pendingTimers.get(key);
     if (existing !== undefined) {
@@ -140,6 +230,7 @@ export function registerDriftDiagnostics(
   // Refresh on file open.
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((document) => {
+      if (!isDiagnosticsEnabled()) return;
       void refreshDiagnostics(document, collection);
     }),
   );
@@ -164,8 +255,21 @@ export function registerDriftDiagnostics(
     }),
   );
 
+  // When the diagnostics.enabled setting is toggled off, clear all diagnostics.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("rocky.diagnostics.enabled")) {
+        if (!isDiagnosticsEnabled()) {
+          collection.clear();
+        }
+      }
+    }),
+  );
+
   // Run on any already-open model files at activation time.
-  for (const document of vscode.workspace.textDocuments) {
-    void refreshDiagnostics(document, collection);
+  if (isDiagnosticsEnabled()) {
+    for (const document of vscode.workspace.textDocuments) {
+      void refreshDiagnostics(document, collection);
+    }
   }
 }

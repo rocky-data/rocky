@@ -5,7 +5,7 @@ import { hasRockyProject, onDidChangeRockyProject } from "./getStartedView";
 
 type Table = NonNullable<DiscoverSource["tables"]>[number];
 
-type Node = SourceNode | TableNode | MessageNode;
+type Node = SourceTypeGroupNode | SourceNode | TableNode | MessageNode;
 
 /**
  * Tree view for sources discovered by `rocky discover --output json`. Loading
@@ -48,9 +48,19 @@ export class SourcesTreeProvider implements vscode.TreeDataProvider<Node> {
       if (this.loadError) {
         return [makeMessage(`Error: ${this.loadError}`, "error")];
       }
+      const sources = this.cache ?? [];
       // Empty cache: return [] so the viewsWelcome content for rocky.sources
       // (with its "Discover Sources" CTA) takes over.
-      return (this.cache ?? []).map((s) => new SourceNode(s));
+      if (sources.length === 0) return [];
+      return groupBySourceType(sources);
+    }
+
+    if (node instanceof SourceTypeGroupNode) {
+      // If only one source in the group, show its tables directly.
+      if (node.sources.length === 1) {
+        return (node.sources[0].tables ?? []).map((t) => new TableNode(t));
+      }
+      return node.sources.map((s) => new SourceNode(s));
     }
 
     if (node instanceof SourceNode) {
@@ -77,6 +87,63 @@ export class SourcesTreeProvider implements vscode.TreeDataProvider<Node> {
       this.loading = false;
       this.emitter.fire();
     }
+  }
+}
+
+/**
+ * Groups sources by `source_type` and returns collapsible parent nodes.
+ * Source types with a single member collapse directly to their table children.
+ */
+function groupBySourceType(sources: DiscoverSource[]): SourceTypeGroupNode[] {
+  const groups = new Map<string, DiscoverSource[]>();
+  for (const s of sources) {
+    const key = s.source_type ?? "(unknown)";
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(s);
+    } else {
+      groups.set(key, [s]);
+    }
+  }
+  return Array.from(groups.entries()).map(
+    ([type, srcs]) => new SourceTypeGroupNode(type, srcs),
+  );
+}
+
+/**
+ * Top-level group node for a `source_type` (e.g. "fivetran", "airbyte").
+ * Shows total table count and the most-recent last_sync_at across members.
+ */
+class SourceTypeGroupNode extends vscode.TreeItem {
+  override readonly contextValue = "rockySourceGroup";
+
+  constructor(
+    public readonly sourceType: string,
+    public readonly sources: DiscoverSource[],
+  ) {
+    super(sourceType, vscode.TreeItemCollapsibleState.Collapsed);
+
+    const totalTables = sources.reduce(
+      (n, s) => n + (s.tables?.length ?? 0),
+      0,
+    );
+    const connectorCount = sources.length;
+    this.description =
+      connectorCount === 1
+        ? `${totalTables} table${totalTables === 1 ? "" : "s"}`
+        : `${connectorCount} connectors · ${totalTables} table${totalTables === 1 ? "" : "s"}`;
+
+    // Surface the most-recent sync time across all sources in this group.
+    const syncTimes = sources
+      .map((s) => s.last_sync_at)
+      .filter((t): t is string => typeof t === "string" && t.length > 0)
+      .sort()
+      .reverse();
+    if (syncTimes.length > 0) {
+      this.tooltip = `Last synced: ${syncTimes[0]}`;
+    }
+
+    this.iconPath = new vscode.ThemeIcon("layers");
   }
 }
 
