@@ -759,15 +759,22 @@ function renderLineageHtml(
     }
 
     // ── Open in editor button ───────────────────────────────────────────────
-    html += '<button class="open-btn" onclick="openInEditor(' + JSON.stringify(modelName) + ')">Open in Editor</button>';
+    // data-model attribute is read by the delegated click listener below —
+    // inline onclick is blocked by the CSP (script-src nonce, no unsafe-inline).
+    html += '<button class="open-btn" data-model="' + escHtml(modelName) + '">Open in Editor</button>';
 
     content.innerHTML = html;
   }
 
-  // Exposed globally so inline onclick can call it.
-  window.openInEditor = function(modelName) {
-    vscode.postMessage({ type: 'openModel', name: modelName });
-  };
+  // Delegated click listener for the "Open in Editor" button.
+  // Must be attached once after the DOM exists; event delegation handles
+  // dynamically-injected button content without inline handlers.
+  document.getElementById('side-panel-content').addEventListener('click', (e) => {
+    const btn = e.target.closest('.open-btn');
+    if (btn) {
+      vscode.postMessage({ type: 'openModel', name: btn.dataset.model });
+    }
+  });
 
   // Listen for messages from the extension host (model details response).
   window.addEventListener('message', (event) => {
