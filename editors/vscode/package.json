@@ -659,12 +659,13 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@dagrejs/dagre": "^3.0.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.2",
     "@types/vscode": "^1.116.0",
-    "@viz-js/viz": "^3.26.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
+    "d3": "^7.9.0",
     "esbuild": "^0.28.0",
     "eslint": "^10.3.0",
     "glob": "^13.0.6",
