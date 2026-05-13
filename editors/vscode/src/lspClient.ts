@@ -18,6 +18,128 @@ interface DiagnosticTotals {
   warnings: number;
 }
 
+// ---------------------------------------------------------------------------
+// Status bar segment cache — updated lazily, never on every keystroke.
+// ---------------------------------------------------------------------------
+
+interface StatusBarSegmentCache {
+  warehouse?: string;
+  lastRunAge?: string;
+  driftCount?: number;
+  branchState?: string;
+  /** Timestamp (ms) of the last cache refresh. */
+  refreshedAt: number;
+}
+
+let segmentCache: StatusBarSegmentCache = { refreshedAt: 0 };
+
+/** Minimum interval between segment-cache refreshes (30 seconds). */
+const SEGMENT_CACHE_TTL_MS = 30_000;
+
+/**
+ * Returns the list of active status bar segment IDs from settings.
+ * Returns an empty array when the setting is absent or empty (opt-in).
+ */
+function getActiveSegments(): string[] {
+  return vscode.workspace
+    .getConfiguration("rocky")
+    .get<string[]>("statusBar.segments", []);
+}
+
+/**
+ * Refresh the segment cache from persistent Rocky state files in the
+ * workspace.  This is intentionally cheap — it only reads local files,
+ * never spawns a CLI process.  The cache is considered fresh for
+ * {@link SEGMENT_CACHE_TTL_MS} ms to avoid hammering the filesystem on
+ * every `onDidChangeDiagnostics` event.
+ */
+function maybeRefreshSegmentCache(): void {
+  const now = Date.now();
+  if (now - segmentCache.refreshedAt < SEGMENT_CACHE_TTL_MS) return;
+  segmentCache.refreshedAt = now;
+
+  const segments = getActiveSegments();
+  if (segments.length === 0) return;
+
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!folder) return;
+
+  // Warehouse: read from rocky.toml if present (simple regex — no TOML parser).
+  if (segments.includes("warehouse")) {
+    try {
+      const tomlPath = path.join(folder, "rocky.toml");
+      const tomlContent = fs.readFileSync(tomlPath, "utf8");
+      const match = /type\s*=\s*["']?(\w+)["']?/.exec(tomlContent);
+      segmentCache.warehouse = match?.[1];
+    } catch {
+      segmentCache.warehouse = undefined;
+    }
+  }
+
+  // Branch state: read from `.rocky-state/branch` if it exists.
+  if (segments.includes("branchState")) {
+    try {
+      const branchFile = path.join(folder, ".rocky-state", "branch");
+      segmentCache.branchState = fs.readFileSync(branchFile, "utf8").trim();
+    } catch {
+      segmentCache.branchState = undefined;
+    }
+  }
+}
+
+/** Format seconds-since-last-run as a human-readable age string. */
+function formatRunAge(lastRunAt: string | undefined): string | undefined {
+  if (!lastRunAt) return undefined;
+  try {
+    const ms = Date.now() - new Date(lastRunAt).getTime();
+    if (ms < 0) return undefined;
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build the optional enrichment suffix for the status bar text.
+ * Each segment silently no-ops when its cached value is unavailable.
+ */
+function buildSegmentSuffix(): string {
+  const segments = getActiveSegments();
+  if (segments.length === 0) return "";
+
+  maybeRefreshSegmentCache();
+
+  const parts: string[] = [];
+
+  if (segments.includes("warehouse") && segmentCache.warehouse) {
+    parts.push(segmentCache.warehouse);
+  }
+
+  if (segments.includes("lastRunAge") && segmentCache.lastRunAge) {
+    const age = formatRunAge(segmentCache.lastRunAge);
+    if (age) parts.push(age);
+  }
+
+  if (
+    segments.includes("driftCount") &&
+    typeof segmentCache.driftCount === "number"
+  ) {
+    parts.push(`${segmentCache.driftCount} drift`);
+  }
+
+  if (segments.includes("branchState") && segmentCache.branchState) {
+    parts.push(`$(git-branch) ${segmentCache.branchState}`);
+  }
+
+  return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
+}
+
 /**
  * Current lifecycle state of the Rocky language server. Independent of
  * diagnostics — those flow separately through the status bar.
@@ -92,6 +214,12 @@ export function startLspClient(context: vscode.ExtensionContext): void {
         );
         void restartLspClient();
       }
+      // Invalidate the segment cache when the segments setting changes so the
+      // status bar updates immediately without waiting for the next TTL.
+      if (event.affectsConfiguration("rocky.statusBar.segments")) {
+        segmentCache = { refreshedAt: 0 };
+        updateStatusBarFromDiagnostics();
+      }
     }),
   );
 
@@ -149,7 +277,7 @@ async function launchClient(): Promise<void> {
 
   try {
     await client.start();
-    statusBarItem.text = "$(check) Rocky: Ready";
+    statusBarItem.text = `$(check) Rocky: Ready${buildSegmentSuffix()}`;
     statusBarItem.backgroundColor = undefined;
     setLspState("Ready");
   } catch (err) {
@@ -277,24 +405,33 @@ function updateStatusBarFromDiagnostics(): void {
   if (!client) return;
   const totals = collectDiagnosticTotals();
 
+  // Keep the driftCount segment in sync with the live diagnostic totals.
+  // This is free (no filesystem or CLI work) so we update it every time.
+  segmentCache.driftCount =
+    totals.errors + totals.warnings > 0
+      ? totals.errors + totals.warnings
+      : undefined;
+
+  const suffix = buildSegmentSuffix();
+
   if (totals.errors === 0 && totals.warnings === 0) {
-    statusBarItem.text = "$(check) Rocky: Ready";
+    statusBarItem.text = `$(check) Rocky: Ready${suffix}`;
     statusBarItem.backgroundColor = undefined;
     statusBarItem.tooltip = "Click to restart Rocky language server";
     return;
   }
 
-  const segments: string[] = [];
+  const diagSegments: string[] = [];
   if (totals.errors > 0) {
-    segments.push(`${totals.errors} error${totals.errors === 1 ? "" : "s"}`);
+    diagSegments.push(`${totals.errors} error${totals.errors === 1 ? "" : "s"}`);
   }
   if (totals.warnings > 0) {
-    segments.push(
+    diagSegments.push(
       `${totals.warnings} warning${totals.warnings === 1 ? "" : "s"}`,
     );
   }
   const icon = totals.errors > 0 ? "$(error)" : "$(warning)";
-  statusBarItem.text = `${icon} Rocky: ${segments.join(", ")}`;
+  statusBarItem.text = `${icon} Rocky: ${diagSegments.join(", ")}${suffix}`;
   statusBarItem.backgroundColor =
     totals.errors > 0
       ? new vscode.ThemeColor("statusBarItem.errorBackground")
