@@ -1296,7 +1296,8 @@ enum BranchAction {
     /// Promote a branch's tables to their production targets.
     ///
     /// Enumerates the configured replication pipeline's production
-    /// targets, runs the optional `[branch.approval]` gate, and dispatches
+    /// targets, runs the optional `[branch.approval]` gate, runs the
+    /// semantic breaking-change gate against `--base-ref`, and dispatches
     /// `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM
     /// branch__<name>.<x>` per target.
     Promote {
@@ -1309,6 +1310,17 @@ enum BranchAction {
         /// audit event so the bypass leaves a paper trail.
         #[arg(long)]
         skip_approval: bool,
+        /// Bypass the semantic breaking-change gate. Always emits a
+        /// `BreakingChangesAllowed` audit event so the override leaves a
+        /// paper trail.
+        #[arg(long)]
+        allow_breaking: bool,
+        /// Git ref to diff against for the breaking-change gate.
+        #[arg(long, default_value = "main")]
+        base_ref: String,
+        /// Models directory used by the breaking-change gate.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
 }
 
@@ -2161,13 +2173,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 name,
                 filter,
                 skip_approval,
+                allow_breaking,
+                base_ref,
+                models,
             } => {
                 rocky_cli::commands::run_branch_promote(
                     &state_path,
                     &cli.config,
+                    &models,
+                    &base_ref,
                     &name,
                     filter.as_deref(),
                     skip_approval,
+                    allow_breaking,
                     json,
                 )
                 .await

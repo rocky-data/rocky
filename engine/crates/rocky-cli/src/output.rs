@@ -3706,6 +3706,20 @@ pub enum AuditEventKind {
     /// the `ROCKY_BRANCH_APPROVAL_SKIP` env-var override. The skip reason is
     /// recorded so a future audit can tell flag-skip apart from env-skip.
     ApprovalSkipped,
+    /// Emitted when the semantic breaking-change gate blocked the promote.
+    /// The findings list is carried on the parent [`AuditEvent`] so reviewers
+    /// see exactly which structural changes triggered the block.
+    BreakingChangesBlocked,
+    /// Emitted when the semantic breaking-change gate detected one or more
+    /// `Breaking`-severity findings but the operator overrode the block via
+    /// `--allow-breaking`. Records the findings so the override leaves an
+    /// audit trail equivalent to `ApprovalSkipped`.
+    BreakingChangesAllowed,
+    /// Emitted when the semantic breaking-change gate could not run — for
+    /// example because the base ref failed to compile under the current
+    /// Rocky version. Fail-open: the gate is skipped and the promote
+    /// proceeds, but the reason is recorded so the bypass is auditable.
+    BreakingChangesGateSkipped,
 }
 
 /// Single audit-trail event emitted during `branch promote`.
@@ -3719,10 +3733,15 @@ pub struct AuditEvent {
     pub branch: String,
     pub branch_state_hash: String,
     /// Free-form context. Populated for `ApprovalSkipped` to record the
-    /// origin of the skip ("--skip-approval CLI flag" or
-    /// "ROCKY_BRANCH_APPROVAL_SKIP=1"); empty for routine state events.
+    /// origin of the skip, and for `BreakingChangesGateSkipped` to record
+    /// why the gate could not run (e.g. "base ref did not compile"). Empty
+    /// for routine state events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Breaking-change findings carried by `BreakingChangesBlocked` and
+    /// `BreakingChangesAllowed` events. Always absent for other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
 }
 
 /// One per-target promote step in [`BranchPromoteOutput::targets`].
@@ -3758,6 +3777,13 @@ pub struct BranchPromoteOutput {
     /// the reason for rejection. Surfaced even on a successful promote so
     /// operators can spot stale artifacts to clean up.
     pub approvals_rejected: Vec<RejectedApproval>,
+    /// Semantic breaking-change findings produced by the pre-promote gate.
+    /// Empty when the gate ran and found no breaking changes; absent when
+    /// the gate was skipped (compile failure on either side). When present
+    /// and non-empty either the promote was blocked or `--allow-breaking`
+    /// was set — see the audit trail for which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
     /// One entry per managed target the promote attempted, in dispatch order.
     pub targets: Vec<PromoteTarget>,
     /// Audit-trail events emitted during this invocation, in order. At

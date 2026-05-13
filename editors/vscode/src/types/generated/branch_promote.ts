@@ -18,9 +18,143 @@ export type ApproverSource = "local" | "ci_oidc" | "pat";
  */
 export type SignatureAlgorithm = "blake3_canonical_json";
 /**
+ * A single typed semantic change between two `ProjectIr` snapshots.
+ *
+ * Each variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.
+ */
+export type BreakingChange =
+  | {
+      kind: "model_removed";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "model_added";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      data_type: string;
+      kind: "column_dropped";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      data_type: string;
+      kind: "column_added";
+      model: string;
+      nullable: boolean;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_type_changed";
+      model: string;
+      /**
+       * `true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).
+       */
+      narrowing: boolean;
+      new_type: string;
+      old_type: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_nullability_changed";
+      model: string;
+      new_nullable: boolean;
+      old_nullable: boolean;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_reordered";
+      model: string;
+      new_index: number;
+      old_index: number;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "materialization_strategy_changed";
+      model: string;
+      new_strategy: string;
+      old_strategy: string;
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
+       */
+      key_kind: string;
+      kind: "materialization_key_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "replication_columns_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "partition_by_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "target_renamed";
+      model: string;
+      new: string;
+      old: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "source_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_mask_changed";
+      model: string;
+      new_strategy?: string | null;
+      old_strategy?: string | null;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "lakehouse_format_changed";
+      model: string;
+      new: string;
+      old: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "sql_body_changed";
+      model: string;
+      [k: string]: unknown;
+    };
+/**
+ * Severity classification for a single semantic change.
+ */
+export type BreakingSeverity = "breaking" | "warning" | "info";
+/**
  * Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
  */
-export type AuditEventKind = ("promote_started" | "promote_completed" | "promote_failed") | "approval_skipped";
+export type AuditEventKind =
+  | ("promote_started" | "promote_completed" | "promote_failed")
+  | "approval_skipped"
+  | "breaking_changes_blocked"
+  | "breaking_changes_allowed"
+  | "breaking_changes_gate_skipped";
 
 /**
  * JSON output for `rocky branch promote`.
@@ -40,6 +174,10 @@ export interface BranchPromoteOutput {
   audit: AuditEvent[];
   branch: string;
   branch_state_hash: string;
+  /**
+   * Semantic breaking-change findings produced by the pre-promote gate. Empty when the gate ran and found no breaking changes; absent when the gate was skipped (compile failure on either side). When present and non-empty either the promote was blocked or `--allow-breaking` was set — see the audit trail for which.
+   */
+  breaking_changes?: BreakingFinding[] | null;
   command: string;
   /**
    * True when every target's SQL succeeded.
@@ -115,11 +253,23 @@ export interface AuditEvent {
   at: string;
   branch: string;
   branch_state_hash: string;
+  /**
+   * Breaking-change findings carried by `BreakingChangesBlocked` and `BreakingChangesAllowed` events. Always absent for other kinds.
+   */
+  breaking_changes?: BreakingFinding[] | null;
   kind: AuditEventKind;
   /**
-   * Free-form context. Populated for `ApprovalSkipped` to record the origin of the skip ("--skip-approval CLI flag" or "ROCKY_BRANCH_APPROVAL_SKIP=1"); empty for routine state events.
+   * Free-form context. Populated for `ApprovalSkipped` to record the origin of the skip, and for `BreakingChangesGateSkipped` to record why the gate could not run (e.g. "base ref did not compile"). Empty for routine state events.
    */
   reason?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * A classified finding produced by [`diff_project_ir`].
+ */
+export interface BreakingFinding {
+  change: BreakingChange;
+  severity: BreakingSeverity;
   [k: string]: unknown;
 }
 /**
