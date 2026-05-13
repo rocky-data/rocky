@@ -569,6 +569,8 @@ rocky ci-diff --semantic
 
 The `breaking_findings` array is omitted from JSON output when empty or when `--semantic` is not set. Each finding carries a tagged `change` object (`kind` discriminator) and a `severity` (`breaking` / `warning` / `info`). Use `--semantic` in `ci-diff` to surface findings on every PR; rely on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) to block promotion when `severity == "breaking"`.
 
+The `breaking_findings` field is JSON-only — `--output table` still renders the structural diff but does not print the semantic findings list. Use `--output json` (and pipe through `jq`) to inspect them.
+
 ### Related Commands
 
 - [`rocky ci`](#rocky-ci) -- full compile + test for CI
