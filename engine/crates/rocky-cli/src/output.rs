@@ -3621,6 +3621,8 @@ pub struct BranchDeleteOutput {
 /// Email is sourced from `git config user.email`; name from
 /// `git config user.name`. Hostname is best-effort from the `hostname` crate
 /// and surfaced as an audit aid only — it is not part of the trust boundary.
+/// Set `ROCKY_SCRUB_HOST` in the environment to replace the hostname with
+/// `"redacted"` when recording public demos.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApproverIdentity {
     pub email: String,

@@ -271,15 +271,28 @@ fn run_git_config(key: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Resolve the hostname surfaced in [`ApproverIdentity::host`].
+///
+/// When `scrub` is true the hostname lookup is skipped and the string
+/// `"redacted"` is returned instead. Pure helper so the env-var policy can
+/// be unit-tested without racy `std::env::set_var` calls.
+fn pick_host(scrub: bool) -> String {
+    if scrub {
+        return "redacted".to_string();
+    }
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Build an [`ApproverIdentity`] from the local environment. Used by both
 /// `branch approve` (signing identity) and `branch promote` (actor on every
 /// audit event).
 fn approver_identity() -> Result<ApproverIdentity> {
     let (email, name) = git_identity()?;
-    let host = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string());
+    let scrub = std::env::var_os("ROCKY_SCRUB_HOST").is_some();
+    let host = pick_host(scrub);
     Ok(ApproverIdentity {
         email,
         name,
@@ -1146,6 +1159,24 @@ mod tests {
         assert!(validate_branch_name("feat_new_join").is_ok());
         assert!(validate_branch_name("hotfix.2026-04-20").is_ok());
         assert!(validate_branch_name("a").is_ok());
+    }
+
+    /// `pick_host(true)` always returns the literal `"redacted"` placeholder
+    /// — preserving the `host: String` schema while keeping the machine
+    /// hostname out of audit JSON when `ROCKY_SCRUB_HOST` is set.
+    #[test]
+    fn pick_host_scrub_returns_redacted_placeholder() {
+        assert_eq!(pick_host(true), "redacted");
+    }
+
+    /// `pick_host(false)` returns a non-empty, non-redacted string — either
+    /// the real hostname or the `"unknown"` fallback. We avoid asserting the
+    /// exact value because it varies by machine.
+    #[test]
+    fn pick_host_unscrubbed_is_not_redacted() {
+        let h = pick_host(false);
+        assert!(!h.is_empty());
+        assert_ne!(h, "redacted");
     }
 
     #[test]
