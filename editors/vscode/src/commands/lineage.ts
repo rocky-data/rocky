@@ -4,6 +4,7 @@ import { getWorkspaceFolder } from "../config";
 import { getExtensionUri } from "../extensionState";
 import { runRocky } from "../rockyCli";
 import type { LineageOutput } from "../types/generated/lineage";
+import type { ModelHistoryOutput } from "../types/generated/model_history";
 import { resolveModelName } from "./ui";
 
 const VIEW_TYPE = "rockyLineage";
@@ -15,6 +16,11 @@ interface SerializedState {
   panY?: number;
   viewMode?: "model" | "column";
 }
+
+/** Message types sent from the extension host to the webview. */
+type HostToWebviewMessage =
+  | { type: "modelDetails"; model: string; history: ModelHistoryOutput | null; errorMsg?: string }
+  | { type: "modelDetailsError"; model: string; errorMsg: string };
 
 export async function showLineage(arg?: unknown): Promise<void> {
   // When invoked from the tree-view context menu, `arg` is a ModelTreeItem.
@@ -91,18 +97,49 @@ async function populatePanel(
 
   panel.webview.html = renderLoadingHtml(panel.webview, modelName);
 
-  // Resolve clicks from the webview by globbing the workspace for the model file
-  // and opening the first match. Disposed when the panel closes.
+  // Handle messages from the webview.
   panel.webview.onDidReceiveMessage(
     async (msg: { type?: string; name?: string }) => {
-      if (msg?.type !== "openModel" || typeof msg.name !== "string") return;
-      const matches = await vscode.workspace.findFiles(
-        `**/models/**/${msg.name}.{rocky,sql}`,
-        undefined,
-        1,
-      );
-      if (matches[0]) {
-        void vscode.commands.executeCommand("vscode.open", matches[0]);
+      if (!msg?.type) return;
+
+      // Open a model file in the editor.
+      if (msg.type === "openModel" && typeof msg.name === "string") {
+        const matches = await vscode.workspace.findFiles(
+          `**/models/**/${msg.name}.{rocky,sql}`,
+          undefined,
+          1,
+        );
+        if (matches[0]) {
+          void vscode.commands.executeCommand("vscode.open", matches[0]);
+        }
+        return;
+      }
+
+      // Fetch model history for the side panel.
+      if (msg.type === "loadModelDetails" && typeof msg.name === "string") {
+        const clickedModel = msg.name;
+        let history: ModelHistoryOutput | null = null;
+        let errorMsg: string | undefined;
+
+        try {
+          const args: string[] = [];
+          if (workspaceFolder) {
+            args.push("--config", `${workspaceFolder}/rocky.toml`);
+          }
+          args.push("history", "--model", clickedModel, "--output", "json");
+          const { stdout } = await runRocky(args, { cwd: workspaceFolder });
+          history = JSON.parse(stdout) as ModelHistoryOutput;
+        } catch (err) {
+          errorMsg = (err as Error).message;
+        }
+
+        const reply: HostToWebviewMessage = {
+          type: "modelDetails",
+          model: clickedModel,
+          history,
+          errorMsg,
+        };
+        void panel.webview.postMessage(reply);
       }
     },
     undefined,
@@ -265,6 +302,10 @@ function renderLineageHtml(
       background: var(--vscode-panel-border);
       margin: 0 4px;
     }
+    /* Main content area: graph + side panel */
+    #main-content {
+      flex: 1; display: flex; overflow: hidden;
+    }
     #viewport {
       flex: 1; overflow: hidden; position: relative;
       cursor: grab;
@@ -276,6 +317,86 @@ function renderLineageHtml(
     #graph-container svg {
       display: block; width: 100%; height: 100%;
     }
+    /* Side panel */
+    #side-panel {
+      width: 320px;
+      min-width: 320px;
+      border-left: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    #side-panel-header {
+      padding: 10px 12px 6px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--vscode-descriptionForeground);
+      flex-shrink: 0;
+    }
+    #side-panel-content {
+      flex: 1; overflow-y: auto; padding: 12px;
+    }
+    .panel-empty {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      text-align: center;
+      margin-top: 40px;
+    }
+    .panel-loading {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      text-align: center;
+      margin-top: 40px;
+    }
+    .panel-section {
+      margin-bottom: 14px;
+    }
+    .panel-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 5px;
+    }
+    .panel-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+    .panel-row .label { color: var(--vscode-descriptionForeground); }
+    .panel-row .value { font-weight: 500; word-break: break-all; }
+    .status-ok    { color: var(--vscode-charts-green, #89d185); }
+    .status-fail  { color: var(--vscode-errorForeground); }
+    .status-other { color: var(--vscode-charts-yellow, #cca700); }
+    .column-list {
+      font-size: 11px;
+      list-style: none;
+      margin: 0; padding: 0;
+    }
+    .column-list li {
+      padding: 2px 0;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      display: flex; justify-content: space-between;
+    }
+    .column-list li:last-child { border-bottom: none; }
+    .col-name { font-family: var(--vscode-editor-font-family, monospace); }
+    .col-type { color: var(--vscode-descriptionForeground); }
+    .panel-error { color: var(--vscode-errorForeground); font-size: 12px; }
+    .open-btn {
+      width: 100%; margin-top: 8px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    .open-btn:hover { background: var(--vscode-button-hoverBackground); }
     /* Node styling — use VS Code token colours */
     .node rect {
       fill: var(--vscode-badge-background);
@@ -292,6 +413,10 @@ function renderLineageHtml(
     }
     .node.leaf rect {
       fill: var(--vscode-charts-green, var(--vscode-badge-background));
+    }
+    .node.selected rect {
+      stroke: var(--vscode-focusBorder, #007fd4);
+      stroke-width: 3px;
     }
     .node { cursor: pointer; }
     .node:hover rect {
@@ -347,8 +472,16 @@ function renderLineageHtml(
     <button id="zoom-fit" title="Fit to view (F)">Fit</button>
     <button id="export-svg" title="Export as SVG">Export SVG</button>
   </header>
-  <div id="viewport">
-    <div id="graph-container"><svg id="graph-svg"></svg></div>
+  <div id="main-content">
+    <div id="viewport">
+      <div id="graph-container"><svg id="graph-svg"></svg></div>
+    </div>
+    <div id="side-panel">
+      <div id="side-panel-header">Node Details</div>
+      <div id="side-panel-content">
+        <p class="panel-empty">Click a node for details.</p>
+      </div>
+    </div>
   </div>
   <div id="status" class="status">Rendering…</div>
 
@@ -364,6 +497,11 @@ function renderLineageHtml(
   const svgEl   = document.getElementById('graph-svg');
   const focalModel = rawData.model;
 
+  // Build a column lookup from LineageOutput.columns (array of {name}).
+  // key: model name (qualified), value: array of column name strings.
+  // NOTE: LineageOutput.columns only contains focal model columns.
+  const focalColumns = (rawData.columns || []).map(c => c.name);
+
   // Restore saved state (zoom/pan/viewMode) from prior session if available.
   const saved = vscode.getState() || {};
 
@@ -376,11 +514,9 @@ function renderLineageHtml(
   const { dagre, d3 } = window.dagreD3;
 
   // ── Current state ─────────────────────────────────────────────────────────────
-  // "model" is the default — less noisy, matches typical lineage expectation.
   let currentViewMode = (saved.viewMode === 'column') ? 'column' : 'model';
+  let selectedNodeModel = null; // currently selected model name (for side panel)
 
-  // Merged state object — updated incrementally so each setState call
-  // preserves all fields.
   let currentState = {
     modelName: focalModel,
     scale: saved.scale,
@@ -397,7 +533,6 @@ function renderLineageHtml(
   // ── Graph building ────────────────────────────────────────────────────────────
 
   function buildModelGraph() {
-    // Aggregate column-level edges into model-level edges (deduplicated).
     const g = new dagre.graphlib.Graph({ multigraph: false });
     g.setGraph({
       rankdir: 'LR',
@@ -428,7 +563,7 @@ function renderLineageHtml(
     for (const edge of rawData.edges) {
       const src = edge.source.model;
       const tgt = edge.target.model;
-      if (src === tgt) continue; // skip self-edges
+      if (src === tgt) continue;
 
       hasOutgoing.add(src);
       hasIncoming.add(tgt);
@@ -455,7 +590,6 @@ function renderLineageHtml(
           height: 36, rx: 4, ry: 4,
         });
       }
-      // dagre deduplicates by (src, tgt) key in a non-multigraph
       if (!g.hasEdge(src, tgt)) {
         g.setEdge(src, tgt, {});
       }
@@ -530,9 +664,119 @@ function renderLineageHtml(
     return { g, hasIncoming, hasOutgoing };
   }
 
-  // ── Rendering ─────────────────────────────────────────────────────────────────
-  // Arrow marker + zoom are set up once; render() reuses them.
+  // ── Side panel ────────────────────────────────────────────────────────────────
 
+  function showPanelLoading(modelName) {
+    const content = document.getElementById('side-panel-content');
+    content.innerHTML = '<p class="panel-loading">Loading details for <strong>' +
+      escHtml(modelName) + '</strong>…</p>';
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function formatDuration(ms) {
+    if (ms < 1000) return ms + 'ms';
+    return (ms / 1000).toFixed(1) + 's';
+  }
+
+  function formatTimestamp(isoStr) {
+    if (!isoStr) return '—';
+    try {
+      const d = new Date(isoStr);
+      const now = new Date();
+      const diffMs = now - d;
+      const diffSec = Math.floor(diffMs / 1000);
+      if (diffSec < 60) return diffSec + 's ago';
+      const diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return diffMin + 'm ago';
+      const diffHr = Math.floor(diffMin / 60);
+      if (diffHr < 24) return diffHr + 'h ago';
+      const diffDay = Math.floor(diffHr / 24);
+      return diffDay + 'd ago';
+    } catch {
+      return isoStr;
+    }
+  }
+
+  function statusClass(s) {
+    const lower = (s || '').toLowerCase();
+    if (lower === 'success' || lower === 'ok') return 'status-ok';
+    if (lower === 'failed' || lower === 'failure' || lower === 'error') return 'status-fail';
+    return 'status-other';
+  }
+
+  function renderPanelDetails(modelName, history, errorMsg) {
+    const content = document.getElementById('side-panel-content');
+    let html = '';
+
+    // ── Model name ──────────────────────────────────────────────────────────
+    html += '<div class="panel-section">';
+    html += '<div class="panel-section-title">Model</div>';
+    html += '<div class="panel-row"><span class="value">' + escHtml(modelName) + '</span></div>';
+    html += '</div>';
+
+    // ── Last run status (from history) ──────────────────────────────────────
+    html += '<div class="panel-section">';
+    html += '<div class="panel-section-title">Last Run</div>';
+
+    if (errorMsg && !history) {
+      html += '<p class="panel-error">History unavailable: ' + escHtml(errorMsg) + '</p>';
+    } else if (history && history.executions && history.executions.length > 0) {
+      const last = history.executions[0];
+      const cls = statusClass(last.status);
+      html += '<div class="panel-row"><span class="label">Status</span>' +
+        '<span class="value ' + cls + '">' + escHtml(last.status) + '</span></div>';
+      html += '<div class="panel-row"><span class="label">When</span>' +
+        '<span class="value">' + escHtml(formatTimestamp(last.started_at)) + '</span></div>';
+      html += '<div class="panel-row"><span class="label">Duration</span>' +
+        '<span class="value">' + escHtml(formatDuration(last.duration_ms)) + '</span></div>';
+      if (last.rows_affected != null) {
+        html += '<div class="panel-row"><span class="label">Rows</span>' +
+          '<span class="value">' + escHtml(String(last.rows_affected)) + '</span></div>';
+      }
+    } else {
+      html += '<div class="panel-row"><span class="label">No runs recorded</span></div>';
+    }
+    html += '</div>';
+
+    // ── Columns (from LineageOutput — only available for the focal model) ──
+    if (modelName === focalModel && focalColumns.length > 0) {
+      html += '<div class="panel-section">';
+      html += '<div class="panel-section-title">Columns (' + focalColumns.length + ')</div>';
+      html += '<ul class="column-list">';
+      for (const col of focalColumns) {
+        html += '<li><span class="col-name">' + escHtml(col) + '</span></li>';
+      }
+      html += '</ul>';
+      html += '</div>';
+    }
+
+    // ── Open in editor button ───────────────────────────────────────────────
+    html += '<button class="open-btn" onclick="openInEditor(' + JSON.stringify(modelName) + ')">Open in Editor</button>';
+
+    content.innerHTML = html;
+  }
+
+  // Exposed globally so inline onclick can call it.
+  window.openInEditor = function(modelName) {
+    vscode.postMessage({ type: 'openModel', name: modelName });
+  };
+
+  // Listen for messages from the extension host (model details response).
+  window.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (!msg || msg.type !== 'modelDetails') return;
+    renderPanelDetails(msg.model, msg.history, msg.errorMsg);
+  });
+
+  // ── Rendering ─────────────────────────────────────────────────────────────────
   const defs = d3.select(svgEl).append('defs');
   defs.append('marker')
     .attr('id', 'arrow')
@@ -547,7 +791,6 @@ function renderLineageHtml(
 
   const graphGroup = d3.select(svgEl).append('g');
 
-  // d3-zoom — attach once; render() updates the viewBox
   const zoom = d3.zoom()
     .scaleExtent([0.1, 8])
     .on('zoom', (event) => {
@@ -567,7 +810,6 @@ function renderLineageHtml(
   let svgHeight = 0;
 
   function render(viewMode) {
-    // Clear previous graph contents (not defs or the root graphGroup)
     graphGroup.selectAll('*').remove();
 
     const built = viewMode === 'model' ? buildModelGraph() : buildColumnGraph();
@@ -615,9 +857,12 @@ function renderLineageHtml(
       const n = g.node(nodeId);
       const isSource = !hasIncoming.has(nodeId);
       const isLeaf   = !hasOutgoing.has(nodeId);
+      // Re-apply selection highlight if this node was selected before re-render
+      const isSelected = (n.model === selectedNodeModel);
       let cls = n.focal ? 'node focal' : 'node';
       if (!n.focal && isSource) cls += ' source';
       else if (!n.focal && isLeaf) cls += ' leaf';
+      if (isSelected) cls += ' selected';
 
       const ng = nodeGroup.append('g')
         .attr('class', cls)
@@ -629,7 +874,7 @@ function renderLineageHtml(
         .attr('rx', n.rx || 4)
         .attr('ry', n.ry || 4);
 
-      ng.append('title').text('Open ' + n.model);
+      ng.append('title').text('Click to see details for ' + n.model);
 
       const lines = n.label.split('\\n');
       const lineHeight = 14;
@@ -644,9 +889,18 @@ function renderLineageHtml(
           .text(line);
       });
 
+      // Click: open side panel (not the file directly)
       ng.on('click', (e) => {
         e.stopPropagation();
-        vscode.postMessage({ type: 'openModel', name: n.model });
+        // Update selected state
+        selectedNodeModel = n.model;
+        // Update visual selection — toggle class on all nodes
+        d3.selectAll('.node').classed('selected', false);
+        ng.classed('selected', true);
+        // Show loading state in panel
+        showPanelLoading(n.model);
+        // Request details from extension host
+        vscode.postMessage({ type: 'loadModelDetails', name: n.model });
       });
     }
 
@@ -657,17 +911,18 @@ function renderLineageHtml(
       status.textContent =
         nodeCount + ' model(s) · ' + edgeCount + ' dep(s) · ' +
         rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
-        'drag to pan · scroll to zoom · click a node to open · F to fit · 0 to reset';
+        'click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
     } else {
       const edgeCount = rawData.edges.length;
-      status.textContent =
-        edgeCount + ' column edge(s) · ' +
-        rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
-        'drag to pan · scroll to zoom · click a node to open · F to fit · 0 to reset';
       if (edgeCount === 0) {
         status.textContent =
           'No column-level edges found for ' + focalModel +
           '. The model may have no typed columns or no upstream dependencies.';
+      } else {
+        status.textContent =
+          edgeCount + ' column edge(s) · ' +
+          rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
+          'click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
       }
     }
   }
@@ -675,7 +930,6 @@ function renderLineageHtml(
   // ── Initial render ────────────────────────────────────────────────────────────
   render(currentViewMode);
 
-  // Update toggle button appearance
   function updateModeButtons() {
     document.getElementById('mode-model').classList.toggle('active', currentViewMode === 'model');
     document.getElementById('mode-column').classList.toggle('active', currentViewMode === 'column');
