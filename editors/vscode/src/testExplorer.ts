@@ -140,10 +140,16 @@ async function runHandler(
       }
     } catch (err) {
       const elapsed = Date.now() - start;
-      const detail =
-        err instanceof RockyCliError
-          ? err.stderr.trim() || err.message
-          : (err as Error).message;
+      let detail: string;
+      if (err instanceof RockyCliError) {
+        if (err.kind === "parse") {
+          detail = err.message;
+        } else {
+          detail = err.stderr.trim() || err.message;
+        }
+      } else {
+        detail = (err as Error).message;
+      }
       run.errored(item, new vscode.TestMessage(detail), elapsed);
     } finally {
       cancelSub.dispose();

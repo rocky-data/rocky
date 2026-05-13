@@ -67,6 +67,7 @@ export function registerGetStartedView(
     showCollapseAll: false,
   });
   context.subscriptions.push(view);
+  context.subscriptions.push(projectChangeEmitter);
 
   const refreshContext = async (): Promise<void> => {
     const has = await detectProject();

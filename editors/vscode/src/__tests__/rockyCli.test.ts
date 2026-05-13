@@ -136,6 +136,51 @@ describe("runRocky", () => {
     controller.abort();
     expect(killSpy).toHaveBeenCalledWith("SIGTERM");
   });
+
+  it("removes the abort listener after the command completes successfully", async () => {
+    const killSpy = vi.fn();
+    let storedCallback: ExecCallback | undefined;
+    execFileMock.mockImplementationOnce(
+      (_cmd: string, _args: string[], _opts: unknown, cb: ExecCallback) => {
+        storedCallback = cb;
+        return { kill: killSpy };
+      },
+    );
+
+    const controller = new AbortController();
+    const promise = runRocky(["run"], { signal: controller.signal });
+
+    // Simulate successful completion.
+    storedCallback!(null, '{"ok":true}', "");
+    await promise;
+
+    // After success, aborting the signal must NOT kill the (already-done) child.
+    controller.abort();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it("removes the abort listener after the command fails", async () => {
+    const killSpy = vi.fn();
+    let storedCallback: ExecCallback | undefined;
+    execFileMock.mockImplementationOnce(
+      (_cmd: string, _args: string[], _opts: unknown, cb: ExecCallback) => {
+        storedCallback = cb;
+        return { kill: killSpy };
+      },
+    );
+
+    const controller = new AbortController();
+    const promise = runRocky(["run"], { signal: controller.signal });
+
+    // Simulate failure.
+    const err = Object.assign(new Error("exit 1"), { code: 1 });
+    storedCallback!(err, "", "error output");
+    await expect(promise).rejects.toBeInstanceOf(RockyCliError);
+
+    // After failure, aborting must NOT kill the already-done child.
+    controller.abort();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("runRockyJson", () => {
@@ -155,6 +200,26 @@ describe("runRockyJson", () => {
   it("throws RockyCliError on invalid JSON", async () => {
     mockSuccess("not json at all");
     await expect(runRockyJson(["doctor"])).rejects.toBeInstanceOf(RockyCliError);
+  });
+
+  it("sets kind='parse' and empty stderr on JSON parse failure", async () => {
+    mockSuccess("not json at all");
+    await expect(runRockyJson(["doctor"])).rejects.toMatchObject({
+      kind: "parse",
+      stderr: "",
+    });
+  });
+
+  it("parse error message does not contain the raw JSON output", async () => {
+    const rawOutput = '{"broken": true, some garbage}';
+    mockSuccess(rawOutput);
+    const err = await runRockyJson(["doctor"]).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RockyCliError);
+    expect((err as RockyCliError).stderr).toBe("");
+    // The message must NOT embed the raw output verbatim.
+    expect((err as RockyCliError).message).not.toContain(rawOutput);
+    // The raw output is available on stdout for diagnostics, but not in the user-visible message.
+    expect((err as RockyCliError).stdout).toBe(rawOutput);
   });
 });
 
