@@ -848,6 +848,143 @@ Branches use three distinct output shapes — see [`rocky branch`](/reference/co
 
 ---
 
+### `rocky branch approve`
+
+Writes a content-addressed approval artifact that binds the approver's git identity to a branch's current state hash. The artifact path is returned so callers can stage it for review.
+
+```json
+{
+  "version": "1.31.0",
+  "command": "branch approve",
+  "artifact": {
+    "version": "1",
+    "branch": "fix-price",
+    "branch_state_hash": "sha256:9a4f…",
+    "approver": {
+      "name": "Hugo Correia",
+      "email": "hugo@example.com"
+    },
+    "signed_at": "2026-05-13T10:14:22Z",
+    "message": "ready to promote",
+    "signature": {
+      "algorithm": "git_identity",
+      "value": "…"
+    }
+  },
+  "artifact_path": "./.rocky/approvals/fix-price/01HXZ…json"
+}
+```
+
+`signature.algorithm` reflects whichever signing identity Rocky could resolve at sign time. `message` is omitted when `--message` is not passed.
+
+---
+
+### `rocky branch promote`
+
+Promotes a branch's tables to their production targets. Emits the approval and semantic-breaking-change gate decisions in `audit`, the per-target SQL outcomes in `targets`, and a top-level `success` flag.
+
+```json
+{
+  "version": "1.31.0",
+  "command": "branch promote",
+  "branch": "fix-price",
+  "branch_state_hash": "sha256:9a4f…",
+  "approvals_used": [ /* ApprovalArtifact, see `branch approve` above */ ],
+  "approvals_rejected": [],
+  "breaking_changes": [
+    {
+      "change": {
+        "kind": "column_dropped",
+        "model": "analytics.marts.fct_orders",
+        "column": "legacy_status",
+        "data_type": "STRING"
+      },
+      "severity": "breaking"
+    }
+  ],
+  "targets": [
+    {
+      "target": "analytics.marts.fct_orders",
+      "source": "analytics.branch__fix-price.fct_orders",
+      "statement": "CREATE OR REPLACE TABLE analytics.marts.fct_orders AS SELECT * FROM analytics.branch__fix-price.fct_orders",
+      "succeeded": true
+    }
+  ],
+  "audit": [
+    {
+      "kind": "promote_started",
+      "at": "2026-05-13T10:20:00Z",
+      "actor": { "name": "Hugo Correia", "email": "hugo@example.com" },
+      "branch": "fix-price",
+      "branch_state_hash": "sha256:9a4f…"
+    },
+    {
+      "kind": "breaking_changes_allowed",
+      "at": "2026-05-13T10:20:00Z",
+      "actor": { "name": "Hugo Correia", "email": "hugo@example.com" },
+      "branch": "fix-price",
+      "branch_state_hash": "sha256:9a4f…",
+      "breaking_changes": [ /* same shape as top-level `breaking_changes` */ ]
+    },
+    {
+      "kind": "promote_completed",
+      "at": "2026-05-13T10:20:02Z",
+      "actor": { "name": "Hugo Correia", "email": "hugo@example.com" },
+      "branch": "fix-price",
+      "branch_state_hash": "sha256:9a4f…"
+    }
+  ],
+  "success": true
+}
+```
+
+**Top-level fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `branch` | string | Branch name being promoted. |
+| `branch_state_hash` | string | Content-addressed hash of the branch's current state — the same value approval artifacts are bound to. |
+| `approvals_used` | array | Approval artifacts that satisfied the `[branch.approval]` gate at promote time. Empty when the gate was disabled or skipped. |
+| `approvals_rejected` | array | Approval artifacts loaded from disk that failed verification, with the reason for rejection. Surfaced even on success so operators can clean up stale artifacts. |
+| `breaking_changes` | array \| absent | Semantic findings produced by the pre-promote gate. Absent when the gate was skipped (compile failure on either side). Empty array when the gate ran and found no breaking changes. When present and non-empty, either the promote was blocked or `--allow-breaking` was set — check `audit`. |
+| `targets` | array | One entry per managed target the promote attempted, in dispatch order. Each carries `target`, `source`, `statement`, `succeeded`, and an optional `error`. |
+| `audit` | array | Audit-trail events emitted during this invocation, in order. |
+| `success` | boolean | True when every target's SQL succeeded. |
+
+**`AuditEvent.kind` values:**
+
+| Kind | Meaning |
+|------|---------|
+| `promote_started` | Promote began. |
+| `promote_completed` | Promote finished successfully (every target's SQL succeeded). |
+| `promote_failed` | A target's SQL failed; subsequent targets did not run. |
+| `approval_skipped` | The approval gate was bypassed via `--skip-approval` or the `ROCKY_BRANCH_APPROVAL_SKIP` env-var override. The `reason` field records which. |
+| `breaking_changes_blocked` | The semantic breaking-change gate blocked the promote. `breaking_changes` carries the findings that triggered the block. Exit code is nonzero. |
+| `breaking_changes_allowed` | The gate detected one or more `breaking`-severity findings but the operator overrode via `--allow-breaking`. `breaking_changes` carries the findings. |
+| `breaking_changes_gate_skipped` | The gate could not run (e.g. base ref failed to compile under the current Rocky version). Fail-open: the gate is skipped and the promote proceeds, but `reason` records why so the bypass is auditable. |
+
+`breaking_changes` is attached to `breaking_changes_blocked` and `breaking_changes_allowed` events; it is absent on every other kind. The top-level `breaking_changes` and the per-event `breaking_changes` carry the same `BreakingFinding` shape.
+
+**`BreakingFinding` shape** (also emitted by [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff)):
+
+```json
+{
+  "change": {
+    "kind": "column_type_changed",
+    "model": "analytics.marts.fct_orders",
+    "column": "amount_cents",
+    "old_type": "BIGINT",
+    "new_type": "INT",
+    "narrowing": true
+  },
+  "severity": "breaking"
+}
+```
+
+`change.kind` is a tagged discriminator. Common variants: `model_removed`, `model_added`, `column_dropped`, `column_added`, `column_type_changed`, `column_nullability_changed`, `column_reordered`, `materialization_strategy_changed`, `materialization_key_changed`, `replication_columns_changed`, `partition_by_changed`, `target_renamed`, `source_changed`, `column_mask_changed`, `lakehouse_format_changed`, `sql_body_changed`. Each variant carries the minimum identifying context (model + before/after values) needed to render a useful message without re-loading the IR. `severity` is one of `breaking`, `warning`, `info`.
+
+---
+
 ### `rocky metrics <model>`
 
 Quality metrics for a model, including snapshots, alerts, and column trends.

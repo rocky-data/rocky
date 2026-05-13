@@ -138,10 +138,10 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 ## CLI Commands (38+)
 
 ### Core Pipeline
-`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch` · `preview create` · `preview diff` · `preview cost`
+`init` · `validate` · `discover` · `plan` · `run` · `compare` · `state` · `branch` (incl. `branch approve`, `branch promote --allow-breaking --base-ref --models --skip-approval`) · `preview create` · `preview diff` · `preview cost`
 
 ### Modeling & Compilation
-`compile` · `lineage` · `lineage-diff` · `test` · `ci` · `ci-diff` · `export-schemas`
+`compile` · `lineage` · `lineage-diff` · `test` · `ci` · `ci-diff` (with `--semantic` for typed-IR breaking-change findings) · `export-schemas`
 
 ### AI
 `ai` (generate) · `ai-sync` · `ai-explain` · `ai-test`

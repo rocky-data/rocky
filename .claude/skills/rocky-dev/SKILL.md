@@ -11,7 +11,7 @@ Rocky is a monorepo with three shipping subprojects + a playground catalog. Most
 
 | Path | Language | Ships as | Build | Test |
 |---|---|---|---|---|
-| `engine/` | Rust (20 crates) | `rocky` CLI binary | `cargo build --release` | `cargo test` |
+| `engine/` | Rust (21 crates) | `rocky` CLI binary | `cargo build --release` | `cargo test` |
 | `integrations/dagster/` | Python | `dagster-rocky` wheel | `uv build --wheel` | `uv run pytest` |
 | `editors/vscode/` | TypeScript | Rocky VSIX | `npm run compile` | `npm run test:unit` |
 | `examples/playground/` | Config | (not published) | `./run.sh` per POC | `./scripts/run-all-duckdb.sh` |

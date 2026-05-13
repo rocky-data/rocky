@@ -493,6 +493,7 @@ rocky ci-diff [base_ref] [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--semantic` | flag | off | Also run the typed-IR semantic breaking-change classifier and surface findings under `breaking_findings` in the JSON output. Informational only — even a `Breaking` finding does not change `ci-diff`'s exit code. The hard gate lives on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch). |
 
 ### Examples
 
@@ -504,7 +505,7 @@ rocky ci-diff
 
 ```json
 {
-  "version": "1.7.0",
+  "version": "1.31.0",
   "command": "ci-diff",
   "base_ref": "main",
   "head_ref": "HEAD",
@@ -535,11 +536,45 @@ rocky ci-diff release/2026-04 --models src/models
 
 The `markdown` field holds a ready-to-post report; in a GitHub Actions workflow you can `jq -r .markdown` the JSON output and feed it into `gh pr comment`.
 
+Run with `--semantic` to surface classified breaking-change findings alongside the structural diff:
+
+```bash
+rocky ci-diff --semantic
+```
+
+```json
+{
+  "version": "1.31.0",
+  "command": "ci-diff",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "summary": { "added": 0, "modified": 1, "removed": 0 },
+  "models": [ /* ... */ ],
+  "markdown": "...",
+  "breaking_findings": [
+    {
+      "change": {
+        "kind": "column_type_changed",
+        "model": "analytics.marts.fct_orders",
+        "column": "amount_cents",
+        "old_type": "BIGINT",
+        "new_type": "INT",
+        "narrowing": true
+      },
+      "severity": "breaking"
+    }
+  ]
+}
+```
+
+The `breaking_findings` array is omitted from JSON output when empty or when `--semantic` is not set. Each finding carries a tagged `change` object (`kind` discriminator) and a `severity` (`breaking` / `warning` / `info`). Use `--semantic` in `ci-diff` to surface findings on every PR; rely on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) to block promotion when `severity == "breaking"`.
+
 ### Related Commands
 
 - [`rocky ci`](#rocky-ci) -- full compile + test for CI
 - [`rocky compile`](#rocky-compile) -- compile a single branch without diffing
 - [`rocky preview`](#rocky-preview) -- pruned re-run + sampled data diff + cost delta on top of `ci-diff`'s structural diff
+- [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) -- promote a branch's tables to production with a hard semantic breaking-change gate
 
 ---
 

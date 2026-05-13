@@ -112,10 +112,11 @@ table = "fct_orders"
 
 ## Crate Architecture
 
-20-crate Cargo workspace (Rust edition 2024, MSRV 1.85):
+21-crate Cargo workspace (Rust edition 2024, MSRV 1.85):
 
 ```
-rocky-core         — Warehouse-agnostic engine: IR, adapter traits, DAG, models, checks, contracts, config, state
+rocky-core         — Warehouse-agnostic engine: adapter traits, DAG executor, models, checks, contracts, config, state
+rocky-ir           — Typed IR (ModelIr / ModelIrVariant / ProjectIr), lakehouse format/options, column lineage, masks, time grains, RockyType
 rocky-sql          — SQL parsing, validation, dialect support, transpilation, lineage
 rocky-lang         — Rocky DSL parser (.rocky files) — lexer (logos) + parser → IR lowering
 rocky-compiler     — Type checking, semantic analysis, contract validation, diagnostics
@@ -126,6 +127,7 @@ rocky-adapter-sdk  — Adapter SDK for building custom warehouse adapters
 rocky-databricks   — Databricks warehouse adapter (SQL execution, Unity Catalog governance, permissions, workspace isolation)
 rocky-snowflake    — Snowflake warehouse adapter (SQL execution, OAuth/key-pair/password auth)
 rocky-bigquery     — BigQuery warehouse adapter (connector, auth, dialect)
+rocky-trino        — Trino warehouse adapter
 rocky-fivetran     — Fivetran source adapter (REST API discovery of connectors/tables — metadata only, no extraction)
 rocky-duckdb       — DuckDB warehouse adapter (local dev/testing, schema discovery, seed loading)
 rocky-cache        — Three-tier caching (memory LRU → Valkey → API)
