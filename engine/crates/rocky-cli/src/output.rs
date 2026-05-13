@@ -991,6 +991,12 @@ pub struct CiDiffOutput {
     pub models: Vec<rocky_core::ci_diff::DiffResult>,
     /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
     pub markdown: String,
+    /// Classified semantic findings from the typed-IR breaking-change
+    /// classifier. Only populated when `ci-diff` is invoked with
+    /// `--semantic` and both base + HEAD compiles succeed; omitted from
+    /// JSON output when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaking_findings: Vec<rocky_core::breaking_change::BreakingFinding>,
 }
 
 impl CiDiffOutput {
@@ -1009,7 +1015,17 @@ impl CiDiffOutput {
             summary,
             models,
             markdown,
+            breaking_findings: Vec::new(),
         }
+    }
+
+    /// Attach semantic breaking-change findings to this output.
+    pub fn with_breaking_findings(
+        mut self,
+        findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+    ) -> Self {
+        self.breaking_findings = findings;
+        self
     }
 }
 

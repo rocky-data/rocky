@@ -786,6 +786,13 @@ enum Command {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
+        /// Also run the typed-IR semantic breaking-change classifier and
+        /// surface findings under `breaking_findings` in the JSON output.
+        ///
+        /// Informational only — even a `Breaking` finding does not change
+        /// the exit code. The hard gate lives on `rocky branch promote`.
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Per-changed-column downstream impact, formatted for PR review
@@ -1979,12 +1986,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Ci { models, contracts } => {
             rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
         }
-        Command::CiDiff { base_ref, models } => rocky_cli::commands::run_ci_diff(
+        Command::CiDiff {
+            base_ref,
+            models,
+            semantic,
+        } => rocky_cli::commands::run_ci_diff(
             &cli.config,
             &state_path,
             &base_ref,
             &models,
             json,
+            semantic,
             cli.cache_ttl,
         ),
         Command::LineageDiff { base_ref, models } => rocky_cli::commands::run_lineage_diff(
