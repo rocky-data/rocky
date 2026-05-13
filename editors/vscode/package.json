@@ -83,6 +83,35 @@
           "type": "boolean",
           "default": true,
           "description": "Show inferred types inline"
+        },
+        "rocky.statusBar.segments": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["warehouse", "lastRunAge", "driftCount", "branchState"]
+          },
+          "default": [],
+          "markdownDescription": "Optional status bar segments to show after the LSP state. Each segment silently no-ops if its data is unavailable. Options: `warehouse`, `lastRunAge`, `driftCount`, `branchState`."
+        },
+        "rocky.defaultWarehouse": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default warehouse identifier shown in status bar and command prompts. Read-only contract — consumed by future commands; changing this has no immediate effect beyond display."
+        },
+        "rocky.defaultBranch": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default branch name for `rocky.branchApprove` / `rocky.branchPromote` prompts. Read-only contract — consumed by future commands."
+        },
+        "rocky.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable drift diagnostics (inline errors/warnings from `rocky compile`). Set to `false` to disable all Rocky diagnostics without uninstalling the extension."
+        },
+        "rocky.autoRunOnSave": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically run the pipeline when a model file is saved. Read-only contract — consumed by future commands; has no effect in this release."
         }
       }
     },
@@ -435,7 +464,7 @@
       },
       {
         "view": "rocky.getStarted",
-        "contents": "Quick actions for your Rocky project.\n\n[Compile Models](command:rocky.compile)\n[Plan Pipeline (Dry Run)](command:rocky.plan)\n[Run Pipeline](command:rocky.run)\n[Discover Sources](command:rocky.discover)\n[Run Health Check](command:rocky.doctor)",
+        "contents": "Quick actions for your Rocky project.\n\nNew? Try Compile first.\n\n[Compile Models](command:rocky.compile)\nType-check models and validate contracts.\n\n[Plan Pipeline (Dry Run)](command:rocky.plan)\nPreview the SQL that will run — no warehouse writes.\n\n[Run Pipeline](command:rocky.run)\nExecute the full pipeline against your warehouse.\n\n[Discover Sources](command:rocky.discover)\nList connectors and tables from your adapter.\n\n[Run Health Check](command:rocky.doctor)\nVerify CLI installation and project configuration.",
         "when": "rocky.hasProject"
       },
       {
@@ -547,6 +576,65 @@
         "command": "rocky.commandPalette",
         "key": "ctrl+shift+r",
         "mac": "cmd+shift+r"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "rocky.getStartedWalkthrough",
+        "title": "Get Started with Rocky",
+        "description": "Set up Rocky and run your first pipeline in five steps.",
+        "steps": [
+          {
+            "id": "rocky.walkthrough.installCli",
+            "title": "Install the Rocky CLI",
+            "description": "Rocky needs the `rocky` binary on your PATH. Run Doctor to verify your installation.\n\n[Run Health Check](command:rocky.doctor)",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            },
+            "completionEvents": ["onCommand:rocky.doctor"]
+          },
+          {
+            "id": "rocky.walkthrough.initProject",
+            "title": "Initialize a Project",
+            "description": "Scaffold a `rocky.toml` and `models/` directory in your workspace.\n\n[Initialize Project](command:rocky.init)",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            },
+            "completionEvents": ["onCommand:rocky.init"]
+          },
+          {
+            "id": "rocky.walkthrough.compile",
+            "title": "Compile Your Models",
+            "description": "Type-check models and validate contracts — fix any errors before running.\n\n[Compile Models](command:rocky.compile)",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            },
+            "completionEvents": ["onCommand:rocky.compile"]
+          },
+          {
+            "id": "rocky.walkthrough.lineage",
+            "title": "View Model Lineage",
+            "description": "Render the model dependency graph as an interactive SVG.\n\n[Show Model Lineage](command:rocky.showLineage)",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            },
+            "completionEvents": ["onCommand:rocky.showLineage"]
+          },
+          {
+            "id": "rocky.walkthrough.run",
+            "title": "Run the Pipeline",
+            "description": "Execute your full Rocky pipeline. Use Plan first for a safe dry run.\n\n[Run Pipeline](command:rocky.run)\n[Plan (Dry Run)](command:rocky.plan)",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            },
+            "completionEvents": ["onCommand:rocky.run"]
+          }
+        ]
       }
     ]
   },
