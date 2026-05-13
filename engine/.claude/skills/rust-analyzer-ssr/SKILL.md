@@ -1,6 +1,6 @@
 ---
 name: rust-analyzer-ssr
-description: Use rust-analyzer's Structural Search and Replace (SSR) for semantic Rust code transformations across the engine workspace. Apply when refactoring API shapes, migrating patterns, or searching for code structure across all 20 crates.
+description: Use rust-analyzer's Structural Search and Replace (SSR) for semantic Rust code transformations across the engine workspace. Apply when refactoring API shapes, migrating patterns, or searching for code structure across all 21 crates.
 ---
 
 # rust-analyzer Structural Search and Replace (SSR)
@@ -8,7 +8,7 @@ description: Use rust-analyzer's Structural Search and Replace (SSR) for semanti
 Source: vendored from [davidbarsky/8fae6dc45c294297db582378284bd1f2](https://gist.github.com/davidbarsky/8fae6dc45c294297db582378284bd1f2) @ `191b2ee46088920de97d682561e2abd1edd64a42` (SKILL-3.md).
 Author: David Barsky (rust-analyzer contributor at Meta). This is a pure tooling reference with no style opinions.
 
-Use rust-analyzer's SSR for semantic code transformations in Rust projects. SSR matches code by AST structure and semantic meaning, not text. In Rocky this is especially useful for cross-crate refactors against the 20-crate workspace — string `grep` regularly over-matches.
+Use rust-analyzer's SSR for semantic code transformations in Rust projects. SSR matches code by AST structure and semantic meaning, not text. In Rocky this is especially useful for cross-crate refactors against the 21-crate workspace — string `grep` regularly over-matches.
 
 ## When to Use
 
@@ -193,4 +193,4 @@ Adapter::old_method($self, $arg) ==>> $self.new_method($arg)
 RunOutput { tables_copied: $t, materializations: $m, ..$rest } ==>> RunOutput { materializations: $m, tables_copied: $t, ..$rest }
 ```
 
-Always dry-run with `parseOnly: true` or preview in the editor before applying workspace-wide — the 20-crate workspace makes a botched refactor expensive to back out.
+Always dry-run with `parseOnly: true` or preview in the editor before applying workspace-wide — the 21-crate workspace makes a botched refactor expensive to back out.
