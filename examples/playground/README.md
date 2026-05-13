@@ -36,7 +36,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**57 of 70 POCs run with no external credentials.** See each POC's README for prerequisites.
+**60 of 73 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -115,7 +115,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [06-retention-policies](pocs/04-governance/06-retention-policies) | Declarative `retention = "<N>[dy]"` sidecars + `rocky retention-status --drift` | none |
 | [07-auto-create-schemas](pocs/04-governance/07-auto-create-schemas) | `[…target.governance] auto_create_schemas = true` on a transformation pipeline targeting a fresh schema (v1.29.0 parity fix) | none |
 
-### 05 — Orchestration (9 POCs · DuckDB / docker)
+### 05 — Orchestration (10 POCs · DuckDB / docker)
 
 Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency.
 
@@ -130,8 +130,9 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [07-dagster-dag-mode](pocs/05-orchestration/07-dagster-dag-mode) | `rocky run --dag` unified cross-pipeline DAG with Dagster orchestration |
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
+| [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
 
-### 06 — Developer Experience (14 POCs · DuckDB)
+### 06 — Developer Experience (16 POCs · DuckDB)
 
 Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes.
 
@@ -151,6 +152,8 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [12-catalog-emit](pocs/06-developer-experience/12-catalog-emit) | `rocky catalog --format both` — column-level lineage emitted as `catalog.json` + `edges.parquet` + `assets.parquet`; readable by any Parquet client without going through the engine |
 | [13-run-watch-inner-loop](pocs/06-developer-experience/13-run-watch-inner-loop) | `rocky run --watch` re-materialises on every save; 200 ms debounce window, FSEvents-safe directory watch, NDJSON-stream output, clean SIGINT exit |
 | [14-import-dbt-failure-modes](pocs/06-developer-experience/14-import-dbt-failure-modes) | `rocky import-dbt` against malformed inputs (missing files, invalid YAML, unknown adapters) — exercises every diagnostic path the importer emits |
+| [15-semantic-breaking-change-gate](pocs/06-developer-experience/15-semantic-breaking-change-gate) | `rocky ci-diff --semantic` (informational) + `rocky branch promote --base-ref / --allow-breaking` — pre-promote gate blocks column drops; override is recorded as a `BreakingChangesAllowed` audit event |
+| [16-history-rolling-stats](pocs/06-developer-experience/16-history-rolling-stats) | `rocky history --model <name> --rolling-stats --window N` — per-model mean / std-dev / z-score / composite `health_score` over the rolling window |
 
 ### 07 — Adapters (7 POCs · mixed)
 
