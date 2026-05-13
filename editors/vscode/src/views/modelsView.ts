@@ -41,15 +41,14 @@ export class ModelTreeItem extends vscode.TreeItem {
   override readonly contextValue = "rockyModel";
 
   constructor(public readonly resourceUri: vscode.Uri) {
-    const label = path.basename(
-      resourceUri.fsPath,
-      path.extname(resourceUri.fsPath),
-    );
+    const ext = path.extname(resourceUri.fsPath);
+    const label = path.basename(resourceUri.fsPath, ext);
     super(label, vscode.TreeItemCollapsibleState.None);
     this.label = label;
     this.id = vscode.workspace.asRelativePath(resourceUri);
     this.tooltip = resourceUri.fsPath;
-    this.description = vscode.workspace.asRelativePath(resourceUri);
+    const kind = ext === ".sql" ? "SQL" : "DSL";
+    this.description = `${kind} · ${vscode.workspace.asRelativePath(resourceUri)}`;
     this.command = {
       command: "vscode.open",
       title: "Open Model",

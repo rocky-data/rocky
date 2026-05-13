@@ -523,6 +523,23 @@
           "when": "view == rocky.models && viewItem == rockyModel",
           "group": "2_inspect@4"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "rocky.history",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@1"
+        },
+        {
+          "command": "rocky.metrics",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@2"
+        },
+        {
+          "command": "rocky.optimize",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@3"
+        }
       ]
     },
     "keybindings": [
