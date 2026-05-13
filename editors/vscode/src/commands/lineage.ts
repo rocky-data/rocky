@@ -13,6 +13,7 @@ interface SerializedState {
   scale?: number;
   panX?: number;
   panY?: number;
+  viewMode?: "model" | "column";
 }
 
 export async function showLineage(arg?: unknown): Promise<void> {
@@ -51,8 +52,8 @@ export async function showLineage(arg?: unknown): Promise<void> {
 
 /**
  * Registers a webview-panel serializer so lineage panels survive workspace
- * reloads. The webview persists `{ modelName, scale, panX, panY }` via
- * `vscode.setState`; on reload we re-run the CLI and restore zoom/pan.
+ * reloads. The webview persists `{ modelName, scale, panX, panY, viewMode }`
+ * via `vscode.setState`; on reload we re-run the CLI and restore zoom/pan.
  */
 export function registerLineageSerializer(
   context: vscode.ExtensionContext,
@@ -236,6 +237,15 @@ function renderLineageHtml(
     }
     header h2 { margin: 0; font-size: 13px; font-weight: 600; }
     header .spacer { flex: 1; }
+    .btn-group {
+      display: flex; gap: 0;
+    }
+    .btn-group button {
+      border-radius: 0;
+      border-right-width: 0;
+    }
+    .btn-group button:first-child { border-radius: 2px 0 0 2px; }
+    .btn-group button:last-child  { border-radius: 0 2px 2px 0; border-right-width: 1px; }
     button {
       background: var(--vscode-button-secondaryBackground);
       color: var(--vscode-button-secondaryForeground);
@@ -246,6 +256,15 @@ function renderLineageHtml(
       border-radius: 2px;
     }
     button:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    button.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .separator {
+      width: 1px;
+      background: var(--vscode-panel-border);
+      margin: 0 4px;
+    }
     #viewport {
       flex: 1; overflow: hidden; position: relative;
       cursor: grab;
@@ -317,6 +336,11 @@ function renderLineageHtml(
   <header>
     <h2>Lineage: ${escapeHtml(modelName)}</h2>
     <span class="spacer"></span>
+    <div class="btn-group" title="View granularity">
+      <button id="mode-model" class="active" title="Model-level view (aggregated)">Model</button>
+      <button id="mode-column" title="Column-level view (detailed)">Column</button>
+    </div>
+    <div class="separator"></div>
     <button id="zoom-out" title="Zoom out (-)">−</button>
     <button id="zoom-reset" title="Reset zoom (0)">100%</button>
     <button id="zoom-in" title="Zoom in (+)">+</button>
@@ -340,7 +364,7 @@ function renderLineageHtml(
   const svgEl   = document.getElementById('graph-svg');
   const focalModel = rawData.model;
 
-  // Restore saved state (zoom/pan) from prior session if available.
+  // Restore saved state (zoom/pan/viewMode) from prior session if available.
   const saved = vscode.getState() || {};
 
   if (!window.dagreD3) {
@@ -351,98 +375,165 @@ function renderLineageHtml(
 
   const { dagre, d3 } = window.dagreD3;
 
-  // ── Build dagre graph ────────────────────────────────────────────────────────
-  // Use column-level edges from LineageOutput.edges.
-  // Each qualified column "model.column" becomes a dagre node.
+  // ── Current state ─────────────────────────────────────────────────────────────
+  // "model" is the default — less noisy, matches typical lineage expectation.
+  let currentViewMode = (saved.viewMode === 'column') ? 'column' : 'model';
 
-  const g = new dagre.graphlib.Graph({ multigraph: false });
-  g.setGraph({
-    rankdir: 'LR',
-    nodesep: 20,
-    ranksep: 60,
-    marginx: 20,
-    marginy: 20,
-  });
-  g.setDefaultEdgeLabel(() => ({}));
+  // Merged state object — updated incrementally so each setState call
+  // preserves all fields.
+  let currentState = {
+    modelName: focalModel,
+    scale: saved.scale,
+    panX: saved.panX,
+    panY: saved.panY,
+    viewMode: currentViewMode,
+  };
 
-  function qualifiedId(qc) {
-    return qc.model + '.' + qc.column;
+  function persistState(patch) {
+    Object.assign(currentState, patch);
+    vscode.setState(currentState);
   }
 
-  function shortLabel(qc) {
-    // If model == focal model, just show column; else show model + newline + column
-    if (qc.model === focalModel) {
-      return qc.column;
-    }
-    const parts = qc.model.split('.');
-    const shortModel = parts[parts.length - 1];
-    return shortModel + '\\n' + qc.column;
-  }
+  // ── Graph building ────────────────────────────────────────────────────────────
 
-  // Collect all node IDs from edges; track in/out degree for source/leaf coloring.
-  const seen = new Set();
-  const hasIncoming = new Set();
-  const hasOutgoing = new Set();
-
-  for (const edge of rawData.edges) {
-    const srcId = qualifiedId(edge.source);
-    const tgtId = qualifiedId(edge.target);
-    hasOutgoing.add(srcId);
-    hasIncoming.add(tgtId);
-
-    if (!seen.has(srcId)) {
-      seen.add(srcId);
-      g.setNode(srcId, {
-        label: shortLabel(edge.source),
-        model: edge.source.model,
-        focal: edge.source.model === focalModel,
-        width: edge.source.model === focalModel ? 120 : 140,
-        height: 36,
-        rx: 4, ry: 4,
-      });
-    }
-    if (!seen.has(tgtId)) {
-      seen.add(tgtId);
-      g.setNode(tgtId, {
-        label: shortLabel(edge.target),
-        model: edge.target.model,
-        focal: edge.target.model === focalModel,
-        width: edge.target.model === focalModel ? 120 : 140,
-        height: 36,
-        rx: 4, ry: 4,
-      });
-    }
-    g.setEdge(srcId, tgtId, { label: edge.transform !== 'direct' ? edge.transform : '' });
-  }
-
-  if (g.nodeCount() === 0) {
-    // No edges — render an isolated node for the focal model itself
-    const id = focalModel + '.(no edges)';
-    g.setNode(id, {
-      label: focalModel,
-      model: focalModel,
-      focal: true,
-      width: 160, height: 36, rx: 4, ry: 4,
+  function buildModelGraph() {
+    // Aggregate column-level edges into model-level edges (deduplicated).
+    const g = new dagre.graphlib.Graph({ multigraph: false });
+    g.setGraph({
+      rankdir: 'LR',
+      nodesep: 30,
+      ranksep: 80,
+      marginx: 20,
+      marginy: 20,
     });
-    status.textContent =
-      'No column-level edges found for ' + focalModel +
-      '. The model may have no typed columns or no upstream dependencies.';
+    g.setDefaultEdgeLabel(() => ({}));
+
+    const seen = new Set();
+    const hasIncoming = new Set();
+    const hasOutgoing = new Set();
+
+    // Add focal node even if it has no edges
+    if (!seen.has(focalModel)) {
+      seen.add(focalModel);
+      const parts = focalModel.split('.');
+      const label = parts[parts.length - 1];
+      g.setNode(focalModel, {
+        label,
+        model: focalModel,
+        focal: true,
+        width: 140, height: 36, rx: 4, ry: 4,
+      });
+    }
+
+    for (const edge of rawData.edges) {
+      const src = edge.source.model;
+      const tgt = edge.target.model;
+      if (src === tgt) continue; // skip self-edges
+
+      hasOutgoing.add(src);
+      hasIncoming.add(tgt);
+
+      if (!seen.has(src)) {
+        seen.add(src);
+        const parts = src.split('.');
+        g.setNode(src, {
+          label: parts[parts.length - 1],
+          model: src,
+          focal: src === focalModel,
+          width: src === focalModel ? 140 : 130,
+          height: 36, rx: 4, ry: 4,
+        });
+      }
+      if (!seen.has(tgt)) {
+        seen.add(tgt);
+        const parts = tgt.split('.');
+        g.setNode(tgt, {
+          label: parts[parts.length - 1],
+          model: tgt,
+          focal: tgt === focalModel,
+          width: tgt === focalModel ? 140 : 130,
+          height: 36, rx: 4, ry: 4,
+        });
+      }
+      // dagre deduplicates by (src, tgt) key in a non-multigraph
+      if (!g.hasEdge(src, tgt)) {
+        g.setEdge(src, tgt, {});
+      }
+    }
+
+    return { g, hasIncoming, hasOutgoing };
   }
 
-  // ── Layout ───────────────────────────────────────────────────────────────────
-  dagre.layout(g);
+  function buildColumnGraph() {
+    const g = new dagre.graphlib.Graph({ multigraph: false });
+    g.setGraph({
+      rankdir: 'LR',
+      nodesep: 20,
+      ranksep: 60,
+      marginx: 20,
+      marginy: 20,
+    });
+    g.setDefaultEdgeLabel(() => ({}));
 
-  // ── Render with d3 ───────────────────────────────────────────────────────────
-  const graphLayout = g.graph();
-  const svgWidth  = graphLayout.width  + 40;
-  const svgHeight = graphLayout.height + 40;
+    function qualifiedId(qc) { return qc.model + '.' + qc.column; }
+    function shortLabel(qc) {
+      if (qc.model === focalModel) return qc.column;
+      const parts = qc.model.split('.');
+      return parts[parts.length - 1] + '\\n' + qc.column;
+    }
 
-  const svg = d3.select(svgEl)
-    .attr('viewBox', '0 0 ' + svgWidth + ' ' + svgHeight)
-    .attr('preserveAspectRatio', 'xMidYMid meet');
+    const seen = new Set();
+    const hasIncoming = new Set();
+    const hasOutgoing = new Set();
 
-  // Arrow marker
-  const defs = svg.append('defs');
+    for (const edge of rawData.edges) {
+      const srcId = qualifiedId(edge.source);
+      const tgtId = qualifiedId(edge.target);
+      hasOutgoing.add(srcId);
+      hasIncoming.add(tgtId);
+
+      if (!seen.has(srcId)) {
+        seen.add(srcId);
+        g.setNode(srcId, {
+          label: shortLabel(edge.source),
+          model: edge.source.model,
+          focal: edge.source.model === focalModel,
+          width: edge.source.model === focalModel ? 120 : 140,
+          height: 36, rx: 4, ry: 4,
+        });
+      }
+      if (!seen.has(tgtId)) {
+        seen.add(tgtId);
+        g.setNode(tgtId, {
+          label: shortLabel(edge.target),
+          model: edge.target.model,
+          focal: edge.target.model === focalModel,
+          width: edge.target.model === focalModel ? 120 : 140,
+          height: 36, rx: 4, ry: 4,
+        });
+      }
+      g.setEdge(srcId, tgtId, {
+        label: edge.transform !== 'direct' ? edge.transform : '',
+      });
+    }
+
+    if (g.nodeCount() === 0) {
+      const id = focalModel + '.(no edges)';
+      g.setNode(id, {
+        label: focalModel,
+        model: focalModel,
+        focal: true,
+        width: 160, height: 36, rx: 4, ry: 4,
+      });
+    }
+
+    return { g, hasIncoming, hasOutgoing };
+  }
+
+  // ── Rendering ─────────────────────────────────────────────────────────────────
+  // Arrow marker + zoom are set up once; render() reuses them.
+
+  const defs = d3.select(svgEl).append('defs');
   defs.append('marker')
     .attr('id', 'arrow')
     .attr('viewBox', '0 0 10 10')
@@ -454,18 +545,16 @@ function renderLineageHtml(
     .append('path')
     .attr('d', 'M 0 0 L 10 5 L 0 10 z');
 
-  const graphGroup = svg.append('g');
+  const graphGroup = d3.select(svgEl).append('g');
 
-  // ── Pan + zoom via d3-zoom ────────────────────────────────────────────────────
+  // d3-zoom — attach once; render() updates the viewBox
   const zoom = d3.zoom()
     .scaleExtent([0.1, 8])
     .on('zoom', (event) => {
       graphGroup.attr('transform', event.transform);
       document.getElementById('zoom-reset').textContent =
         Math.round(event.transform.k * 100) + '%';
-      // Persist state on every zoom/pan event
-      vscode.setState({
-        modelName: focalModel,
+      persistState({
         scale: event.transform.k,
         panX: event.transform.x,
         panY: event.transform.y,
@@ -474,77 +563,142 @@ function renderLineageHtml(
 
   d3.select(svgEl).call(zoom);
 
-  // Edges
-  const edgeGroup = graphGroup.append('g').attr('class', 'edges');
-  for (const e of g.edges()) {
-    const edgeData = g.edge(e);
-    const points = edgeData.points;
-    const line = d3.line()
-      .x(p => p.x)
-      .y(p => p.y)
-      .curve(d3.curveCatmullRom.alpha(0.5));
+  let svgWidth = 0;
+  let svgHeight = 0;
 
-    const ep = edgeGroup.append('g').attr('class', 'edgePath');
-    ep.append('path')
-      .attr('d', line(points))
-      .attr('marker-end', 'url(#arrow)');
+  function render(viewMode) {
+    // Clear previous graph contents (not defs or the root graphGroup)
+    graphGroup.selectAll('*').remove();
 
-    if (edgeData.label) {
-      const mid = points[Math.floor(points.length / 2)];
-      const el = edgeGroup.append('g').attr('class', 'edgeLabel');
-      el.append('text')
-        .attr('x', mid.x)
-        .attr('y', mid.y - 4)
-        .attr('text-anchor', 'middle')
-        .text(edgeData.label);
+    const built = viewMode === 'model' ? buildModelGraph() : buildColumnGraph();
+    const { g, hasIncoming, hasOutgoing } = built;
+
+    dagre.layout(g);
+
+    const gl = g.graph();
+    svgWidth  = (gl.width  || 200) + 40;
+    svgHeight = (gl.height || 100) + 40;
+
+    d3.select(svgEl)
+      .attr('viewBox', '0 0 ' + svgWidth + ' ' + svgHeight)
+      .attr('preserveAspectRatio', 'xMidYMid meet');
+
+    // Edges
+    const edgeGroup = graphGroup.append('g').attr('class', 'edges');
+    for (const e of g.edges()) {
+      const edgeData = g.edge(e);
+      const points = edgeData.points;
+      const line = d3.line()
+        .x(p => p.x)
+        .y(p => p.y)
+        .curve(d3.curveCatmullRom.alpha(0.5));
+
+      const ep = edgeGroup.append('g').attr('class', 'edgePath');
+      ep.append('path')
+        .attr('d', line(points))
+        .attr('marker-end', 'url(#arrow)');
+
+      if (edgeData.label) {
+        const mid = points[Math.floor(points.length / 2)];
+        const el = edgeGroup.append('g').attr('class', 'edgeLabel');
+        el.append('text')
+          .attr('x', mid.x)
+          .attr('y', mid.y - 4)
+          .attr('text-anchor', 'middle')
+          .text(edgeData.label);
+      }
+    }
+
+    // Nodes
+    const nodeGroup = graphGroup.append('g').attr('class', 'nodes');
+    for (const nodeId of g.nodes()) {
+      const n = g.node(nodeId);
+      const isSource = !hasIncoming.has(nodeId);
+      const isLeaf   = !hasOutgoing.has(nodeId);
+      let cls = n.focal ? 'node focal' : 'node';
+      if (!n.focal && isSource) cls += ' source';
+      else if (!n.focal && isLeaf) cls += ' leaf';
+
+      const ng = nodeGroup.append('g')
+        .attr('class', cls)
+        .attr('transform', 'translate(' + (n.x - n.width / 2) + ',' + (n.y - n.height / 2) + ')');
+
+      ng.append('rect')
+        .attr('width', n.width)
+        .attr('height', n.height)
+        .attr('rx', n.rx || 4)
+        .attr('ry', n.ry || 4);
+
+      ng.append('title').text('Open ' + n.model);
+
+      const lines = n.label.split('\\n');
+      const lineHeight = 14;
+      const totalH = lines.length * lineHeight;
+      const startY = (n.height - totalH) / 2 + lineHeight;
+      lines.forEach((line, i) => {
+        ng.append('text')
+          .attr('x', n.width / 2)
+          .attr('y', startY + i * lineHeight)
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'auto')
+          .text(line);
+      });
+
+      ng.on('click', (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'openModel', name: n.model });
+      });
+    }
+
+    // Update status bar
+    if (viewMode === 'model') {
+      const nodeCount = g.nodeCount();
+      const edgeCount = g.edgeCount();
+      status.textContent =
+        nodeCount + ' model(s) · ' + edgeCount + ' dep(s) · ' +
+        rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
+        'drag to pan · scroll to zoom · click a node to open · F to fit · 0 to reset';
+    } else {
+      const edgeCount = rawData.edges.length;
+      status.textContent =
+        edgeCount + ' column edge(s) · ' +
+        rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
+        'drag to pan · scroll to zoom · click a node to open · F to fit · 0 to reset';
+      if (edgeCount === 0) {
+        status.textContent =
+          'No column-level edges found for ' + focalModel +
+          '. The model may have no typed columns or no upstream dependencies.';
+      }
     }
   }
 
-  // Nodes
-  const nodeGroup = graphGroup.append('g').attr('class', 'nodes');
-  for (const nodeId of g.nodes()) {
-    const n = g.node(nodeId);
-    // Determine source/leaf class for coloring
-    const isSource = !hasIncoming.has(nodeId);
-    const isLeaf   = !hasOutgoing.has(nodeId);
-    let cls = n.focal ? 'node focal' : 'node';
-    // source/leaf coloring only for non-focal nodes (focal gets its own highlight)
-    if (!n.focal && isSource) cls += ' source';
-    else if (!n.focal && isLeaf) cls += ' leaf';
+  // ── Initial render ────────────────────────────────────────────────────────────
+  render(currentViewMode);
 
-    const ng = nodeGroup.append('g')
-      .attr('class', cls)
-      .attr('transform', 'translate(' + (n.x - n.width / 2) + ',' + (n.y - n.height / 2) + ')');
-
-    ng.append('rect')
-      .attr('width', n.width)
-      .attr('height', n.height)
-      .attr('rx', n.rx || 4)
-      .attr('ry', n.ry || 4);
-
-    // SVG <title> for native browser tooltip on hover
-    ng.append('title').text('Open ' + n.model);
-
-    // Support multi-line labels (separated by \\n)
-    const lines = n.label.split('\\n');
-    const lineHeight = 14;
-    const totalH = lines.length * lineHeight;
-    const startY = (n.height - totalH) / 2 + lineHeight;
-    lines.forEach((line, i) => {
-      ng.append('text')
-        .attr('x', n.width / 2)
-        .attr('y', startY + i * lineHeight)
-        .attr('text-anchor', 'middle')
-        .attr('dominant-baseline', 'auto')
-        .text(line);
-    });
-
-    // Click-to-open: post message to extension host
-    ng.on('click', (e) => {
-      e.stopPropagation();
-      vscode.postMessage({ type: 'openModel', name: n.model });
-    });
+  // Update toggle button appearance
+  function updateModeButtons() {
+    document.getElementById('mode-model').classList.toggle('active', currentViewMode === 'model');
+    document.getElementById('mode-column').classList.toggle('active', currentViewMode === 'column');
   }
+  updateModeButtons();
+
+  // ── View mode toggle ──────────────────────────────────────────────────────────
+  document.getElementById('mode-model').onclick = () => {
+    if (currentViewMode === 'model') return;
+    currentViewMode = 'model';
+    persistState({ viewMode: 'model' });
+    updateModeButtons();
+    render('model');
+    fitToView();
+  };
+  document.getElementById('mode-column').onclick = () => {
+    if (currentViewMode === 'column') return;
+    currentViewMode = 'column';
+    persistState({ viewMode: 'column' });
+    updateModeButtons();
+    render('column');
+    fitToView();
+  };
 
   // ── Fit to view ──────────────────────────────────────────────────────────────
   function fitToView() {
@@ -602,23 +756,14 @@ function renderLineageHtml(
     URL.revokeObjectURL(url);
   };
 
-  // ── Initial render: restore saved transform or auto-fit ──────────────────────
+  // ── Initial zoom/pan restore or auto-fit ──────────────────────────────────────
   if (typeof saved.scale === 'number' && (saved.panX !== undefined || saved.panY !== undefined)) {
-    // Restore prior zoom/pan without animation
     d3.select(svgEl).call(
       zoom.transform,
       d3.zoomIdentity.translate(saved.panX || 0, saved.panY || 0).scale(saved.scale),
     );
   } else {
-    // Auto-fit on first render so wide DAGs are immediately legible
     fitToView();
-  }
-
-  if (g.nodeCount() > 0 && rawData.edges.length > 0) {
-    status.textContent =
-      rawData.edges.length + ' edge(s) · ' +
-      rawData.upstream.length + ' upstream · ' +
-      rawData.downstream.length + ' downstream · drag to pan · scroll to zoom · click a node to open · F to fit · 0 to reset';
   }
 })();
   </script>
