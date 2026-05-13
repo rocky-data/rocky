@@ -3,12 +3,12 @@ import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
 import type { TestResult } from "./types/rockyJson";
 
-const MODELS_GLOB = "**/models/**/*.rocky";
+const MODELS_GLOB = "**/models/**/*.{rocky,sql}";
 
 /**
- * Wires Rocky models into VS Code's Test Explorer. Each `.rocky` file under
- * `**\/models\/**` becomes a test item; running an item shells out to
- * `rocky test --model NAME --output json` and reports pass/fail back.
+ * Wires Rocky models into VS Code's Test Explorer. Each `.rocky` or `.sql`
+ * file under `**\/models\/**` becomes a test item; running an item shells out
+ * to `rocky test --model NAME --output json` and reports pass/fail back.
  *
  * Phase 3 keeps the tree flat (one item per model). Per-contract granularity
  * will come once the CLI exposes it via either a `rocky test --list` flag or a
@@ -117,7 +117,7 @@ async function runHandler(
     // and `TestFailure.name` use the model basename, so derive that from
     // `item.uri` for the rocky invocation and the failure-name filter.
     const modelName = item.uri
-      ? path.basename(item.uri.fsPath, ".rocky")
+      ? path.basename(item.uri.fsPath, path.extname(item.uri.fsPath))
       : item.id;
 
     try {

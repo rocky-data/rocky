@@ -445,7 +445,7 @@
       },
       {
         "view": "rocky.models",
-        "contents": "No models found in this workspace.\n\nCreate a `.rocky` file under `models/`, or browse the [documentation](command:rocky.openDocumentation) for examples.",
+        "contents": "No models found in this workspace.\n\nAdd a `.rocky` or `.sql` file under `models/`, or browse the [documentation](command:rocky.openDocumentation) for examples.",
         "when": "rocky.hasProject"
       },
       {
