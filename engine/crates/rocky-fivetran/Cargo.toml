@@ -1,6 +1,6 @@
 [package]
 name = "rocky-fivetran"
-version = "1.30.0"
+version = "1.31.0"
 description = "Fivetran source adapter for Rocky"
 edition.workspace = true
 license.workspace = true
