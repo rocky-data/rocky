@@ -15,6 +15,7 @@ interface SerializedState {
   panX?: number;
   panY?: number;
   viewMode?: "model" | "column";
+  clusterMode?: "none" | "schema" | "source";
 }
 
 /** Message types sent from the extension host to the webview. */
@@ -455,6 +456,62 @@ function renderLineageHtml(
       flex-shrink: 0;
     }
     .error { color: var(--vscode-errorForeground); }
+    /* Cluster subgraph styles */
+    .cluster-bbox {
+      fill: transparent;
+      stroke: var(--vscode-tab-border, var(--vscode-panel-border));
+      stroke-width: 1px;
+      stroke-dasharray: 4 3;
+      rx: 6;
+      ry: 6;
+    }
+    .cluster-label {
+      fill: var(--vscode-descriptionForeground);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      pointer-events: none;
+    }
+    .cluster-header-hit {
+      fill: transparent;
+      cursor: pointer;
+    }
+    .cluster-header-hit:hover + .cluster-label,
+    .cluster-header-hit:hover ~ .cluster-label {
+      fill: var(--vscode-foreground);
+    }
+    /* Dimming: applied to graphGroup when a cluster is focused */
+    .dim-mode .node:not(.in-focus) rect,
+    .dim-mode .edgePath:not(.in-focus) path {
+      opacity: 0.2;
+    }
+    .dim-mode .node:not(.in-focus) text {
+      opacity: 0.2;
+    }
+    .dim-mode .cluster-bbox:not(.in-focus) {
+      opacity: 0.2;
+    }
+    .dim-mode .cluster-label:not(.in-focus) {
+      opacity: 0.2;
+    }
+    /* Cluster select */
+    .cluster-select-label {
+      font-size: 12px;
+      color: var(--vscode-foreground);
+    }
+    select.cluster-select {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      padding: 3px 6px;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    select.cluster-select:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
   </style>
 </head>
 <body>
@@ -465,6 +522,13 @@ function renderLineageHtml(
       <button id="mode-model" class="active" title="Model-level view (aggregated)">Model</button>
       <button id="mode-column" title="Column-level view (detailed)">Column</button>
     </div>
+    <div class="separator"></div>
+    <span class="cluster-select-label">Cluster:</span>
+    <select id="cluster-mode" class="cluster-select" title="Group nodes into clusters">
+      <option value="none">None</option>
+      <option value="schema">Schema</option>
+      <option value="source">Source</option>
+    </select>
     <div class="separator"></div>
     <button id="zoom-out" title="Zoom out (-)">−</button>
     <button id="zoom-reset" title="Reset zoom (0)">100%</button>
@@ -515,7 +579,10 @@ function renderLineageHtml(
 
   // ── Current state ─────────────────────────────────────────────────────────────
   let currentViewMode = (saved.viewMode === 'column') ? 'column' : 'model';
+  let currentClusterMode = (saved.clusterMode === 'schema' || saved.clusterMode === 'source')
+    ? saved.clusterMode : 'none';
   let selectedNodeModel = null; // currently selected model name (for side panel)
+  let focusedClusterId = null;  // currently focused cluster (null = none)
 
   let currentState = {
     modelName: focalModel,
@@ -523,6 +590,7 @@ function renderLineageHtml(
     panX: saved.panX,
     panY: saved.panY,
     viewMode: currentViewMode,
+    clusterMode: currentClusterMode,
   };
 
   function persistState(patch) {
@@ -530,14 +598,37 @@ function renderLineageHtml(
     vscode.setState(currentState);
   }
 
+  // ── Cluster key helpers ───────────────────────────────────────────────────────
+
+  /**
+   * Derive a schema cluster key from a qualified model name.
+   * "schema.model"          → cluster key "schema"
+   * "catalog.schema.model"  → cluster key "catalog.schema"
+   * "model"                 → null (no dots → no cluster)
+   */
+  function schemaClusterKey(modelId) {
+    const parts = modelId.split('.');
+    if (parts.length < 2) return null;
+    return parts.slice(0, -1).join('.');
+  }
+
+  /**
+   * For Source clustering: only nodes without incoming edges are grouped.
+   * They share a single synthetic cluster "sources".
+   */
+  function sourceClusterKey(nodeId, hasIncoming) {
+    return hasIncoming.has(nodeId) ? null : 'sources';
+  }
+
   // ── Graph building ────────────────────────────────────────────────────────────
 
   function buildModelGraph() {
-    const g = new dagre.graphlib.Graph({ multigraph: false });
+    const useCompound = currentClusterMode !== 'none';
+    const g = new dagre.graphlib.Graph({ multigraph: false, compound: useCompound });
     g.setGraph({
       rankdir: 'LR',
-      nodesep: 30,
-      ranksep: 80,
+      nodesep: useCompound ? 40 : 30,
+      ranksep: useCompound ? 100 : 80,
       marginx: 20,
       marginy: 20,
     });
@@ -595,21 +686,45 @@ function renderLineageHtml(
       }
     }
 
+    // Apply cluster parents if compound mode is on
+    if (useCompound) {
+      const clusterLabels = new Map(); // clusterId → display label
+      for (const nodeId of g.nodes()) {
+        let cid = null;
+        let clabel = null;
+        if (currentClusterMode === 'schema') {
+          const k = schemaClusterKey(nodeId);
+          if (k) { cid = 'cluster:schema:' + k; clabel = k; }
+        } else if (currentClusterMode === 'source') {
+          const k = sourceClusterKey(nodeId, hasIncoming);
+          if (k) { cid = 'cluster:source:sources'; clabel = 'Sources'; }
+        }
+        if (cid && clabel) {
+          if (!g.hasNode(cid)) {
+            g.setNode(cid, { label: clabel, isCluster: true, width: 0, height: 0 });
+            clusterLabels.set(cid, clabel);
+          }
+          g.setParent(nodeId, cid);
+        }
+      }
+    }
+
     return { g, hasIncoming, hasOutgoing };
   }
 
   function buildColumnGraph() {
-    const g = new dagre.graphlib.Graph({ multigraph: false });
+    const useCompound = currentClusterMode !== 'none';
+    const g = new dagre.graphlib.Graph({ multigraph: false, compound: useCompound });
     g.setGraph({
       rankdir: 'LR',
-      nodesep: 20,
-      ranksep: 60,
+      nodesep: useCompound ? 28 : 20,
+      ranksep: useCompound ? 80 : 60,
       marginx: 20,
       marginy: 20,
     });
     g.setDefaultEdgeLabel(() => ({}));
 
-    function qualifiedId(qc) { return qc.model + '.' + qc.column; }
+    function qualifiedId(qc) { return qc.model + '·' + qc.column; }
     function shortLabel(qc) {
       if (qc.model === focalModel) return qc.column;
       const parts = qc.model.split('.');
@@ -619,6 +734,8 @@ function renderLineageHtml(
     const seen = new Set();
     const hasIncoming = new Set();
     const hasOutgoing = new Set();
+    // Map from column-node id → its model id (for cluster parenting)
+    const nodeToModel = new Map();
 
     for (const edge of rawData.edges) {
       const srcId = qualifiedId(edge.source);
@@ -628,6 +745,7 @@ function renderLineageHtml(
 
       if (!seen.has(srcId)) {
         seen.add(srcId);
+        nodeToModel.set(srcId, edge.source.model);
         g.setNode(srcId, {
           label: shortLabel(edge.source),
           model: edge.source.model,
@@ -638,6 +756,7 @@ function renderLineageHtml(
       }
       if (!seen.has(tgtId)) {
         seen.add(tgtId);
+        nodeToModel.set(tgtId, edge.target.model);
         g.setNode(tgtId, {
           label: shortLabel(edge.target),
           model: edge.target.model,
@@ -652,13 +771,42 @@ function renderLineageHtml(
     }
 
     if (g.nodeCount() === 0) {
-      const id = focalModel + '.(no edges)';
+      const id = focalModel + '·(no edges)';
       g.setNode(id, {
         label: focalModel,
         model: focalModel,
         focal: true,
         width: 160, height: 36, rx: 4, ry: 4,
       });
+    }
+
+    // Apply cluster parents if compound mode is on.
+    // In column mode, cluster by the owning model's cluster key.
+    if (useCompound) {
+      // Build per-model hasIncoming from model-level perspective
+      const modelHasIncoming = new Set();
+      for (const edge of rawData.edges) {
+        modelHasIncoming.add(edge.target.model);
+      }
+
+      for (const nodeId of g.nodes()) {
+        const modelId = nodeToModel.get(nodeId) || nodeId;
+        let cid = null;
+        let clabel = null;
+        if (currentClusterMode === 'schema') {
+          const k = schemaClusterKey(modelId);
+          if (k) { cid = 'cluster:schema:' + k; clabel = k; }
+        } else if (currentClusterMode === 'source') {
+          const k = sourceClusterKey(modelId, modelHasIncoming);
+          if (k) { cid = 'cluster:source:sources'; clabel = 'Sources'; }
+        }
+        if (cid && clabel) {
+          if (!g.hasNode(cid)) {
+            g.setNode(cid, { label: clabel, isCluster: true, width: 0, height: 0 });
+          }
+          g.setParent(nodeId, cid);
+        }
+      }
     }
 
     return { g, hasIncoming, hasOutgoing };
@@ -816,8 +964,69 @@ function renderLineageHtml(
   let svgWidth = 0;
   let svgHeight = 0;
 
+  // ── Cluster focus / dim ───────────────────────────────────────────────────────
+
+  function focusCluster(clusterId) {
+    focusedClusterId = clusterId;
+    // Collect member node ids for this cluster
+    const memberNodes = new Set();
+    const memberEdges = new Set();
+    // graphGroup has nodes with data-cluster-id and data-node-id attributes
+    d3.selectAll('.node').each(function() {
+      const el = d3.select(this);
+      const cid = el.attr('data-cluster-id');
+      if (cid === clusterId) {
+        el.classed('in-focus', true);
+        memberNodes.add(el.attr('data-node-id'));
+      } else {
+        el.classed('in-focus', false);
+      }
+    });
+    d3.selectAll('.cluster-bbox, .cluster-label, .cluster-header-hit').each(function() {
+      const el = d3.select(this);
+      el.classed('in-focus', el.attr('data-cluster-id') === clusterId);
+    });
+    // Edges in-focus if both endpoints belong to this cluster
+    d3.selectAll('.edgePath').each(function() {
+      const el = d3.select(this);
+      const src = el.attr('data-src');
+      const tgt = el.attr('data-tgt');
+      el.classed('in-focus', memberNodes.has(src) && memberNodes.has(tgt));
+    });
+    graphGroup.classed('dim-mode', true);
+
+    // Zoom to fit the cluster bbox
+    const clusterEl = d3.select('.cluster-bbox[data-cluster-id="' + clusterId + '"]');
+    if (!clusterEl.empty()) {
+      const cx = parseFloat(clusterEl.attr('data-cx'));
+      const cy = parseFloat(clusterEl.attr('data-cy'));
+      const cw = parseFloat(clusterEl.attr('data-cw'));
+      const ch = parseFloat(clusterEl.attr('data-ch'));
+      const viewport = document.getElementById('viewport');
+      const vw = viewport.clientWidth;
+      const vh = viewport.clientHeight;
+      const margin = 0.85;
+      const k = Math.min(8, Math.max(0.1, Math.min(vw / cw, vh / ch) * margin));
+      const tx = (vw - cw * k) / 2 - cx * k;
+      const ty = (vh - ch * k) / 2 - cy * k;
+      d3.select(svgEl)
+        .transition().duration(300)
+        .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+    }
+  }
+
+  function clearClusterFocus() {
+    focusedClusterId = null;
+    graphGroup.classed('dim-mode', false);
+    d3.selectAll('.node, .edgePath, .cluster-bbox, .cluster-label, .cluster-header-hit')
+      .classed('in-focus', false);
+    fitToView();
+  }
+
   function render(viewMode) {
     graphGroup.selectAll('*').remove();
+    focusedClusterId = null;
+    graphGroup.classed('dim-mode', false);
 
     const built = viewMode === 'model' ? buildModelGraph() : buildColumnGraph();
     const { g, hasIncoming, hasOutgoing } = built;
@@ -832,6 +1041,63 @@ function renderLineageHtml(
       .attr('viewBox', '0 0 ' + svgWidth + ' ' + svgHeight)
       .attr('preserveAspectRatio', 'xMidYMid meet');
 
+    // ── Cluster bounding boxes (render BEFORE nodes so nodes appear on top) ──
+    const clusterGroup = graphGroup.append('g').attr('class', 'clusters');
+    if (currentClusterMode !== 'none') {
+      for (const nodeId of g.nodes()) {
+        const n = g.node(nodeId);
+        if (!n || !n.isCluster) continue;
+        // dagre gives x/y as center, width/height as the full bbox
+        const bx = n.x - n.width / 2;
+        const by = n.y - n.height / 2;
+        const bw = n.width;
+        const bh = n.height;
+        const cid = nodeId;
+
+        const cg = clusterGroup.append('g').attr('class', 'cluster-group');
+
+        cg.append('rect')
+          .attr('class', 'cluster-bbox')
+          .attr('x', bx)
+          .attr('y', by)
+          .attr('width', bw)
+          .attr('height', bh)
+          .attr('rx', 6)
+          .attr('ry', 6)
+          .attr('data-cluster-id', cid)
+          // Store bbox coords for focusCluster zoom math
+          .attr('data-cx', bx)
+          .attr('data-cy', by)
+          .attr('data-cw', bw)
+          .attr('data-ch', bh);
+
+        // Invisible hit region over the label row at the top of the bbox
+        const hitH = 18;
+        cg.append('rect')
+          .attr('class', 'cluster-header-hit')
+          .attr('x', bx + 4)
+          .attr('y', by + 2)
+          .attr('width', Math.max(0, bw - 8))
+          .attr('height', hitH)
+          .attr('data-cluster-id', cid)
+          .on('click', (e) => {
+            e.stopPropagation();
+            if (focusedClusterId === cid) {
+              clearClusterFocus();
+            } else {
+              focusCluster(cid);
+            }
+          });
+
+        cg.append('text')
+          .attr('class', 'cluster-label')
+          .attr('x', bx + 8)
+          .attr('y', by + 13)
+          .attr('data-cluster-id', cid)
+          .text(n.label);
+      }
+    }
+
     // Edges
     const edgeGroup = graphGroup.append('g').attr('class', 'edges');
     for (const e of g.edges()) {
@@ -842,7 +1108,10 @@ function renderLineageHtml(
         .y(p => p.y)
         .curve(d3.curveCatmullRom.alpha(0.5));
 
-      const ep = edgeGroup.append('g').attr('class', 'edgePath');
+      const ep = edgeGroup.append('g')
+        .attr('class', 'edgePath')
+        .attr('data-src', e.v)
+        .attr('data-tgt', e.w);
       ep.append('path')
         .attr('d', line(points))
         .attr('marker-end', 'url(#arrow)');
@@ -862,6 +1131,9 @@ function renderLineageHtml(
     const nodeGroup = graphGroup.append('g').attr('class', 'nodes');
     for (const nodeId of g.nodes()) {
       const n = g.node(nodeId);
+      // Skip cluster parent nodes — they only define bboxes, rendered above
+      if (n.isCluster) continue;
+
       const isSource = !hasIncoming.has(nodeId);
       const isLeaf   = !hasOutgoing.has(nodeId);
       // Re-apply selection highlight if this node was selected before re-render
@@ -871,8 +1143,13 @@ function renderLineageHtml(
       else if (!n.focal && isLeaf) cls += ' leaf';
       if (isSelected) cls += ' selected';
 
+      // Determine cluster membership for data attribute
+      const parentId = currentClusterMode !== 'none' ? (g.parent(nodeId) || '') : '';
+
       const ng = nodeGroup.append('g')
         .attr('class', cls)
+        .attr('data-node-id', nodeId)
+        .attr('data-cluster-id', parentId)
         .attr('transform', 'translate(' + (n.x - n.width / 2) + ',' + (n.y - n.height / 2) + ')');
 
       ng.append('rect')
@@ -912,13 +1189,16 @@ function renderLineageHtml(
     }
 
     // Update status bar
+    const clusterSuffix = currentClusterMode !== 'none' ? ' · cluster: ' + currentClusterMode : '';
     if (viewMode === 'model') {
-      const nodeCount = g.nodeCount();
+      // nodeCount excludes cluster parents
+      const leafNodes = g.nodes().filter(id => !g.node(id).isCluster);
+      const nodeCount = leafNodes.length;
       const edgeCount = g.edgeCount();
       status.textContent =
         nodeCount + ' model(s) · ' + edgeCount + ' dep(s) · ' +
-        rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
-        'click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
+        rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream' +
+        clusterSuffix + ' · click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
     } else {
       const edgeCount = rawData.edges.length;
       if (edgeCount === 0) {
@@ -928,8 +1208,8 @@ function renderLineageHtml(
       } else {
         status.textContent =
           edgeCount + ' column edge(s) · ' +
-          rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream · ' +
-          'click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
+          rawData.upstream.length + ' upstream · ' + rawData.downstream.length + ' downstream' +
+          clusterSuffix + ' · click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
       }
     }
   }
@@ -942,6 +1222,17 @@ function renderLineageHtml(
     document.getElementById('mode-column').classList.toggle('active', currentViewMode === 'column');
   }
   updateModeButtons();
+
+  // Restore cluster mode select to saved value
+  document.getElementById('cluster-mode').value = currentClusterMode;
+
+  // ── Background click → clear cluster focus ────────────────────────────────────
+  svgEl.addEventListener('click', (e) => {
+    // Only clear if the click target is the SVG itself, not a child element
+    if (e.target === svgEl && focusedClusterId !== null) {
+      clearClusterFocus();
+    }
+  });
 
   // ── View mode toggle ──────────────────────────────────────────────────────────
   document.getElementById('mode-model').onclick = () => {
@@ -960,6 +1251,16 @@ function renderLineageHtml(
     render('column');
     fitToView();
   };
+
+  // ── Cluster mode select ───────────────────────────────────────────────────────
+  document.getElementById('cluster-mode').addEventListener('change', (e) => {
+    const newMode = e.target.value;
+    if (newMode === currentClusterMode) return;
+    currentClusterMode = newMode;
+    persistState({ clusterMode: newMode });
+    render(currentViewMode);
+    fitToView();
+  });
 
   // ── Fit to view ──────────────────────────────────────────────────────────────
   function fitToView() {
