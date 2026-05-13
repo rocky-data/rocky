@@ -53,7 +53,7 @@ class ApproverIdentity(BaseModel):
     """
     Identity of an approver, captured at sign time.
 
-    Email is sourced from `git config user.email`; name from `git config user.name`. Hostname is best-effort from the `hostname` crate and surfaced as an audit aid only — it is not part of the trust boundary.
+    Email is sourced from `git config user.email`; name from `git config user.name`. Hostname is best-effort from the `hostname` crate and surfaced as an audit aid only — it is not part of the trust boundary. Set `ROCKY_SCRUB_HOST` in the environment to replace the hostname with `"redacted"` when recording public demos.
     """
 
     email: str
