@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.29.0] — 2026-05-13
+
+Companion release to engine `v1.31.0`. Headline: **`BreakingChange` / `BreakingFinding` / `BreakingSeverity` types are now first-class on the generated Pydantic surface** — Cluster 3 E (semantic breaking-change diff) shipped end-to-end on the engine side ([#508](https://github.com/rocky-data/rocky/pull/508) classifier, [#509](https://github.com/rocky-data/rocky/pull/509) `rocky ci-diff --semantic`, [#510](https://github.com/rocky-data/rocky/pull/510) `rocky branch promote` gate) and the regenerated Pydantic models flow through `dagster_rocky.types_generated.ci_diff_schema` and `dagster_rocky.types_generated.branch_promote_schema`, so consumers parsing `rocky ci-diff --semantic` or `rocky branch promote` JSON output now see the typed findings + the three new `AuditEventKind` variants (`BreakingChangesBlocked` / `BreakingChangesAllowed` / `BreakingChangesGateSkipped`). Wheel re-cut against the v1.31.0 engine binary.
+
+### Added
+
+- **`BreakingChange` / `BreakingFinding` / `BreakingSeverity` types** (engine [#508](https://github.com/rocky-data/rocky/pull/508)). New Pydantic models in `dagster_rocky.types_generated.ci_diff_schema` and `dagster_rocky.types_generated.branch_promote_schema` covering the 16-variant `BreakingChange` enum + the three severity levels.
+- **`CiDiffOutput.breaking_findings`** field (engine [#509](https://github.com/rocky-data/rocky/pull/509)). Skip-if-empty on the wire; consumers of `rocky ci-diff --semantic` JSON output read findings here.
+- **`BranchPromoteOutput.breaking_changes`** field and `AuditEventKind.{BreakingChangesBlocked, BreakingChangesAllowed, BreakingChangesGateSkipped}` variants (engine [#510](https://github.com/rocky-data/rocky/pull/510)). Surfaced through the regenerated `branch_promote_schema` so Dagster ops inspecting promote audit trails can pattern-match on the new variants.
+
+### Changed
+
+- **Note on `datamodel-codegen` numbering**: adding new `JsonSchema`-deriving variants reshuffles `Kind*` / `BreakingChange*` class names in `preview_diff_schema.py` and adjacent files by encounter order. Pure rename churn, no behaviour change. Existing consumers should reference classes via the parent discriminated-union types (`BreakingChange`, `Kind`) rather than the numbered sub-classes.
+
 ## [1.28.0] — 2026-05-12
 
 Companion release to engine `v1.30.0`. Headline: **regenerated `MaterializationStrategy` enum picks up `content_addressed`** — the new strategy added to the engine IR ([#496](https://github.com/rocky-data/rocky/pull/496)) and accepted by the TOML sidecar ([#497](https://github.com/rocky-data/rocky/pull/497)) flows through codegen into `dagster_rocky.types_generated.adapter_config_schema` and `dagster_rocky.types_generated.rocky_project_schema`, so consumers parsing Rocky JSON output via Pydantic now see `content_addressed` as a valid discriminator without overriding `extra = "forbid"`. The rest of the engine cycle (rocky-iceberg writer Phases 1–5, `rocky-ir` crate extraction, Plan enum deletion, dbt importer GA framing, arrow+parquet 54→58) is source-invisible to the dagster integration — no JSON output struct shape changed. Wheel re-cut against the v1.30.0 engine binary.

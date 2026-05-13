@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.3] — 2026-05-13
+
+Companion release to engine `v1.31.0`. Patch cycle: the regenerated TypeScript interfaces in `src/types/generated/ci_diff.ts` and `src/types/generated/branch_promote.ts` pick up the typed `BreakingChange` / `BreakingFinding` / `BreakingSeverity` surface (engine [#508](https://github.com/rocky-data/rocky/pull/508) / [#509](https://github.com/rocky-data/rocky/pull/509) / [#510](https://github.com/rocky-data/rocky/pull/510)), so any extension code that consumes `rocky ci-diff --semantic` or `rocky branch promote` JSON output now type-checks against the full discriminated union. No extension feature changes — no new commands, no UI changes, no setting changes.
+
 ## [1.15.2] — 2026-05-12
 
 Companion release to engine `v1.30.0`. Patch cycle: the regenerated TypeScript interfaces in `src/types/generated/` pick up the new `content_addressed` value on the `MaterializationStrategy` union (engine [#496](https://github.com/rocky-data/rocky/pull/496) + [#497](https://github.com/rocky-data/rocky/pull/497)), so any extension code that destructures a model sidecar via `rockyJson.ts` now type-checks against the full strategy surface. No extension feature changes — no new commands, no UI changes, no setting changes. Dev-dependency refresh: vitest `4.1.5 → 4.1.6` ([#462](https://github.com/rocky-data/rocky/pull/462)), typescript-eslint bump ([#461](https://github.com/rocky-data/rocky/pull/461)), `@types/node` bump ([#460](https://github.com/rocky-data/rocky/pull/460)).
