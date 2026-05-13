@@ -205,88 +205,84 @@ fn compile_head(
     compile::compile(&config).context("failed to compile models in the current working tree")
 }
 
-/// Try to compile the base ref by checking out model files to a temp dir
-/// and running the compiler against them.
+/// Try to compile the project as it stood at `base_ref` by checking out the
+/// models directory at that ref into a temp directory and running the same
+/// compile path as HEAD.
 ///
-/// This is best-effort: if the base ref doesn't have a complete models
-/// directory or compilation fails, we return `None` rather than erroring.
-/// Callers project schemas / typed models from the `CompileResult` (see
-/// [`typed_columns_from_compile`]).
+/// Returns:
+/// - `Ok(result)` when the base ref's models compiled cleanly.
+/// - `Err(reason)` with a short human-readable reason when the base could
+///   not be materialized or did not compile. The reason is intended for the
+///   semantic-diff gate's `BreakingChangesGateSkipped` audit event;
+///   `compute_ci_diff` calls `.ok()` and treats `None` the same way the
+///   pre-#510 `compile_base_ref` did.
 ///
-/// `source_schemas` seeds the compile from the *current* warehouse
-/// cache, not historical types. That's fine for diff purposes —
-/// typecheck on historical models with today's leaf types still detects
-/// the model-level schema drift that ci-diff is looking for, and there's
-/// no per-ref cache to restore from.
-fn compile_base_ref(
+/// `source_schemas` seeds the compile from the *current* warehouse cache,
+/// not historical types. That's fine for diff purposes — typecheck on
+/// historical models with today's leaf types still detects the model-level
+/// schema drift that ci-diff is looking for, and there's no per-ref cache
+/// to restore from.
+pub(crate) fn extract_base_compile(
     base_ref: &str,
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
-) -> Option<rocky_compiler::compile::CompileResult> {
-    // Try to get the models directory path relative to the repo root
+) -> Result<rocky_compiler::compile::CompileResult, String> {
     let models_rel = match find_models_relative_path(models_dir) {
         Some(p) => p,
         None => {
-            debug!("could not determine models directory relative to repo root");
-            return None;
+            return Err("could not determine models directory relative to repo root".to_string());
         }
     };
 
-    // Create a temp directory and populate it with base-ref model files
     let tmp = match tempfile::tempdir() {
         Ok(t) => t,
         Err(e) => {
-            debug!("failed to create temp dir for base schema extraction: {e}");
-            return None;
+            return Err(format!(
+                "failed to create temp dir for base extraction: {e}"
+            ));
         }
     };
 
-    // Use git ls-tree to find all files under the models path at the base ref
     let ls_output = Command::new("git")
         .args(["ls-tree", "-r", "--name-only", base_ref, &models_rel])
         .output();
-
     let ls_output = match ls_output {
         Ok(o) if o.status.success() => o,
         _ => {
-            debug!(
-                "git ls-tree failed for base ref '{base_ref}' — skipping base schema extraction"
-            );
-            return None;
+            return Err(format!(
+                "git ls-tree failed for base ref '{base_ref}' — models directory missing at that ref?"
+            ));
         }
     };
 
     let file_list = String::from_utf8_lossy(&ls_output.stdout);
+    let mut wrote_any = false;
     for file_path in file_list.lines() {
         let file_path = file_path.trim();
         if file_path.is_empty() {
             continue;
         }
-
-        // Determine the relative path within the models directory
         let rel = match file_path.strip_prefix(&models_rel) {
             Some(r) => r.trim_start_matches('/'),
             None => continue,
         };
-
         let dest = tmp.path().join(rel);
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-
-        // Extract file content from git
         let show_output = Command::new("git")
             .args(["show", &format!("{base_ref}:{file_path}")])
             .output();
-
         if let Ok(o) = show_output {
-            if o.status.success() {
-                let _ = std::fs::write(&dest, &o.stdout);
+            if o.status.success() && std::fs::write(&dest, &o.stdout).is_ok() {
+                wrote_any = true;
             }
         }
     }
+    if !wrote_any {
+        return Err(format!("no model files found at base ref '{base_ref}'"));
+    }
 
-    // Try to compile the extracted models
     let config = CompilerConfig {
         models_dir: tmp.path().to_path_buf(),
         contracts_dir: None,
@@ -295,13 +291,7 @@ fn compile_base_ref(
         ..Default::default()
     };
 
-    match compile::compile(&config) {
-        Ok(result) => Some(result),
-        Err(e) => {
-            debug!("base ref compilation failed (expected for partial models): {e}");
-            None
-        }
-    }
+    compile::compile(&config).map_err(|e| format!("base ref '{base_ref}' did not compile: {e}"))
 }
 
 /// Find the models directory path relative to the git repo root.
@@ -556,7 +546,7 @@ pub(crate) fn compute_ci_diff(
         .unwrap_or_default();
 
     let base_compile = if models_dir.is_dir() {
-        compile_base_ref(base_ref, models_dir, source_schemas)
+        extract_base_compile(base_ref, models_dir, source_schemas).ok()
     } else {
         None
     };

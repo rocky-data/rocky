@@ -27,11 +27,12 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
+use rocky_core::breaking_change::{self, BreakingFinding};
 use rocky_core::compare::ComparisonThresholds;
 use rocky_core::config::BranchApprovalConfig;
 use rocky_core::shadow::{self, ShadowConfig};
 use rocky_core::state::{BranchRecord, StateStore};
-use rocky_ir::TargetRef;
+use rocky_ir::{ModelIr, ProjectIr, TargetRef};
 
 use crate::output::{
     ApprovalArtifact, ApprovalSignature, ApproveOutput, ApproverIdentity, ApproverSource,
@@ -707,12 +708,25 @@ async fn discover_branch_targets(
 
 /// `rocky branch promote <name>` — promote a branch's materialized tables
 /// to their production targets, gated on `[branch.approval]` if enabled.
+///
+/// `models_dir` is the directory containing the project's transformation
+/// models; the semantic breaking-change gate compiles it against `base_ref`
+/// to detect structural regressions. Both default to `"models"` / `"main"`
+/// at the CLI layer.
+///
+/// `allow_breaking = true` bypasses the breaking-change gate (analogous to
+/// `--skip-approval` for the approval gate). The bypass is always recorded
+/// as a `BreakingChangesAllowed` audit event.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_branch_promote(
     state_path: &Path,
     config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
     branch_name: &str,
     filter: Option<&str>,
     skip_approval_flag: bool,
+    allow_breaking: bool,
     json: bool,
 ) -> Result<()> {
     use crate::registry::AdapterRegistry;
@@ -761,6 +775,7 @@ pub async fn run_branch_promote(
             branch: record.name.clone(),
             branch_state_hash: branch_state_hash.clone(),
             reason: Some(reason.clone()),
+            breaking_changes: None,
         });
     } else if approval_cfg.required {
         let (loaded, parse_rejected) = load_approvals_for_branch(&record.name)?;
@@ -797,6 +812,88 @@ pub async fn run_branch_promote(
     // (When required = false and no skip, the gate is a no-op — proceed
     // straight to PromoteStarted with no audit entry beyond the routine ones.)
 
+    // ---- Semantic breaking-change gate ------------------------------------
+    //
+    // Compile the project at the branch's base ref and at HEAD, classify the
+    // structural delta via `rocky_core::breaking_change::diff_project_ir`,
+    // and fail fast on any `Breaking`-severity finding unless the operator
+    // passed `--allow-breaking`.
+    //
+    // Fail-open on compile failure: if either side does not compile under
+    // the current Rocky version (a stale base ref written before a parser
+    // change, a partial models tree, missing `models/` directory) the gate
+    // is *skipped*, the reason is recorded in a `BreakingChangesGateSkipped`
+    // audit event, and the promote proceeds. Failing the promote on a
+    // *compile* error in the gate would surprise users whose past commits
+    // don't compile under today's Rocky — the approval gate already guards
+    // the trust boundary.
+    let breaking_findings: Option<Vec<BreakingFinding>> = evaluate_breaking_change_gate(
+        config_path,
+        models_dir,
+        base_ref,
+        &mut audit,
+        &actor,
+        &record,
+        &branch_state_hash,
+    );
+
+    if let Some(findings) = &breaking_findings {
+        let breaking: Vec<&BreakingFinding> = findings.iter().filter(|f| f.is_breaking()).collect();
+        if !breaking.is_empty() {
+            if allow_breaking {
+                audit.push(AuditEvent {
+                    kind: AuditEventKind::BreakingChangesAllowed,
+                    at: Utc::now(),
+                    actor: actor.clone(),
+                    branch: record.name.clone(),
+                    branch_state_hash: branch_state_hash.clone(),
+                    reason: Some("--allow-breaking CLI flag".to_string()),
+                    breaking_changes: Some(findings.clone()),
+                });
+            } else {
+                audit.push(AuditEvent {
+                    kind: AuditEventKind::BreakingChangesBlocked,
+                    at: Utc::now(),
+                    actor: actor.clone(),
+                    branch: record.name.clone(),
+                    branch_state_hash: branch_state_hash.clone(),
+                    reason: None,
+                    breaking_changes: Some(findings.clone()),
+                });
+
+                let summary = breaking
+                    .iter()
+                    .map(|f| format!("{:?}", f.change))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+
+                // Emit the JSON payload before bailing so operators with
+                // `--output json` still see the findings on a blocked promote.
+                let output = BranchPromoteOutput {
+                    version: VERSION.to_string(),
+                    command: "branch promote".to_string(),
+                    branch: record.name.clone(),
+                    branch_state_hash: branch_state_hash.clone(),
+                    approvals_used,
+                    approvals_rejected,
+                    breaking_changes: Some(findings.clone()),
+                    targets: Vec::new(),
+                    audit,
+                    success: false,
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+
+                anyhow::bail!(
+                    "branch promote blocked by {} breaking change(s): {summary}. \
+                     Review the findings and re-run with `--allow-breaking` to override.",
+                    breaking.len()
+                );
+            }
+        }
+    }
+
     audit.push(AuditEvent {
         kind: AuditEventKind::PromoteStarted,
         at: Utc::now(),
@@ -804,6 +901,7 @@ pub async fn run_branch_promote(
         branch: record.name.clone(),
         branch_state_hash: branch_state_hash.clone(),
         reason: None,
+        breaking_changes: None,
     });
 
     let planned = discover_branch_targets(config_path, &record, filter).await?;
@@ -851,6 +949,7 @@ pub async fn run_branch_promote(
         branch: record.name.clone(),
         branch_state_hash: branch_state_hash.clone(),
         reason: None,
+        breaking_changes: None,
     });
 
     let output = BranchPromoteOutput {
@@ -860,6 +959,7 @@ pub async fn run_branch_promote(
         branch_state_hash,
         approvals_used,
         approvals_rejected,
+        breaking_changes: breaking_findings,
         targets: targets_out,
         audit,
         success: overall_success,
@@ -888,6 +988,123 @@ pub async fn run_branch_promote(
         );
     }
     Ok(())
+}
+
+/// Compute breaking-change findings between `base_ref` and HEAD for the
+/// pre-promote gate. Returns:
+///
+/// - `Some(findings)` when both refs compiled cleanly and the typed-IR diff
+///   ran. `findings` is the full classified list, including `Info`-severity
+///   entries — the caller filters on [`BreakingFinding::is_breaking`].
+/// - `None` when the gate was skipped because either side failed to compile
+///   or the models directory was unavailable. A `BreakingChangesGateSkipped`
+///   audit event is appended to `audit` carrying the human-readable reason.
+fn evaluate_breaking_change_gate(
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    audit: &mut Vec<AuditEvent>,
+    actor: &ApproverIdentity,
+    record: &BranchRecord,
+    branch_state_hash: &str,
+) -> Option<Vec<BreakingFinding>> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let push_skip = |audit: &mut Vec<AuditEvent>, reason: String| {
+        audit.push(AuditEvent {
+            kind: AuditEventKind::BreakingChangesGateSkipped,
+            at: Utc::now(),
+            actor: actor.clone(),
+            branch: record.name.clone(),
+            branch_state_hash: branch_state_hash.to_string(),
+            reason: Some(reason),
+            breaking_changes: None,
+        });
+    };
+
+    if !models_dir.is_dir() {
+        push_skip(
+            audit,
+            format!(
+                "models directory '{}' is missing — gate skipped",
+                models_dir.display()
+            ),
+        );
+        return None;
+    }
+
+    // Seed both compiles with the cached source schemas so the resulting
+    // IR uses real types rather than `Unknown`. Mirrors `compute_ci_diff`'s
+    // policy: degrade to an empty map on config / cache failure rather than
+    // blocking the promote on a configuration issue.
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
+            // The state path is independent of the source-schemas cache for
+            // the gate's purposes; use the workspace default.
+            let state_path = std::path::PathBuf::from(".rocky/state.redb");
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, &state_path)
+        }
+        Err(_) => std::collections::HashMap::new(),
+    };
+
+    let head_compile = {
+        let config = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            contracts_dir: None,
+            source_schemas: source_schemas.clone(),
+            source_column_info: std::collections::HashMap::new(),
+            ..Default::default()
+        };
+        match compile::compile(&config) {
+            Ok(r) => r,
+            Err(e) => {
+                push_skip(audit, format!("HEAD compile failed — gate skipped: {e}"));
+                return None;
+            }
+        }
+    };
+
+    let base_compile =
+        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
+            Ok(r) => r,
+            Err(reason) => {
+                push_skip(audit, format!("{reason} — gate skipped"));
+                return None;
+            }
+        };
+
+    let base_ir = compile_result_to_project_ir(&base_compile);
+    let head_ir = compile_result_to_project_ir(&head_compile);
+    Some(breaking_change::diff_project_ir(&base_ir, &head_ir))
+}
+
+/// Project a [`rocky_compiler::compile::CompileResult`] into a
+/// [`ProjectIr`] suitable for the breaking-change classifier.
+///
+/// `Model::to_model_ir()` returns a `ModelIr` with `typed_columns` empty —
+/// they live on the compiler's `TypeCheckResult::typed_models` map, keyed
+/// by `Model::config.name`. We merge them in here so the classifier sees
+/// the full typed shape it needs for column-level diffs.
+///
+/// Replication-only branches (no transformation models) compile to an
+/// empty `Project::models` and round-trip to an empty `ProjectIr`; the
+/// diff is naturally empty, which is the right answer — replication
+/// pipelines don't carry user-authored SQL whose shape could "break".
+fn compile_result_to_project_ir(result: &rocky_compiler::compile::CompileResult) -> ProjectIr {
+    let mut models: Vec<ModelIr> = Vec::with_capacity(result.project.models.len());
+    for model in &result.project.models {
+        let mut ir = model.to_model_ir();
+        if let Some(typed) = result.type_check.typed_models.get(&model.config.name) {
+            ir.typed_columns = typed.clone();
+        }
+        models.push(ir);
+    }
+    ProjectIr {
+        models,
+        dag: Vec::new(),
+        lineage_edges: Vec::new(),
+    }
 }
 
 /// `rocky branch show <name>` — inspect a single branch.
@@ -1313,6 +1530,7 @@ mod tests {
     /// disabled, nothing to read" cases.
     #[test]
     fn load_approvals_returns_empty_when_directory_missing() {
+        let _cwd_guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let saved = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
@@ -1322,5 +1540,429 @@ mod tests {
         assert!(rejected.is_empty());
 
         std::env::set_current_dir(saved).unwrap();
+    }
+
+    // --- Breaking-change gate ----------------------------------------------
+
+    /// `compile_result_to_project_ir` must merge `typed_models` into each
+    /// `ModelIr.typed_columns` — without that, the classifier sees empty
+    /// schemas and silently produces no column-level findings. This is the
+    /// load-bearing invariant the entire gate relies on.
+    ///
+    /// Uses a two-model chain (raw → fct) so the lineage analyzer extracts
+    /// columns from the upstream source rather than producing an empty
+    /// projection for a fromless `SELECT`.
+    #[test]
+    fn compile_result_to_project_ir_populates_typed_columns() {
+        use rocky_compiler::compile::{self, CompilerConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // Upstream: literal SELECT (lineage extracts column names).
+        std::fs::write(
+            models_dir.join("raw_widgets.sql"),
+            "SELECT 1 AS id, 'a' AS label",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("raw_widgets.toml"),
+            "name = \"raw_widgets\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"raw_widgets\"\n",
+        )
+        .unwrap();
+        // Downstream: explicit projection from the upstream.
+        std::fs::write(
+            models_dir.join("widgets.sql"),
+            "SELECT id, label FROM raw_widgets",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("widgets.toml"),
+            "name = \"widgets\"\ndepends_on = [\"raw_widgets\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"widgets\"\n",
+        )
+        .unwrap();
+
+        let cfg = CompilerConfig {
+            models_dir,
+            ..Default::default()
+        };
+        let result = compile::compile(&cfg).expect("test fixture must compile");
+
+        let ir = compile_result_to_project_ir(&result);
+        assert_eq!(ir.models.len(), 2);
+        // Find the widgets model.
+        let widgets = ir
+            .models
+            .iter()
+            .find(|m| &*m.name == "widgets")
+            .expect("widgets must be in IR");
+        assert!(
+            !widgets.typed_columns.is_empty(),
+            "typed_columns must be merged in from type_check.typed_models"
+        );
+        let names: Vec<&str> = widgets
+            .typed_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"id"), "got {names:?}");
+        assert!(names.contains(&"label"), "got {names:?}");
+    }
+
+    /// Cwd is process-wide; the gate tests call `git rev-parse
+    /// --show-toplevel` from the test dir which means they must run
+    /// serially. The first lock acquisition is fine; the load-bearing
+    /// guarantee is that no two tests overlap their `set_current_dir`
+    /// windows. A poisoned mutex is fine to ignore — the panicked test
+    /// already restored cwd (or failed before changing it).
+    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Helper: initialize a git repo in `dir` with a `main` branch containing
+    /// `models/` files, then return the path of the models directory.
+    fn init_git_repo_with_models(
+        dir: &Path,
+        rocky_toml: &str,
+        files: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(dir.join("rocky.toml"), rocky_toml).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command must run");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "tester@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+
+        for (path, contents) in files {
+            let full = models_dir.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, contents).unwrap();
+        }
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "base"]);
+        models_dir
+    }
+
+    fn dummy_actor() -> ApproverIdentity {
+        ApproverIdentity {
+            email: "tester@example.com".to_string(),
+            name: Some("Tester".to_string()),
+            host: "host-1".to_string(),
+            source: ApproverSource::Local,
+        }
+    }
+
+    /// Build a two-model project (`raw_widgets` + `widgets`) whose downstream
+    /// projection list is `cols`. Used by the gate tests below to vary the
+    /// downstream's column list between base and HEAD without re-stating the
+    /// upstream boilerplate.
+    fn write_two_model_chain(models_dir: &Path, downstream_cols: &str) {
+        std::fs::create_dir_all(models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("raw_widgets.sql"),
+            "SELECT 1 AS id, 'a' AS name, 42 AS qty",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("raw_widgets.toml"),
+            "name = \"raw_widgets\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"raw_widgets\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("widgets.sql"),
+            format!("SELECT {downstream_cols} FROM raw_widgets"),
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("widgets.toml"),
+            "name = \"widgets\"\ndepends_on = [\"raw_widgets\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"widgets\"\n",
+        )
+        .unwrap();
+    }
+
+    /// A column drop between `main` and HEAD produces a `Breaking` finding
+    /// that surfaces in the audit trail. Default behavior (no
+    /// `--allow-breaking`) must block.
+    #[test]
+    fn gate_flags_column_drop_as_breaking() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+
+        // Stage base files: downstream projects all three columns.
+        let models_relpath = "models";
+        let models_dir_abs = dir.join(models_relpath);
+        write_two_model_chain(&models_dir_abs, "id, name, qty");
+
+        // Read each base file back to seed init_git_repo_with_models.
+        let to_pair = |name: &str| -> (String, String) {
+            (
+                name.to_string(),
+                std::fs::read_to_string(models_dir_abs.join(name)).unwrap(),
+            )
+        };
+        let owned = [
+            to_pair("raw_widgets.sql"),
+            to_pair("raw_widgets.toml"),
+            to_pair("widgets.sql"),
+            to_pair("widgets.toml"),
+        ];
+        let files: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        std::fs::remove_dir_all(&models_dir_abs).unwrap();
+        let models_dir = init_git_repo_with_models(dir, rocky_toml, &files);
+
+        // Drop `qty` on HEAD.
+        write_two_model_chain(&models_dir, "id, name");
+
+        let config_path = dir.join("rocky.toml");
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let record = sample_record("fix-price");
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        let findings = evaluate_breaking_change_gate(
+            &config_path,
+            &models_dir,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &record,
+            "branch-state-hash",
+        );
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let findings = findings.expect("gate must run when both refs compile");
+        let breaking: Vec<&BreakingFinding> = findings.iter().filter(|f| f.is_breaking()).collect();
+        assert!(
+            !breaking.is_empty(),
+            "dropping a column must produce a breaking finding, got: {findings:?}"
+        );
+        assert!(
+            breaking.iter().any(|f| matches!(
+                f.change,
+                rocky_core::breaking_change::BreakingChange::ColumnDropped { .. }
+            )),
+            "the breaking finding must be ColumnDropped, got: {breaking:?}"
+        );
+        // No skip event when both sides compile.
+        assert!(
+            !audit
+                .iter()
+                .any(|e| e.kind == AuditEventKind::BreakingChangesGateSkipped),
+            "gate must not record a skip event when both refs compile"
+        );
+    }
+
+    /// A pure SQL-body rewrite that preserves the typed shape produces only
+    /// `Info` findings — the gate must let the promote through with no
+    /// breaking findings.
+    #[test]
+    fn gate_clean_when_only_info_findings() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+
+        let models_dir_abs = dir.join("models");
+        write_two_model_chain(&models_dir_abs, "id, name");
+        let to_pair = |name: &str| -> (String, String) {
+            (
+                name.to_string(),
+                std::fs::read_to_string(models_dir_abs.join(name)).unwrap(),
+            )
+        };
+        let owned = [
+            to_pair("raw_widgets.sql"),
+            to_pair("raw_widgets.toml"),
+            to_pair("widgets.sql"),
+            to_pair("widgets.toml"),
+        ];
+        let files: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        std::fs::remove_dir_all(&models_dir_abs).unwrap();
+        let models_dir = init_git_repo_with_models(dir, rocky_toml, &files);
+
+        // Same shape, swap upstream SQL only to force SqlBodyChanged (Info).
+        std::fs::write(
+            models_dir.join("raw_widgets.sql"),
+            "SELECT 2 AS id, 'b' AS name, 99 AS qty",
+        )
+        .unwrap();
+
+        let config_path = dir.join("rocky.toml");
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let record = sample_record("fix-price");
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        let findings = evaluate_breaking_change_gate(
+            &config_path,
+            &models_dir,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &record,
+            "branch-state-hash",
+        );
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let findings = findings.expect("gate must run when both refs compile");
+        let breaking_count = findings.iter().filter(|f| f.is_breaking()).count();
+        assert_eq!(
+            breaking_count, 0,
+            "a SQL-body-only change must produce zero breaking findings, got {findings:?}"
+        );
+    }
+
+    /// When the base ref's models directory does not exist the gate must
+    /// fail open: return `None`, append `BreakingChangesGateSkipped` to the
+    /// audit, and let the caller proceed.
+    #[test]
+    fn gate_fails_open_when_base_ref_missing_models() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        // Commit an empty repo with only rocky.toml — no models directory at
+        // any ref. The HEAD working tree adds the models dir.
+        let _models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+
+        // Now create a models directory on HEAD only.
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("_defaults.toml"),
+            "[target]\ncatalog = \"poc\"\nschema = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("widgets.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("widgets.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.join("rocky.toml");
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let record = sample_record("fix-price");
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        let findings = evaluate_breaking_change_gate(
+            &config_path,
+            &models_dir,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &record,
+            "branch-state-hash",
+        );
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        assert!(
+            findings.is_none(),
+            "gate must return None when the base ref has no models"
+        );
+        assert_eq!(audit.len(), 1, "exactly one skip event must be recorded");
+        assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+        assert!(
+            audit[0]
+                .reason
+                .as_deref()
+                .map(|r| r.contains("skipped"))
+                .unwrap_or(false),
+            "skip reason must be human-readable: {:?}",
+            audit[0].reason
+        );
+    }
+
+    /// When the models directory is absent entirely the gate must fail open
+    /// without invoking the compiler — `models_dir.is_dir()` check.
+    #[test]
+    fn gate_skips_when_models_dir_missing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let missing = dir.join("does-not-exist");
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(&config_path, "# stub\n").unwrap();
+
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let record = sample_record("fix-price");
+
+        let findings = evaluate_breaking_change_gate(
+            &config_path,
+            &missing,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &record,
+            "branch-state-hash",
+        );
+
+        assert!(findings.is_none());
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+    }
+
+    /// The `BreakingChangesAllowed` audit event carries the findings — the
+    /// `--allow-breaking` override must leave the exact same finding set on
+    /// disk so a future audit can review what was waved through.
+    #[test]
+    fn breaking_changes_allowed_audit_carries_findings() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let findings = vec![BreakingFinding {
+            change: BreakingChange::ColumnDropped {
+                model: "widgets".to_string(),
+                column: "qty".to_string(),
+                data_type: "INT64".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        }];
+
+        let event = AuditEvent {
+            kind: AuditEventKind::BreakingChangesAllowed,
+            at: Utc::now(),
+            actor: dummy_actor(),
+            branch: "fix-price".to_string(),
+            branch_state_hash: "deadbeef".to_string(),
+            reason: Some("--allow-breaking CLI flag".to_string()),
+            breaking_changes: Some(findings.clone()),
+        };
+
+        let json = serde_json::to_string(&event).expect("AuditEvent must serialize");
+        assert!(json.contains("breaking_changes_allowed"));
+        assert!(json.contains("column_dropped"));
+        assert!(json.contains("--allow-breaking CLI flag"));
     }
 }

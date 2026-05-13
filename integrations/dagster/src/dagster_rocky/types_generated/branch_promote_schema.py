@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, RootModel
+from pydantic import AwareDatetime, BaseModel, RootModel, conint
 
 
 class ApproverSource(StrEnum):
@@ -36,6 +36,301 @@ class AuditEventKind2(StrEnum):
     """
 
     approval_skipped = "approval_skipped"
+
+
+class AuditEventKind3(StrEnum):
+    """
+    Emitted when the semantic breaking-change gate blocked the promote. The findings list is carried on the parent [`AuditEvent`] so reviewers see exactly which structural changes triggered the block.
+    """
+
+    breaking_changes_blocked = "breaking_changes_blocked"
+
+
+class AuditEventKind4(StrEnum):
+    """
+    Emitted when the semantic breaking-change gate detected one or more `Breaking`-severity findings but the operator overrode the block via `--allow-breaking`. Records the findings so the override leaves an audit trail equivalent to `ApprovalSkipped`.
+    """
+
+    breaking_changes_allowed = "breaking_changes_allowed"
+
+
+class AuditEventKind5(StrEnum):
+    """
+    Emitted when the semantic breaking-change gate could not run — for example because the base ref failed to compile under the current Rocky version. Fail-open: the gate is skipped and the promote proceeds, but the reason is recorded so the bypass is auditable.
+    """
+
+    breaking_changes_gate_skipped = "breaking_changes_gate_skipped"
+
+
+class Kind(StrEnum):
+    model_removed = "model_removed"
+
+
+class BreakingChange1(BaseModel):
+    """
+    A model present on the base side is absent on the head side.
+    """
+
+    kind: Kind
+    model: str
+
+
+class Kind1(StrEnum):
+    model_added = "model_added"
+
+
+class BreakingChange2(BaseModel):
+    """
+    A model present on the head side is absent on the base side.
+    """
+
+    kind: Kind1
+    model: str
+
+
+class Kind2(StrEnum):
+    column_dropped = "column_dropped"
+
+
+class BreakingChange3(BaseModel):
+    """
+    A column present on the base side is absent on the head side.
+    """
+
+    column: str
+    data_type: str
+    kind: Kind2
+    model: str
+
+
+class Kind3(StrEnum):
+    column_added = "column_added"
+
+
+class BreakingChange4(BaseModel):
+    """
+    A column was added.
+    """
+
+    column: str
+    data_type: str
+    kind: Kind3
+    model: str
+    nullable: bool
+
+
+class Kind4(StrEnum):
+    column_type_changed = "column_type_changed"
+
+
+class BreakingChange5(BaseModel):
+    """
+    A column's data type changed.
+    """
+
+    column: str
+    kind: Kind4
+    model: str
+    narrowing: bool
+    """
+    `true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).
+    """
+    new_type: str
+    old_type: str
+
+
+class Kind5(StrEnum):
+    column_nullability_changed = "column_nullability_changed"
+
+
+class BreakingChange6(BaseModel):
+    """
+    A column's nullability flipped.
+    """
+
+    column: str
+    kind: Kind5
+    model: str
+    new_nullable: bool
+    old_nullable: bool
+
+
+class Kind6(StrEnum):
+    column_reordered = "column_reordered"
+
+
+class BreakingChange7(BaseModel):
+    """
+    A column's position in the output schema changed. `SELECT *` downstream consumers see different positional projection.
+    """
+
+    column: str
+    kind: Kind6
+    model: str
+    new_index: conint(ge=0)
+    old_index: conint(ge=0)
+
+
+class Kind7(StrEnum):
+    materialization_strategy_changed = "materialization_strategy_changed"
+
+
+class BreakingChange8(BaseModel):
+    """
+    The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).
+    """
+
+    kind: Kind7
+    model: str
+    new_strategy: str
+    old_strategy: str
+
+
+class Kind8(StrEnum):
+    materialization_key_changed = "materialization_key_changed"
+
+
+class BreakingChange9(BaseModel):
+    """
+    Materialization-specific key columns changed without the top-level variant changing (e.g. `Merge` `unique_key` rewritten, `Incremental` `timestamp_column` swapped).
+    """
+
+    key_kind: str
+    """
+    Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
+    """
+    kind: Kind8
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind9(StrEnum):
+    replication_columns_changed = "replication_columns_changed"
+
+
+class BreakingChange10(BaseModel):
+    """
+    Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.
+    """
+
+    kind: Kind9
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind10(StrEnum):
+    partition_by_changed = "partition_by_changed"
+
+
+class BreakingChange11(BaseModel):
+    """
+    `LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.
+    """
+
+    kind: Kind10
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind11(StrEnum):
+    target_renamed = "target_renamed"
+
+
+class BreakingChange12(BaseModel):
+    """
+    Target table reference renamed (catalog, schema, or table component).
+    """
+
+    kind: Kind11
+    model: str
+    new: str
+    old: str
+
+
+class Kind12(StrEnum):
+    source_changed = "source_changed"
+
+
+class BreakingChange13(BaseModel):
+    """
+    Source reference rebound to a different table.
+    """
+
+    kind: Kind12
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind13(StrEnum):
+    column_mask_changed = "column_mask_changed"
+
+
+class BreakingChange14(BaseModel):
+    """
+    A column mask was added, removed, or its strategy changed.
+    """
+
+    column: str
+    kind: Kind13
+    model: str
+    new_strategy: str | None = None
+    old_strategy: str | None = None
+
+
+class Kind14(StrEnum):
+    lakehouse_format_changed = "lakehouse_format_changed"
+
+
+class BreakingChange15(BaseModel):
+    """
+    Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).
+    """
+
+    kind: Kind14
+    model: str
+    new: str
+    old: str
+
+
+class Kind15(StrEnum):
+    sql_body_changed = "sql_body_changed"
+
+
+class BreakingChange16(BaseModel):
+    """
+    SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.
+    """
+
+    kind: Kind15
+    model: str
+
+
+class BreakingSeverity1(StrEnum):
+    """
+    Will break a downstream consumer that reads the model's prior shape.
+    """
+
+    breaking = "breaking"
+
+
+class BreakingSeverity2(StrEnum):
+    """
+    May break consumers depending on usage; e.g. nullable → NOT NULL, column reordered.
+    """
+
+    warning = "warning"
+
+
+class BreakingSeverity3(StrEnum):
+    """
+    Informational only — purely additive or backwards-compatible.
+    """
+
+    info = "info"
 
 
 class PromoteTarget(BaseModel):
@@ -120,24 +415,37 @@ class ApproverIdentity(BaseModel):
     source: ApproverSource
 
 
-class AuditEvent(BaseModel):
+class BreakingFinding(BaseModel):
     """
-    Single audit-trail event emitted during `branch promote`.
-
-    Routed to stdout JSON only in v1; persistent audit storage is a follow-up.
+    A classified finding produced by [`diff_project_ir`].
     """
 
-    actor: ApproverIdentity
-    at: AwareDatetime
-    branch: str
-    branch_state_hash: str
-    kind: AuditEventKind1 | AuditEventKind2
+    change: (
+        BreakingChange1
+        | BreakingChange2
+        | BreakingChange3
+        | BreakingChange4
+        | BreakingChange5
+        | BreakingChange6
+        | BreakingChange7
+        | BreakingChange8
+        | BreakingChange9
+        | BreakingChange10
+        | BreakingChange11
+        | BreakingChange12
+        | BreakingChange13
+        | BreakingChange14
+        | BreakingChange15
+        | BreakingChange16
+    )
     """
-    Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
+    A single typed semantic change between two `ProjectIr` snapshots.
+
+    Each variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.
     """
-    reason: str | None = None
+    severity: BreakingSeverity1 | BreakingSeverity2 | BreakingSeverity3
     """
-    Free-form context. Populated for `ApprovalSkipped` to record the origin of the skip ("--skip-approval CLI flag" or "ROCKY_BRANCH_APPROVAL_SKIP=1"); empty for routine state events.
+    Severity classification for a single semantic change.
     """
 
 
@@ -160,6 +468,37 @@ class ApprovalArtifact(BaseModel):
     signed_at: AwareDatetime
 
 
+class AuditEvent(BaseModel):
+    """
+    Single audit-trail event emitted during `branch promote`.
+
+    Routed to stdout JSON only in v1; persistent audit storage is a follow-up.
+    """
+
+    actor: ApproverIdentity
+    at: AwareDatetime
+    branch: str
+    branch_state_hash: str
+    breaking_changes: list[BreakingFinding] | None = None
+    """
+    Breaking-change findings carried by `BreakingChangesBlocked` and `BreakingChangesAllowed` events. Always absent for other kinds.
+    """
+    kind: (
+        AuditEventKind1
+        | AuditEventKind2
+        | AuditEventKind3
+        | AuditEventKind4
+        | AuditEventKind5
+    )
+    """
+    Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
+    """
+    reason: str | None = None
+    """
+    Free-form context. Populated for `ApprovalSkipped` to record the origin of the skip, and for `BreakingChangesGateSkipped` to record why the gate could not run (e.g. "base ref did not compile"). Empty for routine state events.
+    """
+
+
 class BranchPromoteOutput(BaseModel):
     """
     JSON output for `rocky branch promote`.
@@ -179,6 +518,10 @@ class BranchPromoteOutput(BaseModel):
     """
     branch: str
     branch_state_hash: str
+    breaking_changes: list[BreakingFinding] | None = None
+    """
+    Semantic breaking-change findings produced by the pre-promote gate. Empty when the gate ran and found no breaking changes; absent when the gate was skipped (compile failure on either side). When present and non-empty either the promote was blocked or `--allow-breaking` was set — see the audit trail for which.
+    """
     command: str
     success: bool
     """
