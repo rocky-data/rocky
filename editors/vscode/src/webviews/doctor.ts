@@ -12,7 +12,7 @@ export function showDoctorResult(result: DoctorResult): void {
     "rockyDoctor",
     "Rocky Doctor",
     vscode.ViewColumn.Beside,
-    { enableScripts: true, retainContextWhenHidden: true },
+    { enableScripts: true, retainContextWhenHidden: true, enableCommandUris: true },
   );
 
   panel.webview.html = renderDoctorHtml(panel.webview, result);
@@ -54,19 +54,23 @@ function renderDoctorHtml(
         : "fail";
 
   const rows = checks
-    .map(
-      (c) => `
+    .map((c) => {
+      const isFailed =
+        c.status === "critical" ||
+        c.status === "warning";
+      const actionLinks = isFailed ? buildCheckActionLinks(c.name ?? "") : "";
+      return `
       <tr>
         <td><span class="badge ${badgeFor(c.status)}">${escapeHtml(c.status ?? "?")}</span></td>
         <td><strong>${escapeHtml(c.name ?? "")}</strong></td>
-        <td>${escapeHtml(c.message ?? "")}</td>
+        <td>${escapeHtml(c.message ?? "")}${actionLinks}</td>
         <td class="muted">${typeof c.duration_ms === "number" ? c.duration_ms + "ms" : ""}</td>
-      </tr>`,
-    )
+      </tr>`;
+    })
     .join("");
 
   const suggestionList = suggestions
-    .map((s) => `<li>${escapeHtml(s)}</li>`)
+    .map((s) => `<li>${escapeHtml(s)}${buildSuggestionActionLink(s)}</li>`)
     .join("");
 
   return /* html */ `<!DOCTYPE html>
@@ -115,4 +119,37 @@ function badgeFor(status: string | undefined): string {
     default:
       return "warn";
   }
+}
+
+/**
+ * Returns inline `command:` anchor tags for a failed check.
+ *
+ * Uses VS Code `command:` URIs — these work because `enableCommandUris: true`
+ * is set on the webview. All links are hardcoded to commands that are always
+ * registered; no user-supplied data is interpolated into the href.
+ */
+function buildCheckActionLinks(checkName: string): string {
+  // Always offer "Open settings" for any failed check.
+  const settingsLink = ` <a href="command:workbench.action.openSettings?%22rocky%22" title="Open Rocky settings">Open settings</a>`;
+
+  // For CLI-not-found checks, also offer a path configuration shortcut.
+  const isCliCheck =
+    /cli|binary|install|path|not found/i.test(checkName);
+  if (isCliCheck) {
+    const configLink = ` · <a href="command:workbench.action.openSettings?%22rocky.server.path%22" title="Configure CLI path">Configure path</a>`;
+    return settingsLink + configLink;
+  }
+
+  return settingsLink;
+}
+
+/**
+ * Returns an inline `command:` anchor when the suggestion text implies a
+ * well-known one-click fix, otherwise returns an empty string.
+ */
+function buildSuggestionActionLink(suggestion: string): string {
+  if (/settings?|configure|set/i.test(suggestion)) {
+    return ` <a href="command:workbench.action.openSettings?%22rocky%22" title="Open Rocky settings">Open settings</a>`;
+  }
+  return "";
 }
