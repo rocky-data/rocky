@@ -63,10 +63,7 @@ export class RockyCodeLensProvider implements vscode.CodeLensProvider {
         modelName,
       ]),
       makeLens(range, "$(beaker) Test", "rocky.test", [modelName]),
-      makeLens(range, "$(graph) Lineage", "rocky.showLineage"),
-      makeLens(range, "$(history) History", "rocky.history", [modelName]),
-      makeLens(range, "$(pulse) Metrics", "rocky.metrics", [modelName]),
-      makeLens(range, "$(rocket) Optimize", "rocky.optimize", [modelName]),
+      makeLens(range, "$(graph) Lineage", "rocky.showLineage", [modelName]),
     ];
   }
 }
@@ -132,9 +129,7 @@ export function registerCodeLensProvider(
     vscode.languages.registerCodeLensProvider(
       [
         { scheme: "file", language: "rocky" },
-        { scheme: "file", pattern: "**/*.rocky" },
         { scheme: "file", language: "sql", pattern: "**/models/**/*.sql" },
-        { scheme: "file", pattern: "**/models/**/*.sql" },
       ],
       provider,
     ),
