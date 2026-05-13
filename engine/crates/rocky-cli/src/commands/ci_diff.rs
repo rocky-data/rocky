@@ -205,28 +205,30 @@ fn compile_head(
     compile::compile(&config).context("failed to compile models in the current working tree")
 }
 
-/// Try to extract schemas from the base ref by checking out model files to a temp dir.
+/// Try to compile the base ref by checking out model files to a temp dir
+/// and running the compiler against them.
 ///
-/// This is best-effort: if the base ref doesn't have a complete models directory
-/// or compilation fails, we return an empty map rather than erroring.
+/// This is best-effort: if the base ref doesn't have a complete models
+/// directory or compilation fails, we return `None` rather than erroring.
+/// Callers project schemas / typed models from the `CompileResult` (see
+/// [`typed_columns_from_compile`]).
 ///
 /// `source_schemas` seeds the compile from the *current* warehouse
 /// cache, not historical types. That's fine for diff purposes —
 /// typecheck on historical models with today's leaf types still detects
 /// the model-level schema drift that ci-diff is looking for, and there's
 /// no per-ref cache to restore from.
-fn extract_base_schemas(
+fn compile_base_ref(
     base_ref: &str,
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
-) -> HashMap<String, Vec<TypedColumn>> {
+) -> Option<rocky_compiler::compile::CompileResult> {
     // Try to get the models directory path relative to the repo root
-    let models_rel = find_models_relative_path(models_dir);
-    let models_rel = match models_rel {
+    let models_rel = match find_models_relative_path(models_dir) {
         Some(p) => p,
         None => {
             debug!("could not determine models directory relative to repo root");
-            return HashMap::new();
+            return None;
         }
     };
 
@@ -235,7 +237,7 @@ fn extract_base_schemas(
         Ok(t) => t,
         Err(e) => {
             debug!("failed to create temp dir for base schema extraction: {e}");
-            return HashMap::new();
+            return None;
         }
     };
 
@@ -250,7 +252,7 @@ fn extract_base_schemas(
             debug!(
                 "git ls-tree failed for base ref '{base_ref}' — skipping base schema extraction"
             );
-            return HashMap::new();
+            return None;
         }
     };
 
@@ -294,23 +296,10 @@ fn extract_base_schemas(
     };
 
     match compile::compile(&config) {
-        Ok(result) => {
-            let mut schemas = HashMap::new();
-            for (model_name, typed_cols) in &result.type_check.typed_models {
-                let cols: Vec<TypedColumn> = typed_cols
-                    .iter()
-                    .map(|tc| TypedColumn {
-                        name: tc.name.clone(),
-                        data_type: format!("{:?}", tc.data_type),
-                    })
-                    .collect();
-                schemas.insert(model_name.clone(), cols);
-            }
-            schemas
-        }
+        Ok(result) => Some(result),
         Err(e) => {
             debug!("base ref compilation failed (expected for partial models): {e}");
-            HashMap::new()
+            None
         }
     }
 }
@@ -471,10 +460,16 @@ fn build_diff_results(
 /// `head_compile` is `None` when the models directory is missing or the
 /// HEAD compile fails — callers (e.g. `rocky lineage-diff`) that need the
 /// `semantic_graph` for downstream traces must handle that gracefully.
+///
+/// `base_compile` is similarly `None` when the base ref can't be checked
+/// out into a temp dir or fails to compile. Both are kept on the data
+/// struct so the `--semantic` path can lower them into [`ProjectIr`]
+/// without re-running the compiler.
 pub(crate) struct CiDiffData {
     pub(crate) summary: DiffSummary,
     pub(crate) results: Vec<DiffResult>,
     pub(crate) head_compile: Option<rocky_compiler::compile::CompileResult>,
+    pub(crate) base_compile: Option<rocky_compiler::compile::CompileResult>,
     /// Total count of files git reported as changed between `base_ref` and
     /// HEAD (any extension, before the model-file filter). Lets callers
     /// distinguish "PR is empty" from "PR is non-empty but only touches
@@ -520,6 +515,7 @@ pub(crate) fn compute_ci_diff(
             },
             results: vec![],
             head_compile: None,
+            base_compile: None,
             changed_file_count,
         });
     }
@@ -536,6 +532,7 @@ pub(crate) fn compute_ci_diff(
             },
             results: vec![],
             head_compile: None,
+            base_compile: None,
             changed_file_count,
         });
     }
@@ -558,11 +555,15 @@ pub(crate) fn compute_ci_diff(
         .map(typed_columns_from_compile)
         .unwrap_or_default();
 
-    let base_schemas = if models_dir.is_dir() {
-        extract_base_schemas(base_ref, models_dir, source_schemas)
+    let base_compile = if models_dir.is_dir() {
+        compile_base_ref(base_ref, models_dir, source_schemas)
     } else {
-        HashMap::new()
+        None
     };
+    let base_schemas = base_compile
+        .as_ref()
+        .map(typed_columns_from_compile)
+        .unwrap_or_default();
 
     let results = build_diff_results(&model_changes, &head_schemas, &base_schemas);
     let summary = DiffSummary::from_results(&results);
@@ -571,8 +572,67 @@ pub(crate) fn compute_ci_diff(
         summary,
         results,
         head_compile,
+        base_compile,
         changed_file_count,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Semantic breaking-change lowering
+// ---------------------------------------------------------------------------
+
+/// Lower a [`rocky_compiler::compile::CompileResult`] into a
+/// [`rocky_ir::ProjectIr`] suitable for the
+/// [`rocky_core::breaking_change`] classifier.
+///
+/// Each model in `result.project.models` is converted via
+/// [`rocky_core::models::Model::to_model_ir`] (which leaves
+/// `typed_columns` empty) and then enriched with the typed columns from
+/// `result.type_check.typed_models`, keyed by `config.name`. Models the
+/// type-checker did not produce columns for keep their empty
+/// `typed_columns` vec — the classifier handles this gracefully (it
+/// just won't emit per-column findings for that model).
+///
+/// `dag` and `lineage_edges` are left empty: the classifier ignores both
+/// (they are implementation-detail fields per the
+/// `rocky_core::breaking_change` module docs).
+pub(crate) fn project_ir_from_compile(
+    result: &rocky_compiler::compile::CompileResult,
+) -> rocky_ir::ProjectIr {
+    let typed = &result.type_check.typed_models;
+    let models = result
+        .project
+        .models
+        .iter()
+        .map(|m| {
+            let mut ir = m.to_model_ir();
+            if let Some(cols) = typed.get(&m.config.name) {
+                ir.typed_columns = cols.clone();
+            }
+            ir
+        })
+        .collect();
+    rocky_ir::ProjectIr {
+        models,
+        dag: Vec::new(),
+        lineage_edges: Vec::new(),
+    }
+}
+
+/// Run the semantic breaking-change classifier across `base` and `head`
+/// compiles. Returns an empty vec when either side is `None`.
+fn semantic_findings(
+    base: Option<&rocky_compiler::compile::CompileResult>,
+    head: Option<&rocky_compiler::compile::CompileResult>,
+) -> Vec<rocky_core::breaking_change::BreakingFinding> {
+    match (base, head) {
+        (Some(b), Some(h)) => {
+            let old = project_ir_from_compile(b);
+            let new = project_ir_from_compile(h);
+            rocky_core::breaking_change::diff_project_ir(&old, &new)
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,12 +640,19 @@ pub(crate) fn compute_ci_diff(
 // ---------------------------------------------------------------------------
 
 /// Execute `rocky ci-diff`.
+///
+/// `semantic` enables the typed-IR breaking-change classifier
+/// ([`rocky_core::breaking_change::diff_project_ir`]); findings are
+/// attached to the JSON output under `breaking_findings`. The flag is
+/// informational only: even a `Breaking` finding does not change the
+/// exit code. The hard gate lives on `rocky branch promote`.
 pub fn run_ci_diff(
     config_path: &Path,
     state_path: &Path,
     base_ref: &str,
     models_dir: &Path,
     output_json: bool,
+    semantic: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let data = compute_ci_diff(
@@ -621,13 +688,20 @@ pub fn run_ci_diff(
         return Ok(());
     }
 
+    let findings = if semantic {
+        semantic_findings(data.base_compile.as_ref(), data.head_compile.as_ref())
+    } else {
+        Vec::new()
+    };
+
     if output_json {
         let output = CiDiffOutput::new(
             base_ref.to_string(),
             "HEAD".to_string(),
             data.summary,
             data.results,
-        );
+        )
+        .with_breaking_findings(findings);
         print_json(&output)?;
     } else {
         println!("Rocky CI Diff ({base_ref}...HEAD)\n");
@@ -635,6 +709,18 @@ pub fn run_ci_diff(
         println!();
         println!("--- Markdown (for PR comment) ---\n");
         print!("{}", format_diff_markdown(&data.results));
+        if semantic && !findings.is_empty() {
+            println!();
+            println!("--- Semantic Findings ({} total) ---\n", findings.len());
+            for f in &findings {
+                let sev = match f.severity {
+                    rocky_core::breaking_change::BreakingSeverity::Breaking => "BREAKING",
+                    rocky_core::breaking_change::BreakingSeverity::Warning => "WARNING",
+                    rocky_core::breaking_change::BreakingSeverity::Info => "INFO",
+                };
+                println!("[{sev}] {:?}", f.change);
+            }
+        }
     }
 
     Ok(())
@@ -1030,5 +1116,136 @@ mod tests {
             results[0].column_changes[0].change_type,
             ColumnChangeType::Removed
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // project_ir_from_compile + semantic_findings (semantic mode stitching)
+    // -----------------------------------------------------------------------
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Write a minimal transformation model: `<name>.sql` + sidecar
+    /// `<name>.toml`. Mirrors the test helper in `compile.rs`.
+    fn write_model(dir: &Path, name: &str, sql: &str) {
+        let sql_path = dir.join(format!("{name}.sql"));
+        let toml_path = dir.join(format!("{name}.toml"));
+        fs::write(&sql_path, sql).unwrap();
+        fs::write(
+            &toml_path,
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Build a `HashMap<source_name, Vec<TypedColumn>>` to seed the
+    /// compiler so SELECT FROM <source> yields concrete typed columns.
+    fn source_schema(
+        name: &str,
+        cols: &[(&str, rocky_ir::RockyType)],
+    ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_string(),
+            cols.iter()
+                .map(|(n, t)| rocky_compiler::types::TypedColumn {
+                    name: (*n).to_string(),
+                    data_type: t.clone(),
+                    nullable: true,
+                })
+                .collect(),
+        );
+        map
+    }
+
+    #[test]
+    fn project_ir_from_compile_stitches_typed_columns_from_type_check() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path();
+        // SELECT FROM a seeded source so the typechecker produces real
+        // typed columns; SELECT-without-FROM yields an empty schema.
+        write_model(models_dir, "orders", "SELECT id, name FROM src_orders");
+
+        let sources = source_schema(
+            "src_orders",
+            &[
+                ("id", rocky_ir::RockyType::Int64),
+                ("name", rocky_ir::RockyType::String),
+            ],
+        );
+        let result = compile_head(models_dir, sources).expect("compile succeeds");
+        let ir = project_ir_from_compile(&result);
+
+        assert_eq!(ir.models.len(), 1);
+        let model = &ir.models[0];
+        assert_eq!(&*model.name, "orders");
+        assert!(
+            !model.typed_columns.is_empty(),
+            "typed_columns must be stitched from type_check.typed_models",
+        );
+        let names: Vec<&str> = model
+            .typed_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"id"));
+        assert!(names.contains(&"name"));
+    }
+
+    #[test]
+    fn semantic_findings_flag_column_drop_as_breaking() {
+        // Compile two minimal projects that differ only by a dropped
+        // column on a shared model; assert the classifier surfaces a
+        // `column_dropped` finding with `breaking` severity via the
+        // stitched IR.
+        let sources = source_schema(
+            "src_orders",
+            &[
+                ("id", rocky_ir::RockyType::Int64),
+                ("legacy_flag", rocky_ir::RockyType::String),
+            ],
+        );
+
+        let base_dir = TempDir::new().unwrap();
+        write_model(
+            base_dir.path(),
+            "orders",
+            "SELECT id, legacy_flag FROM src_orders",
+        );
+        let head_dir = TempDir::new().unwrap();
+        write_model(head_dir.path(), "orders", "SELECT id FROM src_orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+
+        let findings = semantic_findings(Some(&base_compile), Some(&head_compile));
+        let dropped: Vec<_> = findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.change,
+                    rocky_core::breaking_change::BreakingChange::ColumnDropped { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            dropped.len(),
+            1,
+            "expected exactly one column_dropped finding, got findings: {findings:?}",
+        );
+        assert!(
+            dropped[0].is_breaking(),
+            "column_dropped must surface as breaking severity",
+        );
+    }
+
+    #[test]
+    fn semantic_findings_empty_when_either_side_missing() {
+        // No compile on either side → classifier is skipped, empty vec.
+        // The CLI relies on `skip_serializing_if = "Vec::is_empty"` to
+        // omit the field from JSON output in this case.
+        assert!(semantic_findings(None, None).is_empty());
     }
 }
