@@ -13,20 +13,30 @@ const _mockSubscriptions: { push: ReturnType<typeof vi.fn> } = {
 
 vi.mock("vscode", () => {
   const DiagnosticSeverity = { Error: 0, Warning: 1, Information: 2, Hint: 3 };
+  const CodeActionKind = {
+    QuickFix: { value: "quickfix", append: vi.fn() },
+    Empty: { value: "", append: vi.fn() },
+  };
   return {
     languages: {
       createDiagnosticCollection: vi.fn(() => mockDiagnosticCollection),
+      registerCodeActionsProvider: vi.fn(() => ({ dispose: vi.fn() })),
+    },
+    commands: {
+      registerCommand: vi.fn(() => ({ dispose: vi.fn() })),
     },
     workspace: {
       onDidOpenTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
       onDidSaveTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
       onDidCloseTextDocument: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
       textDocuments: [],
       getConfiguration: () => ({
         get: <T,>(key: string, fallback: T): T => {
           if (key === "server.path") return "rocky" as unknown as T;
           if (key === "server.extraArgs") return [] as unknown as T;
           if (key === "inlayHints.enabled") return true as unknown as T;
+          if (key === "diagnostics.enabled") return true as unknown as T;
           return fallback;
         },
       }),
@@ -39,8 +49,20 @@ vi.mock("vscode", () => {
         dispose: vi.fn(),
       }),
       showErrorMessage: vi.fn(() => Promise.resolve(undefined)),
+      showInformationMessage: vi.fn(() => Promise.resolve(undefined)),
     },
     DiagnosticSeverity,
+    CodeActionKind,
+    CodeAction: class {
+      title: string;
+      kind: unknown;
+      command?: unknown;
+      diagnostics?: unknown[];
+      constructor(title: string, kind: unknown) {
+        this.title = title;
+        this.kind = kind;
+      }
+    },
     Diagnostic: class {
       range: unknown;
       message: string;
@@ -149,11 +171,18 @@ describe("registerDriftDiagnostics", () => {
     expect(vscode.workspace.onDidCloseTextDocument).toHaveBeenCalled();
   });
 
-  it("pushes collection + 3 listeners into subscriptions", () => {
+  it("pushes collection + code action provider + acceptDrift command + 3 listeners + config listener into subscriptions", () => {
     const ctx = makeContext();
     registerDriftDiagnostics(ctx);
-    // collection + onDidOpen + onDidSave + onDidClose = 4
-    expect(ctx.subscriptions.length).toBe(4);
+    // collection + codeActionsProvider + acceptDrift cmd +
+    // onDidOpen + onDidSave + onDidClose + onDidChangeConfiguration = 7
+    expect(ctx.subscriptions.length).toBe(7);
+  });
+
+  it("registers a code actions provider for rocky diagnostics", () => {
+    const ctx = makeContext();
+    registerDriftDiagnostics(ctx);
+    expect(vscode.languages.registerCodeActionsProvider).toHaveBeenCalled();
   });
 });
 

@@ -138,6 +138,29 @@ function formatRunTooltip(run: Run): string {
   if (typeof run.models_executed === "number") {
     lines.push(`Models: ${run.models_executed}`);
   }
+
+  // For partial failures, list the failed models so the user can see which
+  // ones need attention without expanding the tree.
+  const isPartial =
+    run.status === "partial" ||
+    run.status === "PartialFailure";
+  if (isPartial && Array.isArray(run.models)) {
+    const failed = run.models.filter(
+      (m) =>
+        m.status === "failure" ||
+        m.status === "failed" ||
+        m.status === "Failure" ||
+        m.status === "error",
+    );
+    if (failed.length > 0) {
+      lines.push("");
+      lines.push("Failed models:");
+      for (const m of failed) {
+        lines.push(`  • ${m.model_name} (${m.status})`);
+      }
+    }
+  }
+
   return lines.join("\n");
 }
 

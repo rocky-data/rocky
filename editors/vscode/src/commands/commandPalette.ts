@@ -27,12 +27,23 @@ function cmd(
  *   Model    → compile, test, lineage, metrics, optimize
  *   Infra    → doctor, compact, archive, profile storage
  *   AI       → AI explain, AI sync, AI test, AI generate
+ *
+ * The first item appends its keybinding chord so users discover the shortcut
+ * without opening the full VS Code keybindings editor.
  */
 function buildItems(): (vscode.QuickPickItem | CommandPickItem)[] {
+  // Platform-appropriate chord hint for rocky.commandPalette itself.
+  const chord =
+    process.platform === "darwin" ? "⌘⇧R" : "Ctrl+Shift+R";
+
   return [
     // --- Pipeline ---
     separator("Pipeline"),
-    cmd("$(play) Run", "Execute the full pipeline", "rocky.run"),
+    cmd(
+      "$(play) Run",
+      `Execute the full pipeline  [${chord} to reopen this palette]`,
+      "rocky.run",
+    ),
     cmd("$(eye) Plan", "Preview SQL (dry run)", "rocky.plan"),
     cmd("$(search) Discover", "List connectors and tables", "rocky.discover"),
     cmd("$(diff) Compare", "Shadow vs production comparison", "rocky.compare"),
