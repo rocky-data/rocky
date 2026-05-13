@@ -1,0 +1,46 @@
+# 10-state-retention-sweep — `[state.retention]` + `rocky state retention sweep`
+#
+# `[state.retention]` governs the state.redb history domains (run history,
+# DAG snapshots, quality history). The aggressive thresholds below
+# (`min_runs_kept = 1`, `max_age_days = 0`) make every previous run
+# eligible the moment a new one lands. `sweep_interval_seconds = 0`
+# disables the throttle so each `rocky run` triggers an end-of-run
+# auto-sweep — handy for a 10-second demo, NOT a recommendation for a
+# real project.
+#
+# Operational tables (schema cache, watermarks, partition records,
+# branches, idempotency keys) are NEVER swept.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
+[state.retention]
+# Sweep every history-domain row that is at least one day old.
+max_age_days = 0
+# Always keep the most recent successful run, regardless of age.
+min_runs_kept = 1
+# Domains the sweep touches. Operational tables are off-limits regardless.
+applies_to = ["history", "lineage", "audit"]
+# Auto-sweep on every `rocky run` (default is 3600s between sweeps).
+sweep_interval_seconds = 0
+# Soft wall-clock budget; sweeps that exceed it log a warning instead of debug.
+sweep_budget_ms = 5000

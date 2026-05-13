@@ -1,0 +1,39 @@
+# 15-semantic-breaking-change-gate
+#
+# Two pipelines coexist here:
+#
+# * `[pipeline.repl]` — replication, gives `rocky branch promote` real
+#   production targets to copy onto.
+# * The transformation models under `models/` are independent — the
+#   semantic breaking-change gate compiles them at the base ref vs HEAD
+#   to detect column-level regressions.
+#
+# `[branch.approval] required = false` — this POC focuses on the
+# breaking-change gate, not the approval gate (POC `00-foundations/
+# 08-branch-approve-promote` covers that path).
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.repl]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.repl.source.discovery]
+adapter = "default"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "poc"
+schema_template = "prod__{source}"
+
+[pipeline.repl.target.governance]
+auto_create_schemas = true
+
+[branch.approval]
+required = false

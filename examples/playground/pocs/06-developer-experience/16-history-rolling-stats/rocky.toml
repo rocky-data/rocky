@@ -1,0 +1,27 @@
+# 16-history-rolling-stats — `rocky history --model <name> --rolling-stats`
+#
+# Five back-to-back replication runs vary the source row count; the
+# rolling-stats summary then surfaces mean / std-dev / z-score / health-score
+# computed over the window of successful executions.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
