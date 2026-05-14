@@ -373,6 +373,18 @@
         "command": "rocky.showCostDetail",
         "title": "Show Cost Detail",
         "category": "Rocky"
+      },
+      {
+        "command": "rocky.refreshPreviews",
+        "title": "Refresh Previews",
+        "category": "Rocky",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rocky.removePreview",
+        "title": "Remove Preview",
+        "category": "Rocky",
+        "icon": "$(trash)"
       }
     ],
     "semanticTokenScopes": [
@@ -483,6 +495,13 @@
           "visibility": "collapsed"
         },
         {
+          "id": "rocky.previews",
+          "name": "Previews",
+          "icon": "$(git-pull-request)",
+          "contextualTitle": "Rocky Previews",
+          "visibility": "collapsed"
+        },
+        {
           "id": "rocky.help",
           "name": "Help",
           "type": "tree",
@@ -547,6 +566,16 @@
         "view": "rocky.schema",
         "contents": "No catalog data yet. Run the catalog command to populate the schema view.\n\n[Run rocky catalog](command:rocky.refreshSchema)",
         "when": "rocky.hasProject"
+      },
+      {
+        "view": "rocky.previews",
+        "contents": "Open a Rocky project to manage preview branches.",
+        "when": "!rocky.hasProject"
+      },
+      {
+        "view": "rocky.previews",
+        "contents": "No active previews. Create a preview branch to compare your changes against base.\n\n[Create Preview](command:rocky.previewCreate)",
+        "when": "rocky.hasProject"
       }
     ],
     "menus": {
@@ -574,6 +603,11 @@
         {
           "command": "rocky.refreshSchema",
           "when": "view == rocky.schema",
+          "group": "navigation"
+        },
+        {
+          "command": "rocky.refreshPreviews",
+          "when": "view == rocky.previews",
           "group": "navigation"
         }
       ],
@@ -611,6 +645,11 @@
         {
           "command": "rocky.copyColumnReference",
           "when": "view == rocky.schema && viewItem == rockySchemaColumn",
+          "group": "inline@1"
+        },
+        {
+          "command": "rocky.removePreview",
+          "when": "view == rocky.previews && viewItem == rockyPreviewBranch",
           "group": "inline@1"
         }
       ],
