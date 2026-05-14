@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { registerCodeLensProvider } from "./codeLens";
 import { registerCommands } from "./commands";
+import { registerCostCodeLensProvider } from "./costCodeLens";
 import { registerDriftDiagnostics } from "./driftDiagnostics";
 import { setExtensionUri } from "./extensionState";
 import { registerFoldingProvider } from "./foldingProvider";
@@ -20,6 +21,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerTestExplorer(context);
   registerDeclarativeTestProvider(context);
   registerCodeLensProvider(context);
+  registerCostCodeLensProvider(context);
   registerFoldingProvider(context);
   registerFormattingProvider(context);
   registerRunDecorations(context);
