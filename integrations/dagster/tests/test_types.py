@@ -7,6 +7,7 @@ import json
 import pytest
 
 from dagster_rocky.types import (
+    ApplyOutput,
     CatalogOutput,
     CiResult,
     ColumnLineageResult,
@@ -395,6 +396,30 @@ def test_parse_plan_with_governance(plan_with_governance_json: str):
     assert result.retention_actions[0].duration_days == 90
     preview = result.retention_actions[0].warehouse_preview
     assert preview is not None and "delta.logRetentionDuration" in preview
+
+
+def test_parse_plan_with_run_spine(plan_with_run_spine_json: str):
+    """PlanResult with Phase 2 plan_id / models / execution_layers."""
+    result = PlanResult.model_validate_json(plan_with_run_spine_json)
+    assert result.plan_id == "a" * 64
+    assert result.plan_kind == "run"
+    assert result.created_at is not None
+    assert result.models == ["db.schema.orders", "db.schema.users"]
+    assert len(result.execution_layers) == 2
+    assert result.execution_layers[0] == ["db.schema.users"]
+    assert isinstance(parse_rocky_output(plan_with_run_spine_json), PlanResult)
+
+
+def test_parse_apply(apply_json: str):
+    """ApplyOutput envelope wrapping a run result."""
+    result = ApplyOutput.model_validate_json(apply_json)
+    assert result.command == "apply"
+    assert result.plan_id == "a" * 64
+    assert result.plan_kind == "run"
+    assert result.success is True
+    assert isinstance(result.result, dict)
+    assert result.result["command"] == "run"
+    assert isinstance(parse_rocky_output(apply_json), ApplyOutput)
 
 
 def test_parse_state(state_json: str):

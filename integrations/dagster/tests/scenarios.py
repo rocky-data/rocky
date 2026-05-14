@@ -327,6 +327,53 @@ PLAN_WITH_GOVERNANCE: dict[str, Any] = {
     ],
 }
 
+# Phase 2 plan spine — PlanResult with plan_id / models / execution_layers
+# populated (as emitted when a models/ directory exists).
+PLAN_WITH_RUN_SPINE: dict[str, Any] = {
+    "version": "0.1.0",
+    "command": "plan",
+    "filter": "client=acme",
+    "statements": [],
+    "plan_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plan_kind": "run",
+    "created_at": "2026-05-14T12:00:00Z",
+    "models": ["db.schema.orders", "db.schema.users"],
+    "execution_layers": [["db.schema.users"], ["db.schema.orders"]],
+}
+
+# Apply output — wraps a run result with the plan_id envelope.
+APPLY: dict[str, Any] = {
+    "version": "0.1.0",
+    "command": "apply",
+    "plan_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plan_kind": "run",
+    "success": True,
+    "result": {
+        "version": "0.1.0",
+        "command": "run",
+        "status": "success",
+        "filter": "client=acme",
+        "duration_ms": 1234,
+        "tables_copied": 2,
+        "tables_failed": 0,
+        "materializations": [],
+        "check_results": [],
+        "execution": {"layers": 1, "models": 2, "total_duration_ms": 1234},
+        "metrics": None,
+        "permissions": {
+            "grants_applied": 0,
+            "grants_skipped": 0,
+            "grants_failed": 0,
+        },
+        "drift": {
+            "tables_checked": 0,
+            "tables_drifted": 0,
+            "actions": [],
+        },
+        "interrupted": False,
+    },
+}
+
 # ---------------------------------------------------------------------------
 # state — single watermark
 # ---------------------------------------------------------------------------

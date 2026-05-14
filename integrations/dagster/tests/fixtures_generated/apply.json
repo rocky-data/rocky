@@ -1,0 +1,35 @@
+{
+  "version": "0.0.0-SENTINEL",
+  "command": "apply",
+  "plan_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "plan_kind": "run",
+  "success": true,
+  "result": {
+    "version": "0.0.0-SENTINEL",
+    "command": "run",
+    "status": "success",
+    "filter": "",
+    "duration_ms": 0,
+    "tables_copied": 0,
+    "tables_failed": 0,
+    "materializations": [],
+    "check_results": [],
+    "execution": {
+      "layers": 0,
+      "models": 0,
+      "total_duration_ms": 0
+    },
+    "metrics": null,
+    "permissions": {
+      "grants_applied": 0,
+      "grants_skipped": 0,
+      "grants_failed": 0
+    },
+    "drift": {
+      "tables_checked": 0,
+      "tables_drifted": 0,
+      "actions": []
+    },
+    "interrupted": false
+  }
+}
