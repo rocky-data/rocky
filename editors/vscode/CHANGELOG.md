@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-05-14
+
+Audit follow-up release ([#517](https://github.com/rocky-data/rocky/pull/517)) — closes the 2026-05-13 wide-sweep punch list. Three real bug fixes, nine UX polish items, and the Lineage panel's renderer + Tier 3 features (view-mode toggle, node details side panel, subgraph drill-in).
+
+### Added
+
+- **Lineage view-mode toggle (Model ↔ Column).** New toolbar control on the lineage webview switches between **Model** view (default — aggregates column-level edges into model-to-model pairs) and **Column** view (column-level qualified nodes). View mode persists across reloads via the `WebviewPanelSerializer`.
+- **Lineage node details side panel.** Click any node to open a 320px right-side panel showing model name, last-run status / when / duration / row count (from `rocky history --model NAME --output json`), and the focal model's columns. New "Open in Editor" button replaces the previous click-to-open behavior; the click now opens the panel.
+- **Lineage subgraph drill-in.** New toolbar `[None | Schema | Source]` cluster mode draws labelled bounding boxes around grouped nodes. Schema clusters parse from the qualified model name (`catalog.schema.model` → `catalog.schema`); Source mode groups all nodes with no upstream edges under a single "Sources" cluster. Click a cluster header to focus + dim non-members; click background to clear. Cluster mode persists in `SerializedState`.
+- **Status bar enrichment** (opt-in via `rocky.statusBar.segments`). New array setting accepts any of `warehouse`, `lastRunAge`, `driftCount`, `branchState` to append segments alongside the existing LSP state + error count. Segment values cache for 30s; `driftCount` derives live from diagnostics. Setting changes invalidate the cache immediately.
+- **Drift diagnostic quick fixes.** New `DriftCodeActionProvider` registered via `vscode.languages.registerCodeActionsProvider` adds light-bulb actions on drift diagnostics: "Run compile to refresh" (runs `rocky.compile`) and "Accept schema change" (placeholder until upstream support lands).
+- **Doctor webview command-URI links.** Failed checks (critical / warning) and suggestion text now render as clickable `command:` URIs that open settings or jump to the relevant configuration. `enableCommandUris: true` is set on the doctor webview panel.
+- **Sources view grouping.** The Sources sidebar now groups connectors by `source_type` under collapsible parent nodes that surface connector count, total table count, and most-recent `last_sync_at`. Single-member groups collapse directly to tables.
+- **Runs view partial-failure tooltips.** Tooltips on partial-failure runs now list the failed model names and their statuses; full-failure and success tooltips unchanged.
+- **Get Started CTAs sequencing.** The quick-actions block on initialized projects now shows a one-line description per CTA and a "New? Try Compile first." hint above the block.
+- **Onboarding walkthrough** (`contributes.walkthroughs`). 5-step flow for first-time users: Install CLI → Initialize Project → Compile Models → View Lineage → Run Pipeline. Each step links to an existing command.
+- **Command-palette keybinding hint.** The first Pipeline item in the Rocky command palette now surfaces the platform-appropriate chord (`⌘⇧R` on macOS, `Ctrl+Shift+R` on Windows/Linux) so users discover the keybinding.
+- **Four new settings**: `rocky.defaultWarehouse` (string), `rocky.defaultBranch` (string), `rocky.diagnostics.enabled` (boolean, default true; wired into drift diagnostics — no-ops + clears existing diagnostics when toggled off), `rocky.autoRunOnSave` (boolean, default false; read-only contract for future use).
+
+### Changed
+
+- **Lineage renderer swapped from viz.js to `@dagrejs/dagre` v3 + `d3` v7.** The viz.js path used Graphviz/DOT and required `wasm-unsafe-eval` in the webview CSP. The new renderer reads `LineageOutput` JSON directly, lays out with dagre, and renders SVG via d3 with d3-zoom for pan/zoom. The CSP now uses strict `script-src ${webview.cspSource} 'nonce-${nonce}'` (no `unsafe-eval`). Bundled into `media/lineage-graph.js` via esbuild. The library choice avoids `dagre-d3`'s 9 high-severity CVEs in its bundled outdated d3 v6. Existing interactivity from `1.15.x` (click-to-open, hover tooltip, Fit + keyboard shortcuts `+` `-` `0` `F`, source/leaf node coloring, `WebviewPanelSerializer` state persistence) is preserved on the new renderer.
+
+### Fixed
+
+- **`rockyCli.ts` abort-listener leak.** When `runRocky` was passed an `AbortSignal` and `execFile` threw synchronously, the `abort` listener attached on the signal was never removed and accumulated across reuses. The listener is now removed on both success and error completion paths.
+- **`getStartedView` `EventEmitter` disposal.** The module-level `projectChangeEmitter` was never explicitly disposed; rapid extension-host reloads could race a disposed extension. Now pushed into `context.subscriptions` so it's disposed on extension deactivation.
+- **`testExplorer` raw JSON in error messages.** When `runRockyJson` failed on `JSON.parse`, the throw carried the unparseable stdout as `stderr`, so the test explorer surfaced raw JSON as the failure detail. `RockyCliError` now distinguishes `kind: "exit"` from `kind: "parse"`; parse errors carry an empty `stderr` and a clean message ("Rocky CLI returned malformed JSON: …").
+
 ## [1.15.3] — 2026-05-13
 
 Companion release to engine `v1.31.0`. Patch cycle: the regenerated TypeScript interfaces in `src/types/generated/ci_diff.ts` and `src/types/generated/branch_promote.ts` pick up the typed `BreakingChange` / `BreakingFinding` / `BreakingSeverity` surface (engine [#508](https://github.com/rocky-data/rocky/pull/508) / [#509](https://github.com/rocky-data/rocky/pull/509) / [#510](https://github.com/rocky-data/rocky/pull/510)), so any extension code that consumes `rocky ci-diff --semantic` or `rocky branch promote` JSON output now type-checks against the full discriminated union. No extension feature changes — no new commands, no UI changes, no setting changes.
