@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-05-15
+
+Lineage rail redesign and SVG export, plus four lineage rendering bug fixes from [#524](https://github.com/rocky-data/rocky/pull/524). The collapsible right-docked rail replaces the old toolbar + side panel layout, and the SVG exporter now produces standalone-readable files with VS Code colours resolved to concrete values. Also picks up the TypeScript codegen for the engine's Cluster 3 B plan/apply spine — `compact_apply`, `archive_apply`, `plan`, `apply`, and `promote_plan` typed surfaces are available in `src/types/generated/` for future extension wiring; no new commands are registered in this release.
+
 ### Added
 
 - **Collapsible right-docked rail for the lineage webview.** Replaces the previous horizontal toolbar + 320px right-side Node Details panel with a single 240px vertical rail docked on the right. Three top-level collapsible sections — **Controls** (View / Focus / Cluster / Layout / Search / Zoom subgrouped inline), **Node Details**, **Export** — each with a clickable header and chevron. A `‹/›` button at the top of the rail collapses it to a 28px strip. Per-section collapse state and rail-collapsed state both persist across reloads via `vscode.setState`. The graph auto-fits after the rail-width animation finishes so the viewport recenters.
@@ -18,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lineage panel uses the wrong `rocky.toml`.** Previously hard-coded `${workspaceFolder}/rocky.toml` and crashed with `no models found in models` if the workspace root wasn't the project root (e.g. a multi-folder workspace, or a SQL file opened from a sibling folder). Now walks up from the active file's directory to find the nearest `rocky.toml` and runs the CLI from that directory.
 - **`Run Health Check` ("No workspace folder open") in the Get Started view.** `rocky.doctor` was gated by `ensureWorkspace()`, but the Get Started welcome links there precisely so the user can verify their CLI installation **before** there's a project. Removed the gate — doctor runs fine without a workspace and reports `critical` for the missing `rocky.toml`, which is the expected output for that flow.
 - **Webview-script errors are now surfaced.** A pair of `window.addEventListener('error', …)` / `unhandledrejection` listeners live in their own `<script>` tag so a parse error in the main inline script can't prevent them from registering. Any uncaught exception now writes `Lineage error: <message> (<file>:<line>:<col>)` into the status bar instead of leaving the panel stuck on `Rendering…`.
+
+### Changed
+
+- **Codegen pickup of the engine plan/apply spine (engine v1.32.0, upcoming).** Regenerated TypeScript interfaces in `src/types/generated/` for the Cluster 3 B plan/apply surface: `compact_apply.ts` (`CompactApplyOutput`), `archive_apply.ts` (`ArchiveApplyOutput`), `apply.ts` (`ApplyOutput` envelope with `plan_id` + `plan_kind` + `inner`), `plan.ts` (additive `plan_id` / `plan_kind` / `created_at` / `models` / `execution_layers` fields on `PlanOutput`), and `plan_promote.ts` (`PromotePlan` / `PromoteTargetPlan`). No new extension commands or UI wiring — the types are available for future PRs that surface `rocky plan`, `rocky apply`, and `rocky plan promote` in the sidebar or command palette.
 
 ## [1.17.0] — 2026-05-14
 
