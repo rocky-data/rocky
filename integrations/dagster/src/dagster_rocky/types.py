@@ -1067,7 +1067,9 @@ from .types_generated import (  # noqa: E402, F401
     PreviewSampledRowDiff,
     PreviewSamplingWindow,
     PreviewStructuralDiff,
+    PromotePlan,
     PromoteTarget,
+    PromoteTargetPlan,
     RejectedApproval,
     ReplayModelOutput,
     ReplayOutput,
@@ -1135,6 +1137,7 @@ RockyOutput = (
     | CatalogOutput
     | ApproveOutput
     | BranchPromoteOutput
+    | PromotePlan
 )
 
 
@@ -1170,6 +1173,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "catalog": CatalogOutput,
     "branch approve": ApproveOutput,
     "branch promote": BranchPromoteOutput,
+    "plan promote": PromotePlan,
 }
 
 

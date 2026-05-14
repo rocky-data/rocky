@@ -204,6 +204,9 @@ from .branch_promote_schema import (
 )
 from .branch_promote_schema import AuditEventKind1 as AuditEventKind
 
+# Plan promote (plan/apply spine for branch promotion)
+from .plan_promote_schema import PromotePlan, PromoteTargetPlan
+
 # Catalog (project-wide column-lineage snapshot)
 from .catalog_schema import (
     AssetKind,
@@ -386,6 +389,9 @@ __all__ = [
     "AuditEventKind",
     "PromoteTarget",
     "RejectedApproval",
+    # plan promote
+    "PromotePlan",
+    "PromoteTargetPlan",
     # catalog
     "CatalogOutput",
     "CatalogAsset",

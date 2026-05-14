@@ -62,6 +62,7 @@ from .types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    PromotePlan,
     RetentionStatusOutput,
     RunResult,
     StateHealthResult,
@@ -1345,11 +1346,13 @@ class RockyResource(dg.ConfigurableResource):
         - ``archive`` plan → DELETE/VACUUM statements via the warehouse adapter.
         - ``run`` plan → full pipeline re-execution with the flags that were
           active when ``rocky plan`` was called.
+        - ``promote`` plan → executes the pre-built promotion SQL statements
+          without re-running the approval or breaking-change gate.
 
         The returned :class:`ApplyOutput` envelope carries ``plan_id``,
         ``plan_kind``, ``success``, and a ``result`` field whose shape
         matches the per-command output (``CompactApplyOutput``,
-        ``ArchiveApplyOutput``, or ``RunResult``).
+        ``ArchiveApplyOutput``, ``RunResult``, or ``BranchPromoteOutput``).
 
         Args:
             plan_id: Full 64-char blake3 hex plan identifier returned by
@@ -1818,6 +1821,42 @@ class RockyResource(dg.ConfigurableResource):
             self._run_rocky(args),
             BranchPromoteOutput,
             command="branch promote",
+        )
+
+    def plan_promote(
+        self,
+        name: str,
+        *,
+        base: str = "main",
+        allow_breaking: bool = False,
+        filter: str | None = None,
+    ) -> PromotePlan:
+        """Run ``rocky plan promote <name>`` and return the parsed plan.
+
+        Runs the approval gate and breaking-change gate at plan time, builds
+        per-target SQL for every configured production target, and persists
+        the resulting :class:`PromotePlan` to ``.rocky/plans/<plan_id>.json``.
+
+        Gates are **not** re-evaluated at apply time. The returned object
+        carries a ``plan_id`` that can be passed to :meth:`apply` to execute
+        the promotion without re-running the gates.
+
+        Args:
+            name: Branch name to plan the promotion for.
+            base: Base ref to compare against (default ``"main"``).
+            allow_breaking: When ``True``, the plan succeeds even if breaking
+                schema changes are detected (changes are still recorded).
+            filter: Optional component filter (e.g. ``"client=acme"``).
+        """
+        args = ["plan", "promote", name, "--base", base]
+        if allow_breaking:
+            args.append("--allow-breaking")
+        if filter is not None:
+            args.extend(["--filter", filter])
+        return _parse_rocky_json(
+            self._run_rocky(args),
+            PromotePlan,
+            command="plan promote",
         )
 
     # ------------------------------------------------------------------ #
