@@ -59,6 +59,14 @@ pub(crate) async fn run_apply_in(
             run_archive_apply_in(root, config_path, plan_id, output_json).await
         }
         PlanKind::Run => run_apply_run_plan(root, config_path, plan_id, output_json).await,
+        // Promote dispatch is wired in Commit 3 (feat: rocky apply dispatches
+        // PlanKind::Promote). This arm keeps every intermediate commit buildable.
+        PlanKind::Promote => {
+            bail!(
+                "promote apply dispatch not yet implemented — \
+                 use `rocky branch promote --plan {plan_id}` instead (Cluster 3 B Phase 3)"
+            )
+        }
     }
 }
 

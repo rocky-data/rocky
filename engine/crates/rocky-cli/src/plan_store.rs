@@ -32,6 +32,12 @@ pub enum PlanKind {
     /// list, execution layers). Full `ProjectIr` is not persisted — `apply`
     /// re-derives it by re-compiling with the same flags.
     Run,
+    /// A `rocky plan promote` / `rocky apply` promote plan. The payload is a
+    /// `PromotePlan` struct (branch name, base ref, per-target SQL statements,
+    /// plan-time audit events). At apply time the branch-state hash is
+    /// recomputed and checked against the persisted value so stale plans are
+    /// rejected before any SQL is executed.
+    Promote,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -40,6 +46,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Compact => write!(f, "compact"),
             PlanKind::Archive => write!(f, "archive"),
             PlanKind::Run => write!(f, "run"),
+            PlanKind::Promote => write!(f, "promote"),
         }
     }
 }
@@ -196,6 +203,7 @@ mod tests {
         let id_compact = write_plan(dir.path(), PlanKind::Compact, &payload)?;
         let id_archive = write_plan(dir.path(), PlanKind::Archive, &payload)?;
         let id_run = write_plan(dir.path(), PlanKind::Run, &payload)?;
+        let id_promote = write_plan(dir.path(), PlanKind::Promote, &payload)?;
         assert_ne!(
             id_compact, id_archive,
             "different kinds must produce different plan_ids"
@@ -208,6 +216,35 @@ mod tests {
             id_archive, id_run,
             "archive and run must produce different plan_ids"
         );
+        assert_ne!(
+            id_compact, id_promote,
+            "compact and promote must produce different plan_ids"
+        );
+        assert_ne!(
+            id_run, id_promote,
+            "run and promote must produce different plan_ids"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn promote_kind_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.branch_tbl",
+            statement_count: 7,
+        };
+
+        let plan_id = write_plan(dir.path(), PlanKind::Promote, &payload)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Promote);
+        assert_eq!(
+            plan.payload["model"],
+            serde_json::json!("cat.sc.branch_tbl")
+        );
+        assert_eq!(plan.payload["statement_count"], serde_json::json!(7));
         Ok(())
     }
 
@@ -234,6 +271,7 @@ mod tests {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
         assert_eq!(PlanKind::Archive.to_string(), "archive");
         assert_eq!(PlanKind::Run.to_string(), "run");
+        assert_eq!(PlanKind::Promote.to_string(), "promote");
     }
 
     #[test]
