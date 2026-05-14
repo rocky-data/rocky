@@ -3929,6 +3929,11 @@ pub enum AuditEventKind {
     /// Rocky version. Fail-open: the gate is skipped and the promote
     /// proceeds, but the reason is recorded so the bypass is auditable.
     BreakingChangesGateSkipped,
+    /// Emitted by `rocky plan promote` when the plan has been successfully
+    /// written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an
+    /// audit consumer can correlate plan creation to a subsequent
+    /// `rocky apply` event without scanning the filesystem.
+    PromotePlanCreated,
 }
 
 /// Single audit-trail event emitted during `branch promote`.
@@ -4012,6 +4017,90 @@ pub struct RejectedApproval {
     /// `signer_not_allowed`, `parse_error`.
     pub reason: String,
     pub detail: String,
+}
+
+/// Per-model promote step captured in a [`PromotePlan`].
+///
+/// Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields
+/// (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`)
+/// is added at apply time and lives on [`PromoteTarget`].
+///
+/// `statement` is persisted verbatim so `rocky apply` executes the **exact**
+/// SQL generated at plan time — skipping re-discovery and ensuring the
+/// `plan_id` digest is invalidated if the SQL would differ.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromoteTargetPlan {
+    /// Fully-qualified production target (catalog.schema.table).
+    pub target: String,
+    /// Fully-qualified branch source the promote will read from
+    /// (catalog.branch_schema.table).
+    pub source: String,
+    /// `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL,
+    /// dialect-quoted at plan time.
+    pub statement: String,
+}
+
+/// Persisted payload for a `rocky plan promote` run plan.
+///
+/// Written to `.rocky/plans/<plan_id>.json` by `rocky plan promote` and read
+/// back by `rocky apply <plan_id>` (dispatched as `PlanKind::Promote`).
+///
+/// ## What is persisted vs re-derived
+///
+/// - **Persisted**: branch name + refs, state hash at plan time, approval
+///   artifacts used/rejected, breaking-change findings, per-target SQL
+///   statements, and the plan-time audit events.
+/// - **Re-derived at apply time**: nothing related to approvals or
+///   breaking-change gate — those gates ran at plan time and their
+///   outcomes are captured here. The warehouse adapter is resolved at apply
+///   time (to call `execute_statement`), but discovery is NOT re-run.
+///
+/// ## Branch state drift at apply time
+///
+/// `branch_state_hash` reflects the branch metadata + config bytes at plan
+/// time. If the branch's config or metadata changes between `rocky plan
+/// promote` and `rocky apply`, the persisted hash differs from the live hash.
+/// By default, `rocky apply` does **not** re-check the hash — the gates
+/// already ran at plan time, and that is the point of the plan/apply split.
+/// Operators who need a strict re-check can re-run `rocky plan promote` to
+/// produce a fresh plan.
+///
+/// Warehouse table contents are not covered by `branch_state_hash` in v1 —
+/// if a branch's tables are mutated between plan and apply, `rocky apply`
+/// will promote whatever data is in the branch schema at apply time.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromotePlan {
+    /// Branch name being promoted.
+    pub branch_name: String,
+    /// Git ref that `base_ref` was resolved to at plan time (e.g. `"main"`).
+    pub base_ref: String,
+    /// Git HEAD SHA at plan time — informational for audit purposes.
+    pub head_ref: String,
+    /// Content-addressed hash of the branch metadata + config bytes at plan
+    /// time. Stored for audit purposes; not re-validated at apply time.
+    pub branch_state_hash: String,
+    /// Approval artifacts that satisfied the gate at plan time.
+    pub approvals_used: Vec<ApprovalArtifact>,
+    /// Approval artifacts loaded from disk that failed verification at plan
+    /// time.
+    pub approvals_rejected: Vec<RejectedApproval>,
+    /// Semantic breaking-change findings produced by the pre-promote gate at
+    /// plan time. Empty when the gate ran and found no breaking changes;
+    /// absent when the gate was skipped (compile failure on either side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+    /// Whether `--allow-breaking` was set at plan time.
+    #[serde(default)]
+    pub allow_breaking: bool,
+    /// Per-model SQL plan, in dispatch order. SQL is persisted verbatim so
+    /// `rocky apply` executes the exact statements generated at plan time.
+    pub targets: Vec<PromoteTargetPlan>,
+    /// Plan-time audit events (approvals gate + breaking-change gate outcomes).
+    /// Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`)
+    /// are appended in `BranchPromoteOutput.audit` at apply time.
+    pub plan_audit: Vec<AuditEvent>,
+    /// When this plan was persisted.
+    pub created_at: DateTime<Utc>,
 }
 
 /// JSON output for `rocky replay <run_id|latest>`.

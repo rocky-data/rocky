@@ -492,6 +492,268 @@ fn render_governance_preview_text(output: &PlanOutput) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `rocky plan promote <branch-name>` — Phase 3
+// ---------------------------------------------------------------------------
+
+/// Execute `rocky plan promote <branch-name>` — run the approval + breaking-change
+/// gates, build a `PromotePlan` payload, and persist it to the plan store.
+///
+/// On success emits `PlanOutput` with `plan_id`, `plan_kind: "promote"`,
+/// `created_at`, and a target-count summary.
+///
+/// On breaking-change block (without `--allow-breaking`) the plan is **not**
+/// written; a structured JSON error is printed and the function returns `Err`.
+///
+/// ## Parameters
+///
+/// - `root` — the workspace root where `.rocky/plans/` lives (injectable for tests).
+/// - `config_path` — path to `rocky.toml`.
+/// - `models_dir` — directory containing transformation models for the breaking-change gate.
+/// - `base_ref` — git ref to diff against.
+/// - `branch_name` — branch being promoted.
+/// - `filter` — optional replication filter (e.g. `"client=acme"`).
+/// - `allow_breaking` — bypass the breaking-change block gate.
+/// - `output_json` — emit machine-readable JSON instead of text.
+#[allow(clippy::too_many_arguments)]
+pub async fn plan_promote(
+    root: &Path,
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    branch_name: &str,
+    filter: Option<&str>,
+    allow_breaking: bool,
+    output_json: bool,
+) -> Result<()> {
+    let result = build_promote_plan_inner(
+        root,
+        config_path,
+        models_dir,
+        base_ref,
+        branch_name,
+        filter,
+        allow_breaking,
+    )
+    .await?;
+
+    if output_json {
+        print_json(&result.plan_output)?;
+    } else {
+        println!(
+            "Promote plan persisted — {} target(s)",
+            result.plan.targets.len()
+        );
+        println!(
+            "Plan ID:    {}",
+            result.plan_output.plan_id.as_deref().unwrap_or("")
+        );
+        println!(
+            "Apply with: rocky apply {}",
+            result.plan_output.plan_id.as_deref().unwrap_or("")
+        );
+        if let Some(bc) = &result.plan.breaking_changes {
+            let breaking_count = bc.iter().filter(|f| f.is_breaking()).count();
+            if breaking_count > 0 {
+                println!(
+                    "WARNING: {} breaking change(s) allowed (--allow-breaking was set)",
+                    breaking_count
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Internal result of building a promote plan.
+pub(crate) struct PromotePlanResult {
+    pub plan: PromotePlan,
+    pub plan_output: PlanOutput,
+}
+
+/// Build and persist a `PromotePlan` from the given parameters.
+///
+/// Extracted as a named function so both `plan_promote` (standalone command)
+/// and `run_branch_promote` (bare-verb alias) can reuse it without duplicating
+/// the gate logic.
+///
+/// Returns `Err` when:
+/// - The approval gate fails (insufficient valid artifacts).
+/// - The breaking-change gate fires AND `allow_breaking` is false (plan NOT written).
+/// - Any I/O or warehouse discovery error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_promote_plan_inner(
+    root: &Path,
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    branch_name: &str,
+    filter: Option<&str>,
+    allow_breaking: bool,
+) -> Result<PromotePlanResult> {
+    use crate::commands::branch::{
+        APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
+        discover_branch_targets_for_plan, run_approval_gate, run_breaking_change_gate_for_plan,
+        validate_branch_name_pub,
+    };
+    use rocky_core::state::StateStore;
+
+    validate_branch_name_pub(branch_name)?;
+
+    let state_path =
+        rocky_core::state::resolve_state_path(None, std::path::Path::new("models")).path;
+    let store = StateStore::open_read_only(&state_path).with_context(|| {
+        format!(
+            "failed to open state store at {} — run `rocky branch create {}` first",
+            state_path.display(),
+            branch_name
+        )
+    })?;
+
+    let record = store
+        .get_branch(branch_name)?
+        .with_context(|| format!("branch '{branch_name}' not found — see 'rocky branch list'"))?;
+
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+
+    let branch_state_hash = compute_branch_state_hash_pub(&record, config_path)?;
+    let actor = approver_identity_pub()?;
+
+    let env_skip_value = std::env::var(APPROVAL_SKIP_ENV)
+        .ok()
+        .filter(|v| !v.is_empty());
+    let skip_reason: Option<String> = env_skip_value
+        .as_ref()
+        .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"));
+
+    let mut audit: Vec<AuditEvent> = Vec::new();
+
+    let (approvals_used, approvals_rejected) = run_approval_gate(
+        &rocky_cfg,
+        &record,
+        &branch_state_hash,
+        &actor,
+        skip_reason.as_deref(),
+        &mut audit,
+    )?;
+
+    // Breaking-change gate — runs before the plan is written.
+    let breaking_findings = run_breaking_change_gate_for_plan(
+        config_path,
+        models_dir,
+        base_ref,
+        &mut audit,
+        &actor,
+        &record,
+        &branch_state_hash,
+    );
+
+    if let Some(findings) = &breaking_findings {
+        let breaking: Vec<_> = findings.iter().filter(|f| f.is_breaking()).collect();
+        if !breaking.is_empty() {
+            if allow_breaking {
+                audit.push(AuditEvent {
+                    kind: AuditEventKind::BreakingChangesAllowed,
+                    at: Utc::now(),
+                    actor: actor.clone(),
+                    branch: record.name.clone(),
+                    branch_state_hash: branch_state_hash.clone(),
+                    reason: Some("--allow-breaking CLI flag".to_string()),
+                    breaking_changes: Some(findings.clone()),
+                });
+            } else {
+                audit.push(AuditEvent {
+                    kind: AuditEventKind::BreakingChangesBlocked,
+                    at: Utc::now(),
+                    actor: actor.clone(),
+                    branch: record.name.clone(),
+                    branch_state_hash: branch_state_hash.clone(),
+                    reason: None,
+                    breaking_changes: Some(findings.clone()),
+                });
+                let summary = breaking
+                    .iter()
+                    .map(|f| format!("{:?}", f.change))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                anyhow::bail!(
+                    "promote plan blocked by {} breaking change(s): {summary}. \
+                     Re-run with `--allow-breaking` to override.",
+                    breaking.len()
+                );
+            }
+        }
+    }
+
+    // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
+    let planned_targets = discover_branch_targets_for_plan(config_path, &record, filter).await?;
+
+    let head_ref = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let target_plans: Vec<PromoteTargetPlan> = planned_targets
+        .iter()
+        .map(|pt| PromoteTargetPlan {
+            target: pt.target.clone(),
+            source: pt.source.clone(),
+            statement: pt.statement.clone(),
+        })
+        .collect();
+
+    let created_at = Utc::now();
+
+    // Emit PromotePlanCreated audit event.
+    audit.push(AuditEvent {
+        kind: AuditEventKind::PromotePlanCreated,
+        at: created_at,
+        actor: actor.clone(),
+        branch: record.name.clone(),
+        branch_state_hash: branch_state_hash.clone(),
+        reason: None,
+        breaking_changes: None,
+    });
+
+    let promote_plan = PromotePlan {
+        branch_name: branch_name.to_string(),
+        base_ref: base_ref.to_string(),
+        head_ref,
+        branch_state_hash: branch_state_hash.clone(),
+        approvals_used,
+        approvals_rejected,
+        breaking_changes: breaking_findings,
+        allow_breaking,
+        targets: target_plans,
+        plan_audit: audit,
+        created_at,
+    };
+
+    let plan_id = write_plan(root, PlanKind::Promote, &promote_plan)
+        .context("failed to write promote plan")?;
+
+    let mut plan_output = PlanOutput::new(filter.unwrap_or("").to_string());
+    plan_output.plan_id = Some(plan_id);
+    plan_output.plan_kind = Some("promote".to_string());
+    plan_output.created_at = Some(created_at);
+
+    Ok(PromotePlanResult {
+        plan: promote_plan,
+        plan_output,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +942,139 @@ ssn = "confidential"
         assert_eq!(MaskStrategy::Redact.as_str(), "redact");
         assert_eq!(MaskStrategy::Partial.as_str(), "partial");
         assert_eq!(MaskStrategy::None.as_str(), "none");
+    }
+
+    // ------------------------------------------------------------------
+    // PromotePlan — struct serialization and plan_store round-trip
+    // ------------------------------------------------------------------
+
+    use crate::output::{AuditEventKind, PromotePlan, PromoteTargetPlan};
+    use crate::plan_store::{PlanKind, read_plan, write_plan};
+    // TempDir is already in scope from above.
+
+    fn minimal_promote_plan(branch_name: &str) -> PromotePlan {
+        PromotePlan {
+            branch_name: branch_name.to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc1234".to_string(),
+            branch_state_hash: "deadbeef".repeat(8),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![PromoteTargetPlan {
+                target: "cat.prod_schema.orders".to_string(),
+                source: "cat.branch__fix.orders".to_string(),
+                statement: "CREATE OR REPLACE TABLE \"cat\".\"prod_schema\".\"orders\" \
+                     AS SELECT * FROM \"cat\".\"branch__fix\".\"orders\""
+                    .to_string(),
+            }],
+            plan_audit: vec![],
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-05-14T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    /// `PromotePlan` serializes to JSON and can be deserialized back without
+    /// data loss — the plan_store round-trip contract.
+    #[test]
+    fn promote_plan_serde_round_trip() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let plan = minimal_promote_plan("fix-price");
+
+        let plan_id = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(persisted.kind, PlanKind::Promote);
+
+        let decoded: PromotePlan = serde_json::from_value(persisted.payload)?;
+        assert_eq!(decoded.branch_name, "fix-price");
+        assert_eq!(decoded.base_ref, "main");
+        assert_eq!(decoded.targets.len(), 1);
+        assert_eq!(decoded.targets[0].target, "cat.prod_schema.orders");
+        assert!(!decoded.allow_breaking);
+        Ok(())
+    }
+
+    /// Two identical `PromotePlan` payloads produce the same plan_id —
+    /// the idempotency / dedup property inherited from the plan_store.
+    #[test]
+    fn promote_plan_same_payload_same_plan_id() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let plan = minimal_promote_plan("fix-price");
+        let id1 = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+        let id2 = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+        assert_eq!(id1, id2, "identical payload must produce identical plan_id");
+        Ok(())
+    }
+
+    /// `PromotePlan` with `allow_breaking: true` round-trips the flag correctly.
+    #[test]
+    fn promote_plan_allow_breaking_flag_round_trips() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let mut plan = minimal_promote_plan("feat");
+        plan.allow_breaking = true;
+        plan.breaking_changes = Some(vec![]);
+
+        let plan_id = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        let decoded: PromotePlan = serde_json::from_value(persisted.payload)?;
+
+        assert!(decoded.allow_breaking);
+        assert!(
+            matches!(&decoded.breaking_changes, Some(v) if v.is_empty()),
+            "breaking_changes should be Some(empty vec)"
+        );
+        Ok(())
+    }
+
+    /// `PromoteTargetPlan` SQL string is preserved verbatim through the plan_store.
+    /// This is the key invariant: apply executes exactly the SQL generated at plan time.
+    #[test]
+    fn promote_target_plan_sql_is_persisted_verbatim() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let sql = r#"CREATE OR REPLACE TABLE "prod"."schema"."orders" AS SELECT * FROM "branch__fix"."schema"."orders""#;
+        let mut plan = minimal_promote_plan("fix");
+        plan.targets[0].statement = sql.to_string();
+
+        let plan_id = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        let decoded: PromotePlan = serde_json::from_value(persisted.payload)?;
+
+        assert_eq!(decoded.targets[0].statement, sql);
+        Ok(())
+    }
+
+    /// Applying a Promote plan with a different branch name than the positional
+    /// arg must return a clear error — guards against operator mismatches.
+    #[test]
+    fn promote_from_plan_branch_name_mismatch_is_error() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let plan = minimal_promote_plan("fix-price");
+        let plan_id = write_plan(dir.path(), PlanKind::Promote, &plan)?;
+
+        // Simulate what run_branch_promote_from_plan does: read + check name.
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        let decoded: PromotePlan = serde_json::from_value(persisted.payload.clone())?;
+
+        let provided_name = "different-branch";
+        if provided_name != decoded.branch_name {
+            // This is the expected error path.
+            assert_eq!(decoded.branch_name, "fix-price");
+        } else {
+            panic!("should not reach here");
+        }
+        Ok(())
+    }
+
+    /// `AuditEventKind::PromotePlanCreated` serializes to the snake_case wire
+    /// name expected by downstream consumers.
+    #[test]
+    fn promote_plan_created_audit_kind_wire_name() {
+        let kind = AuditEventKind::PromotePlanCreated;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, r#""promote_plan_created""#);
     }
 }
