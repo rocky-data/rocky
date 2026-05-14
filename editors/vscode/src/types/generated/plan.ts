@@ -9,6 +9,10 @@
  * JSON output for `rocky plan`.
  *
  * `statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.
+ *
+ * ## Phase 2 additions (Cluster 3 B)
+ *
+ * `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
  */
 export interface PlanOutput {
   /**
@@ -17,14 +21,34 @@ export interface PlanOutput {
   classification_actions?: ClassificationAction[];
   command: string;
   /**
+   * UTC timestamp when the plan was persisted. Present when `plan_id` is present.
+   */
+  created_at?: string | null;
+  /**
    * Environment name passed via `--env <name>`. Propagates to `mask_actions` so the preview resolves `[mask.<env>]` overrides on top of the workspace `[mask]` defaults. `None` when the flag is absent — preview resolves against defaults only.
    */
   env?: string | null;
+  /**
+   * Execution layers (topological order) as a list-of-lists of model names. Models within a layer can execute concurrently. Informational — re-derived at apply time. Empty for replication-only plans.
+   */
+  execution_layers?: string[][];
   filter: string;
   /**
    * Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.
    */
   mask_actions?: MaskAction[];
+  /**
+   * Qualified model names that will be executed by `rocky apply`. Empty for replication-only plans. Informational — re-derived at apply time.
+   */
+  models?: string[];
+  /**
+   * Full 64-char blake3 plan identifier. Present when the plan was persisted to `.rocky/plans/<plan_id>.json`. Apply with: `rocky apply <plan_id>`.
+   */
+  plan_id?: string | null;
+  /**
+   * Plan kind wire name (`"run"`). Present when `plan_id` is present.
+   */
+  plan_kind?: string | null;
   /**
    * Retention-policy applications the governance reconciler would issue via `apply_retention_policy`. One row per model whose sidecar declares `retention = "<N>[dy]"`. `warehouse_preview` shows the warehouse-native SQL that the current adapter would compile the policy to (Databricks / Snowflake); `None` on warehouses without a first-class retention knob.
    */

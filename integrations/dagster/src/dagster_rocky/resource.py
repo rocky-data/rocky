@@ -43,6 +43,7 @@ from .types import (
     AiResult,
     AiSyncResult,
     AiTestResult,
+    ApplyOutput,
     ApproveOutput,
     BranchPromoteOutput,
     CatalogOutput,
@@ -1298,12 +1299,67 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--pipeline", pipeline])
         return _parse_rocky_json(self._run_rocky(args), DiscoverResult, command="discover")
 
-    def plan(self, filter: str) -> PlanResult:
-        """Run ``rocky plan --filter <key=value>`` and return the parsed result."""
+    def plan(
+        self,
+        filter: str | None = None,
+        *,
+        pipeline: str | None = None,
+        env: str | None = None,
+    ) -> PlanResult:
+        """Run ``rocky plan`` and return the parsed result.
+
+        When a ``models/`` directory exists in the project, ``rocky plan``
+        also compiles the project and persists a ``RunPlan`` blueprint to
+        ``.rocky/plans/<plan_id>.json``. The returned :class:`PlanResult`
+        will have ``plan_id``, ``plan_kind``, ``created_at``, ``models``,
+        and ``execution_layers`` populated in that case. Call
+        :meth:`apply` with the returned ``plan_id`` to execute the plan.
+
+        For replication-only projects (no ``models/`` directory), the plan
+        acts as a SQL dry-run preview and ``plan_id`` will be ``None``.
+
+        Args:
+            filter: Component filter (e.g. ``"client=acme"``). Optional.
+            pipeline: Pipeline name (required when multiple pipelines are
+                defined in ``rocky.toml``).
+            env: Environment name for governance preview (e.g. ``"prod"``).
+                Selects ``[mask.<env>]`` overrides in the mask_actions
+                preview.
+        """
+        args = ["plan"]
+        if filter is not None:
+            args.extend(["--filter", filter])
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
+        if env is not None:
+            args.extend(["--env", env])
+        return _parse_rocky_json(self._run_rocky(args), PlanResult, command="plan")
+
+    def apply(self, plan_id: str) -> ApplyOutput:
+        """Run ``rocky apply <plan-id>`` and return the parsed result.
+
+        Reads the plan from ``.rocky/plans/<plan_id>.json`` and dispatches
+        by kind:
+
+        - ``compact`` plan → OPTIMIZE/VACUUM statements via the warehouse adapter.
+        - ``archive`` plan → DELETE/VACUUM statements via the warehouse adapter.
+        - ``run`` plan → full pipeline re-execution with the flags that were
+          active when ``rocky plan`` was called.
+
+        The returned :class:`ApplyOutput` envelope carries ``plan_id``,
+        ``plan_kind``, ``success``, and a ``result`` field whose shape
+        matches the per-command output (``CompactApplyOutput``,
+        ``ArchiveApplyOutput``, or ``RunResult``).
+
+        Args:
+            plan_id: Full 64-char blake3 hex plan identifier returned by
+                a prior ``rocky plan``, ``rocky compact``, or
+                ``rocky archive`` invocation.
+        """
         return _parse_rocky_json(
-            self._run_rocky(["plan", "--filter", filter]),
-            PlanResult,
-            command="plan",
+            self._run_rocky(["apply", plan_id], allow_partial=True),
+            ApplyOutput,
+            command="apply",
         )
 
     def run(

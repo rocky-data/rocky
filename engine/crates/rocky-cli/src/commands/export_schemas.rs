@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApproveOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput, ApproveOutput,
     ArchiveApplyOutput, ArchiveOutput, BranchDeleteOutput, BranchListOutput, BranchOutput,
     BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput, ClearSchemaCacheOutput,
     ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput, CompactOutput, CompareOutput,
@@ -103,6 +103,8 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ComplianceOutput>("compliance"),
         entry::<RetentionStatusOutput>("retention_status"),
         entry::<RetentionSweepOutput>("state_retention_sweep"),
+        // Plan/apply spine (Cluster 3 B, Phase 2)
+        entry::<ApplyOutput>("apply"),
         // Config types feeding the VS Code project schema. Not CLI command
         // outputs, but exported through the same pipeline so the IDE-facing
         // `editors/vscode/schemas/rocky-project.schema.json` is generated

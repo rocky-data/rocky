@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky apply <plan-id>`.\n\nWraps the inner apply output (compact / archive / run) with a top-level `plan_id` envelope so consumers can correlate the apply result back to the plan that generated it without examining the inner payload's command field.\n\n## Shape decision: envelope (not discriminated enum)\n\nA discriminated enum with `CompactApplyOutput | ArchiveApplyOutput | RunOutput` would produce noisier `JsonSchema` derivations (nested `oneOf` with overlapping field names). An envelope with `inner: serde_json::Value` is simpler and lets consumers fall back to the per-command schema they already know for the `command` field (`\"compact apply\"` / `\"archive apply\"` / `\"run\"`).",
+  "properties": {
+    "command": {
+      "description": "Always `\"apply\"` — the top-level command selector in `parse_rocky_output`.",
+      "type": "string"
+    },
+    "plan_id": {
+      "description": "The plan that was applied (full 64-char blake3 hex).",
+      "type": "string"
+    },
+    "plan_kind": {
+      "description": "`PlanKind` wire name: `\"compact\"`, `\"archive\"`, or `\"run\"`.",
+      "type": "string"
+    },
+    "result": {
+      "description": "The full inner apply result, embedded verbatim. Shape depends on `plan_kind`: - `\"compact\"` → `CompactApplyOutput` - `\"archive\"` → `ArchiveApplyOutput` - `\"run\"`     → `RunOutput`"
+    },
+    "success": {
+      "description": "Whether all statements / materializations succeeded.",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "plan_id",
+    "plan_kind",
+    "result",
+    "success",
+    "version"
+  ],
+  "title": "ApplyOutput",
+  "type": "object"
+}

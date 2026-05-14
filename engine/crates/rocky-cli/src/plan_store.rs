@@ -1,4 +1,5 @@
-//! Persistent plan store for `rocky compact apply` / `rocky archive apply`.
+//! Persistent plan store for `rocky compact apply` / `rocky archive apply` /
+//! `rocky apply`.
 //!
 //! Plans are written to `<root>/.rocky/plans/<plan_id>.json` where `plan_id`
 //! is the full 64-character blake3 hex digest of the canonical JSON
@@ -8,10 +9,10 @@
 //!
 //! The blake3 digest is computed over `serde_json::to_vec` applied to the
 //! canonical envelope `{"kind": ..., "payload": ...}`. Because all payloads
-//! (`CompactOutput`, `ArchiveOutput`) originate from serde-derived structs
-//! with a fixed field order, `to_vec` produces a byte-stable JSON encoding
-//! for the same plan content. The `plan_id` field in `CompactOutput` and
-//! `ArchiveOutput` is excluded from the hash (serialized as `None`) so that
+//! (`CompactOutput`, `ArchiveOutput`, `RunPlan`) originate from serde-derived
+//! structs with a fixed field order, `to_vec` produces a byte-stable JSON
+//! encoding for the same plan content. The `plan_id` field in `CompactOutput`
+//! and `ArchiveOutput` is excluded from the hash (serialized as `None`) so that
 //! re-hashing the persisted `payload` reproduces the filename.
 
 use std::path::Path;
@@ -26,6 +27,11 @@ use serde::{Deserialize, Serialize};
 pub enum PlanKind {
     Compact,
     Archive,
+    /// A `rocky plan` / `rocky apply` run plan. The payload is a `RunPlan`
+    /// struct (operational metadata: filter, pipeline, partition flags, model
+    /// list, execution layers). Full `ProjectIr` is not persisted — `apply`
+    /// re-derives it by re-compiling with the same flags.
+    Run,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -33,6 +39,7 @@ impl std::fmt::Display for PlanKind {
         match self {
             PlanKind::Compact => write!(f, "compact"),
             PlanKind::Archive => write!(f, "archive"),
+            PlanKind::Run => write!(f, "run"),
         }
     }
 }
@@ -116,7 +123,8 @@ pub fn read_plan(root: &Path, plan_id: &str) -> Result<PersistedPlan> {
     if !path.exists() {
         bail!(
             "plan '{}' not found — no file at {}. \
-             Generate a plan first with `rocky compact <model>` or `rocky archive <model>`.",
+             Generate a plan first with `rocky compact <model>`, `rocky archive <model>`, \
+             or `rocky plan`.",
             plan_id,
             path.display()
         );
@@ -187,11 +195,45 @@ mod tests {
 
         let id_compact = write_plan(dir.path(), PlanKind::Compact, &payload)?;
         let id_archive = write_plan(dir.path(), PlanKind::Archive, &payload)?;
+        let id_run = write_plan(dir.path(), PlanKind::Run, &payload)?;
         assert_ne!(
             id_compact, id_archive,
             "different kinds must produce different plan_ids"
         );
+        assert_ne!(
+            id_compact, id_run,
+            "compact and run must produce different plan_ids"
+        );
+        assert_ne!(
+            id_archive, id_run,
+            "archive and run must produce different plan_ids"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn run_kind_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.tbl",
+            statement_count: 5,
+        };
+
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &payload)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Run);
+        assert_eq!(plan.payload["model"], serde_json::json!("cat.sc.tbl"));
+        assert_eq!(plan.payload["statement_count"], serde_json::json!(5));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_kind_display() {
+        assert_eq!(PlanKind::Compact.to_string(), "compact");
+        assert_eq!(PlanKind::Archive.to_string(), "archive");
+        assert_eq!(PlanKind::Run.to_string(), "run");
     }
 
     #[test]

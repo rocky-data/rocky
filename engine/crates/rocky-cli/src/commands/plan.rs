@@ -1,16 +1,18 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 
 use rocky_core::sql_gen;
 use rocky_ir::*;
 
 use crate::output::*;
+use crate::plan_store::{PlanKind, write_plan};
 use crate::registry;
 
 use super::{matches_filter, parse_filter};
 
-/// Execute `rocky plan` — dry-run SQL generation.
+/// Execute `rocky plan` — dry-run SQL generation plus optional run-plan blueprint.
 ///
 /// The `env` parameter, when `Some`, selects the active environment
 /// for the governance preview. It flows into `mask_actions` (via
@@ -18,6 +20,16 @@ use super::{matches_filter, parse_filter};
 /// `[mask.<env>]` override surfaces in the preview on top of the
 /// workspace `[mask]` defaults. Classification tags and retention
 /// policies are env-invariant and are previewed regardless.
+///
+/// ## Run-plan blueprint (Phase 2)
+///
+/// When a `models/` directory exists next to the config, `rocky plan` also
+/// compiles the project, builds a `RunPlan` payload (operational metadata
+/// only — no full IR), and persists it to `.rocky/plans/<plan_id>.json`.
+/// `rocky apply <plan_id>` then calls `rocky run` with the same flags,
+/// re-deriving the `ProjectIr` by recompiling. Full IR persistence is
+/// deferred — the operational-metadata approach covers the deterministic
+/// re-application requirement at acceptable cost.
 pub async fn plan(
     config_path: &Path,
     filter: Option<&str>,
@@ -217,6 +229,32 @@ pub async fn plan(
             .context("failed to compute governance action preview")?;
     }
 
+    // --- Run-plan blueprint (Cluster 3 B, Phase 2) -----------------------
+    //
+    // When a `models/` directory exists, compile the project and persist a
+    // `RunPlan` (operational metadata only — no full IR). `rocky apply` will
+    // re-derive ProjectIr by recompiling with the same flags. Plan write is
+    // best-effort — failure is logged as a warning, not an error, so
+    // replication-only invocations in CI environments without `.rocky/`
+    // write access are not broken.
+    if models_dir.exists() {
+        match build_and_persist_run_plan(&models_dir, filter, pipeline_name, env) {
+            Ok((run_plan, plan_id, persisted_at)) => {
+                output.plan_id = Some(plan_id);
+                output.plan_kind = Some("run".to_string());
+                output.created_at = Some(persisted_at);
+                output.models = run_plan.models.clone();
+                output.execution_layers = run_plan.execution_layers.clone();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build/persist run plan; `rocky apply` will not be available for this invocation"
+                );
+            }
+        }
+    }
+
     if output_json {
         print_json(&output)?;
     } else {
@@ -226,8 +264,74 @@ pub async fn plan(
             println!();
         }
         render_governance_preview_text(&output);
+        if let Some(ref plan_id) = output.plan_id {
+            println!();
+            println!(
+                "Run plan persisted — {} model(s) across {} layer(s)",
+                output.models.len(),
+                output.execution_layers.len()
+            );
+            println!("Plan ID:   {plan_id}");
+            println!("Apply with: rocky apply {plan_id}");
+        }
     }
     Ok(())
+}
+
+/// Compile the models directory, build a `RunPlan` payload, persist it to
+/// `.rocky/plans/<plan_id>.json`, and return `(payload, plan_id, persisted_at)`.
+fn build_and_persist_run_plan(
+    models_dir: &Path,
+    filter: Option<&str>,
+    pipeline: Option<&str>,
+    env: Option<&str>,
+) -> Result<(RunPlan, String, chrono::DateTime<Utc>)> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas: std::collections::HashMap::new(),
+        source_column_info: std::collections::HashMap::new(),
+        mask: std::collections::BTreeMap::new(),
+        allow_unmasked: vec![],
+    };
+
+    let result = compile::compile(&config).context("failed to compile models for run plan")?;
+
+    // Collect qualified model names from the project.
+    let models: Vec<String> = result
+        .project
+        .models
+        .iter()
+        .map(|m| m.config.name.clone())
+        .collect();
+
+    // Execution layers from the DAG (names only — informational).
+    let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
+
+    let run_plan = RunPlan {
+        filter: filter.map(str::to_string),
+        pipeline: pipeline.map(str::to_string),
+        branch: None,
+        partition: None,
+        partition_from: None,
+        partition_to: None,
+        latest: false,
+        missing: false,
+        lookback: None,
+        parallel: 1,
+        run_all: false,
+        env: env.map(str::to_string),
+        models,
+        execution_layers,
+    };
+
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let plan_id = write_plan(&cwd, PlanKind::Run, &run_plan).context("failed to write run plan")?;
+
+    let persisted_at = Utc::now();
+    Ok((run_plan, plan_id, persisted_at))
 }
 
 /// Compile the project and populate `classification_actions`,

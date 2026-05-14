@@ -369,6 +369,35 @@ class PlanResult(BaseModel):
     classification_actions: list[ClassificationAction] = []
     mask_actions: list[MaskAction] = []
     retention_actions: list[RetentionAction] = []
+    # Phase 2 plan-spine fields (Cluster 3 B). Present when rocky plan
+    # compiled a models/ directory and persisted a RunPlan blueprint.
+    # Absent / None for replication-only invocations — byte-stable.
+    plan_id: str | None = None
+    plan_kind: str | None = None
+    created_at: datetime | None = None
+    models: list[str] = []
+    execution_layers: list[list[str]] = []
+
+
+class ApplyOutput(BaseModel):
+    """Output of ``rocky apply <plan-id>`` (Cluster 3 B Phase 2).
+
+    Envelope wrapping the inner apply result with a top-level ``plan_id``
+    so consumers can correlate the apply result back to the plan without
+    parsing the inner ``result`` payload.
+
+    ``result`` is a raw ``dict`` — its shape depends on ``plan_kind``:
+    - ``"compact"`` → ``CompactApplyOutput``
+    - ``"archive"`` → ``ArchiveApplyOutput``
+    - ``"run"``     → ``RunResult``
+    """
+
+    version: str
+    command: str
+    plan_id: str
+    plan_kind: str
+    success: bool
+    result: Any
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1106,7 @@ RockyOutput = (
     DiscoverResult
     | RunResult
     | PlanResult
+    | ApplyOutput
     | StateResult
     | ClearSchemaCacheOutput
     | CompileResult
@@ -1115,6 +1145,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "discover": DiscoverResult,
     "run": RunResult,
     "plan": PlanResult,
+    "apply": ApplyOutput,
     "state": StateResult,
     "state-clear-schema-cache": ClearSchemaCacheOutput,
     "compile": CompileResult,

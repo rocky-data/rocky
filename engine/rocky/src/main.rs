@@ -198,6 +198,21 @@ enum Command {
         template: String,
     },
 
+    /// Execute a previously-generated plan (compact / archive / run).
+    ///
+    /// `rocky apply <plan-id>` reads the plan from `.rocky/plans/<plan-id>.json`
+    /// and dispatches by kind:
+    ///   - compact plan → OPTIMIZE/VACUUM statements
+    ///   - archive plan → DELETE/VACUUM statements
+    ///   - run plan     → full pipeline re-execution with the persisted flags
+    ///
+    /// Generate a run plan with `rocky plan` (models/ must be present).
+    Apply {
+        /// Plan identifier (64-char blake3 hex) returned by `rocky plan`,
+        /// `rocky compact`, or `rocky archive`.
+        plan_id: String,
+    },
+
     /// Validate config without connecting to any APIs
     Validate,
 
@@ -1546,6 +1561,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
+        Command::Apply { plan_id } => {
+            rocky_cli::commands::run_apply(&cli.config, &plan_id, json).await
+        }
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {
             pipeline,
@@ -1692,6 +1710,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     }
                 }
             } else {
+                // `rocky run` is routed through `apply::run_apply_inline_for_run`
+                // (the Phase 2 alias path). This is a thin passthrough — behaviour
+                // is unchanged. Phase 4 will add a deprecation notice here.
+                //
                 // `rocky_cli::commands::run` handles SIGINT internally so it
                 // can flush watermarks + mark in-flight tables as
                 // `Interrupted` in the state store. On first Ctrl-C it
@@ -1699,7 +1721,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // the main() error handler below maps that to exit code 130.
                 // No outer `select!` here — letting the internal handler own
                 // the signal is what makes graceful cancellation possible.
-                rocky_cli::commands::run(
+                rocky_cli::commands::run_apply_inline_for_run(
                     &cli.config,
                     filter.as_deref(),
                     pipeline.as_deref(),

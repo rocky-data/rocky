@@ -13,5 +13,24 @@
       "target": "staging__orders.orders",
       "sql": "CREATE OR REPLACE TABLE staging__orders.orders AS\nSELECT *\nFROM raw__orders.orders"
     }
+  ],
+  "plan_id": "0cbce5ff506d07db4d952e7ce38cda4654c842e481d56f9180ac0963e6114ab6",
+  "plan_kind": "run",
+  "created_at": "2000-01-01T00:00:00Z",
+  "models": [
+    "raw_orders",
+    "revenue_summary",
+    "customer_orders"
+  ],
+  "execution_layers": [
+    [
+      "raw_orders"
+    ],
+    [
+      "customer_orders"
+    ],
+    [
+      "revenue_summary"
+    ]
   ]
 }

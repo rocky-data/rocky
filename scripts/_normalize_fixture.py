@@ -23,6 +23,7 @@ WALL_CLOCK_FIELDS: frozenset[str] = frozenset(
         "finished_at",
         "timestamp",
         "captured_at",
+        "created_at",
         "last_value",
         "watermark",
     }

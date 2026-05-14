@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from dagster_rocky.types import (
+    ApplyOutput,
     CiResult,
     ColumnLineageResult,
     CompileResult,
@@ -60,6 +61,7 @@ EXPECTED_TYPES: dict[str, type] = {
     "discover": DiscoverResult,
     "run": RunResult,
     "plan": PlanResult,
+    "apply": ApplyOutput,
     "state": StateResult,
     "compile": CompileResult,
     "test": TestResult,

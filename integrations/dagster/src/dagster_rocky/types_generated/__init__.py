@@ -163,6 +163,9 @@ from .compact_schema import CompactOutput, NamedStatement
 # Archive command (re-uses NamedStatement from compact)
 from .archive_schema import ArchiveOutput
 
+# Apply command (Cluster 3 B Phase 2 — top-level plan/apply spine)
+from .apply_schema import ApplyOutput
+
 # Profile-storage command
 from .profile_storage_schema import EncodingRecommendationOutput, ProfileStorageOutput
 
@@ -347,6 +350,8 @@ __all__ = [
     "NamedStatement",
     # archive
     "ArchiveOutput",
+    # apply (Cluster 3 B Phase 2 — top-level plan/apply spine)
+    "ApplyOutput",
     # profile-storage
     "ProfileStorageOutput",
     "EncodingRecommendationOutput",

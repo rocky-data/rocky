@@ -1,4 +1,5 @@
 mod ai;
+pub mod apply;
 mod archive;
 #[cfg(feature = "duckdb")]
 pub mod bench;
@@ -59,6 +60,7 @@ mod validate_migration;
 mod watch;
 
 pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
+pub use apply::{run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
