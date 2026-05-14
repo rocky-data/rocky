@@ -226,7 +226,7 @@ mod tests {
             .signed_duration_since(plan.created_at)
             .num_seconds();
         assert!(
-            elapsed >= 0 && elapsed < 5,
+            (0..5).contains(&elapsed),
             "created_at should be within 5s of now, got {elapsed}s ago"
         );
         Ok(())
