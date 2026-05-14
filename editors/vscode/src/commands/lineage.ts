@@ -16,6 +16,7 @@ interface SerializedState {
   panY?: number;
   viewMode?: "model" | "column";
   clusterMode?: "none" | "schema" | "source";
+  layout?: "LR" | "TB";
 }
 
 /** Message types sent from the extension host to the webview. */
@@ -512,6 +513,19 @@ function renderLineageHtml(
     select.cluster-select:hover {
       background: var(--vscode-button-secondaryHoverBackground);
     }
+    /* Layout select */
+    select.layout-select {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      padding: 3px 6px;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    select.layout-select:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
   </style>
 </head>
 <body>
@@ -528,6 +542,12 @@ function renderLineageHtml(
       <option value="none">None</option>
       <option value="schema">Schema</option>
       <option value="source">Source</option>
+    </select>
+    <div class="separator"></div>
+    <span class="cluster-select-label">Layout:</span>
+    <select id="layout-mode" class="layout-select" title="Graph layout direction">
+      <option value="LR">Horizontal</option>
+      <option value="TB">Vertical</option>
     </select>
     <div class="separator"></div>
     <button id="zoom-out" title="Zoom out (-)">−</button>
@@ -581,6 +601,7 @@ function renderLineageHtml(
   let currentViewMode = (saved.viewMode === 'column') ? 'column' : 'model';
   let currentClusterMode = (saved.clusterMode === 'schema' || saved.clusterMode === 'source')
     ? saved.clusterMode : 'none';
+  let currentLayout = (saved.layout === 'TB') ? 'TB' : 'LR';
   let selectedNodeModel = null; // currently selected model name (for side panel)
   let focusedClusterId = null;  // currently focused cluster (null = none)
 
@@ -591,6 +612,7 @@ function renderLineageHtml(
     panY: saved.panY,
     viewMode: currentViewMode,
     clusterMode: currentClusterMode,
+    layout: currentLayout,
   };
 
   function persistState(patch) {
@@ -626,7 +648,7 @@ function renderLineageHtml(
     const useCompound = currentClusterMode !== 'none';
     const g = new dagre.graphlib.Graph({ multigraph: false, compound: useCompound });
     g.setGraph({
-      rankdir: 'LR',
+      rankdir: currentLayout,
       nodesep: useCompound ? 40 : 30,
       ranksep: useCompound ? 100 : 80,
       marginx: 20,
@@ -716,7 +738,7 @@ function renderLineageHtml(
     const useCompound = currentClusterMode !== 'none';
     const g = new dagre.graphlib.Graph({ multigraph: false, compound: useCompound });
     g.setGraph({
-      rankdir: 'LR',
+      rankdir: currentLayout,
       nodesep: useCompound ? 28 : 20,
       ranksep: useCompound ? 80 : 60,
       marginx: 20,
@@ -1226,6 +1248,9 @@ function renderLineageHtml(
   // Restore cluster mode select to saved value
   document.getElementById('cluster-mode').value = currentClusterMode;
 
+  // Restore layout select to saved value
+  document.getElementById('layout-mode').value = currentLayout;
+
   // ── Background click → clear cluster focus ────────────────────────────────────
   svgEl.addEventListener('click', (e) => {
     // Only clear if the click target is the SVG itself, not a child element
@@ -1258,6 +1283,16 @@ function renderLineageHtml(
     if (newMode === currentClusterMode) return;
     currentClusterMode = newMode;
     persistState({ clusterMode: newMode });
+    render(currentViewMode);
+    fitToView();
+  });
+
+  // ── Layout direction select ───────────────────────────────────────────────────
+  document.getElementById('layout-mode').addEventListener('change', (e) => {
+    const newLayout = e.target.value;
+    if (newLayout === currentLayout) return;
+    currentLayout = newLayout;
+    persistState({ layout: newLayout });
     render(currentViewMode);
     fitToView();
   });
