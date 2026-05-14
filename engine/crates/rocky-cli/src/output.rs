@@ -651,6 +651,14 @@ pub struct DriftActionOutput {
 /// `[mask]`, or `retention` config get empty lists — the fields
 /// `skip_serializing_if = Vec::is_empty`, so JSON consumers written
 /// against the pre-Wave A shape are byte-stable.
+///
+/// ## Phase 2 additions (Cluster 3 B)
+///
+/// `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers`
+/// are additive — all have `skip_serializing_if` so existing fixtures and
+/// consumers that do not include a compile step remain byte-stable. When
+/// `rocky plan` runs against a project with a `models/` directory, these
+/// fields are populated and the plan is persisted to `.rocky/plans/`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanOutput {
     pub version: String,
@@ -683,6 +691,34 @@ pub struct PlanOutput {
     /// warehouses without a first-class retention knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
+
+    // ---- Phase 2 plan-spine fields (Cluster 3 B) ------------------------
+    //
+    // Populated when `rocky plan` compiles a `models/` directory and
+    // persists a run plan. Absent for replication-only invocations and
+    // projects without a `models/` directory, so existing consumers are
+    // byte-stable.
+    /// Full 64-char blake3 plan identifier. Present when the plan was
+    /// persisted to `.rocky/plans/<plan_id>.json`. Apply with:
+    /// `rocky apply <plan_id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Plan kind wire name (`"run"`). Present when `plan_id` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_kind: Option<String>,
+    /// UTC timestamp when the plan was persisted. Present when `plan_id`
+    /// is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    /// Qualified model names that will be executed by `rocky apply`. Empty
+    /// for replication-only plans. Informational — re-derived at apply time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Execution layers (topological order) as a list-of-lists of model
+    /// names. Models within a layer can execute concurrently. Informational —
+    /// re-derived at apply time. Empty for replication-only plans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_layers: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2033,6 +2069,113 @@ pub struct ArchiveApplyOutput {
     pub success: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Plan + Apply spine (Cluster 3 B, Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Operational metadata persisted by `rocky plan` for a run-kind plan.
+///
+/// ## Design note: operational-metadata-only (no full IR)
+///
+/// `ProjectIr` round-trip via serde would be a substantial refactor and
+/// is deferred to a future phase. Instead we persist the flags that
+/// produced this plan — `rocky apply` re-derives the `ProjectIr` by
+/// re-compiling with the same flags. The trade-off: apply always re-compiles
+/// (fast, CPU-only, no network) rather than deserialising a potentially
+/// large IR snapshot. Phase 3 can sharpen this if deterministic replay
+/// without re-compile becomes a requirement.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RunPlan {
+    /// Optional filter that was passed to `rocky plan` (e.g. `"client=acme"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Pipeline name if `--pipeline` was specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// Branch name if `--branch` was specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Single partition key (`--partition`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// Range lower bound (`--from`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_from: Option<String>,
+    /// Range upper bound (`--to`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_to: Option<String>,
+    /// Whether `--latest` was specified.
+    #[serde(default)]
+    pub latest: bool,
+    /// Whether `--missing` was specified.
+    #[serde(default)]
+    pub missing: bool,
+    /// Lookback window (`--lookback`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<u32>,
+    /// Partition parallelism (`--parallel`, default 1).
+    #[serde(default = "default_parallel")]
+    pub parallel: u32,
+    /// Whether `--all` was passed (run both replication and models).
+    #[serde(default)]
+    pub run_all: bool,
+    /// Optional governance environment (`--env`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Qualified model names discovered at plan time. Used to populate
+    /// `PlanOutput.models` and surfaced in `rocky apply` dry-run info.
+    /// Re-derived at apply time via recompile; this list is informational.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Execution layers (topological order) discovered at plan time.
+    /// Informational — re-derived at apply time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_layers: Vec<Vec<String>>,
+}
+
+fn default_parallel() -> u32 {
+    1
+}
+
+// Phase 2 plan-spine note: plan_id / plan_kind / created_at / models /
+// execution_layers fields are added directly to `PlanOutput` (inline fields,
+// not a wrapper) so the existing `"plan"` command wire key in
+// `parse_rocky_output` works unchanged. All fields use `skip_serializing_if`
+// so existing consumers and fixtures remain byte-stable when the compile path
+// is absent.
+
+/// JSON output for `rocky apply <plan-id>`.
+///
+/// Wraps the inner apply output (compact / archive / run) with a top-level
+/// `plan_id` envelope so consumers can correlate the apply result back to the
+/// plan that generated it without examining the inner payload's command field.
+///
+/// ## Shape decision: envelope (not discriminated enum)
+///
+/// A discriminated enum with `CompactApplyOutput | ArchiveApplyOutput | RunOutput`
+/// would produce noisier `JsonSchema` derivations (nested `oneOf` with
+/// overlapping field names). An envelope with `inner: serde_json::Value` is
+/// simpler and lets consumers fall back to the per-command schema they already
+/// know for the `command` field (`"compact apply"` / `"archive apply"` / `"run"`).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ApplyOutput {
+    pub version: String,
+    /// Always `"apply"` — the top-level command selector in `parse_rocky_output`.
+    pub command: String,
+    /// The plan that was applied (full 64-char blake3 hex).
+    pub plan_id: String,
+    /// `PlanKind` wire name: `"compact"`, `"archive"`, or `"run"`.
+    pub plan_kind: String,
+    /// Whether all statements / materializations succeeded.
+    pub success: bool,
+    /// The full inner apply result, embedded verbatim. Shape depends on
+    /// `plan_kind`:
+    /// - `"compact"` → `CompactApplyOutput`
+    /// - `"archive"` → `ArchiveApplyOutput`
+    /// - `"run"`     → `RunOutput`
+    pub result: serde_json::Value,
+}
+
 /// JSON output for `rocky compact --measure-dedup` (Layer 0 storage experiment).
 ///
 /// Measures cross-table partition dedup across all Rocky-managed tables in
@@ -2957,6 +3100,11 @@ impl PlanOutput {
             classification_actions: vec![],
             mask_actions: vec![],
             retention_actions: vec![],
+            plan_id: None,
+            plan_kind: None,
+            created_at: None,
+            models: vec![],
+            execution_layers: vec![],
         }
     }
 }
