@@ -17,6 +17,7 @@ interface SerializedState {
   viewMode?: "model" | "column";
   clusterMode?: "none" | "schema" | "source";
   layout?: "LR" | "TB";
+  searchQuery?: string;
 }
 
 /** Message types sent from the extension host to the webview. */
@@ -526,6 +527,36 @@ function renderLineageHtml(
     select.layout-select:hover {
       background: var(--vscode-button-secondaryHoverBackground);
     }
+    /* Search input */
+    .search-input {
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      padding: 3px 7px;
+      font-size: 12px;
+      border-radius: 2px;
+      width: 160px;
+      outline: none;
+    }
+    .search-input:focus {
+      border-color: var(--vscode-focusBorder, #007fd4);
+    }
+    .search-input.search-error {
+      border-color: var(--vscode-errorForeground);
+    }
+    /* Dimming for search + focus mode — applied to individual nodes/edges */
+    .node.dimmed rect,
+    .node.dimmed text {
+      opacity: 0.2;
+    }
+    .edgePath.dimmed path {
+      opacity: 0.1;
+    }
+    /* Matched nodes get a bolder stroke */
+    .node.matched rect {
+      stroke-width: 2.5px;
+      stroke: var(--vscode-focusBorder, #007fd4);
+    }
   </style>
 </head>
 <body>
@@ -549,6 +580,8 @@ function renderLineageHtml(
       <option value="LR">Horizontal</option>
       <option value="TB">Vertical</option>
     </select>
+    <div class="separator"></div>
+    <input id="search-input" class="search-input" type="text" placeholder="Search nodes…" title="Filter nodes by name (case-insensitive). Use /regex/ for pattern matching." />
     <div class="separator"></div>
     <button id="zoom-out" title="Zoom out (-)">−</button>
     <button id="zoom-reset" title="Reset zoom (0)">100%</button>
@@ -602,6 +635,7 @@ function renderLineageHtml(
   let currentClusterMode = (saved.clusterMode === 'schema' || saved.clusterMode === 'source')
     ? saved.clusterMode : 'none';
   let currentLayout = (saved.layout === 'TB') ? 'TB' : 'LR';
+  let currentSearchQuery = (typeof saved.searchQuery === 'string') ? saved.searchQuery : '';
   let selectedNodeModel = null; // currently selected model name (for side panel)
   let focusedClusterId = null;  // currently focused cluster (null = none)
 
@@ -613,6 +647,7 @@ function renderLineageHtml(
     viewMode: currentViewMode,
     clusterMode: currentClusterMode,
     layout: currentLayout,
+    searchQuery: currentSearchQuery,
   };
 
   function persistState(patch) {
@@ -1045,6 +1080,75 @@ function renderLineageHtml(
     fitToView();
   }
 
+  // ── Search / filter ───────────────────────────────────────────────────────────
+
+  /**
+   * Build a matcher from the current search query string.
+   * If query is empty → match everything.
+   * If query starts and ends with '/' → attempt regex (/pattern/flags).
+   * Otherwise → case-insensitive substring.
+   * Returns { test(s): boolean, isError: boolean }.
+   */
+  function buildMatcher(query) {
+    if (!query) return { test: () => true, isError: false };
+    const regexMatch = query.match(/^\/(.*)\/([gimsuy]*)$/);
+    if (regexMatch) {
+      try {
+        const re = new RegExp(regexMatch[1], regexMatch[2] || 'i');
+        return { test: (s) => re.test(s), isError: false };
+      } catch (_) {
+        // Fallback to plain substring on regex parse error
+        return { test: (s) => s.toLowerCase().includes(query.toLowerCase()), isError: true };
+      }
+    }
+    const lower = query.toLowerCase();
+    return { test: (s) => s.toLowerCase().includes(lower), isError: false };
+  }
+
+  /**
+   * Apply search dimming without re-running dagre.
+   * Matched nodes get class 'matched'; non-matched get 'dimmed'.
+   * Edges are dimmed if both endpoints are dimmed.
+   * An empty query clears all search classes.
+   */
+  function applySearchFilter(query) {
+    const matcher = buildMatcher(query);
+    const searchInput = document.getElementById('search-input');
+    if (matcher.isError) {
+      searchInput.classList.add('search-error');
+    } else {
+      searchInput.classList.remove('search-error');
+    }
+
+    if (!query) {
+      // Clear all search classes
+      d3.selectAll('.node').classed('matched', false).classed('dimmed', false);
+      d3.selectAll('.edgePath').classed('dimmed', false);
+      return;
+    }
+
+    // Determine which node-ids match
+    const matchedIds = new Set();
+    d3.selectAll('.node').each(function() {
+      const el = d3.select(this);
+      const nodeId = el.attr('data-node-id');
+      if (!nodeId) return;
+      // In column mode, nodeId is "model·column"; in model mode it's the model name
+      const testStr = nodeId.replace('·', '.');
+      const matches = matcher.test(testStr);
+      el.classed('matched', matches).classed('dimmed', !matches);
+      if (matches) matchedIds.add(nodeId);
+    });
+
+    // Dim edges where neither endpoint matches
+    d3.selectAll('.edgePath').each(function() {
+      const el = d3.select(this);
+      const src = el.attr('data-src');
+      const tgt = el.attr('data-tgt');
+      el.classed('dimmed', !matchedIds.has(src) && !matchedIds.has(tgt));
+    });
+  }
+
   function render(viewMode) {
     graphGroup.selectAll('*').remove();
     focusedClusterId = null;
@@ -1234,6 +1338,9 @@ function renderLineageHtml(
           clusterSuffix + ' · click a node for details · drag to pan · scroll to zoom · F to fit · 0 to reset';
       }
     }
+
+    // Re-apply search filter after each render so classes are up to date
+    applySearchFilter(currentSearchQuery);
   }
 
   // ── Initial render ────────────────────────────────────────────────────────────
@@ -1250,6 +1357,24 @@ function renderLineageHtml(
 
   // Restore layout select to saved value
   document.getElementById('layout-mode').value = currentLayout;
+
+  // Restore search query to saved value
+  if (currentSearchQuery) {
+    document.getElementById('search-input').value = currentSearchQuery;
+    applySearchFilter(currentSearchQuery);
+  }
+
+  // ── Search input (debounced 250ms) ────────────────────────────────────────────
+  let searchDebounceTimer = null;
+  document.getElementById('search-input').addEventListener('input', (e) => {
+    const query = e.target.value;
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      currentSearchQuery = query;
+      persistState({ searchQuery: query });
+      applySearchFilter(query);
+    }, 250);
+  });
 
   // ── Background click → clear cluster focus ────────────────────────────────────
   svgEl.addEventListener('click', (e) => {
