@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-05-14
+
+Companion release to engine `v1.32.0`. Wires the Cluster 3 B plan/apply spine into the dagster integration.
+
+### Added
+
+- **`RockyResource.plan(...)` method.** Mirrors `compile`. Calls `rocky plan --output json`, returns the typed `PlanOutput` with `plan_id`, `plan_kind`, `created_at`, plus the existing legacy plan fields. Companion to engine [#523](https://github.com/rocky-data/rocky/pull/523).
+- **`RockyResource.apply(plan_id, ...)` method.** Mirrors `run` but takes a `plan_id`. Dispatches whatever `PlanKind` the plan has. Returns `ApplyOutput { plan_id, kind, result }` envelope. Companion to engine [#523](https://github.com/rocky-data/rocky/pull/523).
+- **`RockyResource.plan_promote(branch, base, allow_breaking=False, ...)` method.** Mirrors `branch_promote` but returns a typed `PromotePlan` (with `branch_state_hash`, `approvals_used`, `breaking_changes`, `targets[]`) — the breaking-change gate runs at plan time. Companion to engine [#527](https://github.com/rocky-data/rocky/pull/527).
+- **New typed surfaces** re-exported from `dagster_rocky/types.py`: `CompactApplyOutput`, `ArchiveApplyOutput`, `StatementResult`, `RunPlan`, `PromotePlan`, `PromoteTargetPlan`, `ApplyOutput`, `PlanOutput` (evolved with new fields).
+- **`parse_rocky_output()` dispatch entries** for `"compact apply"`, `"archive apply"`, `"plan"`, `"apply"`, `"plan promote"` commands.
+
+### Changed
+
+- `BranchPromoteOutput` JSON shape is unchanged — bare `branch promote` produces byte-stable output even though the engine internally chains plan + apply now.
+
+### Dependencies
+
+- `uv lock --upgrade` SemVer-compatible bumps: `idna` 3.14→3.15, `requests` 2.33.1→2.34.2, `ruff` 0.15.12→0.15.13, `typeguard` 4.5.1→4.5.2, `pyreadline3` 3.5.4→3.5.6.
+
 ## [1.29.0] — 2026-05-13
 
 Companion release to engine `v1.31.0`. Headline: **`BreakingChange` / `BreakingFinding` / `BreakingSeverity` types are now first-class on the generated Pydantic surface** — Cluster 3 E (semantic breaking-change diff) shipped end-to-end on the engine side ([#508](https://github.com/rocky-data/rocky/pull/508) classifier, [#509](https://github.com/rocky-data/rocky/pull/509) `rocky ci-diff --semantic`, [#510](https://github.com/rocky-data/rocky/pull/510) `rocky branch promote` gate) and the regenerated Pydantic models flow through `dagster_rocky.types_generated.ci_diff_schema` and `dagster_rocky.types_generated.branch_promote_schema`, so consumers parsing `rocky ci-diff --semantic` or `rocky branch promote` JSON output now see the typed findings + the three new `AuditEventKind` variants (`BreakingChangesBlocked` / `BreakingChangesAllowed` / `BreakingChangesGateSkipped`). Wheel re-cut against the v1.31.0 engine binary.
