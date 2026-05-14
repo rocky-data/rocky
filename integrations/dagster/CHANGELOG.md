@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.30.0] — 2026-05-14
+## [1.30.0] — 2026-05-15
 
 Companion release to engine `v1.32.0`. Wires the Cluster 3 B plan/apply spine into the dagster integration.
 
