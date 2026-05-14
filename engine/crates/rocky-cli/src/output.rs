@@ -1879,7 +1879,7 @@ pub struct TableCompareResult {
 ///   statement bundles, and `totals` carries aggregate counts. The flat
 ///   `statements` field still carries every SQL statement across all
 ///   tables for consumers that just iterate it.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CompactOutput {
     pub version: String,
     pub command: String,
@@ -1910,23 +1910,29 @@ pub struct CompactOutput {
     /// invocations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totals: Option<CompactTotals>,
+    /// Plan identifier (full 64-char blake3 hex). Populated when the plan is
+    /// persisted to `.rocky/plans/` so it can be applied later via
+    /// `rocky compact apply <plan_id>`. Absent when plan persistence is skipped
+    /// (e.g. `--measure-dedup` path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
 }
 
 /// Per-table compaction plan inside a `--catalog` envelope.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CompactTableEntry {
     pub statements: Vec<NamedStatement>,
 }
 
 /// Aggregate counts over a `rocky compact --catalog` invocation.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CompactTotals {
     pub table_count: usize,
     pub statement_count: usize,
 }
 
 /// Named SQL statement (purpose + sql), reused by compact and archive.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NamedStatement {
     pub purpose: String,
     pub sql: String,
@@ -1938,7 +1944,7 @@ pub struct NamedStatement {
 /// and leave the catalog-scope fields absent; `--catalog` invocations
 /// populate `catalog`, `scope = "catalog"`, `tables`, and `totals`. The
 /// flat `statements` list carries every statement across every table.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ArchiveOutput {
     pub version: String,
     pub command: String,
@@ -1959,19 +1965,72 @@ pub struct ArchiveOutput {
     pub tables: Option<BTreeMap<String, ArchiveTableEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totals: Option<ArchiveTotals>,
+    /// Plan identifier (full 64-char blake3 hex). Populated when the plan is
+    /// persisted to `.rocky/plans/` so it can be applied later via
+    /// `rocky archive apply <plan_id>`. Absent when plan persistence is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
 }
 
 /// Per-table archive plan inside a `--catalog` envelope.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ArchiveTableEntry {
     pub statements: Vec<NamedStatement>,
 }
 
 /// Aggregate counts over a `rocky archive --catalog` invocation.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ArchiveTotals {
     pub table_count: usize,
     pub statement_count: usize,
+}
+
+/// Result of executing one SQL statement during `rocky compact apply` or
+/// `rocky archive apply`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct StatementResult {
+    /// Human-readable purpose label (mirrors `NamedStatement.purpose`).
+    pub purpose: String,
+    /// The SQL that was executed.
+    pub sql: String,
+    /// Whether the adapter accepted the statement without error.
+    pub success: bool,
+    /// Execution duration in milliseconds. Zero when execution was skipped
+    /// due to a prior statement failure in the same apply run.
+    pub duration_ms: u64,
+    /// Adapter error message. `None` when `success == true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// JSON output for `rocky compact apply <plan_id>`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CompactApplyOutput {
+    pub version: String,
+    pub command: String,
+    /// The plan that was applied.
+    pub plan_id: String,
+    pub executed_at: DateTime<Utc>,
+    /// Per-statement results, in the order they were executed.
+    pub statements: Vec<StatementResult>,
+    /// `true` when all statements succeeded; `false` on the first failure
+    /// (remaining statements are still reported with `success: false`
+    /// and `duration_ms: 0`).
+    pub success: bool,
+}
+
+/// JSON output for `rocky archive apply <plan_id>`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ArchiveApplyOutput {
+    pub version: String,
+    pub command: String,
+    /// The plan that was applied.
+    pub plan_id: String,
+    pub executed_at: DateTime<Utc>,
+    /// Per-statement results, in the order they were executed.
+    pub statements: Vec<StatementResult>,
+    /// `true` when all statements succeeded; `false` on the first failure.
+    pub success: bool,
 }
 
 /// JSON output for `rocky compact --measure-dedup` (Layer 0 storage experiment).

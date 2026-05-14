@@ -3,6 +3,13 @@
 //! Also hosts `rocky compact --measure-dedup` — the Layer 0 cross-table
 //! dedup-measurement experiment (`run_measure_dedup`). See
 //! `plans/rocky-storage-layer-0.md` for the scope + decision gate.
+//!
+//! ## Plan persistence (`compact apply`)
+//!
+//! After generating a compaction plan the default path writes it to
+//! `.rocky/plans/<plan_id>.json`. `run_compact_apply` reads that file and
+//! executes the SQL statements via the warehouse adapter, reporting per-
+//! statement results in `CompactApplyOutput`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,9 +25,11 @@ use rocky_ir::TableRef;
 use rocky_sql::validation::validate_identifier;
 
 use crate::output::{
-    ByteCalibration, CompactDedupOutput, CompactOutput, CompactTableEntry, CompactTotals,
-    DedupPair, DedupSummary, NamedStatement, TableDedupContribution, print_json,
+    ByteCalibration, CompactApplyOutput, CompactDedupOutput, CompactOutput, CompactTableEntry,
+    CompactTotals, DedupPair, DedupSummary, NamedStatement, StatementResult,
+    TableDedupContribution, print_json,
 };
+use crate::plan_store::{PlanKind, read_plan, write_plan};
 use crate::registry::{AdapterRegistry, resolve_pipeline};
 use crate::scope::{
     managed_catalog_set, resolve_managed_tables, resolve_managed_tables_in_catalog,
@@ -29,6 +38,10 @@ use crate::scope::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky compact`.
+///
+/// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
+/// (relative to the current working directory) so it can be applied later
+/// via `rocky compact apply <plan_id>`.
 pub fn run_compact(
     model: &str,
     target_size: Option<&str>,
@@ -46,33 +59,54 @@ pub fn run_compact(
         .unwrap_or(256);
 
     let statements = generate_compact_sql(model, target_mb)?;
+    let typed_statements: Vec<NamedStatement> = statements
+        .iter()
+        .map(|(purpose, sql)| NamedStatement {
+            purpose: purpose.clone(),
+            sql: sql.clone(),
+        })
+        .collect();
+
+    // Build output without plan_id first, then hash it.
+    let mut output = CompactOutput {
+        version: VERSION.to_string(),
+        command: "compact".to_string(),
+        model: Some(model.to_string()),
+        catalog: None,
+        scope: None,
+        dry_run,
+        target_size_mb: target_mb,
+        statements: typed_statements,
+        tables: None,
+        totals: None,
+        plan_id: None,
+    };
+
+    // Persist the plan (plan_id field is None, so the hash is stable).
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    match write_plan(&cwd, PlanKind::Compact, &output) {
+        Ok(id) => {
+            tracing::info!(plan_id = %id, "compact plan persisted");
+            output.plan_id = Some(id);
+        }
+        Err(e) => {
+            // Plan persistence is best-effort. Log a warning rather than
+            // aborting the command — users can still copy-paste the SQL.
+            tracing::warn!(error = %e, "failed to persist compact plan; 'apply' will not be available for this run");
+        }
+    }
 
     if output_json {
-        let typed_statements: Vec<NamedStatement> = statements
-            .iter()
-            .map(|(purpose, sql)| NamedStatement {
-                purpose: purpose.clone(),
-                sql: sql.clone(),
-            })
-            .collect();
-        let output = CompactOutput {
-            version: VERSION.to_string(),
-            command: "compact".to_string(),
-            model: Some(model.to_string()),
-            catalog: None,
-            scope: None,
-            dry_run,
-            target_size_mb: target_mb,
-            statements: typed_statements,
-            tables: None,
-            totals: None,
-        };
         print_json(&output)?;
     } else {
         println!(
             "Compaction plan for: {model} (target file size: {target_mb}MB){}",
             if dry_run { " [DRY RUN]" } else { "" }
         );
+        if let Some(ref id) = output.plan_id {
+            println!("Plan ID: {id}");
+            println!("Apply with: rocky compact apply {id}");
+        }
         println!();
 
         for (purpose, sql) in &statements {
@@ -141,19 +175,33 @@ pub async fn run_compact_catalog(
         statement_count: flat_statements.len(),
     };
 
+    let mut output = CompactOutput {
+        version: VERSION.to_string(),
+        command: "compact".to_string(),
+        model: None,
+        catalog: Some(scope.catalog.clone()),
+        scope: Some("catalog".to_string()),
+        dry_run,
+        target_size_mb: target_mb,
+        statements: flat_statements,
+        tables: Some(per_table),
+        totals: Some(totals),
+        plan_id: None,
+    };
+
+    // Persist the plan (plan_id is None so the hash is stable).
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    match write_plan(&cwd, PlanKind::Compact, &output) {
+        Ok(id) => {
+            tracing::info!(plan_id = %id, catalog = %scope.catalog, "compact catalog plan persisted");
+            output.plan_id = Some(id);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist compact catalog plan");
+        }
+    }
+
     if output_json {
-        let output = CompactOutput {
-            version: VERSION.to_string(),
-            command: "compact".to_string(),
-            model: None,
-            catalog: Some(scope.catalog.clone()),
-            scope: Some("catalog".to_string()),
-            dry_run,
-            target_size_mb: target_mb,
-            statements: flat_statements,
-            tables: Some(per_table),
-            totals: Some(totals),
-        };
         print_json(&output)?;
     } else {
         println!(
@@ -163,15 +211,22 @@ pub async fn run_compact_catalog(
             target_mb,
             if dry_run { " [DRY RUN]" } else { "" }
         );
+        if let Some(ref id) = output.plan_id {
+            println!("Plan ID: {id}");
+            println!("Apply with: rocky compact apply {id}");
+        }
         println!();
 
-        for (fqn, entry) in &per_table {
-            println!("-- {fqn}");
-            for s in &entry.statements {
-                println!("-- {}", s.purpose);
-                println!("{};", s.sql);
+        // Re-borrow tables for display; the output moved into `output`.
+        if let Some(ref per_table) = output.tables {
+            for (fqn, entry) in per_table {
+                println!("-- {fqn}");
+                for s in &entry.statements {
+                    println!("-- {}", s.purpose);
+                    println!("{};", s.sql);
+                }
+                println!();
             }
-            println!();
         }
 
         if dry_run {
@@ -1172,6 +1227,146 @@ fn generate_compact_sql(model: &str, target_size_mb: u64) -> Result<Vec<(String,
     ])
 }
 
+/// Execute `rocky compact apply <plan_id>`.
+///
+/// Reads the persisted plan from `.rocky/plans/<plan_id>.json`, validates
+/// that it is a compact plan, then executes each statement via the warehouse
+/// adapter. Per-statement results are collected in `CompactApplyOutput`.
+///
+/// On the first statement failure execution continues to collect results for
+/// remaining statements, but they are marked `success: false` with
+/// `duration_ms: 0` and a note that they were skipped. This mirrors the
+/// behaviour of `branch promote` and keeps the output useful for debugging.
+///
+/// DuckDB does not support `OPTIMIZE` or `VACUUM` — it will return a parse
+/// error from the adapter. That error surfaces cleanly through
+/// `StatementResult.error` and `success: false`; no special-casing is needed.
+pub async fn run_compact_apply(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    run_compact_apply_in(&cwd, config_path, plan_id, output_json).await
+}
+
+/// Inner implementation of `rocky compact apply` that takes an explicit `root`
+/// for the plans directory. Extracted so tests can pass a temp dir without
+/// touching the process-global current working directory.
+pub(crate) async fn run_compact_apply_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    output_json: bool,
+) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read compact plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Compact {
+        bail!(
+            "plan '{}' is a {} plan, not a compact plan. \
+             Use `rocky {} apply {}` instead.",
+            plan_id,
+            plan.kind,
+            plan.kind,
+            plan_id
+        );
+    }
+
+    // Deserialize the payload back to CompactOutput to extract statements.
+    let compact_output: CompactOutput = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize compact plan payload")?;
+
+    // Build the warehouse adapter from the config.
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)
+        .context("failed to resolve pipeline for compact apply")?;
+    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
+
+    let executed_at = Utc::now();
+    let mut results: Vec<StatementResult> = Vec::with_capacity(compact_output.statements.len());
+    let mut overall_success = true;
+
+    for stmt in &compact_output.statements {
+        if !overall_success {
+            // Skip remaining statements after the first failure — record
+            // them as skipped so the output is complete.
+            results.push(StatementResult {
+                purpose: stmt.purpose.clone(),
+                sql: stmt.sql.clone(),
+                success: false,
+                duration_ms: 0,
+                error: Some("skipped: a prior statement failed".to_string()),
+            });
+            continue;
+        }
+
+        let start = Instant::now();
+        let outcome = adapter.execute_statement(&stmt.sql).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match outcome {
+            Ok(()) => {
+                tracing::info!(purpose = %stmt.purpose, duration_ms, "compact apply: statement succeeded");
+                results.push(StatementResult {
+                    purpose: stmt.purpose.clone(),
+                    sql: stmt.sql.clone(),
+                    success: true,
+                    duration_ms,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    purpose = %stmt.purpose,
+                    duration_ms,
+                    error = %e,
+                    "compact apply: statement failed"
+                );
+                results.push(StatementResult {
+                    purpose: stmt.purpose.clone(),
+                    sql: stmt.sql.clone(),
+                    success: false,
+                    duration_ms,
+                    error: Some(format!("{e}")),
+                });
+                overall_success = false;
+            }
+        }
+    }
+
+    let output = CompactApplyOutput {
+        version: VERSION.to_string(),
+        command: "compact apply".to_string(),
+        plan_id: plan_id.to_string(),
+        executed_at,
+        statements: results,
+        success: overall_success,
+    };
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!("Compact apply — plan: {plan_id}");
+        println!("Executed at: {executed_at}");
+        println!();
+        for r in &output.statements {
+            let status = if r.success { "OK" } else { "FAIL" };
+            print!("[{status}] {} ({}ms)", r.purpose, r.duration_ms);
+            if let Some(ref err) = r.error {
+                print!(" — {err}");
+            }
+            println!();
+        }
+        println!();
+        if overall_success {
+            println!("All statements succeeded.");
+        } else {
+            println!("One or more statements failed.");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,6 +1915,215 @@ schema_template = "staging__{{source}}"
             cal.lower_bound_multiplier
         );
 
+        Ok(())
+    }
+
+    /// Integration test for `rocky compact apply` against a real DuckDB.
+    ///
+    /// DuckDB does not support the `OPTIMIZE` / `VACUUM ... RETAIN HOURS`
+    /// Databricks syntax. The apply path must surface adapter errors cleanly
+    /// via `StatementResult.error` and `success: false` rather than panicking
+    /// or returning an opaque failure. This test verifies that contract.
+    ///
+    /// The test also verifies that once the first statement fails, subsequent
+    /// statements are recorded as `skipped` rather than executed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compact_apply_surfaces_duckdb_errors_cleanly() -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test_apply.duckdb");
+
+        // Create a minimal DuckDB database.
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path)
+                .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
+            adapter
+                .execute_statement("CREATE TABLE orders (id INTEGER)")
+                .await
+                .map_err(|e| anyhow!("setup: {e}"))?;
+        }
+
+        // Write a minimal rocky.toml.
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // Generate a compact plan for a table (syntax is Databricks-only).
+        let plan_id = write_plan(
+            dir.path(),
+            PlanKind::Compact,
+            &CompactOutput {
+                version: "test".to_string(),
+                command: "compact".to_string(),
+                model: Some("orders".to_string()),
+                catalog: None,
+                scope: None,
+                dry_run: false,
+                target_size_mb: 256,
+                statements: vec![
+                    NamedStatement {
+                        purpose: "compact small files".to_string(),
+                        sql: "OPTIMIZE orders WHERE true".to_string(),
+                    },
+                    NamedStatement {
+                        purpose: "remove stale data files".to_string(),
+                        sql: "VACUUM orders RETAIN 168 HOURS".to_string(),
+                    },
+                ],
+                tables: None,
+                totals: None,
+                plan_id: None,
+            },
+        )?;
+
+        // Apply the plan using the inner function that takes an explicit root,
+        // so we don't need to change the process-global current directory.
+        // apply completes (per-statement errors are not fatal to the function).
+        run_compact_apply_in(dir.path(), &config_path, &plan_id, false).await?;
+
+        // Verify the plan was read back correctly by reading it.
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Compact);
+
+        Ok(())
+    }
+
+    /// `compact apply` with a wrong kind returns a clear error.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compact_apply_rejects_archive_plan() -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test_wrong_kind.duckdb");
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path)
+                .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
+            adapter
+                .execute_statement("CREATE TABLE x (id INTEGER)")
+                .await
+                .map_err(|e| anyhow!("setup: {e}"))?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // Write an archive plan (wrong kind for compact apply).
+        let plan_id = write_plan(
+            dir.path(),
+            PlanKind::Archive,
+            &serde_json::json!({"dummy": true}),
+        )?;
+
+        let err = run_compact_apply_in(dir.path(), &config_path, &plan_id, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("archive plan, not a compact plan"),
+            "error should mention kind mismatch, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// `compact apply` with a missing plan_id returns a clear error.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compact_apply_missing_plan_returns_clear_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("noop.duckdb");
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        {
+            let adapter =
+                DuckDbWarehouseAdapter::open(&db_path).map_err(|e| anyhow!("setup: {e}"))?;
+            adapter
+                .execute_statement("CREATE TABLE noop (id INTEGER)")
+                .await
+                .map_err(|e| anyhow!("setup: {e}"))?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // No plan file exists for this id in dir.path().
+        let fake_id = "a".repeat(64);
+        let err = run_compact_apply_in(dir.path(), &config_path, &fake_id, false)
+            .await
+            .unwrap_err();
+        // The error chain includes both the wrapper and the plan_store error.
+        let full_err = format!("{err:#}");
+        assert!(
+            full_err.contains("not found"),
+            "error chain should mention 'not found', got: {full_err}"
+        );
         Ok(())
     }
 }

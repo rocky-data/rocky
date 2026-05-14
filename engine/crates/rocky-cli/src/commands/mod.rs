@@ -59,7 +59,7 @@ mod validate_migration;
 mod watch;
 
 pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
-pub use archive::{run_archive, run_archive_catalog};
+pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
@@ -70,7 +70,7 @@ pub use catalog::{CatalogFormat, default_out_dir as catalog_default_out_dir, run
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::run_ci_diff;
-pub use compact::{run_compact, run_compact_catalog, run_measure_dedup};
+pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::run_compile;
 pub use completions::run_completions;

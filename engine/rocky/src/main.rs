@@ -893,16 +893,23 @@ enum Command {
         pipeline: Option<String>,
     },
 
-    /// Generate OPTIMIZE/VACUUM SQL for storage compaction
+    /// Generate OPTIMIZE/VACUUM SQL for storage compaction, or apply a saved plan.
+    ///
+    /// `rocky compact <model>` — generate and persist a compaction plan.
+    /// `rocky compact apply <plan-id>` — execute a previously-generated plan.
+    #[command(args_conflicts_with_subcommands = true)]
     #[command(group(
         ArgGroup::new("compact_scope")
             .args(["model", "catalog", "measure_dedup"])
-            .required(true)
+            .required(false)
             .multiple(false),
     ))]
     Compact {
+        /// Apply a previously-generated compact plan.
+        #[command(subcommand)]
+        action: Option<CompactAction>,
         /// Target table (catalog.schema.table). Required unless one of
-        /// --catalog or --measure-dedup is set.
+        /// --catalog or --measure-dedup is set, or the `apply` subcommand is used.
         model: Option<String>,
         /// Target file size (e.g., "256MB")
         #[arg(long)]
@@ -1105,11 +1112,19 @@ enum Command {
         compare: Option<String>,
     },
 
-    /// Archive old data partitions
+    /// Archive old data partitions, or apply a saved archive plan.
+    ///
+    /// `rocky archive --older-than 90d [--model <fqn>]` — generate and persist
+    /// an archive plan.
+    /// `rocky archive apply <plan-id>` — execute a previously-generated plan.
+    #[command(args_conflicts_with_subcommands = true)]
     Archive {
-        /// Age threshold (e.g., "90d", "6m", "1y")
-        #[arg(long)]
-        older_than: String,
+        /// Apply a previously-generated archive plan.
+        #[command(subcommand)]
+        action: Option<ArchiveAction>,
+        /// Age threshold (e.g., "90d", "6m", "1y"). Required unless `apply` is used.
+        #[arg(long, required = false)]
+        older_than: Option<String>,
         /// Filter to a specific model. Mutually exclusive with --catalog.
         #[arg(long, conflicts_with = "catalog")]
         model: Option<String>,
@@ -1162,6 +1177,24 @@ enum Command {
     Completions {
         /// Target shell: bash, elvish, fish, powershell, or zsh
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum CompactAction {
+    /// Execute a previously-generated compact plan against the warehouse.
+    Apply {
+        /// Plan identifier (64-char blake3 hex) returned by `rocky compact <model>`.
+        plan_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArchiveAction {
+    /// Execute a previously-generated archive plan against the warehouse.
+    Apply {
+        /// Plan identifier (64-char blake3 hex) returned by `rocky archive --older-than <dur>`.
+        plan_id: String,
     },
 }
 
@@ -2087,6 +2120,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             .await
         }
         Command::Compact {
+            action,
             model,
             target_size,
             dry_run,
@@ -2096,7 +2130,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             calibrate_bytes,
             all_tables,
         } => {
-            if measure_dedup {
+            if let Some(CompactAction::Apply { plan_id }) = action {
+                rocky_cli::commands::run_compact_apply(&cli.config, &plan_id, json).await
+            } else if measure_dedup {
                 let cols = exclude_columns.as_deref().map(|s| {
                     s.split(',')
                         .map(str::trim)
@@ -2121,10 +2157,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else {
-                // clap's `required_unless_present_any` on `model`
-                // guarantees this branch always has a model.
-                let model = model
-                    .expect("clap enforces model is present unless --measure-dedup or --catalog");
+                let model = model.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "one of <model>, --catalog, or --measure-dedup is required, \
+                         or use `rocky compact apply <plan-id>`"
+                    )
+                })?;
                 rocky_cli::commands::run_compact(&model, target_size.as_deref(), dry_run, json)
             }
         }
@@ -2309,23 +2347,40 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             compare.as_deref(),
         ),
         Command::Archive {
+            action,
             older_than,
             model,
             catalog,
             dry_run,
-        } => match catalog {
-            Some(catalog) => {
-                rocky_cli::commands::run_archive_catalog(
-                    &cli.config,
-                    &catalog,
-                    &older_than,
-                    dry_run,
-                    json,
-                )
-                .await
+        } => {
+            if let Some(ArchiveAction::Apply { plan_id }) = action {
+                rocky_cli::commands::run_archive_apply(&cli.config, &plan_id, json).await
+            } else {
+                let older_than = older_than.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--older-than is required when not using `rocky archive apply <plan-id>`"
+                    )
+                })?;
+                match catalog {
+                    Some(catalog) => {
+                        rocky_cli::commands::run_archive_catalog(
+                            &cli.config,
+                            &catalog,
+                            &older_than,
+                            dry_run,
+                            json,
+                        )
+                        .await
+                    }
+                    None => rocky_cli::commands::run_archive(
+                        model.as_deref(),
+                        &older_than,
+                        dry_run,
+                        json,
+                    ),
+                }
             }
-            None => rocky_cli::commands::run_archive(model.as_deref(), &older_than, dry_run, json),
-        },
+        }
         Command::Watch { models, contracts } => {
             rocky_cli::commands::run_watch(&models, contracts.as_deref(), json).await
         }
