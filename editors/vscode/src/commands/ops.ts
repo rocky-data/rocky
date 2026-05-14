@@ -10,8 +10,9 @@ import { showDoctorResult } from "../webviews/doctor";
 import { ensureWorkspace, resolveModelName, showJsonInEditor } from "./ui";
 
 export async function doctor(): Promise<void> {
-  if (!ensureWorkspace()) return;
-
+  // Doctor checks binary install + config — it runs without a workspace
+  // and reports `critical` for the missing rocky.toml. The Get Started
+  // welcome links here precisely to verify installation, so don't gate it.
   try {
     const result = await runRockyJsonWithProgress<DoctorResult>(
       "Running Rocky doctor...",
