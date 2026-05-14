@@ -316,6 +316,17 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "rocky.refreshSchema",
+        "title": "Refresh Schema",
+        "category": "Rocky",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rocky.copyColumnReference",
+        "title": "Copy Column Reference",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.openOutputChannel",
         "title": "Show Output Channel",
         "category": "Rocky"
@@ -458,6 +469,13 @@
           "visibility": "collapsed"
         },
         {
+          "id": "rocky.schema",
+          "name": "Schema",
+          "icon": "$(symbol-field)",
+          "contextualTitle": "Rocky Schema",
+          "visibility": "collapsed"
+        },
+        {
           "id": "rocky.help",
           "name": "Help",
           "type": "tree",
@@ -512,6 +530,16 @@
         "view": "rocky.sources",
         "contents": "Sources are discovered from your configured adapter.\n\n[Discover Sources](command:rocky.discover)",
         "when": "rocky.hasProject"
+      },
+      {
+        "view": "rocky.schema",
+        "contents": "Open a Rocky project to browse the schema catalog.",
+        "when": "!rocky.hasProject"
+      },
+      {
+        "view": "rocky.schema",
+        "contents": "No catalog data yet. Run the catalog command to populate the schema view.\n\n[Run rocky catalog](command:rocky.refreshSchema)",
+        "when": "rocky.hasProject"
       }
     ],
     "menus": {
@@ -534,6 +562,11 @@
         {
           "command": "rocky.refreshInfo",
           "when": "view == rocky.info",
+          "group": "navigation"
+        },
+        {
+          "command": "rocky.refreshSchema",
+          "when": "view == rocky.schema",
           "group": "navigation"
         }
       ],
@@ -567,6 +600,11 @@
           "command": "rocky.optimize",
           "when": "view == rocky.models && viewItem == rockyModel",
           "group": "2_inspect@4"
+        },
+        {
+          "command": "rocky.copyColumnReference",
+          "when": "view == rocky.schema && viewItem == rockySchemaColumn",
+          "group": "inline@1"
         }
       ],
       "editor/context": [
