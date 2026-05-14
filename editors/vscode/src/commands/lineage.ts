@@ -18,6 +18,8 @@ interface SerializedState {
   clusterMode?: "none" | "schema" | "source";
   layout?: "LR" | "TB";
   searchQuery?: string;
+  focusMode?: "all" | "upstream" | "downstream" | "selected";
+  focusNode?: string | null;
 }
 
 /** Message types sent from the extension host to the webview. */
@@ -527,6 +529,23 @@ function renderLineageHtml(
     select.layout-select:hover {
       background: var(--vscode-button-secondaryHoverBackground);
     }
+    /* Focus mode select */
+    select.focus-mode-select {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      padding: 3px 6px;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    select.focus-mode-select:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    select.focus-mode-select.focus-active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
     /* Search input */
     .search-input {
       background: var(--vscode-input-background);
@@ -557,6 +576,14 @@ function renderLineageHtml(
       stroke-width: 2.5px;
       stroke: var(--vscode-focusBorder, #007fd4);
     }
+    /* Node-focus dimming (focus mode) — orthogonal to search and cluster dim */
+    .node.node-focus-dimmed rect,
+    .node.node-focus-dimmed text {
+      opacity: 0.15;
+    }
+    .edgePath.node-focus-dimmed path {
+      opacity: 0.08;
+    }
   </style>
 </head>
 <body>
@@ -567,6 +594,14 @@ function renderLineageHtml(
       <button id="mode-model" class="active" title="Model-level view (aggregated)">Model</button>
       <button id="mode-column" title="Column-level view (detailed)">Column</button>
     </div>
+    <div class="separator"></div>
+    <span class="cluster-select-label">Focus:</span>
+    <select id="focus-mode" class="focus-mode-select" title="Click a node to set focus. Upstream/Downstream dims unrelated nodes.">
+      <option value="all">All</option>
+      <option value="upstream">Upstream</option>
+      <option value="downstream">Downstream</option>
+      <option value="selected">Selected only</option>
+    </select>
     <div class="separator"></div>
     <span class="cluster-select-label">Cluster:</span>
     <select id="cluster-mode" class="cluster-select" title="Group nodes into clusters">
@@ -636,8 +671,19 @@ function renderLineageHtml(
     ? saved.clusterMode : 'none';
   let currentLayout = (saved.layout === 'TB') ? 'TB' : 'LR';
   let currentSearchQuery = (typeof saved.searchQuery === 'string') ? saved.searchQuery : '';
+  const validFocusModes = ['all', 'upstream', 'downstream', 'selected'];
+  let currentFocusMode = validFocusModes.includes(saved.focusMode) ? saved.focusMode : 'all';
+  let currentFocusNode = (typeof saved.focusNode === 'string') ? saved.focusNode : null;
   let selectedNodeModel = null; // currently selected model name (for side panel)
   let focusedClusterId = null;  // currently focused cluster (null = none)
+
+  // Adjacency maps built once per render() for BFS in focus mode
+  // nodeId → Set of upstream nodeIds (predecessors)
+  // nodeId → Set of downstream nodeIds (successors)
+  let adjUpstream = new Map();
+  let adjDownstream = new Map();
+  // All rendered node ids (non-cluster) for the current graph
+  let renderedNodeIds = new Set();
 
   let currentState = {
     modelName: focalModel,
@@ -648,6 +694,8 @@ function renderLineageHtml(
     clusterMode: currentClusterMode,
     layout: currentLayout,
     searchQuery: currentSearchQuery,
+    focusMode: currentFocusMode,
+    focusNode: currentFocusNode,
   };
 
   function persistState(patch) {
@@ -1149,6 +1197,84 @@ function renderLineageHtml(
     });
   }
 
+  // ── Focus mode (upstream / downstream / selected only) ────────────────────────
+
+  /**
+   * BFS from startId following adj (a Map of nodeId to Set of neighbors).
+   * Returns a Set of all reachable node ids (including startId).
+   */
+  function bfsReachable(startId, adj) {
+    const visited = new Set();
+    const queue = [startId];
+    while (queue.length > 0) {
+      const id = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const neighbors = adj.get(id);
+      if (neighbors) {
+        for (const n of neighbors) {
+          if (!visited.has(n)) queue.push(n);
+        }
+      }
+    }
+    return visited;
+  }
+
+  /**
+   * Apply node-focus dimming without re-running dagre.
+   * Uses the node-focus-dimmed class so it's orthogonal to search's dimmed
+   * and cluster's dim-mode.
+   */
+  function applyFocusMode() {
+    if (currentFocusMode === 'all' || !currentFocusNode) {
+      d3.selectAll('.node').classed('node-focus-dimmed', false);
+      d3.selectAll('.edgePath').classed('node-focus-dimmed', false);
+      return;
+    }
+
+    // Verify the focus node still exists in the rendered graph
+    if (!renderedNodeIds.has(currentFocusNode)) {
+      d3.selectAll('.node').classed('node-focus-dimmed', false);
+      d3.selectAll('.edgePath').classed('node-focus-dimmed', false);
+      return;
+    }
+
+    let keepIds;
+    if (currentFocusMode === 'selected') {
+      keepIds = new Set([currentFocusNode]);
+    } else if (currentFocusMode === 'upstream') {
+      // Upstream = nodes that can reach the focus node (follow adjUpstream from focus)
+      keepIds = bfsReachable(currentFocusNode, adjUpstream);
+      keepIds.add(currentFocusNode);
+    } else if (currentFocusMode === 'downstream') {
+      // Downstream = nodes reachable from the focus node
+      keepIds = bfsReachable(currentFocusNode, adjDownstream);
+      keepIds.add(currentFocusNode);
+    } else {
+      keepIds = new Set([currentFocusNode]);
+    }
+
+    d3.selectAll('.node').each(function() {
+      const el = d3.select(this);
+      const nodeId = el.attr('data-node-id');
+      el.classed('node-focus-dimmed', nodeId ? !keepIds.has(nodeId) : false);
+    });
+
+    d3.selectAll('.edgePath').each(function() {
+      const el = d3.select(this);
+      const src = el.attr('data-src');
+      const tgt = el.attr('data-tgt');
+      // Keep edge if at least one endpoint is in the focus set
+      el.classed('node-focus-dimmed', !keepIds.has(src) && !keepIds.has(tgt));
+    });
+  }
+
+  /** Update the focus select visual state (active highlight when not "all"). */
+  function updateFocusSelectStyle() {
+    const sel = document.getElementById('focus-mode');
+    if (sel) sel.classList.toggle('focus-active', currentFocusMode !== 'all');
+  }
+
   function render(viewMode) {
     graphGroup.selectAll('*').remove();
     focusedClusterId = null;
@@ -1253,6 +1379,27 @@ function renderLineageHtml(
       }
     }
 
+    // ── Build adjacency maps for focus-mode BFS ───────────────────────────────
+    adjUpstream = new Map();
+    adjDownstream = new Map();
+    renderedNodeIds = new Set();
+    for (const e of g.edges()) {
+      // e.v → e.w means e.v is upstream of e.w
+      if (!adjDownstream.has(e.v)) adjDownstream.set(e.v, new Set());
+      adjDownstream.get(e.v).add(e.w);
+      if (!adjUpstream.has(e.w)) adjUpstream.set(e.w, new Set());
+      adjUpstream.get(e.w).add(e.v);
+    }
+    for (const nodeId of g.nodes()) {
+      if (!g.node(nodeId).isCluster) renderedNodeIds.add(nodeId);
+    }
+
+    // If the saved focusNode is no longer in the graph, clear it
+    if (currentFocusNode && !renderedNodeIds.has(currentFocusNode)) {
+      currentFocusNode = null;
+      persistState({ focusNode: null });
+    }
+
     // Nodes
     const nodeGroup = graphGroup.append('g').attr('class', 'nodes');
     for (const nodeId of g.nodes()) {
@@ -1299,7 +1446,7 @@ function renderLineageHtml(
           .text(line);
       });
 
-      // Click: open side panel (not the file directly)
+      // Click: open side panel + update focus node if focus mode is active
       ng.on('click', (e) => {
         e.stopPropagation();
         // Update selected state
@@ -1307,6 +1454,12 @@ function renderLineageHtml(
         // Update visual selection — toggle class on all nodes
         d3.selectAll('.node').classed('selected', false);
         ng.classed('selected', true);
+        // Update focus node when focus mode is active
+        if (currentFocusMode !== 'all') {
+          currentFocusNode = nodeId;
+          persistState({ focusNode: nodeId });
+          applyFocusMode();
+        }
         // Show loading state in panel
         showPanelLoading(n.model);
         // Request details from extension host
@@ -1339,8 +1492,9 @@ function renderLineageHtml(
       }
     }
 
-    // Re-apply search filter after each render so classes are up to date
+    // Re-apply search filter and focus mode after each render
     applySearchFilter(currentSearchQuery);
+    applyFocusMode();
   }
 
   // ── Initial render ────────────────────────────────────────────────────────────
@@ -1376,11 +1530,44 @@ function renderLineageHtml(
     }, 250);
   });
 
-  // ── Background click → clear cluster focus ────────────────────────────────────
+  // Restore focus mode select to saved value
+  document.getElementById('focus-mode').value = currentFocusMode;
+  updateFocusSelectStyle();
+
+  // ── Focus mode select ─────────────────────────────────────────────────────────
+  document.getElementById('focus-mode').addEventListener('change', (e) => {
+    const newMode = e.target.value;
+    if (newMode === currentFocusMode) return;
+    currentFocusMode = newMode;
+    // Clear focus node when switching to "all"
+    if (newMode === 'all') {
+      currentFocusNode = null;
+      persistState({ focusMode: newMode, focusNode: null });
+      d3.selectAll('.node').classed('node-focus-dimmed', false);
+      d3.selectAll('.edgePath').classed('node-focus-dimmed', false);
+    } else {
+      persistState({ focusMode: newMode });
+      // Re-apply with current focus node (may be null — no dimming until click)
+      applyFocusMode();
+    }
+    updateFocusSelectStyle();
+  });
+
+  // ── Background click → clear cluster focus + node focus ──────────────────────
   svgEl.addEventListener('click', (e) => {
     // Only clear if the click target is the SVG itself, not a child element
-    if (e.target === svgEl && focusedClusterId !== null) {
+    if (e.target !== svgEl) return;
+    let changed = false;
+    if (focusedClusterId !== null) {
       clearClusterFocus();
+      changed = true;
+    }
+    if (currentFocusMode !== 'all' && currentFocusNode !== null) {
+      currentFocusNode = null;
+      persistState({ focusNode: null });
+      d3.selectAll('.node').classed('node-focus-dimmed', false);
+      d3.selectAll('.edgePath').classed('node-focus-dimmed', false);
+      changed = true;
     }
   });
 
