@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * AUTO-GENERATED — do not edit by hand.
- * Source: schemas/branch_promote.schema.json
+ * Source: schemas/plan_promote.schema.json
  * Run `just codegen` from the monorepo root to regenerate.
  */
 
@@ -158,37 +158,65 @@ export type AuditEventKind =
   | "promote_plan_created";
 
 /**
- * JSON output for `rocky branch promote`.
+ * Persisted payload for a `rocky plan promote` run plan.
+ *
+ * Written to `.rocky/plans/<plan_id>.json` by `rocky plan promote` and read back by `rocky apply <plan_id>` (dispatched as `PlanKind::Promote`).
+ *
+ * ## What is persisted vs re-derived
+ *
+ * - **Persisted**: branch name + refs, state hash at plan time, approval artifacts used/rejected, breaking-change findings, per-target SQL statements, and the plan-time audit events. - **Re-derived at apply time**: nothing related to approvals or breaking-change gate — those gates ran at plan time and their outcomes are captured here. The warehouse adapter is resolved at apply time (to call `execute_statement`), but discovery is NOT re-run.
+ *
+ * ## Branch state drift at apply time
+ *
+ * `branch_state_hash` reflects the branch metadata + config bytes at plan time. If the branch's config or metadata changes between `rocky plan promote` and `rocky apply`, the persisted hash differs from the live hash. By default, `rocky apply` does **not** re-check the hash — the gates already ran at plan time, and that is the point of the plan/apply split. Operators who need a strict re-check can re-run `rocky plan promote` to produce a fresh plan.
+ *
+ * Warehouse table contents are not covered by `branch_state_hash` in v1 — if a branch's tables are mutated between plan and apply, `rocky apply` will promote whatever data is in the branch schema at apply time.
  */
-export interface BranchPromoteOutput {
+export interface PromotePlan {
   /**
-   * Approval artifacts loaded from disk that failed verification, with the reason for rejection. Surfaced even on a successful promote so operators can spot stale artifacts to clean up.
+   * Whether `--allow-breaking` was set at plan time.
+   */
+  allow_breaking?: boolean;
+  /**
+   * Approval artifacts loaded from disk that failed verification at plan time.
    */
   approvals_rejected: RejectedApproval[];
   /**
-   * Approval artifacts that satisfied the gate at promote time. Empty when the gate was disabled (`required = false`) or skipped.
+   * Approval artifacts that satisfied the gate at plan time.
    */
   approvals_used: ApprovalArtifact[];
   /**
-   * Audit-trail events emitted during this invocation, in order. At minimum: `PromoteStarted` plus one of `PromoteCompleted` / `PromoteFailed`. `ApprovalSkipped` precedes `PromoteStarted` when the gate was bypassed.
+   * Git ref that `base_ref` was resolved to at plan time (e.g. `"main"`).
    */
-  audit: AuditEvent[];
-  branch: string;
+  base_ref: string;
+  /**
+   * Branch name being promoted.
+   */
+  branch_name: string;
+  /**
+   * Content-addressed hash of the branch metadata + config bytes at plan time. Stored for audit purposes; not re-validated at apply time.
+   */
   branch_state_hash: string;
   /**
-   * Semantic breaking-change findings produced by the pre-promote gate. Empty when the gate ran and found no breaking changes; absent when the gate was skipped (compile failure on either side). When present and non-empty either the promote was blocked or `--allow-breaking` was set — see the audit trail for which.
+   * Semantic breaking-change findings produced by the pre-promote gate at plan time. Empty when the gate ran and found no breaking changes; absent when the gate was skipped (compile failure on either side).
    */
   breaking_changes?: BreakingFinding[] | null;
-  command: string;
   /**
-   * True when every target's SQL succeeded.
+   * When this plan was persisted.
    */
-  success: boolean;
+  created_at: string;
   /**
-   * One entry per managed target the promote attempted, in dispatch order.
+   * Git HEAD SHA at plan time — informational for audit purposes.
    */
-  targets: PromoteTarget[];
-  version: string;
+  head_ref: string;
+  /**
+   * Plan-time audit events (approvals gate + breaking-change gate outcomes). Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`) are appended in `BranchPromoteOutput.audit` at apply time.
+   */
+  plan_audit: AuditEvent[];
+  /**
+   * Per-model SQL plan, in dispatch order. SQL is persisted verbatim so `rocky apply` executes the exact statements generated at plan time.
+   */
+  targets: PromoteTargetPlan[];
   [k: string]: unknown;
 }
 /**
@@ -245,6 +273,14 @@ export interface ApprovalSignature {
   [k: string]: unknown;
 }
 /**
+ * A classified finding produced by [`diff_project_ir`].
+ */
+export interface BreakingFinding {
+  change: BreakingChange;
+  severity: BreakingSeverity;
+  [k: string]: unknown;
+}
+/**
  * Single audit-trail event emitted during `branch promote`.
  *
  * Routed to stdout JSON only in v1; persistent audit storage is a follow-up.
@@ -266,33 +302,21 @@ export interface AuditEvent {
   [k: string]: unknown;
 }
 /**
- * A classified finding produced by [`diff_project_ir`].
+ * Per-model promote step captured in a [`PromotePlan`].
+ *
+ * Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].
+ *
+ * `statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.
  */
-export interface BreakingFinding {
-  change: BreakingChange;
-  severity: BreakingSeverity;
-  [k: string]: unknown;
-}
-/**
- * One per-target promote step in [`BranchPromoteOutput::targets`].
- */
-export interface PromoteTarget {
+export interface PromoteTargetPlan {
   /**
-   * Adapter / SQL error text when `succeeded` is `false`.
-   */
-  error?: string | null;
-  /**
-   * Fully-qualified branch source the promote read from (catalog.branch_schema.table).
+   * Fully-qualified branch source the promote will read from (catalog.branch_schema.table).
    */
   source: string;
   /**
-   * SQL statement dispatched to the adapter for this target.
+   * `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL, dialect-quoted at plan time.
    */
   statement: string;
-  /**
-   * Whether the per-target SQL succeeded. Failures abort the run; on a failure this is `false` for the failing target and absent for any targets that never started.
-   */
-  succeeded: boolean;
   /**
    * Fully-qualified production target (catalog.schema.table).
    */

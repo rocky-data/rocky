@@ -22,7 +22,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::output::RunPlan;
+use crate::output::{AuditEvent, AuditEventKind, BranchPromoteOutput, PromotePlan, RunPlan};
 use crate::plan_store::{PlanKind, read_plan};
 
 use super::archive::run_archive_apply_in;
@@ -59,6 +59,7 @@ pub(crate) async fn run_apply_in(
             run_archive_apply_in(root, config_path, plan_id, output_json).await
         }
         PlanKind::Run => run_apply_run_plan(root, config_path, plan_id, output_json).await,
+        PlanKind::Promote => run_apply_promote_plan(root, config_path, plan_id, output_json).await,
     }
 }
 
@@ -147,6 +148,109 @@ async fn run_apply_run_plan(
 
     // The `run` command has already emitted its own JSON (or text) output.
     // Nothing more to emit in the inline/non-envelope path.
+    Ok(())
+}
+
+/// Apply a `PlanKind::Promote` plan by executing the pre-built SQL statements
+/// against the warehouse adapter.
+///
+/// Gates (approval, breaking-change) are NOT re-run — they ran at plan time
+/// and their outcomes are captured in the persisted `PromotePlan`. Apply only
+/// executes the SQL and emits audit events for `PromoteStarted` /
+/// `PromoteCompleted` / `PromoteFailed`.
+async fn run_apply_promote_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    output_json: bool,
+) -> Result<()> {
+    use crate::output::print_json;
+
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read promote plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Promote {
+        bail!(
+            "plan '{plan_id}' is a {} plan, not a promote plan. \
+             Use `rocky apply {plan_id}` and let the dispatcher route it.",
+            plan.kind,
+        );
+    }
+
+    let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize promote plan payload")?;
+
+    // Build actor identity for apply-time audit events.
+    let actor = crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| {
+        crate::output::ApproverIdentity {
+            email: "unknown".to_string(),
+            name: None,
+            host: "unknown".to_string(),
+            source: crate::output::ApproverSource::Local,
+        }
+    });
+
+    let mut audit = promote_plan.plan_audit.clone();
+
+    audit.push(AuditEvent {
+        kind: AuditEventKind::PromoteStarted,
+        at: chrono::Utc::now(),
+        actor: actor.clone(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        reason: Some(format!("apply plan_id={plan_id}")),
+        breaking_changes: None,
+    });
+
+    let (targets_out, overall_success) =
+        crate::commands::branch::run_promote_apply(config_path, &promote_plan.targets).await?;
+
+    audit.push(AuditEvent {
+        kind: if overall_success {
+            AuditEventKind::PromoteCompleted
+        } else {
+            AuditEventKind::PromoteFailed
+        },
+        at: chrono::Utc::now(),
+        actor: actor.clone(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        reason: None,
+        breaking_changes: None,
+    });
+
+    let output = BranchPromoteOutput {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        command: "branch promote".to_string(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        approvals_used: promote_plan.approvals_used.clone(),
+        approvals_rejected: promote_plan.approvals_rejected.clone(),
+        breaking_changes: promote_plan.breaking_changes.clone(),
+        targets: targets_out,
+        audit,
+        success: overall_success,
+    };
+
+    if output_json {
+        print_json(&output)?;
+    } else if output.success {
+        println!(
+            "promoted branch '{}' ({} targets) via plan {plan_id}",
+            output.branch,
+            output.targets.len()
+        );
+    } else {
+        println!(
+            "promote failed for branch '{}' after {} target(s) — see JSON output for details",
+            output.branch,
+            output.targets.len()
+        );
+    }
+
+    if !overall_success {
+        bail!("`rocky apply {plan_id}` (promote) did not complete successfully");
+    }
     Ok(())
 }
 

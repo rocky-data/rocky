@@ -235,13 +235,26 @@ enum Command {
         with_schemas: bool,
     },
 
-    /// Generate SQL without executing (dry-run)
+    /// Generate SQL without executing (dry-run).
+    ///
+    /// With no subcommand: emits a replication-pipeline SQL dry-run plus an
+    /// optional `RunPlan` blueprint (when a `models/` directory is present).
+    ///
+    /// Subcommands extend the plan spine:
+    ///   `rocky plan promote <branch>` — run approval + breaking-change gates
+    ///   and persist a `PromotePlan` that `rocky apply <plan-id>` can execute.
     Plan {
-        /// Filter sources by component value (e.g., --filter client=acme)
-        #[arg(long, long_help = FILTER_LONG_HELP)]
+        /// Optional subcommand (e.g. `promote`). When absent, runs the default
+        /// replication dry-run plan.
+        #[command(subcommand)]
+        subcommand: Option<PlanSubcommand>,
+        /// Filter sources by component value (e.g., --filter client=acme).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, long_help = FILTER_LONG_HELP, global = false)]
         filter: Option<String>,
-        /// Pipeline name (required if multiple pipelines are defined)
-        #[arg(long)]
+        /// Pipeline name (required if multiple pipelines are defined).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
         pipeline: Option<String>,
         /// Scope the governance preview (`mask_actions`) to a specific
         /// environment. When set, `[mask.<env>]` overrides from
@@ -249,7 +262,8 @@ enum Command {
         /// preview — matches the shape `rocky compliance --env <name>`
         /// already uses. Classification tagging and retention policies
         /// are env-invariant and previewed regardless.
-        #[arg(long)]
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
         env: Option<String>,
     },
 
@@ -1288,6 +1302,38 @@ enum PreviewAction {
     },
 }
 
+/// Subcommands under `rocky plan`.
+#[derive(Subcommand)]
+enum PlanSubcommand {
+    /// Plan a branch promotion — run the approval + breaking-change gates
+    /// and persist a `PromotePlan` to `.rocky/plans/<plan_id>.json`.
+    ///
+    /// On success emits a `PlanOutput` with `plan_kind: "promote"` and the
+    /// `plan_id` needed for `rocky apply <plan_id>`.
+    ///
+    /// The gates are NOT re-run at apply time — they are captured in the
+    /// persisted plan. This enables a CI-friendly "plan in the PR, apply
+    /// on merge" workflow.
+    Promote {
+        /// Branch name to promote.
+        name: String,
+        /// Git ref to diff against for the breaking-change gate.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Bypass the semantic breaking-change gate. Always records a
+        /// `BreakingChangesAllowed` audit event in the plan so the
+        /// override is auditable.
+        #[arg(long)]
+        allow_breaking: bool,
+        /// Filter sources by component value (e.g., --filter client=acme).
+        #[arg(long)]
+        filter: Option<String>,
+        /// Models directory used by the breaking-change gate.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum BranchAction {
     /// Create a new branch
@@ -1348,9 +1394,19 @@ enum BranchAction {
     /// semantic breaking-change gate against `--base-ref`, and dispatches
     /// `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM
     /// branch__<name>.<x>` per target.
+    ///
+    /// When `--plan <plan-id>` is given, the gates are skipped and the
+    /// pre-built promote plan is applied directly. The positional `<name>`
+    /// argument is optional in this case — if supplied it is validated
+    /// against the plan's `branch_name` field.
     Promote {
-        /// Branch name
-        name: String,
+        /// Branch name (optional when --plan is given — the plan carries the name)
+        #[arg(required = false)]
+        name: Option<String>,
+        /// Apply an existing promote plan instead of re-running gates.
+        /// Pass the 64-char plan_id returned by `rocky plan promote`.
+        #[arg(long)]
+        plan: Option<String>,
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long)]
         filter: Option<String>,
@@ -1579,19 +1635,43 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             .await
         }
         Command::Plan {
+            subcommand,
             filter,
             pipeline,
             env,
-        } => {
-            rocky_cli::commands::plan(
-                &cli.config,
-                filter.as_deref(),
-                pipeline.as_deref(),
-                env.as_deref(),
-                json,
-            )
-            .await
-        }
+        } => match subcommand {
+            None => {
+                rocky_cli::commands::plan(
+                    &cli.config,
+                    filter.as_deref(),
+                    pipeline.as_deref(),
+                    env.as_deref(),
+                    json,
+                )
+                .await
+            }
+            Some(PlanSubcommand::Promote {
+                name,
+                base,
+                allow_breaking,
+                filter: promote_filter,
+                models,
+            }) => {
+                let cwd =
+                    std::env::current_dir().context("failed to get current working directory")?;
+                rocky_cli::commands::plan_promote(
+                    &cwd,
+                    &cli.config,
+                    &models,
+                    &base,
+                    &name,
+                    promote_filter.as_deref(),
+                    allow_breaking,
+                    json,
+                )
+                .await
+            }
+        },
         Command::Run {
             filter,
             pipeline,
@@ -2231,24 +2311,47 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             BranchAction::Promote {
                 name,
+                plan,
                 filter,
                 skip_approval,
                 allow_breaking,
                 base_ref,
                 models,
             } => {
-                rocky_cli::commands::run_branch_promote(
-                    &state_path,
-                    &cli.config,
-                    &models,
-                    &base_ref,
-                    &name,
-                    filter.as_deref(),
-                    skip_approval,
-                    allow_breaking,
-                    json,
-                )
-                .await
+                if let Some(plan_id) = plan {
+                    // --plan flag: apply a pre-built promote plan, skipping gates.
+                    let cwd = std::env::current_dir()
+                        .context("failed to get current working directory")?;
+                    rocky_cli::commands::run_branch_promote_from_plan(
+                        &cwd,
+                        &cli.config,
+                        &plan_id,
+                        name.as_deref(),
+                        json,
+                    )
+                    .await
+                } else {
+                    // Bare-verb: plan + apply inline (backward-compatible).
+                    let branch_name = name.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "branch name is required when not using --plan. \
+                             Usage: `rocky branch promote <name>` or \
+                             `rocky branch promote --plan <plan-id>`"
+                        )
+                    })?;
+                    rocky_cli::commands::run_branch_promote(
+                        &state_path,
+                        &cli.config,
+                        &models,
+                        &base_ref,
+                        &branch_name,
+                        filter.as_deref(),
+                        skip_approval,
+                        allow_breaking,
+                        json,
+                    )
+                    .await
+                }
             }
         },
         Command::Replay { target, model } => {

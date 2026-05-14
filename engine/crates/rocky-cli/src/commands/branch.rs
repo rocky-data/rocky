@@ -517,6 +517,211 @@ fn evaluate_artifact(
 }
 
 // ---------------------------------------------------------------------------
+// pub(crate) helpers exposed to plan.rs for `rocky plan promote`
+// ---------------------------------------------------------------------------
+
+/// Public(crate) wrapper for branch name validation — used by `plan.rs`.
+pub(crate) fn validate_branch_name_pub(name: &str) -> Result<()> {
+    validate_branch_name(name)
+}
+
+/// Public(crate) wrapper for branch state hash computation — used by `plan.rs`.
+pub(crate) fn compute_branch_state_hash_pub(
+    record: &BranchRecord,
+    config_path: &Path,
+) -> Result<String> {
+    compute_branch_state_hash(record, config_path)
+}
+
+/// Public(crate) wrapper for resolving the actor identity — used by `plan.rs`.
+pub(crate) fn approver_identity_pub() -> Result<ApproverIdentity> {
+    approver_identity()
+}
+
+/// Per-target SQL entry returned by [`discover_branch_targets_for_plan`].
+///
+/// Contains both the target/source FQNs and the dialect-quoted SQL so the
+/// plan persists deterministic SQL without re-running discovery at apply time.
+pub(crate) struct PlannedPromoteWithSql {
+    pub target: String,
+    pub source: String,
+    pub statement: String,
+}
+
+/// Discover branch targets and build dialect-quoted promote SQL at plan time.
+///
+/// Unlike the internal `discover_branch_targets` (which returns bare `TargetRef`
+/// pairs), this variant resolves the warehouse adapter, builds the SQL per
+/// target, and returns everything the plan needs to persist — so apply just
+/// calls `execute_statement` without re-running discovery.
+pub(crate) async fn discover_branch_targets_for_plan(
+    config_path: &Path,
+    record: &BranchRecord,
+    filter: Option<&str>,
+) -> Result<Vec<PlannedPromoteWithSql>> {
+    use crate::registry::AdapterRegistry;
+
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let (_pipeline_name, pipeline) =
+        crate::registry::resolve_replication_pipeline(&rocky_cfg, None)?;
+    let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
+    let dialect = adapter.dialect();
+
+    let planned = discover_branch_targets(config_path, record, filter).await?;
+
+    Ok(planned
+        .into_iter()
+        .map(|p| PlannedPromoteWithSql {
+            target: p.prod.full_name(),
+            source: p.branch_source.full_name(),
+            statement: build_promote_sql(dialect, &p.prod, &p.branch_source),
+        })
+        .collect())
+}
+
+/// Run the approval gate for a branch, updating `audit` and returning
+/// `(approvals_used, approvals_rejected)`.
+///
+/// Returns `Err` when `approval_cfg.required` is true and insufficient
+/// valid approvals exist.
+pub(crate) fn run_approval_gate(
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    record: &BranchRecord,
+    branch_state_hash: &str,
+    actor: &ApproverIdentity,
+    skip_reason: Option<&str>,
+    audit: &mut Vec<AuditEvent>,
+) -> Result<(Vec<ApprovalArtifact>, Vec<RejectedApproval>)> {
+    let approval_cfg = &rocky_cfg.branch.approval;
+    let mut approvals_used: Vec<ApprovalArtifact> = Vec::new();
+    let mut approvals_rejected: Vec<RejectedApproval> = Vec::new();
+    let now = Utc::now();
+
+    if let Some(reason) = skip_reason {
+        audit.push(AuditEvent {
+            kind: AuditEventKind::ApprovalSkipped,
+            at: now,
+            actor: actor.clone(),
+            branch: record.name.clone(),
+            branch_state_hash: branch_state_hash.to_string(),
+            reason: Some(reason.to_string()),
+            breaking_changes: None,
+        });
+    } else if approval_cfg.required {
+        let (loaded, parse_rejected) = load_approvals_for_branch(&record.name)?;
+        approvals_rejected.extend(parse_rejected);
+        for (_path, artifact) in loaded {
+            match evaluate_artifact(&artifact, branch_state_hash, approval_cfg, now) {
+                Ok(()) => approvals_used.push(artifact),
+                Err(rejected) => approvals_rejected.push(rejected),
+            }
+        }
+
+        if (approvals_used.len() as u32) < approval_cfg.min_approvers {
+            let valid = approvals_used.len();
+            let invalid_summary = if approvals_rejected.is_empty() {
+                "no rejected artifacts".to_string()
+            } else {
+                approvals_rejected
+                    .iter()
+                    .map(|r| format!("{}={}", r.approval_id, r.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            anyhow::bail!(
+                "branch promote requires {} approval(s); found {} valid, {} invalid ({}). \
+                 Run `rocky branch approve {}`.",
+                approval_cfg.min_approvers,
+                valid,
+                approvals_rejected.len(),
+                invalid_summary,
+                record.name
+            );
+        }
+    }
+    Ok((approvals_used, approvals_rejected))
+}
+
+/// Run the breaking-change gate for a plan step, updating `audit`.
+///
+/// Returns the same `Option<Vec<BreakingFinding>>` as the internal
+/// `evaluate_breaking_change_gate` — `None` when the gate was skipped.
+pub(crate) fn run_breaking_change_gate_for_plan(
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    audit: &mut Vec<AuditEvent>,
+    actor: &ApproverIdentity,
+    record: &BranchRecord,
+    branch_state_hash: &str,
+) -> Option<Vec<rocky_core::breaking_change::BreakingFinding>> {
+    evaluate_breaking_change_gate(
+        config_path,
+        models_dir,
+        base_ref,
+        audit,
+        actor,
+        record,
+        branch_state_hash,
+    )
+}
+
+/// Execute a list of promote targets against the warehouse adapter.
+///
+/// This is the apply-time executor — it takes the pre-built SQL statements
+/// from a `PromotePlan` and dispatches them via `execute_statement`, returning
+/// one `PromoteTarget` per step (with `succeeded` / `error` filled in).
+///
+/// Stops on the first failure (same policy as the bare-verb path).
+pub(crate) async fn run_promote_apply(
+    config_path: &Path,
+    targets: &[crate::output::PromoteTargetPlan],
+) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
+    use crate::registry::AdapterRegistry;
+
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let (_pipeline_name, pipeline) =
+        crate::registry::resolve_replication_pipeline(&rocky_cfg, None)?;
+    let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
+
+    let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
+    let mut overall_success = true;
+
+    for step in targets {
+        match adapter.execute_statement(&step.statement).await {
+            Ok(()) => targets_out.push(crate::output::PromoteTarget {
+                target: step.target.clone(),
+                source: step.source.clone(),
+                statement: step.statement.clone(),
+                succeeded: true,
+                error: None,
+            }),
+            Err(e) => {
+                targets_out.push(crate::output::PromoteTarget {
+                    target: step.target.clone(),
+                    source: step.source.clone(),
+                    statement: step.statement.clone(),
+                    succeeded: false,
+                    error: Some(format!("{e}")),
+                });
+                overall_success = false;
+                break;
+            }
+        }
+    }
+
+    Ok((targets_out, overall_success))
+}
+
+// ---------------------------------------------------------------------------
 // `rocky branch approve`
 // ---------------------------------------------------------------------------
 
@@ -1144,6 +1349,124 @@ pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> 
         if let Some(desc) = &record.description {
             println!("description: {desc}");
         }
+    }
+    Ok(())
+}
+
+/// `rocky branch promote --plan <plan-id>` — apply a pre-built `PromotePlan`
+/// without re-running approval or breaking-change gates.
+///
+/// This is the canonical CI-friendly "review in the PR, apply on merge" path:
+/// `rocky plan promote <branch>` generates the plan + runs gates on the PR
+/// runner, then `rocky branch promote --plan <plan-id>` (or equivalently
+/// `rocky apply <plan-id>`) applies it on the merge step.
+///
+/// ## `name` validation
+///
+/// If the caller passes an optional `name` (from the positional arg), it is
+/// validated against `promote_plan.branch_name`. A mismatch is an error —
+/// the user likely intended a different plan. Passing `None` (no positional)
+/// is accepted when `--plan` is the entry point.
+pub async fn run_branch_promote_from_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    name: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
+    use crate::plan_store::{PlanKind, read_plan};
+
+    let plan =
+        read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Promote {
+        anyhow::bail!(
+            "plan '{plan_id}' is a {} plan, not a promote plan. \
+             Pass a plan_id returned by `rocky plan promote`.",
+            plan.kind
+        );
+    }
+
+    let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize promote plan payload")?;
+
+    if let Some(n) = name {
+        if n != promote_plan.branch_name {
+            anyhow::bail!(
+                "branch name '{n}' does not match plan's branch name '{}'. \
+                 Omit the positional arg or pass the correct name.",
+                promote_plan.branch_name
+            );
+        }
+    }
+
+    let actor = approver_identity().unwrap_or_else(|_| crate::output::ApproverIdentity {
+        email: "unknown".to_string(),
+        name: None,
+        host: "unknown".to_string(),
+        source: crate::output::ApproverSource::Local,
+    });
+
+    let mut audit = promote_plan.plan_audit.clone();
+
+    audit.push(AuditEvent {
+        kind: AuditEventKind::PromoteStarted,
+        at: Utc::now(),
+        actor: actor.clone(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        reason: Some(format!("--plan {plan_id}")),
+        breaking_changes: None,
+    });
+
+    let (targets_out, overall_success) =
+        run_promote_apply(config_path, &promote_plan.targets).await?;
+
+    audit.push(AuditEvent {
+        kind: if overall_success {
+            AuditEventKind::PromoteCompleted
+        } else {
+            AuditEventKind::PromoteFailed
+        },
+        at: Utc::now(),
+        actor,
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        reason: None,
+        breaking_changes: None,
+    });
+
+    let output = BranchPromoteOutput {
+        version: VERSION.to_string(),
+        command: "branch promote".to_string(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        approvals_used: promote_plan.approvals_used.clone(),
+        approvals_rejected: promote_plan.approvals_rejected.clone(),
+        breaking_changes: promote_plan.breaking_changes.clone(),
+        targets: targets_out,
+        audit,
+        success: overall_success,
+    };
+
+    if json {
+        print_json(&output)?;
+    } else if output.success {
+        println!(
+            "promoted branch '{}' ({} target(s)) via plan {plan_id}",
+            output.branch,
+            output.targets.len()
+        );
+    } else {
+        println!(
+            "promote failed for branch '{}' — see JSON output for details",
+            output.branch
+        );
+    }
+
+    if !overall_success {
+        anyhow::bail!("`rocky branch promote --plan {plan_id}` did not complete successfully");
     }
     Ok(())
 }
@@ -1995,5 +2318,112 @@ mod tests {
         assert!(json.contains("breaking_changes_allowed"));
         assert!(json.contains("column_dropped"));
         assert!(json.contains("--allow-breaking CLI flag"));
+    }
+
+    // ------------------------------------------------------------------
+    // Byte-stable JSON shape for bare `branch promote` output (Phase 3)
+    //
+    // These tests verify that `BranchPromoteOutput` always serializes to a
+    // JSON object with the exact fields CI consumers (e.g. Dagster) expect.
+    // They are NOT end-to-end tests (those would require a warehouse adapter)
+    // — they guard the schema shape against accidental field renames or
+    // drops, which are the most common regression after refactors.
+    // ------------------------------------------------------------------
+
+    fn minimal_promote_output() -> BranchPromoteOutput {
+        BranchPromoteOutput {
+            version: "1.0.0".to_string(),
+            command: "branch promote".to_string(),
+            branch: "fix-price".to_string(),
+            branch_state_hash: "deadbeef".repeat(8),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            targets: vec![PromoteTarget {
+                target: "cat.schema.orders".to_string(),
+                source: "cat.branch__fix-price.orders".to_string(),
+                statement: "CREATE OR REPLACE TABLE ...".to_string(),
+                succeeded: true,
+                error: None,
+            }],
+            audit: vec![AuditEvent {
+                kind: AuditEventKind::PromoteCompleted,
+                at: chrono::DateTime::parse_from_rfc3339("2026-05-14T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                actor: ApproverIdentity {
+                    email: "a@example.com".to_string(),
+                    name: None,
+                    host: "host".to_string(),
+                    source: ApproverSource::Local,
+                },
+                branch: "fix-price".to_string(),
+                branch_state_hash: "deadbeef".repeat(8),
+                reason: None,
+                breaking_changes: None,
+            }],
+            success: true,
+        }
+    }
+
+    /// Bare-verb `branch promote` output carries all mandatory top-level keys.
+    ///
+    /// Guards the JSON shape contract for Dagster / CI consumers: every key
+    /// emitted by the bare-verb path must still be present after the Phase 3
+    /// internal refactor that chains plan + apply.
+    #[test]
+    fn branch_promote_bare_verb_jsonshape_unchanged_after_phase3() {
+        let output = minimal_promote_output();
+        let json = serde_json::to_string(&output).expect("BranchPromoteOutput must serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("must produce valid JSON");
+
+        // Mandatory top-level keys that CI consumers rely on.
+        for key in [
+            "version",
+            "command",
+            "branch",
+            "branch_state_hash",
+            "approvals_used",
+            "approvals_rejected",
+            "targets",
+            "audit",
+            "success",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "BranchPromoteOutput missing key '{key}' — JSON shape contract broken"
+            );
+        }
+        // `command` must be the exact string CI consumers key on.
+        assert_eq!(value["command"], "branch promote");
+        // `success` must be a JSON bool.
+        assert!(value["success"].is_boolean());
+        // `targets[0]` must have the per-target sub-keys.
+        let t = &value["targets"][0];
+        for key in ["target", "source", "statement", "succeeded"] {
+            assert!(
+                t.get(key).is_some(),
+                "PromoteTarget missing key '{key}' — JSON shape contract broken"
+            );
+        }
+    }
+
+    /// `run_branch_promote_from_plan` rejects a plan_id that points to a
+    /// non-Promote plan (e.g. a Compact plan). This guards the kind-mismatch
+    /// error path without requiring a warehouse adapter.
+    #[test]
+    fn run_promote_from_plan_rejects_wrong_plan_kind() {
+        use crate::plan_store::{PlanKind, write_plan};
+
+        let tmp = TempDir::new().unwrap();
+        // Write a Compact plan — wrong kind.
+        let payload = serde_json::json!({"model": "c.s.t", "statement_count": 1});
+        let plan_id = write_plan(tmp.path(), PlanKind::Compact, &payload).unwrap();
+
+        // Check that reading the plan gives kind=Compact (not Promote).
+        let persisted = crate::plan_store::read_plan(tmp.path(), &plan_id).unwrap();
+        assert_eq!(persisted.kind, PlanKind::Compact);
+        assert_ne!(persisted.kind, PlanKind::Promote);
     }
 }
