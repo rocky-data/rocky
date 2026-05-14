@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, conint
+from pydantic import AwareDatetime, BaseModel, conint
 
 
 class ClassificationAction(BaseModel):
@@ -78,6 +78,10 @@ class PlanOutput(BaseModel):
     JSON output for `rocky plan`.
 
     `statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.
+
+    ## Phase 2 additions (Cluster 3 B)
+
+    `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
     """
 
     classification_actions: list[ClassificationAction] | None = None
@@ -85,14 +89,34 @@ class PlanOutput(BaseModel):
     Column-tag applications the governance reconciler would issue via `apply_column_tags`. One row per `(model, column, tag)` triple declared in a model sidecar's `[classification]` block.
     """
     command: str
+    created_at: AwareDatetime | None = None
+    """
+    UTC timestamp when the plan was persisted. Present when `plan_id` is present.
+    """
     env: str | None = None
     """
     Environment name passed via `--env <name>`. Propagates to `mask_actions` so the preview resolves `[mask.<env>]` overrides on top of the workspace `[mask]` defaults. `None` when the flag is absent — preview resolves against defaults only.
+    """
+    execution_layers: list[list[str]] | None = None
+    """
+    Execution layers (topological order) as a list-of-lists of model names. Models within a layer can execute concurrently. Informational — re-derived at apply time. Empty for replication-only plans.
     """
     filter: str
     mask_actions: list[MaskAction] | None = None
     """
     Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.
+    """
+    models: list[str] | None = None
+    """
+    Qualified model names that will be executed by `rocky apply`. Empty for replication-only plans. Informational — re-derived at apply time.
+    """
+    plan_id: str | None = None
+    """
+    Full 64-char blake3 plan identifier. Present when the plan was persisted to `.rocky/plans/<plan_id>.json`. Apply with: `rocky apply <plan_id>`.
+    """
+    plan_kind: str | None = None
+    """
+    Plan kind wire name (`"run"`). Present when `plan_id` is present.
     """
     retention_actions: list[RetentionAction] | None = None
     """
