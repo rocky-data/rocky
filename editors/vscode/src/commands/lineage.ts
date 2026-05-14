@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { getWorkspaceFolder } from "../config";
+import { resolveProjectRoot } from "../config";
 import { getExtensionUri } from "../extensionState";
 import { runRocky } from "../rockyCli";
 import type { LineageOutput } from "../types/generated/lineage";
@@ -96,7 +96,10 @@ async function populatePanel(
   panel: vscode.WebviewPanel,
   modelName: string,
 ): Promise<void> {
-  const workspaceFolder = getWorkspaceFolder();
+  // Resolve the project root by walking up from the active editor's file,
+  // so users can open a SQL file outside the workspace root (or in a sibling
+  // folder) and lineage still finds the right rocky.toml.
+  const projectRoot = resolveProjectRoot();
   const extensionUri = getExtensionUri();
   const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
 
@@ -127,12 +130,8 @@ async function populatePanel(
         let errorMsg: string | undefined;
 
         try {
-          const args: string[] = [];
-          if (workspaceFolder) {
-            args.push("--config", `${workspaceFolder}/rocky.toml`);
-          }
-          args.push("history", "--model", clickedModel, "--output", "json");
-          const { stdout } = await runRocky(args, { cwd: workspaceFolder });
+          const args = ["history", "--model", clickedModel, "--output", "json"];
+          const { stdout } = await runRocky(args, { cwd: projectRoot });
           history = JSON.parse(stdout) as ModelHistoryOutput;
         } catch (err) {
           errorMsg = (err as Error).message;
@@ -153,13 +152,11 @@ async function populatePanel(
 
   // Use the default JSON output (no -o table / --format dot).
   // The engine emits LineageOutput JSON with upstream/downstream/edges.
+  // Rocky discovers rocky.toml from cwd, so we don't pass --config.
   const args = ["lineage", modelName];
-  if (workspaceFolder) {
-    args.unshift("--config", `${workspaceFolder}/rocky.toml`);
-  }
 
   try {
-    const { stdout } = await runRocky(args, { cwd: workspaceFolder });
+    const { stdout } = await runRocky(args, { cwd: projectRoot });
     const lineageData = JSON.parse(stdout) as LineageOutput;
     panel.webview.html = renderLineageHtml(
       panel.webview,
@@ -270,25 +267,116 @@ function renderLineageHtml(
       display: flex; flex-direction: column;
       height: 100vh; overflow: hidden;
     }
-    header {
-      display: flex; align-items: center; gap: 8px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--vscode-panel-border);
-      background: var(--vscode-editor-background);
+    /* Vertical controls rail (right-docked) */
+    #left-rail {
+      width: 240px;
+      min-width: 240px;
+      border-left: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+      display: flex; flex-direction: column;
+      gap: 6px;
+      padding: 12px 10px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      flex-shrink: 0;
+      transition: width 0.15s ease, min-width 0.15s ease, padding 0.15s ease;
+    }
+    #left-rail.collapsed {
+      width: 28px;
+      min-width: 28px;
+      padding: 8px 4px;
+      gap: 0;
+    }
+    #left-rail.collapsed > :not(.rail-header) { display: none; }
+    .rail-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    #left-rail.collapsed .rail-header { justify-content: center; margin-bottom: 0; }
+    #left-rail.collapsed .rail-title { display: none; }
+    #rail-toggle {
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid transparent;
+      padding: 2px 4px;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      border-radius: 2px;
       flex-shrink: 0;
     }
-    header h2 { margin: 0; font-size: 13px; font-weight: 600; }
-    header .spacer { flex: 1; }
-    .btn-group {
-      display: flex; gap: 0;
+    #rail-toggle:hover {
+      background: var(--vscode-toolbar-hoverBackground, var(--vscode-button-secondaryHoverBackground));
+      color: var(--vscode-foreground);
     }
-    .btn-group button {
-      border-radius: 0;
-      border-right-width: 0;
+    /* Collapsible section accordion */
+    .rail-section {
+      display: flex; flex-direction: column;
+      border-top: 1px solid var(--vscode-panel-border);
+      padding-top: 6px;
     }
-    .btn-group button:first-child { border-radius: 2px 0 0 2px; }
-    .btn-group button:last-child  { border-radius: 0 2px 2px 0; border-right-width: 1px; }
-    button {
+    .rail-section:first-of-type { border-top: none; padding-top: 0; }
+    .rail-section-toggle {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%;
+      background: transparent;
+      border: none;
+      padding: 4px 0;
+      cursor: pointer;
+      color: var(--vscode-descriptionForeground);
+      font: inherit;
+      text-align: left;
+    }
+    .rail-section-toggle:hover { color: var(--vscode-foreground); }
+    .rail-section-toggle:focus { outline: none; }
+    .rail-section-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .rail-section-chevron {
+      font-size: 10px;
+      line-height: 1;
+      transition: transform 0.15s ease;
+    }
+    .rail-section.collapsed .rail-section-chevron { transform: rotate(-90deg); }
+    .rail-section-body {
+      display: flex; flex-direction: column;
+      gap: 4px;
+      padding: 4px 0 6px;
+    }
+    .rail-section.collapsed .rail-section-body { display: none; }
+    /* Sub-grouping inside a section (e.g. View / Focus / etc. live under Controls) */
+    .rail-subgroup { display: flex; flex-direction: column; gap: 3px; }
+    .rail-subgroup + .rail-subgroup { margin-top: 6px; }
+    .rail-subgroup-label {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+    #left-rail .rail-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--vscode-descriptionForeground);
+      margin: 0;
+    }
+    #left-rail .rail-model {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+      word-break: break-word;
+      margin: -8px 0 4px;
+    }
+    #left-rail .btn-group { display: flex; gap: 0; }
+    #left-rail .btn-group button { flex: 1; }
+    #left-rail .btn-group button:not(:first-child) { border-left-width: 0; }
+    #left-rail .btn-group button:first-child { border-radius: 2px 0 0 2px; }
+    #left-rail .btn-group button:last-child  { border-radius: 0 2px 2px 0; }
+    #left-rail .btn-group button:not(:first-child):not(:last-child) { border-radius: 0; }
+    #left-rail button {
       background: var(--vscode-button-secondaryBackground);
       color: var(--vscode-button-secondaryForeground);
       border: 1px solid var(--vscode-button-border, transparent);
@@ -297,16 +385,31 @@ function renderLineageHtml(
       cursor: pointer;
       border-radius: 2px;
     }
-    button:hover { background: var(--vscode-button-secondaryHoverBackground); }
-    button.active {
+    #left-rail button:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    #left-rail button.active {
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
     }
-    .separator {
-      width: 1px;
-      background: var(--vscode-panel-border);
-      margin: 0 4px;
+    #left-rail select,
+    #left-rail input[type="text"] {
+      width: 100%;
+      background: var(--vscode-input-background, var(--vscode-button-secondaryBackground));
+      color: var(--vscode-input-foreground, var(--vscode-button-secondaryForeground));
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      padding: 4px 7px;
+      font-size: 12px;
+      border-radius: 2px;
+      outline: none;
     }
+    #left-rail input[type="text"]:focus,
+    #left-rail select:focus { border-color: var(--vscode-focusBorder, #007fd4); }
+    #left-rail .zoom-row { display: flex; gap: 4px; }
+    #left-rail .zoom-row button { flex: 1; padding: 4px 0; }
+    #left-rail .export-btn {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    #left-rail .export-btn:hover { background: var(--vscode-button-hoverBackground); }
     /* Main content area: graph + side panel */
     #main-content {
       flex: 1; display: flex; overflow: hidden;
@@ -322,42 +425,23 @@ function renderLineageHtml(
     #graph-container svg {
       display: block; width: 100%; height: 100%;
     }
-    /* Side panel */
-    #side-panel {
-      width: 320px;
-      min-width: 320px;
-      border-left: 1px solid var(--vscode-panel-border);
-      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
-      display: flex; flex-direction: column;
-      overflow: hidden;
-    }
-    #side-panel-header {
-      padding: 10px 12px 6px;
-      border-bottom: 1px solid var(--vscode-panel-border);
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--vscode-descriptionForeground);
-      flex-shrink: 0;
-    }
+    /* Node details (now inside the left rail) */
     #side-panel-content {
-      flex: 1; overflow-y: auto; padding: 12px;
+      display: flex; flex-direction: column;
+      gap: 8px;
     }
     .panel-empty {
       color: var(--vscode-descriptionForeground);
       font-size: 12px;
-      text-align: center;
-      margin-top: 40px;
+      margin: 0;
     }
     .panel-loading {
       color: var(--vscode-descriptionForeground);
       font-size: 12px;
-      text-align: center;
-      margin-top: 40px;
+      margin: 0;
     }
     .panel-section {
-      margin-bottom: 14px;
+      margin: 0;
     }
     .panel-section-title {
       font-size: 11px;
@@ -587,58 +671,127 @@ function renderLineageHtml(
   </style>
 </head>
 <body>
-  <header>
-    <h2>Lineage: ${escapeHtml(modelName)}</h2>
-    <span class="spacer"></span>
-    <div class="btn-group" title="View granularity">
-      <button id="mode-model" class="active" title="Model-level view (aggregated)">Model</button>
-      <button id="mode-column" title="Column-level view (detailed)">Column</button>
-    </div>
-    <div class="separator"></div>
-    <span class="cluster-select-label">Focus:</span>
-    <select id="focus-mode" class="focus-mode-select" title="Click a node to set focus. Upstream/Downstream dims unrelated nodes.">
-      <option value="all">All</option>
-      <option value="upstream">Upstream</option>
-      <option value="downstream">Downstream</option>
-      <option value="selected">Selected only</option>
-    </select>
-    <div class="separator"></div>
-    <span class="cluster-select-label">Cluster:</span>
-    <select id="cluster-mode" class="cluster-select" title="Group nodes into clusters">
-      <option value="none">None</option>
-      <option value="schema">Schema</option>
-      <option value="source">Source</option>
-    </select>
-    <div class="separator"></div>
-    <span class="cluster-select-label">Layout:</span>
-    <select id="layout-mode" class="layout-select" title="Graph layout direction">
-      <option value="LR">Horizontal</option>
-      <option value="TB">Vertical</option>
-    </select>
-    <div class="separator"></div>
-    <input id="search-input" class="search-input" type="text" placeholder="Search nodes…" title="Filter nodes by name (case-insensitive). Use /regex/ for pattern matching." />
-    <div class="separator"></div>
-    <button id="zoom-out" title="Zoom out (-)">−</button>
-    <button id="zoom-reset" title="Reset zoom (0)">100%</button>
-    <button id="zoom-in" title="Zoom in (+)">+</button>
-    <button id="zoom-fit" title="Fit to view (F)">Fit</button>
-    <button id="export-svg" title="Export as SVG">Export SVG</button>
-  </header>
   <div id="main-content">
     <div id="viewport">
       <div id="graph-container"><svg id="graph-svg"></svg></div>
     </div>
-    <div id="side-panel">
-      <div id="side-panel-header">Node Details</div>
-      <div id="side-panel-content">
-        <p class="panel-empty">Click a node for details.</p>
+    <aside id="left-rail">
+      <div class="rail-header">
+        <h2 class="rail-title">Lineage</h2>
+        <button id="rail-toggle" type="button" title="Collapse panel" aria-label="Collapse panel">›</button>
       </div>
-    </div>
+      <div class="rail-model" title="${escapeHtml(modelName)}">${escapeHtml(modelName)}</div>
+
+      <div class="rail-section" data-section="controls">
+        <button type="button" class="rail-section-toggle" aria-expanded="true">
+          <span class="rail-section-label">Controls</span>
+          <span class="rail-section-chevron">▾</span>
+        </button>
+        <div class="rail-section-body">
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">View</div>
+            <div class="btn-group" title="View granularity">
+              <button id="mode-model" class="active" title="Model-level view (aggregated)">Model</button>
+              <button id="mode-column" title="Column-level view (detailed)">Column</button>
+            </div>
+          </div>
+
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">Focus</div>
+            <select id="focus-mode" class="focus-mode-select" title="Click a node to set focus. Upstream/Downstream dims unrelated nodes.">
+              <option value="all">All</option>
+              <option value="upstream">Upstream</option>
+              <option value="downstream">Downstream</option>
+              <option value="selected">Selected only</option>
+            </select>
+          </div>
+
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">Cluster</div>
+            <select id="cluster-mode" class="cluster-select" title="Group nodes into clusters">
+              <option value="none">None</option>
+              <option value="schema">Schema</option>
+              <option value="source">Source</option>
+            </select>
+          </div>
+
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">Layout</div>
+            <select id="layout-mode" class="layout-select" title="Graph layout direction">
+              <option value="LR">Horizontal</option>
+              <option value="TB">Vertical</option>
+            </select>
+          </div>
+
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">Search</div>
+            <input id="search-input" class="search-input" type="text" placeholder="filter…" title="Filter nodes by name (case-insensitive). Use /regex/ for pattern matching." />
+          </div>
+
+          <div class="rail-subgroup">
+            <div class="rail-subgroup-label">Zoom</div>
+            <div class="zoom-row">
+              <button id="zoom-out" title="Zoom out (-)">−</button>
+              <button id="zoom-reset" title="Reset zoom (0)">100%</button>
+              <button id="zoom-in" title="Zoom in (+)">+</button>
+            </div>
+            <button id="zoom-fit" title="Fit to view (F)">Fit</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail-section" data-section="details">
+        <button type="button" class="rail-section-toggle" aria-expanded="true">
+          <span class="rail-section-label">Node Details</span>
+          <span class="rail-section-chevron">▾</span>
+        </button>
+        <div class="rail-section-body">
+          <div id="side-panel-content">
+            <p class="panel-empty">Click a node for details.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail-section" data-section="export">
+        <button type="button" class="rail-section-toggle" aria-expanded="true">
+          <span class="rail-section-label">Export</span>
+          <span class="rail-section-chevron">▾</span>
+        </button>
+        <div class="rail-section-body">
+          <button id="export-svg" class="export-btn" title="Export as SVG">Export SVG</button>
+        </div>
+      </div>
+    </aside>
   </div>
   <div id="status" class="status">Rendering…</div>
 
   <script id="lineage-data" type="application/json" nonce="${nonce}">${escapeJsonForScript(dataJson)}</script>
   <script src="${graphUri}" nonce="${nonce}"></script>
+  <script nonce="${nonce}">
+// Error handler lives in its OWN script tag so a parse error in the main
+// script tag below doesn't prevent it from registering. Surfaces any
+// uncaught error to the status bar instead of leaving "Rendering…" stuck.
+(function () {
+  function showError(msg) {
+    const el = document.getElementById('status');
+    if (el) {
+      el.textContent = 'Lineage error: ' + msg;
+      el.classList.add('error');
+    }
+  }
+  window.addEventListener('error', (e) => {
+    if (e.filename && e.lineno) {
+      showError((e.message || 'error') + ' (' + e.filename + ':' + e.lineno + ':' + (e.colno || 0) + ')');
+    } else {
+      showError((e.error && e.error.message) || e.message || 'unknown error');
+    }
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    showError((r && r.message) || String(r) || 'unhandled rejection');
+  });
+})();
+  </script>
   <script nonce="${nonce}">
 (function () {
   'use strict';
@@ -674,6 +827,11 @@ function renderLineageHtml(
   const validFocusModes = ['all', 'upstream', 'downstream', 'selected'];
   let currentFocusMode = validFocusModes.includes(saved.focusMode) ? saved.focusMode : 'all';
   let currentFocusNode = (typeof saved.focusNode === 'string') ? saved.focusNode : null;
+  let railCollapsed = saved.railCollapsed === true;
+  // IDs of rail-sections that should be rendered collapsed.
+  let collapsedSections = new Set(
+    Array.isArray(saved.collapsedSections) ? saved.collapsedSections : []
+  );
   let selectedNodeModel = null; // currently selected model name (for side panel)
   let focusedClusterId = null;  // currently focused cluster (null = none)
 
@@ -696,6 +854,8 @@ function renderLineageHtml(
     searchQuery: currentSearchQuery,
     focusMode: currentFocusMode,
     focusNode: currentFocusNode,
+    railCollapsed: railCollapsed,
+    collapsedSections: Array.from(collapsedSections),
   };
 
   function persistState(patch) {
@@ -1139,7 +1299,9 @@ function renderLineageHtml(
    */
   function buildMatcher(query) {
     if (!query) return { test: () => true, isError: false };
-    const regexMatch = query.match(/^\/(.*)\/([gimsuy]*)$/);
+    // Double-escaped because this entire script body lives inside a TS
+    // template literal; the runtime needs to see \/ in the regex literal.
+    const regexMatch = query.match(/^\\/(.*)\\/([gimsuy]*)$/);
     if (regexMatch) {
       try {
         const re = new RegExp(regexMatch[1], regexMatch[2] || 'i');
@@ -1655,15 +1817,123 @@ function renderLineageHtml(
   });
 
   // ── Export SVG ───────────────────────────────────────────────────────────────
+  // The live SVG references VS Code CSS variables (e.g. --vscode-foreground)
+  // that don't resolve outside the webview, has no xmlns, and lacks a
+  // background. Build a standalone-readable clone that inlines a resolved
+  // stylesheet, adds the SVG namespace, resets the user's pan/zoom, and paints
+  // the editor-background color underneath.
   document.getElementById('export-svg').onclick = () => {
-    const blob = new Blob([svgEl.outerHTML], { type: 'image/svg+xml' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
+    const clone = svgEl.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+
+    // Reset the d3-zoom transform on the cloned graph group so the export
+    // shows the full graph (not the user's current zoom/pan).
+    const gg = clone.querySelector('g[transform]');
+    if (gg) gg.removeAttribute('transform');
+
+    // Set width/height attrs (some viewers ignore SVGs without them).
+    const vb = (clone.getAttribute('viewBox') || '').split(/\\s+/);
+    if (vb.length === 4) {
+      clone.setAttribute('width', vb[2]);
+      clone.setAttribute('height', vb[3]);
+    }
+
+    // Resolve VS Code CSS variables to concrete colors.
+    const root = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => (root.getPropertyValue(name).trim() || fallback);
+    const fg = v('--vscode-foreground', '#cccccc');
+    const bg = v('--vscode-editor-background', '#1e1e1e');
+    const muted = v('--vscode-descriptionForeground', '#888888');
+    const focalBg = v('--vscode-button-background', '#0e639c');
+    const focalFg = v('--vscode-button-foreground', '#ffffff');
+    const badgeBg = v('--vscode-badge-background', '#4d4d4d');
+    const sourceFill = v('--vscode-charts-blue', badgeBg);
+    const leafFill = v('--vscode-charts-green', badgeBg);
+    const panelBorder = v('--vscode-panel-border', '#444444');
+
+    // Inline stylesheet — order matters; .focal overrides .source/.leaf.
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const styleEl = document.createElementNS(svgNs, 'style');
+    styleEl.textContent =
+      'text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 11px; }' +
+      '.node rect { fill: ' + badgeBg + '; stroke: ' + fg + '; stroke-width: 1.5px; }' +
+      '.node text { fill: ' + fg + '; }' +
+      '.node.source rect { fill: ' + sourceFill + '; }' +
+      '.node.leaf rect { fill: ' + leafFill + '; }' +
+      '.node.focal rect { fill: ' + focalBg + '; stroke: ' + focalFg + '; stroke-width: 2px; }' +
+      '.node.focal text { fill: ' + focalFg + '; font-weight: 600; }' +
+      '.cluster-bbox { fill: transparent; stroke: ' + panelBorder + '; stroke-width: 1px; stroke-dasharray: 4 3; }' +
+      '.cluster-label { fill: ' + muted + '; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }' +
+      '.cluster-header-hit { display: none; }' +
+      '.edgePath path { stroke: ' + muted + '; stroke-width: 1.5px; fill: none; }' +
+      '.edgeLabel text { fill: ' + muted + '; font-size: 10px; }' +
+      'marker path { fill: ' + muted + '; stroke: none; }';
+
+    // Background rect so the SVG isn't transparent when opened standalone.
+    const bgRect = document.createElementNS(svgNs, 'rect');
+    bgRect.setAttribute('x', '0');
+    bgRect.setAttribute('y', '0');
+    bgRect.setAttribute('width', '100%');
+    bgRect.setAttribute('height', '100%');
+    bgRect.setAttribute('fill', bg);
+
+    clone.insertBefore(styleEl, clone.firstChild);
+    clone.insertBefore(bgRect, styleEl.nextSibling);
+
+    const xml = '<?xml version="1.0" encoding="UTF-8"?>\\n' + clone.outerHTML;
+    const blob = new Blob([xml], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
     a.download = focalModel + '-lineage.svg';
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  // ── Rail collapse toggle ─────────────────────────────────────────────────────
+  const railEl = document.getElementById('left-rail');
+  const railToggleBtn = document.getElementById('rail-toggle');
+  function applyRailState() {
+    railEl.classList.toggle('collapsed', railCollapsed);
+    // Rail is right-docked: ‹ expands (push left), › collapses (push right).
+    railToggleBtn.textContent = railCollapsed ? '‹' : '›';
+    railToggleBtn.title = railCollapsed ? 'Expand panel' : 'Collapse panel';
+    railToggleBtn.setAttribute('aria-label', railToggleBtn.title);
+  }
+  applyRailState();
+  railToggleBtn.onclick = () => {
+    railCollapsed = !railCollapsed;
+    persistState({ railCollapsed: railCollapsed });
+    applyRailState();
+    // Re-fit after the rail width animation finishes so the graph re-centers
+    // into the new viewport.
+    setTimeout(() => fitToView(), 180);
+  };
+
+  // ── Per-section accordion toggles ────────────────────────────────────────────
+  // Each rail-section has a header button that collapses/expands its body.
+  // The collapsed set is persisted so reloads remember which sections the user
+  // had closed.
+  function applySectionState(section) {
+    const id = section.getAttribute('data-section');
+    const collapsed = collapsedSections.has(id);
+    section.classList.toggle('collapsed', collapsed);
+    const toggle = section.querySelector('.rail-section-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(!collapsed));
+  }
+  document.querySelectorAll('#left-rail .rail-section').forEach((section) => {
+    applySectionState(section);
+    const toggle = section.querySelector('.rail-section-toggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      const id = section.getAttribute('data-section');
+      if (collapsedSections.has(id)) collapsedSections.delete(id);
+      else collapsedSections.add(id);
+      applySectionState(section);
+      persistState({ collapsedSections: Array.from(collapsedSections) });
+    });
+  });
 
   // ── Initial zoom/pan restore or auto-fit ──────────────────────────────────────
   if (typeof saved.scale === 'number' && (saved.panX !== undefined || saved.panY !== undefined)) {

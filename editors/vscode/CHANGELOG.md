@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Collapsible right-docked rail for the lineage webview.** Replaces the previous horizontal toolbar + 320px right-side Node Details panel with a single 240px vertical rail docked on the right. Three top-level collapsible sections — **Controls** (View / Focus / Cluster / Layout / Search / Zoom subgrouped inline), **Node Details**, **Export** — each with a clickable header and chevron. A `‹/›` button at the top of the rail collapses it to a 28px strip. Per-section collapse state and rail-collapsed state both persist across reloads via `vscode.setState`. The graph auto-fits after the rail-width animation finishes so the viewport recenters.
+- **Standalone-readable lineage SVG export.** The exporter clones the live SVG, sets `xmlns` (so OS image viewers will render it), resets the d3-zoom transform on the cloned graph group (export shows the full graph regardless of current pan/zoom), paints the editor background underneath, and inlines a stylesheet with VS Code CSS variables resolved to concrete colours (foreground, badge, button, charts-blue/green, panel-border, etc). Previously the exported file referenced unresolved `var(--vscode-*)` colours and external CSS rules, so opening it outside the webview produced an unreadable SVG.
+
+### Fixed
+
+- **Lineage panel stuck on "Rendering…".** The search-box regex `/^\/(.*)\/([gimsuy]*)$/` lives inside the inline-script TS template literal. The `\/` escape was stripped by the template evaluation, producing the invalid runtime regex `/^/(.*)/(...$/` and a `SyntaxError: Unexpected token '.'` that killed the main IIFE before it could draw the graph. Doubled the backslash (`\\/(.*)\\/`) so the runtime sees the intended `\/`.
+- **Lineage panel uses the wrong `rocky.toml`.** Previously hard-coded `${workspaceFolder}/rocky.toml` and crashed with `no models found in models` if the workspace root wasn't the project root (e.g. a multi-folder workspace, or a SQL file opened from a sibling folder). Now walks up from the active file's directory to find the nearest `rocky.toml` and runs the CLI from that directory.
+- **`Run Health Check` ("No workspace folder open") in the Get Started view.** `rocky.doctor` was gated by `ensureWorkspace()`, but the Get Started welcome links there precisely so the user can verify their CLI installation **before** there's a project. Removed the gate — doctor runs fine without a workspace and reports `critical` for the missing `rocky.toml`, which is the expected output for that flow.
+- **Webview-script errors are now surfaced.** A pair of `window.addEventListener('error', …)` / `unhandledrejection` listeners live in their own `<script>` tag so a parse error in the main inline script can't prevent them from registering. Any uncaught exception now writes `Lineage error: <message> (<file>:<line>:<col>)` into the status bar instead of leaving the panel stuck on `Rendering…`.
+
 ## [1.17.0] — 2026-05-14
 
 Builds on `1.16.0`'s lineage Tier 2/3 work. Two batches: PR [#519](https://github.com/rocky-data/rocky/pull/519) finishes Lineage Tier 2 + adds the inline cost CodeLens and the Schema sidebar; PR [#520](https://github.com/rocky-data/rocky/pull/520) adds the `@rocky` chat participant, branded file icons, and the Previews sidebar. Eight new surfaces total — all vscode-only, no engine cascades.
