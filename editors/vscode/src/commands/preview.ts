@@ -5,6 +5,7 @@ import type {
   PreviewCreateOutput,
   PreviewDiffOutput,
 } from "../types/generated";
+import { firePreviewCreated } from "../views/previewView";
 import { ensureWorkspace, promptForInput, showJsonInEditor } from "./ui";
 
 const BASE_PLACEHOLDER = "e.g., main";
@@ -43,6 +44,11 @@ export async function previewCreate(): Promise<void> {
       vscode.window.showErrorMessage(summary);
     } else {
       vscode.window.showInformationMessage(summary);
+      // Notify the Previews sidebar so it can track this branch.
+      firePreviewCreated({
+        branchName: result.branch_name,
+        createdAt: new Date().toISOString(),
+      });
     }
     await showJsonInEditor(JSON.stringify(result));
   } catch (err) {
