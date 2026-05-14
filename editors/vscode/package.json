@@ -112,6 +112,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Automatically run the pipeline when a model file is saved. Read-only contract — consumed by future commands; has no effect in this release."
+        },
+        "rocky.costAnnotations.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show inline cost annotations (CodeLens) above model files. Data is fetched from `rocky optimize` on activation and refreshed via the **Rocky: Refresh Cost Annotations** command."
         }
       }
     },
@@ -338,6 +343,17 @@
       {
         "command": "rocky.playground",
         "title": "Open Playground",
+        "category": "Rocky"
+      },
+      {
+        "command": "rocky.refreshCosts",
+        "title": "Refresh Cost Annotations",
+        "category": "Rocky",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "rocky.showCostDetail",
+        "title": "Show Cost Detail",
         "category": "Rocky"
       }
     ],
