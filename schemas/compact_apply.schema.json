@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "StatementResult": {
+      "description": "Result of executing one SQL statement during `rocky compact apply` or `rocky archive apply`.",
+      "properties": {
+        "duration_ms": {
+          "description": "Execution duration in milliseconds. Zero when execution was skipped due to a prior statement failure in the same apply run.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "Adapter error message. `None` when `success == true`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "description": "Human-readable purpose label (mirrors `NamedStatement.purpose`).",
+          "type": "string"
+        },
+        "sql": {
+          "description": "The SQL that was executed.",
+          "type": "string"
+        },
+        "success": {
+          "description": "Whether the adapter accepted the statement without error.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "purpose",
+        "sql",
+        "success"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky compact apply <plan_id>`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "executed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "plan_id": {
+      "description": "The plan that was applied.",
+      "type": "string"
+    },
+    "statements": {
+      "description": "Per-statement results, in the order they were executed.",
+      "items": {
+        "$ref": "#/definitions/StatementResult"
+      },
+      "type": "array"
+    },
+    "success": {
+      "description": "`true` when all statements succeeded; `false` on the first failure (remaining statements are still reported with `success: false` and `duration_ms: 0`).",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "executed_at",
+    "plan_id",
+    "statements",
+    "success",
+    "version"
+  ],
+  "title": "CompactApplyOutput",
+  "type": "object"
+}

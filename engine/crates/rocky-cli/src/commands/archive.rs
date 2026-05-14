@@ -1,17 +1,35 @@
 //! `rocky archive` — archive old data partitions.
+//!
+//! ## Plan persistence (`archive apply`)
+//!
+//! After generating an archive plan the default path writes it to
+//! `.rocky/plans/<plan_id>.json`. `run_archive_apply` reads that file and
+//! executes the SQL statements via the warehouse adapter, reporting per-
+//! statement results in `ArchiveApplyOutput`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use rocky_sql::validation::validate_identifier;
 
-use crate::output::{ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement, print_json};
+use crate::output::{
+    ArchiveApplyOutput, ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement,
+    StatementResult, print_json,
+};
+use crate::plan_store::{PlanKind, read_plan, write_plan};
+use crate::registry::AdapterRegistry;
 use crate::scope::resolve_managed_tables_in_catalog;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky archive`.
+///
+/// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
+/// (relative to the current working directory) so it can be applied later
+/// via `rocky archive apply <plan_id>`.
 pub fn run_archive(
     model: Option<&str>,
     older_than: &str,
@@ -22,27 +40,43 @@ pub fn run_archive(
     let days = parse_duration_days(older_than)?;
     let statements = generate_archive_sql(model, days)?;
 
+    let typed_statements: Vec<NamedStatement> = statements
+        .iter()
+        .map(|(purpose, sql)| NamedStatement {
+            purpose: purpose.clone(),
+            sql: sql.clone(),
+        })
+        .collect();
+
+    // Build output without plan_id first, then hash it.
+    let mut output = ArchiveOutput {
+        version: VERSION.to_string(),
+        command: "archive".to_string(),
+        model: model.map(String::from),
+        catalog: None,
+        scope: None,
+        older_than: older_than.to_string(),
+        older_than_days: days,
+        dry_run,
+        statements: typed_statements,
+        tables: None,
+        totals: None,
+        plan_id: None,
+    };
+
+    // Persist the plan (plan_id is None so the hash is stable).
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    match write_plan(&cwd, PlanKind::Archive, &output) {
+        Ok(id) => {
+            tracing::info!(plan_id = %id, "archive plan persisted");
+            output.plan_id = Some(id);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist archive plan; 'apply' will not be available for this run");
+        }
+    }
+
     if output_json {
-        let typed_statements: Vec<NamedStatement> = statements
-            .iter()
-            .map(|(purpose, sql)| NamedStatement {
-                purpose: purpose.clone(),
-                sql: sql.clone(),
-            })
-            .collect();
-        let output = ArchiveOutput {
-            version: VERSION.to_string(),
-            command: "archive".to_string(),
-            model: model.map(String::from),
-            catalog: None,
-            scope: None,
-            older_than: older_than.to_string(),
-            older_than_days: days,
-            dry_run,
-            statements: typed_statements,
-            tables: None,
-            totals: None,
-        };
         print_json(&output)?;
     } else {
         println!(
@@ -51,6 +85,10 @@ pub fn run_archive(
         );
         if let Some(m) = model {
             println!("Model: {m}");
+        }
+        if let Some(ref id) = output.plan_id {
+            println!("Plan ID: {id}");
+            println!("Apply with: rocky archive apply {id}");
         }
         println!();
 
@@ -103,20 +141,34 @@ pub async fn run_archive_catalog(
         statement_count: flat_statements.len(),
     };
 
+    let mut output = ArchiveOutput {
+        version: VERSION.to_string(),
+        command: "archive".to_string(),
+        model: None,
+        catalog: Some(scope.catalog.clone()),
+        scope: Some("catalog".to_string()),
+        older_than: older_than.to_string(),
+        older_than_days: days,
+        dry_run,
+        statements: flat_statements,
+        tables: Some(per_table),
+        totals: Some(totals),
+        plan_id: None,
+    };
+
+    // Persist the plan (plan_id is None so the hash is stable).
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    match write_plan(&cwd, PlanKind::Archive, &output) {
+        Ok(id) => {
+            tracing::info!(plan_id = %id, catalog = %scope.catalog, "archive catalog plan persisted");
+            output.plan_id = Some(id);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist archive catalog plan");
+        }
+    }
+
     if output_json {
-        let output = ArchiveOutput {
-            version: VERSION.to_string(),
-            command: "archive".to_string(),
-            model: None,
-            catalog: Some(scope.catalog.clone()),
-            scope: Some("catalog".to_string()),
-            older_than: older_than.to_string(),
-            older_than_days: days,
-            dry_run,
-            statements: flat_statements,
-            tables: Some(per_table),
-            totals: Some(totals),
-        };
         print_json(&output)?;
     } else {
         println!(
@@ -127,15 +179,21 @@ pub async fn run_archive_catalog(
             days,
             if dry_run { " [DRY RUN]" } else { "" }
         );
+        if let Some(ref id) = output.plan_id {
+            println!("Plan ID: {id}");
+            println!("Apply with: rocky archive apply {id}");
+        }
         println!();
 
-        for (fqn, entry) in &per_table {
-            println!("-- {fqn}");
-            for s in &entry.statements {
-                println!("-- {}", s.purpose);
-                println!("{};", s.sql);
+        if let Some(ref per_table) = output.tables {
+            for (fqn, entry) in per_table {
+                println!("-- {fqn}");
+                for s in &entry.statements {
+                    println!("-- {}", s.purpose);
+                    println!("{};", s.sql);
+                }
+                println!();
             }
-            println!();
         }
 
         if dry_run {
@@ -203,6 +261,139 @@ fn generate_archive_sql(model: Option<&str>, days: u64) -> Result<Vec<(String, S
     ])
 }
 
+/// Execute `rocky archive apply <plan_id>`.
+///
+/// Reads the persisted plan from `.rocky/plans/<plan_id>.json`, validates
+/// that it is an archive plan, then executes each statement via the warehouse
+/// adapter. Per-statement results are collected in `ArchiveApplyOutput`.
+///
+/// DuckDB does not support `VACUUM` with `RETAIN` syntax in the Databricks
+/// form — adapter errors surface cleanly through `StatementResult.error`
+/// and `success: false`; no special-casing is needed.
+pub async fn run_archive_apply(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    run_archive_apply_in(&cwd, config_path, plan_id, output_json).await
+}
+
+/// Inner implementation of `rocky archive apply` that takes an explicit `root`
+/// for the plans directory. Extracted so tests can pass a temp dir without
+/// touching the process-global current working directory.
+pub(crate) async fn run_archive_apply_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    output_json: bool,
+) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read archive plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Archive {
+        bail!(
+            "plan '{}' is a {} plan, not an archive plan. \
+             Use `rocky {} apply {}` instead.",
+            plan_id,
+            plan.kind,
+            plan.kind,
+            plan_id
+        );
+    }
+
+    // Deserialize the payload back to ArchiveOutput to extract statements.
+    let archive_output: ArchiveOutput = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize archive plan payload")?;
+
+    // Build the warehouse adapter from the config.
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)
+        .context("failed to resolve pipeline for archive apply")?;
+    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
+
+    let executed_at = Utc::now();
+    let mut results: Vec<StatementResult> = Vec::with_capacity(archive_output.statements.len());
+    let mut overall_success = true;
+
+    for stmt in &archive_output.statements {
+        if !overall_success {
+            results.push(StatementResult {
+                purpose: stmt.purpose.clone(),
+                sql: stmt.sql.clone(),
+                success: false,
+                duration_ms: 0,
+                error: Some("skipped: a prior statement failed".to_string()),
+            });
+            continue;
+        }
+
+        let start = Instant::now();
+        let outcome = adapter.execute_statement(&stmt.sql).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match outcome {
+            Ok(()) => {
+                tracing::info!(purpose = %stmt.purpose, duration_ms, "archive apply: statement succeeded");
+                results.push(StatementResult {
+                    purpose: stmt.purpose.clone(),
+                    sql: stmt.sql.clone(),
+                    success: true,
+                    duration_ms,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    purpose = %stmt.purpose,
+                    duration_ms,
+                    error = %e,
+                    "archive apply: statement failed"
+                );
+                results.push(StatementResult {
+                    purpose: stmt.purpose.clone(),
+                    sql: stmt.sql.clone(),
+                    success: false,
+                    duration_ms,
+                    error: Some(format!("{e}")),
+                });
+                overall_success = false;
+            }
+        }
+    }
+
+    let output = ArchiveApplyOutput {
+        version: VERSION.to_string(),
+        command: "archive apply".to_string(),
+        plan_id: plan_id.to_string(),
+        executed_at,
+        statements: results,
+        success: overall_success,
+    };
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!("Archive apply — plan: {plan_id}");
+        println!("Executed at: {executed_at}");
+        println!();
+        for r in &output.statements {
+            let status = if r.success { "OK" } else { "FAIL" };
+            print!("[{status}] {} ({}ms)", r.purpose, r.duration_ms);
+            if let Some(ref err) = r.error {
+                print!(" — {err}");
+            }
+            println!();
+        }
+        println!();
+        if overall_success {
+            println!("All statements succeeded.");
+        } else {
+            println!("One or more statements failed.");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +435,157 @@ mod tests {
         assert!(generate_archive_sql(Some("'; DROP TABLE users; --"), 30).is_err());
         assert!(generate_archive_sql(Some(""), 30).is_err());
         assert!(generate_archive_sql(Some("catalog..table"), 30).is_err());
+    }
+
+    /// Integration test for `rocky archive apply` against a real DuckDB.
+    ///
+    /// DuckDB does not support the Databricks-style `VACUUM ... RETAIN HOURS`
+    /// syntax, and `DELETE FROM` on a table with a Databricks-specific column
+    /// (`_fivetran_synced`) will fail too. The apply path must surface adapter
+    /// errors via `StatementResult.error` and `success: false` rather than
+    /// panicking. This test verifies that contract.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn archive_apply_surfaces_duckdb_errors_cleanly() -> anyhow::Result<()> {
+        use anyhow::anyhow;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test_arc_apply.duckdb");
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path)
+                .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
+            adapter
+                .execute_statement("CREATE TABLE events (id INTEGER)")
+                .await
+                .map_err(|e| anyhow!("setup: {e}"))?;
+        }
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // Write an archive plan using the standard generated SQL.
+        let plan_id = write_plan(
+            dir.path(),
+            PlanKind::Archive,
+            &ArchiveOutput {
+                version: "test".to_string(),
+                command: "archive".to_string(),
+                model: Some("events".to_string()),
+                catalog: None,
+                scope: None,
+                older_than: "90d".to_string(),
+                older_than_days: 90,
+                dry_run: false,
+                statements: vec![
+                    NamedStatement {
+                        purpose: "delete rows older than 90 days".to_string(),
+                        sql: "DELETE FROM events WHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())".to_string(),
+                    },
+                    NamedStatement {
+                        purpose: "reclaim storage after deletion".to_string(),
+                        sql: "VACUUM events RETAIN 0 HOURS".to_string(),
+                    },
+                ],
+                tables: None,
+                totals: None,
+                plan_id: None,
+            },
+        )?;
+
+        // Apply the plan using the inner function with an explicit root, so we
+        // don't need to change the process-global current directory.
+        run_archive_apply_in(dir.path(), &config_path, &plan_id, false).await?;
+
+        // Plan round-trip sanity.
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Archive);
+
+        Ok(())
+    }
+
+    /// `archive apply` with a wrong kind (compact plan) returns a clear error.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn archive_apply_rejects_compact_plan() -> anyhow::Result<()> {
+        use anyhow::anyhow;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test_arc_wrong.duckdb");
+        {
+            let adapter =
+                DuckDbWarehouseAdapter::open(&db_path).map_err(|e| anyhow!("setup: {e}"))?;
+            adapter
+                .execute_statement("CREATE TABLE y (id INTEGER)")
+                .await
+                .map_err(|e| anyhow!("setup: {e}"))?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.test]
+strategy = "full_refresh"
+
+[pipeline.test.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.test.target]
+catalog_template = "test"
+schema_template = "staging__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )?;
+
+        // Write a compact plan (wrong kind for archive apply).
+        let plan_id = write_plan(
+            dir.path(),
+            PlanKind::Compact,
+            &serde_json::json!({"dummy": true}),
+        )?;
+
+        let err = run_archive_apply_in(dir.path(), &config_path, &plan_id, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compact plan, not an archive plan"),
+            "error should mention kind mismatch, got: {msg}"
+        );
+        Ok(())
     }
 }

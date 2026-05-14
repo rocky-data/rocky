@@ -21,6 +21,10 @@ export interface ArchiveOutput {
   older_than: string;
   older_than_days: number;
   /**
+   * Plan identifier (full 64-char blake3 hex). Populated when the plan is persisted to `.rocky/plans/` so it can be applied later via `rocky archive apply <plan_id>`. Absent when plan persistence is skipped.
+   */
+  plan_id?: string | null;
+  /**
    * `"catalog"` for the catalog-scoped path; absent for single-model invocations.
    */
   scope?: string | null;
