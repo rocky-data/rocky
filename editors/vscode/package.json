@@ -671,6 +671,33 @@
         }
       ]
     },
+    "chatParticipants": [
+      {
+        "id": "rocky-data.rocky",
+        "name": "rocky",
+        "fullName": "Rocky",
+        "description": "Generate, explain, test, and sync Rocky pipelines",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "generate",
+            "description": "Generate a Rocky model from a description"
+          },
+          {
+            "name": "explain",
+            "description": "Explain the active Rocky model"
+          },
+          {
+            "name": "sync",
+            "description": "Discover and sync sources"
+          },
+          {
+            "name": "test",
+            "description": "Generate quality tests for a model"
+          }
+        ]
+      }
+    ],
     "keybindings": [
       {
         "command": "rocky.commandPalette",

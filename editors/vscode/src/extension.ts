@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { registerChatParticipant } from "./chatParticipant";
 import { registerCodeLensProvider } from "./codeLens";
 import { registerCommands } from "./commands";
 import { registerCostCodeLensProvider } from "./costCodeLens";
@@ -18,6 +19,7 @@ export function activate(context: vscode.ExtensionContext): void {
   setExtensionUri(context.extensionUri);
   startLspClient(context);
   registerCommands(context);
+  registerChatParticipant(context);
   registerTestExplorer(context);
   registerDeclarativeTestProvider(context);
   registerCodeLensProvider(context);
