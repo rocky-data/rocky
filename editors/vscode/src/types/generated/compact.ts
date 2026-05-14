@@ -24,6 +24,10 @@ export interface CompactOutput {
    */
   model?: string | null;
   /**
+   * Plan identifier (full 64-char blake3 hex). Populated when the plan is persisted to `.rocky/plans/` so it can be applied later via `rocky compact apply <plan_id>`. Absent when plan persistence is skipped (e.g. `--measure-dedup` path).
+   */
+  plan_id?: string | null;
+  /**
    * `"catalog"` for the catalog-scoped path; absent for single-model invocations to keep their envelope byte-stable.
    */
   scope?: string | null;

@@ -42,6 +42,10 @@ class ArchiveOutput(BaseModel):
     model: str | None = None
     older_than: str
     older_than_days: conint(ge=0)
+    plan_id: str | None = None
+    """
+    Plan identifier (full 64-char blake3 hex). Populated when the plan is persisted to `.rocky/plans/` so it can be applied later via `rocky archive apply <plan_id>`. Absent when plan persistence is skipped.
+    """
     scope: str | None = None
     """
     `"catalog"` for the catalog-scoped path; absent for single-model invocations.

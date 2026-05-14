@@ -17,16 +17,17 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApproveOutput, ArchiveOutput,
-    BranchDeleteOutput, BranchListOutput, BranchOutput, BranchPromoteOutput, CatalogOutput,
-    CiDiffOutput, CiOutput, ClearSchemaCacheOutput, ColumnLineageOutput, CompactDedupOutput,
-    CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
-    DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
-    HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
-    ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
-    PreviewDiffOutput, ProfileStorageOutput, ReplayOutput, RetentionStatusOutput,
-    RetentionSweepOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput,
-    TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApproveOutput,
+    ArchiveApplyOutput, ArchiveOutput, BranchDeleteOutput, BranchListOutput, BranchOutput,
+    BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput, ClearSchemaCacheOutput,
+    ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput, CompactOutput, CompareOutput,
+    CompileOutput, ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput,
+    DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
+    LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput,
+    OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
+    ProfileStorageOutput, ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, RunOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
+    ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -74,7 +75,9 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<CompareOutput>("compare"),
         entry::<CompactOutput>("compact"),
         entry::<CompactDedupOutput>("compact_dedup"),
+        entry::<CompactApplyOutput>("compact_apply"),
         entry::<ArchiveOutput>("archive"),
+        entry::<ArchiveApplyOutput>("archive_apply"),
         entry::<ProfileStorageOutput>("profile_storage"),
         entry::<ImportDbtOutput>("import_dbt"),
         entry::<HooksListOutput>("hooks_list"),
