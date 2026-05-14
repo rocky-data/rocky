@@ -16,7 +16,7 @@ Companion release to engine `v1.32.0`. Wires the Cluster 3 B plan/apply spine in
 - **`RockyResource.plan(...)` method.** Mirrors `compile`. Calls `rocky plan --output json`, returns the typed `PlanOutput` with `plan_id`, `plan_kind`, `created_at`, plus the existing legacy plan fields. Companion to engine [#523](https://github.com/rocky-data/rocky/pull/523).
 - **`RockyResource.apply(plan_id, ...)` method.** Mirrors `run` but takes a `plan_id`. Dispatches whatever `PlanKind` the plan has. Returns `ApplyOutput { plan_id, kind, result }` envelope. Companion to engine [#523](https://github.com/rocky-data/rocky/pull/523).
 - **`RockyResource.plan_promote(branch, base, allow_breaking=False, ...)` method.** Mirrors `branch_promote` but returns a typed `PromotePlan` (with `branch_state_hash`, `approvals_used`, `breaking_changes`, `targets[]`) — the breaking-change gate runs at plan time. Companion to engine [#527](https://github.com/rocky-data/rocky/pull/527).
-- **New typed surfaces** re-exported from `dagster_rocky/types.py`: `CompactApplyOutput`, `ArchiveApplyOutput`, `StatementResult`, `RunPlan`, `PromotePlan`, `PromoteTargetPlan`, `ApplyOutput`, `PlanOutput` (evolved with new fields).
+- **New typed surfaces** re-exported from `dagster_rocky/types.py`: `CompactApplyOutput`, `ArchiveApplyOutput`, `StatementResult`, `PromotePlan`, `PromoteTargetPlan`, `ApplyOutput`, `PlanOutput` (evolved with new fields).
 - **`parse_rocky_output()` dispatch entries** for `"compact apply"`, `"archive apply"`, `"plan"`, `"apply"`, `"plan promote"` commands.
 
 ### Changed
