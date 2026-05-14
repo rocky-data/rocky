@@ -1,0 +1,13 @@
+{
+  "iconDefinitions": {
+    "_rocky_file": {
+      "iconPath": "../icons/rocky-icon.svg"
+    }
+  },
+  "fileExtensions": {
+    "rocky": "_rocky_file"
+  },
+  "fileNames": {
+    "rocky.toml": "_rocky_file"
+  }
+}

@@ -33,6 +33,13 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "iconThemes": [
+      {
+        "id": "rocky-icons",
+        "label": "Rocky File Icons",
+        "path": "./fileicons/rocky-icon-theme.json"
+      }
+    ],
     "languages": [
       {
         "id": "rocky",
