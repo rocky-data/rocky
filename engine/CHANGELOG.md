@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.32.0] — 2026-05-14
+## [1.32.0] — 2026-05-15
 
 Headline: **Cluster 3 B plan/apply spine fully shipped end-to-end.** Three PRs land the unified plan/apply UX across `compact` / `archive` / `run` / `branch promote`. Plus a small LSP semantic-token column fix.
 
