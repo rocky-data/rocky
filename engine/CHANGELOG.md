@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **LSP semantic tokens off-by-one column** (`rocky-server`). `sqlparser` reports identifier spans with **1-indexed** lines *and* columns, but the LSP token collector only converted the line (`line - 1`) and emitted the column as-is. Identifiers at the end of a line ended up with `endChar = startChar + len` overflowing the line length, causing VS Code to log `Invalid Semantic Tokens Data From Extension: end character > model.getLineLength(lineNumber)` and silently drop the tokens. Fix subtracts 1 from `column` on every emitted token in `collect_tokens_from_table_factor` and the `Identifier` / `CompoundIdentifier` / `Function` arms of `collect_tokens_from_expr`. The qualified-name token in `collect_tokens_from_table_factor` also now uses the first identifier's `value.len()` instead of the full `name.to_string().len()`, so the range can't extend past the line when a `catalog.schema.model` name wraps.
+
 ## [1.31.0] — 2026-05-13
 
 **Cluster 3 E — semantic breaking-change diff — shipped end-to-end** across three PRs. Rocky now produces typed structural classifications of changes between two `ProjectIr` snapshots, exposes them informationally via `rocky ci-diff --semantic`, and uses them as a failing pre-promote gate on `rocky branch promote`. Strictly more powerful than text-shaped diff (SQLMesh's approach): operates on the typed IR rather than parsing emitted SQL strings.

@@ -2887,8 +2887,11 @@ fn collect_tokens_from_table_factor(
                 if let Some(first_ident) = first_part.as_ident() {
                     let line = first_ident.span.start.line as u32;
                     let col = first_ident.span.start.column as u32;
-                    // line is 1-indexed from sqlparser, convert to 0-indexed
-                    tokens.push((line.saturating_sub(1), col, table_name.len() as u32, 0)); // NAMESPACE
+                    // sqlparser uses 1-indexed line/column; LSP expects 0-indexed.
+                    // Only emit a token for the leading identifier so the range
+                    // can't extend past the line if the qualified name wraps.
+                    let len = first_ident.value.len() as u32;
+                    tokens.push((line.saturating_sub(1), col.saturating_sub(1), len, 0)); // NAMESPACE
                 }
             }
         }
@@ -2904,16 +2907,17 @@ fn collect_tokens_from_expr(
         ast::Expr::Identifier(ident) => {
             let line = ident.span.start.line as u32;
             let col = ident.span.start.column as u32;
-            if line > 0 {
-                tokens.push((line - 1, col, ident.value.len() as u32, 1)); // VARIABLE
+            // sqlparser uses 1-indexed line/column; LSP expects 0-indexed.
+            if line > 0 && col > 0 {
+                tokens.push((line - 1, col - 1, ident.value.len() as u32, 1)); // VARIABLE
             }
         }
         ast::Expr::CompoundIdentifier(parts) => {
             for part in parts {
                 let line = part.span.start.line as u32;
                 let col = part.span.start.column as u32;
-                if line > 0 {
-                    tokens.push((line - 1, col, part.value.len() as u32, 1)); // VARIABLE
+                if line > 0 && col > 0 {
+                    tokens.push((line - 1, col - 1, part.value.len() as u32, 1)); // VARIABLE
                 }
             }
         }
@@ -2924,8 +2928,11 @@ fn collect_tokens_from_expr(
                     if let Some(first_ident) = first_part.as_ident() {
                         let line = first_ident.span.start.line as u32;
                         let col = first_ident.span.start.column as u32;
-                        if line > 0 {
-                            tokens.push((line - 1, col, func_name.len() as u32, 2)); // FUNCTION
+                        // Emit only the first ident's length to keep the range
+                        // single-line and within the line bounds.
+                        let len = first_ident.value.len() as u32;
+                        if line > 0 && col > 0 {
+                            tokens.push((line - 1, col - 1, len, 2)); // FUNCTION
                         }
                     }
                 }
