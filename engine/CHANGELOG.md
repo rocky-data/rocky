@@ -7,9 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-05-15
+
+Headline: **Cluster 3 B plan/apply spine fully shipped end-to-end.** Three PRs land the unified plan/apply UX across `compact` / `archive` / `run` / `branch promote`. Plus a small LSP semantic-token column fix.
+
+### Added
+
+- **Persistent plan store.** New `plan_store` module persists plans at `./.rocky/plans/<plan_id>.json`, keyed by a full 64-character blake3 hex digest of the canonical `{kind, payload}` envelope. Plans are content-addressed — same intent → same plan_id. Extensible `PlanKind` enum (Compact / Archive / Run / Promote). PR [#522](https://github.com/rocky-data/rocky/pull/522).
+- **`rocky compact apply <plan-id>` / `rocky archive apply <plan-id>`.** Phase 1 wires the `apply` subcommand for the two simplest verbs. Today's `rocky compact` / `rocky archive` already generate SQL but don't execute — users copy-paste. Now they save the plan and apply it. Per-statement `StatementResult { purpose, sql, success, duration_ms, error }` so partial failures roll up cleanly. DuckDB rejects OPTIMIZE/VACUUM cleanly via the per-statement error path; no adapter-specific branching. PR [#522](https://github.com/rocky-data/rocky/pull/522).
+- **`rocky plan` + `rocky apply` unified entry.** Phase 2 introduces the top-level plan/apply spine. `rocky plan` compiles + emits a content-addressed `RunPlan` JSON; `rocky apply <plan-id>` dispatches by `PlanKind` (Compact → existing apply, Archive → existing apply, Run → existing run path). `--inline` flag skips persistence. `rocky run` is now an alias for `rocky apply --inline` (behavior preserved exactly). New `PlanOutput` evolved additively. PR [#523](https://github.com/rocky-data/rocky/pull/523).
+- **`rocky plan promote <branch>` + `branch promote --plan <plan-id>`.** Phase 3 folds `branch promote` into the plan/apply spine. `rocky plan promote` runs the approval gate + breaking-change classifier at plan time and persists a `PromotePlan` (with `branch_state_hash`, `approvals_used`, `breaking_changes`, `targets[]`). `branch promote --plan <plan-id>` skips the plan step — the canonical "review the plan in CI, apply on merge" UX. Bare `branch promote <branch>` keeps working as an alias that internally chains plan + apply (byte-stable JSON output preserved). New `AuditEventKind::PromotePlanCreated` variant. PR [#527](https://github.com/rocky-data/rocky/pull/527).
+
 ### Fixed
 
-- **LSP semantic tokens off-by-one column** (`rocky-server`). `sqlparser` reports identifier spans with **1-indexed** lines *and* columns, but the LSP token collector only converted the line (`line - 1`) and emitted the column as-is. Identifiers at the end of a line ended up with `endChar = startChar + len` overflowing the line length, causing VS Code to log `Invalid Semantic Tokens Data From Extension: end character > model.getLineLength(lineNumber)` and silently drop the tokens. Fix subtracts 1 from `column` on every emitted token in `collect_tokens_from_table_factor` and the `Identifier` / `CompoundIdentifier` / `Function` arms of `collect_tokens_from_expr`. The qualified-name token in `collect_tokens_from_table_factor` also now uses the first identifier's `value.len()` instead of the full `name.to_string().len()`, so the range can't extend past the line when a `catalog.schema.model` name wraps.
+- **LSP semantic tokens off-by-one column** (`rocky-server`). `sqlparser` reports identifier spans with 1-indexed lines *and* columns, but the LSP token collector only converted the line (`line - 1`) and emitted the column as-is. Identifiers at the end of a line ended up with `endChar = startChar + len` overflowing the line length, causing VS Code to silently drop the tokens. Fix subtracts 1 from `column` on every emitted token in `collect_tokens_from_table_factor` and the `Identifier` / `CompoundIdentifier` / `Function` arms of `collect_tokens_from_expr`. PR [#524](https://github.com/rocky-data/rocky/pull/524).
+- **Fixture-determinism: `created_at` wall-clock field now sentinelled.** Push-fix to PR #523 added `created_at` to `scripts/_normalize_fixture.py::WALL_CLOCK_FIELDS` so the regen-fixtures corpus stays byte-stable across runs.
+
+### Dependencies
+
+- `cargo update` SemVer-compatible bumps: `aws-lc-rs` 1.16.3→1.17.0, `aws-lc-sys` 0.40.0→0.41.0, `clap_complete` 4.6.4→4.6.5, `filetime` 0.2.28→0.2.29, `jsonschema` 0.46.4→0.46.5, `kqueue-sys` 1.1.1→1.1.2, `pin-project` 1.1.12→1.1.13, `pin-project-internal` 1.1.12→1.1.13, `referencing` 0.46.4→0.46.5, `winnow` 1.0.2→1.0.3, `zerofrom` 0.1.7→0.1.8.
 
 ## [1.31.0] — 2026-05-13
 

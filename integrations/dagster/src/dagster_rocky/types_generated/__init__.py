@@ -163,6 +163,12 @@ from .compact_schema import CompactOutput, NamedStatement
 # Archive command (re-uses NamedStatement from compact)
 from .archive_schema import ArchiveOutput
 
+# Compact apply command (Cluster 3 B Phase 1 — plan/apply spine for compact)
+from .compact_apply_schema import CompactApplyOutput, StatementResult
+
+# Archive apply command (Cluster 3 B Phase 1 — plan/apply spine for archive)
+from .archive_apply_schema import ArchiveApplyOutput
+
 # Apply command (Cluster 3 B Phase 2 — top-level plan/apply spine)
 from .apply_schema import ApplyOutput
 
@@ -353,6 +359,11 @@ __all__ = [
     "NamedStatement",
     # archive
     "ArchiveOutput",
+    # compact apply (Cluster 3 B Phase 1)
+    "CompactApplyOutput",
+    "StatementResult",
+    # archive apply (Cluster 3 B Phase 1)
+    "ArchiveApplyOutput",
     # apply (Cluster 3 B Phase 2 — top-level plan/apply spine)
     "ApplyOutput",
     # profile-storage

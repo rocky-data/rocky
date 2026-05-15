@@ -990,6 +990,7 @@ from .types_generated import (  # noqa: E402, F401
     ApproveOutput,
     ApproverIdentity,
     ApproverSource,
+    ArchiveApplyOutput,
     AssetKind,
     AuditEvent,
     AuditEventKind,
@@ -1010,6 +1011,7 @@ from .types_generated import (  # noqa: E402, F401
     ColumnClassificationStatus,
     ColumnLineageOutput,
     ColumnTrendPoint,
+    CompactApplyOutput,
     CompileOutput,
     ComplianceException,
     ComplianceOutput,
@@ -1078,6 +1080,7 @@ from .types_generated import (  # noqa: E402, F401
     RunOutput,
     SignatureAlgorithm,
     SourceOutput,
+    StatementResult,
     StateOutput,
     TableCheckOutput,
     TableErrorOutput,
@@ -1138,6 +1141,8 @@ RockyOutput = (
     | ApproveOutput
     | BranchPromoteOutput
     | PromotePlan
+    | CompactApplyOutput
+    | ArchiveApplyOutput
 )
 
 
@@ -1174,6 +1179,8 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "branch approve": ApproveOutput,
     "branch promote": BranchPromoteOutput,
     "plan promote": PromotePlan,
+    "compact apply": CompactApplyOutput,
+    "archive apply": ArchiveApplyOutput,
 }
 
 
