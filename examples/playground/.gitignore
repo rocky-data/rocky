@@ -14,6 +14,7 @@ pocs/**/expected/*.txt
 pocs/**/expected/*.jsonl
 pocs/**/expected/*.log
 pocs/**/expected/*.err
+pocs/**/expected/*.stderr
 !pocs/**/expected/.gitkeep
 # Aspirational target shapes for not-yet-implemented commands stay tracked.
 !pocs/**/expected/*.example.json
