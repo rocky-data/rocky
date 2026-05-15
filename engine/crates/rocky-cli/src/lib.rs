@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod deprecation;
 pub mod error_reporter;
 pub mod otel_guard;
 pub mod output;

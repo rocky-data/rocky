@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **`rocky run`** — Phase 4 of the plan/apply spine. Bare `rocky run` now emits a one-line `[deprecated]` notice to stderr pointing at the canonical `rocky plan` + `rocky apply <plan-id>` flow. Behaviour is unchanged; removal is targeted for a future major release. JSON-on-stdout is untouched. Suppress with `ROCKY_SUPPRESS_DEPRECATION=1`.
+- **`rocky branch promote <name>`** (without `--plan`) — same Phase 4 cycle. Emits a stderr notice pointing at `rocky plan promote <name>` + `rocky apply <plan-id>`. The `--plan` form is the canonical "review the plan in CI, apply on merge" UX. Suppress with `ROCKY_SUPPRESS_DEPRECATION=1`.
+
+The dagster integration sets `ROCKY_SUPPRESS_DEPRECATION=1` on every subprocess invocation as of `dagster-rocky 1.31.0`, so existing `RockyResource.materialize()` / `RockyResource.run()` callers see no change.
+
 ## [1.32.0] — 2026-05-15
 
 Headline: **Cluster 3 B plan/apply spine fully shipped end-to-end.** Three PRs land the unified plan/apply UX across `compact` / `archive` / `run` / `branch promote`. Plus a small LSP semantic-token column fix.

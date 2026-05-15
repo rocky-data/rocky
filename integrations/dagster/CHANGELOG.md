@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Suppress engine deprecation notices on every subprocess invocation.** Companion to engine Phase 4 (alias deprecation for `rocky run` / `rocky branch promote <name>`). `RockyResource._run_rocky_with_log_sink` now passes a per-subprocess environment to `subprocess.Popen` with `ROCKY_SUPPRESS_DEPRECATION=1` set (`setdefault`, so operators can override). Without this, every dagster-driven `rocky run` would emit a `[deprecated]` line into stderr and surface as Dagster log noise. Migration of the resource off the alias verbs is a separate work item.
+
 ## [1.30.0] — 2026-05-15
 
 Companion release to engine `v1.32.0`. Wires the Cluster 3 B plan/apply spine into the dagster integration.
