@@ -178,8 +178,10 @@ steps:
   - name: Rocky compile (type-check analytics models)
     run: rocky compile --models ./models
 
-  - name: Rocky run (analytics layer)
-    run: rocky run --pipeline analytics
+  - name: Rocky plan + apply (analytics layer)
+    run: |
+      plan_id=$(rocky plan --pipeline analytics --output json | jq -r .plan_id)
+      rocky apply "$plan_id"
 ```
 
 Each tool manages its own models independently. dbt owns the package-generated staging layer; Rocky owns the analytics layer on top.

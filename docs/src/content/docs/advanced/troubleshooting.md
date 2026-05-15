@@ -148,7 +148,8 @@ The embedded redb state file is damaged.
 **Fix:** Delete the state file and re-run. This resets all watermarks, so the next run will be a full refresh:
 ```bash
 rm .rocky-state.redb
-rocky run --filter client=acme
+plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
+rocky apply "$plan_id"
 ```
 
 ## Build Issues

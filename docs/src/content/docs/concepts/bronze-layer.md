@@ -14,12 +14,12 @@ Rocky does not extract data from external systems. It operates on data that has 
 ## The flow
 
 ```
-rocky discover  →  rocky plan  →  rocky run
+rocky discover  →  rocky plan  →  rocky apply
 ```
 
 1. **Discover** — Finds what schemas and tables are available for processing. For `fivetran` adapters, calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, queries `information_schema`. For `manual` adapters, reads inline schema/table definitions. Discovery is metadata-only — it identifies what exists, it does not extract data.
-2. **Plan** — Parses source schema names, resolves target catalogs/schemas, generates SQL statements. Shows what will happen without executing.
-3. **Run** — Executes the plan: creates catalogs/schemas, copies data, runs quality checks, updates watermarks.
+2. **Plan** — Parses source schema names, resolves target catalogs/schemas, generates SQL statements. Records a deterministic plan keyed by `plan_id`.
+3. **Apply** — Executes the plan by id: creates catalogs/schemas, copies data, runs quality checks, updates watermarks. The legacy `rocky run` alias collapses plan + apply into a single invocation and still works.
 
 ## Schema pattern parsing
 
@@ -117,7 +117,8 @@ These are appended to the SELECT: `SELECT *, CAST(NULL AS STRING) AS _loaded_by`
 Scope execution to a specific tenant:
 
 ```bash
-rocky run --config rocky.toml --filter tenant=acme
+plan_id=$(rocky --config rocky.toml plan --filter tenant=acme --output json | jq -r .plan_id)
+rocky apply "$plan_id"
 ```
 
 This processes only schemas where the parsed tenant component matches `acme`.

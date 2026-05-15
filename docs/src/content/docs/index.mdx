@@ -43,9 +43,10 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
 rocky playground my-first-project
 cd my-first-project
-rocky compile    # type-check
-rocky test       # run assertions locally
-rocky run        # execute the pipeline
+rocky compile            # type-check
+rocky test               # run assertions locally
+rocky plan               # build a plan, prints plan_id
+rocky apply <plan-id>    # execute the plan
 ```
 
 No credentials needed — the playground is DuckDB-backed.

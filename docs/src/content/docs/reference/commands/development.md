@@ -73,7 +73,7 @@ Playground ready! Run:
 
 ## `rocky import-dbt`
 
-Import an existing dbt project as a **runnable Rocky repo**. Parses `dbt_project.yml` + `profiles.yml`, translates each `.sql` model body (expanding `{{ ref(...) }}` / `{{ source(...) }}` to plain identifiers; leaving other Jinja with a `# TODO: dbt-jinja-not-translated` comment), and writes a self-contained Rocky directory layout that `rocky compile` and `rocky run` can use directly.
+Import an existing dbt project as a **runnable Rocky repo**. Parses `dbt_project.yml` + `profiles.yml`, translates each `.sql` model body (expanding `{{ ref(...) }}` / `{{ source(...) }}` to plain identifiers; leaving other Jinja with a `# TODO: dbt-jinja-not-translated` comment), and writes a self-contained Rocky directory layout that `rocky compile` and `rocky plan` + `rocky apply` can use directly.
 
 ```bash
 rocky import-dbt --dbt-project <PATH> [flags]
@@ -103,7 +103,7 @@ rocky import-dbt --dbt-project <PATH> [flags]
 └── MIGRATION-NOTES.md          summary: counts, known limitations, required env vars
 ```
 
-Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky run`.
+Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky plan` + `rocky apply`.
 
 `materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
 

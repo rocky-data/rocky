@@ -9,7 +9,7 @@ sidebar:
 
 For the design — how Rocky picks the prune set, why CTAS today and clones tomorrow, how the sampling window works — see the [How Preview Works](/concepts/preview-internals/) concept page. For the full output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
 
-Preview surfaces the data and cost shape of a PR. For typed schema-level breaking-change detection on the same PR, pair preview with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) — and rely on the hard semantic gate that fires when the branch is promoted via `rocky branch promote`. The full flow (PR-time detection → promote-time gate → audited override) is documented in the [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
+Preview surfaces the data and cost shape of a PR. For typed schema-level breaking-change detection on the same PR, pair preview with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) — and rely on the hard semantic gate that fires when the branch is promoted via `rocky plan promote` + `rocky apply` (or the legacy `rocky branch promote` alias). The full flow (PR-time detection → promote-time gate → audited override) is documented in the [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ You'll need:
 - Rocky installed and on `$PATH` (the [Getting Started guide](/getting-started/introduction/) has install instructions).
 - A repo with a `rocky.toml` and a `models/` directory.
 - A git working tree on a feature branch with at least one model change vs. the base ref.
-- The base schema's tables already materialized — `preview create` copies them into the per-PR branch schema, so they need to exist. Running `rocky run` once on `main` is enough.
+- The base schema's tables already materialized — `preview create` copies them into the per-PR branch schema, so they need to exist. Running `rocky plan` + `rocky apply` once on `main` is enough.
 
 The walkthrough below uses `--base main`, but any git ref works.
 
@@ -35,7 +35,7 @@ What this does:
 3. Computes the **copy set** — every working-DAG model not in the prune set.
 4. Registers a branch in the state store (mirrors `rocky branch create`).
 5. Issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` for each copy-set model.
-6. Calls `rocky run --branch <name>` with a model selector limited to the prune set.
+6. Calls `rocky run --branch <name>` with a model selector limited to the prune set. (The `--branch` flag currently lives on the `rocky run` alias only.)
 
 The output is a `PreviewCreateOutput` JSON document:
 
@@ -184,7 +184,7 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op
 
 **`base ref not found`.** `rocky preview create --base <ref>` requires the ref to exist locally. Run `git fetch origin <ref>` first if you're working against a remote-only ref like `origin/main`.
 
-**`preview cost` reports `null` deltas.** Cost requires a prior `RunRecord` for each compared model on the base schema. If the base schema has never been run end-to-end, `base_run_id` is `null` and per-model `delta_usd` falls back to `null`. Run `rocky run` once on `main` to populate the state store, then re-run `preview cost`.
+**`preview cost` reports `null` deltas.** Cost requires a prior `RunRecord` for each compared model on the base schema. If the base schema has never been run end-to-end, `base_run_id` is `null` and per-model `delta_usd` falls back to `null`. Run `rocky plan` + `rocky apply` once on `main` to populate the state store, then re-run `preview cost`.
 
 **`preview cost` reports `null` for the branch.** The cost rollup uses the same adapter telemetry as [`rocky cost`](/reference/commands/administration/#rocky-cost). DuckDB and unconfigured adapters report `null` USD by design; duration and bytes still surface. Configure `[cost]` in `rocky.toml` to get dollar amounts on Databricks / Snowflake.
 

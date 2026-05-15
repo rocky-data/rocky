@@ -14,14 +14,14 @@ For symptom-first lookup ("I got error X, what do I do?"), see [Troubleshooting]
 | Category | Detection signal | Surface |
 |---|---|---|
 | [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E026` | `rocky compile`, `rocky ci`, LSP red squiggles |
-| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E013` | `rocky compile`, `rocky ci`, `rocky run` (pre-flight) |
-| [Schema drift](#3-schema-drift) | `DriftAction` enum on `rocky drift` / `rocky run` output | `rocky drift`, `rocky run` materialisation block |
-| [Quality check failures](#4-quality-check-failures) | `check_results[].status == "Failed"` | `rocky run --output json` |
-| [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky run` exit + `error` field on materialisation | `rocky run`, `rocky doctor` |
+| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E013` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
+| [Schema drift](#3-schema-drift) | `DriftAction` enum on `rocky drift` / `rocky apply` output | `rocky drift`, `rocky apply` materialisation block |
+| [Quality check failures](#4-quality-check-failures) | `check_results[].status == "Failed"` | `rocky apply --output json` |
+| [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky apply` exit + `error` field on materialisation | `rocky apply`, `rocky doctor` |
 | [State store failures](#6-state-store-failures) | `state_sync.status: failed`, lockfile errors, missing watermarks | `rocky doctor`, `rocky state` |
-| [Hook failures](#7-hook-failures) | `hook_results[].status == "Failed"`; `on_failure: error` aborts the run | `rocky run --output json`, `rocky hooks test` |
-| [Cost / budget violations](#8-cost--budget-violations) | `budget_violation` field on materialisation; `--enforce-budgets` flips to non-zero exit | `rocky cost`, `rocky run` |
-| [Governance failures](#9-governance-failures) | `permissions_diff` returns errors, `mask_actions` lists unresolved tags (`W004`) | `rocky run`, `rocky plan --env` |
+| [Hook failures](#7-hook-failures) | `hook_results[].status == "Failed"`; `on_failure: error` aborts the run | `rocky apply --output json`, `rocky hooks test` |
+| [Cost / budget violations](#8-cost--budget-violations) | `budget_violation` field on materialisation; `--enforce-budgets` flips to non-zero exit | `rocky cost`, `rocky apply` |
+| [Governance failures](#9-governance-failures) | `permissions_diff` returns errors, `mask_actions` lists unresolved tags (`W004`) | `rocky apply`, `rocky plan --env` |
 
 The categories are **independent** — a single pipeline can hit several at once, and the recovery for each is independent of the others. When triaging, work down the list in order: compile-time failures fail fast and cheap, runtime failures cost warehouse credits, governance failures land at the very end of a successful materialisation.
 
@@ -47,7 +47,7 @@ The categories are **independent** — a single pipeline can hit several at once
 3. Fix the model SQL or the upstream contract that triggered the diagnostic.
 4. Re-run `rocky compile` until clean.
 
-**Why this matters first.** Every other category in the taxonomy assumes compile is green. A `rocky run` against a project with compile errors aborts before any warehouse work, so it's pointless to debug runtime symptoms while diagnostics are red.
+**Why this matters first.** Every other category in the taxonomy assumes compile is green. A `rocky apply` against a project with compile errors aborts before any warehouse work, so it's pointless to debug runtime symptoms while diagnostics are red.
 
 ---
 
@@ -81,7 +81,7 @@ The categories are **independent** — a single pipeline can hit several at once
 
 **Definition.** The source schema differs from the target table's current schema. Rocky's [graduated drift handling](../../features/schema-drift) tries to handle the divergence in place (`ALTER COLUMN TYPE` for safe widenings, `ALTER TABLE ADD COLUMN` for new columns) and falls back to drop-and-recreate only when it can't.
 
-**Detection signal.** The `DriftResult` struct on `rocky drift` / `rocky run --output json` carries `action: DriftAction`. Three possible actions:
+**Detection signal.** The `DriftResult` struct on `rocky drift` / `rocky apply --output json` carries `action: DriftAction`. Three possible actions:
 
 | `action` | Meaning |
 |---|---|
@@ -94,7 +94,7 @@ The `drifted_columns` array names which columns changed and what the divergence 
 **Recovery playbook.**
 
 - **`Ignore`** — no action needed; the pipeline already chose to surface drift as a warning. Audit `[drift] mode` in `rocky.toml` if the policy doesn't match your team's appetite.
-- **`AlterColumnTypes`** — let the next `rocky run` apply the `ALTER`. Verify in your warehouse afterwards that downstream tables / views / dashboards still parse the widened type correctly.
+- **`AlterColumnTypes`** — let the next `rocky apply` apply the `ALTER`. Verify in your warehouse afterwards that downstream tables / views / dashboards still parse the widened type correctly.
 - **`DropAndRecreate`** — Rocky will full-refresh the target on the next run. If the table is large or downstream consumers can't tolerate the temporary unavailability, schedule the next run during a maintenance window.
 - For columns in the **grace period** (`grace_period_columns`), decide before the deadline whether to keep them (re-adding upstream restores the column) or accept the drop.
 
@@ -110,13 +110,13 @@ The `drifted_columns` array names which columns changed and what the divergence 
 
 **Recovery playbook.**
 
-1. Identify the failing check from `rocky run --output json | jq '.check_results[] | select(.status == "Failed")'`. Each failure carries the failing row sample so you can reproduce in the warehouse.
+1. Identify the failing check from `rocky apply --output json | jq '.check_results[] | select(.status == "Failed")'`. Each failure carries the failing row sample so you can reproduce in the warehouse.
 2. Decide whether the failure is a **data issue** or a **check-definition issue**:
    - **Data issue** (the upstream data violated an expectation the check was right to enforce): triage upstream, replay or backfill the offending partition, then re-run.
    - **Check-definition issue** (the check assertion is stricter than reality should be): adjust the check threshold / predicate in `rocky.toml`. Re-run.
 3. For checks that are *advisory* rather than gating, set `severity = "warn"` on the check so it lands in the output as a warning instead of a failure — preserves the signal without flipping the run status.
 
-**Why checks don't abort by default.** A pipeline with one failed check on `model_A` shouldn't block downstream materialisations of unrelated models. To make checks fail the run hard, set `[execution] fail_on_check_error = true` in `rocky.toml` or pass `--fail-on-check-error` to `rocky run`.
+**Why checks don't abort by default.** A pipeline with one failed check on `model_A` shouldn't block downstream materialisations of unrelated models. To make checks fail the run hard, set `[execution] fail_on_check_error = true` in `rocky.toml` or pass `--fail-on-check-error` to `rocky apply`.
 
 ---
 
@@ -124,7 +124,7 @@ The `drifted_columns` array names which columns changed and what the divergence 
 
 **Definition.** A warehouse call (compile-passing, contract-passing, drift-handled) failed at execution time. Network errors, auth errors, quota errors, statement timeouts, deadlocks — anything that originates inside the adapter rather than the engine.
 
-**Detection signal.** Non-zero `rocky run` exit code, `error` field on the affected `MaterializationOutput`, plus a transient/rate-limit classification on the underlying error.
+**Detection signal.** Non-zero `rocky apply` exit code, `error` field on the affected `MaterializationOutput`, plus a transient/rate-limit classification on the underlying error.
 
 The dispatched adapter classifies its own failures:
 
@@ -139,7 +139,7 @@ The dispatched adapter classifies its own failures:
 **Recovery playbook.**
 
 1. Run `rocky doctor --output json` first. The `adapters[]` block tells you which adapter Rocky thinks should work and which it currently can't reach. Treat doctor as a credentials / connectivity smoke test.
-2. For **transient** failures (`is_transient: true` on the adapter error), use `rocky run --resume-latest` to pick up where the failed run left off rather than restarting from scratch.
+2. For **transient** failures (`is_transient: true` on the adapter error), use `rocky run --resume-latest` (the resume flags currently live on the `rocky run` alias only) to pick up where the failed run left off rather than restarting from scratch.
 3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../features/authentication) has the per-adapter checklist.
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or — better — re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).
@@ -156,7 +156,7 @@ The dispatched adapter classifies its own failures:
 
 | Symptom | Where it surfaces |
 |---|---|
-| `state file locked` | `rocky run` aborts immediately; `rocky doctor.state.status: failed` |
+| `state file locked` | `rocky apply` aborts immediately; `rocky doctor.state.status: failed` |
 | `state file corrupted` | `rocky doctor.state.status: failed`; the structured error names the corrupted table |
 | Missing watermark | `rocky state --output json` shows `watermarks: []` for a model that should have one; the next run becomes a `FullRefresh` |
 | `state_sync` upload failure | `rocky doctor.state_sync.status: failed`; the local state still works but the remote backup is stale |
@@ -193,7 +193,7 @@ The dispatched adapter classifies its own failures:
 
 **Definition.** A model's actual run cost exceeded the per-model `[budget]` block in its sidecar `.toml`, or the project-level cost-projection (`rocky cost --output json`) flagged a PR as over-budget vs. the base ref.
 
-**Detection signal.** `MaterializationOutput.budget_violation` (post-run) or `CostOutput.summary.delta_usd` (pre-run, branch-vs-base). The `--enforce-budgets` flag flips per-model violations from warnings into a non-zero `rocky run` exit.
+**Detection signal.** `MaterializationOutput.budget_violation` (post-run) or `CostOutput.summary.delta_usd` (pre-run, branch-vs-base). The `--enforce-budgets` flag flips per-model violations from warnings into a non-zero `rocky apply` exit.
 
 **Recovery playbook.**
 
@@ -237,7 +237,7 @@ The dispatched adapter classifies its own failures:
 
 - [Troubleshooting](./troubleshooting) — symptom-first lookup ("I got error X")
 - [`rocky doctor`](../../reference/cli#doctor) — aggregate health check across config, state, adapters, pipelines
-- [`rocky run --resume-latest`](../../reference/cli#run) — resume a failed run from its checkpoint
+- [`rocky run --resume-latest`](../../reference/cli#run) — resume a failed run from its checkpoint (resume flags currently live on the `rocky run` alias only)
 - [Schema drift](../../features/schema-drift) — graduated drift handling deep dive
 - [Data quality checks](../../features/data-quality-checks) — inline check authoring + result shape
 - [Governance guide](../../guides/governance) — permissions, classification, masking, retention

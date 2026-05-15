@@ -85,23 +85,23 @@ rocky -o table discover
 
 Calls the Fivetran API and lists connectors matching the schema pattern.
 
-## 5. Preview the SQL
+## 5. Plan
 
 ```bash
-rocky plan --filter tenant=acme
+plan_id=$(rocky plan --filter tenant=acme --output json | jq -r .plan_id)
 ```
 
-Shows the SQL Rocky will generate, without executing it.
+Compiles the pipeline, runs drift detection, and records a deterministic plan keyed by `plan_id`. Inspect it (SQL, drift actions, checks) before committing to a run.
 
-## 6. Run
+## 6. Apply
 
 ```bash
-rocky run --filter tenant=acme
+rocky apply "$plan_id"
 ```
 
-Executes the full pipeline: discover → create catalogs/schemas → detect drift → copy data → run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
+Executes the plan: discover → create catalogs/schemas → apply drift → copy data → run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
 
-Resume from the last checkpoint after a failure:
+Resume from the last checkpoint after a failure. The resume flag currently lives on the legacy `rocky run` alias (which continues to work alongside `rocky plan` + `rocky apply`):
 
 ```bash
 rocky run --filter tenant=acme --resume-latest

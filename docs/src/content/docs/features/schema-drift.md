@@ -57,7 +57,7 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## Output
 
-Drift detection runs inline during `rocky run`; the actions taken are reported in the `drift` section of the run JSON output:
+Drift detection runs inline during `rocky apply`; the actions taken are reported in the `drift` section of the run JSON output:
 
 ```json
 {
@@ -81,4 +81,4 @@ Use `rocky plan` to preview the SQL Rocky would emit (including any drop stateme
 rocky plan --filter client=acme --output json
 ```
 
-Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky run` yet — safe-widening drift currently falls through without action.
+Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky apply` yet — safe-widening drift currently falls through without action.

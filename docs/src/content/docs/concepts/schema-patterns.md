@@ -200,11 +200,11 @@ schema_template = "{department}__{system}"
 
 ## Filtering by parsed component
 
-Once your sources are parsed into components, you can scope `rocky plan`, `rocky run`, and `rocky compare` to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value — with containment semantics for multi-valued (`...`) components:
+Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the legacy `rocky run` alias) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value — with containment semantics for multi-valued (`...`) components:
 
 ```sh
-# Run everything for tenant "acme"
-rocky run --filter tenant=acme
+# Plan everything for tenant "acme" (then `rocky apply <plan-id>` to execute)
+rocky plan --filter tenant=acme
 
 # Compare every source that touches us-west (works because `regions...` is multi-valued)
 rocky compare --filter regions=us_west

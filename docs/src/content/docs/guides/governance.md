@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-Rocky provides a governance layer that enforces data quality, schema stability, access control, masking, retention, and auditability. Most governance features are declarative: you configure them in `rocky.toml` (or a model sidecar) and they execute automatically as part of `rocky run`. Two governance features are exposed as standalone commands for CI gating: `rocky compliance` (classification vs. masking rollup) and `rocky retention-status` (per-model retention report).
+Rocky provides a governance layer that enforces data quality, schema stability, access control, masking, retention, and auditability. Most governance features are declarative: you configure them in `rocky.toml` (or a model sidecar) and they execute automatically as part of `rocky apply`. Two governance features are exposed as standalone commands for CI gating: `rocky compliance` (classification vs. masking rollup) and `rocky retention-status` (per-model retention report).
 
 The five governance pillars live on the pipeline target and across project-level blocks:
 
@@ -176,7 +176,7 @@ This catches contract violations before code reaches production.
 
 ## 3. Grants (Pillar 1 of 5)
 
-Rocky manages Databricks Unity Catalog permissions declaratively. Define desired grants in `rocky.toml` and Rocky reconciles them during each `rocky run`.
+Rocky manages Databricks Unity Catalog permissions declaratively. Define desired grants in `rocky.toml` and Rocky reconciles them during each `rocky apply`.
 
 ### Catalog-level grants
 
@@ -212,7 +212,7 @@ permissions = ["USE SCHEMA", "SELECT"]
 
 ### Reconciliation flow
 
-During `rocky run`, for each managed catalog and schema:
+During `rocky apply`, for each managed catalog and schema:
 
 1. **Read** desired permissions from `[pipeline.<name>.target.governance.grants]` and `[pipeline.<name>.target.governance.schema_grants]`
 2. **Query** current state with `SHOW GRANTS ON CATALOG` and `SHOW GRANTS ON SCHEMA`
@@ -310,7 +310,7 @@ Any tag listed here suppresses the `W004` "tag has no masking strategy" compiler
 
 ### How apply works
 
-After the DAG completes successfully, `rocky run` iterates each model's `[classification]` block and calls the governance adapter's `apply_column_tags` and `apply_masking_policy` hooks. Both are best-effort: failures emit `warn!` and the pipeline continues, mirroring the `apply_grants` semantics.
+After the DAG completes successfully, `rocky apply` iterates each model's `[classification]` block and calls the governance adapter's `apply_column_tags` and `apply_masking_policy` hooks. Both are best-effort: failures emit `warn!` and the pipeline continues, mirroring the `apply_grants` semantics.
 
 On Databricks, Rocky uses Unity Catalog column tags plus `CREATE MASK` / `SET MASKING POLICY`, with **one statement per column** -- UC rejects multi-column masking DDL in a single statement. BigQuery, Snowflake, and DuckDB silently no-op until adapter-specific coverage lands.
 
@@ -543,7 +543,7 @@ cost_center = "CC-1234"
 
 ### What gets tagged
 
-Tags are applied at three levels during `rocky run`:
+Tags are applied at three levels during `rocky apply`:
 
 | Level | SQL | Applied Tags |
 |---|---|---|
@@ -695,7 +695,7 @@ The check passes if the query result is less than or equal to the threshold.
 
 ## 11. Audit Trail
 
-Rocky stores run history and quality metrics in the embedded state store (redb), providing a queryable audit trail. Every `rocky run` now stamps eight extra governance fields on its `RunRecord` (shipped in engine-v1.16.0, Wave A); the full trail is available via `rocky history --audit`.
+Rocky stores run history and quality metrics in the embedded state store (redb), providing a queryable audit trail. Every `rocky apply` now stamps eight extra governance fields on its `RunRecord` (shipped in engine-v1.16.0, Wave A); the full trail is available via `rocky history --audit`.
 
 ### `rocky history --audit` and the 8 audit fields
 
@@ -714,7 +714,7 @@ Each `RunRecord` carries:
 | `session_source` | Auto-detected: `Cli` / `Dagster` / `Lsp` / `HttpApi`. |
 | `git_commit` | Resolved at run start from the current repo. |
 | `git_branch` | Resolved at run start from the current repo. |
-| `idempotency_key` | Echoed from `rocky run --idempotency-key <KEY>` when passed. |
+| `idempotency_key` | Echoed from `rocky run --idempotency-key <KEY>` when passed (the idempotency-key flag currently lives on the `rocky run` alias only). |
 | `target_catalog` | The catalog(s) the run wrote to. |
 | `hostname` | The host that executed the run. |
 | `rocky_version` | The CLI version that produced the record. |

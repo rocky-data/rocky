@@ -624,7 +624,7 @@ Terminal outcomes surface as structured `outcome` fields on `state.upload` / `st
 
 ### `[state.idempotency]`
 
-Tuning knobs for `rocky run --idempotency-key <KEY>` dedup. All fields are optional with the shown defaults; the block is a no-op on runs that don't pass `--idempotency-key`. Unknown fields are rejected.
+Tuning knobs for `rocky run --idempotency-key <KEY>` dedup (the idempotency-key flag currently lives on the `rocky run` alias only). All fields are optional with the shown defaults; the block is a no-op on runs that don't pass `--idempotency-key`. Unknown fields are rejected.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -764,7 +764,7 @@ Controls the schema cache.
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable schema cache reads + writes. Set to `false` for strict CI where every typecheck should resolve against the current warehouse. |
 | `ttl_seconds` | integer | `86400` | TTL for cache entries in seconds (default 24h). Lower for high-DDL-churn teams. |
-| `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off — a fresh clone should warm its cache from its own `rocky run`, not inherit another machine's stale types. |
+| `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off — a fresh clone should warm its cache from its own `rocky apply`, not inherit another machine's stale types. |
 
 ```toml
 [cache.schemas]
@@ -907,7 +907,7 @@ pii = "partial"         # staging gets a softer mask than the dev default
 
 Resolution precedence:
 
-1. `[mask.<env>]` entry for the active env (when supplied to `rocky run --env <env>`).
+1. `[mask.<env>]` entry for the active env (when supplied to `rocky plan --env <env>`).
 2. `[mask]` workspace default.
 3. Unmatched tag — W004 warning unless the tag is listed in [`[classifications] allow_unmasked`](#classifications).
 

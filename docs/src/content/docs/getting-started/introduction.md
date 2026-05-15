@@ -21,12 +21,12 @@ A Rust-based control plane for warehouse-side data work. Storage and compute sta
 | Extract (files) | ✅ | `rocky load` — CSV, Parquet, JSONL from a directory into the warehouse |
 | Load (bronze replication) | ✅ | Config-driven replication pipelines. Discovery via Fivetran metadata, DuckDB `information_schema`, or manual declaration |
 | Transform | ✅ | Compiled SQL models — no Jinja, no manifest, no parse step |
-| Quality | ✅ | Inline assertions during `rocky run`; no separate test step |
+| Quality | ✅ | Inline assertions during `rocky apply`; no separate test step |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` for small standalone teams |
 
 ## What Rocky does
 
-1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
+1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch <name>` (branch execution currently lives on the `rocky run` alias only), `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
 2. **Cost attribution + budgets** — per-model cost on every run. `[budget]` block in `rocky.toml`; `budget_breach` hook event on exceed.
 3. **Resume + circuit breakers** — three-state `CircuitBreaker`, checkpointed run state, deploy safety.
 4. **Observability** — `rocky trace` Gantt output, OpenTelemetry OTLP export (feature-gated).
@@ -49,9 +49,9 @@ A Rust-based control plane for warehouse-side data work. Storage and compute sta
 | Templating | Jinja | None — pure SQL |
 | Staging models | One `.sql` per source table | Config-driven bronze (zero SQL) |
 | Dependencies | `{{ ref('model') }}` | `depends_on = ["model"]` |
-| Tests | `schema.yml` + `dbt test` | Inline checks + assertions in `rocky run` |
+| Tests | `schema.yml` + `dbt test` | Inline checks + assertions in `rocky apply` |
 | State | `manifest.json` + `target/` | Embedded `redb` database |
-| Branches | — | `rocky branch create`, `rocky run --branch` |
+| Branches | — | `rocky branch create`, `rocky run --branch <name>` |
 | Column-level lineage | Post-hoc (`dbt docs`) | Compile-time output |
 | Cost attribution | — | Per-model, every run |
 

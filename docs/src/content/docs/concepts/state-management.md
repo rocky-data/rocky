@@ -16,7 +16,8 @@ Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store 
 By default, Rocky stores state in `.rocky-state.redb` in the current directory. You can override this with the `--state-path` flag:
 
 ```bash
-rocky run --config rocky.toml --state-path /var/lib/rocky/state.redb
+plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan --output json | jq -r .plan_id)
+rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 ```
 
 ## What it stores
