@@ -17,7 +17,7 @@ sidebar:
 
 3. **Compute the copy set.** Every working-DAG model not in the prune set is a copy candidate: it's logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. For each copy-set model, Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter — the portable copy substrate, with per-adapter overrides described below.
 
-4. **Run the prune set.** Rocky calls the existing branch run path ([`rocky run --branch <name>`](/reference/commands/core-pipeline/#rocky-run)) with a model selector limited to the prune set. The branch is registered via [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch); the run writes into the branch's `schema_prefix`.
+4. **Run the prune set.** Rocky calls the existing branch run path ([`rocky run --branch <name>`](/reference/commands/core-pipeline/#rocky-run)) with a model selector limited to the prune set. The branch is registered via [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch); the run writes into the branch's `schema_prefix`. (The `--branch` flag currently lives on the `rocky run` alias only; plumbing it through `rocky plan` + `rocky apply` is a future-phase follow-up.)
 
 The final output ([`PreviewCreateOutput`](#output-shapes)) records `prune_set`, `copy_set`, and `skipped_set` so the decision is auditable from the JSON alone.
 

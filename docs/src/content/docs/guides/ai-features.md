@@ -49,7 +49,7 @@ Error: ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.
 
 ## 2. Generate a Model from Intent
 
-The `rocky ai` command generates a model from a natural language description and **writes both the body file and a matching `.toml` sidecar to the models directory**. The emitted sidecar carries the materialization strategy + target coordinates, so Rocky's loader picks the generated model up on the next `rocky run` without manual editing.
+The `rocky ai` command generates a model from a natural language description and **writes both the body file and a matching `.toml` sidecar to the models directory**. The emitted sidecar carries the materialization strategy + target coordinates, so Rocky's loader picks the generated model up on the next `rocky apply` without manual editing.
 
 ```bash
 rocky ai "monthly revenue by product category from orders and products, completed orders only"

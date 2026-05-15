@@ -158,6 +158,8 @@ lookback = 3
 
 ### CLI flags
 
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. The partition-selection flags below are currently only accepted on the legacy `rocky run` alias; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`).
+
 ```bash
 rocky run --partition 2026-04-01           # Process one partition
 rocky run --from 2026-03-01 --to 2026-04-01  # Date range

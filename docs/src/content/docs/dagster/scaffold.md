@@ -78,7 +78,8 @@ After scaffolding, the README guides users through:
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
 
 # Validate the pipeline locally (DuckDB, no credentials required)
-rocky run --config rocky.toml
+plan_id=$(rocky --config rocky.toml plan --output json | jq -r .plan_id)
+rocky apply "$plan_id"
 
 # Launch the Dagster UI
 dg dev

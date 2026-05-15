@@ -7,7 +7,7 @@ sidebar:
 
 Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
 
-- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `run`, `state`, `branch`
+- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (legacy alias: `run`)
 - **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
@@ -26,7 +26,7 @@ These flags apply to all commands.
 | `--config <PATH>` | `-c` | `rocky.toml` | Path to the pipeline configuration file. |
 | `--output <FORMAT>` | `-o` | `json` | Output format. Accepted values: `json`, `table`. |
 | `--state-path <PATH>` | | resolved (see below) | Path to the embedded state store. When omitted, Rocky resolves to `<models>/.rocky-state.redb` (canonical) or a legacy CWD `.rocky-state.redb` (deprecated, warns on stderr). Passing the flag explicitly is always a hard override. See [`rocky state`](/reference/commands/administration/#rocky-state). |
-| `--cache-ttl <SECONDS>` | | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
+| `--cache-ttl <SECONDS>` | | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky plan`, `rocky apply`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
 
 ```bash
 # Example: use a custom config and table output
@@ -193,6 +193,8 @@ rocky plan --filter <key=value> [--pipeline NAME]
 
 ### `rocky run`
 
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`.
+
 Executes the full pipeline end-to-end.
 
 ```bash
@@ -236,7 +238,7 @@ rocky run --filter <key=value> [flags]
 5. **Retry** — failed tables retried sequentially (configurable via `execution.table_retries`)
 
 :::note
-Governance (tags, workspace bindings, permissions) is NOT a separate CLI command. It runs inline during `rocky run` as catalogs and schemas are created. The governance features are Databricks Unity Catalog specific.
+Governance (tags, workspace bindings, permissions) is NOT a separate CLI command. It runs inline during `rocky apply` (or the `rocky run` alias) as catalogs and schemas are created. The governance features are Databricks Unity Catalog specific.
 :::
 
 **JSON output:**
@@ -421,7 +423,7 @@ data_type = "DATE"
 
 ### `rocky compare`
 
-Compare shadow tables against production tables. Used after `rocky run --shadow` to validate results before promoting shadow data to production.
+Compare shadow tables against production tables. Used after `rocky run --shadow` (shadow mode currently lives on the `rocky run` alias only) to validate results before promoting shadow data to production.
 
 ```bash
 rocky compare --filter <key=value> [flags]
@@ -487,7 +489,7 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 
 When `--state-path` is not passed, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
 
-1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky run` writes.
+1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
 2. Legacy `.rocky-state.redb` in CWD — still works; emits a one-time deprecation warning on stderr.
 3. Both present — CWD wins (to preserve existing watermarks / branches / partitions); a louder warning asks you to reconcile. Merge is lossy.
 4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists, otherwise CWD.

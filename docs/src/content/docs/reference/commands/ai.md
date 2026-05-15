@@ -11,7 +11,7 @@ The AI commands use large language models to generate Rocky models from natural 
 
 ## `rocky ai`
 
-Generate a model from a natural language description and write **both the body file and a matching `.toml` sidecar** to the models directory. The emitted sidecar carries the materialization strategy and target coordinates, so Rocky's model loader picks the generated model up on the next `rocky run` without manual editing.
+Generate a model from a natural language description and write **both the body file and a matching `.toml` sidecar** to the models directory. The emitted sidecar carries the materialization strategy and target coordinates, so Rocky's model loader picks the generated model up on the next `rocky apply` without manual editing.
 
 ```bash
 rocky ai <intent> [flags]
@@ -35,7 +35,7 @@ rocky ai <intent> [flags]
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
 
 :::note[Merge limitation]
-`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky run` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization` — they need richer flag plumbing or live in the IR-only surface.
+`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky apply` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization` — they need richer flag plumbing or live in the IR-only surface.
 :::
 
 ### Examples

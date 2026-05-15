@@ -64,20 +64,22 @@ rocky ci-diff --semantic --output json | jq '.breaking_findings'
 
 Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking` / `warning` / `info`). `ci-diff --semantic` is **informational** — even a `breaking` finding does not change `ci-diff`'s exit code. Use it on every PR to make breaking changes visible to reviewers before promotion.
 
-The hard gate lives on `rocky branch promote`. When promoting a branch to production, Rocky runs the same classifier against `--base-ref` (default `main`); any finding with `severity == "breaking"` blocks the promote and the command exits nonzero. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking`. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
+The hard gate lives on `rocky plan promote` + `rocky apply`. When promoting a branch to production, Rocky runs the same classifier against `--base-ref` (default `main`); any finding with `severity == "breaking"` blocks the promote at plan time and the apply step refuses to execute the plan. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
 
 ```bash
 # PR-time: detect (informational)
 rocky ci-diff --semantic
 
 # Promote-time: gate (blocks on `breaking` findings)
-rocky branch promote fix-price --base-ref main
+plan_id=$(rocky plan promote fix-price --base main --output json | jq -r .plan_id)
+rocky apply "$plan_id"
 
 # Promote-time override (audited)
-rocky branch promote fix-price --base-ref main --allow-breaking
+plan_id=$(rocky plan promote fix-price --base main --allow-breaking --output json | jq -r .plan_id)
+rocky apply "$plan_id"
 ```
 
-See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list and the audit-event reference under [`rocky branch promote` in the JSON output reference](/reference/json-output/#rocky-branch-promote).
+The bare `rocky branch promote <name>` form continues to work as an alias for the two-step flow above. See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list and the audit-event reference under [`rocky branch promote` in the JSON output reference](/reference/json-output/#rocky-branch-promote).
 
 ## 2. GitHub Actions
 

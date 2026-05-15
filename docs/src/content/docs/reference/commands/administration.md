@@ -112,7 +112,7 @@ run_20260401_080015      | 2026-04-01T08:00:15Z  | 52.1s     | 19     | 1      |
 
 ### Audit trail
 
-`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky run` against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
+`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky apply` (and the legacy `rocky run` alias) against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
 
 | Field | Description |
 |-------|-------------|
@@ -160,7 +160,7 @@ Text output appends a `Governance audit trail (--audit):` section after the defa
 
 ### Related Commands
 
-- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- execute a pipeline run
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute a planned pipeline (`rocky run` continues to work as an alias)
 - [`rocky state`](/reference/commands/core-pipeline/#rocky-state) -- view current watermarks
 - [`rocky metrics`](#rocky-metrics) -- view quality metrics for a model
 
@@ -265,7 +265,7 @@ rocky metrics fct_revenue --column net_revenue --alerts
 ### Related Commands
 
 - [`rocky history`](#rocky-history) -- view execution history for the model
-- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- run the pipeline to generate fresh metrics
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute a planned pipeline to generate fresh metrics
 - [`rocky optimize`](#rocky-optimize) -- get strategy recommendations based on metrics
 
 ---
@@ -708,7 +708,7 @@ rocky replay run_20260420_143022 --model fct_revenue
 
 - [`rocky trace`](#rocky-trace) -- same data rendered as a Gantt timeline
 - [`rocky history`](#rocky-history) -- list past runs
-- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- record a new run
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- record a new run
 
 ---
 
@@ -897,7 +897,7 @@ status: success   adapter: databricks   total: $0.101
 ### Adapter coverage
 
 - **Databricks / Snowflake** — cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
-- **BigQuery** — computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky run` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
+- **BigQuery** — computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky apply` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
 - **DuckDB / local** — `$0.00` by definition (no billed compute).
 - **Discovery adapters (Fivetran, Airbyte, etc.)** — skipped; cost is `None`.
 
@@ -933,7 +933,7 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 
 When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
 
-1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky run` writes.
+1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
 2. Legacy CWD `.rocky-state.redb` — still works; emits a one-time deprecation warning on stderr.
 3. Both present — CWD wins (preserves existing watermarks, branches, and partition bookkeeping); a louder warning asks you to reconcile. Merge is lossy — delete one copy to silence the warning.
 4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
@@ -969,7 +969,7 @@ rocky state clear-schema-cache --dry-run
 
 ### Behavior
 
-- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild — the next `rocky run` (write tap) or `rocky discover --with-schemas` warms it back up.
+- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild — the next `rocky apply` (write tap) or `rocky discover --with-schemas` warms it back up.
 - **No prompt.** Entries are disposable; explicit opt-in by running the command is sufficient.
 - **Missing state store is a no-op.** A fresh CI runner with no `.rocky-state.redb` yet exits zero with `entries_deleted: 0`. This keeps "flush before build" safe to run unconditionally on ephemeral runners.
 - Uninitialised cache tables return `entries_deleted: 0` without touching redb.
@@ -1070,7 +1070,7 @@ rocky compliance --env prod --fail-on exception
 
 ### Related Commands
 
-- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- applies classification tags + masking policies inline during the post-DAG governance pass
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- applies classification tags + masking policies inline during the post-DAG governance pass
 - [`rocky retention-status`](#rocky-retention-status) -- sibling governance rollup for retention declarations
 - [Governance configuration](/guides/governance/) -- `[mask]`, `[mask.<env>]`, `[classifications] allow_unmasked`
 
@@ -1136,5 +1136,5 @@ events                                   30 days          -                yes
 ### Related Commands
 
 - [`rocky compliance`](#rocky-compliance) -- sibling governance rollup for classification + masking
-- [`rocky run`](/reference/commands/core-pipeline/#rocky-run) -- applies retention policies inline during the post-DAG governance pass
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- applies retention policies inline during the post-DAG governance pass
 - [Model sidecar `retention`](/reference/model-format/) -- configure `retention = "<N>[dy]"`

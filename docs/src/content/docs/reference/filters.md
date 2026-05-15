@@ -11,8 +11,7 @@ Several Rocky commands accept a `--filter` flag to scope execution to a subset o
 
 | Command | Filter required? | What gets filtered |
 |---|---|---|
-| `rocky plan` | yes | Which sources have SQL statements generated in the dry-run |
-| `rocky run` | yes | Which sources get materialized end-to-end (drift → create → copy → check) |
+| `rocky plan` | yes | Which sources have SQL statements generated. The plan is then executed with `rocky apply <plan-id>`, which materializes only those sources end-to-end (drift → create → copy → check). |
 | `rocky compare` | yes | Which shadow-vs-prod tables are compared |
 
 `rocky discover` does NOT take a filter — it always reports every source the pipeline's adapter returns. Filtering is a **consumer-side** concern: discover produces the catalog, the other commands narrow it.
@@ -27,7 +26,7 @@ Exactly **one** `key=value` pair per invocation. The first `=` separates key fro
 
 ```sh
 # Value "a=b" — the first = is the separator
-rocky run --filter name=a=b
+rocky plan --filter name=a=b
 ```
 
 ## Keys
@@ -63,7 +62,7 @@ A plain variable like `tenant` matches by equality:
 
 ```sh
 # Matches sources whose parsed tenant == "acme"
-rocky run --filter tenant=acme
+rocky plan --filter tenant=acme
 ```
 
 ### Multi-valued components (`...`)
@@ -75,7 +74,7 @@ A component declared with the `...` suffix (e.g. `regions...` in the pattern abo
 # — so src__acme__us_west__shopify matches, and so does
 # src__acme__us_west__us_central__shopify, and so does
 # src__globex__emea__france__us_west__stripe.
-rocky run --filter regions=us_west
+rocky plan --filter regions=us_west
 ```
 
 This is almost always what you want in multi-region pipelines: "run everything that touches us-west".
@@ -89,7 +88,7 @@ Keys and values are matched case-sensitively as-is. `tenant=acme` does NOT match
 ### Run a single tenant's entire pipeline
 
 ```sh
-rocky run --filter tenant=acme
+rocky plan --filter tenant=acme
 ```
 
 ### Dry-run a single connector by id
@@ -107,7 +106,7 @@ rocky compare --filter regions=us_west
 ### Run one connector type across every tenant
 
 ```sh
-rocky run --filter source=stripe
+rocky plan --filter source=stripe
 ```
 
 ### Scope by a custom component
@@ -116,7 +115,7 @@ If your pattern is `["environment", "department", "system"]`, any of those becom
 
 ```sh
 rocky plan --filter department=finance
-rocky run  --filter system=sap
+rocky plan --filter system=sap
 ```
 
 ## Grammar
@@ -127,7 +126,7 @@ key         = "id" | <component name from schema_pattern>
 value       = any non-empty string
 ```
 
-The filter flag is mandatory for `plan`, `run`, and `compare` — these commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
+The filter flag is mandatory for `plan` and `compare` (and the legacy `run` alias) — these commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
 
 ## What's NOT supported today
 
@@ -148,7 +147,7 @@ Rocky produces actionable errors for invalid filter input:
 
 | Input | Error |
 |---|---|
-| `rocky run --filter noequalssign` | `invalid filter 'noequalssign': expected key=value (e.g., client=acme)` |
+| `rocky plan --filter noequalssign` | `invalid filter 'noequalssign': expected key=value (e.g., client=acme)` |
 | `rocky run` (flag missing) | clap: `the following required arguments were not provided: --filter <FILTER>` |
 
 A filter that parses correctly but matches zero sources is **not** an error — the command reports "0 sources after filter" and exits successfully. This is deliberate: empty match is valid orchestration output (e.g. "no tenants had new data this tick").
@@ -157,4 +156,4 @@ A filter that parses correctly but matches zero sources is **not** an error — 
 
 - [Schema Patterns](/concepts/schema-patterns/) — how source schema names are parsed into the components you filter on
 - [CLI Reference](/reference/cli/) — full CLI surface, all commands
-- [Core pipeline commands](/reference/commands/core-pipeline/) — `plan`, `run`, `compare` detail
+- [Core pipeline commands](/reference/commands/core-pipeline/) — `plan`, `apply`, `compare` detail

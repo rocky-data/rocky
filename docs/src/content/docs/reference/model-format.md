@@ -508,7 +508,7 @@ schema = "warehouse"
 table = "fct_daily_events"
 ```
 
-**CLI flags** for time-interval models:
+**CLI flags** for time-interval models. As of engine v1.33 these flags are accepted on the legacy `rocky run` alias only; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`). Plumbing them through `rocky plan` + `rocky apply` is a future-phase follow-up.
 
 ```bash
 # Process a specific partition

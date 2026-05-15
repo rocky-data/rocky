@@ -286,6 +286,8 @@ rocky plan --filter client=acme --pipeline shopify_us
 
 ## `rocky run`
 
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`.
+
 Execute the full pipeline end-to-end: discover sources, detect schema drift, create catalogs/schemas, copy data, apply governance, and run quality checks.
 
 ```bash
@@ -466,7 +468,7 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 ## `rocky branch`
 
-Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky run --branch <name>` is invoked, every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
+Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky run --branch <name>` is invoked, every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up. (The `--branch` flag currently lives on the `rocky run` alias only; plumbing it through `rocky plan` + `rocky apply` is a future-phase follow-up.)
 
 ```bash
 rocky branch create <name> [--description <text>]
@@ -478,6 +480,7 @@ rocky branch approve <name> [--message <text>] [--out <path>]
 rocky branch promote <name> [--allow-breaking] [--base-ref <ref>]
                             [--models <path>] [--skip-approval]
                             [--filter <key=value>]
+rocky branch promote <name> --plan <plan-id>   # canonical: plan + apply
 ```
 
 Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
@@ -492,6 +495,8 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 Writes a content-addressed approval artifact that binds the approver's git identity to the branch's current state hash. `rocky branch promote` later refuses to run unless the on-disk approvals satisfy the [`[branch.approval]`](/reference/configuration/#branchapproval) policy.
 
 ### `branch promote` flags
+
+> Note: as of engine v1.33, the canonical form is `rocky plan promote <name>` followed by `rocky apply <plan-id>` (or `rocky branch promote <name> --plan <plan-id>`). The bare `rocky branch promote <name>` form continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|

@@ -104,6 +104,8 @@ Consumers diffing successive discover snapshots **must** treat ids that appear i
 
 ### `rocky run`
 
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; the JSON output shape below is the same on both `apply` and `run` (the `command` field reflects which verb was invoked). Suppress the alias's stderr deprecation notice with `ROCKY_SUPPRESS_DEPRECATION=1`.
+
 Returns a complete summary of the pipeline execution.
 
 ```json
@@ -371,9 +373,9 @@ Aggregate health checks across config, state, adapters, and pipelines.
 
 ---
 
-### Drift (inline within `rocky run`)
+### Drift (inline within `rocky apply`)
 
-There is no standalone `rocky drift` CLI command today — drift detection runs inline during `rocky run` and surfaces through the top-level `drift` field of the run JSON output (already shown under [`rocky run`](#rocky-run) above).
+There is no standalone `rocky drift` CLI command today — drift detection runs inline during `rocky apply` (or the legacy `rocky run` alias) and surfaces through the top-level `drift` field of the run JSON output (already shown under [`rocky run`](#rocky-run) above).
 
 **Field reference for `drift`:**
 
@@ -880,6 +882,8 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 ---
 
 ### `rocky branch promote`
+
+> Note: as of engine v1.33, the canonical form is `rocky plan promote <name>` followed by `rocky apply <plan-id>` (or `rocky branch promote <name> --plan <plan-id>`). The bare `rocky branch promote <name>` form continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`. The JSON output shape below is identical across all three forms.
 
 Promotes a branch's tables to their production targets. Emits the approval and semantic-breaking-change gate decisions in `audit`, the per-target SQL outcomes in `targets`, and a top-level `success` flag.
 

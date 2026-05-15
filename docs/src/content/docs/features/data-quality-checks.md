@@ -196,7 +196,7 @@ The quarantine predicate is built from every quarantinable assertion, combined w
 
 ### Output
 
-Every assertion produces a `check_results[]` entry in the `rocky run` JSON output:
+Every assertion produces a `check_results[]` entry in the `rocky apply` JSON output:
 
 ```json
 {
