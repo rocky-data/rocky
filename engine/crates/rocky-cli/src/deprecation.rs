@@ -18,10 +18,17 @@ use std::io::{self, Write};
 const SUPPRESS_ENV_VAR: &str = "ROCKY_SUPPRESS_DEPRECATION";
 
 /// Stderr message emitted by `rocky run`.
+///
+/// Wording acknowledges that `rocky plan` / `rocky apply` do not yet accept
+/// the full flag surface of `rocky run` (e.g. `--resume`, `--shadow`,
+/// `--partition`, `--idempotency-key`, `--parallel`, `--all`, `--branch`,
+/// `--governance-override`, `--dag`). Until plan/apply parity lands those
+/// flags continue to live on `rocky run` and the alias is retained for them.
 pub const RUN_DEPRECATION: &str = "\
-`rocky run` is deprecated and will be removed in a future major release. \
-Use `rocky plan` to persist a content-addressed run plan, then `rocky apply <plan-id>` to execute it. \
-The two-step flow produces an auditable artifact at `.rocky/plans/<plan-id>.json`. \
+`rocky run` is deprecated for basic invocations — the canonical form is `rocky plan` followed by `rocky apply <plan-id>`, \
+which persists an auditable artifact at `.rocky/plans/<plan-id>.json`. \
+Advanced flags (--resume, --shadow, --partition, --idempotency-key, --parallel, --all, --branch, --governance-override, --dag) \
+are not yet available on `rocky plan` / `rocky apply` and remain on `rocky run` until plan/apply parity lands. \
 Suppress this warning with ROCKY_SUPPRESS_DEPRECATION=1.";
 
 /// Stderr message emitted by bare `rocky branch promote <name>` (without `--plan`).
