@@ -1792,7 +1792,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 // `rocky run` is routed through `apply::run_apply_inline_for_run`
                 // (the Phase 2 alias path). This is a thin passthrough — behaviour
-                // is unchanged. Phase 4 will add a deprecation notice here.
+                // is unchanged. Phase 4 emits a deprecation notice; the canonical
+                // flow is `rocky plan` + `rocky apply <plan-id>`. The notice
+                // honours `ROCKY_SUPPRESS_DEPRECATION=1` (dagster sets it).
+                rocky_cli::deprecation::warn(rocky_cli::deprecation::RUN_DEPRECATION);
                 //
                 // `rocky_cli::commands::run` handles SIGINT internally so it
                 // can flush watermarks + mark in-flight tables as
@@ -2332,6 +2335,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     .await
                 } else {
                     // Bare-verb: plan + apply inline (backward-compatible).
+                    // Phase 4 emits a deprecation notice; canonical flow is
+                    // `rocky plan promote <name>` + `rocky apply <plan-id>`.
+                    rocky_cli::deprecation::warn(
+                        rocky_cli::deprecation::BRANCH_PROMOTE_DEPRECATION,
+                    );
                     let branch_name = name.ok_or_else(|| {
                         anyhow::anyhow!(
                             "branch name is required when not using --plan. \

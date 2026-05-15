@@ -1117,11 +1117,21 @@ class RockyResource(dg.ConfigurableResource):
         # equivalent; ``proc.kill()`` fallback in ``_kill_process_group``
         # handles the single-process case, which is all rocky does on
         # Windows today.
+        # Inherit the parent environment and force-suppress engine deprecation
+        # notices. `RockyResource.materialize()` still routes through `rocky run`
+        # (and operators can call branch promote in its bare form); engine-v1.33+
+        # would otherwise emit a `[deprecated]` line on stderr for every
+        # invocation, surfacing as noise in Dagster run logs. Migration off the
+        # alias verbs is a separate dagster work item, tracked alongside the
+        # engine Phase 4 cycle.
+        rocky_env = os.environ.copy()
+        rocky_env.setdefault("ROCKY_SUPPRESS_DEPRECATION", "1")
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,
             "bufsize": 1,  # line-buffered so the readers see lines as they're written
+            "env": rocky_env,
         }
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
