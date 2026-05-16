@@ -37,18 +37,20 @@
       "type": "object"
     },
     "NamedStatement": {
-      "description": "Named SQL statement (purpose + sql), reused by compact and archive.",
+      "description": "Named SQL statement (purpose + sql), reused by compact and archive.\n\n`sql` is optional in preparation for the v2 persisted plan format (Cluster 3 C — \"SQL as `.o` files\"). Today's emission path always populates `Some(string)` for both stdout JSON and the persisted plan; the v2 format will write `None` and rely on the apply path to regenerate SQL from the plan's typed IR.",
       "properties": {
         "purpose": {
           "type": "string"
         },
         "sql": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "purpose",
-        "sql"
+        "purpose"
       ],
       "type": "object"
     }
