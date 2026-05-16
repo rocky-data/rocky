@@ -609,4 +609,98 @@ schema_template = "staging__{{source}}"
         );
         Ok(())
     }
+
+    /// Cluster 3 C — C-3 equivalence proof.
+    ///
+    /// The CLI's inline `generate_archive_sql` and the typed-IR-driven
+    /// `rocky_core::sql_gen::archive_from_ir` must emit byte-identical
+    /// `(purpose, sql)` pairs for every input the current emission
+    /// path uses today (single-model, wildcard, and
+    /// per-table-in-catalog-scope). If this test fails, the v2
+    /// persisted plan format would silently regenerate different SQL
+    /// at apply time — see the audit memo for Phase C.
+    ///
+    /// `dialect` is plumbed through `archive_from_ir` for forward
+    /// compatibility but is unused by today's emission path (which
+    /// matches the inline CLI behavior). The Databricks dialect is
+    /// used here because it is the dialect archive targets (Delta
+    /// Lake `DELETE` / `VACUUM` with `DATEADD` runtime date math).
+    mod archive_from_ir_equivalence {
+        use super::*;
+        use rocky_core::sql_gen::archive_from_ir;
+        use rocky_databricks::dialect::DatabricksSqlDialect;
+        use rocky_ir::ArchivePlanIr;
+
+        fn assert_equivalent(model: Option<&str>, days: u64) {
+            let dialect = DatabricksSqlDialect;
+            let inline = generate_archive_sql(model, days)
+                .expect("inline generation must succeed for valid inputs");
+
+            // Mirror today's IR construction: `for_table` for named
+            // models, manual construction for the wildcard path.
+            let ir = match model {
+                Some(table) => ArchivePlanIr::for_table(table, days),
+                None => ArchivePlanIr {
+                    target_table: None,
+                    older_than: format!("{days}d"),
+                    older_than_days: days,
+                    partition_column: "_fivetran_synced".to_string(),
+                    vacuum_retention_hours: Some(0),
+                },
+            };
+            let ir_pairs = archive_from_ir(&ir, &dialect)
+                .expect("ir generation must succeed for valid inputs");
+            assert_eq!(
+                inline, ir_pairs,
+                "archive_from_ir must produce byte-identical SQL to the inline path \
+                 for model={model:?} days={days}",
+            );
+        }
+
+        #[test]
+        fn matches_single_model_default_older_than() {
+            // 90 days is today's canonical default (`rocky archive
+            // --older-than 90d`).
+            assert_equivalent(Some("catalog.schema.events"), 90);
+        }
+
+        #[test]
+        fn matches_single_model_custom_older_than() {
+            assert_equivalent(Some("catalog.schema.events"), 180);
+            assert_equivalent(Some("catalog.schema.events"), 365);
+        }
+
+        #[test]
+        fn matches_two_part_table_ref() {
+            // Catalog-scope CLI invocations resolve managed tables to
+            // fully-qualified `catalog.schema.table` strings. Two-part
+            // and single-segment forms also need to round-trip.
+            assert_equivalent(Some("schema.events"), 90);
+            assert_equivalent(Some("events"), 90);
+        }
+
+        #[test]
+        fn matches_catalog_scope_per_table() {
+            // Simulate the `--catalog` path: every table in the scope
+            // goes through the same single-model emission. Each pair
+            // must match individually so the flat `statements` list
+            // (the catalog-envelope concatenation) is byte-stable.
+            let tables = [
+                "warehouse.facts.events",
+                "warehouse.facts.orders",
+                "warehouse.facts.line_items",
+            ];
+            for fqn in tables {
+                assert_equivalent(Some(fqn), 90);
+            }
+        }
+
+        #[test]
+        fn matches_wildcard_target() {
+            // `model = None` reproduces today's degenerate
+            // `DELETE FROM *` emission — preserved for byte-equivalence
+            // even though the resulting SQL is intentionally invalid.
+            assert_equivalent(None, 30);
+        }
+    }
 }
