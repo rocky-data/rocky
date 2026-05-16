@@ -1160,7 +1160,7 @@ pub struct ClassificationsConfig {
 /// The empty-list guard protects callers from a footgun where a
 /// misconfigured permission store or off-by-one serializer silently
 /// strips every workspace binding from the target catalog.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GovernanceOverride {
     /// Desired workspace-binding set for this run.
     ///

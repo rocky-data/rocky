@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky plan` flag-surface parity with `rocky run`.** `rocky plan` now accepts the full flag surface of `rocky run` (`--resume`, `--resume-latest`, `--shadow`, `--shadow-suffix`, `--shadow-schema`, `--branch`, `--partition`, `--from`, `--to`, `--latest`, `--missing`, `--lookback`, `--parallel`, `--all`, `--dag`, `--idempotency-key`, `--governance-override`, `--model`, `--models`) — the plan/apply pair is now a complete replacement for `rocky run`. Flags are captured into the persisted `RunPlan` payload so `rocky apply <plan-id>` honours them at apply time, including branch → shadow resolution. `--watch` is the one exception: its re-run-loop semantics have no plan/apply analogue and it remains exclusive to `rocky run`.
+
 ### Deprecated
 
-- **`rocky run`** — Phase 4 of the plan/apply spine. Bare `rocky run` now emits a one-line `[deprecated]` notice to stderr pointing at the canonical `rocky plan` + `rocky apply <plan-id>` flow. Behaviour is unchanged. JSON-on-stdout is untouched. Suppress with `ROCKY_SUPPRESS_DEPRECATION=1`.
-
-  **Scope note (added 2026-05-16):** the canonical `rocky plan` / `rocky apply` pair currently accepts only the basic invocation surface (`--filter`, `--pipeline`, `--env`). Advanced flags — `--resume` / `--resume-latest`, `--shadow*`, `--partition` / `--from` / `--to` / `--latest` / `--missing` / `--lookback`, `--idempotency-key`, `--parallel`, `--all`, `--branch`, `--governance-override`, `--dag` — continue to live on `rocky run` until plan/apply parity lands. The deprecation message acknowledges this. `rocky run` is retained for those advanced flows.
+- **`rocky run`** — Phase 4 of the plan/apply spine. Bare `rocky run` now emits a one-line `[deprecated]` notice to stderr pointing at the canonical `rocky plan` + `rocky apply <plan-id>` flow. Behaviour is unchanged. JSON-on-stdout is untouched. Suppress with `ROCKY_SUPPRESS_DEPRECATION=1`. With the flag-surface parity above, `rocky run` is now fully migratable; only `--watch` callers (re-run loop) need to keep using it.
 - **`rocky branch promote <name>`** (without `--plan`) — same Phase 4 cycle. Emits a stderr notice pointing at `rocky plan promote <name>` + `rocky apply <plan-id>`. The `--plan` form is the canonical "review the plan in CI, apply on merge" UX. Suppress with `ROCKY_SUPPRESS_DEPRECATION=1`.
 
 The dagster integration sets `ROCKY_SUPPRESS_DEPRECATION=1` on every subprocess invocation as of `dagster-rocky 1.31.0`, so existing `RockyResource.materialize()` / `RockyResource.run()` callers see no change.

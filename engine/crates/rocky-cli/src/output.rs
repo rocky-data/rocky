@@ -2092,6 +2092,9 @@ pub struct RunPlan {
     /// Pipeline name if `--pipeline` was specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// Single compiled model to execute (`--model`). Skips replication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Branch name if `--branch` was specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -2107,7 +2110,9 @@ pub struct RunPlan {
     /// Whether `--latest` was specified.
     #[serde(default)]
     pub latest: bool,
-    /// Whether `--missing` was specified.
+    /// Whether `--missing` was specified. Resolved against the state store
+    /// at apply time (the partition set is computed when the plan is
+    /// applied, not when it is planned).
     #[serde(default)]
     pub missing: bool,
     /// Lookback window (`--lookback`).
@@ -2122,6 +2127,45 @@ pub struct RunPlan {
     /// Optional governance environment (`--env`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
+    /// Models directory used for transformation execution (`--models`).
+    /// Defaults to `models/` when unset, resolved relative to the config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
+    /// Resume a failed run by `run_id` (`--resume`). At apply time this is
+    /// passed through to the run path unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// Resume the most recent failed run (`--resume-latest`). The actual
+    /// `run_id` is resolved against the state store at apply time.
+    #[serde(default)]
+    pub resume_latest: bool,
+    /// Run in shadow mode (`--shadow`). When set, `shadow_suffix` /
+    /// `shadow_schema` describe the shadow target. Mutually exclusive with
+    /// `branch`; clap rejects the combination at plan time.
+    #[serde(default)]
+    pub shadow: bool,
+    /// Suffix appended to table names in shadow mode (`--shadow-suffix`).
+    /// Only meaningful when `shadow == true` or `branch.is_some()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_suffix: Option<String>,
+    /// Override schema for shadow tables (`--shadow-schema`).
+    /// Only meaningful when `shadow == true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_schema: Option<String>,
+    /// Run all pipelines as a unified DAG (`--dag`). When `true`, apply
+    /// dispatches to the DAG runner instead of the standard run path.
+    #[serde(default)]
+    pub dag: bool,
+    /// Caller-supplied idempotency key (`--idempotency-key` or
+    /// `ROCKY_IDEMPOTENCY_KEY`). Different keys produce different plan_ids
+    /// (the hash discriminates) — there is no key-rewriting at apply time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Governance override resolved at plan time from `--governance-override`
+    /// (`@file.json` is read at plan time; the parsed struct is persisted so
+    /// apply does not need filesystem access to the original file).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governance_override: Option<rocky_core::config::GovernanceOverride>,
     /// Qualified model names discovered at plan time. Used to populate
     /// `PlanOutput.models` and surfaced in `rocky apply` dry-run info.
     /// Re-derived at apply time via recompile; this list is informational.

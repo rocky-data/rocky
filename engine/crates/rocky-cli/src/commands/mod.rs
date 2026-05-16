@@ -99,7 +99,7 @@ pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::run_metrics;
 pub use optimize::run_optimize;
-pub use plan::{plan, plan_promote};
+pub use plan::{PlanRunOptions, plan, plan_promote};
 pub use playground::{run_playground, run_playground_with_template};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
