@@ -2813,8 +2813,32 @@ mod tests {
         }
     }
 
+    /// Spawn the clap parser on a scoped thread with an 8 MB stack.
+    ///
+    /// `Cli`/`Command` is intentionally large — `Command` carries every
+    /// subcommand's argument set inline (see
+    /// `#[allow(clippy::large_enum_variant)]` on `enum Command`). The
+    /// flag-surface parity work (#535) widened `Command::Plan` materially,
+    /// and clap's generated `FromArgMatches` code now allocates a parsed
+    /// `Cli` that exceeds Rust's default 2 MB test-thread stack on Linux
+    /// (macOS gets larger defaults; CI is where the overflow shows up).
+    /// A scoped thread keeps the workaround local to test code; production
+    /// `main()` uses the OS-default 8 MB thread stack and is unaffected.
+    fn try_parse_with_big_stack(args: &[&str]) -> Cli {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    Cli::try_parse_from(args).expect("parse should succeed")
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        })
+    }
+
     fn parse_run_idempotency_key(args: &[&str]) -> Option<String> {
-        let cli = Cli::try_parse_from(args).expect("parse should succeed");
+        let cli = try_parse_with_big_stack(args);
         match cli.command {
             Command::Run {
                 idempotency_key, ..
@@ -2888,7 +2912,7 @@ mod tests {
             Option<String>,             // env
         ) -> T,
     {
-        let cli = Cli::try_parse_from(args).expect("parse should succeed");
+        let cli = try_parse_with_big_stack(args);
         match cli.command {
             Command::Plan {
                 subcommand: None,
@@ -2994,7 +3018,18 @@ mod tests {
         // `conflicts_with_all = ["shadow", "shadow_schema"]` modifier.
         let _guard = ENV_LOCK.lock().unwrap();
         remove_env("ROCKY_IDEMPOTENCY_KEY");
-        let result = Cli::try_parse_from(["rocky", "plan", "--branch", "feature_x", "--shadow"]);
+        let result = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    Cli::try_parse_from(["rocky", "plan", "--branch", "feature_x", "--shadow"])
+                        .map(|_| ())
+                        .map_err(|e| e.kind())
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
         assert!(
             result.is_err(),
             "--branch and --shadow must be mutually exclusive"
