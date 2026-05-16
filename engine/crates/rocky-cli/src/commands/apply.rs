@@ -65,6 +65,13 @@ pub(crate) async fn run_apply_in(
 
 /// Apply a `PlanKind::Run` plan by re-executing `commands::run::run` with
 /// the persisted operational metadata.
+///
+/// The full flag surface of `rocky run` is replayed from the persisted
+/// `RunPlan` payload — partitioning, shadow / branch routing, governance
+/// override, resume, idempotency key, and the `--dag` mode. Flags whose
+/// semantics depend on state at apply time (`--missing`,
+/// `--resume-latest`) are passed through as booleans; the actual state-store
+/// lookup happens inside `commands::run::run`.
 async fn run_apply_run_plan(
     root: &Path,
     config_path: &Path,
@@ -97,25 +104,55 @@ async fn run_apply_run_plan(
         parallel: run_plan.parallel,
     };
 
-    // Shadow config — not persisted in RunPlan (branch is tracked but
-    // shadow_suffix / shadow_schema are derived at apply time from branch).
-    // For Phase 2, branch → shadow routing is not wired; apply executes
-    // against the default (production) target. Phase 3 will add branch-based
-    // shadow resolution.
-    let shadow_config = if let Some(ref _branch) = run_plan.branch {
-        tracing::warn!(
-            "run plan includes a --branch flag but apply does not yet resolve \
-             branch → shadow config; executing against default target. \
-             Phase 3 will add branch-based shadow resolution."
-        );
-        None
+    // Resolve the state path via the standard resolver (mirrors main.rs).
+    // Used both by branch→shadow resolution below and by `run` itself.
+    let resolved = rocky_core::state::resolve_state_path(None, std::path::Path::new("models"));
+    let state_path = resolved.path;
+
+    // Shadow config. Mirrors the `Command::Run` dispatch in main.rs:
+    // `--branch` is internally equivalent to `--shadow --shadow-schema
+    // <branch.schema_prefix>`; otherwise `--shadow` activates the shadow
+    // path with the persisted suffix / schema override. clap rejects
+    // `--branch` combined with the shadow flags at plan time, so we only
+    // see one of the two shapes here.
+    let shadow_suffix = run_plan
+        .shadow_suffix
+        .clone()
+        .unwrap_or_else(|| "_rocky_shadow".to_string());
+    let shadow_config = if let Some(ref name) = run_plan.branch {
+        let store = rocky_core::state::StateStore::open_read_only(&state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let record = store.get_branch(name)?.with_context(|| {
+            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
+        })?;
+        Some(rocky_core::shadow::ShadowConfig {
+            suffix: shadow_suffix,
+            schema_override: Some(record.schema_prefix),
+            cleanup_after: false,
+        })
+    } else if run_plan.shadow {
+        Some(rocky_core::shadow::ShadowConfig {
+            suffix: shadow_suffix,
+            schema_override: run_plan.shadow_schema.clone(),
+            cleanup_after: false,
+        })
     } else {
         None
     };
 
-    // Resolve the state path via the standard resolver (mirrors main.rs).
-    let resolved = rocky_core::state::resolve_state_path(None, std::path::Path::new("models"));
-    let state_path = resolved.path;
+    let models_dir_path = run_plan.models_dir.as_ref().map(std::path::PathBuf::from);
+
+    // `--dag` runs every pipeline as a unified DAG. The DAG runner is
+    // currently flag-light (it reads config + tooling defaults rather than
+    // walking the same flag matrix as `commands::run::run`), so we dispatch
+    // to it for plans that captured `dag = true` and let the future
+    // unification land separately. This preserves the parity-with-`rocky run`
+    // shape for the alias-deprecation path.
+    if run_plan.dag {
+        return crate::commands::run_with_dag(config_path, output_json)
+            .await
+            .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
+    }
 
     // Capture stdout from the run command — `run` writes JSON directly.
     // We execute it normally (it emits output) to preserve streaming
@@ -130,17 +167,17 @@ async fn run_apply_run_plan(
         run_plan.filter.as_deref(),
         run_plan.pipeline.as_deref(),
         &state_path,
-        None, // governance_override — not persisted in RunPlan
+        run_plan.governance_override.as_ref(),
         output_json,
-        None, // models_dir — resolved inside run from config
+        models_dir_path.as_deref(),
         run_plan.run_all,
-        None,  // resume_run_id
-        false, // resume_latest
+        run_plan.resume.as_deref(),
+        run_plan.resume_latest,
         shadow_config.as_ref(),
         &partition_opts,
-        None, // model_name_filter
-        None, // cache_ttl_override
-        None, // idempotency_key — not re-used across apply calls
+        run_plan.model.as_deref(),
+        None, // cache_ttl_override — runtime-only, not part of the plan
+        run_plan.idempotency_key.as_deref(),
         run_plan.env.as_deref(),
     )
     .await
@@ -315,6 +352,7 @@ mod tests {
         RunPlan {
             filter: None,
             pipeline: None,
+            model: None,
             branch: None,
             partition: None,
             partition_from: None,
@@ -325,6 +363,15 @@ mod tests {
             parallel: 1,
             run_all: false,
             env: None,
+            models_dir: None,
+            resume: None,
+            resume_latest: false,
+            shadow: false,
+            shadow_suffix: None,
+            shadow_schema: None,
+            dag: false,
+            idempotency_key: None,
+            governance_override: None,
             models: vec!["schema.orders".to_string()],
             execution_layers: vec![vec!["schema.orders".to_string()]],
         }
@@ -373,12 +420,103 @@ mod tests {
         Ok(())
     }
 
+    /// Every flag in the backfilled surface round-trips through write/read +
+    /// serde. This is the apply-side guarantee that no field is silently
+    /// dropped by the persistence layer.
+    #[test]
+    fn run_plan_full_flag_surface_round_trips() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = RunPlan {
+            filter: Some("client=acme".to_string()),
+            pipeline: Some("main".to_string()),
+            model: Some("orders".to_string()),
+            branch: None,
+            partition: Some("2026-04-07".to_string()),
+            partition_from: None,
+            partition_to: None,
+            latest: false,
+            missing: false,
+            lookback: Some(7),
+            parallel: 2,
+            run_all: true,
+            env: Some("prod".to_string()),
+            models_dir: Some("custom_models".to_string()),
+            resume: Some("rid_123".to_string()),
+            resume_latest: false,
+            shadow: true,
+            shadow_suffix: Some("_my_shadow".to_string()),
+            shadow_schema: Some("custom_schema".to_string()),
+            dag: false,
+            idempotency_key: Some("my_idem_key".to_string()),
+            governance_override: Some(rocky_core::config::GovernanceOverride {
+                workspace_ids: None,
+                allow_empty_workspace_ids: false,
+                grants: vec![],
+                schema_grants: vec![],
+            }),
+            models: vec!["db.s.orders".to_string()],
+            execution_layers: vec![vec!["db.s.orders".to_string()]],
+        };
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        let decoded: RunPlan = serde_json::from_value(persisted.payload)?;
+
+        assert_eq!(decoded.model.as_deref(), Some("orders"));
+        assert_eq!(decoded.partition.as_deref(), Some("2026-04-07"));
+        assert_eq!(decoded.resume.as_deref(), Some("rid_123"));
+        assert!(decoded.shadow);
+        assert_eq!(decoded.shadow_suffix.as_deref(), Some("_my_shadow"));
+        assert_eq!(decoded.shadow_schema.as_deref(), Some("custom_schema"));
+        assert_eq!(decoded.idempotency_key.as_deref(), Some("my_idem_key"));
+        assert_eq!(decoded.models_dir.as_deref(), Some("custom_models"));
+        assert!(decoded.governance_override.is_some());
+        Ok(())
+    }
+
+    /// `--idempotency-key` is part of the content-hashed plan payload, so
+    /// two plans differing only by key get distinct plan_ids. This is the
+    /// canonical answer per the parity PR — the hash discriminates.
+    #[test]
+    fn different_idempotency_keys_produce_distinct_plan_ids() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut base = minimal_run_plan();
+        base.idempotency_key = Some("key_a".to_string());
+        let id_a = write_plan(dir.path(), PlanKind::Run, &base)?;
+
+        base.idempotency_key = Some("key_b".to_string());
+        let id_b = write_plan(dir.path(), PlanKind::Run, &base)?;
+
+        assert_ne!(
+            id_a, id_b,
+            "different idempotency keys must produce different plan_ids"
+        );
+        Ok(())
+    }
+
+    /// `--missing` and `--resume-latest` persist as booleans; both round-trip
+    /// even though the actual lookup happens at apply time against the state
+    /// store. This guards against accidental skip_serializing_if drift.
+    #[test]
+    fn deferred_state_flags_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_run_plan();
+        rp.missing = true;
+        rp.resume_latest = true;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        let decoded: RunPlan = serde_json::from_value(persisted.payload)?;
+        assert!(decoded.missing);
+        assert!(decoded.resume_latest);
+        Ok(())
+    }
+
     #[test]
     fn run_plan_with_all_flags_round_trips() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let rp = RunPlan {
             filter: Some("client=acme".to_string()),
             pipeline: Some("main".to_string()),
+            model: None,
             branch: None,
             partition: None,
             partition_from: Some("2026-01-01".to_string()),
@@ -389,6 +527,15 @@ mod tests {
             parallel: 4,
             run_all: true,
             env: Some("prod".to_string()),
+            models_dir: None,
+            resume: None,
+            resume_latest: false,
+            shadow: false,
+            shadow_suffix: None,
+            shadow_schema: None,
+            dag: false,
+            idempotency_key: None,
+            governance_override: None,
             models: vec!["db.s.orders".to_string(), "db.s.users".to_string()],
             execution_layers: vec![
                 vec!["db.s.users".to_string()],

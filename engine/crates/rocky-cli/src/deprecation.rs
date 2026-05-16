@@ -19,16 +19,18 @@ const SUPPRESS_ENV_VAR: &str = "ROCKY_SUPPRESS_DEPRECATION";
 
 /// Stderr message emitted by `rocky run`.
 ///
-/// Wording acknowledges that `rocky plan` / `rocky apply` do not yet accept
-/// the full flag surface of `rocky run` (e.g. `--resume`, `--shadow`,
-/// `--partition`, `--idempotency-key`, `--parallel`, `--all`, `--branch`,
-/// `--governance-override`, `--dag`). Until plan/apply parity lands those
-/// flags continue to live on `rocky run` and the alias is retained for them.
+/// As of the flag-surface parity work, `rocky plan` accepts the full flag
+/// surface of `rocky run` (`--resume`, `--shadow`, `--partition`,
+/// `--idempotency-key`, `--parallel`, `--all`, `--branch`,
+/// `--governance-override`, `--dag`, `--model`, `--models`, `--from`,
+/// `--to`, `--latest`, `--missing`, `--lookback`, `--resume-latest`,
+/// `--shadow-suffix`, `--shadow-schema`). `--watch` remains on `rocky run`
+/// because its re-run-loop semantics have no plan/apply analogue.
 pub const RUN_DEPRECATION: &str = "\
-`rocky run` is deprecated for basic invocations — the canonical form is `rocky plan` followed by `rocky apply <plan-id>`, \
+`rocky run` is deprecated — the canonical form is `rocky plan [flags]` followed by `rocky apply <plan-id>`, \
 which persists an auditable artifact at `.rocky/plans/<plan-id>.json`. \
-Advanced flags (--resume, --shadow, --partition, --idempotency-key, --parallel, --all, --branch, --governance-override, --dag) \
-are not yet available on `rocky plan` / `rocky apply` and remain on `rocky run` until plan/apply parity lands. \
+`rocky plan` accepts the same flag surface as `rocky run` (filter, pipeline, partition, shadow, branch, resume, idempotency-key, parallel, all, dag, governance-override, model, models, env). \
+The only exception is `--watch`, whose re-run-loop semantics are inherently runtime-only; it remains on `rocky run`. \
 Suppress this warning with ROCKY_SUPPRESS_DEPRECATION=1.";
 
 /// Stderr message emitted by bare `rocky branch promote <name>` (without `--plan`).

@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 
+use rocky_core::config::GovernanceOverride;
 use rocky_core::sql_gen;
 use rocky_ir::*;
 
@@ -10,7 +11,28 @@ use crate::output::*;
 use crate::plan_store::{PlanKind, write_plan};
 use crate::registry;
 
+use super::run::PartitionRunOptions;
 use super::{matches_filter, parse_filter};
+
+/// Bundle of `rocky plan` flags that are not consumed by the SQL-generation
+/// preview but are persisted into `RunPlan` so `rocky apply <plan-id>` can
+/// honour them. Mirrors the flag surface of `rocky run`.
+#[derive(Debug, Default, Clone)]
+pub struct PlanRunOptions {
+    pub model: Option<String>,
+    pub all: bool,
+    pub resume: Option<String>,
+    pub resume_latest: bool,
+    pub shadow: bool,
+    pub shadow_suffix: Option<String>,
+    pub shadow_schema: Option<String>,
+    pub branch: Option<String>,
+    pub dag: bool,
+    pub idempotency_key: Option<String>,
+    pub governance_override: Option<GovernanceOverride>,
+    pub models_dir: Option<PathBuf>,
+    pub partition_opts: PartitionRunOptions,
+}
 
 /// Execute `rocky plan` — dry-run SQL generation plus optional run-plan blueprint.
 ///
@@ -35,6 +57,7 @@ pub async fn plan(
     filter: Option<&str>,
     pipeline_name: Option<&str>,
     env: Option<&str>,
+    run_options: &PlanRunOptions,
     output_json: bool,
 ) -> Result<()> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -237,8 +260,21 @@ pub async fn plan(
     // best-effort — failure is logged as a warning, not an error, so
     // replication-only invocations in CI environments without `.rocky/`
     // write access are not broken.
-    if models_dir.exists() {
-        match build_and_persist_run_plan(&models_dir, filter, pipeline_name, env) {
+    //
+    // The compile honours `--models` when set; otherwise the conventional
+    // `models/` directory next to the config is used.
+    let blueprint_models_dir = run_options
+        .models_dir
+        .clone()
+        .unwrap_or_else(|| models_dir.clone());
+    if blueprint_models_dir.exists() {
+        match build_and_persist_run_plan(
+            &blueprint_models_dir,
+            filter,
+            pipeline_name,
+            env,
+            run_options,
+        ) {
             Ok((run_plan, plan_id, persisted_at)) => {
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
@@ -280,11 +316,16 @@ pub async fn plan(
 
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return `(payload, plan_id, persisted_at)`.
+///
+/// Captures the full `rocky run` flag surface from `run_options` so apply-time
+/// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
+/// as booleans; the actual state-store lookup happens at apply time.
 fn build_and_persist_run_plan(
     models_dir: &Path,
     filter: Option<&str>,
     pipeline: Option<&str>,
     env: Option<&str>,
+    run_options: &PlanRunOptions,
 ) -> Result<(RunPlan, String, chrono::DateTime<Utc>)> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -310,19 +351,33 @@ fn build_and_persist_run_plan(
     // Execution layers from the DAG (names only — informational).
     let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
 
+    let partition = &run_options.partition_opts;
     let run_plan = RunPlan {
         filter: filter.map(str::to_string),
         pipeline: pipeline.map(str::to_string),
-        branch: None,
-        partition: None,
-        partition_from: None,
-        partition_to: None,
-        latest: false,
-        missing: false,
-        lookback: None,
-        parallel: 1,
-        run_all: false,
+        model: run_options.model.clone(),
+        branch: run_options.branch.clone(),
+        partition: partition.partition.clone(),
+        partition_from: partition.from.clone(),
+        partition_to: partition.to.clone(),
+        latest: partition.latest,
+        missing: partition.missing,
+        lookback: partition.lookback,
+        parallel: partition.parallel,
+        run_all: run_options.all,
         env: env.map(str::to_string),
+        models_dir: run_options
+            .models_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        resume: run_options.resume.clone(),
+        resume_latest: run_options.resume_latest,
+        shadow: run_options.shadow,
+        shadow_suffix: run_options.shadow_suffix.clone(),
+        shadow_schema: run_options.shadow_schema.clone(),
+        dag: run_options.dag,
+        idempotency_key: run_options.idempotency_key.clone(),
+        governance_override: run_options.governance_override.clone(),
         models,
         execution_layers,
     };

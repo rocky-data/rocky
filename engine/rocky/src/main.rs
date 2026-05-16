@@ -243,6 +243,13 @@ enum Command {
     /// Subcommands extend the plan spine:
     ///   `rocky plan promote <branch>` — run approval + breaking-change gates
     ///   and persist a `PromotePlan` that `rocky apply <plan-id>` can execute.
+    ///
+    /// The flag surface mirrors `rocky run` (except `--watch`, which is
+    /// inherently a runtime re-run loop with no plan/apply semantics). Each
+    /// flag is captured into the persisted `RunPlan` so `rocky apply
+    /// <plan-id>` replays the same intent. Flags whose semantics depend on
+    /// state observed at apply time — `--resume-latest`, `--missing` — are
+    /// evaluated at apply time, not plan time.
     Plan {
         /// Optional subcommand (e.g. `promote`). When absent, runs the default
         /// replication dry-run plan.
@@ -256,6 +263,123 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         pipeline: Option<String>,
+        /// Execute a single compiled model by name (skips replication).
+        /// Alternative to --filter for model-only execution.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        model: Option<String>,
+        /// Additional governance config (JSON or @file.json), merged with defaults.
+        /// Resolved at plan time and persisted into the `RunPlan` payload.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        governance_override: Option<String>,
+        /// Models directory for transformation execution.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        models: Option<PathBuf>,
+        /// Execute both replication and compiled models.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        all: bool,
+        /// Resume a failed run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        resume: Option<String>,
+        /// Resume the most recent failed run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Resolved against the state store at apply time.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        resume_latest: bool,
+        /// Run in shadow mode: write to shadow targets instead of production.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        shadow: bool,
+        /// Suffix appended to table names in shadow mode (default: _rocky_shadow).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, default_value = "_rocky_shadow", global = false)]
+        shadow_suffix: String,
+        /// Override schema for shadow tables (mutually exclusive with --shadow-suffix).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        shadow_schema: Option<String>,
+        /// Execute the run against a named branch created with `rocky branch
+        /// create`. Internally equivalent to `--shadow --shadow-schema
+        /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"], global = false)]
+        branch: Option<String>,
+
+        // ----- time_interval partition selection -----
+        /// Run a single partition by canonical key (e.g. 2026-04-07 for daily,
+        /// 2026-04 for monthly). Errors if the format doesn't match the
+        /// model's granularity. Mutually exclusive with --from/--to/--latest/--missing.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, conflicts_with_all = ["from", "to", "latest", "missing"], global = false)]
+        partition: Option<String>,
+        /// Lower bound of a closed partition range (inclusive). Both bounds
+        /// must align to the model's grain. Requires --to.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, requires = "to", conflicts_with_all = ["partition", "latest", "missing"], global = false)]
+        from: Option<String>,
+        /// Upper bound of a closed partition range (inclusive). Requires --from.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, requires = "from", conflicts_with_all = ["partition", "latest", "missing"], global = false)]
+        to: Option<String>,
+        /// Run the partition containing now() (UTC). Default for time_interval
+        /// models when no other selection flag is given.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, conflicts_with_all = ["partition", "from", "to", "missing"], global = false)]
+        latest: bool,
+        /// Run the partitions missing from the state store (computed from
+        /// model's first_partition → now). Errors if first_partition is unset.
+        /// Resolved against the state store at apply time.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, conflicts_with_all = ["partition", "from", "to", "latest"], global = false)]
+        missing: bool,
+        /// Recompute the previous N partitions in addition to the selected
+        /// ones (CLI override beats model's TOML lookback). Standard handling
+        /// for late-arriving data.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        lookback: Option<u32>,
+        /// Run N partitions concurrently (default 1). Warehouse-query
+        /// parallelism only — state writes serialize through redb.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, default_value = "1", global = false)]
+        parallel: u32,
+
+        /// Run all pipelines as a unified DAG, in dependency order.
+        /// Each pipeline is a node; cross-pipeline `depends_on` edges define
+        /// execution order. Layers run in parallel.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        dag: bool,
+
+        /// Caller-supplied opaque key used to dedup this run against prior
+        /// runs with the same key. Persisted into the `RunPlan`; the plan_id
+        /// is a content-hash of the payload, so plans differing only by
+        /// idempotency-key get distinct plan_ids — the hash discriminates.
+        ///
+        /// Supported on `local`, `valkey`, and `tiered` state backends.
+        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
+        /// `tiered` for multi-pod deployments.
+        ///
+        /// ⚠️ Keys are stored verbatim in the state store; do NOT put
+        /// secrets in idempotency keys.
+        ///
+        /// Falls back to the `ROCKY_IDEMPOTENCY_KEY` environment variable
+        /// when the flag is not given. Useful for orchestrators that
+        /// already plumb an idempotency key through env (cron wrappers,
+        /// Airflow pod templates, ad-hoc CI bash scripts).
+        /// Applies to the default plan subcommand only.
+        #[arg(
+            long,
+            value_name = "KEY",
+            env = "ROCKY_IDEMPOTENCY_KEY",
+            global = false
+        )]
+        idempotency_key: Option<String>,
+
         /// Scope the governance preview (`mask_actions`) to a specific
         /// environment. When set, `[mask.<env>]` overrides from
         /// `rocky.toml` overlay the workspace `[mask]` defaults in the
@@ -1567,6 +1691,28 @@ fn main() -> Result<()> {
     runtime.block_on(run_async(cli, json))
 }
 
+/// Parse `--governance-override` from its CLI string form.
+///
+/// Accepts an inline JSON object (`'{...}'`) or an `@file.json` reference. The
+/// parsed `GovernanceOverride` is used both by `rocky run` directly and by
+/// `rocky plan` to capture intent into the persisted `RunPlan` payload.
+fn parse_governance_override(
+    raw: Option<&str>,
+) -> Result<Option<rocky_core::config::GovernanceOverride>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let parsed: rocky_core::config::GovernanceOverride = if let Some(path) = s.strip_prefix('@') {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read governance override file: {path}"))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse governance override from {path}"))?
+    } else {
+        serde_json::from_str(s).context("failed to parse governance override JSON")?
+    };
+    Ok(Some(parsed))
+}
+
 async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // Install miette's fancy handler for rich error rendering in text mode.
     // In JSON mode we skip it — errors are serialized as structured data.
@@ -1638,14 +1784,78 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             subcommand,
             filter,
             pipeline,
+            model,
+            governance_override,
+            models: models_dir,
+            all,
+            resume,
+            resume_latest,
+            shadow,
+            shadow_suffix,
+            shadow_schema,
+            branch,
+            partition,
+            from,
+            to,
+            latest,
+            missing,
+            lookback,
+            parallel,
+            dag,
+            idempotency_key,
             env,
         } => match subcommand {
             None => {
+                // Mirror the `rocky run` guard: --idempotency-key is mutually
+                // exclusive with --resume / --resume-latest. Enforced at plan
+                // time so a malformed plan never lands on disk.
+                if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
+                    anyhow::bail!(
+                        "--idempotency-key cannot be combined with --resume / --resume-latest \
+                         (resume is an explicit override of idempotent skip)"
+                    );
+                }
+                let gov_override = parse_governance_override(governance_override.as_deref())?;
+                let partition_opts = rocky_cli::commands::PartitionRunOptions {
+                    partition,
+                    from,
+                    to,
+                    latest,
+                    missing,
+                    lookback,
+                    parallel,
+                };
+                // Only persist `shadow_suffix` when shadow mode is actually
+                // requested (either --shadow or --branch). Otherwise it's the
+                // clap default `_rocky_shadow` and would pollute every plan's
+                // payload — and change the plan_id hash — for plans where the
+                // flag is meaningless.
+                let shadow_suffix = if shadow || branch.is_some() {
+                    Some(shadow_suffix)
+                } else {
+                    None
+                };
+                let run_options = rocky_cli::commands::PlanRunOptions {
+                    model,
+                    all,
+                    resume,
+                    resume_latest,
+                    shadow,
+                    shadow_suffix,
+                    shadow_schema,
+                    branch,
+                    dag,
+                    idempotency_key,
+                    governance_override: gov_override,
+                    models_dir,
+                    partition_opts,
+                };
                 rocky_cli::commands::plan(
                     &cli.config,
                     filter.as_deref(),
                     pipeline.as_deref(),
                     env.as_deref(),
+                    &run_options,
                     json,
                 )
                 .await
@@ -1706,21 +1916,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 );
             }
             // Parse governance override (JSON string or @file.json)
-            let gov_override = match governance_override {
-                Some(ref s) if s.starts_with('@') => {
-                    let path = &s[1..];
-                    let content = std::fs::read_to_string(path).with_context(|| {
-                        format!("failed to read governance override file: {path}")
-                    })?;
-                    Some(serde_json::from_str(&content).with_context(|| {
-                        format!("failed to parse governance override from {path}")
-                    })?)
-                }
-                Some(ref s) => Some(
-                    serde_json::from_str(s).context("failed to parse governance override JSON")?,
-                ),
-                None => None,
-            };
+            let gov_override = parse_governance_override(governance_override.as_deref())?;
 
             // Resolve --branch to the same machinery as --shadow. clap
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
@@ -2651,5 +2847,186 @@ mod tests {
         remove_env("ROCKY_IDEMPOTENCY_KEY");
         let key = parse_run_idempotency_key(&["rocky", "run"]);
         assert!(key.is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // `rocky plan` flag-surface parity tests.
+    //
+    // The new flags backfilled onto `rocky plan` mirror `rocky run`. These
+    // tests pin the clap surface: same flag names, same semantics. The
+    // round-trip end-to-end (plan → persist → apply → run) is tested in
+    // `crates/rocky-cli/src/commands/apply.rs`.
+    // ------------------------------------------------------------------------
+
+    /// Helper: parse `rocky plan` flags and assert we got the bare-plan
+    /// (no subcommand) shape.
+    #[allow(clippy::type_complexity)]
+    fn parse_plan_flags<F, T>(args: &[&str], extract: F) -> T
+    where
+        F: FnOnce(
+            Option<String>,             // filter
+            Option<String>,             // pipeline
+            Option<String>,             // model
+            Option<String>,             // governance_override
+            Option<std::path::PathBuf>, // models_dir
+            bool,                       // all
+            Option<String>,             // resume
+            bool,                       // resume_latest
+            bool,                       // shadow
+            String,                     // shadow_suffix
+            Option<String>,             // shadow_schema
+            Option<String>,             // branch
+            Option<String>,             // partition
+            Option<String>,             // from
+            Option<String>,             // to
+            bool,                       // latest
+            bool,                       // missing
+            Option<u32>,                // lookback
+            u32,                        // parallel
+            bool,                       // dag
+            Option<String>,             // idempotency_key
+            Option<String>,             // env
+        ) -> T,
+    {
+        let cli = Cli::try_parse_from(args).expect("parse should succeed");
+        match cli.command {
+            Command::Plan {
+                subcommand: None,
+                filter,
+                pipeline,
+                model,
+                governance_override,
+                models,
+                all,
+                resume,
+                resume_latest,
+                shadow,
+                shadow_suffix,
+                shadow_schema,
+                branch,
+                partition,
+                from,
+                to,
+                latest,
+                missing,
+                lookback,
+                parallel,
+                dag,
+                idempotency_key,
+                env,
+            } => extract(
+                filter,
+                pipeline,
+                model,
+                governance_override,
+                models,
+                all,
+                resume,
+                resume_latest,
+                shadow,
+                shadow_suffix,
+                shadow_schema,
+                branch,
+                partition,
+                from,
+                to,
+                latest,
+                missing,
+                lookback,
+                parallel,
+                dag,
+                idempotency_key,
+                env,
+            ),
+            _ => panic!("expected bare Plan subcommand"),
+        }
+    }
+
+    #[test]
+    fn plan_accepts_resume_latest() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let resume_latest = parse_plan_flags(
+            &["rocky", "plan", "--resume-latest"],
+            |_, _, _, _, _, _, _, resume_latest, _, _, _, _, _, _, _, _, _, _, _, _, _, _| {
+                resume_latest
+            },
+        );
+        assert!(resume_latest, "--resume-latest should parse to true");
+    }
+
+    #[test]
+    fn plan_accepts_shadow_with_suffix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let (shadow, shadow_suffix) = parse_plan_flags(
+            &["rocky", "plan", "--shadow", "--shadow-suffix", "_my_shadow"],
+            |_, _, _, _, _, _, _, _, shadow, shadow_suffix, _, _, _, _, _, _, _, _, _, _, _, _| {
+                (shadow, shadow_suffix)
+            },
+        );
+        assert!(shadow);
+        assert_eq!(shadow_suffix, "_my_shadow");
+    }
+
+    #[test]
+    fn plan_accepts_partition_range() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let (from, to) = parse_plan_flags(
+            &[
+                "rocky",
+                "plan",
+                "--from",
+                "2026-01-01",
+                "--to",
+                "2026-01-31",
+            ],
+            |_, _, _, _, _, _, _, _, _, _, _, _, _, from, to, _, _, _, _, _, _, _| (from, to),
+        );
+        assert_eq!(from.as_deref(), Some("2026-01-01"));
+        assert_eq!(to.as_deref(), Some("2026-01-31"));
+    }
+
+    #[test]
+    fn plan_rejects_branch_with_shadow() {
+        // clap should reject this combination at parse time via the
+        // `conflicts_with_all = ["shadow", "shadow_schema"]` modifier.
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let result = Cli::try_parse_from(["rocky", "plan", "--branch", "feature_x", "--shadow"]);
+        assert!(
+            result.is_err(),
+            "--branch and --shadow must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn plan_idempotency_key_falls_back_to_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_env("ROCKY_IDEMPOTENCY_KEY", "plan_env_key");
+        let key = parse_plan_flags(
+            &["rocky", "plan"],
+            |_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, idempotency_key, _| {
+                idempotency_key
+            },
+        );
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        assert_eq!(key.as_deref(), Some("plan_env_key"));
+    }
+
+    #[test]
+    fn plan_accepts_all_dag_and_parallel() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        remove_env("ROCKY_IDEMPOTENCY_KEY");
+        let (all, dag, parallel) = parse_plan_flags(
+            &["rocky", "plan", "--all", "--dag", "--parallel", "4"],
+            |_, _, _, _, _, all, _, _, _, _, _, _, _, _, _, _, _, _, parallel, dag, _, _| {
+                (all, dag, parallel)
+            },
+        );
+        assert!(all);
+        assert!(dag);
+        assert_eq!(parallel, 4);
     }
 }
