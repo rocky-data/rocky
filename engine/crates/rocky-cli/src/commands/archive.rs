@@ -44,7 +44,7 @@ pub fn run_archive(
         .iter()
         .map(|(purpose, sql)| NamedStatement {
             purpose: purpose.clone(),
-            sql: sql.clone(),
+            sql: Some(sql.clone()),
         })
         .collect();
 
@@ -130,7 +130,10 @@ pub async fn run_archive_catalog(
         let stmts = generate_archive_sql(Some(fqn), days)?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
-            .map(|(purpose, sql)| NamedStatement { purpose, sql })
+            .map(|(purpose, sql)| NamedStatement {
+                purpose,
+                sql: Some(sql),
+            })
             .collect();
         flat_statements.extend(typed.iter().cloned());
         per_table.insert(fqn.clone(), ArchiveTableEntry { statements: typed });
@@ -190,7 +193,9 @@ pub async fn run_archive_catalog(
                 println!("-- {fqn}");
                 for s in &entry.statements {
                     println!("-- {}", s.purpose);
-                    println!("{};", s.sql);
+                    if let Some(ref sql) = s.sql {
+                        println!("{sql};");
+                    }
                 }
                 println!();
             }
@@ -315,10 +320,26 @@ pub(crate) async fn run_archive_apply_in(
     let mut overall_success = true;
 
     for stmt in &archive_output.statements {
+        // `NamedStatement.sql` is `Option<String>` to leave room for the
+        // v2 persisted plan format (Cluster 3 C — "SQL as `.o` files");
+        // a `None` here means the plan was written by a newer engine
+        // that persists typed IR. See the matching comment in `compact.rs`.
+        let sql = match stmt.sql.as_deref() {
+            Some(sql) => sql,
+            None => bail!(
+                "archive plan '{}' carries a statement without inline SQL \
+                 (purpose: '{}'). This plan was written by a newer engine \
+                 that persists typed-IR plans; this binary cannot regenerate \
+                 SQL from IR yet — upgrade and re-apply.",
+                plan_id,
+                stmt.purpose,
+            ),
+        };
+
         if !overall_success {
             results.push(StatementResult {
                 purpose: stmt.purpose.clone(),
-                sql: stmt.sql.clone(),
+                sql: sql.to_string(),
                 success: false,
                 duration_ms: 0,
                 error: Some("skipped: a prior statement failed".to_string()),
@@ -327,7 +348,7 @@ pub(crate) async fn run_archive_apply_in(
         }
 
         let start = Instant::now();
-        let outcome = adapter.execute_statement(&stmt.sql).await;
+        let outcome = adapter.execute_statement(sql).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match outcome {
@@ -335,7 +356,7 @@ pub(crate) async fn run_archive_apply_in(
                 tracing::info!(purpose = %stmt.purpose, duration_ms, "archive apply: statement succeeded");
                 results.push(StatementResult {
                     purpose: stmt.purpose.clone(),
-                    sql: stmt.sql.clone(),
+                    sql: sql.to_string(),
                     success: true,
                     duration_ms,
                     error: None,
@@ -350,7 +371,7 @@ pub(crate) async fn run_archive_apply_in(
                 );
                 results.push(StatementResult {
                     purpose: stmt.purpose.clone(),
-                    sql: stmt.sql.clone(),
+                    sql: sql.to_string(),
                     success: false,
                     duration_ms,
                     error: Some(format!("{e}")),
@@ -504,11 +525,11 @@ schema_template = "staging__{{source}}"
                 statements: vec![
                     NamedStatement {
                         purpose: "delete rows older than 90 days".to_string(),
-                        sql: "DELETE FROM events WHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())".to_string(),
+                        sql: Some("DELETE FROM events WHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())".to_string()),
                     },
                     NamedStatement {
                         purpose: "reclaim storage after deletion".to_string(),
-                        sql: "VACUUM events RETAIN 0 HOURS".to_string(),
+                        sql: Some("VACUUM events RETAIN 0 HOURS".to_string()),
                     },
                 ],
                 tables: None,

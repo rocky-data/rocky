@@ -20,10 +20,12 @@ class CompactTotals(BaseModel):
 class NamedStatement(BaseModel):
     """
     Named SQL statement (purpose + sql), reused by compact and archive.
+
+    `sql` is optional in preparation for the v2 persisted plan format (Cluster 3 C — "SQL as `.o` files"). Today's emission path always populates `Some(string)` for both stdout JSON and the persisted plan; the v2 format will write `None` and rely on the apply path to regenerate SQL from the plan's typed IR.
     """
 
     purpose: str
-    sql: str
+    sql: str | None = None
 
 
 class CompactOutput(BaseModel):

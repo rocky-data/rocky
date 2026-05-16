@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
-use rocky_ir::{MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
+use rocky_ir::{CompactPlanIr, MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
 
 /// Build the canonical `expected X ModelIr for \`name\`, found <actual>` error
 /// returned by every `generate_*` entry point when its variant guard rejects
@@ -561,6 +561,73 @@ pub fn generate_dynamic_table_sql(
         "CREATE OR REPLACE DYNAMIC TABLE {target}\n  TARGET_LAG = '{target_lag}'\n  WAREHOUSE = {warehouse}\nAS\n{sql}",
         sql = model_ir.sql
     ))
+}
+
+/// Regenerate `(purpose, sql)` pairs for a `rocky compact` plan from its
+/// typed IR.
+///
+/// This is the Phase C ("SQL as `.o` files") regeneration entry point for
+/// the OPTIMIZE/VACUUM statement bundle. Today the CLI builds the SQL
+/// inline at plan time; once the v2 persisted plan format lands (Cluster 3
+/// C — C-5), the same SQL will be regenerated at apply time from the
+/// persisted [`CompactPlanIr`].
+///
+/// The `dialect` parameter is currently unused: the OPTIMIZE/VACUUM
+/// grammar Rocky emits today is Delta-Lake-on-Databricks-flavoured and
+/// hand-interpolates the table identifier (validating each dot-separated
+/// segment up-front rather than going through `format_table_ref`). The
+/// parameter is plumbed so future dialect-specific variants (Snowflake /
+/// BigQuery / Iceberg have different OPTIMIZE / VACUUM equivalents) can
+/// be wired in without breaking the helper's call sites.
+///
+/// Returns the same `(purpose, sql)` shape the CLI's inline path uses, so
+/// the equivalence test can assert byte-for-byte parity.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::Validation`] when `ir.target_table` contains a
+/// dot-separated segment that fails SQL-identifier validation.
+pub fn compact_from_ir(
+    ir: &CompactPlanIr,
+    _dialect: &dyn SqlDialect,
+) -> Result<Vec<(String, String)>, SqlGenError> {
+    for part in ir.target_table.split('.') {
+        validation::validate_identifier(part)?;
+    }
+
+    let target_size_mb = ir.target_size_mb.unwrap_or(256);
+    let mut statements = Vec::with_capacity(2);
+
+    // OPTIMIZE step. Z-ORDER columns are emitted only when populated to
+    // preserve byte-identity with today's emission path (which never
+    // populates them).
+    let mut optimize_sql = format!(
+        "OPTIMIZE {table} WHERE true\n  -- target file size: {target_size_mb}MB",
+        table = ir.target_table,
+    );
+    if !ir.zorder_columns.is_empty() {
+        for col in &ir.zorder_columns {
+            validation::validate_identifier(col)?;
+        }
+        optimize_sql.push_str("\n  ZORDER BY (");
+        optimize_sql.push_str(&ir.zorder_columns.join(", "));
+        optimize_sql.push(')');
+    }
+    statements.push(("compact small files".to_string(), optimize_sql));
+
+    // VACUUM step. Omitted entirely when `vacuum_retention_hours` is
+    // `None`; today's CLI always populates `Some(168)`.
+    if let Some(hours) = ir.vacuum_retention_hours {
+        statements.push((
+            "remove stale data files".to_string(),
+            format!(
+                "VACUUM {table} RETAIN {hours} HOURS",
+                table = ir.target_table
+            ),
+        ));
+    }
+
+    Ok(statements)
 }
 
 /// Validates a SQL type string for safety (no injection).

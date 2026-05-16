@@ -63,7 +63,7 @@ pub fn run_compact(
         .iter()
         .map(|(purpose, sql)| NamedStatement {
             purpose: purpose.clone(),
-            sql: sql.clone(),
+            sql: Some(sql.clone()),
         })
         .collect();
 
@@ -164,7 +164,10 @@ pub async fn run_compact_catalog(
         let stmts = generate_compact_sql(fqn, target_mb)?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
-            .map(|(purpose, sql)| NamedStatement { purpose, sql })
+            .map(|(purpose, sql)| NamedStatement {
+                purpose,
+                sql: Some(sql),
+            })
             .collect();
         flat_statements.extend(typed.iter().cloned());
         per_table.insert(fqn.clone(), CompactTableEntry { statements: typed });
@@ -223,7 +226,9 @@ pub async fn run_compact_catalog(
                 println!("-- {fqn}");
                 for s in &entry.statements {
                     println!("-- {}", s.purpose);
-                    println!("{};", s.sql);
+                    if let Some(ref sql) = s.sql {
+                        println!("{sql};");
+                    }
                 }
                 println!();
             }
@@ -1286,12 +1291,32 @@ pub(crate) async fn run_compact_apply_in(
     let mut overall_success = true;
 
     for stmt in &compact_output.statements {
+        // `NamedStatement.sql` is `Option<String>` to leave room for the
+        // v2 persisted plan format (Cluster 3 C — "SQL as `.o` files")
+        // where `sql: None` signals "regenerate from IR at apply time".
+        // C-2 does not yet flip the persistence format, so every plan
+        // on disk still carries `Some(sql)`. A `None` here means the
+        // plan was written by a future engine and predates the IR
+        // regeneration wiring on this binary — surface a clear error
+        // rather than executing an empty statement.
+        let sql = match stmt.sql.as_deref() {
+            Some(sql) => sql,
+            None => bail!(
+                "compact plan '{}' carries a statement without inline SQL \
+                 (purpose: '{}'). This plan was written by a newer engine \
+                 that persists typed-IR plans; this binary cannot regenerate \
+                 SQL from IR yet — upgrade and re-apply.",
+                plan_id,
+                stmt.purpose,
+            ),
+        };
+
         if !overall_success {
             // Skip remaining statements after the first failure — record
             // them as skipped so the output is complete.
             results.push(StatementResult {
                 purpose: stmt.purpose.clone(),
-                sql: stmt.sql.clone(),
+                sql: sql.to_string(),
                 success: false,
                 duration_ms: 0,
                 error: Some("skipped: a prior statement failed".to_string()),
@@ -1300,7 +1325,7 @@ pub(crate) async fn run_compact_apply_in(
         }
 
         let start = Instant::now();
-        let outcome = adapter.execute_statement(&stmt.sql).await;
+        let outcome = adapter.execute_statement(sql).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match outcome {
@@ -1308,7 +1333,7 @@ pub(crate) async fn run_compact_apply_in(
                 tracing::info!(purpose = %stmt.purpose, duration_ms, "compact apply: statement succeeded");
                 results.push(StatementResult {
                     purpose: stmt.purpose.clone(),
-                    sql: stmt.sql.clone(),
+                    sql: sql.to_string(),
                     success: true,
                     duration_ms,
                     error: None,
@@ -1323,7 +1348,7 @@ pub(crate) async fn run_compact_apply_in(
                 );
                 results.push(StatementResult {
                     purpose: stmt.purpose.clone(),
-                    sql: stmt.sql.clone(),
+                    sql: sql.to_string(),
                     success: false,
                     duration_ms,
                     error: Some(format!("{e}")),
@@ -1394,6 +1419,75 @@ mod tests {
         assert!(generate_compact_sql("'; DROP TABLE users; --", 256).is_err());
         assert!(generate_compact_sql("", 256).is_err());
         assert!(generate_compact_sql("catalog..table", 256).is_err());
+    }
+
+    /// Cluster 3 C — C-2 equivalence proof.
+    ///
+    /// The CLI's inline `generate_compact_sql` and the typed-IR-driven
+    /// `rocky_core::sql_gen::compact_from_ir` must emit byte-identical
+    /// `(purpose, sql)` pairs for every input the current emission path
+    /// uses today (single-model and per-table-in-catalog). If this test
+    /// fails, the v2 persisted plan format would silently regenerate
+    /// different SQL at apply time — see the audit memo for Phase C.
+    ///
+    /// `dialect` is plumbed through `compact_from_ir` for forward
+    /// compatibility but is unused by today's emission path (which
+    /// matches the inline CLI behavior). The Databricks dialect is used
+    /// here because it is the dialect compact targets (Delta Lake
+    /// `OPTIMIZE` / `VACUUM`).
+    mod compact_from_ir_equivalence {
+        use super::*;
+        use rocky_core::sql_gen::compact_from_ir;
+        use rocky_databricks::dialect::DatabricksSqlDialect;
+        use rocky_ir::CompactPlanIr;
+
+        fn assert_equivalent(model: &str, target_mb: u64) {
+            let dialect = DatabricksSqlDialect;
+            let inline = generate_compact_sql(model, target_mb)
+                .expect("inline generation must succeed for a valid identifier");
+            let ir_pairs = compact_from_ir(&CompactPlanIr::for_table(model, target_mb), &dialect)
+                .expect("ir generation must succeed for a valid identifier");
+            assert_eq!(
+                inline, ir_pairs,
+                "compact_from_ir must produce byte-identical SQL to the inline path \
+                 for model={model} target_mb={target_mb}",
+            );
+        }
+
+        #[test]
+        fn matches_single_model_default_size() {
+            assert_equivalent("catalog.schema.orders", 256);
+        }
+
+        #[test]
+        fn matches_single_model_custom_size() {
+            assert_equivalent("catalog.schema.orders", 512);
+        }
+
+        #[test]
+        fn matches_two_part_table_ref() {
+            // Catalog-scope CLI invocations resolve managed tables to
+            // fully-qualified `catalog.schema.table` strings. Two-part
+            // and single-segment forms also need to round-trip.
+            assert_equivalent("schema.orders", 256);
+            assert_equivalent("orders", 256);
+        }
+
+        #[test]
+        fn matches_catalog_scope_per_table() {
+            // Simulate the `--catalog` path: every table in the scope
+            // goes through the same single-model emission. Each pair
+            // must match individually so the flat `statements` list
+            // (the catalog-envelope concatenation) is byte-stable.
+            let tables = [
+                "warehouse.staging.orders",
+                "warehouse.staging.customers",
+                "warehouse.staging.line_items",
+            ];
+            for fqn in tables {
+                assert_equivalent(fqn, 256);
+            }
+        }
     }
 
     /// E2E test for `compute_measure_dedup` against an ephemeral DuckDB.
@@ -1987,11 +2081,11 @@ schema_template = "staging__{{source}}"
                 statements: vec![
                     NamedStatement {
                         purpose: "compact small files".to_string(),
-                        sql: "OPTIMIZE orders WHERE true".to_string(),
+                        sql: Some("OPTIMIZE orders WHERE true".to_string()),
                     },
                     NamedStatement {
                         purpose: "remove stale data files".to_string(),
-                        sql: "VACUUM orders RETAIN 168 HOURS".to_string(),
+                        sql: Some("VACUUM orders RETAIN 168 HOURS".to_string()),
                     },
                 ],
                 tables: None,

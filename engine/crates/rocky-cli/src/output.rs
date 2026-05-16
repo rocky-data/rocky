@@ -1968,10 +1968,17 @@ pub struct CompactTotals {
 }
 
 /// Named SQL statement (purpose + sql), reused by compact and archive.
+///
+/// `sql` is optional in preparation for the v2 persisted plan format
+/// (Cluster 3 C — "SQL as `.o` files"). Today's emission path always
+/// populates `Some(string)` for both stdout JSON and the persisted plan;
+/// the v2 format will write `None` and rely on the apply path to
+/// regenerate SQL from the plan's typed IR.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NamedStatement {
     pub purpose: String,
-    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sql: Option<String>,
 }
 
 /// JSON output for `rocky archive`.

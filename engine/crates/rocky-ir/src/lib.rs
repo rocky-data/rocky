@@ -33,6 +33,7 @@
 //! `use rocky_ir::ModelIr` access. Reach into the module path
 //! (`rocky_ir::ir::ModelIr`) when disambiguating in doc comments.
 
+pub mod compact_plan;
 pub mod dag;
 pub mod ir;
 pub mod lakehouse;
@@ -41,6 +42,7 @@ pub mod mask;
 pub mod time_grain;
 pub mod types;
 
+pub use compact_plan::CompactPlanIr;
 pub use dag::{DagError, DagNode, execution_layers, topological_sort};
 pub use ir::*;
 pub use lakehouse::{LakehouseError, LakehouseFormat, LakehouseOptions};
