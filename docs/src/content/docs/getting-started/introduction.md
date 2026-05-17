@@ -5,11 +5,11 @@ sidebar:
   order: 1
 ---
 
-Rocky is a Rust-based control plane for warehouse SQL pipelines. Branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution — primitives delivered through a single static binary that drives Databricks, Snowflake, BigQuery, or DuckDB. Things your current stack can't offer because it doesn't own the DAG.
+Rocky is a typed-program layer above the warehouse. Branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution — primitives delivered through a single static binary that drives Databricks, Snowflake, BigQuery, or DuckDB. Things your current stack can't offer because it doesn't own the DAG.
 
 ## What Rocky is
 
-A Rust-based control plane for warehouse-side data work. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB). Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
+A typed-program layer above the warehouse. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB). Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
 
 **Rocky is not a warehouse.** It's what sits on top of one.
 

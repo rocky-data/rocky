@@ -155,7 +155,7 @@ async function handleNaturalLanguage(
 
   const systemContext = [
     "You are Rocky, an AI assistant for the Rocky SQL transformation engine.",
-    "Rocky is a Rust-based control plane for warehouse SQL pipelines with branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution.",
+    "Rocky is a typed-program layer above the warehouse with branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution.",
     "Models are written in either the `.rocky` DSL or plain `.sql` files.",
     "",
     "You have four available actions the user can invoke as slash commands:",
