@@ -3,7 +3,9 @@ use thiserror::Error;
 
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
-use rocky_ir::{CompactPlanIr, MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow};
+use rocky_ir::{
+    ArchivePlanIr, CompactPlanIr, MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow,
+};
 
 /// Build the canonical `expected X ModelIr for \`name\`, found <actual>` error
 /// returned by every `generate_*` entry point when its variant guard rejects
@@ -624,6 +626,84 @@ pub fn compact_from_ir(
                 "VACUUM {table} RETAIN {hours} HOURS",
                 table = ir.target_table
             ),
+        ));
+    }
+
+    Ok(statements)
+}
+
+/// Regenerate `(purpose, sql)` pairs for a `rocky archive` plan from
+/// its typed IR.
+///
+/// This is the Phase C ("SQL as `.o` files") regeneration entry point
+/// for the DELETE/VACUUM statement bundle. Today the CLI builds the
+/// SQL inline at plan time; once the v2 persisted plan format lands
+/// (Cluster 3 C — C-5), the same SQL will be regenerated at apply
+/// time from the persisted [`ArchivePlanIr`].
+///
+/// The `dialect` parameter is currently unused: the DELETE/VACUUM
+/// grammar Rocky emits today is Delta-Lake-on-Databricks-flavoured
+/// (`DATEADD` + `RETAIN N HOURS`) and hand-interpolates both the
+/// table identifier and the watermark column (validating each up-front
+/// rather than going through `format_table_ref`). The parameter is
+/// plumbed so future dialect-specific variants can be wired in
+/// without breaking the helper's call sites.
+///
+/// Returns the same `(purpose, sql)` shape the CLI's inline path
+/// uses, so the equivalence test can assert byte-for-byte parity.
+///
+/// # Cutoff handling
+///
+/// Per the C-3 decision (option `a`), the emitted DELETE filter is
+/// `<col> < DATEADD(DAY, -N, CURRENT_TIMESTAMP())` — *runtime* date
+/// math, matching today's emission exactly. Plan-time cutoff
+/// resolution (literal-timestamp emission keyed off
+/// `cutoff_resolved_at`) is C-5 territory; introducing it here would
+/// break byte-equivalence and force a fuzzy shape-only test.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::Validation`] when `ir.target_table` (when
+/// present) contains a dot-separated segment that fails SQL-identifier
+/// validation, or when `ir.partition_column` fails SQL-identifier
+/// validation.
+pub fn archive_from_ir(
+    ir: &ArchivePlanIr,
+    _dialect: &dyn SqlDialect,
+) -> Result<Vec<(String, String)>, SqlGenError> {
+    // Resolve the SQL target. `None` reproduces today's degenerate
+    // `*` wildcard emission — the inline CLI path emits the same
+    // string when neither `--model` nor `--catalog` is supplied.
+    let target = match &ir.target_table {
+        Some(table) => {
+            for part in table.split('.') {
+                validation::validate_identifier(part)?;
+            }
+            table.clone()
+        }
+        None => "*".to_string(),
+    };
+
+    validation::validate_identifier(&ir.partition_column)?;
+
+    let days = ir.older_than_days;
+    let partition_column = &ir.partition_column;
+    let mut statements = Vec::with_capacity(2);
+
+    statements.push((
+        format!("delete rows older than {days} days"),
+        format!(
+            "DELETE FROM {target}\n\
+             WHERE {partition_column} < DATEADD(DAY, -{days}, CURRENT_TIMESTAMP())"
+        ),
+    ));
+
+    // VACUUM step. Omitted entirely when `vacuum_retention_hours` is
+    // `None`; today's CLI always populates `Some(0)`.
+    if let Some(hours) = ir.vacuum_retention_hours {
+        statements.push((
+            "reclaim storage after deletion".to_string(),
+            format!("VACUUM {target} RETAIN {hours} HOURS"),
         ));
     }
 
