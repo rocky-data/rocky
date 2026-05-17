@@ -166,6 +166,7 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 - **Exhaustive checksum-bisection diff** — `rocky preview diff --algorithm bisection` walks the chunk lattice over a single-column integer / numeric primary key for exhaustive row-level coverage at bounded scan cost (`O(K · log_K(N))` chunks examined for a single-row change). Per-adapter native row-hashes — DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`. Snowflake stays on the sampled fallback until a consumer drives the override.
 - **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
 - **`rocky cost <run_id|latest>`** — historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
+- See the combo in action — POC #17 (trace + cost + replay against the same run_id): [examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo)
 
 ## IDE / Language Server (11 capabilities)
 
