@@ -47,6 +47,20 @@ impl AdapterError {
     pub fn not_supported(method: &str) -> Self {
         Self::msg(format!("{method} is not supported by this adapter"))
     }
+
+    /// Borrow the boxed inner error for downcasting.
+    ///
+    /// `AdapterError` deliberately stores the concrete adapter error
+    /// type-erased so the SDK doesn't depend on any adapter crate. The
+    /// `Error::source()` impl walks past `inner` (it returns
+    /// `inner.source()`), so chain-walking consumers never see the
+    /// concrete `ConnectorError` — they jump straight to whatever the
+    /// `ConnectorError` carries underneath. This accessor lets callers
+    /// who hold the boxed wrapper attempt a `downcast_ref::<T>()`
+    /// against the wrapped error directly.
+    pub fn inner(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.as_ref()
+    }
 }
 
 impl std::fmt::Display for AdapterError {
