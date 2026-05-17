@@ -55,7 +55,6 @@ No credentials needed — the playground is DuckDB-backed.
 
 `rocky run` writes a single `RunRecord` to the state store. Three read commands — `rocky trace`, `rocky cost`, `rocky replay` — each project that same record from a different angle: causality and concurrency, per-model warehouse spend, and the byte-for-byte reproducibility artefact. Three views of one tree, not three telemetry domains stitched together after the fact. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
 
-{/* TODO(hugo): record + drop in docs/public/trace-cost-replay-combo.mp4 */}
 <video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 
 <CardGrid>
