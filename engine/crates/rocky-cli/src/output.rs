@@ -5435,4 +5435,97 @@ mod failure_kind_tests {
     fn failure_kind_default_is_unknown() {
         assert_eq!(FailureKind::default(), FailureKind::Unknown);
     }
+
+    // ---- run.rs-style conversion preserves typed variant ----------------
+    //
+    // These pin the conversion idiom now used in `commands/run.rs`. They
+    // ensure that the way `run.rs` materializes its `anyhow::Error`s
+    // (`.map_err(anyhow::Error::from)?` for bare wraps, and
+    // `anyhow::Error::from(e).context(...)` for prefixed wraps) keeps the
+    // typed `AdapterError` in the source chain so `classify_anyhow_error`
+    // can downcast to it and map to the correct `FailureKind`. The old
+    // `anyhow::anyhow!("{e}")` pattern stringified the typed error before
+    // the wrap and made the classifier fall through to `Unknown`.
+    //
+    // Three connector variants are pinned to prove the wiring isn't
+    // variant-specific.
+    fn db_adapter_err(conn: DbE) -> rocky_adapter_sdk::AdapterError {
+        rocky_adapter_sdk::AdapterError::new(conn)
+    }
+
+    fn sn_adapter_err(conn: SnE) -> rocky_adapter_sdk::AdapterError {
+        rocky_adapter_sdk::AdapterError::new(conn)
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_databricks_statement_failed() {
+        // Mirrors `.map_err(anyhow::Error::from)?` on an
+        // `AdapterResult<()>` returned from `WarehouseAdapter::execute_statement`.
+        let result: rocky_adapter_sdk::AdapterResult<()> =
+            Err(db_adapter_err(DbE::StatementFailed {
+                id: "stmt-1".into(),
+                message: "syntax error".into(),
+            }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_snowflake_timeout() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::Timeout {
+            handle: "h-1".into(),
+            seconds: 60,
+        }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_databricks_quota_exceeded() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(db_adapter_err(DbE::ApiError {
+            status: 429,
+            body: String::new(),
+        }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn run_path_context_wrap_preserves_databricks_statement_failed() {
+        // Mirrors `anyhow::Error::from(e).context(format!("..."))` used at
+        // the run.rs bootstrap / model-failed / partition record sites.
+        let adapter_err = db_adapter_err(DbE::StatementFailed {
+            id: "stmt-1".into(),
+            message: "compile error".into(),
+        });
+        let err = anyhow::Error::from(adapter_err).context(format!(
+            "bootstrap of '{}' for model '{}' failed",
+            "tgt", "m"
+        ));
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn run_path_context_wrap_preserves_snowflake_auth_failed() {
+        let adapter_err = sn_adapter_err(SnE::ApiError {
+            status: 401,
+            body: String::new(),
+        });
+        let err = anyhow::Error::from(adapter_err).context("model 'orders' failed");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn run_path_unconverted_anyhow_macro_still_returns_unknown() {
+        // Negative control: the old lossy pattern still drops the typed
+        // variant. If this ever starts returning the typed kind, the
+        // classifier behaviour shifted and the rest of these pins should
+        // be reviewed.
+        let adapter_err = db_adapter_err(DbE::StatementFailed {
+            id: "stmt-1".into(),
+            message: "syntax".into(),
+        });
+        let err = anyhow::anyhow!("{adapter_err}");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Unknown);
+    }
 }
