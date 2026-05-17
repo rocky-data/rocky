@@ -468,7 +468,7 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 ## `rocky branch`
 
-Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky run --branch <name>` is invoked, every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up. (The `--branch` flag currently lives on the `rocky run` alias only; plumbing it through `rocky plan` + `rocky apply` is a future-phase follow-up.)
+Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky plan --branch <name>` + `rocky apply <plan-id>` is invoked (or the legacy `rocky run --branch <name>` alias), every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
 
 ```bash
 rocky branch create <name> [--description <text>]

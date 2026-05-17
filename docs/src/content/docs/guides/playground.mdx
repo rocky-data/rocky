@@ -451,12 +451,12 @@ The playground includes a curated catalog of {pocCounts.total} POCs across {pocC
 | `01-shell-hooks` | Lifecycle hooks with stdin-JSON context |
 | `02-webhook-slack-preset` | Webhook presets (Slack, PagerDuty, Datadog, Teams) |
 | `03-remote-state-s3` | S3 state backend via MinIO docker-compose |
-| `04-checkpoint-resume` | `rocky run --resume-latest` after mid-pipeline failure (resume currently lives on the `rocky run` alias only) |
+| `04-checkpoint-resume` | `rocky plan --resume-latest && rocky apply <plan-id>` after mid-pipeline failure (legacy `rocky run --resume-latest` alias still accepted) |
 | `05-webhook-presets-multi` | Multiple webhook presets composed on the same run |
 | `06-valkey-distributed-cache` | Distributed cache + tiered state via Valkey/Redis |
 | `07-dagster-dag-mode` | Full asset-graph rendering from Rocky's unified DAG |
 | `08-circuit-breaker` | Trust arc 3: retry policy + three-state circuit breaker |
-| `09-idempotency-key` | `rocky run --idempotency-key` dedup + skip semantics (the flag currently lives on the `rocky run` alias only) |
+| `09-idempotency-key` | `rocky plan --idempotency-key` dedup + skip semantics (legacy `rocky run --idempotency-key` alias still accepted) |
 
 ### Developer Experience ({pocCounts.perCategory["06-developer-experience"]} POCs)
 

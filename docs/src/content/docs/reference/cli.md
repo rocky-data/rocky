@@ -423,7 +423,7 @@ data_type = "DATE"
 
 ### `rocky compare`
 
-Compare shadow tables against production tables. Used after `rocky run --shadow` (shadow mode currently lives on the `rocky run` alias only) to validate results before promoting shadow data to production.
+Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the legacy `rocky run --shadow` alias) to validate results before promoting shadow data to production.
 
 ```bash
 rocky compare --filter <key=value> [flags]

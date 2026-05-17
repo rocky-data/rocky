@@ -28,6 +28,7 @@ Two mandatory sections (`[adapter]` + at least one `[pipeline.<name>]`) plus opt
 
 # Optional globals:
 [state]                  # Embedded state store backend
+[plan_store]             # Persisted plan-artifact format (`format = "v1" | "v2"`)
 [cache]                  # Valkey cache for adapter responses
 [cost]                   # Cost model for `rocky optimize`
 [governance]             # Tags, grants, workspace bindings (Databricks)
@@ -318,6 +319,20 @@ region  = "us-east-1"
 backend = "tiered"
 # … S3 fields plus local path
 ```
+
+## Plan store
+
+```toml
+# Default (legacy envelope with inline SQL — omit to keep default)
+[plan_store]
+format = "v1"
+
+# Opt in to typed-IR payloads; SQL regenerated at apply time
+[plan_store]
+format = "v2"
+```
+
+Controls how `rocky plan` persists plan artifacts to `.rocky/plans/<plan-id>.json`. Default `"v1"` keeps the legacy `CompactOutput` / `ArchiveOutput` envelope with inline SQL. Opt-in `"v2"` writes typed-IR payloads (`CompactPlanIr` / `ArchivePlanIr`); `rocky apply` regenerates SQL from the IR via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Stdout JSON is unchanged in both formats; the reader accepts both regardless of writer config. `PromotePlan` (governance) and `RunPlan` (already IR-only) are intentionally untouched.
 
 ## Cache (Valkey/Redis)
 

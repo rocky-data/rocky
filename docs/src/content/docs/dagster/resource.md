@@ -26,6 +26,7 @@ sidebar:
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
 - **Partial success**: Rocky can exit non-zero but still emit valid JSON (e.g., when some tables succeed and others fail). Methods like `run()`, `compile()`, `test()`, and `ci()` handle this automatically, returning the parsed result so callers can distinguish successes from failures.
+- **Plan artifact per materialization**: as of `dagster-rocky` v1.30, `run()`, `run_streaming()`, and `run_pipes()` internally chain `rocky plan` + `rocky apply <plan-id>` instead of a single `rocky run`. Every materialization writes an auditable plan artifact to `.rocky/plans/<plan-id>.json` before execution, so a failed apply can be inspected against the exact plan it tried to apply. Public method signatures and return types are unchanged. Projects without a `models/` directory (replication-only) fall back to the legacy single-subprocess `rocky run` path because `rocky plan` cannot persist a plan there; behaviour is preserved.
 
 ---
 
@@ -55,9 +56,9 @@ Runs `rocky plan` and returns the planned SQL statements without executing them.
 
 ### `run(filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 
-Runs `rocky run` in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
+Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
 
-**Wraps**: `rocky run --filter <filter> --output json`
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`. The plan artifact is persisted to `.rocky/plans/<plan-id>.json` between the two phases. On replication-only projects (no `models/` directory), `rocky plan` emits `plan_id = null` and the method falls back to a single `rocky run --filter <filter> --output json` subprocess (`ROCKY_SUPPRESS_DEPRECATION=1` is set on the subprocess env so the alias's deprecation notice doesn't bubble up to Dagster logs).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -74,9 +75,9 @@ Runs `rocky run` in buffered mode (`subprocess.run`) and returns the full execut
 
 ### `run_streaming(context, filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 
-Pipes-style `rocky run` with live stderr streaming to `context.log`. Same semantics as `run()` but spawns the binary via `subprocess.Popen` and forwards Rocky's stderr (tracing output) to `context.log.info` line-by-line as the run progresses. Use this from inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
+Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()` but spawns the binary via `subprocess.Popen` and forwards Rocky's stderr (tracing output) to `context.log.info` line-by-line as the run progresses. Use this from inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
 
-**Wraps**: `rocky run --filter <filter> --output json`
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json` (same plan-then-apply chain as `run()`; replication-only projects fall back to `rocky run`). Plan-phase stderr is forwarded to the `dagster_rocky` module logger only; apply-phase stderr streams to `context.log` as before. Operators watching the run viewer for discover/drift progress will see those lines start when the apply step starts.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -93,9 +94,9 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 ### `run_pipes(context, filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, pipes_client=None) -> PipesClientCompletedInvocation`
 
-Full Dagster Pipes execution with structured event streaming. Spawns `rocky run` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars. The engine emits one Pipes message per materialization, asset check, and log line, so the run viewer gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time.
+Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line, so the run viewer gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster surfaces it as run metadata in the run viewer.
 
-**Wraps**: `rocky run --filter <filter> --output json` (via Dagster Pipes protocol)
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json` (via Dagster Pipes protocol). Replication-only projects fall back to a single `rocky run --filter <filter>` Pipes invocation without a `plan_id` in `extras`.
 
 | Parameter | Type | Description |
 |---|---|---|

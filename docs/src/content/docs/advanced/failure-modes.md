@@ -139,7 +139,7 @@ The dispatched adapter classifies its own failures:
 **Recovery playbook.**
 
 1. Run `rocky doctor --output json` first. The `adapters[]` block tells you which adapter Rocky thinks should work and which it currently can't reach. Treat doctor as a credentials / connectivity smoke test.
-2. For **transient** failures (`is_transient: true` on the adapter error), use `rocky run --resume-latest` (the resume flags currently live on the `rocky run` alias only) to pick up where the failed run left off rather than restarting from scratch.
+2. For **transient** failures (`is_transient: true` on the adapter error), use `rocky plan --resume-latest && rocky apply <plan-id>` (or the legacy `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
 3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../features/authentication) has the per-adapter checklist.
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or — better — re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).
@@ -237,7 +237,7 @@ The dispatched adapter classifies its own failures:
 
 - [Troubleshooting](./troubleshooting) — symptom-first lookup ("I got error X")
 - [`rocky doctor`](../../reference/cli#doctor) — aggregate health check across config, state, adapters, pipelines
-- [`rocky run --resume-latest`](../../reference/cli#run) — resume a failed run from its checkpoint (resume flags currently live on the `rocky run` alias only)
+- [`rocky plan --resume-latest`](../../reference/cli#run) — resume a failed run from its checkpoint (canonical form; the legacy `rocky run --resume-latest` alias is still accepted)
 - [Schema drift](../../features/schema-drift) — graduated drift handling deep dive
 - [Data quality checks](../../features/data-quality-checks) — inline check authoring + result shape
 - [Governance guide](../../guides/governance) — permissions, classification, masking, retention
