@@ -127,6 +127,7 @@ pub async fn run_ai(
     cache_ttl_override: Option<u64>,
     materialization: &str,
     watermark: Option<&str>,
+    unique_key: Option<Vec<String>>,
     target: Option<&str>,
     overwrite: bool,
 ) -> Result<()> {
@@ -136,12 +137,23 @@ pub async fn run_ai(
     // Validate sidecar inputs up-front — failing here costs no LLM tokens.
     // Materialization parsing also enforces the `--watermark` requirement
     // for `incremental` before we make the API call.
-    let parsed_materialization = SidecarMaterialization::parse(materialization, watermark)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let parsed_materialization =
+        SidecarMaterialization::parse(materialization, watermark, unique_key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     let parsed_target_override = match target {
         Some(value) => Some(SidecarTarget::parse(value).map_err(|e| anyhow::anyhow!("{e}"))?),
         None => None,
     };
+
+    // Sanity check: `--materialization merge` without `--unique-key` emits
+    // a sidecar that `rocky run` rejects at load time (`StrategyConfig::Merge`
+    // requires `unique_key`). Warn rather than fail so the legacy
+    // "fill it in later" workflow still works.
+    if let SidecarMaterialization::Merge { unique_key: None } = &parsed_materialization {
+        tracing::warn!(
+            "--materialization merge was passed without --unique-key; the emitted sidecar is incomplete and `rocky run` will reject it until you fill in [strategy] unique_key"
+        );
+    }
 
     // Best-effort compile of the project to ground the prompt.
     // If it fails (missing dir, parse errors, etc.) we degrade to unschema'd

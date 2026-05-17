@@ -740,6 +740,17 @@ enum Command {
         /// otherwise.
         #[arg(long)]
         watermark: Option<String>,
+        /// Required for `--materialization merge`. Columns that uniquely
+        /// identify a row for upsert. Maps to `[strategy] unique_key` in
+        /// the emitted sidecar TOML.
+        ///
+        /// Accepts a comma-separated list (`--unique-key id,created_at`)
+        /// or repeated flags (`--unique-key id --unique-key created_at`).
+        /// Omitting the flag for `--materialization merge` emits an
+        /// incomplete sidecar that `rocky run` will reject until you fill
+        /// in `unique_key` by hand.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        unique_key: Vec<String>,
         /// Target table coordinates as `catalog.schema.table`. Defaults to
         /// `generated.ai.<model_name>`, matching the in-memory default
         /// used during AI compile-verify.
@@ -2176,9 +2187,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             materialization,
             watermark,
+            unique_key,
             target,
             overwrite,
         } => {
+            // Collapse empty Vec → None so the downstream renderer can
+            // distinguish "user didn't pass --unique-key" from "user passed
+            // an explicit list" without an extra Option<Vec<String>> on
+            // the clap side.
+            let unique_key = if unique_key.is_empty() {
+                None
+            } else {
+                Some(unique_key)
+            };
             rocky_cli::commands::run_ai(
                 &cli.config,
                 &state_path,
@@ -2189,6 +2210,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 cli.cache_ttl,
                 &materialization,
                 watermark.as_deref(),
+                unique_key,
                 target.as_deref(),
                 overwrite,
             )
