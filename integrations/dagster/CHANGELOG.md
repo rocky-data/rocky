@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.31.0] — 2026-05-17
+
+Companion release to engine `v1.33.0`. `RockyResource` is migrated to the canonical `rocky plan` + `rocky apply <plan-id>` flow: every Dagster materialization now persists an auditable plan artifact under `.rocky/plans/<plan_id>.json` (the same id a `rocky plan` CLI invocation would produce) and then dispatches `rocky apply` for execution. The public method signatures and return types of `run(...)`, `run_streaming(...)`, and `run_pipes(...)` are preserved. Projects without a `models/` directory next to the config keep their previous single-subprocess `rocky run` argv via an automatic replication-only fallback, so behaviour is preserved for replication-only pipelines. To keep stderr quiet for that fallback path, every subprocess invocation now sets `ROCKY_SUPPRESS_DEPRECATION=1` by default (overrideable via the env var) so the engine's `rocky run` / `rocky branch promote <name>` deprecation notices don't surface as Dagster log noise.
+
 ### Changed
 
 - **Migrate `RockyResource` from `rocky run` to canonical `rocky plan` + `rocky apply <plan-id>` flow** (Cluster 3 B Phase 5). The three execution methods — `run(...)`, `run_streaming(...)`, and `run_pipes(...)` — now invoke `rocky plan` first (buffered, single-digit seconds), capture the persisted `plan_id`, then dispatch `rocky apply <plan_id>` via the existing process model for that method (buffered / streamed-to-`context.log` / Dagster Pipes). Every Dagster materialization now writes an auditable plan artifact at `.rocky/plans/<plan_id>.json` — the same id a `rocky plan` CLI invocation would produce. The public method signatures and return types are unchanged (`run()` and `run_streaming()` still return `RunResult`; `run_pipes()` still returns `PipesClientCompletedInvocation`). Notable subtleties:
