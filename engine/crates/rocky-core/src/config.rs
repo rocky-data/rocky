@@ -515,6 +515,89 @@ fn default_state_transfer_timeout_secs() -> u64 {
     300
 }
 
+/// Persisted plan format selector for the `.rocky/plans/<id>.json` writer.
+///
+/// Phase C ("SQL as `.o` files") replaces eagerly-persisted SQL strings with
+/// a typed-IR plan body that the apply path regenerates SQL from at
+/// execution time. The migration ships as a config-bit-gated soft cycle so
+/// adopters can opt in early and existing users see no behaviour change:
+///
+/// - **`v1` (default today, v1.33):** the writer emits the legacy
+///   `CompactOutput` / `ArchiveOutput` payload shape with `NamedStatement.sql`
+///   populated. Byte-stable with every prior release.
+/// - **`v2` (opt-in today, default in a future minor):** the writer emits a
+///   typed-IR payload — [`rocky_ir::CompactPlanIr`] for compact plans,
+///   [`rocky_ir::ArchivePlanIr`] for archive plans. `rocky apply` regenerates
+///   the SQL at execution time via `rocky_core::sql_gen::{compact_from_ir,
+///   archive_from_ir}`.
+///
+/// `PromotePlan` and `RunPlan` are unaffected by this switch: promote keeps
+/// its SQL strings as a documented exception (governance-audit surface) and
+/// run plans were already IR-only as of the Cluster 3 B plan/apply spine.
+///
+/// The reader accepts both formats unconditionally regardless of the
+/// current writer config so v1 plans on disk continue to apply against a
+/// binary configured for v2 (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanStoreFormat {
+    /// Legacy persisted-plan format. The writer serializes the full
+    /// `CompactOutput` / `ArchiveOutput` envelope (including inline SQL)
+    /// as the `payload`. Byte-stable with every prior release; the
+    /// default through v1.x for the soft-migration cycle.
+    #[default]
+    V1,
+    /// Typed-IR persisted-plan format. The writer serializes
+    /// [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`] as the
+    /// `payload`; the apply path regenerates SQL from the IR via
+    /// `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`.
+    /// Stdout JSON (the `--output json` payload printed by `rocky compact`
+    /// / `rocky archive`) keeps carrying SQL in both formats — the split
+    /// is purely between the persisted-to-disk shape and the stdout shape.
+    V2,
+}
+
+impl std::fmt::Display for PlanStoreFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanStoreFormat::V1 => write!(f, "v1"),
+            PlanStoreFormat::V2 => write!(f, "v2"),
+        }
+    }
+}
+
+/// Configuration for the persisted-plan store under `.rocky/plans/`.
+///
+/// Today's only knob is [`PlanStoreConfig::format`] — the writer's
+/// persisted-payload format selector (Phase C — "SQL as `.o` files").
+/// Reader behaviour is unaffected: both v1 and v2 payloads on disk are
+/// accepted regardless of this setting so the migration window is
+/// non-breaking.
+///
+/// ```toml
+/// [plan_store]
+/// format = "v2"  # opt in to the typed-IR persisted format
+/// ```
+///
+/// ## Migration cycle
+///
+/// 1. **v1.33 (now):** writer defaults to `format = "v1"`. Adopters opt
+///    in to v2 by setting `format = "v2"` explicitly.
+/// 2. **Future minor (C-6):** writer default flips to `"v2"`. Reader still
+///    accepts both formats.
+/// 3. **Subsequent minor (C-7):** v1 reader path is removed. Plans on disk
+///    written under the v1 default return a clear regenerate-or-discard
+///    error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStoreConfig {
+    /// Persisted-plan format for `rocky compact` / `rocky archive`.
+    /// Defaults to [`PlanStoreFormat::V1`] for the v1.x soft-migration
+    /// cycle. See [`PlanStoreFormat`] for the full lifecycle.
+    #[serde(default)]
+    pub format: PlanStoreFormat,
+}
+
 /// Policy controlling which terminal outcomes count for
 /// [`IdempotencyConfig::dedup_on`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -1777,6 +1860,16 @@ pub struct RockyConfig {
     /// Global state persistence configuration.
     #[serde(default)]
     pub state: StateConfig,
+
+    /// Persisted-plan store configuration (Phase C — "SQL as `.o` files").
+    ///
+    /// Today this is just the `format` field — `v1` (default) keeps the
+    /// pre-Phase-C `.rocky/plans/<id>.json` shape with inline SQL; `v2`
+    /// opts in to the typed-IR persisted format so `rocky apply`
+    /// regenerates SQL at execution time from `CompactPlanIr` /
+    /// `ArchivePlanIr`. See [`PlanStoreConfig`].
+    #[serde(default)]
+    pub plan_store: PlanStoreConfig,
 
     /// Named adapter configurations (keyed by adapter name).
     #[serde(default, rename = "adapter", alias = "adapters")]
@@ -6220,5 +6313,92 @@ max_rows = 1000
         let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.mask.is_empty());
         assert!(cfg.classifications.allow_unmasked.is_empty());
+    }
+
+    // ---------- Phase C — [plan_store] config bit (C-5) ----------
+
+    #[test]
+    fn plan_store_defaults_to_v1_when_omitted() {
+        // Zero-config contract for Phase C: omitting `[plan_store]` leaves
+        // the writer on the legacy v1 format so existing users see no
+        // behaviour change. C-6 will flip this default to v2.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plan_store.format, PlanStoreFormat::V1);
+    }
+
+    #[test]
+    fn plan_store_parses_explicit_v1() {
+        // Operators may pin `format = "v1"` to lock the legacy shape even
+        // after the C-6 default flip. Equivalent to omitting the block today.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [plan_store]
+            format = "v1"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plan_store.format, PlanStoreFormat::V1);
+    }
+
+    #[test]
+    fn plan_store_parses_v2_opt_in() {
+        // The opt-in path C-5 introduces: `format = "v2"` turns on the
+        // typed-IR persisted plan shape for `rocky compact` / `rocky archive`.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [plan_store]
+            format = "v2"
+        "#;
+        let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plan_store.format, PlanStoreFormat::V2);
+    }
+
+    #[test]
+    fn plan_store_rejects_unknown_format() {
+        // `[plan_store]` uses `deny_unknown_fields` for the table itself
+        // and the enum is exhaustive over v1/v2 — typos should fail loudly
+        // rather than silently fall back to the default.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [plan_store]
+            format = "v3"
+        "#;
+        let err = toml::from_str::<RockyConfig>(toml_str)
+            .expect_err("unknown format value should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v3") || msg.contains("unknown variant"),
+            "error should mention the bad value or variant set, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_store_rejects_unknown_fields() {
+        // `deny_unknown_fields` on `PlanStoreConfig` guards against typos
+        // in sibling field names that would otherwise be silently ignored.
+        let toml_str = r#"
+            [adapter.default]
+            type = "duckdb"
+
+            [plan_store]
+            format = "v1"
+            backend = "redis"
+        "#;
+        let err = toml::from_str::<RockyConfig>(toml_str)
+            .expect_err("unknown sibling field should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backend") || msg.contains("unknown field"),
+            "error should mention the unknown field, got: {msg}"
+        );
     }
 }

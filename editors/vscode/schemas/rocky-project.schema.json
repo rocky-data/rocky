@@ -1518,6 +1518,41 @@
       ],
       "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
     },
+    "PlanStoreConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for the persisted-plan store under `.rocky/plans/`.\n\nToday's only knob is [`PlanStoreConfig::format`] — the writer's persisted-payload format selector (Phase C — \"SQL as `.o` files\"). Reader behaviour is unaffected: both v1 and v2 payloads on disk are accepted regardless of this setting so the migration window is non-breaking.\n\n```toml [plan_store] format = \"v2\"  # opt in to the typed-IR persisted format ```\n\n## Migration cycle\n\n1. **v1.33 (now):** writer defaults to `format = \"v1\"`. Adopters opt in to v2 by setting `format = \"v2\"` explicitly. 2. **Future minor (C-6):** writer default flips to `\"v2\"`. Reader still accepts both formats. 3. **Subsequent minor (C-7):** v1 reader path is removed. Plans on disk written under the v1 default return a clear regenerate-or-discard error.",
+      "properties": {
+        "format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PlanStoreFormat"
+            }
+          ],
+          "default": "v1",
+          "description": "Persisted-plan format for `rocky compact` / `rocky archive`. Defaults to [`PlanStoreFormat::V1`] for the v1.x soft-migration cycle. See [`PlanStoreFormat`] for the full lifecycle."
+        }
+      },
+      "type": "object"
+    },
+    "PlanStoreFormat": {
+      "description": "Persisted plan format selector for the `.rocky/plans/<id>.json` writer.\n\nPhase C (\"SQL as `.o` files\") replaces eagerly-persisted SQL strings with a typed-IR plan body that the apply path regenerates SQL from at execution time. The migration ships as a config-bit-gated soft cycle so adopters can opt in early and existing users see no behaviour change:\n\n- **`v1` (default today, v1.33):** the writer emits the legacy `CompactOutput` / `ArchiveOutput` payload shape with `NamedStatement.sql` populated. Byte-stable with every prior release. - **`v2` (opt-in today, default in a future minor):** the writer emits a typed-IR payload — [`rocky_ir::CompactPlanIr`] for compact plans, [`rocky_ir::ArchivePlanIr`] for archive plans. `rocky apply` regenerates the SQL at execution time via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`.\n\n`PromotePlan` and `RunPlan` are unaffected by this switch: promote keeps its SQL strings as a documented exception (governance-audit surface) and run plans were already IR-only as of the Cluster 3 B plan/apply spine.\n\nThe reader accepts both formats unconditionally regardless of the current writer config so v1 plans on disk continue to apply against a binary configured for v2 (and vice versa).",
+      "oneOf": [
+        {
+          "description": "Legacy persisted-plan format. The writer serializes the full `CompactOutput` / `ArchiveOutput` envelope (including inline SQL) as the `payload`. Byte-stable with every prior release; the default through v1.x for the soft-migration cycle.",
+          "enum": [
+            "v1"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Typed-IR persisted-plan format. The writer serializes [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`] as the `payload`; the apply path regenerates SQL from the IR via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Stdout JSON (the `--output json` payload printed by `rocky compact` / `rocky archive`) keeps carrying SQL in both formats — the split is purely between the persisted-to-disk shape and the stdout shape.",
+          "enum": [
+            "v2"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "PortabilityConfig": {
       "additionalProperties": false,
       "description": "Project-wide dialect portability configuration.\n\nLives at the top level because a Rocky project targets one warehouse; per-pipeline overrides aren't supported yet (no demand signal). The `allow` list applies to every model — a per-model override is the `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed by [`rocky_sql::pragma`].",
@@ -3057,6 +3092,17 @@
       ],
       "default": {},
       "description": "Named pipeline configurations (keyed by pipeline name)."
+    },
+    "plan_store": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PlanStoreConfig"
+        }
+      ],
+      "default": {
+        "format": "v1"
+      },
+      "description": "Persisted-plan store configuration (Phase C — \"SQL as `.o` files\").\n\nToday this is just the `format` field — `v1` (default) keeps the pre-Phase-C `.rocky/plans/<id>.json` shape with inline SQL; `v2` opts in to the typed-IR persisted format so `rocky apply` regenerates SQL at execution time from `CompactPlanIr` / `ArchivePlanIr`. See [`PlanStoreConfig`]."
     },
     "portability": {
       "allOf": [

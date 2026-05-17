@@ -279,6 +279,18 @@ export type BindingType = "READ_WRITE" | "READ_ONLY";
  */
 export type LoadFileFormat = "csv" | "parquet" | "json_lines";
 /**
+ * Persisted plan format selector for the `.rocky/plans/<id>.json` writer.
+ *
+ * Phase C ("SQL as `.o` files") replaces eagerly-persisted SQL strings with a typed-IR plan body that the apply path regenerates SQL from at execution time. The migration ships as a config-bit-gated soft cycle so adopters can opt in early and existing users see no behaviour change:
+ *
+ * - **`v1` (default today, v1.33):** the writer emits the legacy `CompactOutput` / `ArchiveOutput` payload shape with `NamedStatement.sql` populated. Byte-stable with every prior release. - **`v2` (opt-in today, default in a future minor):** the writer emits a typed-IR payload — [`rocky_ir::CompactPlanIr`] for compact plans, [`rocky_ir::ArchivePlanIr`] for archive plans. `rocky apply` regenerates the SQL at execution time via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`.
+ *
+ * `PromotePlan` and `RunPlan` are unaffected by this switch: promote keeps its SQL strings as a documented exception (governance-audit surface) and run plans were already IR-only as of the Cluster 3 B plan/apply spine.
+ *
+ * The reader accepts both formats unconditionally regardless of the current writer config so v1 plans on disk continue to apply against a binary configured for v2 (and vice versa).
+ */
+export type PlanStoreFormat = "v1" | "v2";
+/**
  * Target dialect for transpilation.
  *
  * Serializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.
@@ -361,6 +373,12 @@ export interface RockyConfig {
    * Named pipeline configurations (keyed by pipeline name).
    */
   pipeline?: PipelinesFieldSchema;
+  /**
+   * Persisted-plan store configuration (Phase C — "SQL as `.o` files").
+   *
+   * Today this is just the `format` field — `v1` (default) keeps the pre-Phase-C `.rocky/plans/<id>.json` shape with inline SQL; `v2` opts in to the typed-IR persisted format so `rocky apply` regenerates SQL at execution time from `CompactPlanIr` / `ArchivePlanIr`. See [`PlanStoreConfig`].
+   */
+  plan_store?: PlanStoreConfig;
   /**
    * Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
    */
@@ -1268,6 +1286,23 @@ export interface LoadTargetConfig {
    * Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).
    */
   table?: string | null;
+}
+/**
+ * Configuration for the persisted-plan store under `.rocky/plans/`.
+ *
+ * Today's only knob is [`PlanStoreConfig::format`] — the writer's persisted-payload format selector (Phase C — "SQL as `.o` files"). Reader behaviour is unaffected: both v1 and v2 payloads on disk are accepted regardless of this setting so the migration window is non-breaking.
+ *
+ * ```toml [plan_store] format = "v2"  # opt in to the typed-IR persisted format ```
+ *
+ * ## Migration cycle
+ *
+ * 1. **v1.33 (now):** writer defaults to `format = "v1"`. Adopters opt in to v2 by setting `format = "v2"` explicitly. 2. **Future minor (C-6):** writer default flips to `"v2"`. Reader still accepts both formats. 3. **Subsequent minor (C-7):** v1 reader path is removed. Plans on disk written under the v1 default return a clear regenerate-or-discard error.
+ */
+export interface PlanStoreConfig {
+  /**
+   * Persisted-plan format for `rocky compact` / `rocky archive`. Defaults to [`PlanStoreFormat::V1`] for the v1.x soft-migration cycle. See [`PlanStoreFormat`] for the full lifecycle.
+   */
+  format?: PlanStoreFormat & string;
 }
 /**
  * Project-wide dialect portability configuration.

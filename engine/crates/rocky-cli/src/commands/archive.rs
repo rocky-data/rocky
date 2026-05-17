@@ -13,15 +13,81 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use rocky_core::config::PlanStoreFormat;
+use rocky_databricks::dialect::DatabricksSqlDialect;
+use rocky_ir::ArchivePlanIr;
 use rocky_sql::validation::validate_identifier;
 
 use crate::output::{
     ArchiveApplyOutput, ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement,
     StatementResult, print_json,
 };
-use crate::plan_store::{PlanKind, read_plan, write_plan};
+use crate::plan_store::{PlanKind, read_plan, write_plan, write_plan_v2};
 use crate::registry::AdapterRegistry;
 use crate::scope::resolve_managed_tables_in_catalog;
+
+/// Resolve the persisted-plan format from the project config. When no
+/// config can be loaded falls back to the default v1 format.
+fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
+    let Some(path) = config_path else {
+        return PlanStoreFormat::default();
+    };
+    match rocky_core::config::load_rocky_config(path) {
+        Ok(cfg) => cfg.plan_store.format,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "failed to load rocky config for [plan_store] lookup; falling back to v1"
+            );
+            PlanStoreFormat::default()
+        }
+    }
+}
+
+/// Build the per-table `ArchivePlanIr` that mirrors the CLI's inline
+/// `generate_archive_sql` inputs for a `model` / `days` pair. Matches
+/// the construction used in the C-3 equivalence test so v2 plan
+/// regeneration replays byte-identical SQL.
+fn build_archive_ir(model: Option<&str>, days: u64) -> ArchivePlanIr {
+    match model {
+        Some(table) => ArchivePlanIr::for_table(table, days),
+        None => ArchivePlanIr {
+            target_table: None,
+            older_than: format!("{days}d"),
+            older_than_days: days,
+            partition_column: "_fivetran_synced".to_string(),
+            vacuum_retention_hours: Some(0),
+        },
+    }
+}
+
+/// Persist an archive plan using the configured `[plan_store]` format.
+/// See [`persist_compact_plan`] in [`super::compact`] for the symmetric
+/// rationale; the only difference here is the payload-envelope shape
+/// (carries `older_than` / `older_than_days` in addition to the per-table
+/// IR list).
+fn persist_archive_plan(
+    root: &Path,
+    format: PlanStoreFormat,
+    output: &ArchiveOutput,
+    ir_payloads: &[ArchivePlanIr],
+) -> Result<String> {
+    match format {
+        PlanStoreFormat::V1 => write_plan(root, PlanKind::Archive, output),
+        PlanStoreFormat::V2 => {
+            let v2_payload = serde_json::json!({
+                "model": output.model,
+                "catalog": output.catalog,
+                "scope": output.scope,
+                "older_than": output.older_than,
+                "older_than_days": output.older_than_days,
+                "dry_run": output.dry_run,
+                "plans": ir_payloads,
+            });
+            write_plan_v2(root, PlanKind::Archive, &v2_payload)
+        }
+    }
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,7 +96,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
 /// (relative to the current working directory) so it can be applied later
 /// via `rocky archive apply <plan_id>`.
+///
+/// The persisted-plan format is selected by `[plan_store] format` in
+/// `config_path` (defaults to v1). The stdout JSON shape is unchanged
+/// either way — it always carries SQL for human + CI consumers.
 pub fn run_archive(
+    config_path: &Path,
     model: Option<&str>,
     older_than: &str,
     dry_run: bool,
@@ -66,9 +137,11 @@ pub fn run_archive(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    match write_plan(&cwd, PlanKind::Archive, &output) {
+    let plan_format = resolve_plan_store_format(Some(config_path));
+    let ir_payloads = vec![build_archive_ir(model, days)];
+    match persist_archive_plan(&cwd, plan_format, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, "archive plan persisted");
+            tracing::info!(plan_id = %id, format = %plan_format, "archive plan persisted");
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -125,6 +198,7 @@ pub async fn run_archive_catalog(
 
     let mut flat_statements: Vec<NamedStatement> = Vec::new();
     let mut per_table: BTreeMap<String, ArchiveTableEntry> = BTreeMap::new();
+    let mut ir_payloads: Vec<ArchivePlanIr> = Vec::with_capacity(scope.tables.len());
 
     for fqn in &scope.tables {
         let stmts = generate_archive_sql(Some(fqn), days)?;
@@ -137,6 +211,7 @@ pub async fn run_archive_catalog(
             .collect();
         flat_statements.extend(typed.iter().cloned());
         per_table.insert(fqn.clone(), ArchiveTableEntry { statements: typed });
+        ir_payloads.push(build_archive_ir(Some(fqn), days));
     }
 
     let totals = ArchiveTotals {
@@ -161,9 +236,15 @@ pub async fn run_archive_catalog(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    match write_plan(&cwd, PlanKind::Archive, &output) {
+    let plan_format = resolve_plan_store_format(Some(config_path));
+    match persist_archive_plan(&cwd, plan_format, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, catalog = %scope.catalog, "archive catalog plan persisted");
+            tracing::info!(
+                plan_id = %id,
+                catalog = %scope.catalog,
+                format = %plan_format,
+                "archive catalog plan persisted"
+            );
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -266,6 +347,51 @@ fn generate_archive_sql(model: Option<&str>, days: u64) -> Result<Vec<(String, S
     ])
 }
 
+/// Regenerate `Vec<NamedStatement>` from a v2 (typed-IR) persisted
+/// archive plan payload.
+///
+/// Mirrors `regenerate_v2_compact_statements` in `compact.rs`. The v2
+/// envelope shape is `{ model?, catalog?, scope?, older_than,
+/// older_than_days, dry_run, plans: [ArchivePlanIr, ...] }`. Cutoff
+/// math stays at runtime (`DATEADD(DAY, -N, CURRENT_TIMESTAMP())`) so
+/// regeneration is byte-equivalent to the v1 inline path; literal-
+/// timestamp cutoffs (`cutoff_resolved_at`) are a separate semantic
+/// improvement deferred to a follow-up PR.
+fn regenerate_v2_archive_statements(
+    plan_id: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<NamedStatement>> {
+    let plans_value = payload
+        .get("plans")
+        .ok_or_else(|| anyhow::anyhow!(
+            "archive plan '{}' (v2) is missing the `plans` field; expected an envelope of \
+             {{ model?, catalog?, scope?, older_than, older_than_days, dry_run, plans: [ArchivePlanIr, ...] }}",
+            plan_id,
+        ))?;
+    let ir_plans: Vec<ArchivePlanIr> = serde_json::from_value(plans_value.clone())
+        .with_context(|| format!(
+            "archive plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<ArchivePlanIr>"
+        ))?;
+
+    let dialect = DatabricksSqlDialect;
+    let mut statements = Vec::new();
+    for ir in &ir_plans {
+        let pairs = rocky_core::sql_gen::archive_from_ir(ir, &dialect).with_context(|| {
+            format!(
+                "archive plan '{plan_id}' (v2): failed to regenerate SQL for target {target}",
+                target = ir.target_table.as_deref().unwrap_or("<wildcard>"),
+            )
+        })?;
+        for (purpose, sql) in pairs {
+            statements.push(NamedStatement {
+                purpose,
+                sql: Some(sql),
+            });
+        }
+    }
+    Ok(statements)
+}
+
 /// Execute `rocky archive apply <plan_id>`.
 ///
 /// Reads the persisted plan from `.rocky/plans/<plan_id>.json`, validates
@@ -303,9 +429,25 @@ pub(crate) async fn run_archive_apply_in(
         );
     }
 
-    // Deserialize the payload back to ArchiveOutput to extract statements.
-    let archive_output: ArchiveOutput = serde_json::from_value(plan.payload.clone())
-        .context("failed to deserialize archive plan payload")?;
+    // Phase C — "SQL as `.o` files" — dispatch on the persisted-plan
+    // format version. v1 plans carry `ArchiveOutput` with inline SQL;
+    // v2 plans carry an `ArchivePlanIr` envelope and SQL is regenerated
+    // here via `sql_gen::archive_from_ir`.
+    let statements: Vec<NamedStatement> = match plan.format_version {
+        1 => {
+            let archive_output: ArchiveOutput = serde_json::from_value(plan.payload.clone())
+                .context("failed to deserialize archive plan payload (v1)")?;
+            archive_output.statements
+        }
+        2 => regenerate_v2_archive_statements(plan_id, &plan.payload)?,
+        other => bail!(
+            "archive plan '{}' has unknown format_version {}. \
+             This binary supports v1 (legacy ArchiveOutput) and v2 (typed ArchivePlanIr) \
+             persisted plans; the file is from a newer engine — upgrade and re-apply.",
+            plan_id,
+            other
+        ),
+    };
 
     // Build the warehouse adapter from the config.
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
@@ -316,21 +458,22 @@ pub(crate) async fn run_archive_apply_in(
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let executed_at = Utc::now();
-    let mut results: Vec<StatementResult> = Vec::with_capacity(archive_output.statements.len());
+    let mut results: Vec<StatementResult> = Vec::with_capacity(statements.len());
     let mut overall_success = true;
 
-    for stmt in &archive_output.statements {
-        // `NamedStatement.sql` is `Option<String>` to leave room for the
-        // v2 persisted plan format (Cluster 3 C — "SQL as `.o` files");
-        // a `None` here means the plan was written by a newer engine
-        // that persists typed IR. See the matching comment in `compact.rs`.
+    for stmt in &statements {
+        // After the v1/v2 dispatch above, `sql` is always populated:
+        // v1 payloads write `Some(sql)` from `generate_archive_sql`,
+        // and v2 regeneration goes through `archive_from_ir` which
+        // also returns `Some(sql)` for every statement. A `None` here
+        // means a v1 plan was malformed (written with `sql: None` by
+        // some unknown caller).
         let sql = match stmt.sql.as_deref() {
             Some(sql) => sql,
             None => bail!(
-                "archive plan '{}' carries a statement without inline SQL \
-                 (purpose: '{}'). This plan was written by a newer engine \
-                 that persists typed-IR plans; this binary cannot regenerate \
-                 SQL from IR yet — upgrade and re-apply.",
+                "archive plan '{}' carries a v1 statement without inline SQL \
+                 (purpose: '{}'). v1 plans must persist SQL; this is a \
+                 malformed plan file.",
                 plan_id,
                 stmt.purpose,
             ),
@@ -701,6 +844,90 @@ schema_template = "staging__{{source}}"
             // `DELETE FROM *` emission — preserved for byte-equivalence
             // even though the resulting SQL is intentionally invalid.
             assert_equivalent(None, 30);
+        }
+    }
+
+    /// Cluster 3 C — C-5 v2-payload regeneration tests.
+    ///
+    /// The reader-side dispatch in `run_archive_apply_in` calls
+    /// `regenerate_v2_archive_statements` on a `format_version = 2`
+    /// payload. These tests pin that helper against:
+    ///
+    /// - the inline `generate_archive_sql` baseline (byte-equivalence),
+    /// - the envelope-shape contract (missing `plans` field → clear error),
+    /// - the v1↔v2 invariant that both paths produce the same
+    ///   `(purpose, sql)` pairs for the same input.
+    mod v2_regeneration {
+        use super::*;
+
+        fn build_v2_payload(model: Option<&str>, days: u64) -> serde_json::Value {
+            let ir = build_archive_ir(model, days);
+            serde_json::json!({
+                "model": model,
+                "older_than": format!("{days}d"),
+                "older_than_days": days,
+                "dry_run": false,
+                "plans": [ir],
+            })
+        }
+
+        #[test]
+        fn v2_regenerates_named_model_archive_statements() {
+            let payload = build_v2_payload(Some("catalog.schema.events"), 90);
+            let stmts = regenerate_v2_archive_statements("test-plan", &payload).unwrap();
+            // Inline path baseline — must be byte-identical.
+            let baseline = generate_archive_sql(Some("catalog.schema.events"), 90).unwrap();
+            assert_eq!(stmts.len(), baseline.len());
+            for (s, (purpose, sql)) in stmts.iter().zip(baseline.iter()) {
+                assert_eq!(s.purpose, *purpose);
+                assert_eq!(s.sql.as_deref(), Some(sql.as_str()));
+            }
+        }
+
+        #[test]
+        fn v2_regenerates_catalog_scope_archive_statements_in_order() {
+            // Multi-entry `plans` list models the `--catalog` path.
+            // Flat concatenation must match the inline catalog loop.
+            let tables = ["warehouse.facts.events", "warehouse.facts.orders"];
+            let irs: Vec<_> = tables
+                .iter()
+                .map(|t| build_archive_ir(Some(t), 90))
+                .collect();
+            let payload = serde_json::json!({
+                "catalog": "warehouse",
+                "scope": "catalog",
+                "older_than": "90d",
+                "older_than_days": 90,
+                "dry_run": false,
+                "plans": irs,
+            });
+            let stmts = regenerate_v2_archive_statements("test-plan", &payload).unwrap();
+            let mut expected: Vec<(String, String)> = Vec::new();
+            for t in tables {
+                expected.extend(generate_archive_sql(Some(t), 90).unwrap());
+            }
+            assert_eq!(stmts.len(), expected.len());
+            for (s, (purpose, sql)) in stmts.iter().zip(expected.iter()) {
+                assert_eq!(s.purpose, *purpose);
+                assert_eq!(s.sql.as_deref(), Some(sql.as_str()));
+            }
+        }
+
+        #[test]
+        fn v2_missing_plans_field_returns_clear_error() {
+            let payload = serde_json::json!({
+                "model": "x",
+                "older_than": "90d",
+                "older_than_days": 90,
+                "dry_run": false,
+                // no `plans` field
+            });
+            let err = regenerate_v2_archive_statements("test-plan", &payload).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("plans") && msg.contains("v2"),
+                "error should mention the missing `plans` field, got: {msg}"
+            );
         }
     }
 }

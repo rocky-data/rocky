@@ -542,6 +542,22 @@ class Type20(StrEnum):
     load = "load"
 
 
+class PlanStoreFormat1(StrEnum):
+    """
+    Legacy persisted-plan format. The writer serializes the full `CompactOutput` / `ArchiveOutput` envelope (including inline SQL) as the `payload`. Byte-stable with every prior release; the default through v1.x for the soft-migration cycle.
+    """
+
+    v1 = "v1"
+
+
+class PlanStoreFormat2(StrEnum):
+    """
+    Typed-IR persisted-plan format. The writer serializes [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`] as the `payload`; the apply path regenerates SQL from the IR via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Stdout JSON (the `--output json` payload printed by `rocky compact` / `rocky archive`) keeps carrying SQL in both formats — the split is purely between the persisted-to-disk shape and the stdout shape.
+    """
+
+    v2 = "v2"
+
+
 class PortabilityConfig(BaseModel):
     """
     Project-wide dialect portability configuration.
@@ -1223,6 +1239,28 @@ class PipelineSourceConfig(BaseModel):
     schema_pattern: SchemaPatternConfig
     """
     Schema pattern for parsing source schema names.
+    """
+
+
+class PlanStoreConfig(BaseModel):
+    """
+    Configuration for the persisted-plan store under `.rocky/plans/`.
+
+    Today's only knob is [`PlanStoreConfig::format`] — the writer's persisted-payload format selector (Phase C — "SQL as `.o` files"). Reader behaviour is unaffected: both v1 and v2 payloads on disk are accepted regardless of this setting so the migration window is non-breaking.
+
+    ```toml [plan_store] format = "v2"  # opt in to the typed-IR persisted format ```
+
+    ## Migration cycle
+
+    1. **v1.33 (now):** writer defaults to `format = "v1"`. Adopters opt in to v2 by setting `format = "v2"` explicitly. 2. **Future minor (C-6):** writer default flips to `"v2"`. Reader still accepts both formats. 3. **Subsequent minor (C-7):** v1 reader path is removed. Plans on disk written under the v1 default return a clear regenerate-or-discard error.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    format: PlanStoreFormat1 | PlanStoreFormat2 | None = "v1"
+    """
+    Persisted-plan format for `rocky compact` / `rocky archive`. Defaults to [`PlanStoreFormat::V1`] for the v1.x soft-migration cycle. See [`PlanStoreFormat`] for the full lifecycle.
     """
 
 
@@ -2547,6 +2585,12 @@ class RockyConfig(BaseModel):
     ) = Field({}, validate_default=True)
     """
     Named pipeline configurations (keyed by pipeline name).
+    """
+    plan_store: PlanStoreConfig | None = Field({"format": "v1"}, validate_default=True)
+    """
+    Persisted-plan store configuration (Phase C — "SQL as `.o` files").
+
+    Today this is just the `format` field — `v1` (default) keeps the pre-Phase-C `.rocky/plans/<id>.json` shape with inline SQL; `v2` opts in to the typed-IR persisted format so `rocky apply` regenerates SQL at execution time from `CompactPlanIr` / `ArchivePlanIr`. See [`PlanStoreConfig`].
     """
     portability: PortabilityConfig | None = Field(
         {"allow": [], "target_dialect": None}, validate_default=True
