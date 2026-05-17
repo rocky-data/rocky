@@ -76,6 +76,11 @@ struct TableError {
     error: String,
     /// Index into the original tables_to_process vec (for retry).
     task_index: Option<usize>,
+    /// Coarse classification of the failure for the public JSON output.
+    /// Set by walking the typed connector-error chain on `e` before the
+    /// error is stringified; defaults to `Unknown` when no connector
+    /// variant is in the chain (drift / governance / panic paths).
+    failure_kind: crate::output::FailureKind,
 }
 
 /// Sentinel error signalling that `rocky run` was cancelled by a shutdown
@@ -2056,6 +2061,9 @@ pub async fn run(
                 }
             }
             Ok((idx, Err(e))) => {
+                // Classify before stringification so the typed connector
+                // variant is preserved on `TableError.failure_kind`.
+                let failure_kind = classify_anyhow_error(&e);
                 let msg = format!("{e:#}");
                 if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -2118,6 +2126,7 @@ pub async fn run(
                     asset_key: vec![],
                     error: msg,
                     task_index: Some(idx),
+                    failure_kind,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2151,6 +2160,7 @@ pub async fn run(
                     asset_key: vec![],
                     error: msg,
                     task_index: None,
+                    failure_kind: FailureKind::Unknown,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2369,6 +2379,7 @@ pub async fn run(
                         info!(table = task.table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
+                        let failure_kind = classify_anyhow_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.table_name.as_str(),
@@ -2379,6 +2390,7 @@ pub async fn run(
                             asset_key: vec![],
                             error: msg,
                             task_index: Some(idx),
+                            failure_kind,
                         });
                     }
                 }
@@ -3033,6 +3045,7 @@ pub async fn run(
         .map(|e| TableErrorOutput {
             asset_key: e.asset_key.clone(),
             error: e.error.clone(),
+            failure_kind: e.failure_kind,
         })
         .collect();
 
@@ -4860,6 +4873,9 @@ async fn process_completed_result(
             }
         }
         Ok((idx, Err(e))) => {
+            // Classify before stringification so the typed connector
+            // variant is preserved on `TableError.failure_kind`.
+            let failure_kind = classify_anyhow_error(&e);
             let msg = format!("{e:#}");
             if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -4908,6 +4924,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: Some(idx),
+                failure_kind,
             });
         }
         Err(e) => {
@@ -4937,6 +4954,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: None,
+                failure_kind: FailureKind::Unknown,
             });
         }
     }

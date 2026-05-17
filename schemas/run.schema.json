@@ -343,6 +343,60 @@
       ],
       "type": "object"
     },
+    "FailureKind": {
+      "description": "Coarse-grained failure classification for an entry on [`RunOutput::errors`]. Lets orchestrators branch on the kind of failure (retry, page someone, surface in the UI) without parsing the free-form `error` string.\n\nVariants partition the [`rocky_databricks::connector::ConnectorError`] and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown` is the fallback for non-connector failures (drift, governance, adapter-internal errors) where the error reached the output layer already type-erased.",
+      "oneOf": [
+        {
+          "description": "TCP / TLS / DNS / connection-establishment failure.",
+          "enum": [
+            "connection-failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Credentials rejected, token expired or otherwise invalid.",
+          "enum": [
+            "auth-failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Warehouse rejected the SQL — syntax error, schema mismatch, missing permission, semantic analysis failure.",
+          "enum": [
+            "query-rejected"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry-worthy failure — 5xx, network glitch, statement aborted by a transient warehouse condition.",
+          "enum": [
+            "transient"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rate limit hit or a configured budget cap (retry budget, circuit breaker, account-level quota).",
+          "enum": [
+            "quota-exceeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Requested catalog / schema / table not present.",
+          "enum": [
+            "not-found"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Fallback when the failure could not be classified — e.g. errors raised outside the connector layer that reach this struct type-erased through `anyhow::Error`.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "MaterializationMetadata": {
       "properties": {
         "column_count": {
@@ -852,6 +906,15 @@
         },
         "error": {
           "type": "string"
+        },
+        "failure_kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FailureKind"
+            }
+          ],
+          "default": "unknown",
+          "description": "Coarse classification of the failure so orchestrators can branch on kind (retry, page, surface) without parsing `error`. Defaults to [`FailureKind::Unknown`] for errors that reached the output layer type-erased."
         }
       },
       "required": [

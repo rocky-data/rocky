@@ -92,6 +92,62 @@ class ExecutionSummary(BaseModel):
     tables_processed: conint(ge=0)
 
 
+class FailureKind1(StrEnum):
+    """
+    TCP / TLS / DNS / connection-establishment failure.
+    """
+
+    connection_failed = "connection-failed"
+
+
+class FailureKind2(StrEnum):
+    """
+    Credentials rejected, token expired or otherwise invalid.
+    """
+
+    auth_failed = "auth-failed"
+
+
+class FailureKind3(StrEnum):
+    """
+    Warehouse rejected the SQL — syntax error, schema mismatch, missing permission, semantic analysis failure.
+    """
+
+    query_rejected = "query-rejected"
+
+
+class FailureKind4(StrEnum):
+    """
+    Retry-worthy failure — 5xx, network glitch, statement aborted by a transient warehouse condition.
+    """
+
+    transient = "transient"
+
+
+class FailureKind5(StrEnum):
+    """
+    Rate limit hit or a configured budget cap (retry budget, circuit breaker, account-level quota).
+    """
+
+    quota_exceeded = "quota-exceeded"
+
+
+class FailureKind6(StrEnum):
+    """
+    Requested catalog / schema / table not present.
+    """
+
+    not_found = "not-found"
+
+
+class FailureKind7(StrEnum):
+    """
+    Fallback when the failure could not be classified — e.g. errors raised outside the connector layer that reach this struct type-erased through `anyhow::Error`.
+    """
+
+    unknown = "unknown"
+
+
 class MaterializationMetadata(BaseModel):
     column_count: conint(ge=0) | None = None
     """
@@ -291,6 +347,19 @@ class TableErrorOutput(BaseModel):
 
     asset_key: list[str]
     error: str
+    failure_kind: (
+        FailureKind1
+        | FailureKind2
+        | FailureKind3
+        | FailureKind4
+        | FailureKind5
+        | FailureKind6
+        | FailureKind7
+        | None
+    ) = "unknown"
+    """
+    Coarse classification of the failure so orchestrators can branch on kind (retry, page, surface) without parsing `error`. Defaults to [`FailureKind::Unknown`] for errors that reached the output layer type-erased.
+    """
 
 
 class TestSeverity3(StrEnum):
