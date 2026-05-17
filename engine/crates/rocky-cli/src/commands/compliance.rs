@@ -307,6 +307,8 @@ mod tests {
                 classification,
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: "SELECT 1".to_string(),
             file_path: format!("models/{name}.sql"),

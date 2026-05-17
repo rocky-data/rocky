@@ -893,13 +893,20 @@ fn lint_config(
         return;
     }
 
-    // L001: name matches filename stem
+    // L001: name matches filename stem.
+    //
+    // Both the post-substitution `name` and the raw author-declared
+    // `name_declared` must match — otherwise an env-resolved value that
+    // happens to coincide with the filename stem (e.g.
+    // `name = "${ROCKY_MODEL_NAME:-fct_orders}"` in `fct_orders.toml`)
+    // would noisily fire the "you can omit it" lint on an intentional
+    // template.
     for model in models {
         let file_stem = std::path::Path::new(&model.file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        if model.config.name == file_stem {
+        if model.config.name == file_stem && model.config.name_declared == file_stem {
             out.push(ValidateMessage {
                 severity: "lint".into(),
                 code: "L001".into(),
@@ -912,8 +919,15 @@ fn lint_config(
             });
         }
 
-        // L002: target.table matches name
-        if model.config.target.table == model.config.name {
+        // L002: target.table matches name.
+        //
+        // Same raw-vs-resolved reasoning as L001 — only fire when the
+        // author's declared template also matches, so
+        // `table = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"` with
+        // `name = "customer_facts"` no longer trips the lint.
+        if model.config.target.table == model.config.name
+            && model.config.target_table_declared == model.config.name_declared
+        {
             out.push(ValidateMessage {
                 severity: "lint".into(),
                 code: "L002".into(),
@@ -1425,6 +1439,126 @@ schema_template = "demo"
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
         assert!(unknown[0].message.contains("postgres"));
+    }
+
+    /// L002 must NOT fire when `target.table` is declared as a
+    /// `${VAR:-default}` template that happens to collapse to the
+    /// model's `name` after env substitution. Compares raw declared
+    /// templates against each other, not env-resolved literals.
+    #[test]
+    fn test_l002_skips_env_template_default() {
+        use rocky_core::models::{Model, ModelConfig, SourceConfig, StrategyConfig, TargetConfig};
+        let model = Model {
+            config: ModelConfig {
+                name: "customer_facts".into(),
+                depends_on: Vec::new(),
+                strategy: StrategyConfig::FullRefresh,
+                target: TargetConfig {
+                    catalog: "analytics".into(),
+                    schema: "marts".into(),
+                    // Post-substitution literal (env unset, default applied).
+                    table: "customer_facts".into(),
+                },
+                sources: Vec::<SourceConfig>::new(),
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: Vec::new(),
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                retention: None,
+                budget: None,
+                name_declared: "customer_facts".into(),
+                target_table_declared: "${ROCKY_TABLE_OVERRIDE:-customer_facts}".into(),
+            },
+            sql: "SELECT 1".into(),
+            file_path: "/tmp/customer_facts.sql".into(),
+            contract_path: None,
+        };
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+target.adapter = "default"
+"#;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
+
+        let mut out = ValidateOutput::default();
+        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+
+        let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
+        assert!(
+            l002.is_empty(),
+            "L002 must not fire on env-template default that resolves to name: {l002:?}"
+        );
+    }
+
+    /// Counter-check: when the author actually wrote a literal
+    /// `target.table = "<name>"` that matches `name`, L002 still fires.
+    /// This locks in the original lint signal so the raw-vs-resolved fix
+    /// doesn't silently disable the lint for the literal case.
+    #[test]
+    fn test_l002_still_fires_on_literal_redundant_table() {
+        use rocky_core::models::{Model, ModelConfig, SourceConfig, StrategyConfig, TargetConfig};
+        let model = Model {
+            config: ModelConfig {
+                name: "customer_facts".into(),
+                depends_on: Vec::new(),
+                strategy: StrategyConfig::FullRefresh,
+                target: TargetConfig {
+                    catalog: "analytics".into(),
+                    schema: "marts".into(),
+                    table: "customer_facts".into(),
+                },
+                sources: Vec::<SourceConfig>::new(),
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: Vec::new(),
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                retention: None,
+                budget: None,
+                // Declared literally — same value as `name_declared`.
+                name_declared: "customer_facts".into(),
+                target_table_declared: "customer_facts".into(),
+            },
+            sql: "SELECT 1".into(),
+            file_path: "/tmp/customer_facts.sql".into(),
+            contract_path: None,
+        };
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+target.adapter = "default"
+"#;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
+
+        let mut out = ValidateOutput::default();
+        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+
+        let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
+        assert_eq!(
+            l002.len(),
+            1,
+            "L002 must still fire on literal redundant target.table: {:?}",
+            out.messages
+        );
     }
 
     #[test]

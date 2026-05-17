@@ -254,6 +254,8 @@ fn build_generated_model(name: &str, sql: String, source: &str, format: &str) ->
             classification: Default::default(),
             retention: None,
             budget: None,
+            name_declared: String::new(),
+            target_table_declared: String::new(),
         },
         sql: if format == "rocky" {
             sql
@@ -336,6 +338,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: sql.to_string(),
             file_path: format!("upstream/{name}.sql"),

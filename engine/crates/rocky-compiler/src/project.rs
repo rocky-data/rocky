@@ -244,6 +244,8 @@ fn load_single_rocky_model(
             classification: Default::default(),
             retention: None,
             budget: None,
+            name_declared: String::new(),
+            target_table_declared: String::new(),
         }
     };
 
@@ -289,6 +291,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),
