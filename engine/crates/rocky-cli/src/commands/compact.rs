@@ -18,10 +18,12 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
+use rocky_core::config::PlanStoreFormat;
 use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
-use rocky_ir::TableRef;
+use rocky_databricks::dialect::DatabricksSqlDialect;
+use rocky_ir::{CompactPlanIr, TableRef};
 use rocky_sql::validation::validate_identifier;
 
 use crate::output::{
@@ -29,11 +31,75 @@ use crate::output::{
     CompactTotals, DedupPair, DedupSummary, NamedStatement, StatementResult,
     TableDedupContribution, print_json,
 };
-use crate::plan_store::{PlanKind, read_plan, write_plan};
+use crate::plan_store::{PlanKind, read_plan, write_plan, write_plan_v2};
 use crate::registry::{AdapterRegistry, resolve_pipeline};
 use crate::scope::{
     managed_catalog_set, resolve_managed_tables, resolve_managed_tables_in_catalog,
 };
+
+/// Resolve the persisted-plan format from the project config. When no
+/// config can be loaded (e.g. running outside a Rocky project), falls
+/// back to the default v1 format so behaviour is unchanged.
+///
+/// `config_path` is optional because today's single-model `run_compact`
+/// / `run_archive` entry points don't take a config path on every code
+/// path — when absent we keep the v1 default and skip the lookup
+/// entirely.
+fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
+    let Some(path) = config_path else {
+        return PlanStoreFormat::default();
+    };
+    match rocky_core::config::load_rocky_config(path) {
+        Ok(cfg) => cfg.plan_store.format,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "failed to load rocky config for [plan_store] lookup; falling back to v1"
+            );
+            PlanStoreFormat::default()
+        }
+    }
+}
+
+/// Persist a compact plan using the configured `[plan_store]` format.
+///
+/// For `PlanStoreFormat::V1` (default) emits today's `CompactOutput`
+/// payload byte-for-byte — every existing plan on disk stays
+/// reproducible. For `PlanStoreFormat::V2` emits a `CompactPlanIr`
+/// payload (the apply path regenerates SQL at execution time via
+/// `sql_gen::compact_from_ir`).
+///
+/// `ir_payloads` carries one `CompactPlanIr` per logical table in the
+/// plan (single-model invocations have one entry; catalog-scope
+/// invocations have one per managed table). For the v1 path the
+/// argument is unused — `output` carries the canonical SQL strings
+/// already.
+fn persist_compact_plan(
+    root: &Path,
+    format: PlanStoreFormat,
+    output: &CompactOutput,
+    ir_payloads: &[CompactPlanIr],
+) -> Result<String> {
+    match format {
+        PlanStoreFormat::V1 => write_plan(root, PlanKind::Compact, output),
+        PlanStoreFormat::V2 => {
+            // Per-table IR list is what the apply path replays through
+            // `compact_from_ir`. Single-model invocations have len 1;
+            // catalog-scope invocations have len == scope.tables.len().
+            // Wrap in an envelope so the apply-side reader has a stable
+            // payload shape regardless of scope.
+            let v2_payload = serde_json::json!({
+                "model": output.model,
+                "catalog": output.catalog,
+                "scope": output.scope,
+                "dry_run": output.dry_run,
+                "target_size_mb": output.target_size_mb,
+                "plans": ir_payloads,
+            });
+            write_plan_v2(root, PlanKind::Compact, &v2_payload)
+        }
+    }
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -42,7 +108,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
 /// (relative to the current working directory) so it can be applied later
 /// via `rocky compact apply <plan_id>`.
+///
+/// The persisted-plan format is selected by `[plan_store] format` in
+/// `config_path` (defaults to v1). The stdout JSON shape is unchanged
+/// either way — it always carries SQL for human + CI consumers.
 pub fn run_compact(
+    config_path: &Path,
     model: &str,
     target_size: Option<&str>,
     dry_run: bool,
@@ -84,9 +155,11 @@ pub fn run_compact(
 
     // Persist the plan (plan_id field is None, so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    match write_plan(&cwd, PlanKind::Compact, &output) {
+    let plan_format = resolve_plan_store_format(Some(config_path));
+    let ir_payloads = vec![CompactPlanIr::for_table(model, target_mb)];
+    match persist_compact_plan(&cwd, plan_format, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, "compact plan persisted");
+            tracing::info!(plan_id = %id, format = %plan_format, "compact plan persisted");
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -159,6 +232,7 @@ pub async fn run_compact_catalog(
     let mut flat_statements: Vec<NamedStatement> = Vec::new();
     let mut per_table: std::collections::BTreeMap<String, CompactTableEntry> =
         std::collections::BTreeMap::new();
+    let mut ir_payloads: Vec<CompactPlanIr> = Vec::with_capacity(scope.tables.len());
 
     for fqn in &scope.tables {
         let stmts = generate_compact_sql(fqn, target_mb)?;
@@ -171,6 +245,7 @@ pub async fn run_compact_catalog(
             .collect();
         flat_statements.extend(typed.iter().cloned());
         per_table.insert(fqn.clone(), CompactTableEntry { statements: typed });
+        ir_payloads.push(CompactPlanIr::for_table(fqn, target_mb));
     }
 
     let totals = CompactTotals {
@@ -194,9 +269,15 @@ pub async fn run_compact_catalog(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    match write_plan(&cwd, PlanKind::Compact, &output) {
+    let plan_format = resolve_plan_store_format(Some(config_path));
+    match persist_compact_plan(&cwd, plan_format, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, catalog = %scope.catalog, "compact catalog plan persisted");
+            tracing::info!(
+                plan_id = %id,
+                catalog = %scope.catalog,
+                format = %plan_format,
+                "compact catalog plan persisted"
+            );
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -1232,6 +1313,57 @@ fn generate_compact_sql(model: &str, target_size_mb: u64) -> Result<Vec<(String,
     ])
 }
 
+/// Regenerate `Vec<NamedStatement>` from a v2 (typed-IR) persisted compact
+/// plan payload.
+///
+/// The v2 envelope shape is `{ model?, catalog?, scope?, dry_run,
+/// target_size_mb, plans: [CompactPlanIr, ...] }`. For each entry in
+/// `plans` we call `sql_gen::compact_from_ir` to materialize the same
+/// `(purpose, sql)` pairs that the v1 writer persisted directly; the
+/// flat concatenation matches the v1 `statements` field shape
+/// byte-for-byte for the today's-emission inputs covered by the C-2
+/// equivalence tests.
+///
+/// `dialect` is hardcoded to [`DatabricksSqlDialect`] because today's
+/// OPTIMIZE/VACUUM grammar is Delta-on-Databricks flavoured; the
+/// `compact_from_ir` helper accepts the dialect for forward
+/// compatibility but currently ignores it.
+fn regenerate_v2_compact_statements(
+    plan_id: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<NamedStatement>> {
+    let plans_value = payload.get("plans").ok_or_else(|| {
+        anyhow::anyhow!(
+            "compact plan '{}' (v2) is missing the `plans` field; expected an envelope of \
+             {{ model?, catalog?, scope?, dry_run, target_size_mb, plans: [CompactPlanIr, ...] }}",
+            plan_id,
+        )
+    })?;
+    let ir_plans: Vec<CompactPlanIr> = serde_json::from_value(plans_value.clone())
+        .with_context(|| format!(
+            "compact plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<CompactPlanIr>"
+        ))?;
+
+    let dialect = DatabricksSqlDialect;
+    let mut statements = Vec::new();
+    for ir in &ir_plans {
+        let pairs = rocky_core::sql_gen::compact_from_ir(ir, &dialect).with_context(|| {
+            format!(
+                "compact plan '{plan_id}' (v2): failed to regenerate SQL for target \
+                     '{target}'",
+                target = ir.target_table,
+            )
+        })?;
+        for (purpose, sql) in pairs {
+            statements.push(NamedStatement {
+                purpose,
+                sql: Some(sql),
+            });
+        }
+    }
+    Ok(statements)
+}
+
 /// Execute `rocky compact apply <plan_id>`.
 ///
 /// Reads the persisted plan from `.rocky/plans/<plan_id>.json`, validates
@@ -1274,9 +1406,26 @@ pub(crate) async fn run_compact_apply_in(
         );
     }
 
-    // Deserialize the payload back to CompactOutput to extract statements.
-    let compact_output: CompactOutput = serde_json::from_value(plan.payload.clone())
-        .context("failed to deserialize compact plan payload")?;
+    // Phase C — "SQL as `.o` files" — dispatch on the persisted-plan
+    // format version. v1 plans carry `CompactOutput` with inline SQL;
+    // v2 plans carry a `CompactPlanIr` envelope and SQL is regenerated
+    // here via `sql_gen::compact_from_ir`. Both formats land on the
+    // same `Vec<NamedStatement>` shape the apply loop consumes below.
+    let statements: Vec<NamedStatement> = match plan.format_version {
+        1 => {
+            let compact_output: CompactOutput = serde_json::from_value(plan.payload.clone())
+                .context("failed to deserialize compact plan payload (v1)")?;
+            compact_output.statements
+        }
+        2 => regenerate_v2_compact_statements(plan_id, &plan.payload)?,
+        other => bail!(
+            "compact plan '{}' has unknown format_version {}. \
+             This binary supports v1 (legacy CompactOutput) and v2 (typed CompactPlanIr) \
+             persisted plans; the file is from a newer engine — upgrade and re-apply.",
+            plan_id,
+            other
+        ),
+    };
 
     // Build the warehouse adapter from the config.
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
@@ -1287,25 +1436,23 @@ pub(crate) async fn run_compact_apply_in(
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let executed_at = Utc::now();
-    let mut results: Vec<StatementResult> = Vec::with_capacity(compact_output.statements.len());
+    let mut results: Vec<StatementResult> = Vec::with_capacity(statements.len());
     let mut overall_success = true;
 
-    for stmt in &compact_output.statements {
-        // `NamedStatement.sql` is `Option<String>` to leave room for the
-        // v2 persisted plan format (Cluster 3 C — "SQL as `.o` files")
-        // where `sql: None` signals "regenerate from IR at apply time".
-        // C-2 does not yet flip the persistence format, so every plan
-        // on disk still carries `Some(sql)`. A `None` here means the
-        // plan was written by a future engine and predates the IR
-        // regeneration wiring on this binary — surface a clear error
-        // rather than executing an empty statement.
+    for stmt in &statements {
+        // After the v1/v2 dispatch above, `sql` is always populated:
+        // v1 payloads write `Some(sql)` from `generate_compact_sql`,
+        // and v2 regeneration goes through `compact_from_ir` which
+        // also returns `Some(sql)` for every statement. A `None` here
+        // would mean a v1 plan was written with `sql: None` by some
+        // unknown caller — surface a clear error rather than executing
+        // an empty statement.
         let sql = match stmt.sql.as_deref() {
             Some(sql) => sql,
             None => bail!(
-                "compact plan '{}' carries a statement without inline SQL \
-                 (purpose: '{}'). This plan was written by a newer engine \
-                 that persists typed-IR plans; this binary cannot regenerate \
-                 SQL from IR yet — upgrade and re-apply.",
+                "compact plan '{}' carries a v1 statement without inline SQL \
+                 (purpose: '{}'). v1 plans must persist SQL; this is a \
+                 malformed plan file.",
                 plan_id,
                 stmt.purpose,
             ),
@@ -2219,5 +2366,83 @@ schema_template = "staging__{{source}}"
             "error chain should mention 'not found', got: {full_err}"
         );
         Ok(())
+    }
+
+    /// Cluster 3 C — C-5 v2-payload regeneration tests.
+    ///
+    /// `regenerate_v2_compact_statements` is the apply-side entry point
+    /// that turns a `format_version = 2` persisted plan back into the
+    /// same `(purpose, sql)` pairs the v1 writer would have persisted
+    /// directly. These tests pin that helper against the inline baseline
+    /// and the envelope-shape contract.
+    mod v2_regeneration {
+        use super::*;
+
+        fn build_v2_payload(model: &str, target_mb: u64) -> serde_json::Value {
+            serde_json::json!({
+                "model": model,
+                "dry_run": false,
+                "target_size_mb": target_mb,
+                "plans": [CompactPlanIr::for_table(model, target_mb)],
+            })
+        }
+
+        #[test]
+        fn v2_regenerates_single_model_compact_statements() {
+            let payload = build_v2_payload("catalog.schema.orders", 256);
+            let stmts = regenerate_v2_compact_statements("test-plan", &payload).unwrap();
+            let baseline = generate_compact_sql("catalog.schema.orders", 256).unwrap();
+            assert_eq!(stmts.len(), baseline.len());
+            for (s, (purpose, sql)) in stmts.iter().zip(baseline.iter()) {
+                assert_eq!(s.purpose, *purpose);
+                assert_eq!(s.sql.as_deref(), Some(sql.as_str()));
+            }
+        }
+
+        #[test]
+        fn v2_regenerates_catalog_scope_compact_statements_in_order() {
+            let tables = [
+                "warehouse.staging.orders",
+                "warehouse.staging.customers",
+                "warehouse.staging.line_items",
+            ];
+            let irs: Vec<_> = tables
+                .iter()
+                .map(|t| CompactPlanIr::for_table(*t, 256))
+                .collect();
+            let payload = serde_json::json!({
+                "catalog": "warehouse",
+                "scope": "catalog",
+                "dry_run": false,
+                "target_size_mb": 256,
+                "plans": irs,
+            });
+            let stmts = regenerate_v2_compact_statements("test-plan", &payload).unwrap();
+            let mut expected: Vec<(String, String)> = Vec::new();
+            for t in tables {
+                expected.extend(generate_compact_sql(t, 256).unwrap());
+            }
+            assert_eq!(stmts.len(), expected.len());
+            for (s, (purpose, sql)) in stmts.iter().zip(expected.iter()) {
+                assert_eq!(s.purpose, *purpose);
+                assert_eq!(s.sql.as_deref(), Some(sql.as_str()));
+            }
+        }
+
+        #[test]
+        fn v2_missing_plans_field_returns_clear_error() {
+            let payload = serde_json::json!({
+                "model": "x",
+                "dry_run": false,
+                "target_size_mb": 256,
+                // no `plans` field
+            });
+            let err = regenerate_v2_compact_statements("test-plan", &payload).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("plans") && msg.contains("v2"),
+                "error should mention the missing `plans` field, got: {msg}"
+            );
+        }
     }
 }

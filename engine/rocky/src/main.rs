@@ -2464,7 +2464,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          or use `rocky compact apply <plan-id>`"
                     )
                 })?;
-                rocky_cli::commands::run_compact(&model, target_size.as_deref(), dry_run, json)
+                rocky_cli::commands::run_compact(
+                    &cli.config,
+                    &model,
+                    target_size.as_deref(),
+                    dry_run,
+                    json,
+                )
             }
         }
         Command::ProfileStorage { model } => rocky_cli::commands::run_profile_storage(&model, json),
@@ -2702,6 +2708,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         .await
                     }
                     None => rocky_cli::commands::run_archive(
+                        &cli.config,
                         model.as_deref(),
                         &older_than,
                         dry_run,
