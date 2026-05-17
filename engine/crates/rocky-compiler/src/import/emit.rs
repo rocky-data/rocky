@@ -600,6 +600,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
         }
     }
