@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import urllib.error
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -592,13 +593,76 @@ def _run_json() -> str:
     )
 
 
+def _plan_json(plan_id: str = "a" * 64) -> str:
+    """Minimal valid ``rocky plan`` JSON with a persisted ``plan_id``.
+
+    Used by the Phase 5 streaming/pipes tests so the plan/apply
+    orchestration dispatches the apply path (not the replication-only
+    fallback). The body shape matches the engine's ``PlanOutput`` —
+    only ``plan_id`` is load-bearing for ``_extract_plan_id``.
+    """
+    return json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": plan_id,
+            "plan_kind": "run",
+            "created_at": "2026-05-17T00:00:00Z",
+            "models": [],
+            "execution_layers": [],
+        }
+    )
+
+
+def _apply_envelope_json(*, plan_id: str = "a" * 64, inner: dict | None = None) -> str:
+    """``rocky apply`` envelope JSON wrapping a run result (Phase 5)."""
+    return json.dumps(
+        {
+            "version": "0.3.0",
+            "command": "apply",
+            "plan_id": plan_id,
+            "plan_kind": "run",
+            "success": True,
+            "result": inner or json.loads(_run_json()),
+        }
+    )
+
+
+def _two_phase_popen_side_effect(
+    plan_proc: Any,
+    apply_proc: Any,
+) -> Callable[..., Any]:
+    """Return a ``subprocess.Popen`` side-effect that yields procs in order.
+
+    Phase 5 ``run_streaming`` spawns two subprocesses: ``rocky plan``
+    (buffered, single-digit seconds) followed by ``rocky apply``
+    (streamed). Tests use this to script those two return values without
+    monkeypatching the higher-level methods.
+    """
+    procs = iter([plan_proc, apply_proc])
+
+    def _side_effect(*_args: Any, **_kwargs: Any) -> Any:
+        return next(procs)
+
+    return _side_effect
+
+
 def test_run_streaming_forwards_stderr_to_context_log():
-    """Each non-empty stderr line is forwarded to context.log.info with a
-    'rocky:' prefix as the subprocess runs."""
+    """Each non-empty stderr line from the apply phase is forwarded to
+    context.log.info with a 'rocky:' prefix as the subprocess runs.
+
+    Phase 5 narrative note: plan-phase stderr is forwarded to the module
+    logger only (not to ``context.log``) — so this test scripts the apply
+    subprocess as the source of every line that should land in the run
+    viewer. See ``_apply_plan`` + ``run_streaming``'s docstring.
+    """
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(
-        stdout=_run_json(),
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(
+        stdout=_apply_envelope_json(),
         stderr_lines=[
             "INFO discovering sources",
             "INFO copying table acme.orders",
@@ -609,7 +673,10 @@ def test_run_streaming_forwards_stderr_to_context_log():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch(
+            "dagster_rocky.resource.subprocess.Popen",
+            side_effect=_two_phase_popen_side_effect(plan_proc, apply_proc),
+        ),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -627,14 +694,18 @@ def test_run_streaming_skips_empty_stderr_lines():
     """Blank stderr lines are dropped so the run viewer doesn't get spam."""
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(
-        stdout=_run_json(),
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(
+        stdout=_apply_envelope_json(),
         stderr_lines=["INFO start", "", "  ", "INFO done"],
     )
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch(
+            "dagster_rocky.resource.subprocess.Popen",
+            side_effect=_two_phase_popen_side_effect(plan_proc, apply_proc),
+        ),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
@@ -650,32 +721,42 @@ def test_run_streaming_skips_empty_stderr_lines():
 
 def test_run_streaming_returns_parsed_run_result():
     """The captured stdout is parsed into a RunResult after the
-    subprocess exits."""
+    subprocess exits.
+
+    Phase 5: the apply step's stdout is the ``ApplyOutput`` envelope;
+    ``_parse_run_or_apply`` unwraps the inner ``result`` field which is
+    the ``RunResult`` payload the public surface promises.
+    """
     rocky = RockyResource()
     context = _captured_log_context()
-    payload = json.dumps(
-        {
-            "version": "0.3.0",
-            "command": "run",
-            "filter": "tenant=acme",
-            "duration_ms": 12345,
-            "tables_copied": 7,
-            "materializations": [],
-            "check_results": [],
-            "permissions": {
-                "grants_added": 0,
-                "grants_revoked": 0,
-                "catalogs_created": 0,
-                "schemas_created": 0,
-            },
-            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
-        }
+    inner = {
+        "version": "0.3.0",
+        "command": "run",
+        "filter": "tenant=acme",
+        "duration_ms": 12345,
+        "tables_copied": 7,
+        "materializations": [],
+        "check_results": [],
+        "permissions": {
+            "grants_added": 0,
+            "grants_revoked": 0,
+            "catalogs_created": 0,
+            "schemas_created": 0,
+        },
+        "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+    }
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(
+        stdout=_apply_envelope_json(inner=inner),
+        stderr_lines=[],
     )
-    proc = _streaming_popen_mock(stdout=payload, stderr_lines=[])
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch(
+            "dagster_rocky.resource.subprocess.Popen",
+            side_effect=_two_phase_popen_side_effect(plan_proc, apply_proc),
+        ),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -685,18 +766,26 @@ def test_run_streaming_returns_parsed_run_result():
 
 def test_run_streaming_partial_success_returns_result_on_nonzero_exit():
     """Same partial-success semantics as run(): non-zero exit + valid
-    JSON stdout still returns the parsed result."""
+    JSON stdout still returns the parsed result.
+
+    Phase 5: partial-success applies to the apply step (where rows are
+    actually written). The plan step always succeeds in this scenario.
+    """
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(
-        stdout=_run_json(),
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(
+        stdout=_apply_envelope_json(),
         stderr_lines=["WARN one table failed"],
         returncode=1,
     )
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch(
+            "dagster_rocky.resource.subprocess.Popen",
+            side_effect=_two_phase_popen_side_effect(plan_proc, apply_proc),
+        ),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -993,16 +1082,24 @@ def test_run_rocky_buffered_path_hard_kills_hung_binary(tmp_path: Path):
 
 def test_run_streaming_threads_partition_flags():
     """run_streaming accepts the same partition kwargs as run() and
-    threads them through to the subprocess command."""
+    threads them through to both the plan and apply subprocess commands.
+
+    Phase 5: both ``rocky plan`` and ``rocky apply`` (which the engine
+    expands back into the persisted flag surface) need the same flags.
+    Asserting on the plan-phase argv keeps the test robust to either
+    end of the orchestration.
+    """
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(stdout=_run_json(), stderr_lines=[])
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(stdout=_apply_envelope_json(), stderr_lines=[])
 
     captured_cmd: list[list[str]] = []
+    procs = iter([plan_proc, apply_proc])
 
     def fake_popen(cmd, **kwargs):
         captured_cmd.append(cmd)
-        return proc
+        return next(procs)
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
@@ -1016,26 +1113,35 @@ def test_run_streaming_threads_partition_flags():
             parallel=4,
         )
 
-    cmd = captured_cmd[0]
-    assert "--partition" in cmd
-    assert "2026-04-08" in cmd
-    assert "--lookback" in cmd
-    assert "2" in cmd
-    assert "--parallel" in cmd
-    assert "4" in cmd
+    # Plan subprocess argv carries every flag (flag-surface parity is
+    # enforced by engine PR #535).
+    plan_cmd = captured_cmd[0]
+    assert "plan" in plan_cmd
+    assert "--partition" in plan_cmd
+    assert "2026-04-08" in plan_cmd
+    assert "--lookback" in plan_cmd
+    assert "2" in plan_cmd
+    assert "--parallel" in plan_cmd
+    assert "4" in plan_cmd
+    # Apply subprocess argv is keyed by the plan_id only — the engine
+    # rehydrates flags from the persisted plan file.
+    apply_cmd = captured_cmd[1]
+    assert "apply" in apply_cmd
 
 
 def test_run_streaming_default_omits_partition_flags():
-    """Plain run_streaming() emits no partition flags."""
+    """Plain run_streaming() emits no partition flags on the plan argv."""
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(stdout=_run_json(), stderr_lines=[])
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(stdout=_apply_envelope_json(), stderr_lines=[])
 
     captured_cmd: list[list[str]] = []
+    procs = iter([plan_proc, apply_proc])
 
     def fake_popen(cmd, **kwargs):
         captured_cmd.append(cmd)
-        return proc
+        return next(procs)
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
@@ -1043,9 +1149,9 @@ def test_run_streaming_default_omits_partition_flags():
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
-    cmd = captured_cmd[0]
+    plan_cmd = captured_cmd[0]
     for flag in ("--partition", "--from", "--to", "--latest", "--missing", "--lookback"):
-        assert flag not in cmd
+        assert flag not in plan_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1053,23 +1159,37 @@ def test_run_streaming_default_omits_partition_flags():
 # ---------------------------------------------------------------------------
 
 
+def _patch_pipes_plan_step(plan_id: str = "a" * 64) -> Any:
+    """Patch ``_run_rocky`` so the Phase 5 plan step returns a fixed plan_id.
+
+    ``run_pipes`` runs the plan step via the buffered ``_run_rocky`` and
+    then hands the ``["apply", <plan_id>]`` argv to
+    ``PipesSubprocessClient.run``. Tests use this helper to skip the
+    plan-side subprocess entirely so they can assert on the Pipes
+    client call arguments without staging two Popen mocks.
+    """
+    return patch.object(RockyResource, "_run_rocky", return_value=_plan_json(plan_id))
+
+
 def test_run_pipes_calls_pipes_client_with_built_command():
-    """T2: run_pipes() forwards the rocky CLI command to a
-    PipesSubprocessClient and returns the client's invocation result.
-    The command must include the global flags + the partition argv
-    that _build_run_args produced."""
+    """T2 (Phase 5): run_pipes() runs ``rocky plan`` then forwards the
+    ``rocky apply <plan_id>`` argv to a PipesSubprocessClient and returns
+    the client's invocation result. The Pipes-side command is keyed off
+    the plan id; the plan-side argv carries the user-supplied flags."""
     rocky = RockyResource(config_path="rocky.toml")
     context = MagicMock(spec=dg.AssetExecutionContext)
     fake_client = MagicMock(spec=dg.PipesSubprocessClient)
     fake_invocation = MagicMock(spec=dg.PipesClientCompletedInvocation)
     fake_client.run = MagicMock(return_value=fake_invocation)
 
-    result = rocky.run_pipes(
-        context,
-        filter="tenant=acme",
-        partition="2026-04-08",
-        pipes_client=fake_client,
-    )
+    plan_id = "b" * 64
+    with _patch_pipes_plan_step(plan_id=plan_id):
+        result = rocky.run_pipes(
+            context,
+            filter="tenant=acme",
+            partition="2026-04-08",
+            pipes_client=fake_client,
+        )
 
     assert result is fake_invocation
     fake_client.run.assert_called_once()
@@ -1081,41 +1201,51 @@ def test_run_pipes_calls_pipes_client_with_built_command():
     assert "--config" in cmd
     assert "--output" in cmd
     assert "json" in cmd
-    # Subcommand + partition flag is present
-    assert "run" in cmd
-    assert "--filter" in cmd
-    assert "tenant=acme" in cmd
-    assert "--partition" in cmd
-    assert "2026-04-08" in cmd
+    # Apply subcommand + plan id (no per-flag re-emission — the engine
+    # rehydrates from the persisted plan file).
+    assert "apply" in cmd
+    assert plan_id in cmd
+    # Phase 5 audit-artifact: plan id is also surfaced as Pipes extras
+    # so Dagster shows it as run metadata.
+    assert call_kwargs.get("extras") == {"plan_id": plan_id}
 
 
 def test_run_pipes_threads_all_partition_flags():
-    """run_pipes() accepts the same partition kwargs as run() / run_streaming()
-    and threads them through to the subprocess command."""
+    """run_pipes() threads partition kwargs through to the plan-phase
+    subprocess argv (Phase 5 — apply-phase argv is just ``apply <plan_id>``).
+    """
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
     fake_client = MagicMock(spec=dg.PipesSubprocessClient)
     fake_client.run = MagicMock(return_value=MagicMock())
 
-    rocky.run_pipes(
-        context,
-        filter="tenant=acme",
-        partition_from="2026-04-01",
-        partition_to="2026-04-08",
-        lookback=2,
-        parallel=4,
-        pipes_client=fake_client,
-    )
+    captured_plan_args: list[list[str]] = []
 
-    cmd = fake_client.run.call_args.kwargs["command"]
-    assert "--from" in cmd
-    assert "2026-04-01" in cmd
-    assert "--to" in cmd
-    assert "2026-04-08" in cmd
-    assert "--lookback" in cmd
-    assert "2" in cmd
-    assert "--parallel" in cmd
-    assert "4" in cmd
+    def fake_run_rocky(self, args, *, allow_partial=False):
+        captured_plan_args.append(args)
+        return _plan_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run_rocky):
+        rocky.run_pipes(
+            context,
+            filter="tenant=acme",
+            partition_from="2026-04-01",
+            partition_to="2026-04-08",
+            lookback=2,
+            parallel=4,
+            pipes_client=fake_client,
+        )
+
+    plan_args = captured_plan_args[0]
+    assert "plan" in plan_args
+    assert "--from" in plan_args
+    assert "2026-04-01" in plan_args
+    assert "--to" in plan_args
+    assert "2026-04-08" in plan_args
+    assert "--lookback" in plan_args
+    assert "2" in plan_args
+    assert "--parallel" in plan_args
+    assert "4" in plan_args
 
 
 def test_run_pipes_constructs_default_client_when_none_passed():
@@ -1126,9 +1256,10 @@ def test_run_pipes_constructs_default_client_when_none_passed():
 
     fake_invocation = MagicMock()
 
-    with patch(
-        "dagster_rocky.resource.dg.PipesSubprocessClient",
-    ) as mock_client_cls:
+    with (
+        _patch_pipes_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as mock_client_cls,
+    ):
         mock_instance = mock_client_cls.return_value
         mock_instance.run = MagicMock(return_value=fake_invocation)
 
@@ -1150,7 +1281,8 @@ def test_run_pipes_returns_pipes_client_completed_invocation():
     sentinel = MagicMock(name="sentinel_invocation")
     fake_client.run = MagicMock(return_value=sentinel)
 
-    result = rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+    with _patch_pipes_plan_step():
+        result = rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
     assert result is sentinel
 
 
@@ -1203,16 +1335,18 @@ def test_run_without_shadow_suffix_omits_shadow_flags():
 
 
 def test_run_streaming_with_shadow_suffix():
-    """run_streaming threads shadow_suffix through to the CLI command."""
+    """run_streaming threads shadow_suffix through to the plan argv."""
     rocky = RockyResource()
     context = _captured_log_context()
-    proc = _streaming_popen_mock(stdout=_run_json(), stderr_lines=[])
+    plan_proc = _streaming_popen_mock(stdout=_plan_json(), stderr_lines=[])
+    apply_proc = _streaming_popen_mock(stdout=_apply_envelope_json(), stderr_lines=[])
 
     captured_cmd: list[list[str]] = []
+    procs = iter([plan_proc, apply_proc])
 
     def fake_popen(cmd, **kwargs):
         captured_cmd.append(cmd)
-        return proc
+        return next(procs)
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
@@ -1224,30 +1358,38 @@ def test_run_streaming_with_shadow_suffix():
             shadow_suffix="_dagster_pr_99",
         )
 
-    cmd = captured_cmd[0]
-    assert "--shadow" in cmd
-    shadow_idx = cmd.index("--shadow-suffix")
-    assert cmd[shadow_idx + 1] == "_dagster_pr_99"
+    plan_cmd = captured_cmd[0]
+    assert "--shadow" in plan_cmd
+    shadow_idx = plan_cmd.index("--shadow-suffix")
+    assert plan_cmd[shadow_idx + 1] == "_dagster_pr_99"
 
 
 def test_run_pipes_with_shadow_suffix():
-    """run_pipes threads shadow_suffix through to the CLI command."""
+    """run_pipes threads shadow_suffix through to the plan-phase argv
+    (Phase 5: the apply-phase argv is just ``apply <plan_id>``)."""
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
     fake_client = MagicMock(spec=dg.PipesSubprocessClient)
     fake_client.run = MagicMock(return_value=MagicMock())
 
-    rocky.run_pipes(
-        context,
-        filter="tenant=acme",
-        shadow_suffix="_dagster_pr_7",
-        pipes_client=fake_client,
-    )
+    captured_plan_args: list[list[str]] = []
 
-    cmd = fake_client.run.call_args.kwargs["command"]
-    assert "--shadow" in cmd
-    shadow_idx = cmd.index("--shadow-suffix")
-    assert cmd[shadow_idx + 1] == "_dagster_pr_7"
+    def fake_run_rocky(self, args, *, allow_partial=False):
+        captured_plan_args.append(args)
+        return _plan_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run_rocky):
+        rocky.run_pipes(
+            context,
+            filter="tenant=acme",
+            shadow_suffix="_dagster_pr_7",
+            pipes_client=fake_client,
+        )
+
+    plan_args = captured_plan_args[0]
+    assert "--shadow" in plan_args
+    shadow_idx = plan_args.index("--shadow-suffix")
+    assert plan_args[shadow_idx + 1] == "_dagster_pr_7"
 
 
 def test_compile_uses_http_when_server_url_is_set():
@@ -1291,6 +1433,178 @@ def test_metrics_uses_http_when_server_url_is_set():
         result = rocky.metrics("orders")
     http_mock.assert_called_once_with("/api/v1/models/orders/metrics")
     assert result.model == "orders"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 plan/apply orchestration
+# ---------------------------------------------------------------------------
+
+
+def test_run_dispatches_plan_then_apply_when_plan_id_persisted():
+    """Phase 5 happy path — ``rocky plan`` persists a plan_id, then the
+    integration dispatches ``rocky apply <plan_id>`` and returns the
+    inner RunResult unwrapped from the apply envelope."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+    plan_id = "f" * 64
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(list(args))
+        if args[0] == "plan":
+            return _plan_json(plan_id=plan_id)
+        # apply <plan_id> — return the envelope.
+        return _apply_envelope_json(plan_id=plan_id)
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.run(filter="tenant=acme")
+
+    # First call: rocky plan with the user-supplied flags.
+    assert captured[0][:3] == ["plan", "--filter", "tenant=acme"]
+    # Second call: rocky apply <plan_id>.
+    assert captured[1] == ["apply", plan_id]
+    # Inner RunResult parsed out of the envelope.
+    assert result.command == "run"
+    assert result.tables_copied == 1
+
+
+def test_run_falls_back_to_rocky_run_when_plan_id_absent():
+    """Phase 5 fallback — ``rocky plan`` without a ``models/`` directory
+    emits ``plan_id = null``. The integration falls back to the legacy
+    ``rocky run`` argv (single subprocess) so replication-only projects
+    keep working with no functional change."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, allow_partial=False):
+        captured.append(list(args))
+        if args[0] == "plan":
+            # Engine emits PlanOutput with plan_id = None when no
+            # models/ directory exists next to the config.
+            return json.dumps(
+                {
+                    "version": "0.1.0",
+                    "command": "plan",
+                    "filter": "tenant=acme",
+                    "statements": [],
+                    "plan_id": None,
+                    "plan_kind": None,
+                    "created_at": None,
+                    "models": [],
+                    "execution_layers": [],
+                }
+            )
+        # Fallback path runs `rocky run` and returns RunResult directly.
+        return _run_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+        result = rocky.run(filter="tenant=acme")
+
+    # First call: rocky plan.
+    assert captured[0][0] == "plan"
+    # Second call (fallback): rocky run with the original flags.
+    assert captured[1][:3] == ["run", "--filter", "tenant=acme"]
+    # Direct RunResult — no apply envelope unwrap needed.
+    assert result.command == "run"
+    assert result.tables_copied == 1
+
+
+def test_run_pipes_attaches_extras_with_plan_id():
+    """Phase 5 audit-artifact wiring — when ``rocky plan`` returns a
+    plan_id, ``run_pipes`` surfaces it as Pipes ``extras`` so Dagster
+    shows the plan id as run metadata. The persisted plan lives at
+    ``.rocky/plans/<plan_id>.json`` for offline inspection."""
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    plan_id = "c" * 64
+    with patch.object(RockyResource, "_run_rocky", return_value=_plan_json(plan_id=plan_id)):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    fake_client.run.assert_called_once()
+    extras = fake_client.run.call_args.kwargs.get("extras")
+    assert extras == {"plan_id": plan_id}
+
+
+def test_run_pipes_replication_only_fallback_omits_extras():
+    """Replication-only fallback for run_pipes — no plan_id to surface.
+
+    The single-subprocess ``rocky run`` argv is handed to
+    ``PipesSubprocessClient.run`` (Pipes still emits structured events
+    from the run binary). ``extras`` is NOT passed because there is no
+    plan id to correlate against.
+    """
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    plan_without_id = json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": None,
+            "plan_kind": None,
+            "created_at": None,
+            "models": [],
+            "execution_layers": [],
+        }
+    )
+    with patch.object(RockyResource, "_run_rocky", return_value=plan_without_id):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    fake_client.run.assert_called_once()
+    call_kwargs = fake_client.run.call_args.kwargs
+    assert "extras" not in call_kwargs
+    # Subprocess argv is the legacy `rocky run` shape, not `apply`.
+    cmd = call_kwargs["command"]
+    assert "run" in cmd
+    assert "apply" not in cmd
+
+
+def test_extract_plan_id_returns_none_for_malformed_payload():
+    """``_extract_plan_id`` is the gate keeping malformed plan output
+    from sending the apply step into a broken state. Treat any
+    non-string ``plan_id`` (missing, null, wrong type, malformed JSON)
+    as 'no plan persisted' so the fallback path kicks in."""
+    assert RockyResource._extract_plan_id("not json") is None
+    assert RockyResource._extract_plan_id("{}") is None
+    assert RockyResource._extract_plan_id(json.dumps({"plan_id": None})) is None
+    assert RockyResource._extract_plan_id(json.dumps({"plan_id": 42})) is None
+    assert RockyResource._extract_plan_id(json.dumps({"plan_id": "abc"})) == "abc"
+
+
+def test_build_plan_args_mirrors_build_run_args_flag_surface():
+    """Cluster 3 B Phase 5 leans on engine PR #535 (flag-surface parity
+    between ``rocky run`` and ``rocky plan``). This test pins the parity
+    on the Python side — every flag ``_build_run_args`` emits must also
+    appear in ``_build_plan_args``'s output for the same kwargs (only the
+    leading verb differs).
+    """
+    rocky = RockyResource(models_dir="m")
+    kwargs: dict[str, Any] = {
+        "governance_override": {"workspace_ids": [1]},
+        "pipeline": "main",
+        "run_models": True,
+        "partition": "2026-04-08",
+        "partition_from": None,
+        "partition_to": None,
+        "latest": False,
+        "missing": False,
+        "lookback": 3,
+        "parallel": 2,
+        "shadow_suffix": "_pr_42",
+        "idempotency_key": "key-1",
+    }
+    run_args = rocky._build_run_args("tenant=acme", **kwargs)
+    plan_args = rocky._build_plan_args("tenant=acme", **kwargs)
+    # Only the verb token differs.
+    assert run_args[0] == "run"
+    assert plan_args[0] == "plan"
+    assert run_args[1:] == plan_args[1:]
 
 
 # ---------------------------------------------------------------------------

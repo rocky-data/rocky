@@ -16,6 +16,7 @@ the resource. These tests pin down the design contract:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,37 @@ def _empty_run_json() -> str:
         '"check_results":[],"permissions":{"grants_added":0,"grants_revoked":0,'
         '"catalogs_created":0,"schemas_created":0},"drift":{"tables_checked":0,'
         '"tables_drifted":0,"actions_taken":[]}}'
+    )
+
+
+def _plan_json() -> str:
+    """Minimal ``rocky plan`` JSON with a persisted plan_id (Phase 5)."""
+    return json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": "a" * 64,
+            "plan_kind": "run",
+            "created_at": "2026-05-17T00:00:00Z",
+            "models": [],
+            "execution_layers": [],
+        }
+    )
+
+
+def _apply_envelope_json() -> str:
+    """``rocky apply`` envelope JSON wrapping an empty run result (Phase 5)."""
+    return json.dumps(
+        {
+            "version": "0.3.0",
+            "command": "apply",
+            "plan_id": "a" * 64,
+            "plan_kind": "run",
+            "success": True,
+            "result": json.loads(_empty_run_json()),
+        }
     )
 
 
@@ -283,11 +315,18 @@ def test_run_streaming_passes_context_to_resolver():
 
     rocky = RockyResource(shadow_suffix_fn=fn)
     context = _captured_log_context()
-    proc = _streaming_popen_mock(_empty_run_json())
+    # Phase 5: run_streaming spawns two subprocesses — plan (buffered)
+    # then apply (streamed). Both go through subprocess.Popen.
+    plan_proc = _streaming_popen_mock(_plan_json())
+    apply_proc = _streaming_popen_mock(_apply_envelope_json())
+    procs = iter([plan_proc, apply_proc])
+
+    def fake_popen(*_args: Any, **_kwargs: Any) -> Any:
+        return next(procs)
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
@@ -309,7 +348,9 @@ def test_run_pipes_passes_context_to_resolver():
     pipes_client = MagicMock()
     pipes_client.run = MagicMock(return_value=MagicMock())
 
-    rocky.run_pipes(context, filter="tenant=acme", pipes_client=pipes_client)
+    # Phase 5: run_pipes runs the plan step via _run_rocky first.
+    with patch.object(RockyResource, "_run_rocky", return_value=_plan_json()):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=pipes_client)
 
     assert captured_contexts == [context]
     assert captured_methods == ["run_pipes"]

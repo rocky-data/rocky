@@ -20,6 +20,7 @@ Exercises:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import dagster as dg
@@ -221,12 +222,37 @@ def test_rocky_pipes_message_reader_wraps_handler_with_proxy():
 # ---------------------------------------------------------------------------
 
 
+def _plan_step_stub() -> str:
+    """Minimal ``rocky plan`` JSON with a persisted plan_id (Phase 5)."""
+    return json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": "a" * 64,
+            "plan_kind": "run",
+            "created_at": "2026-05-17T00:00:00Z",
+            "models": [],
+            "execution_layers": [],
+        }
+    )
+
+
+def _patch_plan_step():
+    """Patch ``_run_rocky`` for Phase 5 — fakes the plan-phase subprocess."""
+    return patch.object(RockyResource, "_run_rocky", return_value=_plan_step_stub())
+
+
 def test_run_pipes_injects_custom_reader_when_asset_key_fn_is_set():
     """Supplying asset_key_fn triggers a RockyPipesMessageReader in the client."""
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
 
-    with patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls:
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
         instance = client_cls.return_value
         instance.run = MagicMock(return_value=MagicMock())
 
@@ -246,7 +272,10 @@ def test_run_pipes_injects_custom_reader_when_include_keys_is_set():
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
 
-    with patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls:
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
         instance = client_cls.return_value
         instance.run = MagicMock(return_value=MagicMock())
 
@@ -266,7 +295,10 @@ def test_run_pipes_uses_default_client_when_no_translation_kwargs():
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
 
-    with patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls:
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
         instance = client_cls.return_value
         instance.run = MagicMock(return_value=MagicMock())
 
@@ -283,7 +315,10 @@ def test_run_pipes_caller_supplied_client_wins_over_translation_kwargs():
     fake_client = MagicMock(spec=dg.PipesSubprocessClient)
     fake_client.run = MagicMock(return_value=MagicMock())
 
-    with patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls:
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
         rocky.run_pipes(
             context,
             filter="tenant=acme",

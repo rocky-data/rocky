@@ -273,6 +273,75 @@ def _parse_rocky_json(output: str, model_cls: type[_TModel], *, command: str) ->
         ) from exc
 
 
+def _parse_run_or_apply(output: str, *, command: str) -> RunResult:
+    """Parse ``rocky apply`` / ``rocky run`` JSON into a :class:`RunResult`.
+
+    The Phase 5 plan/apply migration of :meth:`RockyResource.run` and
+    :meth:`RockyResource.run_streaming` makes either shape possible
+    depending on whether ``rocky plan`` was able to persist a plan:
+
+    * Plan/apply path → stdout is the ``ApplyOutput`` envelope
+      (``{plan_id, plan_kind, success, result}``). The inner ``result``
+      field is the ``RunResult`` payload — unwrap it.
+    * Replication-only fallback → stdout is the legacy ``RunResult``
+      directly (``rocky run`` was invoked).
+
+    The two are distinguished by the top-level ``command`` field:
+    ``"apply"`` for the envelope, ``"run"`` for the legacy shape. This
+    keeps the public method signatures (``-> RunResult``) stable across
+    the migration.
+
+    Args:
+        output: Raw stdout from ``rocky apply`` or ``rocky run``.
+        command: Friendly command label for error metadata
+            (``"run"`` or ``"run (streaming)"``).
+
+    Returns:
+        Parsed :class:`RunResult` — the inner payload from the apply
+        envelope, or the legacy direct shape.
+
+    Raises:
+        dg.Failure: When the JSON cannot be parsed or doesn't match
+            :class:`RunResult` — surfaces the operator-friendly preview
+            from :func:`_parse_rocky_json`.
+    """
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        preview = (output or "")[:_JSON_ERROR_PREVIEW_BYTES]
+        raise dg.Failure(
+            description=(
+                f"rocky {command} returned malformed JSON — see metadata for the stdout preview"
+            ),
+            metadata={
+                "command": dg.MetadataValue.text(command),
+                "stdout_preview": dg.MetadataValue.text(preview),
+                "stdout_bytes": dg.MetadataValue.int(len(output or "")),
+                "json_error": dg.MetadataValue.text(str(exc)),
+            },
+        ) from exc
+
+    # Apply envelope: unwrap the inner result (a RunResult-shaped dict).
+    if isinstance(payload, dict) and payload.get("command") == "apply":
+        inner = payload.get("result")
+        if not isinstance(inner, dict):
+            raise dg.Failure(
+                description=(
+                    f"rocky {command} apply envelope missing inner result "
+                    "(expected dict under `result`)"
+                ),
+                metadata={
+                    "command": dg.MetadataValue.text(command),
+                    "plan_id": dg.MetadataValue.text(str(payload.get("plan_id", ""))),
+                    "plan_kind": dg.MetadataValue.text(str(payload.get("plan_kind", ""))),
+                },
+            )
+        return _parse_rocky_json(json.dumps(inner), RunResult, command=command)
+
+    # Legacy fallback path — `rocky run` shape, already a RunResult.
+    return _parse_rocky_json(output, RunResult, command=command)
+
+
 def _forward_stderr_to_sink(
     stderr: Iterable[str] | None,
     log_line: Callable[[str], None],
@@ -1118,12 +1187,14 @@ class RockyResource(dg.ConfigurableResource):
         # handles the single-process case, which is all rocky does on
         # Windows today.
         # Inherit the parent environment and force-suppress engine deprecation
-        # notices. `RockyResource.materialize()` still routes through `rocky run`
-        # (and operators can call branch promote in its bare form); engine-v1.33+
-        # would otherwise emit a `[deprecated]` line on stderr for every
-        # invocation, surfacing as noise in Dagster run logs. Migration off the
-        # alias verbs is a separate dagster work item, tracked alongside the
-        # engine Phase 4 cycle.
+        # notices. After Cluster 3 B Phase 5, the three exec methods route
+        # through `rocky plan` + `rocky apply <plan-id>` so the alias warning
+        # is mostly silent — but the replication-only fallback in
+        # :meth:`_apply_plan` still invokes `rocky run` (engine cannot persist
+        # a plan when no `models/` directory exists), and operators can call
+        # `branch promote <name>` in its bare form too. Keep the suppression
+        # so neither path leaks a `[deprecated]` line into Dagster run logs.
+        # `setdefault` keeps the env var operator-overridable.
         rocky_env = os.environ.copy()
         rocky_env.setdefault("ROCKY_SUPPRESS_DEPRECATION", "1")
         popen_kwargs: dict[str, object] = {
@@ -1461,24 +1532,28 @@ class RockyResource(dg.ConfigurableResource):
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
-        args = self._build_run_args(
-            filter,
-            governance_override=resolved.get("governance_override"),
-            pipeline=pipeline,
-            run_models=run_models,
-            partition=partition,
-            partition_from=partition_from,
-            partition_to=partition_to,
-            latest=latest,
-            missing=missing,
-            lookback=lookback,
-            parallel=parallel,
-            shadow_suffix=resolved.get("shadow_suffix"),
-            idempotency_key=resolved.get("idempotency_key"),
+        build_kwargs: dict[str, Any] = {
+            "governance_override": resolved.get("governance_override"),
+            "pipeline": pipeline,
+            "run_models": run_models,
+            "partition": partition,
+            "partition_from": partition_from,
+            "partition_to": partition_to,
+            "latest": latest,
+            "missing": missing,
+            "lookback": lookback,
+            "parallel": parallel,
+            "shadow_suffix": resolved.get("shadow_suffix"),
+            "idempotency_key": resolved.get("idempotency_key"),
+        }
+        plan_args = self._build_plan_args(filter, **build_kwargs)
+        run_fallback_args = self._build_run_args(filter, **build_kwargs)
+        apply_stdout = self._apply_plan(
+            plan_args=plan_args,
+            run_fallback_args=run_fallback_args,
+            apply_runner=lambda args: self._run_rocky(args, allow_partial=True),
         )
-        return _parse_rocky_json(
-            self._run_rocky(args, allow_partial=True), RunResult, command="run"
-        )
+        return _parse_run_or_apply(apply_stdout, command="run")
 
     def run_streaming(
         self,
@@ -1521,6 +1596,18 @@ class RockyResource(dg.ConfigurableResource):
         * Partial-success handling (non-zero exit + valid JSON stdout
           still returns the parsed result).
         * Captured stderr tail in any ``dg.Failure`` raised on errors.
+        * Audit-artifact: every run writes
+          ``.rocky/plans/<plan_id>.json`` before applying — the same
+          plan id you'd see if you invoked ``rocky plan`` from the CLI.
+
+        Log narrative note (Cluster 3 B Phase 5): the integration now
+        runs ``rocky plan`` first (buffered, single-digit seconds) and
+        then ``rocky apply <plan_id>`` (streamed). Plan-phase stderr is
+        forwarded to the module logger only — it does **not** reach
+        ``context.log``. Apply-phase stderr streams to ``context.log``
+        as before. Replication-only projects (no ``models/`` directory)
+        fall back to ``rocky run`` and keep the legacy single-stream
+        narrative.
 
         Args:
             context: Dagster execution context. Either an
@@ -1550,25 +1637,31 @@ class RockyResource(dg.ConfigurableResource):
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
-        args = self._build_run_args(
-            filter,
-            governance_override=resolved.get("governance_override"),
-            run_models=run_models,
-            partition=partition,
-            partition_from=partition_from,
-            partition_to=partition_to,
-            latest=latest,
-            missing=missing,
-            lookback=lookback,
-            parallel=parallel,
-            shadow_suffix=resolved.get("shadow_suffix"),
-            idempotency_key=resolved.get("idempotency_key"),
+        build_kwargs: dict[str, Any] = {
+            "governance_override": resolved.get("governance_override"),
+            "run_models": run_models,
+            "partition": partition,
+            "partition_from": partition_from,
+            "partition_to": partition_to,
+            "latest": latest,
+            "missing": missing,
+            "lookback": lookback,
+            "parallel": parallel,
+            "shadow_suffix": resolved.get("shadow_suffix"),
+            "idempotency_key": resolved.get("idempotency_key"),
+        }
+        plan_args = self._build_plan_args(filter, **build_kwargs)
+        run_fallback_args = self._build_run_args(filter, **build_kwargs)
+        # Plan is buffered (single-digit seconds, no progress to stream).
+        # Stderr is forwarded to the module logger rather than
+        # ``context.log`` — see the docstring's "log narrative" note.
+        # Apply is the long-running step and gets the streaming sink.
+        apply_stdout = self._apply_plan(
+            plan_args=plan_args,
+            run_fallback_args=run_fallback_args,
+            apply_runner=lambda args: self._run_rocky_streaming(args, context, allow_partial=True),
         )
-        return _parse_rocky_json(
-            self._run_rocky_streaming(args, context, allow_partial=True),
-            RunResult,
-            command="run (streaming)",
-        )
+        return _parse_run_or_apply(apply_stdout, command="run (streaming)")
 
     def _build_run_args(
         self,
@@ -1587,7 +1680,16 @@ class RockyResource(dg.ConfigurableResource):
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
     ) -> list[str]:
-        """Shared argv builder used by :meth:`run`, :meth:`run_streaming`, and :meth:`run_pipes`.
+        """Shared argv builder for the legacy ``rocky run`` alias path.
+
+        After Cluster 3 B Phase 5, the three public exec methods
+        (:meth:`run`, :meth:`run_streaming`, :meth:`run_pipes`) route
+        through :meth:`_build_plan_args` + :meth:`_apply_plan` by
+        default. This builder remains in place for the replication-only
+        fallback (projects with no ``models/`` directory, where
+        ``rocky plan`` cannot persist a plan and there is no
+        ``plan_id`` to apply). It is also kept for any direct caller
+        that still wants the single-subprocess shape.
 
         Single source of truth for the flag plumbing so adding a new
         flag is a one-place change. The flags are defensive:
@@ -1620,6 +1722,147 @@ class RockyResource(dg.ConfigurableResource):
         if idempotency_key is not None:
             args.extend(["--idempotency-key", idempotency_key])
         return args
+
+    def _build_plan_args(
+        self,
+        filter: str,
+        *,
+        governance_override: dict | None,
+        pipeline: str | None = None,
+        run_models: bool,
+        partition: str | None,
+        partition_from: str | None,
+        partition_to: str | None,
+        latest: bool,
+        missing: bool,
+        lookback: int | None,
+        parallel: int | None,
+        shadow_suffix: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> list[str]:
+        """Sibling of :meth:`_build_run_args` that emits ``rocky plan`` argv.
+
+        Used by :meth:`run`, :meth:`run_streaming`, and :meth:`run_pipes`
+        after the Cluster 3 B Phase 5 migration. Identical flag plumbing
+        to :meth:`_build_run_args` — engine PR #535 backfilled every
+        ``rocky run`` flag onto ``rocky plan`` so the only structural
+        difference is the verb token. Keeping the bodies as siblings
+        (rather than a `subcommand` parameter on the existing builder)
+        keeps the call sites readable and lets the migration land
+        without touching every existing :meth:`_build_run_args` caller.
+
+        ``--watch`` is intentionally omitted — it has no
+        :meth:`_build_run_args` counterpart, and Dagster never invokes
+        the watch loop (Dagster owns the re-run cadence).
+        """
+        args = ["plan", "--filter", filter]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
+        if governance_override:
+            args.extend(["--governance-override", json.dumps(governance_override)])
+        if run_models:
+            args.extend(["--models", self.models_dir, "--all"])
+        if shadow_suffix is not None:
+            args.extend(["--shadow", "--shadow-suffix", shadow_suffix])
+        if partition is not None:
+            args.extend(["--partition", partition])
+        if partition_from is not None and partition_to is not None:
+            args.extend(["--from", partition_from, "--to", partition_to])
+        if latest:
+            args.append("--latest")
+        if missing:
+            args.append("--missing")
+        if lookback is not None:
+            args.extend(["--lookback", str(lookback)])
+        if parallel is not None:
+            args.extend(["--parallel", str(parallel)])
+        if idempotency_key is not None:
+            args.extend(["--idempotency-key", idempotency_key])
+        return args
+
+    @staticmethod
+    def _extract_plan_id(plan_stdout: str) -> str | None:
+        """Pull ``plan_id`` out of a ``rocky plan`` JSON payload.
+
+        Returns ``None`` for the replication-only case (no ``models/``
+        directory next to the config), where the engine's
+        ``rocky plan`` command emits a ``PlanOutput`` with
+        ``plan_id = null`` because there is no run-plan spine to
+        persist. Callers fall back to ``rocky run`` argv in that case
+        — see :meth:`_apply_plan`.
+
+        Args:
+            plan_stdout: Raw ``rocky plan --output json`` stdout.
+
+        Returns:
+            The full 64-char blake3 plan id, or ``None`` when the
+            plan was not persisted (replication-only project).
+        """
+        try:
+            payload = json.loads(plan_stdout)
+        except json.JSONDecodeError:
+            # Defer to the buffered _parse_rocky_json error path that
+            # the caller will hit when it parses the apply output —
+            # giving up here would mask the actual JSON shape problem.
+            return None
+        plan_id = payload.get("plan_id")
+        if not isinstance(plan_id, str):
+            return None
+        return plan_id
+
+    def _apply_plan(
+        self,
+        *,
+        plan_args: list[str],
+        run_fallback_args: list[str],
+        apply_runner: Callable[[list[str]], str],
+    ) -> str:
+        """Run ``rocky plan`` then dispatch ``rocky apply <plan_id>``.
+
+        Single source of truth for the two-step plan/apply orchestration
+        used by :meth:`run`, :meth:`run_streaming`, and :meth:`run_pipes`
+        after Cluster 3 B Phase 5. The plan step is always buffered
+        (single-digit seconds, no progress to forward); the apply step
+        is the long-running one and per-method-specific — ``apply_runner``
+        is the callable that exec the apply argv with whatever process
+        model the caller wants (buffered, streaming, Pipes, …).
+
+        Replication-only fallback: when ``rocky plan`` cannot persist a
+        plan because the project has no ``models/`` directory (the
+        ``plan_id`` field is ``None`` on the wire), this method
+        transparently falls back to ``rocky run`` with the original
+        flag surface — behavior-preserving for the pre-Phase-5
+        replication-only path. The deprecation notice is still
+        suppressed via ``ROCKY_SUPPRESS_DEPRECATION`` in
+        :meth:`_run_rocky_with_log_sink` so users see no stderr noise
+        on the fallback.
+
+        Args:
+            plan_args: Argv for ``rocky plan`` (built by
+                :meth:`_build_plan_args`).
+            run_fallback_args: Argv for the ``rocky run`` legacy path
+                (built by :meth:`_build_run_args`). Used only when
+                ``rocky plan`` returns ``plan_id = null``.
+            apply_runner: Per-method exec callable. Receives the
+                ``["apply", <plan_id>]`` argv (or
+                ``run_fallback_args`` on the fallback path) and
+                returns the resulting stdout. Examples:
+                ``lambda args: self._run_rocky(args, allow_partial=True)``
+                for the buffered path; the streaming sink-emitting
+                helper for the streaming path.
+
+        Returns:
+            The captured stdout from the apply (or fallback ``run``)
+            invocation, ready to be parsed.
+        """
+        plan_stdout = self._run_rocky(plan_args)
+        plan_id = self._extract_plan_id(plan_stdout)
+        if plan_id is None:
+            # Replication-only project (no models/ directory) — engine
+            # cannot persist a plan and there is no plan_id to apply.
+            # Fall back to the single-subprocess `rocky run` path.
+            return apply_runner(run_fallback_args)
+        return apply_runner(["apply", plan_id])
 
     def run_pipes(
         self,
@@ -1728,20 +1971,21 @@ class RockyResource(dg.ConfigurableResource):
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
-        args = self._build_run_args(
-            filter,
-            governance_override=resolved.get("governance_override"),
-            run_models=run_models,
-            partition=partition,
-            partition_from=partition_from,
-            partition_to=partition_to,
-            latest=latest,
-            missing=missing,
-            lookback=lookback,
-            parallel=parallel,
-            shadow_suffix=resolved.get("shadow_suffix"),
-            idempotency_key=resolved.get("idempotency_key"),
-        )
+        build_kwargs: dict[str, Any] = {
+            "governance_override": resolved.get("governance_override"),
+            "run_models": run_models,
+            "partition": partition,
+            "partition_from": partition_from,
+            "partition_to": partition_to,
+            "latest": latest,
+            "missing": missing,
+            "lookback": lookback,
+            "parallel": parallel,
+            "shadow_suffix": resolved.get("shadow_suffix"),
+            "idempotency_key": resolved.get("idempotency_key"),
+        }
+        plan_args = self._build_plan_args(filter, **build_kwargs)
+        run_fallback_args = self._build_run_args(filter, **build_kwargs)
         if pipes_client is not None:
             client = pipes_client
         elif asset_key_fn is not None or include_keys is not None:
@@ -1757,9 +2001,27 @@ class RockyResource(dg.ConfigurableResource):
             )
         else:
             client = dg.PipesSubprocessClient()
+        # Plan step is buffered and a separate subprocess. Pipes attaches
+        # to the apply step (the engine's Pipes emitter is a no-op on
+        # ``rocky plan`` — only ``rocky apply`` reports materializations).
+        # Replication-only projects fall back to ``rocky run`` (no plan
+        # persisted), which still emits Pipes messages under the
+        # ``DAGSTER_PIPES_*`` env vars set by ``PipesSubprocessClient``.
+        plan_stdout = self._run_rocky(plan_args)
+        plan_id = self._extract_plan_id(plan_stdout)
+        if plan_id is None:
+            # Replication-only fallback — single subprocess via Pipes.
+            return client.run(
+                context=context,
+                command=self._build_cmd(run_fallback_args),
+            )
         return client.run(
             context=context,
-            command=self._build_cmd(args),
+            command=self._build_cmd(["apply", plan_id]),
+            # Surface the plan id on the Dagster run as Pipes extras so
+            # operators can correlate the materialization back to the
+            # persisted plan artifact at ``.rocky/plans/<plan_id>.json``.
+            extras={"plan_id": plan_id},
         )
 
     def state(self) -> StateResult:
