@@ -3243,8 +3243,49 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let mut value: toml::Value = toml::from_str(&substituted).map_err(to_parse_err)?;
     apply_deprecations(&mut value);
     normalize_toml_shorthands(&mut value);
-    let config: RockyConfig = value.try_into().map_err(to_parse_err)?;
+    let mut config: RockyConfig = value.try_into().map_err(to_parse_err)?;
+    apply_single_adapter_discovery_default(&mut config);
     Ok(config)
+}
+
+/// When exactly one `[adapter]` is defined and a replication pipeline
+/// omits `[source.discovery]` entirely, materialize the discovery block
+/// pointing at that one adapter so callers downstream (e.g. `rocky
+/// compact --catalog`) don't have to special-case "no discovery
+/// configured".
+///
+/// Mirrors what serde already does for `source.adapter` and
+/// `target.adapter` via `#[serde(default = "default_adapter_name")]`,
+/// except the auto-wire uses the *actual* adapter name (which may be
+/// `"default"` under the canonical `[adapter]` shorthand, or any name
+/// when written as `[adapter.<name>]`) rather than the hardcoded
+/// `"default"` literal — otherwise a single-adapter project named
+/// `[adapter.local]` would wire discovery at `"default"` and fail the
+/// existing `V022` "no adapter named 'default'" diagnostic.
+///
+/// Multi-adapter configs are left alone — the existing "no discovery
+/// configured" path keeps emitting its warning and the user has to wire
+/// it explicitly.
+fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
+    let sole_adapter = match config.adapters.len() {
+        1 => config
+            .adapters
+            .keys()
+            .next()
+            .expect("len == 1 guarantees one key")
+            .clone(),
+        _ => return,
+    };
+    for pipeline in config.pipelines.values_mut() {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        if replication.source.discovery.is_none() {
+            replication.source.discovery = Some(DiscoveryConfig {
+                adapter: sole_adapter.clone(),
+            });
+        }
+    }
 }
 
 /// Loads, parses, and validates a Rocky configuration (v2 format only).
@@ -4414,6 +4455,145 @@ target = { catalog_template = "main", schema_template = "staging__{source}" }
         assert_eq!(default_pipeline.target.schema_template, "staging__{source}");
         // When [state] is completely omitted, StateConfig::default() gives Local backend.
         assert_eq!(config.state.backend, StateBackend::Local);
+    }
+
+    /// Single-adapter shorthand with `[source.discovery]` entirely absent
+    /// should auto-wire discovery to the lone adapter — `parse_rocky_config`
+    /// materializes `DiscoveryConfig { adapter = "default" }` so callers
+    /// like `rocky compact --catalog` don't have to special-case "no
+    /// discovery configured" when the project shape is unambiguous.
+    #[test]
+    fn test_single_adapter_autowires_discovery() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "main", schema_template = "staging" }
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        let discovery = poc.source.discovery.as_ref().expect("discovery auto-wired");
+        assert_eq!(discovery.adapter, "default");
+    }
+
+    /// Auto-wire follows the actual adapter name, not the literal
+    /// `"default"`. A project that writes `[adapter.local]` explicitly
+    /// must auto-wire discovery to `"local"` — otherwise `source.adapter`
+    /// (which serde defaults to `"default"`) is in conflict with a
+    /// hardcoded `"default"` discovery ref and the downstream registry
+    /// fails with `V022` "no adapter named 'default'".
+    #[test]
+    fn test_single_named_adapter_autowires_to_its_name() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+[pipeline.poc.source]
+adapter = "local"
+schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "main"
+schema_template = "staging"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        let discovery = poc.source.discovery.as_ref().expect("discovery auto-wired");
+        assert_eq!(discovery.adapter, "local");
+    }
+
+    /// Multi-adapter project: `[source.discovery]` absent must stay
+    /// `None` so the existing "no discovery adapter configured" code
+    /// path keeps its signal — refusing to guess which adapter handles
+    /// discovery in an ambiguous setup is the safe behavior.
+    #[test]
+    fn test_multi_adapter_does_not_autowire_discovery() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter.warehouse]
+type = "duckdb"
+path = ":memory:"
+
+[adapter.source_fetch]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+
+[pipeline.poc]
+[pipeline.poc.source]
+adapter = "warehouse"
+schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+
+[pipeline.poc.target]
+adapter = "warehouse"
+catalog_template = "main"
+schema_template = "staging"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        assert!(
+            poc.source.discovery.is_none(),
+            "multi-adapter project must not auto-wire discovery"
+        );
+    }
+
+    /// When the user did supply `[source.discovery]` explicitly, the
+    /// auto-wire pass must leave it alone — even on a single-adapter
+    /// project — so an operator-chosen discovery adapter never gets
+    /// silently replaced.
+    #[test]
+    fn test_explicit_discovery_not_overwritten() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+source.discovery = { adapter = "default" }
+target = { catalog_template = "main", schema_template = "staging" }
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        assert_eq!(
+            poc.source.discovery.as_ref().expect("present").adapter,
+            "default"
+        );
     }
 
     #[test]

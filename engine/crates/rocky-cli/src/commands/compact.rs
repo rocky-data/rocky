@@ -1855,21 +1855,30 @@ schema_template = "staging__{{source}}"
         // The actual catalog name from `information_schema.tables` will
         // be the db name, so we match on `staging__shopify` schema only.
         //
-        // For replication pipeline, managed-table resolution requires a
-        // discovery adapter. Since DuckDB doesn't have one, the resolver
-        // falls back to `Ok(None)` → scope = "all". That's fine for
-        // testing that the fallback works correctly.
+        // For replication pipeline, managed-table resolution requires
+        // discovery. Use a second `[adapter.stub]` so the auto-wire
+        // post-load pass leaves `source.discovery` unset (it only fires
+        // when exactly one adapter is defined) — the resolver then
+        // returns `Ok(None)` and scope falls back to "all", which is
+        // what this test pins.
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
             &config_path,
             format!(
                 r#"
-[adapter]
+[adapter.warehouse]
 type = "duckdb"
 path = "{}"
 
+[adapter.stub]
+type = "duckdb"
+path = ":memory:"
+
 [pipeline.test]
 strategy = "full_refresh"
+
+[pipeline.test.source]
+adapter = "warehouse"
 
 [pipeline.test.source.schema_pattern]
 prefix = "raw__"
@@ -1877,6 +1886,7 @@ separator = "__"
 components = ["source"]
 
 [pipeline.test.target]
+adapter = "warehouse"
 catalog_template = "test"
 schema_template = "staging__{{source}}"
 "#,
