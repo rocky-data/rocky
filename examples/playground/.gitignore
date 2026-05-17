@@ -23,6 +23,11 @@ pocs/**/expected/*.stderr
 # in the import-dbt POCs. Same role as expected/ — fully regenerated each run.
 pocs/**/imported/
 
+# Rendered screencast artefacts emitted by VHS — the .tape file is the
+# tracked source; the .mp4 / .gif lives in docs/public/ when needed.
+pocs/**/*.mp4
+pocs/**/*.gif
+
 # Python (benchmarks, dbt-migration POC)
 __pycache__/
 *.py[cod]
