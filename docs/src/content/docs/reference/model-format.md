@@ -508,26 +508,26 @@ schema = "warehouse"
 table = "fct_daily_events"
 ```
 
-**CLI flags** for time-interval models. As of engine v1.33 these flags are accepted on the legacy `rocky run` alias only; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`). Plumbing them through `rocky plan` + `rocky apply` is a future-phase follow-up.
+**CLI flags** for time-interval models. As of engine v1.33 every flag below is accepted on both `rocky plan` and the legacy `rocky run` alias; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`). The canonical form is `rocky plan` followed by `rocky apply <plan-id>`.
 
 ```bash
 # Process a specific partition
-rocky run --partition 2026-04-01
+rocky plan --partition 2026-04-01 && rocky apply <plan-id>
 
 # Process a date range
-rocky run --from 2026-03-01 --to 2026-04-01
+rocky plan --from 2026-03-01 --to 2026-04-01 && rocky apply <plan-id>
 
 # Process the latest partition
-rocky run --latest
+rocky plan --latest && rocky apply <plan-id>
 
 # Discover and process missing partitions
-rocky run --missing
+rocky plan --missing && rocky apply <plan-id>
 
 # Set lookback window
-rocky run --lookback 7
+rocky plan --lookback 7 && rocky apply <plan-id>
 
 # Parallelize partition processing
-rocky run --parallel 4
+rocky plan --parallel 4 && rocky apply <plan-id>
 ```
 
 Per-partition state is tracked in the state store. The `--missing` flag consults stored partition records to discover gaps.
