@@ -924,6 +924,27 @@ class StateHealthResult(BaseModel):
     * :attr:`probe_error` — human-readable failure message from the same
       check when :attr:`probe_outcome` is ``"timeout"`` or ``"error"``.
       ``None`` on success and when the probe wasn't requested.
+
+    Example:
+
+        Inspect a snapshot to log or tag the per-tick state-backend
+        health. ``probe_outcome`` is ``None`` on the cheap path; on the
+        ``probe_write=True`` path it's one of ``"ok"`` / ``"timeout"`` /
+        ``"error"``.
+
+        .. code-block:: python
+
+            from dagster_rocky import StateHealthResult, state_health
+
+            snapshot: StateHealthResult = state_health(rocky, probe_write=True)
+            tags = {
+                "rocky/state_backend": snapshot.backend,
+                "rocky/last_run_status": snapshot.last_run_status or "unknown",
+            }
+            if snapshot.probe_outcome == "ok":
+                tags["rocky/state_rw_ms"] = str(snapshot.probe_duration_ms)
+            elif snapshot.probe_outcome in ("timeout", "error"):
+                tags["rocky/state_rw_error"] = snapshot.probe_error or "unknown"
     """
 
     backend: StateBackendKind
