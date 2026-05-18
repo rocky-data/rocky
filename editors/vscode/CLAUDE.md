@@ -84,7 +84,7 @@ icons/
 ### TypeScript
 - Target: ES2022, Module: CommonJS
 - Strict mode enabled
-- VS Code API minimum: 1.105.0 (must match the version pinned in `src/test/runTest.ts`; test runner activates against that exact build)
+- VS Code API minimum: 1.120.0 (must match the version pinned in `src/test/runTest.ts`; test runner activates against that exact build)
 - Use `cp.execFile()` for subprocess calls (not `cp.exec()` — no shell injection)
 - Use `vscode.window.withProgress()` for long-running commands
 - Escape HTML in webview content via `escapeHtml()`
