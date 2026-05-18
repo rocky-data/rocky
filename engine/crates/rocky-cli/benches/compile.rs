@@ -303,7 +303,7 @@ fn bench_sql_generation(c: &mut Criterion) {
             |b, irs| {
                 b.iter(|| {
                     for ir in irs.iter() {
-                        sql_gen::generate_insert_sql(ir, &dialect).unwrap();
+                        sql_gen::generate_insert_sql(ir, &dialect, None).unwrap();
                     }
                 });
             },

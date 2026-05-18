@@ -472,10 +472,15 @@ impl SqlDialect for ProcessDialect {
         Ok(sql)
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
-        Ok(format!(
-            "WHERE {timestamp_col} > (SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01') FROM {target_ref})"
-        ))
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn insert_overwrite_partition(
@@ -592,15 +597,30 @@ mod tests {
     }
 
     #[test]
-    fn test_process_dialect_watermark_where() {
+    fn test_process_dialect_watermark_where_no_prior() {
         let d = ProcessDialect {
             name: "test".into(),
         };
-        let sql = d
-            .watermark_where("_fivetran_synced", "target.schema.table")
-            .unwrap();
-        assert!(sql.contains("WHERE _fivetran_synced >"));
-        assert!(sql.contains("target.schema.table"));
+        let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_process_dialect_watermark_where_with_prior() {
+        use chrono::TimeZone;
+        let d = ProcessDialect {
+            name: "test".into(),
+        };
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
+        // Source-side semantics: literal substitution, no MAX subquery.
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"
+        );
     }
 
     #[test]

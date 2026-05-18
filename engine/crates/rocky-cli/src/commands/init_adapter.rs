@@ -114,10 +114,19 @@ impl SqlDialect for {name_pascal}SqlDialect {{
         Ok(sql)
     }}
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {{
-        Ok(format!(
-            "WHERE {{timestamp_col}} > (SELECT COALESCE(MAX({{timestamp_col}}), TIMESTAMP '1970-01-01') FROM {{target_ref}})"
-        ))
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {{
+        // Substitute the previous run's max source watermark as a literal —
+        // the runner queries SELECT MAX(ts) FROM source post-execute and
+        // records that value to the state store. None means "no prior
+        // watermark" (first run / after delete_watermark); scan everything.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {{timestamp_col}} > TIMESTAMP '{{literal}}'"))
     }}
 
     fn describe_table_sql(&self, table_ref: &str) -> String {{

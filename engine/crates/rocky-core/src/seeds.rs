@@ -865,7 +865,7 @@ id = "INTEGER"
         fn watermark_where(
             &self,
             _timestamp_col: &str,
-            _target_ref: &str,
+            _last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
         ) -> crate::traits::AdapterResult<String> {
             Ok(String::new())
         }

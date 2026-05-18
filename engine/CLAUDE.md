@@ -216,7 +216,7 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 ## SQL Patterns Rocky Generates
 
-**Incremental copy (the core operation):** watermark-filtered INSERT via `_fivetran_synced > MAX(...)` subquery. See `sql_gen.rs`.
+**Incremental copy (the core operation):** watermark-filtered INSERT via `WHERE _fivetran_synced > TIMESTAMP '<prior>'` — the runner reads the previous run's `MAX(ts) FROM source` from the state store, threads it into SQL gen as a literal, and re-queries source post-execute to record the next watermark. See `sql_gen.rs` and `commands/run.rs::query_source_max_timestamp`.
 
 **Schema drift:** `DESCRIBE TABLE` source vs target → safe type widening (`ALTER COLUMN TYPE`) or full refresh. See `drift.rs:is_safe_type_widening()`.
 

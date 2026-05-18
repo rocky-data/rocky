@@ -172,10 +172,11 @@ async fn test_incremental_pipeline_two_runs() {
     .await
     .unwrap();
 
-    // Run 2: incremental (only new rows). The watermark itself is read
-    // from the state store at SQL-generation time, not carried on the
-    // strategy.
-    let _wm = store.get_watermark("target.events").unwrap();
+    // Run 2: incremental (only new rows). The runner reads the prior
+    // source-side watermark from the state store and threads it into
+    // SQL generation; the dialect substitutes it as a literal in the
+    // WHERE clause (no correlated subquery against target).
+    let prior_wm = store.get_watermark("target.events").unwrap().unwrap();
     let plan2 = duckdb_replication_ir(
         "events",
         "events",
@@ -183,10 +184,10 @@ async fn test_incremental_pipeline_two_runs() {
             timestamp_column: "_fivetran_synced".into(),
         },
     );
-    let sql2 = sql_gen::generate_insert_sql(&plan2, &d).unwrap();
+    let sql2 = sql_gen::generate_insert_sql(&plan2, &d, Some(&prior_wm.last_value)).unwrap();
     p.execute(&sql2).await.unwrap();
 
-    // Should now have 4 rows (2 original + 2 new)
+    // Should now have 4 rows (2 original + 2 new).
     assert_eq!(p.row_count("target.events").await.unwrap(), 4);
 }
 

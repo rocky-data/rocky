@@ -95,13 +95,20 @@ impl SqlDialect for BigQueryDialect {
         Ok(format!("{base}, {}", meta_cols.join(", ")))
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        Ok(format!(
-            "WHERE {timestamp_col} > (\n  \
-             SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01')\n  \
-             FROM {target_ref}\n)"
-        ))
+        // BigQuery's `TIMESTAMP '...'` literal accepts the ISO 8601 form
+        // with microsecond precision (six digits after the decimal). The
+        // 1970-01-01 sentinel covers the first-run / post-`delete_watermark`
+        // case so the WHERE clause stays permissive.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -365,12 +372,26 @@ mod tests {
     }
 
     #[test]
-    fn test_watermark_where() {
+    fn test_watermark_where_no_prior_uses_sentinel() {
         let d = BigQueryDialect;
-        let sql = d
-            .watermark_where("_fivetran_synced", "`p`.`d`.`t`")
-            .unwrap();
-        assert!(sql.contains("TIMESTAMP '1970-01-01'"));
+        let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_with_prior_substitutes_literal() {
+        use chrono::TimeZone;
+        let d = BigQueryDialect;
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
+        // Source-side semantics: literal substitution, no MAX subquery.
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"
+        );
     }
 
     #[test]

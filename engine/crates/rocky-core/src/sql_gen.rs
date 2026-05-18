@@ -56,6 +56,16 @@ pub enum SqlGenError {
 
 /// Generates the SELECT SQL for a replication model using the given dialect.
 ///
+/// `last_watermark` is the previous run's max source timestamp, read from
+/// the embedded state store by the runner before SQL generation. The
+/// dialect substitutes it as a warehouse-native timestamp literal inside the
+/// WHERE clause. `None` is used on first runs or after
+/// [`crate::state::StateStore::delete_watermark`]; the dialect falls back
+/// to a `1970-01-01` sentinel so the full source is scanned.
+///
+/// The argument only applies to [`MaterializationStrategy::Incremental`];
+/// other variants ignore it.
+///
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
@@ -63,6 +73,7 @@ pub enum SqlGenError {
 pub fn generate_select_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
+    last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> Result<String, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Replication {
         return Err(variant_mismatch(model_ir, "Replication"));
@@ -85,14 +96,7 @@ pub fn generate_select_sql(
         timestamp_column, ..
     } = &model_ir.materialization
     {
-        let target = dialect.format_table_ref(
-            &model_ir.target.catalog,
-            &model_ir.target.schema,
-            &model_ir.target.table,
-        )?;
-
-        let where_clause = dialect.watermark_where(timestamp_column, &target)?;
-
+        let where_clause = dialect.watermark_where(timestamp_column, last_watermark)?;
         let _ = write!(sql, "\n{where_clause}");
     }
 
@@ -101,6 +105,9 @@ pub fn generate_select_sql(
 
 /// Generates `INSERT INTO <target> SELECT ...` using the given dialect.
 ///
+/// `last_watermark` is forwarded to [`generate_select_sql`] for the
+/// incremental WHERE filter. See that function's docs for semantics.
+///
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
@@ -108,6 +115,7 @@ pub fn generate_select_sql(
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
+    last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> Result<String, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Replication {
         return Err(variant_mismatch(model_ir, "Replication"));
@@ -117,7 +125,7 @@ pub fn generate_insert_sql(
         &model_ir.target.schema,
         &model_ir.target.table,
     )?;
-    let select = generate_select_sql(model_ir, dialect)?;
+    let select = generate_select_sql(model_ir, dialect, last_watermark)?;
     Ok(dialect.insert_into(&target, &select))
 }
 
@@ -1002,14 +1010,16 @@ mod tests {
             Ok(sql)
         }
 
-        fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+        fn watermark_where(
+            &self,
+            timestamp_col: &str,
+            last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
             rocky_sql::validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-            Ok(format!(
-                "WHERE {timestamp_col} > (\n\
-                 \x20   SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01')\n\
-                 \x20   FROM {target_ref}\n\
-                 )"
-            ))
+            let literal = last_watermark
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+            Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
         }
 
         fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -1094,19 +1104,46 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_select() {
-        let sql = generate_select_sql(&sample_incremental_ir(), &dialect()).unwrap();
+    fn test_incremental_select_no_prior_watermark_uses_sentinel() {
+        // First run / post-`delete_watermark`: state has no entry, the
+        // WHERE clause falls back to the 1970-01-01 sentinel so the
+        // whole source is scanned.
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect(), None).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog.src__acme__us_west__shopify.orders"));
-        assert!(sql.contains("WHERE _fivetran_synced > ("));
-        assert!(sql.contains("COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')"));
-        assert!(sql.contains("FROM acme_warehouse.staging__us_west__shopify.orders"));
+        assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"));
+        // The target table reference must not appear in the WHERE clause
+        // any more — source-side watermarks substitute a literal instead.
+        assert!(
+            !sql.contains("acme_warehouse.staging__us_west__shopify.orders"),
+            "target table reference must not appear in source-side WHERE: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_incremental_select_with_prior_watermark_substitutes_literal() {
+        // Second run: the runner reads the previous run's max source
+        // watermark from state and threads it in. The WHERE clause is a
+        // single literal — no correlated subquery against target.
+        use chrono::TimeZone;
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect(), Some(&prior)).unwrap();
+
+        assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"));
+        assert!(
+            !sql.contains("SELECT COALESCE(MAX"),
+            "source-side WHERE must not emit a correlated MAX subquery: {sql}"
+        );
+        assert!(
+            !sql.contains("acme_warehouse.staging__us_west__shopify.orders"),
+            "target table reference must not appear in source-side WHERE: {sql}"
+        );
     }
 
     #[test]
     fn test_full_refresh_select() {
-        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect(), None).unwrap();
 
         assert!(sql.starts_with("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("FROM source_catalog"));
@@ -1115,11 +1152,12 @@ mod tests {
 
     #[test]
     fn test_insert_into_sql() {
-        let sql = generate_insert_sql(&sample_incremental_ir(), &dialect()).unwrap();
+        let sql = generate_insert_sql(&sample_incremental_ir(), &dialect(), None).unwrap();
 
         assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
         assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
-        assert!(sql.contains("WHERE _fivetran_synced > ("));
+        // First run: no prior watermark → 1970-01-01 sentinel literal.
+        assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"));
     }
 
     #[test]
@@ -1143,7 +1181,7 @@ mod tests {
             "status".into(),
         ]));
         ir.metadata_columns = vec![];
-        let sql = generate_select_sql(&ir, &dialect()).unwrap();
+        let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
 
         assert!(sql.starts_with("SELECT id, name, status"));
         assert!(!sql.contains("*"));
@@ -1153,7 +1191,7 @@ mod tests {
     fn test_no_metadata_columns() {
         let mut ir = sample_full_refresh_ir();
         ir.metadata_columns = vec![];
-        let sql = generate_select_sql(&ir, &dialect()).unwrap();
+        let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
 
         assert_eq!(sql.lines().next().unwrap().trim(), "SELECT *");
         assert!(!sql.contains("CAST"));
@@ -1174,7 +1212,7 @@ mod tests {
                 value: "42".into(),
             },
         ];
-        let sql = generate_select_sql(&ir, &dialect()).unwrap();
+        let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
 
         assert!(sql.contains("CAST(NULL AS STRING) AS _loaded_by"));
         assert!(sql.contains("CAST(42 AS INT) AS load_id"));
@@ -1188,7 +1226,7 @@ mod tests {
             schema: "schema".into(),
             table: "table".into(),
         });
-        assert!(generate_select_sql(&ir, &dialect()).is_err());
+        assert!(generate_select_sql(&ir, &dialect(), None).is_err());
     }
 
     #[test]
@@ -1199,7 +1237,7 @@ mod tests {
             data_type: "STRING".into(),
             value: "NULL".into(),
         }];
-        assert!(generate_select_sql(&ir, &dialect()).is_err());
+        assert!(generate_select_sql(&ir, &dialect(), None).is_err());
     }
 
     #[test]
@@ -1216,7 +1254,7 @@ mod tests {
         // This test now checks that the dialect produces output (it does, since TestDialect
         // doesn't validate literal values). In production, the DatabricksSqlDialect should
         // validate literal values.
-        let _ = generate_select_sql(&ir, &dialect());
+        let _ = generate_select_sql(&ir, &dialect(), None);
     }
 
     #[test]
@@ -1228,7 +1266,7 @@ mod tests {
             value: "NULL".into(),
         }];
         // Same as above: data type validation is delegated to the dialect.
-        let _ = generate_select_sql(&ir, &dialect());
+        let _ = generate_select_sql(&ir, &dialect(), None);
     }
 
     #[test]
@@ -1238,7 +1276,7 @@ mod tests {
             unique_key: vec!["id".into()],
             update_columns: ColumnSelection::All,
         };
-        let sql = generate_select_sql(&ir, &dialect()).unwrap();
+        let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
         assert!(!sql.contains("WHERE")); // merge SELECT is a full scan
     }
 
@@ -1391,22 +1429,38 @@ mod tests {
 
     #[test]
     fn test_sample_incremental_sql_matches_expected() {
-        let sql = generate_select_sql(&sample_incremental_ir(), &dialect()).unwrap();
+        // Source-side semantics: with no prior watermark in state, the
+        // dialect substitutes the 1970-01-01 sentinel literal — the target
+        // table reference no longer appears in the WHERE clause.
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect(), None).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM source_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM acme_warehouse.staging__us_west__shopify.orders
-)";
+WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'";
+
+        assert_eq!(sql, expected);
+    }
+
+    #[test]
+    fn test_sample_incremental_sql_with_prior_watermark_matches_expected() {
+        // Second-run shape: state carries the previous run's
+        // `MAX(_fivetran_synced) FROM source`, threaded in as a literal.
+        use chrono::TimeZone;
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = generate_select_sql(&sample_incremental_ir(), &dialect(), Some(&prior)).unwrap();
+
+        let expected = "\
+SELECT *, CAST(NULL AS STRING) AS _loaded_by
+FROM source_catalog.src__acme__us_west__shopify.orders
+WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'";
 
         assert_eq!(sql, expected);
     }
 
     #[test]
     fn test_sample_full_refresh_sql_matches_expected() {
-        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect()).unwrap();
+        let sql = generate_select_sql(&sample_full_refresh_ir(), &dialect(), None).unwrap();
 
         let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -2056,7 +2110,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn variant_mismatch_error_names_the_actual_variant() {
         let ir = sample_transformation_ir();
-        let err = generate_select_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let err =
+            generate_select_sql(&ir, &dialect(), None).expect_err("expected variant mismatch");
         let msg = err.to_string();
         assert!(
             msg.contains("expected Replication ModelIr"),

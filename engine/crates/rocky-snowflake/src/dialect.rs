@@ -131,13 +131,21 @@ impl SqlDialect for SnowflakeSqlDialect {
         Ok(sql)
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
+        // Snowflake casts string literals to TIMESTAMP_NTZ explicitly so the
+        // result type matches the column under the default
+        // `TIMESTAMP_TYPE_MAPPING` setting. Sub-second precision is
+        // preserved by chrono's `%.f` directive.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         Ok(format!(
-            "WHERE {timestamp_col} > (\n\
-             \x20   SELECT COALESCE(MAX({timestamp_col}), '1970-01-01'::TIMESTAMP_NTZ)\n\
-             \x20   FROM {target_ref}\n\
-             )"
+            "WHERE {timestamp_col} > '{literal}'::TIMESTAMP_NTZ"
         ))
     }
 
@@ -320,10 +328,26 @@ mod tests {
     }
 
     #[test]
-    fn test_watermark_uses_timestamp_ntz() {
+    fn test_watermark_no_prior_uses_sentinel_timestamp_ntz() {
         let d = dialect();
-        let sql = d.watermark_where("_fivetran_synced", "db.sch.tbl").unwrap();
-        assert!(sql.contains("TIMESTAMP_NTZ"));
+        let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > '1970-01-01 00:00:00'::TIMESTAMP_NTZ"
+        );
+    }
+
+    #[test]
+    fn test_watermark_with_prior_substitutes_literal() {
+        use chrono::TimeZone;
+        let d = dialect();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
+        // Source-side semantics: literal substitution, no correlated subquery.
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > '2026-04-17 09:30:00'::TIMESTAMP_NTZ"
+        );
     }
 
     #[test]

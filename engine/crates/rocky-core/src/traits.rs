@@ -682,7 +682,26 @@ pub trait SqlDialect: Send + Sync {
 
     /// WHERE clause for incremental watermark filtering.
     /// Returns the full WHERE clause including the keyword.
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String>;
+    ///
+    /// The watermark value is supplied as a literal `DateTime<Utc>` read from
+    /// the embedded state store at run time — the previous run's max source
+    /// timestamp. The dialect formats it as a warehouse-native timestamp
+    /// literal (`TIMESTAMP '...'` on most dialects, `'...'::TIMESTAMP_NTZ`
+    /// on Snowflake). When `None` (first run or after `delete_watermark`),
+    /// the WHERE clause uses the sentinel `1970-01-01` so the whole source
+    /// is scanned.
+    ///
+    /// Source-side semantics: the watermark reflects what's been processed
+    /// *from* source, not what's *in* target. The runner computes
+    /// `SELECT MAX({ts}) FROM source` post-execute and persists that value;
+    /// the next run reads it back and passes it here. This composes
+    /// correctly with `merge`, `delete_insert`, and other strategies that
+    /// collapse source rows on write.
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&DateTime<Utc>>,
+    ) -> AdapterResult<String>;
 
     /// SQL to describe a table's schema (column names and types).
     fn describe_table_sql(&self, table_ref: &str) -> String;

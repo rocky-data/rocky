@@ -109,14 +109,20 @@ impl SqlDialect for DatabricksSqlDialect {
         Ok(sql)
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        Ok(format!(
-            "WHERE {timestamp_col} > (\n\
-             \x20   SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01')\n\
-             \x20   FROM {target_ref}\n\
-             )"
-        ))
+        // Format as `YYYY-MM-DD HH:MM:SS.ffffff` — Databricks accepts the
+        // ANSI `TIMESTAMP '...'` literal with sub-second precision. The
+        // 1970-01-01 sentinel covers the no-prior-watermark case so first
+        // runs and post-`delete_watermark` runs still scan everything.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -315,14 +321,32 @@ mod tests {
     }
 
     #[test]
-    fn test_watermark_where() {
+    fn test_watermark_where_no_prior_uses_sentinel() {
         let d = dialect();
-        let sql = d
-            .watermark_where("_fivetran_synced", "cat.sch.tbl")
-            .unwrap();
-        assert!(sql.starts_with("WHERE _fivetran_synced > ("));
-        assert!(sql.contains("COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')"));
-        assert!(sql.contains("FROM cat.sch.tbl"));
+        let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_with_prior_substitutes_literal() {
+        use chrono::TimeZone;
+        let d = dialect();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
+        // Source-side semantics: no correlated subquery against target.
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_rejects_bad_timestamp_column() {
+        let d = dialect();
+        assert!(d.watermark_where("'; DROP", None).is_err());
     }
 
     #[test]

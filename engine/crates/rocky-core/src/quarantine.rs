@@ -531,7 +531,11 @@ mod unit_tests {
         ) -> AdapterResult<String> {
             unimplemented!()
         }
-        fn watermark_where(&self, _: &str, _: &str) -> AdapterResult<String> {
+        fn watermark_where(
+            &self,
+            _: &str,
+            _: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
             unimplemented!()
         }
         fn describe_table_sql(&self, t: &str) -> String {

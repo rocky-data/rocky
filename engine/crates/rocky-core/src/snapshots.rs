@@ -447,10 +447,15 @@ mod tests {
             Ok(sql)
         }
 
-        fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
-            Ok(format!(
-                "WHERE {timestamp_col} > (SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01') FROM {target_ref})"
-            ))
+        fn watermark_where(
+            &self,
+            timestamp_col: &str,
+            last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            let literal = last_watermark
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+            Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
         }
 
         fn describe_table_sql(&self, table_ref: &str) -> String {

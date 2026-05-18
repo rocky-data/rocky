@@ -146,14 +146,19 @@ impl SqlDialect for DuckDbSqlDialect {
         Ok(sql)
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        Ok(format!(
-            "WHERE {timestamp_col} > (\n\
-             \x20   SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01')\n\
-             \x20   FROM {target_ref}\n\
-             )"
-        ))
+        // DuckDB accepts the ANSI `TIMESTAMP '...'` literal form with
+        // sub-second precision via the `%.f` directive. The 1970-01-01
+        // sentinel keeps the WHERE permissive on first runs.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -298,6 +303,35 @@ mod tests {
             d.tablesample_clause(10).unwrap(),
             "USING SAMPLE 10 PERCENT (bernoulli)"
         );
+    }
+
+    #[test]
+    fn test_watermark_where_no_prior_uses_sentinel() {
+        let d = dialect();
+        let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_with_prior_substitutes_literal() {
+        use chrono::TimeZone;
+        let d = dialect();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
+        // Source-side semantics: literal substitution, no correlated subquery.
+        assert_eq!(
+            sql,
+            "WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_rejects_bad_timestamp_column() {
+        let d = dialect();
+        assert!(d.watermark_where("'; DROP", None).is_err());
     }
 
     #[test]

@@ -210,14 +210,19 @@ pub async fn plan(
             // Full refresh uses CREATE OR REPLACE TABLE AS so the target doesn't
             // need to exist; incremental uses INSERT INTO which requires the
             // target to already exist (created on the first full-refresh run).
+            //
+            // `plan` is forward-looking — it renders the SQL the runner would
+            // emit on a fresh run, so we pass `None` for the watermark to
+            // surface the 1970-01-01 sentinel literal. The runner reads the
+            // actual prior watermark from state at execute time.
             let sql = match &strategy {
                 MaterializationStrategy::FullRefresh => {
                     sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
                 }
                 MaterializationStrategy::Incremental { .. } => {
-                    sql_gen::generate_insert_sql(&model_ir, dialect)?
+                    sql_gen::generate_insert_sql(&model_ir, dialect, None)?
                 }
-                _ => sql_gen::generate_insert_sql(&model_ir, dialect)?,
+                _ => sql_gen::generate_insert_sql(&model_ir, dialect, None)?,
             };
 
             let target_label = if effective_target_catalog.is_empty() {

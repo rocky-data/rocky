@@ -4467,11 +4467,14 @@ fn accumulate_bytes(acc: Option<u64>, next: Option<u64>) -> Option<u64> {
 /// Anything else → `FullRefresh` (backwards-compatible fallback; see follow-up
 ///   note in PR body about tightening unknown strategy values).
 ///
-/// Note: the watermark-filter clause (`WHERE ts > MAX(target.ts)`) lives in
+/// Note: the watermark-filter clause (`WHERE ts > TIMESTAMP '<prior>'`, where
+/// `<prior>` is the previous run's `MAX(ts) FROM source`) lives in
 /// `sql_gen::generate_select_sql` and applies for `Incremental` only; `merge`
 /// upserts the entire source via the dialect-specific `MERGE INTO`. The
-/// runner advances the watermark timestamp after each tick regardless of
-/// strategy (via `DeferredWatermark`).
+/// runner re-queries `MAX(ts) FROM source` after each tick (via
+/// [`query_source_max_timestamp`]) regardless of strategy, recording the
+/// new value via `DeferredWatermark`.
+///
 /// Convenience wrapper used by unit tests — applies no per-table
 /// override. Production code paths go through
 /// [`build_replication_strategy_with_override`] so per-table overrides
@@ -4536,16 +4539,81 @@ fn build_replication_strategy_with_override(
     }
 }
 
+/// Queries `SELECT MAX({timestamp_column}) FROM source` and parses the
+/// returned value into a `DateTime<Utc>`.
+///
+/// Returns `None` on any failure path (network error, malformed result,
+/// NULL / empty source, unparseable timestamp). Callers fall back to a
+/// wall-clock `Utc::now()` when the value is unavailable — same shape as
+/// the batch freshness check at the top of this file. Identifier validation
+/// is delegated to the dialect's `format_table_ref` and to the centralised
+/// `validate_identifier` check on the column name.
+///
+/// Used by `process_table` to record the source-side watermark after a
+/// successful replication tick — the value the next run will use to bound
+/// the WHERE clause via `SqlDialect::watermark_where`.
+async fn query_source_max_timestamp(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    source: &TableRef,
+    timestamp_column: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    if rocky_sql::validation::validate_identifier(timestamp_column).is_err() {
+        return None;
+    }
+    let source_ref = dialect
+        .format_table_ref(&source.catalog, &source.schema, &source.table)
+        .ok()?;
+    let sql = format!("SELECT MAX({timestamp_column}) FROM {source_ref}");
+
+    let result = match warehouse.execute_query(&sql).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                table = source.full_name(),
+                error = %e,
+                "source-side MAX(ts) query failed — falling back to wall-clock"
+            );
+            return None;
+        }
+    };
+
+    result.rows.first().and_then(|r| r.first()).and_then(|v| {
+        v.as_str().and_then(|s| {
+            s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
+                // Some warehouses (Snowflake REST, DuckDB) return naive
+                // timestamps without an offset; treat as UTC.
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                    .ok()
+                    .map(|naive| naive.and_utc())
+            })
+        })
+    })
+}
+
 /// Processes a single table: drift detection + replication.
 ///
 /// Uses `WarehouseAdapter` for all SQL execution and schema introspection,
 /// making this function adapter-agnostic (Databricks, Snowflake, BigQuery,
 /// DuckDB). Tagging and watermark updates are returned as deferred
 /// operations and applied in a post-run batch phase for better concurrency.
+///
+/// ## Source-side watermark semantics
+///
+/// For incremental replication, the runner reads the previous run's
+/// `MAX({timestamp_column}) FROM source` from the state store **before**
+/// SQL gen — that value bounds the WHERE clause as a literal. **After** a
+/// successful execute, the runner issues a fresh
+/// `SELECT MAX({timestamp_column}) FROM source` query and records the
+/// result as the new watermark (replaces the older `Utc::now()` semantics).
+/// Falls back to `Utc::now()` only when the query returns no parseable
+/// timestamp (empty source, non-incremental strategies). The watermark
+/// reflects what's been processed *from* source — not what's *in* target.
 #[tracing::instrument(skip_all, fields(table = %task.table_name))]
 async fn process_table(
     warehouse: &dyn WarehouseAdapter,
-    _state: &Mutex<StateStore>,
+    state: &Mutex<StateStore>,
     pipeline: &ReplicationPipelineConfig,
     task: &TableTask,
 ) -> Result<TableResult> {
@@ -4718,6 +4786,18 @@ async fn process_table(
     // already resolved at the connector-loop level — see
     // `TableTask::effective_override`.
     let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
+    // Effective timestamp column after per-table override. Mirrors the same
+    // override > pipeline-default precedence used inside
+    // `build_replication_strategy_with_override` so the strategy's WHERE
+    // clause and the post-execute `query_source_max_timestamp` call below
+    // both operate on the same column — if an override changes the column,
+    // the recorded watermark stays aligned with the next run's filter.
+    let effective_timestamp_column = task
+        .effective_override
+        .timestamp_column
+        .as_deref()
+        .unwrap_or(pipeline.timestamp_column.as_str())
+        .to_string();
     let model_ir = ModelIr::replication(
         TargetRef {
             catalog: task.target_catalog.clone(),
@@ -4739,6 +4819,27 @@ async fn process_table(
         },
     );
 
+    // Source-side watermark: read the previous run's `MAX(ts) FROM source`
+    // from state. The dialect-level `watermark_where` substitutes this as
+    // a literal (no correlated subquery against target). On a first run /
+    // post-`delete_watermark`, `None` falls back to the 1970-01-01 sentinel
+    // so the whole source is scanned.
+    let prior_watermark: Option<chrono::DateTime<Utc>> = {
+        let state_guard = state.lock().await;
+        match state_guard.get_watermark(&target_table.state_key()) {
+            Ok(Some(wm)) => Some(wm.last_value),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    table = target_table.full_name(),
+                    error = %e,
+                    "could not read prior watermark from state — falling back to full scan"
+                );
+                None
+            }
+        }
+    };
+
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
@@ -4751,7 +4852,7 @@ async fn process_table(
             }
             MaterializationStrategy::Incremental { .. } => {
                 strategy_name = "incremental";
-                sql_gen::generate_insert_sql(&model_ir, dialect)?
+                sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
             }
             MaterializationStrategy::Merge { .. } => {
                 strategy_name = "merge";
@@ -4789,7 +4890,7 @@ async fn process_table(
             MaterializationStrategy::Microbatch { .. } => {
                 strategy_name = "microbatch";
                 // Microbatch on replication tables falls back to incremental insert.
-                sql_gen::generate_insert_sql(&model_ir, dialect)?
+                sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
             }
             MaterializationStrategy::ContentAddressed { .. } => {
                 // content_addressed is a transformation strategy backed by
@@ -4835,9 +4936,39 @@ async fn process_table(
         None
     };
 
+    // Source-side watermark recording: after a successful execute, query
+    // `SELECT MAX({ts}) FROM source` so the next run filters off the actual
+    // max source timestamp we've processed. Only emitted for strategies
+    // that read the watermark on the next tick — for `full_refresh` /
+    // `merge` / `delete_insert` the round-trip would be wasted (the WHERE
+    // clause doesn't consult state-store watermarks). Falls back to
+    // `Utc::now()` if the source is empty, returns NULL, or the timestamp
+    // column is unparseable.
+    let advances_watermark = matches!(
+        strategy,
+        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
+    ) && !use_full_refresh;
+    let new_watermark = if advances_watermark {
+        query_source_max_timestamp(
+            warehouse,
+            dialect,
+            &source_table,
+            &effective_timestamp_column,
+        )
+        .await
+        .unwrap_or(now)
+    } else {
+        // Non-incremental strategies still record a watermark so a future
+        // strategy flip (e.g. `full_refresh` → `incremental` after the
+        // first bootstrap run) has a non-empty lower bound to start from.
+        // Using `Utc::now()` here preserves the prior wall-clock behaviour
+        // for strategies that don't read source-side watermarks anyway.
+        now
+    };
+
     let deferred_watermark = Some(DeferredWatermark {
         state_key: target_table.state_key(),
-        timestamp: now,
+        timestamp: new_watermark,
     });
 
     let table_duration = table_start.elapsed().as_millis() as u64;
@@ -4891,7 +5022,10 @@ async fn process_table(
             started_at: table_started_at,
             metadata: MaterializationMetadata {
                 strategy: strategy_name.to_string(),
-                watermark: Some(now),
+                // Surface the source-side watermark (what's been processed
+                // *from* source). Falls back to `now` when the source query
+                // returned no parseable timestamp.
+                watermark: Some(new_watermark),
                 target_table_full_name: Some(target_table_full_name.clone()),
                 sql_hash: None,
                 column_count: None,
@@ -6321,5 +6455,147 @@ merge_keys = ["id"]
             }
             (a, b) => panic!("mismatch: {a:?} vs {b:?}"),
         }
+    }
+
+    /// End-to-end test for `query_source_max_timestamp` against an
+    /// in-memory DuckDB.
+    ///
+    /// Seeds a source table with three rows at known timestamps, asks the
+    /// helper to query `MAX(ts) FROM source`, and asserts the returned
+    /// `DateTime<Utc>` matches the max seed value. This is the
+    /// discriminating check the SqlDialect-level tests don't cover —
+    /// the runner reads the warehouse result row, parses the timestamp
+    /// shape DuckDB returns, and we want to find out at unit-test time
+    /// (not at the first live run) if those assumptions ever shift.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn query_source_max_timestamp_returns_max_of_seeded_source() {
+        use chrono::TimeZone;
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS source")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE source.events ( \
+                    id INTEGER, \
+                    _fivetran_synced TIMESTAMP \
+                 )",
+            )
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "INSERT INTO source.events VALUES \
+                    (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                    (2, TIMESTAMP '2026-03-02 11:00:00'), \
+                    (3, TIMESTAMP '2026-03-03 12:00:00')",
+            )
+            .await
+            .unwrap();
+
+        let dialect = DuckDbSqlDialect;
+        let source = TableRef {
+            catalog: String::new(),
+            schema: "source".into(),
+            table: "events".into(),
+        };
+
+        let watermark = super::query_source_max_timestamp(
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &source,
+            "_fivetran_synced",
+        )
+        .await;
+
+        let expected = chrono::Utc.with_ymd_and_hms(2026, 3, 3, 12, 0, 0).unwrap();
+        assert_eq!(
+            watermark,
+            Some(expected),
+            "expected MAX(_fivetran_synced) = {expected}, got {watermark:?}"
+        );
+    }
+
+    /// `query_source_max_timestamp` returns `None` for an empty source so
+    /// `process_table` can fall back to `Utc::now()` without panicking.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn query_source_max_timestamp_returns_none_for_empty_source() {
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS source")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE source.empty_events (id INTEGER, _fivetran_synced TIMESTAMP)",
+            )
+            .await
+            .unwrap();
+
+        let dialect = DuckDbSqlDialect;
+        let source = TableRef {
+            catalog: String::new(),
+            schema: "source".into(),
+            table: "empty_events".into(),
+        };
+
+        let watermark = super::query_source_max_timestamp(
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &source,
+            "_fivetran_synced",
+        )
+        .await;
+
+        assert!(
+            watermark.is_none(),
+            "empty source should yield None so the caller falls back to Utc::now()"
+        );
+    }
+
+    /// Bad identifier rejected before any warehouse query is issued —
+    /// defense in depth against SQL injection via the `timestamp_column`
+    /// parameter (the runner reads it from `rocky.toml`).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn query_source_max_timestamp_rejects_unsafe_timestamp_column() {
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let dialect = DuckDbSqlDialect;
+        let source = TableRef {
+            catalog: String::new(),
+            schema: "source".into(),
+            table: "events".into(),
+        };
+
+        let watermark = super::query_source_max_timestamp(
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &source,
+            "'; DROP TABLE",
+        )
+        .await;
+
+        assert!(
+            watermark.is_none(),
+            "unsafe timestamp_column must be rejected before the SQL is built"
+        );
     }
 }

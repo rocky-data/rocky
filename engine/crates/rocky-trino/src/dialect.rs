@@ -91,14 +91,19 @@ impl SqlDialect for TrinoDialect {
         Ok(format!("{base}, {}", meta_cols.join(", ")))
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        // Trino accepts ANSI `TIMESTAMP '...'` literals.
-        Ok(format!(
-            "WHERE {timestamp_col} > (\n  \
-             SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01 00:00:00')\n  \
-             FROM {target_ref}\n)"
-        ))
+        // Trino accepts ANSI `TIMESTAMP '...'` literals with sub-second
+        // precision. The 1970-01-01 sentinel keeps the WHERE permissive
+        // on first runs and after `delete_watermark`.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -240,19 +245,26 @@ mod tests {
     }
 
     #[test]
-    fn watermark_where_uses_ansi_timestamp_literal() {
+    fn watermark_where_no_prior_uses_sentinel_literal() {
         let d = TrinoDialect::new();
-        let sql = d
-            .watermark_where("_synced_at", "\"c\".\"s\".\"t\"")
-            .unwrap();
-        assert!(sql.contains("TIMESTAMP '1970-01-01"));
-        assert!(sql.contains("MAX(_synced_at)"));
+        let sql = d.watermark_where("_synced_at", None).unwrap();
+        assert_eq!(sql, "WHERE _synced_at > TIMESTAMP '1970-01-01 00:00:00'");
+    }
+
+    #[test]
+    fn watermark_where_with_prior_substitutes_literal() {
+        use chrono::TimeZone;
+        let d = TrinoDialect::new();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = d.watermark_where("_synced_at", Some(&prior)).unwrap();
+        // Source-side semantics: literal substitution, no correlated subquery.
+        assert_eq!(sql, "WHERE _synced_at > TIMESTAMP '2026-04-17 09:30:00'");
     }
 
     #[test]
     fn watermark_where_rejects_bad_identifier() {
         let d = TrinoDialect::new();
-        assert!(d.watermark_where("'; DROP", "\"c\".\"s\".\"t\"").is_err());
+        assert!(d.watermark_where("'; DROP", None).is_err());
     }
 
     #[test]
