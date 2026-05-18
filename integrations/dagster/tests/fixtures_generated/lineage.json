@@ -65,5 +65,15 @@
       },
       "transform": "direct"
     }
+  ],
+  "nodes": [
+    {
+      "model": "revenue_summary",
+      "target_schema": "gold"
+    },
+    {
+      "model": "customer_orders",
+      "target_schema": "silver"
+    }
   ]
 }

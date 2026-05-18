@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig};
 
 use crate::output::{
-    ColumnLineageOutput, LineageColumnDef, LineageEdgeRecord, LineageOutput,
+    ColumnLineageOutput, LineageColumnDef, LineageEdgeRecord, LineageNodeDef, LineageOutput,
     LineageQualifiedColumn, print_json,
 };
 
@@ -137,6 +137,50 @@ pub fn run_lineage(
                     }
                 })
                 .collect();
+            // Per-node metadata for the focal model + every distinct
+            // endpoint of `edges`. Project models contribute a
+            // `target_schema` from their declared target config; nodes
+            // not present in `project.models` are treated as external
+            // sources and carry their qualified reference string as
+            // `source_id` so the VS Code lineage subgraph drill-in can
+            // cluster them without parsing the qualified name.
+            let mut node_ids: Vec<String> = Vec::new();
+            let mut seen_nodes: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if seen_nodes.insert(model_name.to_string()) {
+                node_ids.push(model_name.to_string());
+            }
+            for edge in result
+                .semantic_graph
+                .edges
+                .iter()
+                .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
+            {
+                for endpoint in [&edge.source.model, &edge.target.model] {
+                    let name = endpoint.to_string();
+                    if seen_nodes.insert(name.clone()) {
+                        node_ids.push(name);
+                    }
+                }
+            }
+            let nodes: Vec<LineageNodeDef> = node_ids
+                .into_iter()
+                .map(|id| {
+                    if let Some(model) = result.project.model(&id) {
+                        LineageNodeDef {
+                            model: id,
+                            target_schema: Some(model.config.target.schema.clone()),
+                            source_id: None,
+                        }
+                    } else {
+                        LineageNodeDef {
+                            model: id.clone(),
+                            target_schema: None,
+                            source_id: Some(id),
+                        }
+                    }
+                })
+                .collect();
             let output = LineageOutput {
                 version: VERSION.to_string(),
                 command: "lineage".to_string(),
@@ -145,6 +189,7 @@ pub fn run_lineage(
                 upstream: schema.upstream.clone(),
                 downstream: schema.downstream.clone(),
                 edges,
+                nodes,
             };
             print_json(&output)?;
         }

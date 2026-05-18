@@ -14,6 +14,27 @@ class LineageColumnDef(BaseModel):
     name: str
 
 
+class LineageNodeDef(BaseModel):
+    """
+    Per-node metadata for the lineage graph.
+
+    One entry per distinct model referenced by `LineageOutput.edges` (plus the focal model). Carries cluster keys consumers can use to group nodes without having to parse the qualified node name. Either optional field may be absent — `target_schema` is `None` for nodes that aren't project models, and `source_id` is `None` for nodes that are project models (i.e. the two fields are mutually exclusive in practice).
+    """
+
+    model: str
+    """
+    Qualified node identifier as it appears in `edges[].source.model` and `edges[].target.model`. Stable across the rest of the payload.
+    """
+    source_id: str | None = None
+    """
+    Source identifier for nodes that represent an external source (i.e. a referenced table outside the project model set). The value mirrors how the SQL referenced the source so consumers can key on it directly. Omitted for project models.
+    """
+    target_schema: str | None = None
+    """
+    Resolved target schema for project models, from the model's declared target config. Omitted for external sources and any node Rocky couldn't resolve to a project model.
+    """
+
+
 class LineageQualifiedColumn(BaseModel):
     column: str
     model: str
@@ -40,5 +61,9 @@ class LineageOutput(BaseModel):
     downstream: list[str]
     edges: list[LineageEdgeRecord]
     model: str
+    nodes: list[LineageNodeDef] | None = None
+    """
+    Per-node metadata for every model referenced by this lineage view (the focal model plus each endpoint of `edges`). Lets consumers (e.g. the VS Code subgraph drill-in) cluster nodes by their resolved target schema or source identity instead of parsing the qualified node name. Empty when no nodes were resolved; older JSON payloads cached locally may omit the field entirely.
+    """
     upstream: list[str]
     version: str
