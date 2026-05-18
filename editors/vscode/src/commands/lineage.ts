@@ -802,10 +802,15 @@ function renderLineageHtml(
   const svgEl   = document.getElementById('graph-svg');
   const focalModel = rawData.model;
 
-  // Build a column lookup from LineageOutput.columns (array of {name}).
-  // key: model name (qualified), value: array of column name strings.
+  // Build a column lookup from LineageOutput.columns (array of {name, data_type?}).
   // NOTE: LineageOutput.columns only contains focal model columns.
-  const focalColumns = (rawData.columns || []).map(c => c.name);
+  // data_type is omitted by the engine when the compiler can't infer a
+  // concrete type (e.g. SELECT * against an uncached upstream). Render the
+  // type only when it's present.
+  const focalColumns = (rawData.columns || []).map(c => ({
+    name: c.name,
+    dataType: typeof c.data_type === 'string' ? c.data_type : null,
+  }));
 
   // Restore saved state (zoom/pan/viewMode) from prior session if available.
   const saved = vscode.getState() || {};
@@ -1165,7 +1170,10 @@ function renderLineageHtml(
       html += '<div class="panel-section-title">Columns (' + focalColumns.length + ')</div>';
       html += '<ul class="column-list">';
       for (const col of focalColumns) {
-        html += '<li><span class="col-name">' + escHtml(col) + '</span></li>';
+        const typePart = col.dataType
+          ? '<span class="col-type">' + escHtml(col.dataType) + '</span>'
+          : '';
+        html += '<li><span class="col-name">' + escHtml(col.name) + '</span>' + typePart + '</li>';
       }
       html += '</ul>';
       html += '</div>';

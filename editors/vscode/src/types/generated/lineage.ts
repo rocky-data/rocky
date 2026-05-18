@@ -21,6 +21,10 @@ export interface LineageOutput {
   [k: string]: unknown;
 }
 export interface LineageColumnDef {
+  /**
+   * Inferred column type, rendered as a Rocky type string (e.g. `STRING`, `INT64`, `DECIMAL(10,2)`, `TIMESTAMP`). Omitted when the type could not be inferred — typically a `SELECT *` against an upstream whose schema isn't cached, or a model that did not pass typecheck.
+   */
+  data_type?: string | null;
   name: string;
   [k: string]: unknown;
 }
