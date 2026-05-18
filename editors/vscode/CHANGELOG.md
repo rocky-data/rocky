@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-05-18
+
+Codegen-companion release to engine `v1.36.0`. The regenerated TypeScript interface in `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` pick up the new `merge_keys` and `merge_keys_fallback` fields on `ReplicationPipelineConfig` from engine v1.36.0's replication `strategy = "merge"` (engine [#561](https://github.com/rocky-data/rocky/pull/561)). No new extension commands, UI, or settings — pure codegen cascade.
+
+### Changed
+
+- **Codegen pickup of engine `v1.36.0` replication `strategy = "merge"`** (engine [#561](https://github.com/rocky-data/rocky/pull/561)). Regenerated `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` add `merge_keys?: string[] | null` and `merge_keys_fallback?: string[] | null` as optional fields on `ReplicationPipelineConfig`, plus a description tweak on the `strategy` literal. Extension code that consumes `rocky.toml` via the generated TypeScript types — including the `rockyJson.ts` compat shim — now type-checks against the merge-strategy config surface. No behavioural change in the extension itself.
+
 ## [1.19.1] — 2026-05-18
 
 Codegen-companion patch release for engine `v1.35.0` and dagster `v1.33.0`. The regenerated TypeScript interface in `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` pick up the new `[plan_store] format` default (`"v1"` → `"v2"`) plus a doc-comment refresh on `PlanStoreFormat` / `PlanStoreConfig` reflecting the post-flip migration cycle. No new extension commands, UI, or settings — the new engine `PlanKind::Replication` variant doesn't change the TypeScript surface (`plan_kind` is a plain string).

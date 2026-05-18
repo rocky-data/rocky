@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.0] — 2026-05-18
+
+Companion release to engine `v1.36.0`. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up the new `merge_keys` and `merge_keys_fallback` fields on `ReplicationPipelineConfig` from engine v1.36.0's replication `strategy = "merge"` (engine [#561](https://github.com/rocky-data/rocky/pull/561)). No new dagster API surface — pure codegen cascade. Wheel re-cut against the v1.36.0 engine binary. Dagster code that constructs `RockyResource` configs against engine v1.36.0+ can now declare `strategy = "merge"` on replication pipelines and supply the keys via the typed config; consumers parsing Rocky JSON output via Pydantic see the new optional fields without overriding `extra = "forbid"`.
+
+### Added
+
+- **`ReplicationPipelineConfig.merge_keys` and `merge_keys_fallback`** (engine `v1.36.0` — [#561](https://github.com/rocky-data/rocky/pull/561)). Pydantic model regenerated from the engine's JSON schema; both fields are optional `list[str] | None`. Strictly additive — re-exported from `dagster_rocky.types` under both the generated and legacy import paths so existing consumers see no breakage. Use of the new `strategy = "merge"` value on the replication-pipeline strategy literal requires engine `v1.36.0` or newer at runtime; the engine fails fast at config-parse time if `strategy = "merge"` lacks both `merge_keys` and `merge_keys_fallback`.
+
 ## [1.33.0] — 2026-05-18
 
 Companion release to engine `v1.35.0`. Two changes ship: (a) `RockyResource`'s replication-only fallback to `rocky run` is removed — the engine's new `PlanKind::Replication` lets the plan/apply pair handle every project shape uniformly; (b) `_emit_results` no longer crashes on cross-schema same-table-name collisions, closing a failure mode where a Rocky run with row-count anomalies could fail the multi-asset op after every table had already been copied.
