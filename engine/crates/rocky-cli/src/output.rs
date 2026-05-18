@@ -2338,6 +2338,107 @@ fn default_parallel() -> u32 {
 // so existing consumers and fixtures remain byte-stable when the compile path
 // is absent.
 
+/// A connector snapshot recorded in a `ReplicationPlan` for stale-source
+/// detection at apply time.
+///
+/// Volatile fields are intentionally omitted: `last_sync_at` is a
+/// wall-clock value that wiggles every sync, and the adapter-namespaced
+/// `metadata` map can include fields like rate-limit counters that
+/// change without altering the replication contract. Only the identity
+/// of the source (`id`, `schema`, `source_type`) and the table list
+/// (sorted, name + row_count) influence the plan_id digest.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReplicationConnectorSnapshot {
+    pub id: String,
+    pub schema: String,
+    pub source_type: String,
+    /// Tables discovered for this connector. Sorted by `name` so the
+    /// serialized payload is deterministic across discover runs.
+    pub tables: Vec<ReplicationTableSnapshot>,
+}
+
+/// A table snapshot inside a `ReplicationConnectorSnapshot`.
+///
+/// `row_count` is captured when the discovery adapter surfaces it
+/// (DuckDB does; Fivetran does not). Including the count in the
+/// snapshot means a row-count change between plan and apply marks the
+/// plan stale — that's intentional for the row-count-aware adapters,
+/// since downstream materializations may depend on size class.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReplicationTableSnapshot {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+}
+
+/// Plan payload persisted by `rocky plan` for a replication-only project.
+///
+/// A "replication-only" project is one with no `models/` directory (or
+/// where `models/` exists but compile returns zero models). For those
+/// the `RunPlan` spine has nothing to persist — there are no models
+/// to re-derive at apply time. This payload captures the full
+/// `RockyConfig` plus the discovered source state so the plan_id is
+/// genuinely content-addressed: same config + same source state ⇒
+/// same plan_id.
+///
+/// ## Design call: plan-time discovery (not apply-time)
+///
+/// Discovery already runs inside `rocky plan` today (the existing
+/// statement preview iterates discovered connectors). Capturing the
+/// snapshot in the plan payload is essentially free I/O-wise and
+/// gives us a deterministic plan_id keyed on observable inputs.
+/// Apply re-runs discovery and asserts the snapshot still matches —
+/// any drift fails with a clear "re-plan and re-apply" error before
+/// SQL is emitted.
+///
+/// ## What is NOT in the snapshot
+///
+/// - `last_sync_at` (volatile, not part of the replication contract)
+/// - Adapter-namespaced `metadata` map (rate-limit counters etc.
+///   change without altering what gets replicated)
+///
+/// Including those would invite "I planned, waited 5 minutes, and now
+/// the plan is stale" surprises with no actionable difference.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationPlan {
+    /// `--filter` passed to `rocky plan` (e.g. `"client=acme"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// `--pipeline` if specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// `--env` for governance preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// `--idempotency-key` (or `ROCKY_IDEMPOTENCY_KEY`). Different keys
+    /// produce different plan_ids — the hash discriminates, mirroring
+    /// `RunPlan`'s behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// `--resume <run_id>` if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// `--resume-latest` toggle. Resolved against the state store at
+    /// apply time, like `RunPlan.resume_latest`.
+    #[serde(default)]
+    pub resume_latest: bool,
+    /// Governance override resolved at plan time from
+    /// `--governance-override`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governance_override: Option<rocky_core::config::GovernanceOverride>,
+    /// Full `RockyConfig` snapshot, serialised after env-var
+    /// substitution. Captured verbatim — apply does not try to extract
+    /// "the replication-relevant subset" because that's a footgun: any
+    /// hidden runtime dependency on a config field that isn't in the
+    /// subset would silently break replay. Cheaper to keep the whole
+    /// config and let the hash do its job.
+    pub config_snapshot: serde_json::Value,
+    /// Discovered connectors sorted by `id`. Tables within each
+    /// connector are sorted by `name`. Apply re-discovers and asserts
+    /// byte-equality against this snapshot before running SQL.
+    pub source_state_snapshot: Vec<ReplicationConnectorSnapshot>,
+}
+
 /// JSON output for `rocky apply <plan-id>`.
 ///
 /// Wraps the inner apply output (compact / archive / run) with a top-level

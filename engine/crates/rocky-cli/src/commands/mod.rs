@@ -34,7 +34,7 @@ mod load;
 mod lsp;
 mod metrics;
 mod optimize;
-mod plan;
+pub mod plan;
 mod playground;
 mod preview;
 mod profile_storage;
