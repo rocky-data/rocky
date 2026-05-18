@@ -119,6 +119,10 @@ export interface RunOutput {
   materializations: MaterializationOutput[];
   metrics?: MetricsSnapshot | null;
   /**
+   * Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
+   */
+  override_warnings?: OverrideWarningOutput[];
+  /**
    * Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.
    */
   partition_summaries: PartitionSummary[];
@@ -375,6 +379,34 @@ export interface MetricsSnapshot {
   table_duration_p95_ms: number;
   tables_failed: number;
   tables_processed: number;
+  [k: string]: unknown;
+}
+/**
+ * Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.
+ *
+ * Distinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.
+ */
+export interface OverrideWarningOutput {
+  /**
+   * Echo of `match.connector` from the rule, for cross-reference.
+   */
+  connector?: string | null;
+  /**
+   * Coarse kind: `"zero_match"` (rule matched no pair at all) or `"connector_match_empty"` (the connector half of the match resolved nothing).
+   */
+  kind: string;
+  /**
+   * Human-readable explanation, for logs and Dagster UI rendering.
+   */
+  message: string;
+  /**
+   * Position of the rule in `[[table_overrides]]`, 0-based — same index the validator's error messages use.
+   */
+  rule_index: number;
+  /**
+   * Echo of `match.table` from the rule, for cross-reference.
+   */
+  table?: string | null;
   [k: string]: unknown;
 }
 /**

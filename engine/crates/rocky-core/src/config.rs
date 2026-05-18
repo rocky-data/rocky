@@ -209,6 +209,50 @@ pub enum ConfigError {
          Set [pipeline.{pipeline}.merge_keys = [\"col1\", \"col2\"]] in your rocky.toml."
     )]
     ReplicationMergeMissingKeys { pipeline: String },
+
+    #[error(
+        "pipeline '{pipeline}' table_overrides[{rule_index}] has an empty `match` block. \
+         Set at least one of `match.connector` or `match.table`, or remove the rule and \
+         change pipeline-level defaults instead."
+    )]
+    TableOverrideEmptyMatch { pipeline: String, rule_index: usize },
+
+    #[error(
+        "pipeline '{pipeline}' table_overrides have two duplicate fully-specific rules \
+         (connector = {connector:?}, table = {table:?}) at indices {first_index} and \
+         {second_index}. Combine them or narrow one further."
+    )]
+    TableOverrideDuplicate {
+        pipeline: String,
+        first_index: usize,
+        second_index: usize,
+        connector: String,
+        table: String,
+    },
+
+    #[error(
+        "pipeline '{pipeline}' table_overrides[{rule_index}] has an invalid glob pattern \
+         in `match.table`: {reason}"
+    )]
+    TableOverrideInvalidGlob {
+        pipeline: String,
+        rule_index: usize,
+        reason: String,
+    },
+
+    #[error(
+        "pipeline '{pipeline}' table_overrides[{rule_index}] sets strategy = \"merge\" \
+         but no merge_keys (or merge_keys_fallback) are reachable for the matched tables — \
+         neither the override nor the pipeline default supplies any."
+    )]
+    TableOverrideMergeMissingKeys { pipeline: String, rule_index: usize },
+
+    #[error(
+        "pipeline '{pipeline}' source.schema_pattern.components contains the reserved \
+         name {component:?} — rename it (e.g. `source_{component}`). \
+         `table` and `id` are reserved for `--filter` and `[[table_overrides]]`."
+    )]
+    SchemaPatternReservedComponent { pipeline: String, component: String },
 }
 
 /// Concurrency strategy for table processing.
@@ -2667,10 +2711,363 @@ pub struct ReplicationPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Per-`(connector, table)` overrides applied on top of the pipeline
+    /// defaults. Each rule matches against a discovered connector +
+    /// table pair and, when matched, replaces selected pipeline-level
+    /// fields with override-supplied values.
+    ///
+    /// Resolution is **per-field most-specific-match-wins**: for each
+    /// overrideable field, the most specific matching rule that
+    /// explicitly sets that field wins; less-specific rules contribute
+    /// values only for fields they actually set. Specificity ranking
+    /// (highest to lowest):
+    ///
+    /// 1. Both `match.connector` AND `match.table` set, with
+    ///    `match.table` a literal (no glob).
+    /// 2. Both set, with `match.table` containing a `*` or `?` glob.
+    /// 3. Only `match.connector` set.
+    /// 4. Only `match.table` set.
+    ///
+    /// Ties at the same specificity tier for a `(connector, table)`
+    /// pair are rejected at parse time as ambiguous.
+    ///
+    /// Empty by default — projects that don't need per-table tweaking
+    /// pay nothing in JSON output, schema surface area, or runtime
+    /// cost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_overrides: Vec<TableOverride>,
 }
 
 /// Backward-compatible alias for [`ReplicationPipelineConfig`].
 pub type PipelineConfigV2 = ReplicationPipelineConfig;
+
+/// A per-`(connector, table)` override rule on a replication pipeline.
+///
+/// Authored as one TOML array entry under
+/// `[[pipeline.<name>.table_overrides]]`. Each field except `match_` is
+/// optional — `None` means "inherit from the pipeline-level default."
+/// The resolver applies overrides with per-field most-specific-wins
+/// semantics; see [`ReplicationPipelineConfig::table_overrides`] for the
+/// ranking.
+///
+/// # Example
+///
+/// ```toml
+/// [[pipeline.raw.table_overrides]]
+/// match.connector = "stripe_main"
+/// match.table     = "pii_users"
+/// merge_keys      = ["user_id", "tenant_id"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TableOverride {
+    /// Match criteria — at least one of `connector` or `table` must be
+    /// set. A rule with neither (or a `match` block omitted entirely)
+    /// is rejected at parse time (use pipeline-level fields to change
+    /// defaults for all tables). `default` lets serde deserialize an
+    /// override missing the whole `match` block; the validator catches
+    /// the resulting empty match.
+    #[serde(rename = "match", default)]
+    pub match_: TableMatch,
+
+    /// Override for [`ReplicationPipelineConfig::strategy`]. `None`
+    /// inherits the pipeline default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+
+    /// Override for [`ReplicationPipelineConfig::merge_keys`]. `None`
+    /// inherits the pipeline default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_keys: Option<Vec<String>>,
+
+    /// Override for
+    /// [`ReplicationPipelineConfig::merge_keys_fallback`]. `None`
+    /// inherits the pipeline default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_keys_fallback: Option<Vec<String>>,
+
+    /// Override for [`ReplicationPipelineConfig::timestamp_column`].
+    /// `None` inherits the pipeline default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_column: Option<String>,
+
+    /// When `Some(false)`, the matched `(connector, table)` pairs are
+    /// dropped from the run and surfaced under
+    /// `RunOutput.excluded_tables` with
+    /// `reason = "table_override_disabled"`. Net-new field with no
+    /// pipeline-level counterpart — disabling a whole pipeline is
+    /// already covered by removing the pipeline block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Match criteria for a [`TableOverride`].
+///
+/// At least one of `connector` or `table` must be set (`None` for both
+/// is rejected at parse time as redundant — use pipeline-level fields
+/// to change defaults globally).
+///
+/// `connector` matches against either
+/// [`crate::source::DiscoveredConnector::id`] (the stable
+/// adapter-side identifier — e.g. a Fivetran connector_id) **or**
+/// [`crate::source::DiscoveredConnector::schema`] (the human-meaningful
+/// source schema name — e.g. `src__acme__shopify`). String equality on
+/// either match wins.
+///
+/// `table` matches against
+/// [`crate::source::DiscoveredTable::name`]. Supports `*` (zero or more
+/// characters) and `?` (exactly one character) glob wildcards; presence
+/// of either character switches the value from literal to glob.
+///
+/// # Reserved
+///
+/// `table` and `id` are reserved as schema-pattern component names —
+/// configs that use either as a component in
+/// [`SchemaPatternConfig::components`] are rejected at parse time to
+/// avoid colliding with `--filter table=` and `--filter id=`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TableMatch {
+    /// Connector match — equals either `DiscoveredConnector.id` or
+    /// `DiscoveredConnector.schema`. `None` matches every connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+
+    /// Table-name match. Literal when no `*`/`?`; glob otherwise.
+    /// `None` matches every table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+}
+
+/// The set of fields a [`TableOverride`] can change, after the
+/// per-field most-specific-match-wins resolver has merged the matching
+/// rules for a given `(connector, table)` pair.
+///
+/// Fields that no matching rule set remain `None` so callers can
+/// distinguish "use pipeline default" from "explicitly cleared."
+/// Construct via [`resolve_table_override`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedTableOverride {
+    pub strategy: Option<String>,
+    pub merge_keys: Option<Vec<String>>,
+    pub merge_keys_fallback: Option<Vec<String>>,
+    pub timestamp_column: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+impl ResolvedTableOverride {
+    /// Returns `true` when this override carries no field overrides at
+    /// all — equivalent to "no rule matched."
+    pub fn is_empty(&self) -> bool {
+        self.strategy.is_none()
+            && self.merge_keys.is_none()
+            && self.merge_keys_fallback.is_none()
+            && self.timestamp_column.is_none()
+            && self.enabled.is_none()
+    }
+}
+
+/// Specificity tier of a [`TableMatch`] for a given `(connector,
+/// table)` pair, used by [`resolve_table_override`] to break per-field
+/// ties.
+///
+/// Variants are ordered from most-specific to least-specific so the
+/// resolver can sort by `(rule_tier, declaration_order)` and pick the
+/// first rule that sets each field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchSpecificity {
+    /// Both `connector` and `table` set, with a literal table.
+    BothLiteralTable = 0,
+    /// Both `connector` and `table` set, with a glob table.
+    BothGlobTable = 1,
+    /// Only `connector` set.
+    ConnectorOnly = 2,
+    /// Only `table` set.
+    TableOnly = 3,
+}
+
+impl TableMatch {
+    /// Returns `true` when the rule's connector half (if any) matches
+    /// the given discovered connector. A rule with no `connector`
+    /// constraint matches everything.
+    ///
+    /// `connector_schema` is `DiscoveredConnector.schema`. Both the id
+    /// and schema axes are checked — OR semantics — so users can write
+    /// `match.connector = "stripe_main"` against either identity.
+    pub fn matches_connector(&self, connector_id: &str, connector_schema: &str) -> bool {
+        let Some(pattern) = self.connector.as_deref() else {
+            return true;
+        };
+        pattern == connector_id || pattern == connector_schema
+    }
+
+    /// Returns `true` when the rule's table half (if any) matches the
+    /// given discovered table name. A rule with no `table` constraint
+    /// matches every table; a value containing `*` or `?` is treated
+    /// as a glob, otherwise literal equality.
+    pub fn matches_table(&self, table_name: &str) -> bool {
+        let Some(pattern) = self.table.as_deref() else {
+            return true;
+        };
+        if pattern_is_glob(pattern) {
+            glob_match(pattern, table_name)
+        } else {
+            pattern == table_name
+        }
+    }
+
+    /// Returns `true` when both halves match. The full match predicate
+    /// used by [`resolve_table_override`].
+    pub fn matches(&self, connector_id: &str, connector_schema: &str, table_name: &str) -> bool {
+        self.matches_connector(connector_id, connector_schema) && self.matches_table(table_name)
+    }
+
+    /// Specificity tier — see [`MatchSpecificity`]. Panics if both
+    /// halves are `None` (parse-time validation must reject that case
+    /// via [`validate_replication_overrides`]).
+    fn specificity(&self) -> MatchSpecificity {
+        match (self.connector.as_deref(), self.table.as_deref()) {
+            (Some(_), Some(t)) if pattern_is_glob(t) => MatchSpecificity::BothGlobTable,
+            (Some(_), Some(_)) => MatchSpecificity::BothLiteralTable,
+            (Some(_), None) => MatchSpecificity::ConnectorOnly,
+            (None, Some(_)) => MatchSpecificity::TableOnly,
+            (None, None) => unreachable!(
+                "empty TableMatch should be rejected by validate_replication_overrides"
+            ),
+        }
+    }
+}
+
+/// Returns `true` when `pattern` contains a glob metacharacter
+/// (`*` or `?`).
+fn pattern_is_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// Hand-rolled `*`/`?` glob matcher. `*` matches zero or more
+/// characters; `?` matches exactly one. No character classes, no
+/// alternation. Returns `true` when `pattern` matches `text` against
+/// the entire input.
+///
+/// Implementation is a straightforward backtracking matcher over byte
+/// slices. Table names are ASCII (warehouse identifier conventions),
+/// so byte-level comparison is correct.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let txt = text.as_bytes();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    // Snapshots used to back up after a failed `*` consumption.
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    while ti < txt.len() {
+        if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    // Consume any trailing `*`s.
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pat.len()
+}
+
+/// Validates a glob pattern. Today the only invalid forms are an empty
+/// pattern (`""`) — every other byte sequence is a valid `*`/`?` glob.
+/// Returns the offending pattern string when invalid.
+fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("empty glob pattern".to_string());
+    }
+    Ok(())
+}
+
+/// Resolves the effective per-field override for a `(connector_id,
+/// connector_schema, table_name)` triple against an ordered list of
+/// [`TableOverride`] rules.
+///
+/// Walks every matching rule in increasing specificity order
+/// (most-specific first; ties broken by declaration order). For each
+/// overrideable field, the first rule that explicitly sets it wins;
+/// less-specific rules contribute values only for fields they actually
+/// set. Returns an empty [`ResolvedTableOverride`] when no rule
+/// matches.
+///
+/// # Example
+///
+/// Given:
+///
+/// ```toml
+/// [[pipeline.raw.table_overrides]]
+/// match.connector  = "stripe_main"
+/// timestamp_column = "_stripe_synced"
+///
+/// [[pipeline.raw.table_overrides]]
+/// match.connector = "stripe_main"
+/// match.table     = "pii_users"
+/// merge_keys      = ["user_id", "tenant_id"]
+/// ```
+///
+/// For `("conn_xyz", "stripe_main", "pii_users")` the resolver
+/// returns `merge_keys = ["user_id", "tenant_id"]` (from the
+/// more-specific rule) **and** `timestamp_column = "_stripe_synced"`
+/// (from the less-specific rule). Both are applied — per-field, not
+/// whole-rule.
+pub fn resolve_table_override(
+    rules: &[TableOverride],
+    connector_id: &str,
+    connector_schema: &str,
+    table_name: &str,
+) -> ResolvedTableOverride {
+    // Collect matching rules paired with their specificity tier.
+    let mut matched: Vec<(MatchSpecificity, usize, &TableOverride)> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.match_
+                .matches(connector_id, connector_schema, table_name)
+        })
+        .map(|(idx, rule)| (rule.match_.specificity(), idx, rule))
+        .collect();
+
+    // Sort by (specificity, declaration index) — most specific first.
+    matched.sort_by_key(|(spec, idx, _)| (*spec, *idx));
+
+    let mut resolved = ResolvedTableOverride::default();
+    for (_, _, rule) in &matched {
+        if resolved.strategy.is_none() && rule.strategy.is_some() {
+            resolved.strategy = rule.strategy.clone();
+        }
+        if resolved.merge_keys.is_none() && rule.merge_keys.is_some() {
+            resolved.merge_keys = rule.merge_keys.clone();
+        }
+        if resolved.merge_keys_fallback.is_none() && rule.merge_keys_fallback.is_some() {
+            resolved.merge_keys_fallback = rule.merge_keys_fallback.clone();
+        }
+        if resolved.timestamp_column.is_none() && rule.timestamp_column.is_some() {
+            resolved.timestamp_column = rule.timestamp_column.clone();
+        }
+        if resolved.enabled.is_none() && rule.enabled.is_some() {
+            resolved.enabled = rule.enabled;
+        }
+    }
+    resolved
+}
 
 /// Transformation pipeline configuration.
 ///
@@ -3240,6 +3637,146 @@ pub fn validate_replication_strategies(config: &RockyConfig) -> Vec<ConfigError>
     errors
 }
 
+/// Parse-time validation for `[[table_overrides]]` blocks.
+///
+/// Catches the structural classes the resolver and runner can't
+/// recover from gracefully:
+///
+/// - **T1.1** Duplicate fully-specific rules — two entries with the
+///   same `(match.connector, match.table)` literal pair. The resolver
+///   would otherwise have to break the tie by declaration order,
+///   which is the trust-failure mode the rest of `rocky.toml` avoids.
+/// - **T1.2** Empty `match` block — both `connector` and `table` are
+///   `None`. Use pipeline-level fields to change defaults globally.
+/// - **T1.4** Unreachable merge keys — an override sets
+///   `strategy = "merge"` and supplies no `merge_keys` /
+///   `merge_keys_fallback`, **and** the pipeline default supplies
+///   neither either. The effective config would crash at run time.
+/// - **T1.6** Malformed glob in `match.table` — an empty pattern
+///   today; the surface is intentionally narrow to keep future
+///   `globset`-style extensions backwards-compatible.
+///
+/// Zero-match rules are intentionally **not** caught here — connectors
+/// come and go in real production environments, and a rule that
+/// doesn't match today may match tomorrow. The runner emits a soft
+/// warning via `RunOutput.override_warnings` instead.
+pub fn validate_replication_overrides(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        let overrides = &replication.table_overrides;
+
+        // T1.2 + T1.6 — per-rule structural checks.
+        for (idx, rule) in overrides.iter().enumerate() {
+            if rule.match_.connector.is_none() && rule.match_.table.is_none() {
+                errors.push(ConfigError::TableOverrideEmptyMatch {
+                    pipeline: pipeline_name.clone(),
+                    rule_index: idx,
+                });
+            }
+            if let Some(table_pat) = rule.match_.table.as_deref() {
+                if pattern_is_glob(table_pat) {
+                    if let Err(reason) = validate_glob_pattern(table_pat) {
+                        errors.push(ConfigError::TableOverrideInvalidGlob {
+                            pipeline: pipeline_name.clone(),
+                            rule_index: idx,
+                            reason,
+                        });
+                    }
+                } else if table_pat.is_empty() {
+                    errors.push(ConfigError::TableOverrideInvalidGlob {
+                        pipeline: pipeline_name.clone(),
+                        rule_index: idx,
+                        reason: "empty table pattern".to_string(),
+                    });
+                }
+            }
+
+            // T1.4 — strategy="merge" with no reachable merge keys.
+            if rule.strategy.as_deref() == Some("merge") {
+                let override_has_keys =
+                    rule.merge_keys.is_some() || rule.merge_keys_fallback.is_some();
+                let pipeline_has_keys = replication.resolved_merge_keys().is_some();
+                if !override_has_keys && !pipeline_has_keys {
+                    errors.push(ConfigError::TableOverrideMergeMissingKeys {
+                        pipeline: pipeline_name.clone(),
+                        rule_index: idx,
+                    });
+                }
+            }
+        }
+
+        // T1.1 — duplicate fully-specific (connector, table) literal
+        // pairs. We compare by the raw strings; two glob patterns that
+        // happen to overlap (e.g. `_x_*` vs `*_y`) are not a duplicate
+        // — same-tier ambiguity for an actual `(connector, table)` is
+        // a per-resolution concern surfaced at run time below if any
+        // such pair is ever discovered (see T1.3 note).
+        for (i, a) in overrides.iter().enumerate() {
+            if a.match_.connector.is_none() || a.match_.table.is_none() {
+                continue;
+            }
+            let a_table = a.match_.table.as_deref().unwrap_or_default();
+            if pattern_is_glob(a_table) {
+                continue;
+            }
+            for (j, b) in overrides.iter().enumerate().skip(i + 1) {
+                if b.match_.connector.is_none() || b.match_.table.is_none() {
+                    continue;
+                }
+                let b_table = b.match_.table.as_deref().unwrap_or_default();
+                if pattern_is_glob(b_table) {
+                    continue;
+                }
+                if a.match_.connector == b.match_.connector && a.match_.table == b.match_.table {
+                    errors.push(ConfigError::TableOverrideDuplicate {
+                        pipeline: pipeline_name.clone(),
+                        first_index: i,
+                        second_index: j,
+                        connector: a.match_.connector.clone().unwrap_or_default(),
+                        table: a_table.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// Parse-time validation that schema-pattern components don't use the
+/// reserved names `table` or `id`. Both are reserved for
+/// [`--filter`-style keys](crate::source::DiscoveredConnector::id) and
+/// the new `[[table_overrides]]` match grammar — a schema pattern
+/// component that shadows either would create ambiguity that no
+/// runtime resolver can untangle.
+///
+/// Returns one error per reserved component. Rename the component in
+/// `[pipeline.x.source.schema_pattern]` (e.g. `source_table` instead
+/// of `table`) to resolve.
+pub fn validate_schema_pattern_reserved_components(config: &RockyConfig) -> Vec<ConfigError> {
+    const RESERVED: &[&str] = &["table", "id"];
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        for component in &replication.source.schema_pattern.components {
+            // `regions...` style variadic components — strip the
+            // suffix before comparing.
+            let name = component.trim_end_matches("...");
+            if RESERVED.contains(&name) {
+                errors.push(ConfigError::SchemaPatternReservedComponent {
+                    pipeline: pipeline_name.clone(),
+                    component: name.to_string(),
+                });
+            }
+        }
+    }
+    errors
+}
+
 /// Does this adapter actively serve `role`?
 ///
 /// An adapter block actively serves a role when:
@@ -3367,6 +3904,15 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
         return Err(first);
     }
     if let Some(first) = validate_replication_strategies(&config).into_iter().next() {
+        return Err(first);
+    }
+    if let Some(first) = validate_schema_pattern_reserved_components(&config)
+        .into_iter()
+        .next()
+    {
+        return Err(first);
+    }
+    if let Some(first) = validate_replication_overrides(&config).into_iter().next() {
         return Err(first);
     }
     Ok(config)
@@ -6920,6 +7466,539 @@ schema_template = "raw__{source}"
         assert!(
             matches!(err, ConfigError::ReplicationMergeMissingKeys { ref pipeline }
                 if pipeline == "bronze"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // ---------------- Table-override tests (PR-B3) ----------------
+
+    /// TOML base for table-override tests. Pipeline name is `bronze`,
+    /// strategy is `merge` with pipeline-level `merge_keys = ["id"]`,
+    /// schema pattern uses `source` component only.
+    fn override_pipeline_toml_base() -> String {
+        let mut s = String::from(merge_pipeline_toml_base());
+        s.push_str(
+            r#"
+strategy = "merge"
+merge_keys = ["id"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        s
+    }
+
+    #[test]
+    fn glob_match_literal_no_wildcards() {
+        assert!(glob_match("pii_users", "pii_users"));
+        assert!(!glob_match("pii_users", "pii_orders"));
+    }
+
+    #[test]
+    fn glob_match_star_prefix_suffix_middle() {
+        assert!(glob_match("_diagnostics_*", "_diagnostics_x"));
+        assert!(glob_match("_diagnostics_*", "_diagnostics_"));
+        assert!(!glob_match("_diagnostics_*", "diagnostics_x"));
+        assert!(glob_match("*_temp", "users_temp"));
+        assert!(!glob_match("*_temp", "users_temp_extra"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(glob_match("a*b*c", "abc"));
+        assert!(!glob_match("a*b*c", "ac"));
+    }
+
+    #[test]
+    fn glob_match_question_mark_single_char() {
+        assert!(glob_match("u?ers", "users"));
+        assert!(!glob_match("u?ers", "uers"));
+        assert!(!glob_match("u?ers", "useers"));
+    }
+
+    #[test]
+    fn glob_match_full_anchor() {
+        // Patterns are anchored — partial matches do not pass.
+        assert!(!glob_match("pii", "pii_users"));
+        assert!(!glob_match("users", "pii_users"));
+    }
+
+    #[test]
+    fn pattern_is_glob_detects_wildcards() {
+        assert!(pattern_is_glob("_diagnostics_*"));
+        assert!(pattern_is_glob("u?ers"));
+        assert!(!pattern_is_glob("pii_users"));
+        assert!(!pattern_is_glob(""));
+    }
+
+    #[test]
+    fn table_overrides_parse_minimal() {
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "pii_users"
+merge_keys      = ["user_id", "tenant_id"]
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        assert_eq!(pipeline.table_overrides.len(), 1);
+        let rule = &pipeline.table_overrides[0];
+        assert_eq!(rule.match_.connector.as_deref(), Some("stripe_main"));
+        assert_eq!(rule.match_.table.as_deref(), Some("pii_users"));
+        assert_eq!(
+            rule.merge_keys.as_deref(),
+            Some(&["user_id".to_string(), "tenant_id".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn table_overrides_serialize_skips_when_empty() {
+        // `skip_serializing_if = "Vec::is_empty"` keeps the JSON shape
+        // stable for replication pipelines that don't opt into
+        // overrides.
+        let toml_str = override_pipeline_toml_base();
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        let json = serde_json::to_string(pipeline).unwrap();
+        assert!(
+            !json.contains("table_overrides"),
+            "JSON output should omit empty table_overrides: {json}"
+        );
+    }
+
+    #[test]
+    fn resolve_table_override_no_rules_returns_empty() {
+        let resolved = resolve_table_override(&[], "conn_x", "stripe_main", "users");
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_table_override_per_field_most_specific_wins() {
+        // Less-specific rule sets `timestamp_column`, more-specific
+        // rule sets `merge_keys`. Both must apply for the matched
+        // table — per-field, not whole-rule.
+        let rules = vec![
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: None,
+                },
+                strategy: None,
+                merge_keys: None,
+                merge_keys_fallback: None,
+                timestamp_column: Some("_stripe_synced".to_string()),
+                enabled: None,
+            },
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: Some("pii_users".to_string()),
+                },
+                strategy: None,
+                merge_keys: Some(vec!["user_id".to_string(), "tenant_id".to_string()]),
+                merge_keys_fallback: None,
+                timestamp_column: None,
+                enabled: None,
+            },
+        ];
+        let resolved = resolve_table_override(&rules, "conn_xyz", "stripe_main", "pii_users");
+        assert_eq!(
+            resolved.merge_keys,
+            Some(vec!["user_id".to_string(), "tenant_id".to_string()])
+        );
+        assert_eq!(resolved.timestamp_column.as_deref(), Some("_stripe_synced"));
+    }
+
+    #[test]
+    fn resolve_table_override_more_specific_wins_for_same_field() {
+        // Both rules set `merge_keys`. The more-specific rule wins.
+        let rules = vec![
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: None,
+                },
+                strategy: None,
+                merge_keys: Some(vec!["pipeline_id".to_string()]),
+                merge_keys_fallback: None,
+                timestamp_column: None,
+                enabled: None,
+            },
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: Some("pii_users".to_string()),
+                },
+                strategy: None,
+                merge_keys: Some(vec!["user_id".to_string()]),
+                merge_keys_fallback: None,
+                timestamp_column: None,
+                enabled: None,
+            },
+        ];
+        let resolved = resolve_table_override(&rules, "conn_xyz", "stripe_main", "pii_users");
+        assert_eq!(resolved.merge_keys, Some(vec!["user_id".to_string()]));
+    }
+
+    #[test]
+    fn resolve_table_override_connector_matches_id_or_schema() {
+        // `match.connector` matches against either the discovered id
+        // or the discovered schema name (OR semantics).
+        let rule = TableOverride {
+            match_: TableMatch {
+                connector: Some("stripe_main".to_string()),
+                table: Some("users".to_string()),
+            },
+            strategy: Some("incremental".to_string()),
+            merge_keys: None,
+            merge_keys_fallback: None,
+            timestamp_column: None,
+            enabled: None,
+        };
+        // Match against schema.
+        let by_schema = resolve_table_override(
+            std::slice::from_ref(&rule),
+            "conn_abc",
+            "stripe_main",
+            "users",
+        );
+        assert_eq!(by_schema.strategy.as_deref(), Some("incremental"));
+        // Match against id.
+        let by_id = resolve_table_override(
+            std::slice::from_ref(&rule),
+            "stripe_main",
+            "some_schema",
+            "users",
+        );
+        assert_eq!(by_id.strategy.as_deref(), Some("incremental"));
+        // No match against either.
+        let no_match = resolve_table_override(&[rule], "conn_z", "other_schema", "users");
+        assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn resolve_table_override_glob_matches() {
+        let rule = TableOverride {
+            match_: TableMatch {
+                connector: None,
+                table: Some("_diagnostics_*".to_string()),
+            },
+            strategy: None,
+            merge_keys: None,
+            merge_keys_fallback: None,
+            timestamp_column: None,
+            enabled: Some(false),
+        };
+        let resolved = resolve_table_override(
+            std::slice::from_ref(&rule),
+            "c",
+            "stripe_main",
+            "_diagnostics_x",
+        );
+        assert_eq!(resolved.enabled, Some(false));
+        let unmatched = resolve_table_override(&[rule], "c", "stripe_main", "users_diagnostics_no");
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn resolve_table_override_literal_beats_glob_at_same_pair_tier() {
+        // Both rules match `(stripe_main, pii_users)`. The literal one
+        // is more specific than the glob one.
+        let rules = vec![
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: Some("pii_*".to_string()),
+                },
+                strategy: None,
+                merge_keys: Some(vec!["from_glob".to_string()]),
+                merge_keys_fallback: None,
+                timestamp_column: None,
+                enabled: None,
+            },
+            TableOverride {
+                match_: TableMatch {
+                    connector: Some("stripe_main".to_string()),
+                    table: Some("pii_users".to_string()),
+                },
+                strategy: None,
+                merge_keys: Some(vec!["from_literal".to_string()]),
+                merge_keys_fallback: None,
+                timestamp_column: None,
+                enabled: None,
+            },
+        ];
+        let resolved = resolve_table_override(&rules, "c", "stripe_main", "pii_users");
+        assert_eq!(resolved.merge_keys, Some(vec!["from_literal".to_string()]));
+    }
+
+    #[test]
+    fn validate_replication_overrides_rejects_empty_match() {
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+merge_keys = ["x"]
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0],
+            ConfigError::TableOverrideEmptyMatch { rule_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn validate_replication_overrides_rejects_duplicate_fully_specific_literal() {
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "pii_users"
+merge_keys      = ["user_id"]
+
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "pii_users"
+timestamp_column = "synced_at"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::TableOverrideDuplicate {
+                first_index: 0,
+                second_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_replication_overrides_allows_duplicate_glob_table_patterns() {
+        // Two glob rules with overlapping match sets are NOT treated
+        // as duplicates at parse time — the resolver disambiguates by
+        // declaration order if they tie on specificity. Only literal
+        // fully-specific dupes fail-fast.
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "pii_*"
+merge_keys      = ["x"]
+
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "*_users"
+merge_keys      = ["y"]
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert!(errors.is_empty(), "got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_replication_overrides_rejects_unreachable_merge_keys() {
+        // Pipeline default is `strategy="incremental"` (no
+        // merge_keys), and the override sets `strategy="merge"`
+        // without keys → unreachable.
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+timestamp_column = "_synced"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "audit_log"
+strategy        = "merge"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::TableOverrideMergeMissingKeys { rule_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn validate_replication_overrides_unreachable_keys_accepts_pipeline_default() {
+        // Pipeline default supplies merge_keys, so an override that
+        // sets strategy="merge" without its own keys is fine —
+        // inheritance covers it.
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = "audit_log"
+strategy        = "merge"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert!(errors.is_empty(), "got: {errors:?}");
+    }
+
+    #[test]
+    fn validate_replication_overrides_rejects_empty_glob_pattern() {
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+match.connector = "stripe_main"
+match.table     = ""
+merge_keys      = ["x"]
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_overrides(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::TableOverrideInvalidGlob { .. })),
+            "expected TableOverrideInvalidGlob: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_schema_pattern_reserved_components_rejects_table() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["client", "table"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{client}__{table}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_schema_pattern_reserved_components(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            ConfigError::SchemaPatternReservedComponent { component, .. } if component == "table"
+        ));
+    }
+
+    #[test]
+    fn validate_schema_pattern_reserved_components_rejects_id() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["client", "id"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{client}__{id}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_schema_pattern_reserved_components(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            ConfigError::SchemaPatternReservedComponent { component, .. } if component == "id"
+        ));
+    }
+
+    #[test]
+    fn validate_schema_pattern_reserved_components_strips_variadic_suffix() {
+        // `regions...` is fine; reserving `regions` would block a
+        // common user pattern. The variadic stripping must look at
+        // the bare name.
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["client", "id..."]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{client}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_schema_pattern_reserved_components(&config);
+        // `id...` (variadic) is rejected the same as `id` (literal)
+        // because the bare name is still reserved.
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn load_rocky_config_fails_fast_on_empty_match() {
+        use std::io::Write;
+        let mut toml_str = override_pipeline_toml_base();
+        toml_str.push_str(
+            r#"
+[[pipeline.bronze.table_overrides]]
+strategy = "incremental"
+"#,
+        );
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let err = load_rocky_config(tmp.path())
+            .expect_err("load_rocky_config should reject empty match block");
+        assert!(
+            matches!(
+                err,
+                ConfigError::TableOverrideEmptyMatch { rule_index: 0, .. }
+            ),
             "unexpected error: {err:?}"
         );
     }

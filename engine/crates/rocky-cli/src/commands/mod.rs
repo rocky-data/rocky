@@ -144,7 +144,14 @@ pub(crate) fn parse_filter(filter: &str) -> Result<(String, String)> {
 
 /// Checks if a connector matches a filter.
 ///
-/// The special key `id` matches against the connector's unique identifier.
+/// Reserved keys:
+/// - `id` matches against `DiscoveredConnector.id`.
+/// - `table` is also reserved (used for per-table filtering); the
+///   connector-level filter never accepts it as a schema-component
+///   axis. Callers that need to filter by table name must apply the
+///   `table=` filter on the discovered table list separately. See
+///   [`filter_table_matches`].
+///
 /// All other keys match against parsed schema components.
 pub(crate) fn matches_filter(
     conn: &rocky_core::source::DiscoveredConnector,
@@ -155,6 +162,13 @@ pub(crate) fn matches_filter(
     if filter_key == "id" {
         return conn.id == filter_value;
     }
+    if filter_key == "table" {
+        // `table=` is consumed at the table level — every connector
+        // passes the connector-level filter; the table loop filters
+        // the discovered tables individually via
+        // `filter_table_matches`.
+        return true;
+    }
     match parsed.get(filter_key) {
         Some(val) => val == filter_value,
         None => {
@@ -164,6 +178,27 @@ pub(crate) fn matches_filter(
                 .is_some_and(|vals| vals.iter().any(|v| v == filter_value))
         }
     }
+}
+
+/// Returns true when a `--filter table=<literal>` filter (or no
+/// table filter at all) matches the given table name.
+///
+/// CLI `--filter table=` accepts literals only — no globs. Globs live
+/// in the TOML `[[table_overrides]]` `match.table` grammar instead, to
+/// avoid CLI shell-quoting footguns (`--filter table=*_temp` would be
+/// shell-globbed before reaching Rocky on most shells).
+///
+/// When `filter` is `None` or the key isn't `"table"`, every table
+/// matches (the connector-level filter has already decided whether
+/// this connector is in scope).
+pub(crate) fn filter_table_matches(filter: Option<&(String, String)>, table_name: &str) -> bool {
+    let Some((key, value)) = filter else {
+        return true;
+    };
+    if key != "table" {
+        return true;
+    }
+    table_name == value
 }
 
 /// Converts a ParsedSchema into a JSON-compatible components map.
@@ -286,6 +321,55 @@ mod tests {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
         };
         assert!(!matches_filter(&conn, &parsed, "nonexistent", "value"));
+    }
+
+    #[test]
+    fn test_matches_filter_table_passes_at_connector_level() {
+        // `table=` is the new reserved key — at the connector level,
+        // every connector passes, and the table-level filter
+        // (`filter_table_matches`) handles the actual subsetting.
+        let conn = DiscoveredConnector {
+            id: "conn_123".into(),
+            schema: "test".into(),
+            source_type: "fivetran".into(),
+            last_sync_at: None,
+            tables: vec![],
+            metadata: Default::default(),
+        };
+        let parsed = ParsedSchema {
+            values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
+        };
+        assert!(matches_filter(&conn, &parsed, "table", "anything"));
+    }
+
+    #[test]
+    fn test_filter_table_matches_no_filter_matches_all() {
+        assert!(filter_table_matches(None, "users"));
+        assert!(filter_table_matches(None, "_diagnostics_x"));
+    }
+
+    #[test]
+    fn test_filter_table_matches_non_table_key_passes() {
+        // Connector-level filters don't subset at the table level.
+        let f = ("client".to_string(), "acme".to_string());
+        assert!(filter_table_matches(Some(&f), "users"));
+    }
+
+    #[test]
+    fn test_filter_table_matches_table_literal_subsets() {
+        let f = ("table".to_string(), "pii_users".to_string());
+        assert!(filter_table_matches(Some(&f), "pii_users"));
+        assert!(!filter_table_matches(Some(&f), "orders"));
+    }
+
+    #[test]
+    fn test_filter_table_matches_no_glob_in_cli() {
+        // CLI accepts literals only — globs live in TOML
+        // [[table_overrides]]. A `*` in the filter value is treated
+        // literally (won't match anything in practice).
+        let f = ("table".to_string(), "_diagnostics_*".to_string());
+        assert!(filter_table_matches(Some(&f), "_diagnostics_*"));
+        assert!(!filter_table_matches(Some(&f), "_diagnostics_x"));
     }
 
     #[test]

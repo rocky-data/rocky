@@ -13,7 +13,7 @@ use crate::plan_store::{PlanKind, write_plan};
 use crate::registry;
 
 use super::run::PartitionRunOptions;
-use super::{matches_filter, parse_filter};
+use super::{filter_table_matches, matches_filter, parse_filter};
 
 /// Bundle of `rocky plan` flags that are not consumed by the SQL-generation
 /// preview but are persisted into `RunPlan` so `rocky apply <plan-id>` can
@@ -160,6 +160,10 @@ pub async fn plan(
             String::new()
         };
         for table in &conn.tables {
+            // PR-B3: CLI `--filter table=<literal>` consumed here.
+            if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                continue;
+            }
             let metadata_columns: Vec<MetadataColumn> = pipeline
                 .metadata_columns
                 .iter()

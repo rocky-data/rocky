@@ -205,6 +205,35 @@ class ModelCostEntry(BaseModel):
     duration_ms: conint(ge=0)
 
 
+class OverrideWarningOutput(BaseModel):
+    """
+    Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.
+
+    Distinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.
+    """
+
+    connector: str | None = None
+    """
+    Echo of `match.connector` from the rule, for cross-reference.
+    """
+    kind: str
+    """
+    Coarse kind: `"zero_match"` (rule matched no pair at all) or `"connector_match_empty"` (the connector half of the match resolved nothing).
+    """
+    message: str
+    """
+    Human-readable explanation, for logs and Dagster UI rendering.
+    """
+    rule_index: conint(ge=0)
+    """
+    Position of the rule in `[[table_overrides]]`, 0-based — same index the validator's error messages use.
+    """
+    table: str | None = None
+    """
+    Echo of `match.table` from the rule, for cross-reference.
+    """
+
+
 class PartitionInfo(BaseModel):
     """
     Partition window information for a single `time_interval` materialization.
@@ -564,6 +593,10 @@ class RunOutput(BaseModel):
     """
     materializations: list[MaterializationOutput]
     metrics: MetricsSnapshot | None = None
+    override_warnings: list[OverrideWarningOutput] | None = None
+    """
+    Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
+    """
     partition_summaries: list[PartitionSummary]
     """
     Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.

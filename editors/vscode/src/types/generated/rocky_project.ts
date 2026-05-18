@@ -774,6 +774,18 @@ export interface ReplicationPipelineConfig {
    */
   strategy?: string;
   /**
+   * Per-`(connector, table)` overrides applied on top of the pipeline defaults. Each rule matches against a discovered connector + table pair and, when matched, replaces selected pipeline-level fields with override-supplied values.
+   *
+   * Resolution is **per-field most-specific-match-wins**: for each overrideable field, the most specific matching rule that explicitly sets that field wins; less-specific rules contribute values only for fields they actually set. Specificity ranking (highest to lowest):
+   *
+   * 1. Both `match.connector` AND `match.table` set, with `match.table` a literal (no glob). 2. Both set, with `match.table` containing a `*` or `?` glob. 3. Only `match.connector` set. 4. Only `match.table` set.
+   *
+   * Ties at the same specificity tier for a `(connector, table)` pair are rejected at parse time as ambiguous.
+   *
+   * Empty by default — projects that don't need per-table tweaking pay nothing in JSON output, schema surface area, or runtime cost.
+   */
+  table_overrides?: TableOverride[];
+  /**
    * Target configuration.
    */
   target: PipelineTargetConfig;
@@ -945,6 +957,64 @@ export interface SchemaPatternConfig {
   components: string[];
   prefix: string;
   separator: string;
+}
+/**
+ * A per-`(connector, table)` override rule on a replication pipeline.
+ *
+ * Authored as one TOML array entry under `[[pipeline.<name>.table_overrides]]`. Each field except `match_` is optional — `None` means "inherit from the pipeline-level default." The resolver applies overrides with per-field most-specific-wins semantics; see [`ReplicationPipelineConfig::table_overrides`] for the ranking.
+ *
+ * # Example
+ *
+ * ```toml [[pipeline.raw.table_overrides]] match.connector = "stripe_main" match.table     = "pii_users" merge_keys      = ["user_id", "tenant_id"] ```
+ */
+export interface TableOverride {
+  /**
+   * When `Some(false)`, the matched `(connector, table)` pairs are dropped from the run and surfaced under `RunOutput.excluded_tables` with `reason = "table_override_disabled"`. Net-new field with no pipeline-level counterpart — disabling a whole pipeline is already covered by removing the pipeline block.
+   */
+  enabled?: boolean | null;
+  /**
+   * Match criteria — at least one of `connector` or `table` must be set. A rule with neither (or a `match` block omitted entirely) is rejected at parse time (use pipeline-level fields to change defaults for all tables). `default` lets serde deserialize an override missing the whole `match` block; the validator catches the resulting empty match.
+   */
+  match?: TableMatch;
+  /**
+   * Override for [`ReplicationPipelineConfig::merge_keys`]. `None` inherits the pipeline default.
+   */
+  merge_keys?: string[] | null;
+  /**
+   * Override for [`ReplicationPipelineConfig::merge_keys_fallback`]. `None` inherits the pipeline default.
+   */
+  merge_keys_fallback?: string[] | null;
+  /**
+   * Override for [`ReplicationPipelineConfig::strategy`]. `None` inherits the pipeline default.
+   */
+  strategy?: string | null;
+  /**
+   * Override for [`ReplicationPipelineConfig::timestamp_column`]. `None` inherits the pipeline default.
+   */
+  timestamp_column?: string | null;
+}
+/**
+ * Match criteria for a [`TableOverride`].
+ *
+ * At least one of `connector` or `table` must be set (`None` for both is rejected at parse time as redundant — use pipeline-level fields to change defaults globally).
+ *
+ * `connector` matches against either [`crate::source::DiscoveredConnector::id`] (the stable adapter-side identifier — e.g. a Fivetran connector_id) **or** [`crate::source::DiscoveredConnector::schema`] (the human-meaningful source schema name — e.g. `src__acme__shopify`). String equality on either match wins.
+ *
+ * `table` matches against [`crate::source::DiscoveredTable::name`]. Supports `*` (zero or more characters) and `?` (exactly one character) glob wildcards; presence of either character switches the value from literal to glob.
+ *
+ * # Reserved
+ *
+ * `table` and `id` are reserved as schema-pattern component names — configs that use either as a component in [`SchemaPatternConfig::components`] are rejected at parse time to avoid colliding with `--filter table=` and `--filter id=`.
+ */
+export interface TableMatch {
+  /**
+   * Connector match — equals either `DiscoveredConnector.id` or `DiscoveredConnector.schema`. `None` matches every connector.
+   */
+  connector?: string | null;
+  /**
+   * Table-name match. Literal when no `*`/`?`; glob otherwise. `None` matches every table.
+   */
+  table?: string | null;
 }
 /**
  * Pipeline target configuration.

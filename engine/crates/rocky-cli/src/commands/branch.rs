@@ -853,7 +853,7 @@ async fn discover_branch_targets(
     record: &BranchRecord,
     filter: Option<&str>,
 ) -> Result<Vec<PlannedPromote>> {
-    use super::{matches_filter, parse_filter};
+    use super::{filter_table_matches, matches_filter, parse_filter};
     use crate::registry::{self, AdapterRegistry};
 
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -908,6 +908,10 @@ async fn discover_branch_targets(
         let target_schema = parsed.resolve_template(target_schema_template, target_sep);
 
         for table in &conn.tables {
+            // PR-B3: CLI `--filter table=<literal>` consumed here.
+            if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                continue;
+            }
             let prod = TargetRef {
                 catalog: target_catalog.clone(),
                 schema: target_schema.clone(),

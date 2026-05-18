@@ -12,7 +12,9 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use rocky_adapter_sdk::throttle::AdaptiveThrottle;
 
 use rocky_core::checks;
-use rocky_core::config::{GovernanceOverride, ReplicationPipelineConfig};
+use rocky_core::config::{
+    GovernanceOverride, ReplicationPipelineConfig, ResolvedTableOverride, resolve_table_override,
+};
 use rocky_core::drift;
 use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
@@ -28,7 +30,7 @@ use crate::registry::{self, AdapterRegistry};
 use crate::schema_cache_writer::{SchemaCacheWriteTap, persist_batch_describe};
 
 use super::run_audit::AuditContext;
-use super::{matches_filter, parse_filter, parsed_to_json_map};
+use super::{filter_table_matches, matches_filter, parse_filter, parsed_to_json_map};
 
 /// Accumulated check results for a table, assembled after batched execution.
 struct PendingCheck {
@@ -151,6 +153,13 @@ struct TableTask {
     /// When present, `process_table` skips individual DESCRIBE TABLE calls.
     prefetched_source_cols: Option<Vec<ColumnInfo>>,
     prefetched_target_cols: Option<Vec<ColumnInfo>>,
+    /// Per-table override resolved against
+    /// `ReplicationPipelineConfig::table_overrides` at connector-loop
+    /// time. Empty when no rule matched this `(connector, table)` pair.
+    /// `process_table` reads this when building the materialization
+    /// strategy so per-table overrides apply ahead of pipeline-level
+    /// defaults.
+    effective_override: ResolvedTableOverride,
 }
 
 /// CLI selection state for `time_interval` partition execution.
@@ -1124,6 +1133,12 @@ pub async fn run(
     let mut batch_asset_keys: Vec<(String, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
+    // PR-B3: count how many `(connector, table)` pairs matched each
+    // `[[table_overrides]]` rule. Rules with zero matches surface as
+    // soft warnings on `RunOutput.override_warnings` (T2) so
+    // orchestrators can flag stale rules without breaking the pipeline
+    // for connectors that come and go.
+    let mut override_rule_match_counts: HashMap<usize, usize> = HashMap::new();
 
     let governance = &pipeline.target.governance;
     let target_catalog_template = &pipeline.target.catalog_template;
@@ -1468,6 +1483,12 @@ pub async fn run(
 
             let mut skipped_source_missing = 0usize;
             for table in &conn.tables {
+                // PR-B3: CLI `--filter table=<literal>` consumed here
+                // — every other connector-level filter dimension has
+                // already short-circuited above via `matches_filter`.
+                if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                    continue;
+                }
                 if !source_tables.contains(&table.name.to_lowercase()) {
                     // Build the same asset key the materialization path
                     // would have used (`[source_type, ...components, table]`)
@@ -1503,6 +1524,60 @@ pub async fn run(
                     skipped_source_missing += 1;
                     continue;
                 }
+
+                // PR-B3: resolve per-table override against the
+                // pipeline's `table_overrides` rules. Record per-rule
+                // match counts for the discovery-time zero-match
+                // warning (T2).
+                let effective_override = resolve_table_override(
+                    &pipeline.table_overrides,
+                    &conn.id,
+                    &conn.schema,
+                    &table.name,
+                );
+                for (idx, rule) in pipeline.table_overrides.iter().enumerate() {
+                    if rule.match_.matches(&conn.id, &conn.schema, &table.name) {
+                        override_rule_match_counts
+                            .entry(idx)
+                            .and_modify(|c| *c += 1usize)
+                            .or_insert(1);
+                    }
+                }
+
+                // `enabled = false` → skip the table with an
+                // explanatory excluded_tables entry. Mirrors the
+                // missing-from-source path above so orchestrators see
+                // a uniform exclusion surface.
+                if effective_override.enabled == Some(false) {
+                    let mut asset_key = vec![conn.source_type.clone()];
+                    for v in components.values() {
+                        match v {
+                            serde_json::Value::String(s) => asset_key.push(s.clone()),
+                            serde_json::Value::Array(arr) => {
+                                for item in arr {
+                                    if let Some(s) = item.as_str() {
+                                        asset_key.push(s.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    asset_key.push(table.name.clone());
+                    info!(
+                        table = table.name.as_str(),
+                        schema = conn.schema.as_str(),
+                        "table excluded by [[table_overrides]] (enabled = false)"
+                    );
+                    output.excluded_tables.push(ExcludedTableOutput {
+                        asset_key,
+                        source_schema: conn.schema.clone(),
+                        table_name: table.name.clone(),
+                        reason: "table_override_disabled".to_string(),
+                    });
+                    continue;
+                }
+
                 // In shadow suffix mode, append suffix to table name
                 let target_table_name = if let Some(shadow_cfg) = shadow_config {
                     if shadow_cfg.schema_override.is_none() {
@@ -1558,6 +1633,7 @@ pub async fn run(
                     // Populated later by batch pre-fetch phase
                     prefetched_source_cols: None,
                     prefetched_target_cols: None,
+                    effective_override,
                 });
             }
             if skipped_source_missing > 0 {
@@ -1569,6 +1645,44 @@ pub async fn run(
             }
         }
     }
+
+    // PR-B3 (T2): emit a structured warning for every
+    // `[[table_overrides]]` rule that matched no `(connector, table)`
+    // pair this run. Soft warning only — connectors come and go in
+    // real production environments, and a stale rule is recoverable.
+    // The output struct lets Dagster branch on `kind` without text
+    // parsing.
+    for (idx, rule) in pipeline.table_overrides.iter().enumerate() {
+        if override_rule_match_counts.get(&idx).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        let kind = if rule.match_.connector.is_some() && rule.match_.table.is_some() {
+            "zero_match".to_string()
+        } else if rule.match_.connector.is_some() {
+            "connector_match_empty".to_string()
+        } else {
+            "zero_match".to_string()
+        };
+        let message = format!(
+            "[[table_overrides]] rule index {idx} (connector = {:?}, table = {:?}) \
+             matched no (connector, table) pair in this run",
+            rule.match_.connector, rule.match_.table
+        );
+        warn!(
+            rule_index = idx,
+            kind = kind.as_str(),
+            message = message.as_str(),
+            "table_override rule matched zero tables"
+        );
+        output.override_warnings.push(OverrideWarningOutput {
+            rule_index: idx,
+            kind,
+            message,
+            connector: rule.match_.connector.clone(),
+            table: rule.match_.table.clone(),
+        });
+    }
+
     // --- Checkpoint / resume: filter already-completed tables ---
     // `run_id` minted at the top of `run()`.
 
@@ -4358,18 +4472,58 @@ fn accumulate_bytes(acc: Option<u64>, next: Option<u64>) -> Option<u64> {
 /// upserts the entire source via the dialect-specific `MERGE INTO`. The
 /// runner advances the watermark timestamp after each tick regardless of
 /// strategy (via `DeferredWatermark`).
+/// Convenience wrapper used by unit tests — applies no per-table
+/// override. Production code paths go through
+/// [`build_replication_strategy_with_override`] so per-table overrides
+/// land.
+#[cfg(test)]
 fn build_replication_strategy(
     pipeline: &ReplicationPipelineConfig,
 ) -> Result<MaterializationStrategy> {
-    match pipeline.strategy.as_str() {
+    build_replication_strategy_with_override(pipeline, &ResolvedTableOverride::default())
+}
+
+/// Build a materialization strategy applying any per-table override on
+/// top of pipeline defaults. Per-field most-specific-match-wins
+/// resolution has already produced `override_` at the connector-loop
+/// level; this function consumes the merged result with pipeline
+/// fallback.
+///
+/// T3 fail-fast lives here — an effective `strategy = "merge"` with
+/// no reachable merge_keys returns an error so the table fails (the
+/// pipeline keeps running and other tables continue).
+fn build_replication_strategy_with_override(
+    pipeline: &ReplicationPipelineConfig,
+    override_: &ResolvedTableOverride,
+) -> Result<MaterializationStrategy> {
+    let effective_strategy = override_
+        .strategy
+        .as_deref()
+        .unwrap_or(pipeline.strategy.as_str());
+    let effective_timestamp = override_
+        .timestamp_column
+        .as_deref()
+        .unwrap_or(pipeline.timestamp_column.as_str());
+
+    match effective_strategy {
         "incremental" => Ok(MaterializationStrategy::Incremental {
-            timestamp_column: pipeline.timestamp_column.clone(),
+            timestamp_column: effective_timestamp.to_string(),
         }),
         "merge" => {
-            let keys = pipeline.resolved_merge_keys().ok_or_else(|| {
+            // Resolve merge keys with per-field inheritance.
+            // Effective merge_keys: override > pipeline.merge_keys >
+            // override.merge_keys_fallback > pipeline.merge_keys_fallback.
+            let effective_keys: Option<Vec<String>> = override_
+                .merge_keys
+                .clone()
+                .or_else(|| pipeline.merge_keys.clone())
+                .or_else(|| override_.merge_keys_fallback.clone())
+                .or_else(|| pipeline.merge_keys_fallback.clone());
+            let keys = effective_keys.filter(|k| !k.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "strategy = \"merge\" requires merge_keys or merge_keys_fallback \
-                     (this should have been caught by load_rocky_config)"
+                    "table override produces strategy = \"merge\" with empty effective \
+                     merge_keys — set merge_keys on the override or the pipeline default \
+                     (this guard catches a residual not caught at parse time)"
                 )
             })?;
             let unique_key: Vec<Arc<str>> = keys.iter().map(|k| Arc::from(k.as_str())).collect();
@@ -4560,8 +4714,10 @@ async fn process_table(
         }
     }
 
-    // Build replication IR directly.
-    let strategy = build_replication_strategy(pipeline)?;
+    // Build replication IR directly. Applies any per-table override
+    // already resolved at the connector-loop level — see
+    // `TableTask::effective_override`.
+    let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
     let model_ir = ModelIr::replication(
         TargetRef {
             catalog: task.target_catalog.clone(),
@@ -5341,6 +5497,7 @@ mod tests {
             interrupted: false,
             cost_summary: None,
             budget_breaches: vec![],
+            override_warnings: vec![],
         };
 
         emit_pipes_events(&emitter, &output);
@@ -6030,5 +6187,139 @@ merge_keys_fallback = ["fallback_only"]
         let pipeline = parse_pipeline(r#"strategy = "totally_made_up""#);
         let strategy = build_replication_strategy(&pipeline).expect("strategy build");
         assert!(matches!(strategy, MaterializationStrategy::FullRefresh));
+    }
+
+    // ----- PR-B3: per-table override application -----
+
+    #[test]
+    fn override_changes_strategy_from_merge_to_incremental() {
+        // Pipeline default is strategy = "merge", but the override
+        // resolved for this table flips to "incremental". The
+        // resulting MaterializationStrategy must be Incremental and
+        // pick up the override's timestamp column.
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys = ["id"]
+"#,
+        );
+        let resolved = ResolvedTableOverride {
+            strategy: Some("incremental".to_string()),
+            merge_keys: None,
+            merge_keys_fallback: None,
+            timestamp_column: Some("occurred_at".to_string()),
+            enabled: None,
+        };
+        let strategy = build_replication_strategy_with_override(&pipeline, &resolved)
+            .expect("strategy build with override");
+        match strategy {
+            MaterializationStrategy::Incremental { timestamp_column } => {
+                assert_eq!(timestamp_column, "occurred_at");
+            }
+            other => panic!("expected Incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_replaces_pipeline_merge_keys() {
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys = ["id"]
+"#,
+        );
+        let resolved = ResolvedTableOverride {
+            strategy: None,
+            merge_keys: Some(vec!["user_id".into(), "tenant_id".into()]),
+            merge_keys_fallback: None,
+            timestamp_column: None,
+            enabled: None,
+        };
+        let strategy =
+            build_replication_strategy_with_override(&pipeline, &resolved).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Merge { unique_key, .. } => {
+                let keys: Vec<&str> = unique_key.iter().map(AsRef::as_ref).collect();
+                assert_eq!(keys, vec!["user_id", "tenant_id"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_inherits_pipeline_merge_keys_when_unset() {
+        // Override sets only the strategy; merge_keys inherit from
+        // the pipeline default.
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+merge_keys = ["id"]
+"#,
+        );
+        let resolved = ResolvedTableOverride {
+            strategy: Some("merge".to_string()),
+            merge_keys: None,
+            merge_keys_fallback: None,
+            timestamp_column: None,
+            enabled: None,
+        };
+        let strategy =
+            build_replication_strategy_with_override(&pipeline, &resolved).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Merge { unique_key, .. } => {
+                let keys: Vec<&str> = unique_key.iter().map(AsRef::as_ref).collect();
+                assert_eq!(keys, vec!["id"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_merge_with_empty_effective_keys_errors_t3() {
+        // T3 fail-fast guard: even though the parse-time validator
+        // catches the obvious case, an override that explicitly sets
+        // `merge_keys = []` (empty vec) is also caught here at
+        // strategy-build time.
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let resolved = ResolvedTableOverride {
+            strategy: Some("merge".to_string()),
+            merge_keys: Some(vec![]),
+            merge_keys_fallback: None,
+            timestamp_column: None,
+            enabled: None,
+        };
+        let err = build_replication_strategy_with_override(&pipeline, &resolved)
+            .expect_err("empty effective keys must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("empty effective"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn override_empty_is_pipeline_identity() {
+        // Sanity: ResolvedTableOverride::default() yields the
+        // pre-PR-B3 behavior — equal to plain build_replication_strategy.
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys = ["id"]
+"#,
+        );
+        let baseline = build_replication_strategy(&pipeline).expect("baseline");
+        let overridden =
+            build_replication_strategy_with_override(&pipeline, &ResolvedTableOverride::default())
+                .expect("override empty");
+        match (baseline, overridden) {
+            (
+                MaterializationStrategy::Merge {
+                    unique_key: a,
+                    update_columns: _,
+                },
+                MaterializationStrategy::Merge {
+                    unique_key: b,
+                    update_columns: _,
+                },
+            ) => {
+                let ak: Vec<&str> = a.iter().map(AsRef::as_ref).collect();
+                let bk: Vec<&str> = b.iter().map(AsRef::as_ref).collect();
+                assert_eq!(ak, bk);
+            }
+            (a, b) => panic!("mismatch: {a:?} vs {b:?}"),
+        }
     }
 }
