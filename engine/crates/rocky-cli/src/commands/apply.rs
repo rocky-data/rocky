@@ -3,11 +3,15 @@
 //! Dispatches by `PlanKind`:
 //! - `Compact` → `commands::compact::run_compact_apply_in`
 //! - `Archive` → `commands::archive::run_archive_apply_in`
-//! - `Run`     → `commands::run::run` with the `RunPlan` operational metadata
+//! - `Run` → `commands::run::run` with the `RunPlan` operational metadata
+//! - `Replication` → `commands::run::run` against a replication-only project,
+//!   after re-discovering source state and asserting it matches the persisted snapshot
+//! - `Promote` → `commands::branch::run_promote_apply` with the persisted
+//!   per-target SQL statements
 //!
 //! The `--inline` flag skips plan persistence and executes immediately —
 //! this is the path that `rocky run` aliases to so existing callers see no
-//! behaviour change. Phase 4 will add a deprecation warning on `rocky run`.
+//! behaviour change.
 //!
 //! ## Plan payload for Run kind
 //!
@@ -17,12 +21,26 @@
 //! the same flags — a fast, CPU-only recompile step. Full IR persistence is
 //! deferred to a future phase if deterministic replay without recompile
 //! becomes a hard requirement.
+//!
+//! ## Plan payload for Replication kind (Phase 5b)
+//!
+//! `ReplicationPlan` persists the canonical `RockyConfig` snapshot plus a
+//! sorted source-state snapshot (connectors + tables). Apply re-runs
+//! discovery, rebuilds the snapshot with the same canonicalization, and
+//! asserts byte-equality against the persisted one — any drift surfaces
+//! a clear "source state has drifted since plan was created" error before
+//! any SQL is emitted. The successful path delegates to
+//! `commands::run::run` with `models_dir = None`, `run_all = false`, and
+//! no model filter so the engine's existing replication arm executes.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::output::{AuditEvent, AuditEventKind, BranchPromoteOutput, PromotePlan, RunPlan};
+use crate::output::{
+    AuditEvent, AuditEventKind, BranchPromoteOutput, PromotePlan, ReplicationConnectorSnapshot,
+    ReplicationPlan, RunPlan,
+};
 use crate::plan_store::{PlanKind, read_plan};
 
 use super::archive::run_archive_apply_in;
@@ -59,6 +77,9 @@ pub(crate) async fn run_apply_in(
             run_archive_apply_in(root, config_path, plan_id, output_json).await
         }
         PlanKind::Run => run_apply_run_plan(root, config_path, plan_id, output_json).await,
+        PlanKind::Replication => {
+            run_apply_replication_plan(root, config_path, plan_id, output_json).await
+        }
         PlanKind::Promote => run_apply_promote_plan(root, config_path, plan_id, output_json).await,
     }
 }
@@ -186,6 +207,171 @@ async fn run_apply_run_plan(
     // The `run` command has already emitted its own JSON (or text) output.
     // Nothing more to emit in the inline/non-envelope path.
     Ok(())
+}
+
+/// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
+/// the source state matches the persisted snapshot, then delegating to the
+/// replication arm of `commands::run::run`.
+///
+/// Stale-source detection compares the snapshot built from a fresh discovery
+/// against the one captured at plan time. Any difference (connectors added,
+/// removed, renamed; tables added, removed, renamed; row counts changed when
+/// the adapter surfaces them) is treated as drift and aborts the apply with
+/// a clear "re-plan and re-apply" error. The check happens BEFORE any SQL
+/// is emitted to the warehouse.
+async fn run_apply_replication_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    output_json: bool,
+) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read replication plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Replication {
+        bail!(
+            "plan '{plan_id}' is a {} plan, not a replication plan. \
+             Use `rocky apply {plan_id}` and let the dispatcher route it.",
+            plan.kind,
+        );
+    }
+
+    let replication_plan: ReplicationPlan = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize replication plan payload")?;
+
+    // Re-load config + re-run discovery to detect source drift before
+    // touching the warehouse.
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_replication_pipeline(
+        &rocky_cfg,
+        replication_plan.pipeline.as_deref(),
+    )?;
+    let pattern = pipeline.schema_pattern()?;
+
+    let adapter_registry = crate::registry::AdapterRegistry::from_config(&rocky_cfg)?;
+    let live_connectors = if let Some(ref disc) = pipeline.source.discovery {
+        let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
+        discovery_adapter
+            .discover(&pattern.prefix)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .connectors
+    } else {
+        anyhow::bail!("no discovery adapter configured for this pipeline")
+    };
+
+    let live_snapshot = crate::commands::plan::build_source_state_snapshot(&live_connectors);
+
+    if live_snapshot != replication_plan.source_state_snapshot {
+        let diff_summary =
+            summarize_source_state_drift(&replication_plan.source_state_snapshot, &live_snapshot);
+        bail!(
+            "source state has drifted since plan '{plan_id}' was created.\n\
+             {diff_summary}\n\
+             Re-plan with `rocky plan` and re-apply against the resulting plan_id."
+        );
+    }
+
+    // Snapshot matched — delegate to the existing replication codepath
+    // by calling `commands::run::run` with model-related args set to
+    // defaults. The replication arm inside `run` handles everything
+    // from here.
+    let resolved = rocky_core::state::resolve_state_path(None, std::path::Path::new("models"));
+    let state_path = resolved.path;
+
+    let partition_opts = crate::commands::run::PartitionRunOptions::default();
+
+    crate::commands::run::run(
+        config_path,
+        replication_plan.filter.as_deref(),
+        replication_plan.pipeline.as_deref(),
+        &state_path,
+        replication_plan.governance_override.as_ref(),
+        output_json,
+        // No models directory — replication-only apply does not run
+        // transformation models.
+        None,
+        // `--all` runs both replication and models; replication-only
+        // apply never wants the model leg.
+        false,
+        replication_plan.resume.as_deref(),
+        replication_plan.resume_latest,
+        // No shadow config — branch promote and shadow paths are
+        // independent of replication-plan replay.
+        None,
+        &partition_opts,
+        // No model filter — replication runs every discovered table.
+        None,
+        // Cache TTL override — runtime-only, not part of the plan.
+        None,
+        replication_plan.idempotency_key.as_deref(),
+        replication_plan.env.as_deref(),
+    )
+    .await
+    .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
+
+    Ok(())
+}
+
+/// Render a human-readable summary of the diff between the persisted
+/// source-state snapshot and the live one. Surfaced inside the
+/// stale-source bail message so operators see what changed without
+/// having to inspect the plan file by hand.
+fn summarize_source_state_drift(
+    persisted: &[ReplicationConnectorSnapshot],
+    live: &[ReplicationConnectorSnapshot],
+) -> String {
+    use std::collections::BTreeMap;
+
+    let persisted_map: BTreeMap<&str, &ReplicationConnectorSnapshot> =
+        persisted.iter().map(|c| (c.id.as_str(), c)).collect();
+    let live_map: BTreeMap<&str, &ReplicationConnectorSnapshot> =
+        live.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let mut lines = vec![format!(
+        "  persisted snapshot: {} connector(s); live snapshot: {} connector(s)",
+        persisted.len(),
+        live.len(),
+    )];
+
+    let added: Vec<&str> = live_map
+        .keys()
+        .filter(|k| !persisted_map.contains_key(*k))
+        .copied()
+        .collect();
+    let removed: Vec<&str> = persisted_map
+        .keys()
+        .filter(|k| !live_map.contains_key(*k))
+        .copied()
+        .collect();
+
+    if !added.is_empty() {
+        lines.push(format!(
+            "  connectors added (in live, not in plan): {}",
+            added.join(", ")
+        ));
+    }
+    if !removed.is_empty() {
+        lines.push(format!(
+            "  connectors removed (in plan, not in live): {}",
+            removed.join(", ")
+        ));
+    }
+    for (id, p_conn) in &persisted_map {
+        if let Some(l_conn) = live_map.get(id) {
+            if p_conn != l_conn {
+                lines.push(format!(
+                    "  connector '{id}' changed (tables: {} -> {}; schema/type may also differ)",
+                    p_conn.tables.len(),
+                    l_conn.tables.len(),
+                ));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// Apply a `PlanKind::Promote` plan by executing the pre-built SQL statements
@@ -345,7 +531,7 @@ pub async fn run_apply_inline_for_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::RunPlan;
+    use crate::output::{ReplicationTableSnapshot, RunPlan};
     use crate::plan_store::write_plan;
 
     fn minimal_run_plan() -> RunPlan {
@@ -555,5 +741,260 @@ mod tests {
         assert_eq!(decoded.env.as_deref(), Some("prod"));
         assert_eq!(decoded.execution_layers.len(), 2);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Replication plan (Phase 5b)
+    // ------------------------------------------------------------------
+
+    fn minimal_replication_plan() -> ReplicationPlan {
+        ReplicationPlan {
+            filter: Some("source=orders".to_string()),
+            pipeline: Some("playground".to_string()),
+            env: None,
+            idempotency_key: None,
+            resume: None,
+            resume_latest: false,
+            governance_override: None,
+            config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            source_state_snapshot: vec![ReplicationConnectorSnapshot {
+                id: "raw__orders".to_string(),
+                schema: "raw__orders".to_string(),
+                source_type: "duckdb".to_string(),
+                tables: vec![ReplicationTableSnapshot {
+                    name: "orders".to_string(),
+                    row_count: Some(100),
+                }],
+            }],
+        }
+    }
+
+    /// Round-trip: `ReplicationPlan` written to disk parses back into an
+    /// identical struct. Guards against accidental skip_serializing_if
+    /// drift on the new payload.
+    #[test]
+    fn replication_plan_round_trip_serde() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_replication_plan();
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let persisted = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(persisted.kind, PlanKind::Replication);
+
+        let decoded: ReplicationPlan = serde_json::from_value(persisted.payload)?;
+        assert_eq!(decoded.filter.as_deref(), Some("source=orders"));
+        assert_eq!(decoded.pipeline.as_deref(), Some("playground"));
+        assert_eq!(decoded.source_state_snapshot.len(), 1);
+        assert_eq!(decoded.source_state_snapshot[0].id, "raw__orders");
+        assert_eq!(decoded.source_state_snapshot[0].tables.len(), 1);
+        assert_eq!(decoded.source_state_snapshot[0].tables[0].name, "orders");
+        assert_eq!(
+            decoded.source_state_snapshot[0].tables[0].row_count,
+            Some(100)
+        );
+        Ok(())
+    }
+
+    /// Identical replication plan payloads produce identical plan_ids —
+    /// the content-addressing property that the apply path relies on
+    /// for stale-source detection.
+    #[test]
+    fn replication_plan_same_payload_same_plan_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_replication_plan();
+        let id1 = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        let id2 = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        assert_eq!(
+            id1, id2,
+            "identical replication payload must produce identical plan_id"
+        );
+        Ok(())
+    }
+
+    /// Differing config snapshots (any field) produce different plan_ids.
+    /// Critical for "I changed my rocky.toml and re-planned" workflows —
+    /// each config edit yields a fresh plan_id and the old plan stays
+    /// rejected by stale-source / stale-config logic.
+    #[test]
+    fn replication_plan_differing_config_yields_distinct_plan_ids() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_replication_plan();
+        let id_a = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Mutate the config snapshot — even a single key change must
+        // shift the plan_id.
+        rp.config_snapshot = serde_json::json!({"adapter": {"default": {"type": "snowflake"}}});
+        let id_b = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        assert_ne!(
+            id_a, id_b,
+            "different config_snapshot must produce different plan_ids"
+        );
+        Ok(())
+    }
+
+    /// Differing source-state snapshots (e.g. table added, row_count
+    /// changed) produce different plan_ids. The plan_id is the
+    /// deterministic correlation handle apply uses to detect drift —
+    /// this is the property that keeps stale plans from re-running
+    /// against a moved source.
+    #[test]
+    fn replication_plan_differing_source_state_yields_distinct_plan_ids() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_replication_plan();
+        let id_a = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Add a new table to the snapshot.
+        rp.source_state_snapshot[0]
+            .tables
+            .push(ReplicationTableSnapshot {
+                name: "order_items".to_string(),
+                row_count: Some(500),
+            });
+        let id_b = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        assert_ne!(
+            id_a, id_b,
+            "different source_state_snapshot must produce different plan_ids"
+        );
+
+        // Mutate row_count — also has to change the plan_id.
+        rp.source_state_snapshot[0].tables[0].row_count = Some(101);
+        let id_c = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        assert_ne!(
+            id_b, id_c,
+            "row_count mutation must produce different plan_id"
+        );
+        Ok(())
+    }
+
+    /// Mismatched filter / idempotency_key produce different plan_ids,
+    /// mirroring `RunPlan`'s precedent. Two runs with the same source
+    /// state but different `--filter` are not the same plan.
+    #[test]
+    fn replication_plan_differing_filter_yields_distinct_plan_ids() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_replication_plan();
+        rp.filter = Some("source=orders".to_string());
+        let id_a = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        rp.filter = Some("source=customers".to_string());
+        let id_b = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        assert_ne!(
+            id_a, id_b,
+            "different filter must produce different plan_ids"
+        );
+        Ok(())
+    }
+
+    /// Wrong-kind dispatch: an applier given a `PlanKind::Compact` id
+    /// reports the actual kind in the error message rather than
+    /// silently treating it as Replication.
+    #[test]
+    fn wrong_kind_for_replication_apply_returns_clear_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id = write_plan(
+            dir.path(),
+            crate::plan_store::PlanKind::Compact,
+            &serde_json::json!({"dummy": true}),
+        )?;
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, crate::plan_store::PlanKind::Compact);
+        assert_ne!(
+            plan.kind,
+            PlanKind::Replication,
+            "compact plan kind must differ from Replication"
+        );
+        Ok(())
+    }
+
+    /// `summarize_source_state_drift` surfaces added/removed/changed
+    /// connectors so the apply-side bail message tells operators what
+    /// changed.
+    #[test]
+    fn drift_summary_calls_out_added_removed_changed() {
+        let persisted = vec![
+            ReplicationConnectorSnapshot {
+                id: "conn_a".to_string(),
+                schema: "schema_a".to_string(),
+                source_type: "fivetran".to_string(),
+                tables: vec![ReplicationTableSnapshot {
+                    name: "orders".to_string(),
+                    row_count: None,
+                }],
+            },
+            ReplicationConnectorSnapshot {
+                id: "conn_b".to_string(),
+                schema: "schema_b".to_string(),
+                source_type: "fivetran".to_string(),
+                tables: vec![],
+            },
+        ];
+        let live = vec![
+            // conn_a kept but with one extra table — changed.
+            ReplicationConnectorSnapshot {
+                id: "conn_a".to_string(),
+                schema: "schema_a".to_string(),
+                source_type: "fivetran".to_string(),
+                tables: vec![
+                    ReplicationTableSnapshot {
+                        name: "orders".to_string(),
+                        row_count: None,
+                    },
+                    ReplicationTableSnapshot {
+                        name: "shipments".to_string(),
+                        row_count: None,
+                    },
+                ],
+            },
+            // conn_b absent — removed.
+            // conn_c added.
+            ReplicationConnectorSnapshot {
+                id: "conn_c".to_string(),
+                schema: "schema_c".to_string(),
+                source_type: "fivetran".to_string(),
+                tables: vec![],
+            },
+        ];
+
+        let summary = summarize_source_state_drift(&persisted, &live);
+        assert!(
+            summary.contains("connectors added"),
+            "summary should mention adds: {summary}"
+        );
+        assert!(
+            summary.contains("conn_c"),
+            "summary should name the added connector: {summary}"
+        );
+        assert!(
+            summary.contains("connectors removed"),
+            "summary should mention removals: {summary}"
+        );
+        assert!(
+            summary.contains("conn_b"),
+            "summary should name the removed connector: {summary}"
+        );
+        assert!(
+            summary.contains("conn_a"),
+            "summary should mention the changed connector: {summary}"
+        );
+    }
+
+    /// Identical snapshots produce a summary that still surfaces counts
+    /// (operators may want to confirm "same shape but my apply still
+    /// rejected", which would be a bug elsewhere).
+    #[test]
+    fn drift_summary_handles_identical_snapshots() {
+        let snap = vec![ReplicationConnectorSnapshot {
+            id: "conn_a".to_string(),
+            schema: "schema_a".to_string(),
+            source_type: "duckdb".to_string(),
+            tables: vec![],
+        }];
+        let summary = summarize_source_state_drift(&snap, &snap);
+        assert!(summary.contains("1 connector(s)"));
     }
 }

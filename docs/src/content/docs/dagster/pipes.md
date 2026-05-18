@@ -176,8 +176,15 @@ def my_asset(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 Spawns rocky via [`dg.PipesSubprocessClient`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesSubprocessClient)
 which sets `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env vars.
-The rocky engine (v0.4+) detects these and emits structured Pipes
-messages on the messages channel:
+As of `dagster-rocky` v1.30, the client invokes `rocky plan` first to
+write `.rocky/plans/<plan-id>.json`, then runs `rocky apply <plan-id>`
+as the Pipes subprocess. The plan id is passed via `extras={"plan_id":
+plan_id}`, so the Dagster run viewer surfaces it as run metadata and
+reviewers can click straight from the materialization back to the plan
+artifact that produced it.
+
+The rocky engine (v0.4+) detects the Pipes env vars and emits structured
+Pipes messages on the messages channel:
 
 * `report_asset_materialization` per copied table — appears as a
   `MaterializationEvent` in the run viewer with structured metadata
@@ -190,6 +197,11 @@ messages on the messages channel:
 Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster constructed from the Pipes
 messages.
+
+On replication-only projects (no `models/` directory), `rocky plan`
+cannot persist a plan, so `run_pipes` falls back to a single
+`rocky run` Pipes invocation. No `plan_id` is attached to `extras` in
+that case.
 
 **This is the canonical Dagster Pipes integration pattern.**
 

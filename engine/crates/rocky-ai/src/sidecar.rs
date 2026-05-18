@@ -54,16 +54,31 @@ pub enum SidecarError {
 #[derive(Debug, Clone)]
 pub enum SidecarMaterialization {
     FullRefresh,
-    Incremental { watermark: String },
-    Merge,
+    Incremental {
+        watermark: String,
+    },
+    Merge {
+        /// Columns that uniquely identify a row for upsert. Maps to
+        /// `[strategy] unique_key` in the emitted TOML, which Rocky's
+        /// `StrategyConfig::Merge` requires at runtime. `None` is allowed
+        /// for back-compat — callers that omit it emit an incomplete
+        /// sidecar that the user has to fill in before `rocky run`.
+        unique_key: Option<Vec<String>>,
+    },
     Ephemeral,
 }
 
 impl SidecarMaterialization {
-    /// Parse the `--materialization` CLI value. The optional `watermark` is
-    /// only consumed when `value == "incremental"` — it's required there
-    /// and ignored otherwise.
-    pub fn parse(value: &str, watermark: Option<&str>) -> Result<Self, SidecarError> {
+    /// Parse the `--materialization` CLI value. `watermark` is required when
+    /// `value == "incremental"` and ignored otherwise. `unique_key` is
+    /// carried through verbatim for `value == "merge"` and ignored
+    /// otherwise — an empty `Vec` is treated as "not provided" so the
+    /// emitted TOML omits the field rather than writing `unique_key = []`.
+    pub fn parse(
+        value: &str,
+        watermark: Option<&str>,
+        unique_key: Option<Vec<String>>,
+    ) -> Result<Self, SidecarError> {
         match value {
             "full_refresh" => Ok(Self::FullRefresh),
             "incremental" => {
@@ -72,7 +87,9 @@ impl SidecarMaterialization {
                     watermark: w.to_string(),
                 })
             }
-            "merge" => Ok(Self::Merge),
+            "merge" => Ok(Self::Merge {
+                unique_key: unique_key.filter(|v| !v.is_empty()),
+            }),
             "ephemeral" => Ok(Self::Ephemeral),
             other => Err(SidecarError::UnknownMaterialization {
                 value: other.to_string(),
@@ -142,7 +159,15 @@ enum SidecarStrategyToml<'a> {
     #[serde(rename = "incremental")]
     Incremental { timestamp_column: &'a str },
     #[serde(rename = "merge")]
-    Merge,
+    Merge {
+        /// Mirrors `StrategyConfig::Merge { unique_key, .. }` in
+        /// `rocky-core` — the loader rejects merge models without it at
+        /// runtime. Skipped from the emitted TOML when `None` so the
+        /// sidecar stays compact for the legacy "user fills it in later"
+        /// path; surfaced when `--unique-key` is passed on the CLI.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unique_key: Option<&'a [String]>,
+    },
     #[serde(rename = "ephemeral")]
     Ephemeral,
 }
@@ -156,13 +181,12 @@ struct SidecarTargetToml<'a> {
 
 /// Render the sidecar TOML body for the given (name, strategy, target).
 ///
-/// The `Merge` variant intentionally serializes without a `unique_key`
-/// list — Rocky's `StrategyConfig::Merge` requires `unique_key`, so the
-/// emitted TOML for `--materialization merge` is **incomplete on its own**.
-/// The user is expected to fill in the unique key before running
-/// `rocky run`. This is consistent with the brief's "first cut" scope:
-/// the AI doesn't know the unique key, and we don't have a flag to capture
-/// it yet. A future iteration can add `--unique-key`.
+/// For `SidecarMaterialization::Merge`, the `unique_key` list is serialized
+/// when present and omitted otherwise. Rocky's `StrategyConfig::Merge`
+/// requires `unique_key`, so a merge sidecar emitted without it is
+/// **incomplete on its own** — the user must fill in the unique key
+/// before running `rocky run`. The CLI surfaces `--unique-key` so the
+/// common case produces a complete, runnable sidecar in one shot.
 pub fn render_sidecar_toml(
     name: &str,
     materialization: &SidecarMaterialization,
@@ -173,7 +197,9 @@ pub fn render_sidecar_toml(
         SidecarMaterialization::Incremental { watermark } => SidecarStrategyToml::Incremental {
             timestamp_column: watermark,
         },
-        SidecarMaterialization::Merge => SidecarStrategyToml::Merge,
+        SidecarMaterialization::Merge { unique_key } => SidecarStrategyToml::Merge {
+            unique_key: unique_key.as_deref(),
+        },
         SidecarMaterialization::Ephemeral => SidecarStrategyToml::Ephemeral,
     };
 
@@ -317,14 +343,45 @@ mod tests {
 
     #[test]
     fn parse_materialization_unknown_rejected() {
-        let err = SidecarMaterialization::parse("materialized_view", None).unwrap_err();
+        let err = SidecarMaterialization::parse("materialized_view", None, None).unwrap_err();
         assert!(matches!(err, SidecarError::UnknownMaterialization { .. }));
     }
 
     #[test]
     fn parse_incremental_requires_watermark() {
-        let err = SidecarMaterialization::parse("incremental", None).unwrap_err();
+        let err = SidecarMaterialization::parse("incremental", None, None).unwrap_err();
         assert!(matches!(err, SidecarError::MissingWatermark));
+    }
+
+    #[test]
+    fn parse_merge_carries_unique_key() {
+        let parsed = SidecarMaterialization::parse(
+            "merge",
+            None,
+            Some(vec!["id".to_string(), "created_at".to_string()]),
+        )
+        .unwrap();
+        match parsed {
+            SidecarMaterialization::Merge { unique_key } => {
+                assert_eq!(
+                    unique_key,
+                    Some(vec!["id".to_string(), "created_at".to_string()])
+                );
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_merge_empty_unique_key_treated_as_absent() {
+        // An empty Vec from clap (no `--unique-key` passed, or `--unique-key ""`
+        // collapsed by the delimiter) should fall back to None so the emitted
+        // TOML omits the field rather than writing `unique_key = []`.
+        let parsed = SidecarMaterialization::parse("merge", None, Some(Vec::new())).unwrap();
+        match parsed {
+            SidecarMaterialization::Merge { unique_key } => assert!(unique_key.is_none()),
+            other => panic!("expected Merge, got {other:?}"),
+        }
     }
 
     #[test]
@@ -456,5 +513,47 @@ mod tests {
         let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
         let model = parse_model_inline(&inline, "staging_users.sql", None).unwrap();
         assert!(matches!(model.config.strategy, StrategyConfig::Ephemeral));
+    }
+
+    #[test]
+    fn render_merge_serializes_unique_key_when_present() {
+        // Round-trip: rendering with a unique_key emits the TOML field the
+        // loader expects, and re-parsing through rocky-core's
+        // `parse_model_inline` rebuilds the strategy without losing keys.
+        let target = SidecarTarget::default_for("fct_orders");
+        let materialization = SidecarMaterialization::Merge {
+            unique_key: Some(vec!["id".to_string(), "created_at".to_string()]),
+        };
+        let sidecar = render_sidecar_toml("fct_orders", &materialization, &target).unwrap();
+
+        assert!(sidecar.contains("type = \"merge\""));
+        assert!(sidecar.contains("unique_key = [\"id\", \"created_at\"]"));
+
+        let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
+        let model = parse_model_inline(&inline, "fct_orders.sql", None).unwrap();
+        match model.config.strategy {
+            StrategyConfig::Merge {
+                unique_key,
+                update_columns,
+            } => {
+                assert_eq!(unique_key, vec!["id".to_string(), "created_at".to_string()]);
+                assert!(update_columns.is_none());
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_merge_without_unique_key_omits_field() {
+        // Back-compat: an explicitly-None unique_key emits a sidecar that
+        // does NOT contain `unique_key = []`. The loader will reject it at
+        // runtime, but that matches the historical behaviour for callers
+        // that don't pass `--unique-key`.
+        let target = SidecarTarget::default_for("fct_orders");
+        let materialization = SidecarMaterialization::Merge { unique_key: None };
+        let sidecar = render_sidecar_toml("fct_orders", &materialization, &target).unwrap();
+
+        assert!(sidecar.contains("type = \"merge\""));
+        assert!(!sidecar.contains("unique_key"));
     }
 }

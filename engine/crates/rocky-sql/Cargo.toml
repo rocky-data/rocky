@@ -1,6 +1,6 @@
 [package]
 name = "rocky-sql"
-version = "1.32.0"
+version = "1.34.0"
 description = "SQL parsing, validation, and dialect support for Rocky"
 edition.workspace = true
 license.workspace = true

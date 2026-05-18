@@ -162,6 +162,30 @@ pub struct ModelConfig {
     /// `on_breach = "error"` for this one model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<ModelBudgetConfig>,
+
+    /// Pre-substitution value of the `name` field as it appeared in the
+    /// sidecar TOML (or the filename stem when `name` was omitted).
+    ///
+    /// Captured before `${VAR}` / `${VAR:-default}` env substitution so
+    /// lint rules that judge author intent (L001 — name matches filename)
+    /// can compare against what the user wrote, not what the env
+    /// resolved to. Internal only — never serialized, never appears in
+    /// JSON schema.
+    #[serde(default, skip)]
+    #[schemars(skip)]
+    pub name_declared: String,
+
+    /// Pre-substitution value of `target.table` as it appeared in the
+    /// sidecar TOML (or `name_declared` when `target.table` was omitted).
+    ///
+    /// Captured before env substitution so L002 (target.table matches
+    /// name) can compare raw templates against raw templates — a
+    /// `${VAR:-X}` default that happens to collapse to the model's
+    /// `name` no longer trips the lint. Internal only — never
+    /// serialized, never appears in JSON schema.
+    #[serde(default, skip)]
+    #[schemars(skip)]
+    pub target_table_declared: String,
 }
 
 /// Per-model freshness configuration.
@@ -399,6 +423,26 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     Ok(defaults)
 }
 
+/// Raw, pre-substitution view of the lint-relevant sidecar fields.
+///
+/// Captured from the TOML *before* `${VAR}` / `${VAR:-default}` env
+/// substitution runs, so lints that judge author intent (L001, L002)
+/// can compare against what the user actually wrote rather than what
+/// the env resolved to.
+///
+/// Absent fields use the same fallback chain as the post-substitution
+/// resolver — `name` falls back to the filename stem, `target.table`
+/// falls back to `name`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeclaredModelFields {
+    /// Raw `name` as it appeared in the sidecar, pre-substitution.
+    /// Defaults to the filename stem when omitted.
+    pub name: Option<String>,
+    /// Raw `target.table` as it appeared in the sidecar, pre-substitution.
+    /// Defaults to `name` (declared) when omitted.
+    pub target_table: Option<String>,
+}
+
 /// Resolves a [`RawModelConfig`] into a strict [`ModelConfig`] by applying
 /// filename inference and directory defaults.
 ///
@@ -407,8 +451,10 @@ fn resolve_model_config(
     raw: RawModelConfig,
     file_stem: &str,
     defaults: Option<&DirDefaults>,
+    declared: DeclaredModelFields,
 ) -> Result<ModelConfig, ModelError> {
     let name = raw.name.unwrap_or_else(|| file_stem.to_string());
+    let name_declared = declared.name.unwrap_or_else(|| file_stem.to_string());
 
     let strategy = raw
         .strategy
@@ -448,6 +494,9 @@ fn resolve_model_config(
         })?;
 
     let table = raw_target.table.unwrap_or_else(|| name.clone());
+    let target_table_declared = declared
+        .target_table
+        .unwrap_or_else(|| name_declared.clone());
 
     // Parse `retention = "<N>[dy]"` into a typed RetentionPolicy. Garbage
     // inputs surface as ModelError::InvalidRetention so the diagnostic
@@ -485,7 +534,41 @@ fn resolve_model_config(
         classification: raw.classification,
         retention,
         budget: raw.budget,
+        name_declared,
+        target_table_declared,
     })
+}
+
+/// Extract the pre-substitution `name` and `target.table` from raw TOML
+/// text so L001/L002 lints can compare author intent against the
+/// filename stem and the model name without env-resolved values muddying
+/// the picture.
+///
+/// Returns an all-`None` [`DeclaredModelFields`] when the TOML fails to
+/// parse — the post-substitution pass will surface that as the
+/// authoritative error, and the lint pass falls back to the resolved
+/// values (which match exactly when no env vars are involved).
+pub(crate) fn extract_declared_fields(raw_toml: &str) -> DeclaredModelFields {
+    let Ok(raw_value) = toml::from_str::<toml::Value>(raw_toml) else {
+        return DeclaredModelFields::default();
+    };
+
+    let Some(table) = raw_value.as_table() else {
+        return DeclaredModelFields::default();
+    };
+
+    let name = table
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let target_table = table
+        .get("target")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("table"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    DeclaredModelFields { name, target_table }
 }
 
 /// A parsed model file (frontmatter + SQL body).
@@ -654,6 +737,7 @@ pub fn load_model_pair(
         }
     };
     let raw_toml = std::fs::read_to_string(toml_path)?;
+    let declared = extract_declared_fields(&raw_toml);
     let toml_content =
         substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
             path: toml_path.display().to_string(),
@@ -670,7 +754,7 @@ pub fn load_model_pair(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, declared)?;
 
     // Check for sibling contract file
     let contract_path = sql_path.with_extension("contract.toml");
@@ -702,6 +786,8 @@ pub fn parse_model_inline(
             path: file_path.to_string(),
         })?;
 
+    let declared = extract_declared_fields(frontmatter);
+
     let frontmatter =
         substitute_env_vars(frontmatter).map_err(|source| ModelError::EnvSubstitution {
             path: file_path.to_string(),
@@ -719,7 +805,7 @@ pub fn parse_model_inline(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, declared)?;
 
     // Check for sibling contract file (inline models can have them too)
     let contract_file = Path::new(file_path).with_extension("contract.toml");
@@ -1924,5 +2010,63 @@ SELECT 1
         unsafe {
             std::env::remove_var("ROCKY_TEST_INLINE_CATALOG");
         }
+    }
+
+    /// `name_declared` and `target_table_declared` must capture the raw
+    /// `${VAR:-...}` templates from the sidecar, not the post-substitution
+    /// values. This is what lets L001/L002 distinguish an intentional
+    /// template that happens to resolve to a "redundant" value from an
+    /// actually redundant literal.
+    #[test]
+    fn test_declared_fields_capture_raw_env_templates() {
+        // SAFETY: test-only.
+        unsafe {
+            std::env::remove_var("ROCKY_TABLE_OVERRIDE");
+        }
+
+        let content = r#"---toml
+name = "customer_facts"
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "customer_facts.sql", None).unwrap();
+
+        // Resolved values: env unset, so the default collapses to the literal.
+        assert_eq!(model.config.name, "customer_facts");
+        assert_eq!(model.config.target.table, "customer_facts");
+
+        // Declared values: still hold the raw template.
+        assert_eq!(model.config.name_declared, "customer_facts");
+        assert_eq!(
+            model.config.target_table_declared,
+            "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
+        );
+    }
+
+    /// When the sidecar omits `name` and/or `target.table` entirely, the
+    /// declared values must fall back to the same chain the resolved
+    /// values use — filename stem for `name`, and `name_declared` for
+    /// `target.table` — so the lints behave identically on minimal
+    /// configs that never touched env substitution.
+    #[test]
+    fn test_declared_fields_fallback_to_filename_stem() {
+        let content = r#"---toml
+[target]
+catalog = "analytics"
+schema = "marts"
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "stg_orders.sql", None).unwrap();
+        assert_eq!(model.config.name, "stg_orders");
+        assert_eq!(model.config.target.table, "stg_orders");
+        assert_eq!(model.config.name_declared, "stg_orders");
+        assert_eq!(model.config.target_table_declared, "stg_orders");
     }
 }

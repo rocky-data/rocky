@@ -19,7 +19,8 @@ side-by-side without touching production data.
 - **`branch_deployment_info()`** — structured snapshot of the deployment
   context (deployment name, PR number, Git SHA).
 - **`branch_deploy_shadow_suffix()`** — derives a stable Rocky shadow
-  suffix suitable for `rocky run --shadow --shadow-suffix <value>`.
+  suffix suitable for `rocky plan --shadow --shadow-suffix <value>` + `rocky apply <plan-id>`
+  (the legacy `rocky run --shadow --shadow-suffix <value>` alias is still accepted).
 
 ## Quickstart
 

@@ -122,3 +122,4 @@ Shows stored watermarks for every table.
 - [Silver layer](/concepts/silver-layer/) — add transformation models
 - [Data quality checks](/features/data-quality-checks/)
 - [Dagster integration](/dagster/introduction/)
+- See the combo in action — POC #17 (trace + cost + replay against the same run_id): [examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo)

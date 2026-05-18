@@ -1,6 +1,6 @@
 # Rocky monorepo
 
-Single repository for the Rocky data platform — a Rust-based control plane for warehouse SQL pipelines — and its first-party integrations.
+Single repository for the Rocky data platform — a typed-program layer above the warehouse — and its first-party integrations.
 
 ## Subprojects
 

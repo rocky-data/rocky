@@ -76,6 +76,11 @@ struct TableError {
     error: String,
     /// Index into the original tables_to_process vec (for retry).
     task_index: Option<usize>,
+    /// Coarse classification of the failure for the public JSON output.
+    /// Set by walking the typed connector-error chain on `e` before the
+    /// error is stringified; defaults to `Unknown` when no connector
+    /// variant is in the chain (drift / governance / panic paths).
+    failure_kind: crate::output::FailureKind,
 }
 
 /// Sentinel error signalling that `rocky run` was cancelled by a shutdown
@@ -1076,7 +1081,7 @@ pub async fn run(
             discovery_adapter
                 .discover(&pattern.prefix)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(anyhow::Error::from)
         } else {
             anyhow::bail!("no discovery adapter configured for this pipeline")
         }
@@ -1180,7 +1185,7 @@ pub async fn run(
                 // behind.
                 if let Some(ov) = governance_override {
                     ov.validate_workspace_ids(&target_catalog)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .map_err(anyhow::Error::from)?;
                 }
 
                 // Create catalog via generic dialect SQL
@@ -1188,7 +1193,7 @@ pub async fn run(
                     warehouse_adapter
                         .execute_statement(&sql_result?)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .map_err(anyhow::Error::from)?;
                 }
                 catalogs_created += 1;
 
@@ -1372,7 +1377,7 @@ pub async fn run(
                     warehouse_adapter
                         .execute_statement(&sql_result?)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .map_err(anyhow::Error::from)?;
                 }
                 schemas_created += 1;
 
@@ -2056,6 +2061,9 @@ pub async fn run(
                 }
             }
             Ok((idx, Err(e))) => {
+                // Classify before stringification so the typed connector
+                // variant is preserved on `TableError.failure_kind`.
+                let failure_kind = classify_anyhow_error(&e);
                 let msg = format!("{e:#}");
                 if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -2118,6 +2126,7 @@ pub async fn run(
                     asset_key: vec![],
                     error: msg,
                     task_index: Some(idx),
+                    failure_kind,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2151,6 +2160,7 @@ pub async fn run(
                     asset_key: vec![],
                     error: msg,
                     task_index: None,
+                    failure_kind: FailureKind::Unknown,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2369,6 +2379,7 @@ pub async fn run(
                         info!(table = task.table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
+                        let failure_kind = classify_anyhow_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.table_name.as_str(),
@@ -2379,6 +2390,7 @@ pub async fn run(
                             asset_key: vec![],
                             error: msg,
                             task_index: Some(idx),
+                            failure_kind,
                         });
                     }
                 }
@@ -2536,7 +2548,7 @@ pub async fn run(
                 }
             },
         )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from)?;
         (src, tgt, fresh)
     } else {
         // Per-table fallback via WarehouseAdapter for adapters with no
@@ -2550,7 +2562,7 @@ pub async fn run(
             for br in &source_batch_refs {
                 let table_ref = dialect
                     .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
                 let sql = format!("SELECT COUNT(*) FROM {table_ref}");
                 match shared_warehouse.execute_query(&sql).await {
                     Ok(result) => {
@@ -2576,7 +2588,7 @@ pub async fn run(
             for br in &target_batch_refs {
                 let table_ref = dialect
                     .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
                 let sql = format!("SELECT COUNT(*) FROM {table_ref}");
                 match shared_warehouse.execute_query(&sql).await {
                     Ok(result) => {
@@ -2605,7 +2617,7 @@ pub async fn run(
             for br in &freshness_batch_refs {
                 let table_ref = dialect
                     .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
                 let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
                 match shared_warehouse.execute_query(&sql).await {
                     Ok(result) => {
@@ -3033,6 +3045,7 @@ pub async fn run(
         .map(|e| TableErrorOutput {
             asset_key: e.asset_key.clone(),
             error: e.error.clone(),
+            failure_kind: e.failure_kind,
         })
         .collect();
 
@@ -3550,11 +3563,11 @@ pub(crate) async fn execute_models(
         }
         for (catalog, schema) in &targets {
             if let Some(sql_result) = dialect.create_schema_sql(catalog, schema) {
-                let sql = sql_result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sql = sql_result.map_err(anyhow::Error::from)?;
                 warehouse
                     .execute_statement(&sql)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
             }
         }
     }
@@ -3736,7 +3749,7 @@ pub(crate) async fn execute_models(
                     &model_ir.target.schema,
                     &model_ir.target.table,
                 )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::from)?;
 
             // MERGE requires the target to exist before the statement runs.
             // sql_gen exposes `generate_transformation_initial_ddl` for
@@ -3775,9 +3788,9 @@ pub(crate) async fn execute_models(
                     );
                     for ddl in &initial_ddls {
                         warehouse.execute_statement(ddl).await.map_err(|e| {
-                            anyhow::anyhow!(
-                                "bootstrap of '{target_ref}' for model '{model_name}' failed: {e}"
-                            )
+                            anyhow::Error::from(e).context(format!(
+                                "bootstrap of '{target_ref}' for model '{model_name}' failed"
+                            ))
                         })?;
                     }
                 }
@@ -3814,7 +3827,9 @@ pub(crate) async fn execute_models(
                         }
                     }
                     Err(e) => {
-                        exec_error = Some(anyhow::anyhow!("model '{model_name}' failed: {e}"));
+                        exec_error = Some(
+                            anyhow::Error::from(e).context(format!("model '{model_name}' failed")),
+                        );
                         break;
                     }
                 }
@@ -4035,9 +4050,9 @@ async fn execute_time_interval_model(
             .execute_statement(&bootstrap_sql)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "bootstrap of '{target_table}' failed for model '{model_name}': {e}"
-                )
+                anyhow::Error::from(e).context(format!(
+                    "bootstrap of '{target_table}' failed for model '{model_name}'"
+                ))
             })?;
     }
 
@@ -4180,9 +4195,9 @@ async fn run_one_partition(
     if let Err(e) = state_ref.record_partition(&record) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
-            outcome: Err(anyhow::anyhow!(
-                "failed to record InProgress for {model_name}|{key}: {e}"
-            )),
+            outcome: Err(anyhow::Error::from(e).context(format!(
+                "failed to record InProgress for {model_name}|{key}"
+            ))),
         };
     }
 
@@ -4201,9 +4216,8 @@ async fn run_one_partition(
         Err(e) => {
             return PartitionExecutionResult {
                 partition_key: key.clone(),
-                outcome: Err(anyhow::anyhow!(
-                    "SQL gen failed for {model_name}|{key}: {e}"
-                )),
+                outcome: Err(anyhow::Error::from(e)
+                    .context(format!("SQL gen failed for {model_name}|{key}"))),
             };
         }
     };
@@ -4242,7 +4256,7 @@ async fn run_one_partition(
                 }
             }
             Err(e) => {
-                exec_err = Some(anyhow::anyhow!("{e}"));
+                exec_err = Some(anyhow::Error::from(e));
                 break;
             }
         }
@@ -4270,9 +4284,8 @@ async fn run_one_partition(
     if let Err(e) = state_ref.record_partition(&record) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
-            outcome: Err(anyhow::anyhow!(
-                "failed to record Computed for {model_name}|{key}: {e}"
-            )),
+            outcome: Err(anyhow::Error::from(e)
+                .context(format!("failed to record Computed for {model_name}|{key}"))),
         };
     }
 
@@ -4392,7 +4405,7 @@ async fn process_table(
             warehouse
                 .execute_statement(&drop_sql)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(anyhow::Error::from)?;
             use_full_refresh = true;
 
             let reason = drift_result
@@ -4432,7 +4445,7 @@ async fn process_table(
                 warehouse
                     .execute_statement(stmt)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
             }
             // If the same drift round also surfaced added columns,
             // apply them as part of the same schema-evolution step
@@ -4447,7 +4460,7 @@ async fn process_table(
                     warehouse
                         .execute_statement(stmt)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .map_err(anyhow::Error::from)?;
                 }
             }
             let reason = drift_result
@@ -4490,7 +4503,7 @@ async fn process_table(
                 warehouse
                     .execute_statement(stmt)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(anyhow::Error::from)?;
             }
             let reason = drift_result
                 .added_columns
@@ -4613,7 +4626,7 @@ async fn process_table(
     let exec_stats = warehouse
         .execute_statement_with_stats(&sql)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from)?;
 
     // Tagging and watermark updates are deferred to post-run batch phase
     // to avoid blocking the concurrency semaphore with sequential SQL
@@ -4860,6 +4873,9 @@ async fn process_completed_result(
             }
         }
         Ok((idx, Err(e))) => {
+            // Classify before stringification so the typed connector
+            // variant is preserved on `TableError.failure_kind`.
+            let failure_kind = classify_anyhow_error(&e);
             let msg = format!("{e:#}");
             if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -4908,6 +4924,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: Some(idx),
+                failure_kind,
             });
         }
         Err(e) => {
@@ -4937,6 +4954,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: None,
+                failure_kind: FailureKind::Unknown,
             });
         }
     }

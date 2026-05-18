@@ -5,11 +5,11 @@ sidebar:
   order: 1
 ---
 
-Rocky is a Rust-based control plane for warehouse SQL pipelines. Branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution — primitives delivered through a single static binary that drives Databricks, Snowflake, BigQuery, or DuckDB. Things your current stack can't offer because it doesn't own the DAG.
+Rocky is a typed-program layer above the warehouse. Branches, replay, column-level lineage, compile-time type safety, and per-model cost attribution — primitives delivered through a single static binary that drives Databricks, Snowflake, BigQuery, or DuckDB. Things your current stack can't offer because it doesn't own the DAG.
 
 ## What Rocky is
 
-A Rust-based control plane for warehouse-side data work. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB). Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
+A typed-program layer above the warehouse. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB). Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
 
 **Rocky is not a warehouse.** It's what sits on top of one.
 
@@ -26,7 +26,7 @@ A Rust-based control plane for warehouse-side data work. Storage and compute sta
 
 ## What Rocky does
 
-1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch <name>` (branch execution currently lives on the `rocky run` alias only), `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
+1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky plan --branch <name>` + `rocky apply <plan-id>` (the legacy `rocky run --branch <name>` alias is still accepted), `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
 2. **Cost attribution + budgets** — per-model cost on every run. `[budget]` block in `rocky.toml`; `budget_breach` hook event on exceed.
 3. **Resume + circuit breakers** — three-state `CircuitBreaker`, checkpointed run state, deploy safety.
 4. **Observability** — `rocky trace` Gantt output, OpenTelemetry OTLP export (feature-gated).
@@ -51,7 +51,7 @@ A Rust-based control plane for warehouse-side data work. Storage and compute sta
 | Dependencies | `{{ ref('model') }}` | `depends_on = ["model"]` |
 | Tests | `schema.yml` + `dbt test` | Inline checks + assertions in `rocky apply` |
 | State | `manifest.json` + `target/` | Embedded `redb` database |
-| Branches | — | `rocky branch create`, `rocky run --branch <name>` |
+| Branches | — | `rocky branch create`, `rocky plan --branch <name>` |
 | Column-level lineage | Post-hoc (`dbt docs`) | Compile-time output |
 | Cost attribution | — | Per-model, every run |
 

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`_emit_results` no longer crashes on cross-schema same-table-name collisions.** Two independent guards in `component.py` close the failure mode where a Rocky run with row-count anomalies could fail the multi-asset op with `DagsterInvariantViolationError: ... returned an output "..._row_count_anomaly" multiple times` after every table had already been copied successfully:
+  - **Part A — resolver disambiguation.** `_build_table_resolver`'s last-segment fallback previously returned an arbitrary dict-iteration winner when a bare identifier matched multiple translator-mapped keys (e.g. the same connector/table loaded under multiple region prefixes). It now refuses to guess on ambiguity: a unique last-segment match still resolves; an ambiguous match returns `None` and logs a single WARN line. Adopters can disambiguate by emitting schema- or catalog-qualified identifiers (`schema.table` / `catalog.schema.table`) which the trailing-tuple loop resolves deterministically.
+  - **Part B — defensive emit-time dedup.** The table-check and anomaly loops in `_emit_results` now consult `yielded_checks` before emitting, so a same-`(asset_key, check_name)` duplicate is silently dropped (with a debug log) rather than reaching Dagster's duplicate-output invariant. With Part A applied this branch is unreachable for the resolver-collision shape; the dedup guards against any other path that could legitimately yield the same check twice.
+
+  Behaviour change for adopters relying on the previous fuzzy fallback: an ambiguous bare-segment lookup that previously returned an arbitrary winner now drops the event. Adopters whose translator keys are full schema-qualified suffixes (the common case) see zero change.
+
+## [1.32.0] — 2026-05-18
+
+Companion release to engine `v1.34.0`. The dagster bindings pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` via the regenerated Pydantic models. No new dagster API surface — pure codegen cascade. The engine-side `run.rs` typed-error-preserving refactor that ships in `v1.34.0` is what makes the discriminator practically useful in production: downstream Dagster assets that key off run-output errors can now branch on a stable classification rather than `unknown`. Wheel re-cut against the v1.34.0 engine binary.
+
+### Added
+
+- **`RunOutput.errors[*].failure_kind`** typed discriminator (engine `v1.34.0`). Pydantic model regenerated from the engine's JSON schema; the field is an enum with values `connection-failed`, `auth-failed`, `query-rejected`, `transient`, `quota-exceeded`, `not-found`, `unknown`. Strictly additive — re-exported from `dagster_rocky.types` under both the generated and legacy import paths so existing consumers see no breakage. Dagster code that reads `RunResult.errors[...]` can now pattern-match on `.failure_kind` to drive retry / alerting / on-call-routing decisions instead of grepping the error string.
+
+## [1.31.0] — 2026-05-17
+
+Companion release to engine `v1.33.0`. `RockyResource` is migrated to the canonical `rocky plan` + `rocky apply <plan-id>` flow: every Dagster materialization now persists an auditable plan artifact under `.rocky/plans/<plan_id>.json` (the same id a `rocky plan` CLI invocation would produce) and then dispatches `rocky apply` for execution. The public method signatures and return types of `run(...)`, `run_streaming(...)`, and `run_pipes(...)` are preserved. Projects without a `models/` directory next to the config keep their previous single-subprocess `rocky run` argv via an automatic replication-only fallback, so behaviour is preserved for replication-only pipelines. To keep stderr quiet for that fallback path, every subprocess invocation now sets `ROCKY_SUPPRESS_DEPRECATION=1` by default (overrideable via the env var) so the engine's `rocky run` / `rocky branch promote <name>` deprecation notices don't surface as Dagster log noise.
+
 ### Changed
 
 - **Migrate `RockyResource` from `rocky run` to canonical `rocky plan` + `rocky apply <plan-id>` flow** (Cluster 3 B Phase 5). The three execution methods — `run(...)`, `run_streaming(...)`, and `run_pipes(...)` — now invoke `rocky plan` first (buffered, single-digit seconds), capture the persisted `plan_id`, then dispatch `rocky apply <plan_id>` via the existing process model for that method (buffered / streamed-to-`context.log` / Dagster Pipes). Every Dagster materialization now writes an auditable plan artifact at `.rocky/plans/<plan_id>.json` — the same id a `rocky plan` CLI invocation would produce. The public method signatures and return types are unchanged (`run()` and `run_streaming()` still return `RunResult`; `run_pipes()` still returns `PipesClientCompletedInvocation`). Notable subtleties:

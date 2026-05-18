@@ -1,6 +1,6 @@
 # Rocky — Agent Instructions
 
-Rocky is a Rust-based control plane for warehouse SQL pipelines. It owns the DAG: compile-time types, branches + replay, column-level lineage, drift handling, incremental logic, and per-model cost attribution. Storage and compute stay with the warehouse (Databricks, Snowflake, BigQuery, DuckDB).
+Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-time types, branches + replay, column-level lineage, drift handling, incremental logic, and per-model cost attribution. Storage and compute stay with the warehouse (Databricks, Snowflake, BigQuery, DuckDB).
 
 ## Key Concepts
 

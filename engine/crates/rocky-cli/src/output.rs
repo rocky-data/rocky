@@ -371,11 +371,154 @@ pub struct AnomalyOutput {
     pub reason: String,
 }
 
+/// Coarse-grained failure classification for an entry on
+/// [`RunOutput::errors`]. Lets orchestrators branch on the kind of
+/// failure (retry, page someone, surface in the UI) without parsing the
+/// free-form `error` string.
+///
+/// Variants partition the [`rocky_databricks::connector::ConnectorError`]
+/// and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown`
+/// is the fallback for non-connector failures (drift, governance,
+/// adapter-internal errors) where the error reached the output layer
+/// already type-erased.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureKind {
+    /// TCP / TLS / DNS / connection-establishment failure.
+    ConnectionFailed,
+    /// Credentials rejected, token expired or otherwise invalid.
+    AuthFailed,
+    /// Warehouse rejected the SQL — syntax error, schema mismatch,
+    /// missing permission, semantic analysis failure.
+    QueryRejected,
+    /// Retry-worthy failure — 5xx, network glitch, statement aborted by
+    /// a transient warehouse condition.
+    Transient,
+    /// Rate limit hit or a configured budget cap (retry budget, circuit
+    /// breaker, account-level quota).
+    QuotaExceeded,
+    /// Requested catalog / schema / table not present.
+    NotFound,
+    /// Fallback when the failure could not be classified — e.g. errors
+    /// raised outside the connector layer that reach this struct
+    /// type-erased through `anyhow::Error`.
+    #[default]
+    Unknown,
+}
+
+impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
+    fn from(err: &rocky_databricks::connector::ConnectorError) -> Self {
+        use rocky_databricks::connector::ConnectorError as E;
+        match err {
+            E::Auth(_) => FailureKind::AuthFailed,
+            E::Http(e) => {
+                if e.is_connect() {
+                    FailureKind::ConnectionFailed
+                } else if e.is_timeout() {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::ConnectionFailed
+                }
+            }
+            E::StatementFailed { .. } => FailureKind::QueryRejected,
+            E::Timeout { .. } => FailureKind::Transient,
+            E::Canceled { .. } => FailureKind::Unknown,
+            E::UnexpectedState { .. } => FailureKind::Unknown,
+            E::ApiError { status, .. } => match status {
+                401 | 403 => FailureKind::AuthFailed,
+                404 => FailureKind::NotFound,
+                429 => FailureKind::QuotaExceeded,
+                500..=599 => FailureKind::Transient,
+                _ => FailureKind::QueryRejected,
+            },
+            E::CircuitBreakerOpen { .. } => FailureKind::Transient,
+            E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
+        }
+    }
+}
+
+impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
+    fn from(err: &rocky_snowflake::connector::ConnectorError) -> Self {
+        use rocky_snowflake::connector::ConnectorError as E;
+        match err {
+            E::Auth(_) => FailureKind::AuthFailed,
+            E::Http(e) => {
+                if e.is_connect() {
+                    FailureKind::ConnectionFailed
+                } else if e.is_timeout() {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::ConnectionFailed
+                }
+            }
+            E::StatementFailed { .. } => FailureKind::QueryRejected,
+            E::Timeout { .. } => FailureKind::Transient,
+            E::ApiError { status, .. } => match status {
+                401 | 403 => FailureKind::AuthFailed,
+                404 => FailureKind::NotFound,
+                429 => FailureKind::QuotaExceeded,
+                500..=599 => FailureKind::Transient,
+                _ => FailureKind::QueryRejected,
+            },
+            E::CircuitBreakerOpen { .. } => FailureKind::Transient,
+            E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
+        }
+    }
+}
+
+/// Walk an `anyhow::Error`'s `chain()` looking for a typed
+/// `ConnectorError` and classify it via [`FailureKind`]. Returns
+/// [`FailureKind::Unknown`] when neither connector enum is reachable.
+///
+/// Production-path note: adapter calls go through
+/// [`rocky_adapter_sdk::AdapterError`], a `Box<dyn Error>` wrapper
+/// whose `Error::source()` impl returns the *inner*'s source — so a
+/// bare `chain()` walk skips past the wrapper straight to whatever the
+/// `ConnectorError` carries (e.g. `reqwest::Error`) and never sees the
+/// connector variant itself. To handle that, each cause is also
+/// downcast to `AdapterError`; when matched, its
+/// [`AdapterError::inner`] is probed for the typed `ConnectorError`.
+///
+/// Many existing call sites in `run.rs` still build their `anyhow`
+/// errors via `anyhow::anyhow!("…{e}")`, which stringifies the
+/// `AdapterError` and drops the type. Migrating those to `.context(…)`
+/// is a separate, mechanical follow-up — the classifier is correct,
+/// its reach grows as those sites are converted.
+fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKind> {
+    if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some(e.into());
+    }
+    None
+}
+
+pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
+    for cause in err.chain() {
+        if let Some(kind) = classify_cause(cause) {
+            return kind;
+        }
+        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+            if let Some(kind) = classify_cause(adapter_err.inner()) {
+                return kind;
+            }
+        }
+    }
+    FailureKind::Unknown
+}
+
 /// Error from a table that failed during parallel processing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TableErrorOutput {
     pub asset_key: Vec<String>,
     pub error: String,
+    /// Coarse classification of the failure so orchestrators can branch
+    /// on kind (retry, page, surface) without parsing `error`. Defaults
+    /// to [`FailureKind::Unknown`] for errors that reached the output
+    /// layer type-erased.
+    #[serde(default)]
+    pub failure_kind: FailureKind,
 }
 
 /// A table that the discovery adapter reported but that is missing from
@@ -2195,6 +2338,107 @@ fn default_parallel() -> u32 {
 // so existing consumers and fixtures remain byte-stable when the compile path
 // is absent.
 
+/// A connector snapshot recorded in a `ReplicationPlan` for stale-source
+/// detection at apply time.
+///
+/// Volatile fields are intentionally omitted: `last_sync_at` is a
+/// wall-clock value that wiggles every sync, and the adapter-namespaced
+/// `metadata` map can include fields like rate-limit counters that
+/// change without altering the replication contract. Only the identity
+/// of the source (`id`, `schema`, `source_type`) and the table list
+/// (sorted, name + row_count) influence the plan_id digest.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReplicationConnectorSnapshot {
+    pub id: String,
+    pub schema: String,
+    pub source_type: String,
+    /// Tables discovered for this connector. Sorted by `name` so the
+    /// serialized payload is deterministic across discover runs.
+    pub tables: Vec<ReplicationTableSnapshot>,
+}
+
+/// A table snapshot inside a `ReplicationConnectorSnapshot`.
+///
+/// `row_count` is captured when the discovery adapter surfaces it
+/// (DuckDB does; Fivetran does not). Including the count in the
+/// snapshot means a row-count change between plan and apply marks the
+/// plan stale — that's intentional for the row-count-aware adapters,
+/// since downstream materializations may depend on size class.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReplicationTableSnapshot {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+}
+
+/// Plan payload persisted by `rocky plan` for a replication-only project.
+///
+/// A "replication-only" project is one with no `models/` directory (or
+/// where `models/` exists but compile returns zero models). For those
+/// the `RunPlan` spine has nothing to persist — there are no models
+/// to re-derive at apply time. This payload captures the full
+/// `RockyConfig` plus the discovered source state so the plan_id is
+/// genuinely content-addressed: same config + same source state ⇒
+/// same plan_id.
+///
+/// ## Design call: plan-time discovery (not apply-time)
+///
+/// Discovery already runs inside `rocky plan` today (the existing
+/// statement preview iterates discovered connectors). Capturing the
+/// snapshot in the plan payload is essentially free I/O-wise and
+/// gives us a deterministic plan_id keyed on observable inputs.
+/// Apply re-runs discovery and asserts the snapshot still matches —
+/// any drift fails with a clear "re-plan and re-apply" error before
+/// SQL is emitted.
+///
+/// ## What is NOT in the snapshot
+///
+/// - `last_sync_at` (volatile, not part of the replication contract)
+/// - Adapter-namespaced `metadata` map (rate-limit counters etc.
+///   change without altering what gets replicated)
+///
+/// Including those would invite "I planned, waited 5 minutes, and now
+/// the plan is stale" surprises with no actionable difference.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationPlan {
+    /// `--filter` passed to `rocky plan` (e.g. `"client=acme"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// `--pipeline` if specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// `--env` for governance preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// `--idempotency-key` (or `ROCKY_IDEMPOTENCY_KEY`). Different keys
+    /// produce different plan_ids — the hash discriminates, mirroring
+    /// `RunPlan`'s behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// `--resume <run_id>` if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// `--resume-latest` toggle. Resolved against the state store at
+    /// apply time, like `RunPlan.resume_latest`.
+    #[serde(default)]
+    pub resume_latest: bool,
+    /// Governance override resolved at plan time from
+    /// `--governance-override`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governance_override: Option<rocky_core::config::GovernanceOverride>,
+    /// Full `RockyConfig` snapshot, serialised after env-var
+    /// substitution. Captured verbatim — apply does not try to extract
+    /// "the replication-relevant subset" because that's a footgun: any
+    /// hidden runtime dependency on a config field that isn't in the
+    /// subset would silently break replay. Cheaper to keep the whole
+    /// config and let the hash do its job.
+    pub config_snapshot: serde_json::Value,
+    /// Discovered connectors sorted by `id`. Tables within each
+    /// connector are sorted by `name`. Apply re-discovers and asserts
+    /// byte-equality against this snapshot before running SQL.
+    pub source_state_snapshot: Vec<ReplicationConnectorSnapshot>,
+}
+
 /// JSON output for `rocky apply <plan-id>`.
 ///
 /// Wraps the inner apply output (compact / archive / run) with a top-level
@@ -3687,6 +3931,7 @@ mod run_record_tests {
         out.errors.push(TableErrorOutput {
             asset_key: vec!["s".to_string(), "broken".to_string()],
             error: "connection refused".to_string(),
+            failure_kind: FailureKind::Unknown,
         });
 
         let started = fixed_start();
@@ -5022,5 +5267,366 @@ impl PreviewCostOutput {
             projected_per_model_budget_breaches,
             markdown,
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_kind_tests {
+    //! Mapping coverage for [`FailureKind`] against every variant of
+    //! Databricks and Snowflake [`ConnectorError`]. The `Http(reqwest::Error)`
+    //! variant is not directly constructed here (reqwest exposes no public
+    //! constructor) — its mapping is exercised end-to-end inside the
+    //! `classify_anyhow_error` path.
+    use super::*;
+    use rocky_databricks::connector::ConnectorError as DbE;
+    use rocky_snowflake::connector::ConnectorError as SnE;
+
+    fn db_api(status: u16) -> DbE {
+        DbE::ApiError {
+            status,
+            body: String::new(),
+        }
+    }
+
+    fn sn_api(status: u16) -> SnE {
+        SnE::ApiError {
+            status,
+            body: String::new(),
+        }
+    }
+
+    // ---- Databricks ConnectorError → FailureKind --------------------------
+
+    #[test]
+    fn databricks_auth_maps_to_auth_failed() {
+        let e = DbE::Auth(rocky_databricks::auth::AuthError::NoAuthConfigured);
+        assert_eq!(FailureKind::from(&e), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn databricks_statement_failed_maps_to_query_rejected() {
+        let e = DbE::StatementFailed {
+            id: "stmt-1".into(),
+            message: "syntax error".into(),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn databricks_timeout_maps_to_transient() {
+        let e = DbE::Timeout {
+            id: "stmt-1".into(),
+            seconds: 30,
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+    }
+
+    #[test]
+    fn databricks_canceled_maps_to_unknown() {
+        let e = DbE::Canceled {
+            id: "stmt-1".into(),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+    }
+
+    #[test]
+    fn databricks_unexpected_state_maps_to_unknown() {
+        let e = DbE::UnexpectedState {
+            id: "stmt-1".into(),
+            state: "FOO".into(),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+    }
+
+    #[test]
+    fn databricks_api_error_401_403_maps_to_auth_failed() {
+        assert_eq!(FailureKind::from(&db_api(401)), FailureKind::AuthFailed);
+        assert_eq!(FailureKind::from(&db_api(403)), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn databricks_api_error_404_maps_to_not_found() {
+        assert_eq!(FailureKind::from(&db_api(404)), FailureKind::NotFound);
+    }
+
+    #[test]
+    fn databricks_api_error_429_maps_to_quota_exceeded() {
+        assert_eq!(FailureKind::from(&db_api(429)), FailureKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn databricks_api_error_5xx_maps_to_transient() {
+        for status in [500u16, 502, 503, 504, 599] {
+            assert_eq!(
+                FailureKind::from(&db_api(status)),
+                FailureKind::Transient,
+                "status {status}",
+            );
+        }
+    }
+
+    #[test]
+    fn databricks_api_error_other_maps_to_query_rejected() {
+        assert_eq!(FailureKind::from(&db_api(400)), FailureKind::QueryRejected);
+        assert_eq!(FailureKind::from(&db_api(409)), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn databricks_circuit_breaker_maps_to_transient() {
+        let e = DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+    }
+
+    #[test]
+    fn databricks_retry_budget_exhausted_maps_to_quota_exceeded() {
+        let e = DbE::RetryBudgetExhausted { limit: 10 };
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+    }
+
+    // ---- Snowflake ConnectorError → FailureKind ---------------------------
+
+    #[test]
+    fn snowflake_auth_maps_to_auth_failed() {
+        let e = SnE::Auth(rocky_snowflake::auth::AuthError::NoAuthConfigured);
+        assert_eq!(FailureKind::from(&e), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn snowflake_statement_failed_maps_to_query_rejected() {
+        let e = SnE::StatementFailed {
+            handle: "h-1".into(),
+            message: "compile error".into(),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn snowflake_timeout_maps_to_transient() {
+        let e = SnE::Timeout {
+            handle: "h-1".into(),
+            seconds: 60,
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+    }
+
+    #[test]
+    fn snowflake_api_error_401_403_maps_to_auth_failed() {
+        assert_eq!(FailureKind::from(&sn_api(401)), FailureKind::AuthFailed);
+        assert_eq!(FailureKind::from(&sn_api(403)), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn snowflake_api_error_404_maps_to_not_found() {
+        assert_eq!(FailureKind::from(&sn_api(404)), FailureKind::NotFound);
+    }
+
+    #[test]
+    fn snowflake_api_error_429_maps_to_quota_exceeded() {
+        assert_eq!(FailureKind::from(&sn_api(429)), FailureKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn snowflake_api_error_5xx_maps_to_transient() {
+        for status in [500u16, 502, 503, 504, 599] {
+            assert_eq!(
+                FailureKind::from(&sn_api(status)),
+                FailureKind::Transient,
+                "status {status}",
+            );
+        }
+    }
+
+    #[test]
+    fn snowflake_api_error_other_maps_to_query_rejected() {
+        assert_eq!(FailureKind::from(&sn_api(400)), FailureKind::QueryRejected);
+        assert_eq!(FailureKind::from(&sn_api(422)), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn snowflake_circuit_breaker_maps_to_transient() {
+        let e = SnE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+    }
+
+    #[test]
+    fn snowflake_retry_budget_exhausted_maps_to_quota_exceeded() {
+        let e = SnE::RetryBudgetExhausted { limit: 10 };
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+    }
+
+    // ---- classify_anyhow_error chain walk --------------------------------
+
+    #[test]
+    fn classify_anyhow_walks_chain_for_databricks_connector_error() {
+        let err = anyhow::Error::new(DbE::StatementFailed {
+            id: "s".into(),
+            message: "boom".into(),
+        })
+        .context("running materialization");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn classify_anyhow_walks_chain_for_snowflake_connector_error() {
+        let err = anyhow::Error::new(SnE::Timeout {
+            handle: "h".into(),
+            seconds: 30,
+        })
+        .context("running materialization");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
+    }
+
+    #[test]
+    fn classify_anyhow_returns_unknown_when_no_connector_error_in_chain() {
+        let err = anyhow::anyhow!("some non-connector failure");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Unknown);
+    }
+
+    #[test]
+    fn classify_anyhow_unwraps_adapter_error_wrapping_databricks_connector() {
+        // Mirrors the production path: ConnectorError is wrapped in
+        // AdapterError (boxed) before crossing into anyhow.
+        let conn_err = DbE::ApiError {
+            status: 429,
+            body: String::new(),
+        };
+        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
+        let conn_err = SnE::Timeout {
+            handle: "h".into(),
+            seconds: 30,
+        };
+        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
+    }
+
+    // ---- Serialization contract ------------------------------------------
+
+    #[test]
+    fn failure_kind_serializes_to_kebab_case() {
+        let cases = [
+            (FailureKind::ConnectionFailed, "\"connection-failed\""),
+            (FailureKind::AuthFailed, "\"auth-failed\""),
+            (FailureKind::QueryRejected, "\"query-rejected\""),
+            (FailureKind::Transient, "\"transient\""),
+            (FailureKind::QuotaExceeded, "\"quota-exceeded\""),
+            (FailureKind::NotFound, "\"not-found\""),
+            (FailureKind::Unknown, "\"unknown\""),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                expected,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_kind_default_is_unknown() {
+        assert_eq!(FailureKind::default(), FailureKind::Unknown);
+    }
+
+    // ---- run.rs-style conversion preserves typed variant ----------------
+    //
+    // These pin the conversion idiom now used in `commands/run.rs`. They
+    // ensure that the way `run.rs` materializes its `anyhow::Error`s
+    // (`.map_err(anyhow::Error::from)?` for bare wraps, and
+    // `anyhow::Error::from(e).context(...)` for prefixed wraps) keeps the
+    // typed `AdapterError` in the source chain so `classify_anyhow_error`
+    // can downcast to it and map to the correct `FailureKind`. The old
+    // `anyhow::anyhow!("{e}")` pattern stringified the typed error before
+    // the wrap and made the classifier fall through to `Unknown`.
+    //
+    // Three connector variants are pinned to prove the wiring isn't
+    // variant-specific.
+    fn db_adapter_err(conn: DbE) -> rocky_adapter_sdk::AdapterError {
+        rocky_adapter_sdk::AdapterError::new(conn)
+    }
+
+    fn sn_adapter_err(conn: SnE) -> rocky_adapter_sdk::AdapterError {
+        rocky_adapter_sdk::AdapterError::new(conn)
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_databricks_statement_failed() {
+        // Mirrors `.map_err(anyhow::Error::from)?` on an
+        // `AdapterResult<()>` returned from `WarehouseAdapter::execute_statement`.
+        let result: rocky_adapter_sdk::AdapterResult<()> =
+            Err(db_adapter_err(DbE::StatementFailed {
+                id: "stmt-1".into(),
+                message: "syntax error".into(),
+            }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_snowflake_timeout() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::Timeout {
+            handle: "h-1".into(),
+            seconds: 60,
+        }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
+    }
+
+    #[test]
+    fn run_path_bare_wrap_preserves_databricks_quota_exceeded() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(db_adapter_err(DbE::ApiError {
+            status: 429,
+            body: String::new(),
+        }));
+        let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn run_path_context_wrap_preserves_databricks_statement_failed() {
+        // Mirrors `anyhow::Error::from(e).context(format!("..."))` used at
+        // the run.rs bootstrap / model-failed / partition record sites.
+        let adapter_err = db_adapter_err(DbE::StatementFailed {
+            id: "stmt-1".into(),
+            message: "compile error".into(),
+        });
+        let err = anyhow::Error::from(adapter_err).context(format!(
+            "bootstrap of '{}' for model '{}' failed",
+            "tgt", "m"
+        ));
+        assert_eq!(classify_anyhow_error(&err), FailureKind::QueryRejected);
+    }
+
+    #[test]
+    fn run_path_context_wrap_preserves_snowflake_auth_failed() {
+        let adapter_err = sn_adapter_err(SnE::ApiError {
+            status: 401,
+            body: String::new(),
+        });
+        let err = anyhow::Error::from(adapter_err).context("model 'orders' failed");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::AuthFailed);
+    }
+
+    #[test]
+    fn run_path_unconverted_anyhow_macro_still_returns_unknown() {
+        // Negative control: the old lossy pattern still drops the typed
+        // variant. If this ever starts returning the typed kind, the
+        // classifier behaviour shifted and the rest of these pins should
+        // be reviewed.
+        let adapter_err = db_adapter_err(DbE::StatementFailed {
+            id: "stmt-1".into(),
+            message: "syntax".into(),
+        });
+        let err = anyhow::anyhow!("{adapter_err}");
+        assert_eq!(classify_anyhow_error(&err), FailureKind::Unknown);
     }
 }

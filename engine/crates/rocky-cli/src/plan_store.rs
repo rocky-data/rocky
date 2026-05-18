@@ -19,17 +19,18 @@
 //!
 //! [`PersistedPlan::format_version`] tags the on-disk plan shape:
 //!
-//! - **`1` (default; the only format prior to C-5):** the `payload` is a
-//!   full `CompactOutput` / `ArchiveOutput` / `RunPlan` / `PromotePlan`
-//!   envelope including inline SQL strings. Apply reads SQL directly from
-//!   the payload.
-//! - **`2` (opt-in via `[plan_store] format = "v2"`):** for compact and
-//!   archive plans, the `payload` is a [`rocky_ir::CompactPlanIr`] /
-//!   [`rocky_ir::ArchivePlanIr`]; apply regenerates SQL via
-//!   `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Run plans
-//!   keep `format_version = 1` (they are already IR-only by construction);
-//!   promote plans always keep `format_version = 1` (governance audit
-//!   exception per the Phase C audit memo §Q2).
+//! - **`1` (legacy; the only format prior to C-5, opt-in as of v1.35):**
+//!   the `payload` is a full `CompactOutput` / `ArchiveOutput` / `RunPlan`
+//!   / `PromotePlan` envelope including inline SQL strings. Apply reads
+//!   SQL directly from the payload.
+//! - **`2` (default as of v1.35; selected when `[plan_store] format = "v2"`
+//!   or omitted):** for compact and archive plans, the `payload` is a
+//!   [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]; apply
+//!   regenerates SQL via `rocky_core::sql_gen::{compact_from_ir,
+//!   archive_from_ir}`. Run plans keep `format_version = 1` (they are
+//!   already IR-only by construction); promote plans always keep
+//!   `format_version = 1` (governance audit exception per the Phase C
+//!   audit memo §Q2).
 //!
 //! The reader accepts both versions unconditionally — a v1 plan on disk
 //! continues to apply against a binary configured for v2 writes, and vice
@@ -58,6 +59,15 @@ pub enum PlanKind {
     /// list, execution layers). Full `ProjectIr` is not persisted — `apply`
     /// re-derives it by re-compiling with the same flags.
     Run,
+    /// A `rocky plan` / `rocky apply` plan for a replication-only project
+    /// (no `models/` directory, or `models/` exists but contains zero
+    /// compiled models). The payload is a `ReplicationPlan` struct
+    /// capturing the canonical `RockyConfig` snapshot and the discovered
+    /// source state (sorted connectors + tables) at plan time. At apply
+    /// time discovery is re-run and the snapshot is asserted byte-equal
+    /// against the persisted one — stale plans are rejected with a clear
+    /// "re-plan and re-apply" error before any SQL is executed.
+    Replication,
     /// A `rocky plan promote` / `rocky apply` promote plan. The payload is a
     /// `PromotePlan` struct (branch name, base ref, per-target SQL statements,
     /// plan-time audit events). At apply time the branch-state hash is
@@ -72,6 +82,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Compact => write!(f, "compact"),
             PlanKind::Archive => write!(f, "archive"),
             PlanKind::Run => write!(f, "run"),
+            PlanKind::Replication => write!(f, "replication"),
             PlanKind::Promote => write!(f, "promote"),
         }
     }
@@ -145,7 +156,7 @@ fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
 ///
 /// This is the **v1** writer entry point. Tags the persisted record with
 /// `format_version = 1`. For the v2 typed-IR writer used by `rocky compact`
-/// / `rocky archive` when `[plan_store] format = "v2"`, see
+/// / `rocky archive` under the default `[plan_store] format = "v2"`, see
 /// [`write_plan_v2`].
 pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
     write_plan_inner(root, kind, payload, 1)
@@ -153,8 +164,9 @@ pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Res
 
 /// Persist a **v2** typed-IR plan payload (`format_version = 2`).
 ///
-/// Used by `rocky compact` / `rocky archive` when `[plan_store] format =
-/// "v2"`. `payload` is expected to be a [`rocky_ir::CompactPlanIr`] /
+/// Used by `rocky compact` / `rocky archive` under the default
+/// `[plan_store] format = "v2"` (v1.35.0 onward). `payload` is expected
+/// to be a [`rocky_ir::CompactPlanIr`] /
 /// [`rocky_ir::ArchivePlanIr`] (or any serde value the apply path knows
 /// how to reconstruct into one).
 ///
@@ -302,6 +314,7 @@ mod tests {
         let id_compact = write_plan(dir.path(), PlanKind::Compact, &payload)?;
         let id_archive = write_plan(dir.path(), PlanKind::Archive, &payload)?;
         let id_run = write_plan(dir.path(), PlanKind::Run, &payload)?;
+        let id_replication = write_plan(dir.path(), PlanKind::Replication, &payload)?;
         let id_promote = write_plan(dir.path(), PlanKind::Promote, &payload)?;
         assert_ne!(
             id_compact, id_archive,
@@ -314,6 +327,14 @@ mod tests {
         assert_ne!(
             id_archive, id_run,
             "archive and run must produce different plan_ids"
+        );
+        assert_ne!(
+            id_run, id_replication,
+            "run and replication must produce different plan_ids"
+        );
+        assert_ne!(
+            id_compact, id_replication,
+            "compact and replication must produce different plan_ids"
         );
         assert_ne!(
             id_compact, id_promote,
@@ -348,6 +369,39 @@ mod tests {
     }
 
     #[test]
+    fn replication_kind_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.replication_table",
+            statement_count: 4,
+        };
+
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &payload)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Replication);
+        assert_eq!(
+            plan.payload["model"],
+            serde_json::json!("cat.sc.replication_table")
+        );
+        assert_eq!(plan.payload["statement_count"], serde_json::json!(4));
+        Ok(())
+    }
+
+    /// `PlanKind::Replication` serializes to the snake_case wire name
+    /// `"replication"`, mirroring the other variants. The dispatcher in
+    /// `commands::apply` relies on this for round-trip dispatch.
+    #[test]
+    fn replication_kind_wire_name() {
+        let kind = PlanKind::Replication;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, r#""replication""#);
+        let parsed: PlanKind = serde_json::from_str(r#""replication""#).unwrap();
+        assert_eq!(parsed, PlanKind::Replication);
+    }
+
+    #[test]
     fn run_kind_round_trip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let payload = DummyPayload {
@@ -370,6 +424,7 @@ mod tests {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
         assert_eq!(PlanKind::Archive.to_string(), "archive");
         assert_eq!(PlanKind::Run.to_string(), "run");
+        assert_eq!(PlanKind::Replication.to_string(), "replication");
         assert_eq!(PlanKind::Promote.to_string(), "promote");
     }
 
@@ -416,9 +471,10 @@ mod tests {
     #[test]
     fn write_plan_tags_format_version_one() -> anyhow::Result<()> {
         // C-5 invariant: the legacy `write_plan` entry point always tags
-        // the persisted record with `format_version = 1`. Existing callers
-        // (single-model and catalog-scope compact/archive paths under the
-        // v1 default) keep producing v1 plans byte-for-byte.
+        // the persisted record with `format_version = 1`. Callers that
+        // opt into the v1 on-disk shape via `[plan_store] format = "v1"`
+        // (single-model and catalog-scope compact/archive paths) keep
+        // producing v1 plans byte-for-byte.
         let dir = tempfile::tempdir()?;
         let payload = DummyPayload {
             model: "cat.sc.tbl",

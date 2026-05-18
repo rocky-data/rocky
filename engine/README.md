@@ -1,6 +1,6 @@
 # Rocky
 
-A Rust-based control plane for warehouse SQL pipelines: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Single static binary; storage and compute stay with your warehouse.
+A typed-program layer above the warehouse: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Single static binary; storage and compute stay with your warehouse.
 
 **Rocky is not a warehouse.** Storage and compute stay with your warehouse; Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
 

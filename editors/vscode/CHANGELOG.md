@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-05-18
+
+Two small additive changes. The TypeScript bindings under `src/types/generated/` pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` (engine `v1.34.0`); the `@rocky` chat-participant system prompt is reframed to "typed-program layer above the warehouse" so the chat participant's self-introduction matches the public README and docs site copy.
+
+### Added
+
+- **`RunOutput.errors[*].failure_kind`** typed discriminator (engine `v1.34.0`). TypeScript interface regenerated in `src/types/generated/run.ts`; the field is a union with values `"connection-failed" | "auth-failed" | "query-rejected" | "transient" | "quota-exceeded" | "not-found" | "unknown"`. Extension code consuming `rocky run --output json` via `rockyJson.ts` now type-checks against the discriminator without further hand-edits.
+
+### Changed
+
+- **`@rocky` chat-participant framing**. System prompt in `src/chatParticipant.ts` updated from "Rust-based control plane for warehouse SQL pipelines" to "typed-program layer above the warehouse" so the chat participant's self-introduction matches the README, docs site, and `CLAUDE.md` copy across the monorepo. No behavioural change for slash commands; only the natural-language fallback prompt is reframed.
+
+## [1.18.1] — 2026-05-17
+
+Codegen-companion patch release for engine `v1.33.0`. The TypeScript bindings under `src/types/generated/` are regenerated to pick up the new `NamedStatement.sql` optionality (`compact.ts` / `archive.ts` — today's emission path still writes `sql`, so consumer code sees no behaviour change) and the new top-level `[plan_store] format = "v1" | "v2"` field on `rocky_project.ts`. No new extension commands, UI, or settings — types are available for future extension wiring.
+
+### Changed
+
+- **Codegen pickup of the engine Cluster 3 C IR foundation (engine v1.33.0).** Regenerated TypeScript interfaces in `src/types/generated/`: `NamedStatement.sql` is now optional on `compact.ts` / `archive.ts` (today's engine always writes `sql`, so existing consumer code is unaffected); `rocky_project.ts` picks up the new top-level `plan_store: { format: "v1" | "v2" }` config field with default `"v1"`. No new commands or sidebar entries — types are available for future PRs.
+
 ## [1.18.0] — 2026-05-15
 
 Lineage rail redesign and SVG export, plus four lineage rendering bug fixes from [#524](https://github.com/rocky-data/rocky/pull/524). The collapsible right-docked rail replaces the old toolbar + side panel layout, and the SVG exporter now produces standalone-readable files with VS Code colours resolved to concrete values. Also picks up the TypeScript codegen for the engine's Cluster 3 B plan/apply spine — `compact_apply`, `archive_apply`, `plan`, `apply`, and `promote_plan` typed surfaces are available in `src/types/generated/` for future extension wiring; no new commands are registered in this release.

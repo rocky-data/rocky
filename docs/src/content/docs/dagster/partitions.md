@@ -14,9 +14,9 @@ variants.
 
 These are **standalone helpers** today. The `RockyComponent`-side wiring
 (group splitting by partitioning shape, threading partition keys through
-`rocky run --partition`) is a follow-up that depends on derived-model
-surfacing — currently the component emits source-replication tables only,
-none of which use `time_interval`.
+`rocky plan --partition` + `rocky apply`) is a follow-up that depends on
+derived-model surfacing — currently the component emits source-replication
+tables only, none of which use `time_interval`.
 
 ## Strategy mapping
 
@@ -148,7 +148,7 @@ def fct_daily_orders_asset(
     rocky_key = dagster_to_rocky_partition_key("day", context.partition_key)
     result = rocky.run(
         filter="layer=marts",
-        partition=rocky_key,   # threads through to `rocky run --partition <key>`
+        partition=rocky_key,   # threads through to `rocky plan --partition <key>` + `rocky apply`
     )
     return result.tables_copied
 ```

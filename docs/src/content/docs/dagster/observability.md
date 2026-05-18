@@ -11,10 +11,29 @@ warnings to first-class Dagster primitives:
 - **Schema drift** → `dg.AssetObservation` events on the asset timeline
 - **Row-count anomalies** → `dg.AssetCheckResult` with severity `WARN`
 - **Optimization recommendations** → `AssetSpec.metadata` (load-time)
+- **Plan artifact trail** → `.rocky/plans/<plan-id>.json` per materialization
 
 Drift and anomaly emission is **automatic** when using `RockyComponent` —
 nothing to wire up. Standalone helpers are also exported for users with
 hand-rolled multi_assets.
+
+## Plan artifact per materialization
+
+Every `RockyResource.run()`, `run_streaming()`, and `run_pipes()` call
+chains `rocky plan` + `rocky apply <plan-id>` under the hood (as of
+`dagster-rocky` v1.30), and each invocation writes the typed plan to
+`.rocky/plans/<plan-id>.json` before the apply phase runs. That file is
+the audit record of *exactly what Rocky tried to apply*: the materialization
+list, governance plan, drift actions, and inline SQL (or typed IR — see
+[Configuration › `[plan_store]`](/reference/configuration/#plan_store)).
+
+For `run_pipes`, the plan id is also attached as `extras={"plan_id":
+plan_id}` so Dagster surfaces it as run metadata in the run viewer — one
+click from a failed materialization back to the plan that produced it.
+
+Replication-only projects (no `models/` directory) fall back to the
+legacy single-subprocess `rocky run` path and do not write a plan
+artifact for now.
 
 ## Drift events as `AssetObservation`
 

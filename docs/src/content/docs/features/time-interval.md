@@ -108,7 +108,7 @@ is rejected even though `chrono` would parse it.
 
 ## CLI flags
 
-> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`. The partition-selection flags below currently live on the `rocky run` alias only; plumbing them through `rocky plan` + `rocky apply` is a future-phase follow-up.
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`. Every partition-selection flag below is accepted on both `rocky plan` and `rocky run`.
 
 `rocky run` accepts seven new flags for selecting and modifying which
 partitions to compute. The selection flags are mutually exclusive (`clap`

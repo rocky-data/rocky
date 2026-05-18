@@ -1970,6 +1970,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),
@@ -2654,6 +2656,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: format!(
                 "SELECT {time_column} FROM upstream WHERE {time_column} >= @start_date AND {time_column} < @end_date"

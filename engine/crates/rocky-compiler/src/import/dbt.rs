@@ -305,6 +305,8 @@ fn import_manifest_node(
         classification: Default::default(),
         retention: None,
         budget: None,
+        name_declared: String::new(),
+        target_table_declared: String::new(),
     };
 
     result.imported.push(ImportedModel {
@@ -676,6 +678,8 @@ fn import_single_model(
         classification: Default::default(),
         retention: None,
         budget: None,
+        name_declared: String::new(),
+        target_table_declared: String::new(),
     };
 
     Ok((

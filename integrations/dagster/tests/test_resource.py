@@ -318,9 +318,26 @@ def test_run_rocky_timeout_kills_proc_and_raises():
 def test_run_passes_governance_override_as_json():
     rocky = RockyResource()
     captured: list[list[str]] = []
+    plan_id = "a" * 64
 
     def fake_run(*, args, **_):
         captured.append(args)
+        if args[0] == "plan":
+            # Phase 5b: plan emits a real plan_id even for
+            # replication-only projects. ``--governance-override``
+            # appears on both ``plan`` and ``apply``, but the test
+            # only needs to see it land on the plan argv.
+            return json.dumps(
+                {
+                    "version": "0.1.0",
+                    "command": "plan",
+                    "filter": "tenant=acme",
+                    "statements": [],
+                    "plan_id": plan_id,
+                    "plan_kind": "replication",
+                    "created_at": "2026-05-18T00:00:00Z",
+                }
+            )
         return (
             '{"version":"0.3.0","command":"run","filter":"tenant=acme",'
             '"duration_ms":0,"tables_copied":0,"materializations":[],'
@@ -333,6 +350,8 @@ def test_run_passes_governance_override_as_json():
         run_mock.side_effect = lambda self, args, allow_partial=False: fake_run(args=args)
         rocky.run(filter="tenant=acme", governance_override={"workspace_ids": [1, 2]})
 
+    # `rocky plan` is invoked first; the governance override flag must
+    # land on its argv (the persisted plan stamps the override).
     assert "--governance-override" in captured[0]
     idx = captured[0].index("--governance-override")
     assert '"workspace_ids"' in captured[0][idx + 1]
@@ -420,9 +439,22 @@ def test_run_rejects_empty_workspace_ids_before_subprocess():
 def test_run_with_run_models_appends_models_and_all():
     rocky = RockyResource(models_dir="m")
     captured: list[list[str]] = []
+    plan_id = "a" * 64
 
     def fake_run(self, args, allow_partial=False):
         captured.append(args)
+        if args[0] == "plan":
+            return json.dumps(
+                {
+                    "version": "0.1.0",
+                    "command": "plan",
+                    "filter": "tenant=acme",
+                    "statements": [],
+                    "plan_id": plan_id,
+                    "plan_kind": "replication",
+                    "created_at": "2026-05-18T00:00:00Z",
+                }
+            )
         return (
             '{"version":"0.3.0","command":"run","filter":"tenant=acme",'
             '"duration_ms":0,"tables_copied":0,"materializations":[],'
@@ -434,6 +466,8 @@ def test_run_with_run_models_appends_models_and_all():
     with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", run_models=True)
 
+    # `--models <dir> --all` lands on the plan argv (the persisted plan
+    # stamps the model-execution intent).
     assert captured[0][-3:] == ["--models", "m", "--all"]
 
 
@@ -452,12 +486,36 @@ def _empty_run_json() -> str:
     )
 
 
+def _plan_then_run_json(plan_id: str = "a" * 64) -> str:
+    """Return the Phase-5b plan JSON used by plan-args captors."""
+    return json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": plan_id,
+            "plan_kind": "replication",
+            "created_at": "2026-05-18T00:00:00Z",
+        }
+    )
+
+
 def _capture_run_args() -> tuple[list[list[str]], Any]:
-    """Set up a captor + side_effect that records args and returns empty JSON."""
+    """Set up a captor + side_effect for the plan/apply two-step flow.
+
+    Phase 5b: ``rocky.run()`` invokes ``rocky plan`` then
+    ``rocky apply <plan_id>``. Returns the plan JSON on the first call
+    and the empty run JSON on the second. Most flag-plumbing tests
+    assert against ``captured[0]`` — the plan argv — since the engine
+    flag-surface parity guarantees plan and run share the same flags.
+    """
     captured: list[list[str]] = []
 
     def fake_run(self, args, allow_partial=False):
         captured.append(args)
+        if args[0] == "plan":
+            return _plan_then_run_json()
         return _empty_run_json()
 
     return captured, fake_run
@@ -1467,33 +1525,35 @@ def test_run_dispatches_plan_then_apply_when_plan_id_persisted():
     assert result.tables_copied == 1
 
 
-def test_run_falls_back_to_rocky_run_when_plan_id_absent():
-    """Phase 5 fallback — ``rocky plan`` without a ``models/`` directory
-    emits ``plan_id = null``. The integration falls back to the legacy
-    ``rocky run`` argv (single subprocess) so replication-only projects
-    keep working with no functional change."""
+def test_run_routes_replication_only_project_through_apply():
+    """Phase 5b — replication-only projects now content-address a plan
+    just like model-driven projects do, so ``run`` always routes
+    through ``rocky apply`` and never falls back to ``rocky run``. The
+    plan output carries ``plan_kind == "replication"`` and a real
+    64-char plan_id.
+    """
     rocky = RockyResource()
     captured: list[list[str]] = []
+    plan_id = "f" * 64
 
     def fake_run(self, args, allow_partial=False):
         captured.append(list(args))
         if args[0] == "plan":
-            # Engine emits PlanOutput with plan_id = None when no
-            # models/ directory exists next to the config.
+            # Phase 5b: engine emits a real plan_id for replication-only.
             return json.dumps(
                 {
                     "version": "0.1.0",
                     "command": "plan",
                     "filter": "tenant=acme",
                     "statements": [],
-                    "plan_id": None,
-                    "plan_kind": None,
-                    "created_at": None,
+                    "plan_id": plan_id,
+                    "plan_kind": "replication",
+                    "created_at": "2026-05-18T00:00:00Z",
                     "models": [],
                     "execution_layers": [],
                 }
             )
-        # Fallback path runs `rocky run` and returns RunResult directly.
+        # Apply path returns the standard RunResult shape.
         return _run_json()
 
     with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
@@ -1501,11 +1561,42 @@ def test_run_falls_back_to_rocky_run_when_plan_id_absent():
 
     # First call: rocky plan.
     assert captured[0][0] == "plan"
-    # Second call (fallback): rocky run with the original flags.
-    assert captured[1][:3] == ["run", "--filter", "tenant=acme"]
-    # Direct RunResult — no apply envelope unwrap needed.
+    # Second call: rocky apply <plan_id> — NOT the legacy run fallback.
+    assert captured[1] == ["apply", plan_id]
     assert result.command == "run"
     assert result.tables_copied == 1
+
+
+def test_run_raises_when_engine_returns_null_plan_id():
+    """Phase 5b — the engine should always emit a plan_id. When it
+    doesn't (engine version skew, malformed payload), ``_apply_plan``
+    raises :class:`dg.Failure` with an upgrade hint instead of
+    silently falling back to ``rocky run``."""
+    rocky = RockyResource()
+
+    def fake_run(self, args, allow_partial=False):
+        if args[0] == "plan":
+            # Simulated stale-engine payload — plan_id absent.
+            return json.dumps(
+                {
+                    "version": "0.1.0",
+                    "command": "plan",
+                    "filter": "tenant=acme",
+                    "statements": [],
+                    "plan_id": None,
+                }
+            )
+        # If apply were called we'd reach here — but we shouldn't.
+        return _run_json()
+
+    with (
+        patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run),
+        pytest.raises(dg.Failure) as exc,
+    ):
+        rocky.run(filter="tenant=acme")
+
+    assert "plan_id" in str(exc.value)
+    assert "engine-v1.34" in str(exc.value) or "plan_id" in str(exc.value)
 
 
 def test_run_pipes_attaches_extras_with_plan_id():
@@ -1527,13 +1618,11 @@ def test_run_pipes_attaches_extras_with_plan_id():
     assert extras == {"plan_id": plan_id}
 
 
-def test_run_pipes_replication_only_fallback_omits_extras():
-    """Replication-only fallback for run_pipes — no plan_id to surface.
-
-    The single-subprocess ``rocky run`` argv is handed to
-    ``PipesSubprocessClient.run`` (Pipes still emits structured events
-    from the run binary). ``extras`` is NOT passed because there is no
-    plan id to correlate against.
+def test_run_pipes_raises_when_engine_returns_null_plan_id():
+    """Phase 5b — ``run_pipes`` no longer falls back to ``rocky run``
+    when the engine returns a null ``plan_id``. It raises
+    :class:`dg.Failure` so version skew surfaces loudly instead of a
+    silent behaviour change.
     """
     rocky = RockyResource()
     context = MagicMock(spec=dg.AssetExecutionContext)
@@ -1547,29 +1636,27 @@ def test_run_pipes_replication_only_fallback_omits_extras():
             "filter": "tenant=acme",
             "statements": [],
             "plan_id": None,
-            "plan_kind": None,
-            "created_at": None,
-            "models": [],
-            "execution_layers": [],
         }
     )
-    with patch.object(RockyResource, "_run_rocky", return_value=plan_without_id):
+    with (
+        patch.object(RockyResource, "_run_rocky", return_value=plan_without_id),
+        pytest.raises(dg.Failure) as exc,
+    ):
         rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
 
-    fake_client.run.assert_called_once()
-    call_kwargs = fake_client.run.call_args.kwargs
-    assert "extras" not in call_kwargs
-    # Subprocess argv is the legacy `rocky run` shape, not `apply`.
-    cmd = call_kwargs["command"]
-    assert "run" in cmd
-    assert "apply" not in cmd
+    # Pipes client should NOT have been invoked — the failure is raised
+    # before reaching the subprocess.
+    fake_client.run.assert_not_called()
+    assert "plan_id" in str(exc.value)
 
 
 def test_extract_plan_id_returns_none_for_malformed_payload():
     """``_extract_plan_id`` is the gate keeping malformed plan output
     from sending the apply step into a broken state. Treat any
     non-string ``plan_id`` (missing, null, wrong type, malformed JSON)
-    as 'no plan persisted' so the fallback path kicks in."""
+    as 'no plan persisted' so :meth:`_apply_plan` raises a clear
+    upgrade-hint Failure instead of silently routing into a broken
+    state."""
     assert RockyResource._extract_plan_id("not json") is None
     assert RockyResource._extract_plan_id("{}") is None
     assert RockyResource._extract_plan_id(json.dumps({"plan_id": None})) is None

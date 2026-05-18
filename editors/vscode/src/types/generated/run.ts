@@ -65,6 +65,19 @@ export type CheckResult1 =
  */
 export type TestSeverity = "error" | "warning";
 /**
+ * Coarse-grained failure classification for an entry on [`RunOutput::errors`]. Lets orchestrators branch on the kind of failure (retry, page someone, surface in the UI) without parsing the free-form `error` string.
+ *
+ * Variants partition the [`rocky_databricks::connector::ConnectorError`] and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown` is the fallback for non-connector failures (drift, governance, adapter-internal errors) where the error reached the output layer already type-erased.
+ */
+export type FailureKind =
+  | "connection-failed"
+  | "auth-failed"
+  | "query-rejected"
+  | "transient"
+  | "quota-exceeded"
+  | "not-found"
+  | "unknown";
+/**
  * Status of a pipeline run.
  *
  * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
@@ -228,6 +241,10 @@ export interface DriftActionOutput {
 export interface TableErrorOutput {
   asset_key: string[];
   error: string;
+  /**
+   * Coarse classification of the failure so orchestrators can branch on kind (retry, page, surface) without parsing `error`. Defaults to [`FailureKind::Unknown`] for errors that reached the output layer type-erased.
+   */
+  failure_kind?: FailureKind & string;
   [k: string]: unknown;
 }
 /**

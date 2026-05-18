@@ -158,15 +158,15 @@ lookback = 3
 
 ### CLI flags
 
-> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. The partition-selection flags below are currently only accepted on the legacy `rocky run` alias; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`).
+> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. Every partition-selection flag below is accepted on both `rocky plan` and the legacy `rocky run` alias; `rocky run` continues to work and emits a one-line `[deprecated]` notice to stderr (silence with `ROCKY_SUPPRESS_DEPRECATION=1`).
 
 ```bash
-rocky run --partition 2026-04-01           # Process one partition
-rocky run --from 2026-03-01 --to 2026-04-01  # Date range
-rocky run --latest                          # Most recent partition
-rocky run --missing                         # Discover and fill gaps
-rocky run --lookback 7                      # Reprocess last N partitions
-rocky run --parallel 4                      # Parallelize partitions
+rocky plan --partition 2026-04-01 && rocky apply <plan-id>          # Process one partition
+rocky plan --from 2026-03-01 --to 2026-04-01 && rocky apply <plan-id>  # Date range
+rocky plan --latest && rocky apply <plan-id>                        # Most recent partition
+rocky plan --missing && rocky apply <plan-id>                       # Discover and fill gaps
+rocky plan --lookback 7 && rocky apply <plan-id>                    # Reprocess last N partitions
+rocky plan --parallel 4 && rocky apply <plan-id>                    # Parallelize partitions
 ```
 
 ## Full refresh fallback

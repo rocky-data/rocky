@@ -522,14 +522,14 @@ fn default_state_transfer_timeout_secs() -> u64 {
 /// execution time. The migration ships as a config-bit-gated soft cycle so
 /// adopters can opt in early and existing users see no behaviour change:
 ///
-/// - **`v1` (default today, v1.33):** the writer emits the legacy
-///   `CompactOutput` / `ArchiveOutput` payload shape with `NamedStatement.sql`
-///   populated. Byte-stable with every prior release.
-/// - **`v2` (opt-in today, default in a future minor):** the writer emits a
-///   typed-IR payload — [`rocky_ir::CompactPlanIr`] for compact plans,
-///   [`rocky_ir::ArchivePlanIr`] for archive plans. `rocky apply` regenerates
-///   the SQL at execution time via `rocky_core::sql_gen::{compact_from_ir,
-///   archive_from_ir}`.
+/// - **`v1` (legacy):** the writer emits the legacy `CompactOutput` /
+///   `ArchiveOutput` payload shape with `NamedStatement.sql` populated.
+///   Byte-stable with every prior release. Now opt-in only — projects that
+///   need the legacy on-disk shape must set `format = "v1"` explicitly.
+/// - **`v2` (default):** the writer emits a typed-IR payload —
+///   [`rocky_ir::CompactPlanIr`] for compact plans, [`rocky_ir::ArchivePlanIr`]
+///   for archive plans. `rocky apply` regenerates the SQL at execution time
+///   via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`.
 ///
 /// `PromotePlan` and `RunPlan` are unaffected by this switch: promote keeps
 /// its SQL strings as a documented exception (governance-audit surface) and
@@ -543,17 +543,17 @@ fn default_state_transfer_timeout_secs() -> u64 {
 pub enum PlanStoreFormat {
     /// Legacy persisted-plan format. The writer serializes the full
     /// `CompactOutput` / `ArchiveOutput` envelope (including inline SQL)
-    /// as the `payload`. Byte-stable with every prior release; the
-    /// default through v1.x for the soft-migration cycle.
-    #[default]
+    /// as the `payload`. Byte-stable with every prior release; opt-in
+    /// only — set `format = "v1"` to keep the legacy on-disk shape.
     V1,
-    /// Typed-IR persisted-plan format. The writer serializes
+    /// Typed-IR persisted-plan format (default). The writer serializes
     /// [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`] as the
     /// `payload`; the apply path regenerates SQL from the IR via
     /// `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`.
     /// Stdout JSON (the `--output json` payload printed by `rocky compact`
     /// / `rocky archive`) keeps carrying SQL in both formats — the split
     /// is purely between the persisted-to-disk shape and the stdout shape.
+    #[default]
     V2,
 }
 
@@ -576,24 +576,26 @@ impl std::fmt::Display for PlanStoreFormat {
 ///
 /// ```toml
 /// [plan_store]
-/// format = "v2"  # opt in to the typed-IR persisted format
+/// format = "v1"  # opt back into the legacy on-disk shape
 /// ```
 ///
 /// ## Migration cycle
 ///
-/// 1. **v1.33 (now):** writer defaults to `format = "v1"`. Adopters opt
-///    in to v2 by setting `format = "v2"` explicitly.
-/// 2. **Future minor (C-6):** writer default flips to `"v2"`. Reader still
-///    accepts both formats.
-/// 3. **Subsequent minor (C-7):** v1 reader path is removed. Plans on disk
-///    written under the v1 default return a clear regenerate-or-discard
+/// 1. **v1.33:** writer shipped `format = "v2"` as an opt-in; default
+///    remained `"v1"` so existing users saw no behaviour change.
+/// 2. **v1.35 (now):** writer default flips to `"v2"`. Reader still
+///    accepts both formats. Projects that need the legacy on-disk shape
+///    must set `format = "v1"` explicitly.
+/// 3. **Future minor (C-7):** v1 reader path is removed. Plans on disk
+///    written under the v1 format return a clear regenerate-or-discard
 ///    error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStoreConfig {
     /// Persisted-plan format for `rocky compact` / `rocky archive`.
-    /// Defaults to [`PlanStoreFormat::V1`] for the v1.x soft-migration
-    /// cycle. See [`PlanStoreFormat`] for the full lifecycle.
+    /// Defaults to [`PlanStoreFormat::V2`] as of v1.35.0; set
+    /// `format = "v1"` to opt back into the legacy on-disk shape. See
+    /// [`PlanStoreFormat`] for the full lifecycle.
     #[serde(default)]
     pub format: PlanStoreFormat,
 }
@@ -1863,11 +1865,11 @@ pub struct RockyConfig {
 
     /// Persisted-plan store configuration (Phase C — "SQL as `.o` files").
     ///
-    /// Today this is just the `format` field — `v1` (default) keeps the
-    /// pre-Phase-C `.rocky/plans/<id>.json` shape with inline SQL; `v2`
-    /// opts in to the typed-IR persisted format so `rocky apply`
+    /// Today this is just the `format` field — `v2` (default as of
+    /// v1.35.0) emits the typed-IR persisted format so `rocky apply`
     /// regenerates SQL at execution time from `CompactPlanIr` /
-    /// `ArchivePlanIr`. See [`PlanStoreConfig`].
+    /// `ArchivePlanIr`; `v1` opts back into the legacy `.rocky/plans/<id>.json`
+    /// shape with inline SQL. See [`PlanStoreConfig`].
     #[serde(default)]
     pub plan_store: PlanStoreConfig,
 
@@ -3243,8 +3245,49 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let mut value: toml::Value = toml::from_str(&substituted).map_err(to_parse_err)?;
     apply_deprecations(&mut value);
     normalize_toml_shorthands(&mut value);
-    let config: RockyConfig = value.try_into().map_err(to_parse_err)?;
+    let mut config: RockyConfig = value.try_into().map_err(to_parse_err)?;
+    apply_single_adapter_discovery_default(&mut config);
     Ok(config)
+}
+
+/// When exactly one `[adapter]` is defined and a replication pipeline
+/// omits `[source.discovery]` entirely, materialize the discovery block
+/// pointing at that one adapter so callers downstream (e.g. `rocky
+/// compact --catalog`) don't have to special-case "no discovery
+/// configured".
+///
+/// Mirrors what serde already does for `source.adapter` and
+/// `target.adapter` via `#[serde(default = "default_adapter_name")]`,
+/// except the auto-wire uses the *actual* adapter name (which may be
+/// `"default"` under the canonical `[adapter]` shorthand, or any name
+/// when written as `[adapter.<name>]`) rather than the hardcoded
+/// `"default"` literal — otherwise a single-adapter project named
+/// `[adapter.local]` would wire discovery at `"default"` and fail the
+/// existing `V022` "no adapter named 'default'" diagnostic.
+///
+/// Multi-adapter configs are left alone — the existing "no discovery
+/// configured" path keeps emitting its warning and the user has to wire
+/// it explicitly.
+fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
+    let sole_adapter = match config.adapters.len() {
+        1 => config
+            .adapters
+            .keys()
+            .next()
+            .expect("len == 1 guarantees one key")
+            .clone(),
+        _ => return,
+    };
+    for pipeline in config.pipelines.values_mut() {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        if replication.source.discovery.is_none() {
+            replication.source.discovery = Some(DiscoveryConfig {
+                adapter: sole_adapter.clone(),
+            });
+        }
+    }
 }
 
 /// Loads, parses, and validates a Rocky configuration (v2 format only).
@@ -4414,6 +4457,145 @@ target = { catalog_template = "main", schema_template = "staging__{source}" }
         assert_eq!(default_pipeline.target.schema_template, "staging__{source}");
         // When [state] is completely omitted, StateConfig::default() gives Local backend.
         assert_eq!(config.state.backend, StateBackend::Local);
+    }
+
+    /// Single-adapter shorthand with `[source.discovery]` entirely absent
+    /// should auto-wire discovery to the lone adapter — `parse_rocky_config`
+    /// materializes `DiscoveryConfig { adapter = "default" }` so callers
+    /// like `rocky compact --catalog` don't have to special-case "no
+    /// discovery configured" when the project shape is unambiguous.
+    #[test]
+    fn test_single_adapter_autowires_discovery() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "main", schema_template = "staging" }
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        let discovery = poc.source.discovery.as_ref().expect("discovery auto-wired");
+        assert_eq!(discovery.adapter, "default");
+    }
+
+    /// Auto-wire follows the actual adapter name, not the literal
+    /// `"default"`. A project that writes `[adapter.local]` explicitly
+    /// must auto-wire discovery to `"local"` — otherwise `source.adapter`
+    /// (which serde defaults to `"default"`) is in conflict with a
+    /// hardcoded `"default"` discovery ref and the downstream registry
+    /// fails with `V022` "no adapter named 'default'".
+    #[test]
+    fn test_single_named_adapter_autowires_to_its_name() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+[pipeline.poc.source]
+adapter = "local"
+schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "main"
+schema_template = "staging"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        let discovery = poc.source.discovery.as_ref().expect("discovery auto-wired");
+        assert_eq!(discovery.adapter, "local");
+    }
+
+    /// Multi-adapter project: `[source.discovery]` absent must stay
+    /// `None` so the existing "no discovery adapter configured" code
+    /// path keeps its signal — refusing to guess which adapter handles
+    /// discovery in an ambiguous setup is the safe behavior.
+    #[test]
+    fn test_multi_adapter_does_not_autowire_discovery() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter.warehouse]
+type = "duckdb"
+path = ":memory:"
+
+[adapter.source_fetch]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+
+[pipeline.poc]
+[pipeline.poc.source]
+adapter = "warehouse"
+schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+
+[pipeline.poc.target]
+adapter = "warehouse"
+catalog_template = "main"
+schema_template = "staging"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        assert!(
+            poc.source.discovery.is_none(),
+            "multi-adapter project must not auto-wire discovery"
+        );
+    }
+
+    /// When the user did supply `[source.discovery]` explicitly, the
+    /// auto-wire pass must leave it alone — even on a single-adapter
+    /// project — so an operator-chosen discovery adapter never gets
+    /// silently replaced.
+    #[test]
+    fn test_explicit_discovery_not_overwritten() {
+        use std::io::Write;
+
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+source.discovery = { adapter = "default" }
+target = { catalog_template = "main", schema_template = "staging" }
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let config = parse_rocky_config(tmp.path()).expect("parse");
+
+        let poc = config.pipelines["poc"]
+            .as_replication()
+            .expect("replication");
+        assert_eq!(
+            poc.source.discovery.as_ref().expect("present").adapter,
+            "default"
+        );
     }
 
     #[test]
@@ -6315,25 +6497,26 @@ max_rows = 1000
         assert!(cfg.classifications.allow_unmasked.is_empty());
     }
 
-    // ---------- Phase C — [plan_store] config bit (C-5) ----------
+    // ---------- Phase C — [plan_store] config bit (C-5 / C-6) ----------
 
     #[test]
-    fn plan_store_defaults_to_v1_when_omitted() {
-        // Zero-config contract for Phase C: omitting `[plan_store]` leaves
-        // the writer on the legacy v1 format so existing users see no
-        // behaviour change. C-6 will flip this default to v2.
+    fn plan_store_defaults_to_v2_when_omitted() {
+        // Zero-config contract after the C-6 default flip: omitting
+        // `[plan_store]` selects the typed-IR v2 writer. Operators that
+        // need the legacy shape must opt back in via `format = "v1"`.
         let toml_str = r#"
             [adapter.default]
             type = "duckdb"
         "#;
         let cfg: RockyConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.plan_store.format, PlanStoreFormat::V1);
+        assert_eq!(cfg.plan_store.format, PlanStoreFormat::V2);
     }
 
     #[test]
     fn plan_store_parses_explicit_v1() {
-        // Operators may pin `format = "v1"` to lock the legacy shape even
-        // after the C-6 default flip. Equivalent to omitting the block today.
+        // Operators pin `format = "v1"` to opt back into the legacy
+        // on-disk shape after the C-6 default flip. The reader still
+        // accepts both formats — this just controls the writer.
         let toml_str = r#"
             [adapter.default]
             type = "duckdb"
@@ -6346,9 +6529,10 @@ max_rows = 1000
     }
 
     #[test]
-    fn plan_store_parses_v2_opt_in() {
-        // The opt-in path C-5 introduces: `format = "v2"` turns on the
-        // typed-IR persisted plan shape for `rocky compact` / `rocky archive`.
+    fn plan_store_parses_explicit_v2() {
+        // Explicit `format = "v2"` resolves to the same variant the
+        // default does post-C-6. Pinning the value continues to work for
+        // adopters who set it during the v1.33/v1.34 opt-in window.
         let toml_str = r#"
             [adapter.default]
             type = "duckdb"

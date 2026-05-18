@@ -978,6 +978,8 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
             sql: format!("SELECT * FROM upstream_{name}"),
             file_path: format!("models/{name}.sql"),

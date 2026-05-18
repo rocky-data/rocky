@@ -1,6 +1,6 @@
 ---
-title: Rocky — Rust control plane for warehouse SQL pipelines
-description: Rust-based control plane for warehouse SQL pipelines — branches, replay, column-level lineage, compile-time type safety, per-model cost attribution.
+title: Rocky — typed-program layer above the warehouse
+description: A typed-program layer above the warehouse — branches, replay, column-level lineage, compile-time type safety, per-model cost attribution.
 template: splash
 hero:
   tagline: A compiled SQL transformation engine in Rust. Type-safe compilation, column-level lineage, and an AI intent layer — for data pipelines that don't break.
@@ -50,6 +50,12 @@ rocky apply <plan-id>    # execute the plan
 ```
 
 No credentials needed — the playground is DuckDB-backed.
+
+## One trace, one cost graph, one replay handle
+
+`rocky run` writes a single `RunRecord` to the state store. Three read commands — `rocky trace`, `rocky cost`, `rocky replay` — each project that same record from a different angle: causality and concurrency, per-model warehouse spend, and the byte-for-byte reproducibility artefact. Three views of one tree, not three telemetry domains stitched together after the fact. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
+
+<video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 
 <CardGrid>
   <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Import your dbt project, convert tests to contracts, and adopt Rocky incrementally." />
