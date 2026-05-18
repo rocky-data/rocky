@@ -812,6 +812,22 @@ function renderLineageHtml(
     dataType: typeof c.data_type === 'string' ? c.data_type : null,
   }));
 
+  // Build a per-node lookup from LineageOutput.nodes (array of
+  // {model, target_schema?, source_id?}). The engine emits one entry
+  // per distinct model referenced by the focal lineage so the cluster
+  // helpers below can avoid parsing qualified names. Older lineage
+  // JSON cached locally omits this field entirely — the helpers fall
+  // back to the legacy heuristics in that case.
+  const nodeMeta = new Map();
+  for (const node of (rawData.nodes || [])) {
+    if (node && typeof node.model === 'string') {
+      nodeMeta.set(node.model, {
+        targetSchema: typeof node.target_schema === 'string' ? node.target_schema : null,
+        sourceId: typeof node.source_id === 'string' ? node.source_id : null,
+      });
+    }
+  }
+
   // Restore saved state (zoom/pan/viewMode) from prior session if available.
   const saved = vscode.getState() || {};
 
@@ -871,22 +887,31 @@ function renderLineageHtml(
   // ── Cluster key helpers ───────────────────────────────────────────────────────
 
   /**
-   * Derive a schema cluster key from a qualified model name.
+   * Derive a schema cluster key for a node.
+   * Prefers the engine-emitted target_schema (LineageOutput.nodes), and
+   * falls back to splitting the qualified name when the field is absent —
+   * matters for older cached lineage JSON that pre-dates the nodes field.
    * "schema.model"          → cluster key "schema"
    * "catalog.schema.model"  → cluster key "catalog.schema"
    * "model"                 → null (no dots → no cluster)
    */
   function schemaClusterKey(modelId) {
+    const meta = nodeMeta.get(modelId);
+    if (meta && meta.targetSchema) return meta.targetSchema;
     const parts = modelId.split('.');
     if (parts.length < 2) return null;
     return parts.slice(0, -1).join('.');
   }
 
   /**
-   * For Source clustering: only nodes without incoming edges are grouped.
-   * They share a single synthetic cluster "sources".
+   * For Source clustering: prefer the engine-emitted source_id
+   * (LineageOutput.nodes) — present iff the node is an external source.
+   * Falls back to "node has no incoming edges" for older cached JSON.
+   * Either way, matching nodes share a single synthetic cluster "sources".
    */
   function sourceClusterKey(nodeId, hasIncoming) {
+    const meta = nodeMeta.get(nodeId);
+    if (meta) return meta.sourceId ? 'sources' : null;
     return hasIncoming.has(nodeId) ? null : 'sources';
   }
 
