@@ -188,6 +188,17 @@ fn extract_select_columns(
                     columns.push(lineage);
                 }
             }
+            // Spark SQL `SELECT expr AS (a, b, c)` — multi-alias binding.
+            // Emit one lineage entry per alias, cloning the upstream lineage.
+            SelectItem::ExprWithAliases { expr, aliases } => {
+                if let Some(base) = extract_expr_lineage(expr, alias_map, source_tables) {
+                    for alias in aliases {
+                        let mut lineage = base.clone();
+                        lineage.target_column = alias.value.clone();
+                        columns.push(lineage);
+                    }
+                }
+            }
         }
     }
 
