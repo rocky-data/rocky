@@ -33,10 +33,14 @@
 //! `commands::run::run` with `models_dir = None`, `run_all = false`, and
 //! no model filter so the engine's existing replication arm executes.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use rocky_core::schema::SchemaPattern;
+use tracing::warn;
 
+use crate::commands::parse_filter;
 use crate::output::{
     AuditEvent, AuditEventKind, BranchPromoteOutput, PromotePlan, ReplicationConnectorSnapshot,
     ReplicationPlan, RunPlan,
@@ -265,14 +269,56 @@ async fn run_apply_replication_plan(
 
     let live_snapshot = crate::commands::plan::build_source_state_snapshot(&live_connectors);
 
-    if live_snapshot != replication_plan.source_state_snapshot {
-        let diff_summary =
-            summarize_source_state_drift(&replication_plan.source_state_snapshot, &live_snapshot);
-        bail!(
-            "source state has drifted since plan '{plan_id}' was created.\n\
-             {diff_summary}\n\
-             Re-plan with `rocky plan` and re-apply against the resulting plan_id."
-        );
+    // Drift tolerance: when the apply is filtered (e.g. `rocky run --filter id=<X>`
+    // or `--filter client=<X>`) and the discovered drift is disjoint from the
+    // filter scope, demote the abort to a WARN and proceed. Unfiltered applies
+    // keep today's strict behaviour. Drift inside the filter scope (the
+    // filtered source itself was added/removed/changed) still bails — that's a
+    // real conflict the caller must resolve.
+    match decide_drift_scope(
+        &replication_plan.source_state_snapshot,
+        &live_snapshot,
+        replication_plan.filter.as_deref(),
+        &pattern,
+    ) {
+        DriftScope::None => {}
+        DriftScope::OutOfScope { drifted, filter } => {
+            warn!(
+                target = "rocky::replication::drift",
+                filter = filter.as_str(),
+                drifted = drifted.join(",").as_str(),
+                "source state has drifted outside filter scope (filter={filter}, drifted=[{}]); \
+                 continuing",
+                drifted.join(", "),
+            );
+        }
+        DriftScope::InScope {
+            in_scope_drifted,
+            filter,
+        } => {
+            let diff_summary = summarize_source_state_drift(
+                &replication_plan.source_state_snapshot,
+                &live_snapshot,
+            );
+            bail!(
+                "source state has drifted since plan '{plan_id}' was created \
+                 (in-scope under filter={filter}, affected=[{}]).\n\
+                 {diff_summary}\n\
+                 Re-plan with `rocky plan` and re-apply against the resulting plan_id.",
+                in_scope_drifted.join(", ")
+            );
+        }
+        DriftScope::Unfiltered => {
+            let diff_summary = summarize_source_state_drift(
+                &replication_plan.source_state_snapshot,
+                &live_snapshot,
+            );
+            bail!(
+                "source state has drifted since plan '{plan_id}' was created.\n\
+                 {diff_summary}\n\
+                 Re-plan with `rocky plan` and re-apply against the resulting plan_id."
+            );
+        }
     }
 
     // Snapshot matched — delegate to the existing replication codepath
@@ -314,6 +360,177 @@ async fn run_apply_replication_plan(
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
 
     Ok(())
+}
+
+/// Outcome of the symmetric source-state drift comparison at apply time,
+/// scoped against the active `--filter`.
+///
+/// Filtered applies (`rocky run --filter id=<X>` / `--filter client=<X>`)
+/// only intend to touch the in-scope subset. Drift in the *complement* of
+/// that subset is informational, not actionable — bailing throws away the
+/// preceding bulk run's work and makes wrapping orchestrators non-idempotent
+/// under steady-state source-system churn. Unfiltered applies keep the
+/// strict semantics because any drift is structurally undefined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DriftScope {
+    /// Snapshots match — proceed normally.
+    None,
+    /// Drift exists but the active filter excludes every drifted connector
+    /// from scope. The caller logs a WARN and proceeds; the downstream
+    /// `commands::run::run` call re-discovers and applies the same filter,
+    /// so the in-scope subset still executes against fresh source state.
+    OutOfScope {
+        /// Sorted connector-ids that drifted (added/removed/changed) outside
+        /// the filter scope. Surfaced in the WARN log so operators can
+        /// correlate against upstream change events.
+        drifted: Vec<String>,
+        /// Echo of the `--filter` string for logging.
+        filter: String,
+    },
+    /// Drift intersects the filter scope — the caller bails with the
+    /// existing hard error. The `--filter` target itself was added,
+    /// removed, or schema-changed since plan time; that's a real conflict
+    /// the wrapping job needs to resolve.
+    InScope {
+        /// Sorted connector-ids that drifted *and* are in scope of the
+        /// active filter. Surfaced in the bail message so operators see
+        /// which filter-relevant connector(s) changed.
+        in_scope_drifted: Vec<String>,
+        /// Echo of the `--filter` string for the error message.
+        filter: String,
+    },
+    /// No filter was specified — drift detected; the caller bails with
+    /// the existing hard error (today's behaviour for unfiltered runs).
+    Unfiltered,
+}
+
+/// Compute the drift-scope decision used by `run_apply_replication_plan`.
+///
+/// Pure function so the four FR acceptance scenarios are unit-testable
+/// without standing up a discovery adapter or warehouse connection.
+///
+/// Algorithm:
+/// 1. Compute the set of *drifted* connector-ids: every id whose
+///    `ReplicationConnectorSnapshot` differs across `persisted` ↔ `live`
+///    (added, removed, or any inner field changed — tables, row_count,
+///    schema, source_type).
+/// 2. If empty → `DriftScope::None`.
+/// 3. If `filter` is `None` → `DriftScope::Unfiltered`.
+/// 4. Otherwise, expand the filter scope: each connector-id from
+///    `persisted ∪ live` that `matches_filter` accepts is in scope.
+/// 5. Partition the drifted set by membership in the filter scope. If
+///    *any* drifted id is in scope → `DriftScope::InScope`, else
+///    `DriftScope::OutOfScope`.
+///
+/// `client=<X>` may resolve to multiple connector ids (multi-source
+/// clients). The filter-scope set is the union of every connector that
+/// matches today (live) and every connector that matched at plan time
+/// (persisted) — that way a removed in-scope connector is correctly
+/// surfaced as in-scope drift even though `live` no longer carries it.
+fn decide_drift_scope(
+    persisted: &[ReplicationConnectorSnapshot],
+    live: &[ReplicationConnectorSnapshot],
+    filter: Option<&str>,
+    pattern: &SchemaPattern,
+) -> DriftScope {
+    use std::collections::BTreeMap;
+
+    let persisted_map: BTreeMap<&str, &ReplicationConnectorSnapshot> =
+        persisted.iter().map(|c| (c.id.as_str(), c)).collect();
+    let live_map: BTreeMap<&str, &ReplicationConnectorSnapshot> =
+        live.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let mut drifted: BTreeSet<String> = BTreeSet::new();
+    for id in persisted_map.keys().chain(live_map.keys()) {
+        match (persisted_map.get(id), live_map.get(id)) {
+            (Some(p), Some(l)) if p != l => {
+                drifted.insert((*id).to_string());
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                drifted.insert((*id).to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if drifted.is_empty() {
+        return DriftScope::None;
+    }
+
+    let Some(filter_str) = filter else {
+        return DriftScope::Unfiltered;
+    };
+
+    // Filter string is well-formed at plan time (it round-tripped through
+    // `parse_filter` inside `rocky plan`), but be defensive — if parsing
+    // fails here we fall back to today's strict behaviour rather than
+    // silently widening tolerance.
+    let Ok((filter_key, filter_value)) = parse_filter(filter_str) else {
+        return DriftScope::Unfiltered;
+    };
+
+    // Build the union of in-scope connector ids across persisted ∪ live.
+    // A connector that was in scope at plan time but vanished from live
+    // is correctly classified as in-scope drift (the caller must re-plan).
+    let in_scope: BTreeSet<&str> = persisted_map
+        .values()
+        .chain(live_map.values())
+        .filter(|snap| connector_matches_filter(snap, pattern, &filter_key, &filter_value))
+        .map(|snap| snap.id.as_str())
+        .collect();
+
+    let in_scope_drifted: Vec<String> = drifted
+        .iter()
+        .filter(|id| in_scope.contains(id.as_str()))
+        .cloned()
+        .collect();
+
+    if in_scope_drifted.is_empty() {
+        DriftScope::OutOfScope {
+            drifted: drifted.into_iter().collect(),
+            filter: filter_str.to_string(),
+        }
+    } else {
+        DriftScope::InScope {
+            in_scope_drifted,
+            filter: filter_str.to_string(),
+        }
+    }
+}
+
+/// Apply the connector-level `--filter` semantics from
+/// [`crate::commands::matches_filter`] directly against a
+/// [`ReplicationConnectorSnapshot`].
+///
+/// `matches_filter` takes `&DiscoveredConnector`, which is the
+/// adapter-shaped value; the persisted plan stores the leaner
+/// `ReplicationConnectorSnapshot` shape. Rather than synthesise a
+/// `DiscoveredConnector`, we re-apply the same id / parsed-schema rules
+/// so plan-time and apply-time filter semantics stay in lockstep.
+///
+/// `table=` is connector-pass-through here (same as `matches_filter`) —
+/// per-table subsetting happens inside the downstream `run::run`.
+fn connector_matches_filter(
+    snap: &ReplicationConnectorSnapshot,
+    pattern: &SchemaPattern,
+    filter_key: &str,
+    filter_value: &str,
+) -> bool {
+    if filter_key == "id" {
+        return snap.id == filter_value;
+    }
+    if filter_key == "table" {
+        return true;
+    }
+    let Ok(parsed) = pattern.parse(&snap.schema) else {
+        return false;
+    };
+    match parsed.get(filter_key) {
+        Some(val) => val == filter_value,
+        None => parsed
+            .get_multiple(filter_key)
+            .is_some_and(|vals| vals.iter().any(|v| v == filter_value)),
+    }
 }
 
 /// Render a human-readable summary of the diff between the persisted
@@ -996,5 +1213,338 @@ mod tests {
         }];
         let summary = summarize_source_state_drift(&snap, &snap);
         assert!(summary.contains("1 connector(s)"));
+    }
+
+    // ------------------------------------------------------------------
+    // Drift scope decision (filter-aware tolerance)
+    // ------------------------------------------------------------------
+    //
+    // The four FR acceptance scenarios drive these tests:
+    //   1. Unfiltered drift -> Unfiltered (today's hard error).
+    //   2. Filtered (`id=`) + out-of-scope drift -> OutOfScope (WARN).
+    //   3. Filtered (`id=`) + in-scope drift -> InScope (hard error).
+    //   4. Filtered (`client=`) parity for the multi-source case.
+    //
+    // The pure-function shape lets us cover all four paths without
+    // standing up a discovery adapter or warehouse adapter.
+
+    /// Standard `src__<client>__<region>__<source>` pattern used in the
+    /// monorepo's playground / config-skill examples. Lets us exercise
+    /// `--filter client=<X>` against parsed schema components.
+    fn fivetran_pattern() -> SchemaPattern {
+        use rocky_core::schema::PatternComponent;
+        SchemaPattern {
+            prefix: "src__".to_string(),
+            separator: "__".to_string(),
+            components: vec![
+                PatternComponent::Variable {
+                    name: "client".to_string(),
+                },
+                PatternComponent::Variable {
+                    name: "region".to_string(),
+                },
+                PatternComponent::Terminal {
+                    name: "source".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn snap(id: &str, client: &str, region: &str, source: &str) -> ReplicationConnectorSnapshot {
+        ReplicationConnectorSnapshot {
+            id: id.to_string(),
+            schema: format!("src__{client}__{region}__{source}"),
+            source_type: "fivetran".to_string(),
+            tables: vec![],
+        }
+    }
+
+    fn snap_with_tables(
+        id: &str,
+        client: &str,
+        region: &str,
+        source: &str,
+        tables: Vec<&str>,
+    ) -> ReplicationConnectorSnapshot {
+        ReplicationConnectorSnapshot {
+            id: id.to_string(),
+            schema: format!("src__{client}__{region}__{source}"),
+            source_type: "fivetran".to_string(),
+            tables: tables
+                .into_iter()
+                .map(|t| ReplicationTableSnapshot {
+                    name: t.to_string(),
+                    row_count: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// No drift at all -> `None`, regardless of filter.
+    #[test]
+    fn drift_scope_no_drift_returns_none() {
+        let pattern = fivetran_pattern();
+        let snap_a = snap("conn_a", "acme", "us_west", "shopify");
+        let live = vec![snap_a.clone()];
+        let persisted = vec![snap_a];
+
+        for filter in [None, Some("id=conn_a"), Some("client=acme")] {
+            let decision = decide_drift_scope(&persisted, &live, filter, &pattern);
+            assert_eq!(
+                decision,
+                DriftScope::None,
+                "no drift must resolve to None (filter={filter:?})"
+            );
+        }
+    }
+
+    /// Drift exists and no filter -> `Unfiltered` (today's behaviour).
+    #[test]
+    fn drift_scope_unfiltered_drift_returns_unfiltered() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_b", "globex", "eu_central", "stripe"),
+        ];
+        let live = vec![snap("conn_a", "acme", "us_west", "shopify")];
+
+        let decision = decide_drift_scope(&persisted, &live, None, &pattern);
+        assert_eq!(
+            decision,
+            DriftScope::Unfiltered,
+            "unfiltered drift must keep strict semantics"
+        );
+    }
+
+    /// FR Acceptance #1: bulk run completes, an unrelated connector
+    /// drops from upstream, the filtered apply tolerates the drift.
+    /// `--filter id=conn_a` + only `conn_b` dropped -> `OutOfScope`.
+    #[test]
+    fn drift_scope_id_filter_out_of_scope_drift_returns_out_of_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_b", "globex", "eu_central", "stripe"),
+        ];
+        // conn_b removed in live.
+        let live = vec![snap("conn_a", "acme", "us_west", "shopify")];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("id=conn_a"), &pattern);
+        match decision {
+            DriftScope::OutOfScope { drifted, filter } => {
+                assert_eq!(drifted, vec!["conn_b".to_string()]);
+                assert_eq!(filter, "id=conn_a");
+            }
+            other => panic!("expected OutOfScope, got {other:?}"),
+        }
+    }
+
+    /// FR Acceptance #2: the filtered source itself is dropped ->
+    /// `InScope` (hard error preserved).
+    #[test]
+    fn drift_scope_id_filter_in_scope_drift_returns_in_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_b", "globex", "eu_central", "stripe"),
+        ];
+        // conn_a dropped — the filter target itself moved.
+        let live = vec![snap("conn_b", "globex", "eu_central", "stripe")];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("id=conn_a"), &pattern);
+        match decision {
+            DriftScope::InScope {
+                in_scope_drifted,
+                filter,
+            } => {
+                assert_eq!(in_scope_drifted, vec!["conn_a".to_string()]);
+                assert_eq!(filter, "id=conn_a");
+            }
+            other => panic!("expected InScope, got {other:?}"),
+        }
+    }
+
+    /// FR Acceptance #3: in-scope schema/table mutation (filter target
+    /// still present) -> `InScope`.
+    #[test]
+    fn drift_scope_id_filter_in_scope_table_mutation_returns_in_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![snap_with_tables(
+            "conn_a",
+            "acme",
+            "us_west",
+            "shopify",
+            vec!["orders"],
+        )];
+        // conn_a now exposes one extra table.
+        let live = vec![snap_with_tables(
+            "conn_a",
+            "acme",
+            "us_west",
+            "shopify",
+            vec!["orders", "shipments"],
+        )];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("id=conn_a"), &pattern);
+        match decision {
+            DriftScope::InScope {
+                in_scope_drifted, ..
+            } => {
+                assert_eq!(in_scope_drifted, vec!["conn_a".to_string()]);
+            }
+            other => panic!("expected InScope on table mutation, got {other:?}"),
+        }
+    }
+
+    /// FR Acceptance #4: `--filter client=<X>` with multi-source
+    /// clients — out-of-scope churn tolerated.
+    /// `client=acme` resolves to {conn_a, conn_a2}; only conn_b
+    /// (client=globex) churns.
+    #[test]
+    fn drift_scope_client_filter_out_of_scope_drift_returns_out_of_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_a2", "acme", "eu_central", "stripe"),
+            snap("conn_b", "globex", "us_west", "shopify"),
+        ];
+        // conn_b dropped in live.
+        let live = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_a2", "acme", "eu_central", "stripe"),
+        ];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("client=acme"), &pattern);
+        match decision {
+            DriftScope::OutOfScope { drifted, filter } => {
+                assert_eq!(drifted, vec!["conn_b".to_string()]);
+                assert_eq!(filter, "client=acme");
+            }
+            other => panic!("expected OutOfScope for client filter, got {other:?}"),
+        }
+    }
+
+    /// `--filter client=<X>` where any in-scope connector mutates ->
+    /// `InScope` (the FR's "real conflict for the caller" case).
+    #[test]
+    fn drift_scope_client_filter_in_scope_drift_returns_in_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap_with_tables("conn_a", "acme", "us_west", "shopify", vec!["orders"]),
+            snap("conn_a2", "acme", "eu_central", "stripe"),
+            snap("conn_b", "globex", "us_west", "shopify"),
+        ];
+        // conn_a (client=acme — in scope) gained a table; conn_b also
+        // dropped, but the in-scope mutation is the decisive signal.
+        let live = vec![
+            snap_with_tables(
+                "conn_a",
+                "acme",
+                "us_west",
+                "shopify",
+                vec!["orders", "shipments"],
+            ),
+            snap("conn_a2", "acme", "eu_central", "stripe"),
+        ];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("client=acme"), &pattern);
+        match decision {
+            DriftScope::InScope {
+                in_scope_drifted, ..
+            } => {
+                assert!(
+                    in_scope_drifted.contains(&"conn_a".to_string()),
+                    "in-scope set must include conn_a: {in_scope_drifted:?}"
+                );
+                assert!(
+                    !in_scope_drifted.contains(&"conn_b".to_string()),
+                    "out-of-scope drifted ids must NOT appear: {in_scope_drifted:?}"
+                );
+            }
+            other => panic!("expected InScope for client filter, got {other:?}"),
+        }
+    }
+
+    /// A connector that was in scope at plan time but vanished from
+    /// live must be classified as in-scope drift (re-plan required).
+    /// Guards against the "removed-but-still-mine" edge case.
+    #[test]
+    fn drift_scope_client_filter_removed_in_scope_connector_returns_in_scope() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![
+            snap("conn_a", "acme", "us_west", "shopify"),
+            snap("conn_a2", "acme", "eu_central", "stripe"),
+        ];
+        // conn_a2 (client=acme — in scope) is gone.
+        let live = vec![snap("conn_a", "acme", "us_west", "shopify")];
+
+        let decision = decide_drift_scope(&persisted, &live, Some("client=acme"), &pattern);
+        match decision {
+            DriftScope::InScope {
+                in_scope_drifted, ..
+            } => {
+                assert_eq!(in_scope_drifted, vec!["conn_a2".to_string()]);
+            }
+            other => panic!("expected InScope for removed in-scope connector, got {other:?}"),
+        }
+    }
+
+    /// Malformed filter strings degrade to `Unfiltered` (today's
+    /// strict behaviour). Defensive — the filter has already been
+    /// parsed once at plan time, but we don't want a parse regression
+    /// here to silently widen tolerance.
+    #[test]
+    fn drift_scope_malformed_filter_falls_back_to_unfiltered() {
+        let pattern = fivetran_pattern();
+        let persisted = vec![snap("conn_a", "acme", "us_west", "shopify")];
+        let live = vec![];
+
+        // No "=" → parse_filter fails.
+        let decision = decide_drift_scope(&persisted, &live, Some("noequals"), &pattern);
+        assert_eq!(
+            decision,
+            DriftScope::Unfiltered,
+            "unparseable filter must keep strict semantics"
+        );
+    }
+
+    /// `connector_matches_filter` mirrors `commands::matches_filter`'s
+    /// rules for `id` / `table` / parsed-schema components. Pinned so
+    /// the plan-time and apply-time filter semantics stay aligned.
+    #[test]
+    fn connector_matches_filter_id_and_components() {
+        let pattern = fivetran_pattern();
+        let s = snap("conn_a", "acme", "us_west", "shopify");
+        assert!(connector_matches_filter(&s, &pattern, "id", "conn_a"));
+        assert!(!connector_matches_filter(&s, &pattern, "id", "conn_b"));
+        assert!(connector_matches_filter(&s, &pattern, "client", "acme"));
+        assert!(!connector_matches_filter(&s, &pattern, "client", "globex"));
+        assert!(connector_matches_filter(&s, &pattern, "source", "shopify"));
+        // `table` is connector-pass-through.
+        assert!(connector_matches_filter(&s, &pattern, "table", "anything"));
+        // Unknown component key short-circuits to false.
+        assert!(!connector_matches_filter(
+            &s,
+            &pattern,
+            "nonexistent",
+            "value"
+        ));
+    }
+
+    /// A connector whose `schema` cannot be parsed against the pattern
+    /// (e.g. a synthetic id from a non-Fivetran adapter) is excluded
+    /// from non-`id` filter scope. `--filter id=` still matches by id
+    /// since the id path does not require schema parsing.
+    #[test]
+    fn connector_matches_filter_unparseable_schema_excludes_component_match() {
+        let pattern = fivetran_pattern();
+        let s = ReplicationConnectorSnapshot {
+            id: "duckdb_local".to_string(),
+            schema: "totally__not__the__pattern__shape__at__all".to_string(),
+            source_type: "duckdb".to_string(),
+            tables: vec![],
+        };
+        assert!(connector_matches_filter(&s, &pattern, "id", "duckdb_local"));
+        assert!(!connector_matches_filter(&s, &pattern, "client", "acme"));
     }
 }
