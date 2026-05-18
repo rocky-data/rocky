@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 rocky-core = { path = "../rocky-core" }
+rocky-catalog-core = { path = "../rocky-catalog-core" }
 rocky-ir = { path = "../rocky-ir" }
 rocky-observe = { path = "../rocky-observe" }
 rocky-sql = { path = "../rocky-sql" }
@@ -20,12 +21,17 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+percent-encoding = { workspace = true }
 
 [features]
 test-support = []
 
 [[test]]
 name = "wiremock_tests"
+required-features = ["test-support"]
+
+[[test]]
+name = "unity_catalog_client_wiremock"
 required-features = ["test-support"]
 
 [dev-dependencies]
