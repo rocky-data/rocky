@@ -913,7 +913,6 @@ mod tests {
         }
         RockyConfig {
             state: StateConfig::default(),
-            plan_store: Default::default(),
             adapters: IndexMap::new(),
             pipelines: map,
             hooks: Default::default(),

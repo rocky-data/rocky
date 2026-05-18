@@ -703,7 +703,6 @@ mod tests {
 
         let config = RockyConfig {
             state: Default::default(),
-            plan_store: Default::default(),
             adapters: IndexMap::new(),
             pipelines: IndexMap::new(),
             hooks: Default::default(),
@@ -791,7 +790,6 @@ mod tests {
 
         let config = RockyConfig {
             state: Default::default(),
-            plan_store: Default::default(),
             adapters: IndexMap::new(),
             pipelines: IndexMap::new(),
             hooks: Default::default(),
@@ -870,7 +868,6 @@ mod tests {
 
         let config = RockyConfig {
             state: Default::default(),
-            plan_store: Default::default(),
             adapters: IndexMap::new(),
             pipelines: IndexMap::new(),
             hooks: Default::default(),

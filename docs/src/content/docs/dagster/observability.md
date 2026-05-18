@@ -24,8 +24,9 @@ chains `rocky plan` + `rocky apply <plan-id>` under the hood (as of
 `dagster-rocky` v1.30), and each invocation writes the typed plan to
 `.rocky/plans/<plan-id>.json` before the apply phase runs. That file is
 the audit record of *exactly what Rocky tried to apply*: the materialization
-list, governance plan, drift actions, and inline SQL (or typed IR — see
-[Configuration › `[plan_store]`](/reference/configuration/#plan_store)).
+list, governance plan, drift actions, and (for compact / archive plans)
+the typed IR that the apply path regenerates SQL from — see
+[Plan store v1 to v2 migration guide](/concepts/plan-store-v1-to-v2/).
 
 For `run_pipes`, the plan id is also attached as `extras={"plan_id":
 plan_id}` so Dagster surfaces it as run metadata in the run viewer — one

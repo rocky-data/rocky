@@ -1,79 +1,47 @@
 ---
 title: Plan Store v1 to v2 — Migration Guide
-description: The typed-IR plan-store format is the default as of engine v1.35.0; this page covers the dual-reader migration window and how to opt back into v1 if you need it.
+description: The typed-IR plan-store format is the only loadable shape for compact / archive plans; the v1 inline-SQL envelope was retired and the [plan_store] config block was removed.
 sidebar:
   order: 17
 ---
 
-`rocky plan` persists each plan to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. As of engine v1.35.0 the **default** on-disk format is the typed-IR v2 envelope; the legacy v1 envelope is still selectable for projects that need it. Both formats share the same path and the same `plan-id` digest scheme — only the body changes.
+`rocky plan` persists each plan to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. The typed-IR **v2** envelope is the only loadable shape for `rocky compact` / `rocky archive` plans; the legacy **v1** inline-SQL envelope has been retired and the `[plan_store]` config block that selected between them has been removed.
 
-This page explains what changed, what to do if you want to stay on v1, and how the dual-reader window works so existing plans on disk keep applying cleanly.
+This page explains what changed, how to upgrade from a v1-shaped plan on disk, and the timeline that got us here.
 
-For the field-level reference of the config block itself, see [`[plan_store]`](/reference/configuration/#plan_store).
+## What's changed
 
-## What's changed in v1.35.0
+- **The v1 inline-SQL envelope is no longer readable.** Compact / archive plans written by Rocky < engine-v1.35.0 (the v1 default era) error out at `rocky apply <plan-id>` with a clear migration message. Re-run `rocky compact` / `rocky archive` to write a fresh v2 plan.
+- **The `[plan_store]` config block has been removed.** Projects still carrying it (typically pinned to `format = "v1"` after the v1.35.0 default flip) fail to parse `rocky.toml` with an "unknown field" error. Remove the block entirely.
+- **`Run` / `Replication` / `Promote` plans are untouched.** These never used the inline-SQL envelope — they ship operational metadata (run/replication) or per-target SQL as a documented governance-audit exception (promote). Their on-disk shape is unchanged.
 
-The default value of `[plan_store] format` flipped from `"v1"` to `"v2"`. Concretely:
+Stdout JSON (`rocky plan --output json`, `rocky compact --output json`, `rocky archive --output json`) is **unchanged** — inline SQL is always present for human and CI consumers. Only the on-disk persisted shape was simplified.
 
-- Projects without an explicit `[plan_store]` block now write **v2** envelopes for `rocky compact` / `rocky archive`.
-- Projects that already set `format = "v2"` see no change (the explicit value already resolved to v2).
-- Projects that want to stay on the legacy on-disk shape must set `[plan_store] format = "v1"` explicitly.
-- **Plans persisted under v1 before this upgrade keep reading cleanly.** The reader still accepts both formats unconditionally — see [Dual-reader migration window](#dual-reader-migration-window).
+## Format recap
 
-Stdout JSON (`rocky plan --output json`, `rocky compact --output json`, `rocky archive --output json`) is **unchanged** in both formats — inline SQL is always present for human and CI consumers. The format switch only affects what's written to `.rocky/plans/`.
+The plan store is the on-disk envelope that `rocky plan` writes and `rocky apply` reads back. The path (`.rocky/plans/<plan-id>.json`) and the blake3-content-addressed `plan-id` are unchanged — only the body shape changed:
 
-## What changed in the previous release (v1.33.0)
+- **v1 (legacy, retired)** — the envelope shipped **inline SQL** as the canonical payload. `rocky apply` read the SQL out of the plan and submitted it to the warehouse verbatim. This is the shape Rocky < engine-v1.35.0 produced by default.
+- **v2 (typed IR, now the only loadable shape)** — the envelope ships the **typed-IR payload** (`CompactPlanIr` for `rocky compact` plans, `ArchivePlanIr` for `rocky archive` plans). `rocky apply` regenerates SQL from the IR at execution time via the `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}` helpers in the `rocky-ir` crate.
 
-The plan store is the on-disk envelope that `rocky plan` writes and `rocky apply` reads back. Both formats live at the same path (`.rocky/plans/<plan-id>.json`) and both are keyed by the same blake3 content hash — only the body changes:
+Only `CompactPlan` and `ArchivePlan` were ever affected by the v1/v2 split. `PromotePlan` (governance) and `RunPlan` (already IR-only) sit outside this surface.
 
-- **v1 (legacy)** — the envelope ships **inline SQL** as the canonical payload. `rocky apply` reads the SQL out of the plan and submits it to the warehouse verbatim.
-- **v2 (typed IR)** — the envelope ships the **typed-IR payload** (`CompactPlanIr` for `rocky compact` plans, `ArchivePlanIr` for `rocky archive` plans). `rocky apply` regenerates SQL from the IR at execution time via the `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}` helpers in the `rocky-ir` crate.
+## Migration recipe
 
-Only `CompactPlan` and `ArchivePlan` are affected. `PromotePlan` (governance, kept as a documented exception so the audit-grep surface stays intact) and `RunPlan` (already IR-only — `rocky apply` recompiles from `rocky.toml` + `models/` + flags) are untouched by this format switch.
+If `rocky apply <plan-id>` fails with a "plan is in format v1" error after upgrading:
 
-## The `[plan_store]` config block
+1. **Drop any `[plan_store]` block from your `rocky.toml`.** The block no longer parses; `rocky.toml` will fail on first load if it's still there. The previous `format = "v2"` or `format = "v1"` setting is now a no-op (v2 is the only shape).
+2. **Re-run `rocky plan`** (or `rocky compact <model>` / `rocky archive <model>`). This produces a fresh v2 envelope with a new `plan-id` — content-addressed, so identical intent against an unchanged source state yields a stable id across machines.
+3. **Apply the new plan**: `rocky apply <new-plan-id>`. The v2 reader regenerates SQL from the typed IR at execution time, producing the same warehouse outcomes the retired v1 path would have.
 
-```toml
-[plan_store]
-format = "v1"  # opt back into the legacy on-disk shape
-```
+There is no automatic in-place upgrade — a stale v1 envelope is simply not parseable. Re-plan is the only path forward, and it's a cheap operation on the same `rocky.toml` + `models/` you already have.
 
-Valid values are `"v1"` and `"v2"` (default as of v1.35.0). The block is optional; omitting it selects v2. See the [`[plan_store]` reference](/reference/configuration/#plan_store) for the full field table.
+## Timeline
 
-## Dual-reader migration window
-
-The reader accepts **both formats unconditionally** during the migration window. That means:
-
-- A binary writing **v2** (the v1.35.0+ default) can still **read existing v1 plans** sitting in `.rocky/plans/` from before the flip. No re-plan is needed for in-flight workflows when you upgrade.
-- A binary writing **v1** (explicit opt-back-in) can still **read v2 plans** if one of your runners has the default behaviour. Mixing formats across a fleet during a rollout is safe.
-- The format key controls the **writer** only. There is no reader-side `[plan_store]` toggle in the migration window — the reader looks at the persisted plan's `format_version` tag and dispatches accordingly.
-
-Practical consequence: upgrading the engine to v1.35.0 does not require you to re-plan anything that's already sitting on disk. CI artifacts, PR-review-held plans, Dagster-orchestrated `RockyResource.plan()` outputs from earlier runs — all keep applying cleanly.
-
-## Recommended migration path
-
-**Most users should accept the new v2 default** — it's been the recommended path since v1.33.0, ships a smaller and more auditable on-disk artefact, and is the only format that will survive the eventual v1 reader removal. No code or config changes are needed.
-
-**Projects with custom dialects or non-trivial materialization strategies** (especially `compact` / `archive` over partitioned tables) that haven't yet validated against v2 in their own environment should do so before the v1 reader retires. A useful smoke test:
-
-1. Generate a v1 plan by setting `[plan_store] format = "v1"` and running `rocky plan`. Stash the resulting `.rocky/plans/<plan-id>.json`.
-2. Switch back to the default (or set `[plan_store] format = "v2"`) and run `rocky plan` against the same models / config.
-3. Inspect the v2 envelope (typed IR is human-readable JSON — same shape as the inline-SQL one would be, minus the rendered SQL).
-4. Run `rocky apply <plan-id>` against both — the warehouse outcomes should match. If they don't, the v2 writer has a regression worth reporting before v1 retires.
-
-**Projects that need to stay on v1 for now** can set `[plan_store] format = "v1"` explicitly. The legacy shape is still fully supported in v1.35.0 — but plan to migrate before the v1 reader is removed (see below).
-
-## When the v1 reader is removed
-
-The v1 reader will be dropped in a subsequent minor release after v1.35.0; the exact version isn't yet pinned and will be announced in the corresponding release notes. After that:
-
-- **Plans written under `format = "v1"`** in that release or later will be **unreadable** by `rocky apply`. There is no automatic in-place upgrade — a stale v1 envelope after the drop is simply not parseable, and `rocky plan` will produce a fresh v2 envelope on the next invocation.
-- **Projects still pinning `format = "v1"`** will need to flip that to `"v2"` (or remove the explicit setting) before upgrading.
-- **Existing v1 plans on disk** generated before the v1-reader-drop release will need to be re-planned to a v2 envelope before they can be applied.
-
-The conservative path is to drop any explicit `format = "v1"` setting now, validate against your own pipeline on v1.35.0, and ride the future v1-reader-drop release as a no-op.
+- **engine-v1.33.0** — shipped `format = "v2"` as opt-in alongside the v1 default. Adopters could validate v2 against their pipeline before the default flip.
+- **engine-v1.35.0** — flipped the writer default to `"v2"`; the reader still accepted both formats. Operators who wanted the legacy shape pinned `format = "v1"` explicitly.
+- **A later minor (this drop)** — retired the v1 reader for compact / archive plans and removed the `[plan_store]` block. v2 is the only loadable shape; the version that ships this change is announced in the release notes alongside this guide.
 
 ## Related
 
-- [`[plan_store]` reference](/reference/configuration/#plan_store) — field-level config reference.
 - [Content-Addressed Materialization](/concepts/content-addressed/) — another writer surface where blake3 content hashing keys the on-disk artefact.
