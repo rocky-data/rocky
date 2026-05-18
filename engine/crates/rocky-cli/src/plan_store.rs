@@ -19,17 +19,18 @@
 //!
 //! [`PersistedPlan::format_version`] tags the on-disk plan shape:
 //!
-//! - **`1` (default; the only format prior to C-5):** the `payload` is a
-//!   full `CompactOutput` / `ArchiveOutput` / `RunPlan` / `PromotePlan`
-//!   envelope including inline SQL strings. Apply reads SQL directly from
-//!   the payload.
-//! - **`2` (opt-in via `[plan_store] format = "v2"`):** for compact and
-//!   archive plans, the `payload` is a [`rocky_ir::CompactPlanIr`] /
-//!   [`rocky_ir::ArchivePlanIr`]; apply regenerates SQL via
-//!   `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Run plans
-//!   keep `format_version = 1` (they are already IR-only by construction);
-//!   promote plans always keep `format_version = 1` (governance audit
-//!   exception per the Phase C audit memo §Q2).
+//! - **`1` (legacy; the only format prior to C-5, opt-in as of v1.35):**
+//!   the `payload` is a full `CompactOutput` / `ArchiveOutput` / `RunPlan`
+//!   / `PromotePlan` envelope including inline SQL strings. Apply reads
+//!   SQL directly from the payload.
+//! - **`2` (default as of v1.35; selected when `[plan_store] format = "v2"`
+//!   or omitted):** for compact and archive plans, the `payload` is a
+//!   [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]; apply
+//!   regenerates SQL via `rocky_core::sql_gen::{compact_from_ir,
+//!   archive_from_ir}`. Run plans keep `format_version = 1` (they are
+//!   already IR-only by construction); promote plans always keep
+//!   `format_version = 1` (governance audit exception per the Phase C
+//!   audit memo §Q2).
 //!
 //! The reader accepts both versions unconditionally — a v1 plan on disk
 //! continues to apply against a binary configured for v2 writes, and vice
@@ -145,7 +146,7 @@ fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
 ///
 /// This is the **v1** writer entry point. Tags the persisted record with
 /// `format_version = 1`. For the v2 typed-IR writer used by `rocky compact`
-/// / `rocky archive` when `[plan_store] format = "v2"`, see
+/// / `rocky archive` under the default `[plan_store] format = "v2"`, see
 /// [`write_plan_v2`].
 pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
     write_plan_inner(root, kind, payload, 1)
@@ -153,8 +154,9 @@ pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Res
 
 /// Persist a **v2** typed-IR plan payload (`format_version = 2`).
 ///
-/// Used by `rocky compact` / `rocky archive` when `[plan_store] format =
-/// "v2"`. `payload` is expected to be a [`rocky_ir::CompactPlanIr`] /
+/// Used by `rocky compact` / `rocky archive` under the default
+/// `[plan_store] format = "v2"` (v1.35.0 onward). `payload` is expected
+/// to be a [`rocky_ir::CompactPlanIr`] /
 /// [`rocky_ir::ArchivePlanIr`] (or any serde value the apply path knows
 /// how to reconstruct into one).
 ///
@@ -416,9 +418,10 @@ mod tests {
     #[test]
     fn write_plan_tags_format_version_one() -> anyhow::Result<()> {
         // C-5 invariant: the legacy `write_plan` entry point always tags
-        // the persisted record with `format_version = 1`. Existing callers
-        // (single-model and catalog-scope compact/archive paths under the
-        // v1 default) keep producing v1 plans byte-for-byte.
+        // the persisted record with `format_version = 1`. Callers that
+        // opt into the v1 on-disk shape via `[plan_store] format = "v1"`
+        // (single-model and catalog-scope compact/archive paths) keep
+        // producing v1 plans byte-for-byte.
         let dir = tempfile::tempdir()?;
         let payload = DummyPayload {
             model: "cat.sc.tbl",

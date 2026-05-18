@@ -27,7 +27,8 @@ use crate::registry::AdapterRegistry;
 use crate::scope::resolve_managed_tables_in_catalog;
 
 /// Resolve the persisted-plan format from the project config. When no
-/// config can be loaded falls back to the default v1 format.
+/// config can be loaded falls back to [`PlanStoreFormat::default`] (v2
+/// as of v1.35.0).
 fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
     let Some(path) = config_path else {
         return PlanStoreFormat::default();
@@ -37,7 +38,7 @@ fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
         Err(e) => {
             tracing::debug!(
                 error = %e,
-                "failed to load rocky config for [plan_store] lookup; falling back to v1"
+                "failed to load rocky config for [plan_store] lookup; using default writer format"
             );
             PlanStoreFormat::default()
         }
@@ -98,8 +99,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// via `rocky archive apply <plan_id>`.
 ///
 /// The persisted-plan format is selected by `[plan_store] format` in
-/// `config_path` (defaults to v1). The stdout JSON shape is unchanged
-/// either way — it always carries SQL for human + CI consumers.
+/// `config_path` (defaults to v2 as of v1.35.0). The stdout JSON shape is
+/// unchanged either way — it always carries SQL for human + CI consumers.
 pub fn run_archive(
     config_path: &Path,
     model: Option<&str>,

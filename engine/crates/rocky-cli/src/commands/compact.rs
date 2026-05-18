@@ -39,12 +39,12 @@ use crate::scope::{
 
 /// Resolve the persisted-plan format from the project config. When no
 /// config can be loaded (e.g. running outside a Rocky project), falls
-/// back to the default v1 format so behaviour is unchanged.
+/// back to [`PlanStoreFormat::default`] (v2 as of v1.35.0).
 ///
 /// `config_path` is optional because today's single-model `run_compact`
 /// / `run_archive` entry points don't take a config path on every code
-/// path — when absent we keep the v1 default and skip the lookup
-/// entirely.
+/// path — when absent we use the default writer format and skip the
+/// lookup entirely.
 fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
     let Some(path) = config_path else {
         return PlanStoreFormat::default();
@@ -54,7 +54,7 @@ fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
         Err(e) => {
             tracing::debug!(
                 error = %e,
-                "failed to load rocky config for [plan_store] lookup; falling back to v1"
+                "failed to load rocky config for [plan_store] lookup; using default writer format"
             );
             PlanStoreFormat::default()
         }
@@ -63,9 +63,9 @@ fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
 
 /// Persist a compact plan using the configured `[plan_store]` format.
 ///
-/// For `PlanStoreFormat::V1` (default) emits today's `CompactOutput`
-/// payload byte-for-byte — every existing plan on disk stays
-/// reproducible. For `PlanStoreFormat::V2` emits a `CompactPlanIr`
+/// For `PlanStoreFormat::V1` emits the legacy `CompactOutput` payload
+/// byte-for-byte — every existing plan on disk stays reproducible. For
+/// `PlanStoreFormat::V2` (default as of v1.35.0) emits a `CompactPlanIr`
 /// payload (the apply path regenerates SQL at execution time via
 /// `sql_gen::compact_from_ir`).
 ///
@@ -110,8 +110,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// via `rocky compact apply <plan_id>`.
 ///
 /// The persisted-plan format is selected by `[plan_store] format` in
-/// `config_path` (defaults to v1). The stdout JSON shape is unchanged
-/// either way — it always carries SQL for human + CI consumers.
+/// `config_path` (defaults to v2 as of v1.35.0). The stdout JSON shape is
+/// unchanged either way — it always carries SQL for human + CI consumers.
 pub fn run_compact(
     config_path: &Path,
     model: &str,
