@@ -1870,9 +1870,18 @@ def _emit_results(
         if asset_key not in selected_keys:
             continue
         for check in table_check.checks:
-            if (asset_key, check.name) not in declared_checks:
+            spec_key = (asset_key, check.name)
+            if spec_key not in declared_checks:
                 continue
-            yielded_checks.add((asset_key, check.name))
+            if spec_key in yielded_checks:
+                _log.debug(
+                    "Skipping duplicate AssetCheckResult emission: %s for %s "
+                    "(already yielded earlier in this op)",
+                    check.name,
+                    asset_key,
+                )
+                continue
+            yielded_checks.add(spec_key)
             yield dg.AssetCheckResult(
                 asset_key=asset_key,
                 check_name=check.name,
@@ -1890,9 +1899,17 @@ def _emit_results(
     # before any run; placeholders below cover the no-anomaly case.
     for run_result in results:
         for anomaly_result in anomaly_check_results(run_result, key_resolver=selected_resolver):
-            if (anomaly_result.asset_key, ANOMALY_CHECK_NAME) not in declared_checks:
+            spec_key = (anomaly_result.asset_key, ANOMALY_CHECK_NAME)
+            if spec_key not in declared_checks:
                 continue
-            yielded_checks.add((anomaly_result.asset_key, ANOMALY_CHECK_NAME))
+            if spec_key in yielded_checks:
+                _log.debug(
+                    "Skipping duplicate row_count_anomaly emission for %s "
+                    "(already yielded earlier in this op)",
+                    anomaly_result.asset_key,
+                )
+                continue
+            yielded_checks.add(spec_key)
             yield anomaly_result
 
     yield from _emit_placeholder_checks(
@@ -1929,11 +1946,30 @@ def _build_table_resolver(
             if tup in rocky_key_to_dagster_key:
                 key = rocky_key_to_dagster_key[tup]
                 return key if key in selected_keys else None
-        # Fallback: match by last path segment.
+        # Fallback: match by last path segment, but only if unique. When two
+        # translator-mapped tables share the same last segment (e.g. the same
+        # connector loaded under multiple region prefixes), an arbitrary
+        # dict-iteration winner would silently collapse distinct Rocky tables
+        # onto one Dagster asset — which causes DagsterInvariantViolationError
+        # downstream once both emit a check/anomaly/drift event in the same op.
         last = parts[-1]
-        for tup, key in rocky_key_to_dagster_key.items():
-            if tup and tup[-1] == last and key in selected_keys:
-                return key
+        candidates = [
+            key
+            for tup, key in rocky_key_to_dagster_key.items()
+            if tup and tup[-1] == last and key in selected_keys
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            _log.warning(
+                "Ambiguous Rocky table identifier %r: matched %d translator-mapped keys "
+                "via last-segment fallback. Refusing to guess; dropping event. "
+                "Adopters can disambiguate by emitting the schema-qualified "
+                "(schema.table) or catalog-qualified (catalog.schema.table) form, "
+                "which the trailing-tuple lookup resolves deterministically.",
+                table_name,
+                len(candidates),
+            )
         return None
 
     return resolve
