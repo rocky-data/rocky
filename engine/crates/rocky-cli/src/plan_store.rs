@@ -58,6 +58,15 @@ pub enum PlanKind {
     /// list, execution layers). Full `ProjectIr` is not persisted — `apply`
     /// re-derives it by re-compiling with the same flags.
     Run,
+    /// A `rocky plan` / `rocky apply` plan for a replication-only project
+    /// (no `models/` directory, or `models/` exists but contains zero
+    /// compiled models). The payload is a `ReplicationPlan` struct
+    /// capturing the canonical `RockyConfig` snapshot and the discovered
+    /// source state (sorted connectors + tables) at plan time. At apply
+    /// time discovery is re-run and the snapshot is asserted byte-equal
+    /// against the persisted one — stale plans are rejected with a clear
+    /// "re-plan and re-apply" error before any SQL is executed.
+    Replication,
     /// A `rocky plan promote` / `rocky apply` promote plan. The payload is a
     /// `PromotePlan` struct (branch name, base ref, per-target SQL statements,
     /// plan-time audit events). At apply time the branch-state hash is
@@ -72,6 +81,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Compact => write!(f, "compact"),
             PlanKind::Archive => write!(f, "archive"),
             PlanKind::Run => write!(f, "run"),
+            PlanKind::Replication => write!(f, "replication"),
             PlanKind::Promote => write!(f, "promote"),
         }
     }
@@ -302,6 +312,7 @@ mod tests {
         let id_compact = write_plan(dir.path(), PlanKind::Compact, &payload)?;
         let id_archive = write_plan(dir.path(), PlanKind::Archive, &payload)?;
         let id_run = write_plan(dir.path(), PlanKind::Run, &payload)?;
+        let id_replication = write_plan(dir.path(), PlanKind::Replication, &payload)?;
         let id_promote = write_plan(dir.path(), PlanKind::Promote, &payload)?;
         assert_ne!(
             id_compact, id_archive,
@@ -314,6 +325,14 @@ mod tests {
         assert_ne!(
             id_archive, id_run,
             "archive and run must produce different plan_ids"
+        );
+        assert_ne!(
+            id_run, id_replication,
+            "run and replication must produce different plan_ids"
+        );
+        assert_ne!(
+            id_compact, id_replication,
+            "compact and replication must produce different plan_ids"
         );
         assert_ne!(
             id_compact, id_promote,
@@ -348,6 +367,39 @@ mod tests {
     }
 
     #[test]
+    fn replication_kind_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.replication_table",
+            statement_count: 4,
+        };
+
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &payload)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Replication);
+        assert_eq!(
+            plan.payload["model"],
+            serde_json::json!("cat.sc.replication_table")
+        );
+        assert_eq!(plan.payload["statement_count"], serde_json::json!(4));
+        Ok(())
+    }
+
+    /// `PlanKind::Replication` serializes to the snake_case wire name
+    /// `"replication"`, mirroring the other variants. The dispatcher in
+    /// `commands::apply` relies on this for round-trip dispatch.
+    #[test]
+    fn replication_kind_wire_name() {
+        let kind = PlanKind::Replication;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, r#""replication""#);
+        let parsed: PlanKind = serde_json::from_str(r#""replication""#).unwrap();
+        assert_eq!(parsed, PlanKind::Replication);
+    }
+
+    #[test]
     fn run_kind_round_trip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let payload = DummyPayload {
@@ -370,6 +422,7 @@ mod tests {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
         assert_eq!(PlanKind::Archive.to_string(), "archive");
         assert_eq!(PlanKind::Run.to_string(), "run");
+        assert_eq!(PlanKind::Replication.to_string(), "replication");
         assert_eq!(PlanKind::Promote.to_string(), "promote");
     }
 

@@ -72,11 +72,35 @@ def _apply_envelope_json() -> str:
     )
 
 
+def _plan_json(plan_id: str = "a" * 64) -> str:
+    """Phase 5b: ``rocky plan`` always emits a plan_id, replication or not."""
+    return json.dumps(
+        {
+            "version": "0.1.0",
+            "command": "plan",
+            "filter": "tenant=acme",
+            "statements": [],
+            "plan_id": plan_id,
+            "plan_kind": "replication",
+            "created_at": "2026-05-18T00:00:00Z",
+        }
+    )
+
+
 def _capture_run_args() -> tuple[list[list[str]], Any]:
+    """Phase 5b: ``rocky.run()`` invokes ``plan`` then ``apply``. Return the
+    plan JSON on the first call and the empty run JSON on the second.
+
+    Resolver tests assert against ``captured[0]`` (the plan argv) since
+    every flag emitted by ``_build_run_args`` also lands on the plan
+    argv via ``_build_plan_args`` (engine flag-surface parity, Phase 4).
+    """
     captured: list[list[str]] = []
 
     def fake_run(self, args, allow_partial=False):
         captured.append(args)
+        if args[0] == "plan":
+            return _plan_json()
         return _empty_run_json()
 
     return captured, fake_run
@@ -565,6 +589,8 @@ def test_resolvers_survive_dagster_materialize_lifecycle():
 
     def fake_run(self, args, allow_partial=False):
         captured.append(args)
+        if args[0] == "plan":
+            return _plan_json()
         return _empty_run_json()
 
     @dg.asset

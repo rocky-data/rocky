@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 
 use rocky_core::config::GovernanceOverride;
+use rocky_core::source::DiscoveredConnector;
 use rocky_core::sql_gen;
 use rocky_ir::*;
 
@@ -252,21 +253,24 @@ pub async fn plan(
             .context("failed to compute governance action preview")?;
     }
 
-    // --- Run-plan blueprint (Cluster 3 B, Phase 2) -----------------------
+    // --- Plan-spine persistence (Cluster 3 B, Phase 2 + Phase 5b) ---------
     //
-    // When a `models/` directory exists, compile the project and persist a
-    // `RunPlan` (operational metadata only — no full IR). `rocky apply` will
-    // re-derive ProjectIr by recompiling with the same flags. Plan write is
-    // best-effort — failure is logged as a warning, not an error, so
-    // replication-only invocations in CI environments without `.rocky/`
-    // write access are not broken.
+    // Persist a `RunPlan` when the project has compiled models, or a
+    // `ReplicationPlan` for replication-only projects (no `models/`
+    // directory, or `models/` exists but compile returns zero models).
+    // In both cases `output.plan_id` ends up populated so `rocky apply`
+    // can re-execute the same intent. Plan write is best-effort —
+    // failure is logged as a warning, not an error, so CLI invocations
+    // in CI environments without `.rocky/` write access still emit the
+    // statement preview.
     //
-    // The compile honours `--models` when set; otherwise the conventional
-    // `models/` directory next to the config is used.
+    // The run-plan compile honours `--models` when set; otherwise the
+    // conventional `models/` directory next to the config is used.
     let blueprint_models_dir = run_options
         .models_dir
         .clone()
         .unwrap_or_else(|| models_dir.clone());
+    let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
             &blueprint_models_dir,
@@ -275,17 +279,54 @@ pub async fn plan(
             env,
             run_options,
         ) {
-            Ok((run_plan, plan_id, persisted_at)) => {
+            Ok(Some((run_plan, plan_id, persisted_at))) => {
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
+                run_plan_persisted = true;
+            }
+            Ok(None) => {
+                // `models/` exists but compile produced zero models —
+                // fall through to the replication-plan branch below.
+                tracing::debug!(
+                    "`models/` directory has no compiled models — building replication plan instead"
+                );
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "failed to build/persist run plan; `rocky apply` will not be available for this invocation"
+                );
+            }
+        }
+    }
+
+    // Replication-plan branch — fires when there is no `models/`
+    // directory or the directory exists but contains zero compiled
+    // models. The plan_id is content-addressed by the canonical
+    // `RockyConfig` snapshot + the discovered source state (sorted
+    // connectors + tables), so identical inputs produce an identical
+    // plan_id across machines.
+    if !run_plan_persisted {
+        match build_and_persist_replication_plan(
+            &rocky_cfg,
+            &connectors,
+            filter,
+            pipeline_name,
+            env,
+            run_options,
+        ) {
+            Ok((_replication_plan, plan_id, persisted_at)) => {
+                output.plan_id = Some(plan_id);
+                output.plan_kind = Some("replication".to_string());
+                output.created_at = Some(persisted_at);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build/persist replication plan; `rocky apply` will not be available for this invocation"
                 );
             }
         }
@@ -302,11 +343,22 @@ pub async fn plan(
         render_governance_preview_text(&output);
         if let Some(ref plan_id) = output.plan_id {
             println!();
-            println!(
-                "Run plan persisted — {} model(s) across {} layer(s)",
-                output.models.len(),
-                output.execution_layers.len()
-            );
+            match output.plan_kind.as_deref() {
+                Some("replication") => {
+                    println!(
+                        "Replication plan persisted — {} statement(s) across {} connector(s)",
+                        output.statements.len(),
+                        connectors.len(),
+                    );
+                }
+                _ => {
+                    println!(
+                        "Run plan persisted — {} model(s) across {} layer(s)",
+                        output.models.len(),
+                        output.execution_layers.len()
+                    );
+                }
+            }
             println!("Plan ID:   {plan_id}");
             println!("Apply with: rocky apply {plan_id}");
         }
@@ -315,7 +367,11 @@ pub async fn plan(
 }
 
 /// Compile the models directory, build a `RunPlan` payload, persist it to
-/// `.rocky/plans/<plan_id>.json`, and return `(payload, plan_id, persisted_at)`.
+/// `.rocky/plans/<plan_id>.json`, and return
+/// `Some((payload, plan_id, persisted_at))`.
+///
+/// Returns `Ok(None)` when the compile succeeds but produces zero models —
+/// the caller falls through to the replication-plan branch in that case.
 ///
 /// Captures the full `rocky run` flag surface from `run_options` so apply-time
 /// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
@@ -326,7 +382,7 @@ fn build_and_persist_run_plan(
     pipeline: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
-) -> Result<(RunPlan, String, chrono::DateTime<Utc>)> {
+) -> Result<Option<(RunPlan, String, chrono::DateTime<Utc>)>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
@@ -339,6 +395,14 @@ fn build_and_persist_run_plan(
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
+
+    if result.project.models.is_empty() {
+        // No models compiled — this is a replication-only project even
+        // though `models/` exists on disk (e.g. it only holds
+        // `_defaults.toml` or stub files). Let the caller take the
+        // replication-plan path.
+        return Ok(None);
+    }
 
     // Collect qualified model names from the project.
     let models: Vec<String> = result
@@ -386,7 +450,83 @@ fn build_and_persist_run_plan(
     let plan_id = write_plan(&cwd, PlanKind::Run, &run_plan).context("failed to write run plan")?;
 
     let persisted_at = Utc::now();
-    Ok((run_plan, plan_id, persisted_at))
+    Ok(Some((run_plan, plan_id, persisted_at)))
+}
+
+/// Build a canonical, sorted source-state snapshot from the discovered
+/// connectors. Used both at plan time (to build the `ReplicationPlan`
+/// payload) and at apply time (to assert the source hasn't drifted
+/// since the plan was created).
+///
+/// Sort order is stable: connectors by `id`, tables by `name`. Volatile
+/// fields (`last_sync_at`, adapter `metadata`) are intentionally
+/// omitted — see [`ReplicationConnectorSnapshot`] for the rationale.
+pub(crate) fn build_source_state_snapshot(
+    connectors: &[DiscoveredConnector],
+) -> Vec<ReplicationConnectorSnapshot> {
+    let mut snapshot: Vec<ReplicationConnectorSnapshot> = connectors
+        .iter()
+        .map(|c| {
+            let mut tables: Vec<ReplicationTableSnapshot> = c
+                .tables
+                .iter()
+                .map(|t| ReplicationTableSnapshot {
+                    name: t.name.clone(),
+                    row_count: t.row_count,
+                })
+                .collect();
+            tables.sort_by(|a, b| a.name.cmp(&b.name));
+            ReplicationConnectorSnapshot {
+                id: c.id.clone(),
+                schema: c.schema.clone(),
+                source_type: c.source_type.clone(),
+                tables,
+            }
+        })
+        .collect();
+    snapshot.sort_by(|a, b| a.id.cmp(&b.id));
+    snapshot
+}
+
+/// Build a `ReplicationPlan` payload from the loaded config + the
+/// already-discovered connectors, persist it to
+/// `.rocky/plans/<plan_id>.json`, and return
+/// `(payload, plan_id, persisted_at)`.
+///
+/// Called by the replication-plan branch of `rocky plan` — fires when
+/// the project has no `models/` directory or when compile produced
+/// zero models. Discovery has already happened earlier in `plan()`;
+/// this function only canonicalizes the result and persists.
+fn build_and_persist_replication_plan(
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    connectors: &[DiscoveredConnector],
+    filter: Option<&str>,
+    pipeline: Option<&str>,
+    env: Option<&str>,
+    run_options: &PlanRunOptions,
+) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
+    let config_snapshot = serde_json::to_value(rocky_cfg)
+        .context("failed to serialize RockyConfig for replication plan")?;
+    let source_state_snapshot = build_source_state_snapshot(connectors);
+
+    let replication_plan = ReplicationPlan {
+        filter: filter.map(str::to_string),
+        pipeline: pipeline.map(str::to_string),
+        env: env.map(str::to_string),
+        idempotency_key: run_options.idempotency_key.clone(),
+        resume: run_options.resume.clone(),
+        resume_latest: run_options.resume_latest,
+        governance_override: run_options.governance_override.clone(),
+        config_snapshot,
+        source_state_snapshot,
+    };
+
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let plan_id = write_plan(&cwd, PlanKind::Replication, &replication_plan)
+        .context("failed to write replication plan")?;
+
+    let persisted_at = Utc::now();
+    Ok((replication_plan, plan_id, persisted_at))
 }
 
 /// Compile the project and populate `classification_actions`,
@@ -1131,5 +1271,102 @@ ssn = "confidential"
         let kind = AuditEventKind::PromotePlanCreated;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, r#""promote_plan_created""#);
+    }
+
+    // ------------------------------------------------------------------
+    // Replication plan source-state snapshot canonicalization (Phase 5b)
+    //
+    // The plan_id digest is computed over the JSON bytes of the
+    // payload, so `build_source_state_snapshot` MUST be deterministic
+    // across discover runs — same connectors, same tables, same
+    // plan_id. These tests pin the sort + field-omission contract that
+    // makes that property hold.
+    // ------------------------------------------------------------------
+
+    use rocky_core::source::{DiscoveredConnector, DiscoveredTable};
+
+    fn make_connector(id: &str, schema: &str, table_names: &[&str]) -> DiscoveredConnector {
+        DiscoveredConnector {
+            id: id.to_string(),
+            schema: schema.to_string(),
+            source_type: "duckdb".to_string(),
+            // last_sync_at is intentionally volatile — verify it
+            // doesn't leak into the snapshot.
+            last_sync_at: Some(chrono::Utc::now()),
+            tables: table_names
+                .iter()
+                .map(|n| DiscoveredTable {
+                    name: n.to_string(),
+                    row_count: Some(10),
+                })
+                .collect(),
+            // metadata is intentionally volatile (rate-limit counters
+            // etc.) — verify it doesn't leak either.
+            metadata: indexmap::IndexMap::from([(
+                "fivetran.rate_limit_used".to_string(),
+                serde_json::json!(42),
+            )]),
+        }
+    }
+
+    /// Connectors sort by `id`, tables within each connector sort by
+    /// `name`. Discover adapters may return either ordering depending
+    /// on the upstream API; without this canonicalization the
+    /// content-addressed plan_id would wiggle.
+    #[test]
+    fn snapshot_sorts_connectors_and_tables() {
+        let connectors = vec![
+            make_connector("conn_zebra", "schema_z", &["zulu", "alpha"]),
+            make_connector("conn_alpha", "schema_a", &["delta", "bravo"]),
+        ];
+        let snap = build_source_state_snapshot(&connectors);
+
+        assert_eq!(snap.len(), 2);
+        // Connectors sorted by id.
+        assert_eq!(snap[0].id, "conn_alpha");
+        assert_eq!(snap[1].id, "conn_zebra");
+        // Tables sorted by name within each connector.
+        assert_eq!(snap[0].tables[0].name, "bravo");
+        assert_eq!(snap[0].tables[1].name, "delta");
+        assert_eq!(snap[1].tables[0].name, "alpha");
+        assert_eq!(snap[1].tables[1].name, "zulu");
+    }
+
+    /// Re-running the snapshot on the same connector list must
+    /// produce byte-identical JSON. This is the property the plan_id
+    /// content-addressing relies on.
+    #[test]
+    fn snapshot_is_deterministic_across_runs() {
+        let connectors = vec![
+            make_connector("c2", "s2", &["t2", "t1"]),
+            make_connector("c1", "s1", &["t1"]),
+        ];
+        let s1 = build_source_state_snapshot(&connectors);
+        let s2 = build_source_state_snapshot(&connectors);
+
+        let j1 = serde_json::to_string(&s1).unwrap();
+        let j2 = serde_json::to_string(&s2).unwrap();
+        assert_eq!(j1, j2, "snapshot must be byte-stable for the same input");
+    }
+
+    /// Volatile fields (`last_sync_at`, adapter `metadata`) MUST be
+    /// excluded from the snapshot. Including them would invalidate
+    /// the plan on every sync tick — the very bug Phase 5b avoids by
+    /// content-addressing on stable identity only.
+    #[test]
+    fn snapshot_excludes_volatile_fields() {
+        let conn = make_connector("c1", "s1", &["t1"]);
+        let snap = build_source_state_snapshot(std::slice::from_ref(&conn));
+        let json = serde_json::to_value(&snap).unwrap();
+
+        // Spot-check the wire format: no last_sync_at, no metadata.
+        assert!(json[0].get("last_sync_at").is_none());
+        assert!(json[0].get("metadata").is_none());
+        // Identity fields are present.
+        assert_eq!(json[0]["id"], "c1");
+        assert_eq!(json[0]["schema"], "s1");
+        assert_eq!(json[0]["source_type"], "duckdb");
+        assert_eq!(json[0]["tables"][0]["name"], "t1");
+        assert_eq!(json[0]["tables"][0]["row_count"], 10);
     }
 }

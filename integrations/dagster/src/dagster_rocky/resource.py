@@ -1187,13 +1187,12 @@ class RockyResource(dg.ConfigurableResource):
         # handles the single-process case, which is all rocky does on
         # Windows today.
         # Inherit the parent environment and force-suppress engine deprecation
-        # notices. After Cluster 3 B Phase 5, the three exec methods route
-        # through `rocky plan` + `rocky apply <plan-id>` so the alias warning
-        # is mostly silent — but the replication-only fallback in
-        # :meth:`_apply_plan` still invokes `rocky run` (engine cannot persist
-        # a plan when no `models/` directory exists), and operators can call
-        # `branch promote <name>` in its bare form too. Keep the suppression
-        # so neither path leaks a `[deprecated]` line into Dagster run logs.
+        # notices. After Cluster 3 B Phase 5b, the three exec methods route
+        # exclusively through `rocky plan` + `rocky apply <plan-id>` (the
+        # replication-only fallback was dropped — every project shape now
+        # emits a plan_id). The suppression stays for direct callers
+        # (operators invoking `rocky run` from CI scripts) and for the bare
+        # `branch promote <name>` invocation that some tests still exercise.
         # `setdefault` keeps the env var operator-overridable.
         rocky_env = os.environ.copy()
         rocky_env.setdefault("ROCKY_SUPPRESS_DEPRECATION", "1")
@@ -1390,15 +1389,15 @@ class RockyResource(dg.ConfigurableResource):
     ) -> PlanResult:
         """Run ``rocky plan`` and return the parsed result.
 
-        When a ``models/`` directory exists in the project, ``rocky plan``
-        also compiles the project and persists a ``RunPlan`` blueprint to
-        ``.rocky/plans/<plan_id>.json``. The returned :class:`PlanResult`
-        will have ``plan_id``, ``plan_kind``, ``created_at``, ``models``,
-        and ``execution_layers`` populated in that case. Call
-        :meth:`apply` with the returned ``plan_id`` to execute the plan.
-
-        For replication-only projects (no ``models/`` directory), the plan
-        acts as a SQL dry-run preview and ``plan_id`` will be ``None``.
+        Every project shape — including replication-only (no
+        ``models/`` directory) — content-addresses a plan and persists
+        it to ``.rocky/plans/<plan_id>.json``. The returned
+        :class:`PlanResult` always has ``plan_id``, ``plan_kind``, and
+        ``created_at`` populated. ``plan_kind`` is ``"run"`` when
+        compiled models drive the plan and ``"replication"`` when the
+        plan is content-addressed by the canonical ``rocky.toml``
+        snapshot + the discovered source state. Call :meth:`apply`
+        with the returned ``plan_id`` to execute the plan.
 
         Args:
             filter: Component filter (e.g. ``"client=acme"``). Optional.
@@ -1427,6 +1426,10 @@ class RockyResource(dg.ConfigurableResource):
         - ``archive`` plan → DELETE/VACUUM statements via the warehouse adapter.
         - ``run`` plan → full pipeline re-execution with the flags that were
           active when ``rocky plan`` was called.
+        - ``replication`` plan → re-discover source state, assert it matches
+          the persisted snapshot, then execute the replication-only pipeline.
+          Stale source state aborts the apply with a clear "re-plan and
+          re-apply" error.
         - ``promote`` plan → executes the pre-built promotion SQL statements
           without re-running the approval or breaking-change gate.
 
@@ -1600,14 +1603,14 @@ class RockyResource(dg.ConfigurableResource):
           ``.rocky/plans/<plan_id>.json`` before applying — the same
           plan id you'd see if you invoked ``rocky plan`` from the CLI.
 
-        Log narrative note (Cluster 3 B Phase 5): the integration now
+        Log narrative note (Cluster 3 B Phase 5b): the integration
         runs ``rocky plan`` first (buffered, single-digit seconds) and
-        then ``rocky apply <plan_id>`` (streamed). Plan-phase stderr is
-        forwarded to the module logger only — it does **not** reach
+        then ``rocky apply <plan_id>`` (streamed). Plan-phase stderr
+        is forwarded to the module logger only — it does **not** reach
         ``context.log``. Apply-phase stderr streams to ``context.log``
-        as before. Replication-only projects (no ``models/`` directory)
-        fall back to ``rocky run`` and keep the legacy single-stream
-        narrative.
+        as before. Every project shape — including replication-only —
+        content-addresses a plan after Phase 5b, so the two-stream
+        narrative is uniform across the matrix.
 
         Args:
             context: Dagster execution context. Either an
@@ -1682,14 +1685,15 @@ class RockyResource(dg.ConfigurableResource):
     ) -> list[str]:
         """Shared argv builder for the legacy ``rocky run`` alias path.
 
-        After Cluster 3 B Phase 5, the three public exec methods
+        After Cluster 3 B Phase 5b, the three public exec methods
         (:meth:`run`, :meth:`run_streaming`, :meth:`run_pipes`) route
-        through :meth:`_build_plan_args` + :meth:`_apply_plan` by
-        default. This builder remains in place for the replication-only
-        fallback (projects with no ``models/`` directory, where
-        ``rocky plan`` cannot persist a plan and there is no
-        ``plan_id`` to apply). It is also kept for any direct caller
-        that still wants the single-subprocess shape.
+        exclusively through :meth:`_build_plan_args` + :meth:`_apply_plan`
+        (the replication-only fallback was dropped — engine-v1.34+
+        emits a content-addressed plan_id for every project shape,
+        replication-only included). This builder is still passed to
+        :meth:`_apply_plan` for argv-symmetry across exec methods, and
+        remains exposed for direct callers that want the
+        single-subprocess shape (CI scripts, ad-hoc tooling).
 
         Single source of truth for the flag plumbing so adding a new
         flag is a one-place change. The flags are defensive:
@@ -1827,41 +1831,55 @@ class RockyResource(dg.ConfigurableResource):
         is the callable that exec the apply argv with whatever process
         model the caller wants (buffered, streaming, Pipes, …).
 
-        Replication-only fallback: when ``rocky plan`` cannot persist a
-        plan because the project has no ``models/`` directory (the
-        ``plan_id`` field is ``None`` on the wire), this method
-        transparently falls back to ``rocky run`` with the original
-        flag surface — behavior-preserving for the pre-Phase-5
-        replication-only path. The deprecation notice is still
-        suppressed via ``ROCKY_SUPPRESS_DEPRECATION`` in
-        :meth:`_run_rocky_with_log_sink` so users see no stderr noise
-        on the fallback.
+        After Phase 5b every supported project shape — including
+        replication-only (no ``models/`` directory) — emits a
+        content-addressed ``plan_id``. A ``None`` ``plan_id`` is now
+        treated as a malformed payload and surfaces as a clear
+        :class:`dg.Failure` instead of silently falling back to
+        ``rocky run``. The version skew is intentional: the dagster
+        wheel that ships this method requires an engine that emits
+        ``plan_id`` for every project shape (engine-v1.34+).
 
         Args:
             plan_args: Argv for ``rocky plan`` (built by
                 :meth:`_build_plan_args`).
-            run_fallback_args: Argv for the ``rocky run`` legacy path
-                (built by :meth:`_build_run_args`). Used only when
-                ``rocky plan`` returns ``plan_id = null``.
+            run_fallback_args: Unused since Phase 5b — kept on the
+                signature so the three call sites (`run`,
+                `run_streaming`, `run_pipes`) stay symmetrical while
+                the engine alias-deprecation cycle runs. Build it the
+                normal way; this method just doesn't read it anymore.
             apply_runner: Per-method exec callable. Receives the
-                ``["apply", <plan_id>]`` argv (or
-                ``run_fallback_args`` on the fallback path) and
-                returns the resulting stdout. Examples:
+                ``["apply", <plan_id>]`` argv and returns the resulting
+                stdout. Examples:
                 ``lambda args: self._run_rocky(args, allow_partial=True)``
                 for the buffered path; the streaming sink-emitting
                 helper for the streaming path.
 
         Returns:
-            The captured stdout from the apply (or fallback ``run``)
-            invocation, ready to be parsed.
+            The captured stdout from the apply invocation, ready to be
+            parsed.
+
+        Raises:
+            :class:`dg.Failure`: When ``rocky plan`` fails to emit a
+                ``plan_id`` (engine version skew or malformed payload).
         """
+        del run_fallback_args  # see docstring — kept on signature for symmetry only
         plan_stdout = self._run_rocky(plan_args)
         plan_id = self._extract_plan_id(plan_stdout)
         if plan_id is None:
-            # Replication-only project (no models/ directory) — engine
-            # cannot persist a plan and there is no plan_id to apply.
-            # Fall back to the single-subprocess `rocky run` path.
-            return apply_runner(run_fallback_args)
+            raise dg.Failure(
+                description=(
+                    "rocky plan did not emit a plan_id — this dagster integration "
+                    "requires engine-v1.34+ which content-addresses every plan, "
+                    "including replication-only projects. Upgrade the rocky binary "
+                    "or pin dagster-rocky<1.33 if a downgrade is needed."
+                ),
+                metadata={
+                    "plan_stdout_tail": dg.MetadataValue.text(
+                        _truncate_stderr_for_metadata(plan_stdout)
+                    ),
+                },
+            )
         return apply_runner(["apply", plan_id])
 
     def run_pipes(
@@ -2004,16 +2022,26 @@ class RockyResource(dg.ConfigurableResource):
         # Plan step is buffered and a separate subprocess. Pipes attaches
         # to the apply step (the engine's Pipes emitter is a no-op on
         # ``rocky plan`` — only ``rocky apply`` reports materializations).
-        # Replication-only projects fall back to ``rocky run`` (no plan
-        # persisted), which still emits Pipes messages under the
-        # ``DAGSTER_PIPES_*`` env vars set by ``PipesSubprocessClient``.
+        # After Phase 5b every project shape — including replication-only
+        # — content-addresses a plan, so the null-plan_id fallback to
+        # ``rocky run`` is gone. ``run_fallback_args`` is computed above
+        # for symmetry with the other two exec methods but unused here.
+        del run_fallback_args  # see comment above
         plan_stdout = self._run_rocky(plan_args)
         plan_id = self._extract_plan_id(plan_stdout)
         if plan_id is None:
-            # Replication-only fallback — single subprocess via Pipes.
-            return client.run(
-                context=context,
-                command=self._build_cmd(run_fallback_args),
+            raise dg.Failure(
+                description=(
+                    "rocky plan did not emit a plan_id — this dagster integration "
+                    "requires engine-v1.34+ which content-addresses every plan, "
+                    "including replication-only projects. Upgrade the rocky binary "
+                    "or pin dagster-rocky<1.33 if a downgrade is needed."
+                ),
+                metadata={
+                    "plan_stdout_tail": dg.MetadataValue.text(
+                        _truncate_stderr_for_metadata(plan_stdout)
+                    ),
+                },
             )
         return client.run(
             context=context,
