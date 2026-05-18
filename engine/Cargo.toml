@@ -70,7 +70,7 @@ anyhow = "1"
 miette = { version = "7", features = ["fancy"] }
 
 # SQL parsing
-sqlparser = { version = "0.61", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # State store
 redb = "2"
