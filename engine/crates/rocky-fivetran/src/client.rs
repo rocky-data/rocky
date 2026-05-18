@@ -1,7 +1,10 @@
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::Client;
+use reqwest::{Client, Response};
+
+use crate::ratelimit;
 
 /// Percent-encode a single user-supplied URL path component.
 ///
@@ -83,6 +86,14 @@ pub struct FivetranClient {
     retry: RetryConfig,
     /// Shared retry budget across the run (§P2.7). Unbounded by default.
     retry_budget: rocky_core::retry_budget::RetryBudget,
+    /// Short hex hash of the API key — used as the per-host coordination
+    /// file name and as the `account_id` attribute on rate-limit OTLP
+    /// span events. Computed once at construction so we never re-hash
+    /// the credential on a hot path.
+    account_id_hash: String,
+    /// Directory holding the per-account shared rate-limit state file
+    /// (FR-B). One file per account: `{ratelimit_dir}/{hash}.json`.
+    ratelimit_dir: PathBuf,
 }
 
 /// Standard Fivetran API envelope.
@@ -108,6 +119,7 @@ impl FivetranClient {
     pub fn with_retry(api_key: String, api_secret: String, retry: RetryConfig) -> Self {
         let retry_budget =
             rocky_core::retry_budget::RetryBudget::from_config(retry.max_retries_per_run);
+        let account_id_hash = ratelimit::hash_account_id(&api_key);
         FivetranClient {
             client: build_http_client(),
             base_url: "https://api.fivetran.com".to_string(),
@@ -115,6 +127,8 @@ impl FivetranClient {
             api_secret: RedactedString::new(api_secret),
             retry,
             retry_budget,
+            account_id_hash,
+            ratelimit_dir: ratelimit::default_ratelimit_dir(),
         }
     }
 
@@ -126,9 +140,72 @@ impl FivetranClient {
         self
     }
 
+    /// Override the per-host rate-limit state directory (FR-B). Tests
+    /// pass a per-test [`tempfile::tempdir()`] so concurrent runs don't
+    /// collide on the default `${TMPDIR}/rocky-fivetran-ratelimit/`
+    /// location. Production callers should leave the default in place
+    /// so every `rocky-cli` process on the host shares a single file.
+    #[must_use]
+    pub fn with_ratelimit_dir(mut self, dir: PathBuf) -> Self {
+        self.ratelimit_dir = dir;
+        self
+    }
+
+    /// Resolve the per-account state file under [`Self::ratelimit_dir`].
+    fn ratelimit_path(&self) -> PathBuf {
+        ratelimit::account_state_path(&self.ratelimit_dir, &self.account_id_hash)
+    }
+
+    /// Block on any active shared rate-limit window before sending a
+    /// request. Fail-open — see [`ratelimit::pre_request_wait`].
+    async fn observe_shared_budget(&self) {
+        ratelimit::pre_request_wait(&self.ratelimit_path()).await;
+    }
+
+    /// Record a new shared rate-limit window so other rocky-cli
+    /// processes on the host observe the same backoff. Called when we
+    /// receive a 429 / 503 with `Retry-After`. Also emits the
+    /// `fivetran.rate_limit_observed` OTLP span event.
+    ///
+    /// `sleep_for` is the effective wait the caller is about to
+    /// perform (already `max(header, fixed_backoff)` when `source =
+    /// Header`). `header_value` is the unmodified value parsed from
+    /// the upstream header (None for `source = Fallback`). Splitting
+    /// the two lets dashboards see "upstream said 100ms but we slept
+    /// 1s because backoff dominated" without conflating the signals.
+    fn publish_rate_limit_observation(
+        &self,
+        sleep_for: Duration,
+        header_value: Option<Duration>,
+        source: RateLimitSource,
+        status: u16,
+    ) {
+        let wake_at = SystemTime::now() + sleep_for;
+        ratelimit::record_wake_at(&self.ratelimit_path(), wake_at);
+
+        let to_ms = |d: Duration| -> u64 {
+            d.as_millis()
+                .min(u128::from(u64::MAX))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        };
+        let mut evt = PipelineEvent::new("fivetran.rate_limit_observed")
+            .with_error_class(ErrorClass::RateLimit)
+            .with_metadata("retry_after_ms", to_ms(sleep_for))
+            .with_metadata("source", source.as_str())
+            .with_metadata("account_id", self.account_id_hash.clone())
+            .with_metadata("status", u64::from(status));
+        if let Some(h) = header_value {
+            evt = evt.with_metadata("header_retry_after_ms", to_ms(h));
+        }
+        record_span_event(&evt);
+        global_event_bus().emit(evt);
+    }
+
     /// Creates a client pointing at a custom base URL (for testing with wiremock).
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_base_url(api_key: String, api_secret: String, base_url: String) -> Self {
+        let account_id_hash = ratelimit::hash_account_id(&api_key);
         FivetranClient {
             client: build_http_client(),
             base_url,
@@ -139,6 +216,34 @@ impl FivetranClient {
                 ..Default::default()
             },
             retry_budget: rocky_core::retry_budget::RetryBudget::unbounded(),
+            account_id_hash,
+            // Tests that need an isolated shared-budget file should
+            // chain `.with_ratelimit_dir(...)` after construction.
+            ratelimit_dir: ratelimit::default_ratelimit_dir(),
+        }
+    }
+
+    /// Test-only variant of [`Self::with_base_url`] that lets the
+    /// caller supply a [`RetryConfig`] — used by FR-B's Retry-After
+    /// integration tests where the first attempt must be retried so
+    /// the post-`Retry-After` sleep is observable.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_base_url_and_retry(
+        api_key: String,
+        api_secret: String,
+        base_url: String,
+        retry: RetryConfig,
+    ) -> Self {
+        let account_id_hash = ratelimit::hash_account_id(&api_key);
+        FivetranClient {
+            client: build_http_client(),
+            base_url,
+            api_key: RedactedString::new(api_key),
+            api_secret: RedactedString::new(api_secret),
+            retry,
+            retry_budget: rocky_core::retry_budget::RetryBudget::unbounded(),
+            account_id_hash,
+            ratelimit_dir: ratelimit::default_ratelimit_dir(),
         }
     }
 
@@ -173,6 +278,11 @@ impl FivetranClient {
         for attempt in 0..=self.retry.max_retries {
             debug!(path, attempt, "GET");
 
+            // FR-B: observe any active shared backoff window before
+            // sending — a peer rocky-cli that just hit a 429 may have
+            // recorded a wake_at we should honor.
+            self.observe_shared_budget().await;
+
             let resp = self
                 .client
                 .get(&url)
@@ -204,13 +314,13 @@ impl FivetranClient {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
                     self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
-                    let backoff = retry_backoff(&self.retry, attempt);
+                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429);
                     warn!(
                         attempt = attempt + 1,
-                        backoff_ms = backoff.as_millis() as u64,
+                        backoff_ms = sleep_for.as_millis() as u64,
                         "rate limited, retrying"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(sleep_for).await;
                     continue;
                 }
                 return Err(FivetranError::RateLimited);
@@ -220,14 +330,16 @@ impl FivetranClient {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
                 self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
-                let backoff = retry_backoff(&self.retry, attempt);
+                // 503 Service Unavailable carries `Retry-After` per
+                // RFC 9110 §10.2.3 — honor it the same way as 429.
+                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status);
                 warn!(
                     attempt = attempt + 1,
                     status,
-                    backoff_ms = backoff.as_millis() as u64,
+                    backoff_ms = sleep_for.as_millis() as u64,
                     "server error, retrying"
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(sleep_for).await;
                 continue;
             }
 
@@ -299,6 +411,9 @@ impl FivetranClient {
         for attempt in 0..=self.retry.max_retries {
             debug!(path, cursor, attempt, "GET (paginated)");
 
+            // FR-B: observe shared backoff window before issuing.
+            self.observe_shared_budget().await;
+
             let resp = self
                 .client
                 .get(url)
@@ -330,13 +445,13 @@ impl FivetranClient {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
                     self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
-                    let backoff = retry_backoff(&self.retry, attempt);
+                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429);
                     warn!(
                         attempt = attempt + 1,
-                        backoff_ms = backoff.as_millis() as u64,
+                        backoff_ms = sleep_for.as_millis() as u64,
                         "rate limited, retrying page"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(sleep_for).await;
                     continue;
                 }
                 return Err(FivetranError::RateLimited);
@@ -346,14 +461,14 @@ impl FivetranClient {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
                 self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
-                let backoff = retry_backoff(&self.retry, attempt);
+                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status);
                 warn!(
                     attempt = attempt + 1,
                     status,
-                    backoff_ms = backoff.as_millis() as u64,
+                    backoff_ms = sleep_for.as_millis() as u64,
                     "server error, retrying page"
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(sleep_for).await;
                 continue;
             }
 
@@ -384,6 +499,94 @@ impl FivetranClient {
 
         unreachable!("retry loop should always return")
     }
+
+    /// Compute the sleep duration after a throttle-class response (429
+    /// or 503). When the upstream returned a `Retry-After` header we
+    /// take `max(retry_after, fixed_backoff)` per the FR-B contract,
+    /// publish the shared rate-limit window so peer rocky-cli processes
+    /// observe the same wake-up, and emit the `fivetran.rate_limit_observed`
+    /// span event sourced as `"header"`. Without a header we use the
+    /// existing per-attempt exponential backoff and tag the event as
+    /// `"fallback"` so dashboards can spot adapters that aren't getting
+    /// the upstream signal.
+    fn compute_throttle_sleep(&self, resp: &Response, attempt: u32, status: u16) -> Duration {
+        let backoff = retry_backoff(&self.retry, attempt);
+        match parse_retry_after(resp) {
+            Some(retry_after) => {
+                let sleep_for = retry_after.max(backoff);
+                self.publish_rate_limit_observation(
+                    sleep_for,
+                    Some(retry_after),
+                    RateLimitSource::Header,
+                    status,
+                );
+                sleep_for
+            }
+            None => {
+                self.publish_rate_limit_observation(
+                    backoff,
+                    None,
+                    RateLimitSource::Fallback,
+                    status,
+                );
+                backoff
+            }
+        }
+    }
+}
+
+/// Tag for the `source` field of the `fivetran.rate_limit_observed`
+/// span event — distinguishes upstream-signalled throttles (`header`)
+/// from local fixed-backoff fallbacks (`fallback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateLimitSource {
+    /// The wait duration came from a `Retry-After` response header.
+    Header,
+    /// The upstream omitted `Retry-After`; we used the local fixed
+    /// exponential-backoff schedule.
+    Fallback,
+}
+
+impl RateLimitSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RateLimitSource::Header => "header",
+            RateLimitSource::Fallback => "fallback",
+        }
+    }
+}
+
+/// Parse a `Retry-After` header per RFC 9110 §10.2.3. The header may
+/// be either a non-negative integer count of seconds or an HTTP-date
+/// (RFC 7231 §7.1.1.1). Returns `None` when the header is absent,
+/// unparseable, or refers to a past instant.
+fn parse_retry_after(resp: &Response) -> Option<Duration> {
+    let raw = resp.headers().get(reqwest::header::RETRY_AFTER)?;
+    parse_retry_after_value(raw.to_str().ok()?, SystemTime::now())
+}
+
+/// Pure-string variant of [`parse_retry_after`], exposed so unit tests
+/// can exercise the parser without an HTTP response in hand. `now`
+/// fixes the reference for HTTP-date arithmetic.
+fn parse_retry_after_value(raw: &str, now: SystemTime) -> Option<Duration> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // 1) Integer seconds form. RFC 9110 says non-negative; treat
+    //    negative or overflowing values as "no useful signal" rather
+    //    than guessing.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+
+    // 2) HTTP-date form. `httpdate::parse_http_date` accepts all three
+    //    formats RFC 7231 lists (IMF-fixdate, RFC 850, asctime). A
+    //    date already in the past collapses to `None` so we don't
+    //    immediately retry but also don't sleep for a negative amount.
+    let target = httpdate::parse_http_date(s).ok()?;
+    target.duration_since(now).ok()
 }
 
 /// Computes backoff from RetryConfig with exponential growth, cap, and optional jitter.
@@ -502,5 +705,66 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data.items.len(), 1);
         assert!(data.next_cursor.is_none());
+    }
+
+    /// `Retry-After: 30` → 30 seconds. The trivial integer-seconds
+    /// form is what Fivetran sends today; HTTP-date form is documented
+    /// in the spec and parsed below.
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        let now = SystemTime::now();
+        let parsed = parse_retry_after_value("30", now).expect("integer-seconds must parse");
+        assert_eq!(parsed, Duration::from_secs(30));
+    }
+
+    /// `Retry-After: 0` is valid — caller should fall through to
+    /// `max(retry_after, current_backoff)` and end up using the
+    /// fixed backoff for this attempt. The parser itself returns 0.
+    #[test]
+    fn parse_retry_after_zero_seconds() {
+        let now = SystemTime::now();
+        let parsed = parse_retry_after_value("0", now).expect("zero must parse");
+        assert_eq!(parsed, Duration::from_secs(0));
+    }
+
+    /// HTTP-date form (RFC 7231 IMF-fixdate). Reference instant is
+    /// pinned so the test is deterministic regardless of wall-clock.
+    #[test]
+    fn parse_retry_after_http_date_future() {
+        // 100 seconds after 2026-01-01T00:00:00Z.
+        let now = httpdate::parse_http_date("Thu, 01 Jan 2026 00:00:00 GMT").unwrap();
+        let parsed = parse_retry_after_value("Thu, 01 Jan 2026 00:01:40 GMT", now)
+            .expect("future HTTP-date must parse");
+        assert_eq!(parsed, Duration::from_secs(100));
+    }
+
+    /// HTTP-date already in the past collapses to `None` so the
+    /// caller falls back to the fixed schedule rather than sleeping
+    /// for an invalid (negative) duration.
+    #[test]
+    fn parse_retry_after_http_date_past_is_none() {
+        let now = httpdate::parse_http_date("Thu, 01 Jan 2026 00:01:00 GMT").unwrap();
+        let parsed = parse_retry_after_value("Thu, 01 Jan 2026 00:00:00 GMT", now);
+        assert!(parsed.is_none(), "past date should collapse to None");
+    }
+
+    #[test]
+    fn parse_retry_after_empty_is_none() {
+        assert!(parse_retry_after_value("", SystemTime::now()).is_none());
+        assert!(parse_retry_after_value("   ", SystemTime::now()).is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_is_none() {
+        assert!(parse_retry_after_value("soonish", SystemTime::now()).is_none());
+        assert!(parse_retry_after_value("-5", SystemTime::now()).is_none());
+    }
+
+    #[test]
+    fn rate_limit_source_string_shape() {
+        // The wire form is consumed by dashboards / log greps — keep
+        // it stable across refactors.
+        assert_eq!(RateLimitSource::Header.as_str(), "header");
+        assert_eq!(RateLimitSource::Fallback.as_str(), "fallback");
     }
 }

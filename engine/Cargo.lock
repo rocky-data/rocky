@@ -3948,7 +3948,9 @@ version = "1.36.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "fs4",
  "futures",
+ "httpdate",
  "indexmap",
  "percent-encoding",
  "reqwest",
@@ -3956,6 +3958,8 @@ dependencies = [
  "rocky-observe",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
