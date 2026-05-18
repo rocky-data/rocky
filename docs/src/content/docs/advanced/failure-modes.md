@@ -124,7 +124,7 @@ The `drifted_columns` array names which columns changed and what the divergence 
 
 **Definition.** A warehouse call (compile-passing, contract-passing, drift-handled) failed at execution time. Network errors, auth errors, quota errors, statement timeouts, deadlocks — anything that originates inside the adapter rather than the engine.
 
-**Detection signal.** Non-zero `rocky apply` exit code, `error` field on the affected `MaterializationOutput`, plus a transient/rate-limit classification on the underlying error.
+**Detection signal.** Non-zero `rocky apply` exit code, an entry on `RunOutput.errors[*]` per failed table (with a typed [`failure_kind`](./per-table-error-containment#failure_kind-taxonomy) discriminator the orchestrator can branch on), plus a transient/rate-limit classification on the underlying error. Other tables in the same run continue -- see [Per-table error containment](./per-table-error-containment).
 
 The dispatched adapter classifies its own failures:
 
@@ -139,7 +139,7 @@ The dispatched adapter classifies its own failures:
 **Recovery playbook.**
 
 1. Run `rocky doctor --output json` first. The `adapters[]` block tells you which adapter Rocky thinks should work and which it currently can't reach. Treat doctor as a credentials / connectivity smoke test.
-2. For **transient** failures (`is_transient: true` on the adapter error), use `rocky plan --resume-latest && rocky apply <plan-id>` (or the legacy `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
+2. For **transient** failures (entries with `failure_kind: "transient"` or `"connection-failed"` on `errors[*]`), use `rocky plan --resume-latest && rocky apply <plan-id>` (or the legacy `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
 3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../features/authentication) has the per-adapter checklist.
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or — better — re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).
@@ -235,6 +235,7 @@ The dispatched adapter classifies its own failures:
 
 ## See also
 
+- [Per-table error containment](./per-table-error-containment) — how the run path isolates failures at the table boundary and how to consume the `failure_kind` discriminator
 - [Troubleshooting](./troubleshooting) — symptom-first lookup ("I got error X")
 - [`rocky doctor`](../../reference/cli#doctor) — aggregate health check across config, state, adapters, pipelines
 - [`rocky plan --resume-latest`](../../reference/cli#run) — resume a failed run from its checkpoint (canonical form; the legacy `rocky run --resume-latest` alias is still accepted)

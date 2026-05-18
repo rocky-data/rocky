@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TableError.failure_kind` now surfaces on `RunResult.errors[*]`.** The legacy hand-written `TableError` Pydantic model previously stripped the engine's `failure_kind` field during parsing — only the generated `TableErrorOutput` model exposed it. Added `failure_kind: str = "unknown"` to the legacy model so downstream Dagster assets that read `RunResult.errors[*].failure_kind` see the engine-emitted classifier directly. Strictly additive; the default makes the field forward-compatible with older engine binaries that don't emit it.
+
 ## [1.34.0] — 2026-05-18
 
 Companion release to engine `v1.36.0`. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up the new `merge_keys` and `merge_keys_fallback` fields on `ReplicationPipelineConfig` from engine v1.36.0's replication `strategy = "merge"` (engine [#561](https://github.com/rocky-data/rocky/pull/561)). No new dagster API surface — pure codegen cascade. Wheel re-cut against the v1.36.0 engine binary. Dagster code that constructs `RockyResource` configs against engine v1.36.0+ can now declare `strategy = "merge"` on replication pipelines and supply the keys via the typed config; consumers parsing Rocky JSON output via Pydantic see the new optional fields without overriding `extra = "forbid"`. Also bundles a small fix to `RockyComponent`'s state-cache plumbing so the JSON written to the discover/compile/optimize caches now uses the same field-alias convention as the rocky CLI (matches the existing `dag()` call at `component.py:655`).
