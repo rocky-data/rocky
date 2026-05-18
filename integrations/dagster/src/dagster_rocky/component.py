@@ -524,7 +524,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         rocky = self._get_rocky_resource()
 
         try:
-            discover_payload = json.loads(rocky.discover().model_dump_json())
+            discover_payload = json.loads(rocky.discover().model_dump_json(by_alias=True))
         except Exception:
             # Discover can fail on multi-pipeline configs without a pipeline
             # arg, or when no replication pipeline exists. In dag_mode the
@@ -595,7 +595,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         if not Path(self.models_dir).is_dir():
             return None
         try:
-            return json.loads(rocky.compile().model_dump_json())
+            return json.loads(rocky.compile().model_dump_json(by_alias=True))
         except ValidationError as exc:
             raise _engine_schema_mismatch_failure("compile", exc) from exc
         except dg.Failure as exc:
@@ -627,7 +627,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         ``dg.Failure`` — see ``_compile_payload`` for the rationale.
         """
         try:
-            return json.loads(rocky.optimize().model_dump_json())
+            return json.loads(rocky.optimize().model_dump_json(by_alias=True))
         except ValidationError as exc:
             raise _engine_schema_mismatch_failure("optimize", exc) from exc
         except dg.Failure as exc:
