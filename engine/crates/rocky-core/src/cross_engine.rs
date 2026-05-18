@@ -540,6 +540,7 @@ mod tests {
             checks: ChecksConfig::default(),
             execution: ExecutionConfig::default(),
             depends_on,
+            table_overrides: vec![],
         }))
     }
 

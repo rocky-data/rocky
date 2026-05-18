@@ -16,7 +16,7 @@ use rocky_ir::TargetRef;
 use crate::output::{CompareOutput, TableCompareResult, print_json};
 use crate::registry::{self, AdapterRegistry};
 
-use super::{matches_filter, parse_filter};
+use super::{filter_table_matches, matches_filter, parse_filter};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -88,6 +88,10 @@ pub async fn compare(
         let target_schema = parsed.resolve_template(target_schema_template, target_sep);
 
         for table in &conn.tables {
+            // PR-B3: CLI `--filter table=<literal>` consumed here.
+            if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                continue;
+            }
             // Build production and shadow target refs
             let prod_target = TargetRef {
                 catalog: target_catalog.clone(),

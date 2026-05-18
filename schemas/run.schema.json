@@ -644,6 +644,45 @@
       ],
       "type": "object"
     },
+    "OverrideWarningOutput": {
+      "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
+      "properties": {
+        "connector": {
+          "description": "Echo of `match.connector` from the rule, for cross-reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Coarse kind: `\"zero_match\"` (rule matched no pair at all) or `\"connector_match_empty\"` (the connector half of the match resolved nothing).",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable explanation, for logs and Dagster UI rendering.",
+          "type": "string"
+        },
+        "rule_index": {
+          "description": "Position of the rule in `[[table_overrides]]`, 0-based — same index the validator's error messages use.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "Echo of `match.table` from the rule, for cross-reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "message",
+        "rule_index"
+      ],
+      "type": "object"
+    },
     "PartitionInfo": {
       "description": "Partition window information for a single `time_interval` materialization.\n\n`key` is the canonical Rocky partition key (e.g. `\"2026-04-07\"` for daily; `\"2026-04-07T13\"` for hourly). `start` / `end` are the half-open `[start, end)` window the SQL substituted for `@start_date` / `@end_date`. `batched_with` lists any additional partition keys that were merged into this batch when `batch_size > 1` — empty for the default one-partition-per-statement case.",
       "properties": {
@@ -1031,6 +1070,13 @@
           "type": "null"
         }
       ]
+    },
+    "override_warnings": {
+      "description": "Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.",
+      "items": {
+        "$ref": "#/definitions/OverrideWarningOutput"
+      },
+      "type": "array"
     },
     "partition_summaries": {
       "description": "Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.",

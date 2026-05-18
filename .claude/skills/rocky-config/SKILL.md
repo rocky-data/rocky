@@ -155,8 +155,10 @@ All four share `execution`, `checks`, `depends_on`, and `target.adapter`. They d
 ```toml
 [pipeline.raw]
 # type = "replication"               # optional, this is the default
-strategy         = "incremental"     # or "full_refresh"
+strategy         = "incremental"     # or "full_refresh" or "merge"
 timestamp_column = "_fivetran_synced"
+# merge_keys     = ["id"]            # required when strategy = "merge"
+# merge_keys_fallback = ["id"]       # used when merge_keys is unset
 metadata_columns = [
     { name = "_loaded_by", type = "STRING", value = "'rocky'" },
 ]
@@ -169,11 +171,42 @@ separator  = "__"
 components = ["client", "regions...", "connector"]
 # "name"    = single segment
 # "name..." = variable-length (1+)
+# Reserved: `table` and `id` are not allowed as component names
+# (they're consumed by `--filter` and `[[table_overrides]]`).
 
 [pipeline.raw.target]
 catalog_template = "{client}_warehouse"
 schema_template  = "staging__{regions}__{connector}"
+
+# Per-`(connector, table)` overrides on top of the pipeline defaults.
+# Per-field most-specific-match-wins: each field is supplied by the
+# most-specific matching rule that sets it; unrelated rules don't
+# clobber it. See `engine/crates/rocky-core/src/config.rs` ::
+# `TableOverride` for the full surface.
+
+# Skip diagnostic tables on every connector.
+[[pipeline.raw.table_overrides]]
+match.table = "_diagnostics_*"        # `*`/`?` glob in TOML only — CLI literals
+enabled     = false
+
+# `pii_users` on one specific connector needs a composite merge key.
+[[pipeline.raw.table_overrides]]
+match.connector = "stripe_main"        # matches conn.id OR conn.schema
+match.table     = "pii_users"
+merge_keys      = ["user_id", "tenant_id"]
+
+# `audit_log` is append-only — keep it on incremental even when
+# the pipeline default is `merge`.
+[[pipeline.raw.table_overrides]]
+match.connector  = "stripe_main"
+match.table      = "audit_log"
+strategy         = "incremental"
+timestamp_column = "occurred_at"
 ```
+
+**CLI symmetry:** `--filter table=<literal>` filters to one table at a
+time (no globs at the CLI; shell quoting is too fragile). The
+connector-level `--filter id=<conn_id>` keys remain unchanged.
 
 ### Transformation pipeline
 

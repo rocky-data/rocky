@@ -964,6 +964,7 @@ mod tests {
             checks: ChecksConfig::default(),
             execution: ExecutionConfig::default(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
+            table_overrides: vec![],
         }))
     }
 

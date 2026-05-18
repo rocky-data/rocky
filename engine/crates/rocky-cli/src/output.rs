@@ -243,6 +243,39 @@ pub struct RunOutput {
     /// `on_budget_breach` hook so subscribers see them live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_breaches: Vec<BudgetBreachOutput>,
+    /// Soft warnings raised by the per-table override resolver — one
+    /// entry per `[[table_overrides]]` rule that matched zero
+    /// `(connector, table)` pairs this run, or whose connector half
+    /// resolved nothing. Discovery-time-only — the pipeline runs to
+    /// completion regardless. Empty for runs whose pipeline declares
+    /// no overrides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_warnings: Vec<OverrideWarningOutput>,
+}
+
+/// Soft warning surfaced on
+/// [`RunOutput::override_warnings`] when an override rule matched no
+/// tables this run.
+///
+/// Distinct kinds let orchestrators (Dagster) branch on cause without
+/// parsing free-form messages.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OverrideWarningOutput {
+    /// Position of the rule in `[[table_overrides]]`, 0-based — same
+    /// index the validator's error messages use.
+    pub rule_index: usize,
+    /// Coarse kind: `"zero_match"` (rule matched no pair at all) or
+    /// `"connector_match_empty"` (the connector half of the match
+    /// resolved nothing).
+    pub kind: String,
+    /// Human-readable explanation, for logs and Dagster UI rendering.
+    pub message: String,
+    /// Echo of `match.connector` from the rule, for cross-reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// Echo of `match.table` from the rule, for cross-reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
 }
 
 /// Per-model cost attribution entry inside [`RunCostSummary`].
@@ -3151,6 +3184,7 @@ impl RunOutput {
             interrupted: false,
             cost_summary: None,
             budget_breaches: vec![],
+            override_warnings: vec![],
         }
     }
 
