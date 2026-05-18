@@ -16,6 +16,7 @@ members = [
     "crates/rocky-fivetran",
     "crates/rocky-airbyte",
     "crates/rocky-iceberg",
+    "crates/rocky-catalog-core",
     "crates/rocky-cache",
     "crates/rocky-duckdb",
     "crates/rocky-observe",
