@@ -17,7 +17,7 @@ async function main() {
     // Keep this in sync with `engines.vscode` in package.json — a test host
     // older than `engines.vscode` fails to activate the extension silently,
     // which shows up as "0 commands registered" in the suite.
-    const version = process.env.VSCODE_TEST_VERSION ?? "1.116.0";
+    const version = process.env.VSCODE_TEST_VERSION ?? "1.120.0";
 
     await runTests({
       version,
