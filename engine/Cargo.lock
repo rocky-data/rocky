@@ -3758,6 +3758,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-catalog-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "rocky-cli"
 version = "1.35.0"
 dependencies = [
