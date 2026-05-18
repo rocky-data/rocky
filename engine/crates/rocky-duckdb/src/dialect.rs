@@ -37,6 +37,26 @@ impl SqlDialect for DuckDbSqlDialect {
         format!("INSERT INTO {target}\n{select_sql}")
     }
 
+    /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
+    ///
+    /// DuckDB 0.10+ supports the standard ANSI MERGE statement, but with two
+    /// dialect-specific quirks Rocky has to honour:
+    ///
+    /// 1. **No `UPDATE SET *` shorthand.** DuckDB rejects the wildcard form
+    ///    accepted by Databricks; the SET clause has to enumerate every
+    ///    target column. This matches Snowflake's behaviour. Callers that
+    ///    pass [`ColumnSelection::All`] get a fail-fast error — the model
+    ///    TOML has to declare `update_columns` explicitly. Tracking
+    ///    auto-enumeration via warehouse introspection is a follow-up; the
+    ///    current `SqlDialect::merge_into` signature carries no schema hint.
+    /// 2. **No qualified column names on the SET left-hand side.** DuckDB
+    ///    raises `Parser Error: Qualified column names in UPDATE .. SET not
+    ///    supported` for `t.col = s.col`. The target column stays unqualified
+    ///    (`col = s.col`); the source side keeps its alias.
+    ///
+    /// DuckDB *does* accept `INSERT *` shorthand in the `WHEN NOT MATCHED`
+    /// branch — the live regression test in this module exercises that path
+    /// end-to-end, so the wildcard insert is safe to keep.
     fn merge_into(
         &self,
         target: &str,
@@ -60,13 +80,12 @@ impl SqlDialect for DuckDbSqlDialect {
             .collect::<Vec<_>>()
             .join(" AND ");
 
-        // DuckDB does NOT support `UPDATE SET *` — must enumerate columns
+        // DuckDB does NOT support `UPDATE SET *` — must enumerate columns.
         let update_clause = match update_cols {
             ColumnSelection::All => {
-                // DuckDB requires explicit column names — we can't use * here.
-                // Use a DELETE + INSERT pattern instead when columns are unknown.
                 return Err(AdapterError::msg(
-                    "DuckDB MERGE does not support UPDATE SET *. Use explicit update_columns.",
+                    "DuckDB MERGE does not support UPDATE SET *. \
+                     Declare `update_columns` explicitly in the model TOML.",
                 ));
             }
             ColumnSelection::Explicit(cols) => {
@@ -322,6 +341,66 @@ mod tests {
         // DuckDB rejects qualified column names on the SET LHS — see
         // `merge_into` for the parser-error rationale.
         assert!(sql.contains("UPDATE SET name = s.name, status = s.status"));
+    }
+
+    #[test]
+    fn test_merge_compound_unique_key() {
+        let d = dialect();
+        let sql = d
+            .merge_into(
+                "tbl",
+                "SELECT 1",
+                &["id".into(), "created_at".into()],
+                &ColumnSelection::Explicit(vec!["status".into()]),
+            )
+            .unwrap();
+        // ON clause concatenates predicates with AND, in declaration order.
+        assert!(
+            sql.contains("ON t.id = s.id AND t.created_at = s.created_at"),
+            "expected compound ON clause: {sql}"
+        );
+        // The SET clause uses unqualified target column names (DuckDB parser
+        // requirement — see `merge_into` doc).
+        assert!(
+            sql.contains("UPDATE SET status = s.status"),
+            "expected unqualified SET LHS: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_merge_rejects_empty_keys() {
+        let d = dialect();
+        let result = d.merge_into(
+            "tbl",
+            "SELECT 1",
+            &[],
+            &ColumnSelection::Explicit(vec!["name".into()]),
+        );
+        assert!(result.is_err(), "empty unique_key must error");
+    }
+
+    #[test]
+    fn test_merge_rejects_injection_in_key() {
+        let d = dialect();
+        let result = d.merge_into(
+            "tbl",
+            "SELECT 1",
+            &["id; DROP TABLE x; --".into()],
+            &ColumnSelection::Explicit(vec!["name".into()]),
+        );
+        assert!(result.is_err(), "injection in unique_key must error");
+    }
+
+    #[test]
+    fn test_merge_rejects_injection_in_update_column() {
+        let d = dialect();
+        let result = d.merge_into(
+            "tbl",
+            "SELECT 1",
+            &["id".into()],
+            &ColumnSelection::Explicit(vec!["name; DROP TABLE x; --".into()]),
+        );
+        assert!(result.is_err(), "injection in update_columns must error");
     }
 
     /// Live regression: the MERGE SQL produced by `merge_into` must execute

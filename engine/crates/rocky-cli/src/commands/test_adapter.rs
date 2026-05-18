@@ -112,7 +112,12 @@ pub async fn run_test_adapter_builtin(
             batch_checks: false,
             create_catalog: false,
             create_schema: true,
-            merge: false,
+            // DuckDB MERGE is supported when `update_columns` is enumerated
+            // explicitly. Like Snowflake (which also reports `merge: true`),
+            // DuckDB rejects the `UPDATE SET *` shorthand — callers must
+            // declare the column list in the model TOML. See
+            // `rocky-duckdb::dialect::merge_into`.
+            merge: true,
             tablesample: true,
             file_load: true,
         },
