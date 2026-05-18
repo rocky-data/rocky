@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.35.0] — 2026-05-19
+
+Companion release to engine `v1.37.0`. Pydantic models regenerated via `just codegen` pick up four engine-side changes: (1) the `[plan_store]` config block is dropped from `RockyConfig` (engine Cluster 3 C — C-7); (2) the new `[[table_overrides]]` array lands on `ReplicationPipelineConfig` (engine PR-B3); (3) `LineageNode.target_schema` + `source_id` and `LineageColumnDef.data_type` enrich the `LineageOutput` model; (4) the legacy `TableError` model now exposes the engine's `failure_kind` discriminator on `RunResult.errors[*]`. Pure codegen cascade plus the one-line legacy-model patch — no new dagster API surface. Wheel re-cut against the v1.37.0 engine binary.
+
+### Added
+
+- **`ReplicationPipelineConfig.table_overrides`** (engine `v1.37.0` — commit `56199841`). Pydantic model regenerated from the engine's JSON schema; the field is `list[TableOverride] | None`. Each `TableOverride` carries a `match` block (table / schema / connector glob patterns) plus per-field overrides for `strategy`, `merge_keys`, `merge_keys_fallback`, `timestamp_column`, `target_table`, `target_schema`. Strictly additive — re-exported from `dagster_rocky.types` under both the generated and legacy import paths so existing consumers see no breakage.
+- **`LineageNode.target_schema` + `source_id`, `LineageColumnDef.data_type`** (engine `v1.37.0` — commits `cbfaed43` + `d959f924`). Pydantic models regenerated from the engine's JSON schema. Strictly additive optional fields on `LineageOutput` — downstream Dagster assets that parse `rocky lineage --output json` via the typed Pydantic surface see the new fields without further code changes.
+
 ### Changed
 
 - **Codegen pickup of engine `[plan_store]` removal (Cluster 3 C — C-7).** The `PlanStoreConfig` and `PlanStoreFormat` Pydantic models drop out of `dagster_rocky/types_generated/rocky_project_schema.py` along with the `plan_store` field on the root `RockyConfig`. Dagster code that constructs `RockyResource` configs no longer accepts a `plan_store` block (the engine now rejects it at parse time). Pure codegen cascade; no new dagster API surface.
