@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Codegen pickup of engine `[plan_store]` removal (Cluster 3 C — C-7).** The regenerated `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` drop the `PlanStoreConfig` / `PlanStoreFormat` TypeScript types and the `plan_store` field on the root `RockyConfig`. Extension code that consumes `rocky.toml` via the generated TypeScript types no longer offers `[plan_store]` completions (the engine now rejects the block at parse time). Pure codegen cascade; no behavioural change in the extension itself.
+
 ## [1.20.0] — 2026-05-18
 
 Codegen-companion release to engine `v1.36.0`. The regenerated TypeScript interface in `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` pick up the new `merge_keys` and `merge_keys_fallback` fields on `ReplicationPipelineConfig` from engine v1.36.0's replication `strategy = "merge"` (engine [#561](https://github.com/rocky-data/rocky/pull/561)). No new extension commands, UI, or settings — pure codegen cascade.

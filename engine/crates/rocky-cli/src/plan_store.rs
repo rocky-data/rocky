@@ -19,28 +19,30 @@
 //!
 //! [`PersistedPlan::format_version`] tags the on-disk plan shape:
 //!
-//! - **`1` (legacy; the only format prior to C-5, opt-in as of v1.35):**
-//!   the `payload` is a full `CompactOutput` / `ArchiveOutput` / `RunPlan`
-//!   / `PromotePlan` envelope including inline SQL strings. Apply reads
-//!   SQL directly from the payload.
-//! - **`2` (default as of v1.35; selected when `[plan_store] format = "v2"`
-//!   or omitted):** for compact and archive plans, the `payload` is a
+//! - **`1` (used for `Run` / `Replication` / `Promote` plans):** the
+//!   `payload` is a `RunPlan` / `ReplicationPlan` / `PromotePlan` struct.
+//!   These payloads were never inline-SQL envelopes — run/replication
+//!   plans are IR-only by construction, and promote plans persist
+//!   per-target SQL strings as a documented governance-audit exception
+//!   (Phase C audit memo §Q2). They have always parsed as
+//!   `format_version = 1` and continue to do so.
+//! - **`2` (used for `Compact` / `Archive` plans, the only loadable
+//!   shape for those kinds as of C-7):** the `payload` is a
 //!   [`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]; apply
 //!   regenerates SQL via `rocky_core::sql_gen::{compact_from_ir,
-//!   archive_from_ir}`. Run plans keep `format_version = 1` (they are
-//!   already IR-only by construction); promote plans always keep
-//!   `format_version = 1` (governance audit exception per the Phase C
-//!   audit memo §Q2).
+//!   archive_from_ir}`.
 //!
-//! The reader accepts both versions unconditionally — a v1 plan on disk
-//! continues to apply against a binary configured for v2 writes, and vice
-//! versa, for the duration of the migration window.
+//! The reader is format-agnostic — it parses `PersistedPlan` from disk
+//! and hands the payload + kind + `format_version` to the per-kind
+//! apply dispatch. The compact-apply and archive-apply paths now
+//! require `format_version = 2`; v1-shaped compact/archive payloads
+//! (legacy `CompactOutput` / `ArchiveOutput` envelopes with inline SQL,
+//! written by Rocky < engine-v1.35.0) are rejected with a clear
+//! migration error — see the corresponding `format_version` dispatch
+//! arms in [`crate::commands::compact`] and [`crate::commands::archive`].
 //!
 //! The `format_version` field is **not** included in the `plan_id`
-//! digest. The digest is computed over `{kind, payload}` only; equivalent
-//! payloads written under either format use different payload bytes
-//! anyway, so the digest is unique to the persisted shape without
-//! mixing the version tag in.
+//! digest. The digest is computed over `{kind, payload}` only.
 
 use std::path::Path;
 
@@ -97,27 +99,40 @@ pub struct PersistedPlan {
     pub created_at: DateTime<Utc>,
     /// Persisted plan-format version (Phase C — "SQL as `.o` files").
     ///
-    /// `1` is the legacy shape: `payload` is the full `*Output` envelope
-    /// with inline SQL. `2` (compact/archive only) is the typed-IR shape:
-    /// `payload` is `CompactPlanIr` / `ArchivePlanIr` and the apply path
-    /// regenerates SQL at execution time.
+    /// - `1` — used for `Run` / `Replication` / `Promote` plans (the
+    ///   payload was never an inline-SQL envelope; these kinds have
+    ///   always been parsed under this tag).
+    /// - `2` — used for `Compact` / `Archive` plans (typed-IR payload —
+    ///   `CompactPlanIr` / `ArchivePlanIr`; SQL is regenerated at apply
+    ///   time).
+    ///
+    /// Compact/archive payloads written by Rocky < engine-v1.35.0 carry
+    /// `format_version = 1` (the legacy inline-SQL envelope) and are no
+    /// longer loadable — see the dispatch arms in
+    /// [`crate::commands::compact`] / [`crate::commands::archive`].
     ///
     /// `#[serde(default = "default_format_version")]` so plans on disk
-    /// written before C-5 (which had no `format_version` field) parse as
-    /// `1` without any migration step.
+    /// written before C-5 (which had no `format_version` field) parse
+    /// as `1` without any migration step — relevant for `Run` /
+    /// `Replication` / `Promote` plans that are still legitimately
+    /// `format_version = 1`.
     #[serde(default = "default_format_version")]
     pub format_version: u32,
-    /// Raw plan body, opaque to plan_store. For `format_version = 1`
-    /// this is the full `*Output` struct serialized to JSON (with
-    /// `plan_id = None` so the digest remains reproducible). For
-    /// `format_version = 2` this is the typed-IR shape
-    /// ([`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]).
+    /// Raw plan body, opaque to plan_store. For `format_version = 2`
+    /// (compact/archive) this is the typed-IR shape
+    /// ([`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]). For
+    /// `format_version = 1` (run/replication/promote) this is the
+    /// per-kind plan struct serialized to JSON.
     pub payload: serde_json::Value,
 }
 
 /// Default `format_version` for `PersistedPlan` when the field is absent
-/// on disk — kept at `1` so legacy plans (which predate C-5) read cleanly
-/// without any migration step.
+/// on disk — kept at `1` so plans written before C-5 (which had no
+/// `format_version` field) read cleanly. `Run` / `Replication` /
+/// `Promote` plans still parse as `format_version = 1` legitimately;
+/// `Compact` / `Archive` plans with `format_version = 1` are rejected
+/// by the per-kind apply dispatch (see the C-7 drop note in the module
+/// docs).
 fn default_format_version() -> u32 {
     1
 }
@@ -147,39 +162,36 @@ fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// Serialize `payload` via `impl Serialize`, compute the plan_id, persist the
-/// plan to `<root>/.rocky/plans/<plan_id>.json`, and return the plan_id.
+/// Persist a `Run` / `Replication` / `Promote` plan with
+/// `format_version = 1`.
 ///
-/// `payload` should be the output struct with its `plan_id` field set to
-/// `None` (so the digest is stable). Callers populate `plan_id` in the
-/// printed output *after* this call returns.
+/// These payloads were never inline-SQL envelopes — run/replication
+/// plans are IR-only by construction, and promote plans persist
+/// per-target SQL strings as a documented governance-audit exception
+/// (Phase C audit memo §Q2). The `format_version = 1` tag has always
+/// applied to these kinds and continues to do so after C-7.
 ///
-/// This is the **v1** writer entry point. Tags the persisted record with
-/// `format_version = 1`. For the v2 typed-IR writer used by `rocky compact`
-/// / `rocky archive` under the default `[plan_store] format = "v2"`, see
-/// [`write_plan_v2`].
+/// Production `Compact` / `Archive` callers must go through
+/// [`write_plan_v2`]; v1-shaped compact/archive payloads are no
+/// longer a loadable shape (the apply dispatch rejects them with a
+/// migration error). `PlanKind::Compact` / `PlanKind::Archive` are
+/// still accepted here so that round-trip / kind-mismatch tests can
+/// fabricate a v1 plan on disk and assert the apply path errors
+/// cleanly.
 pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
     write_plan_inner(root, kind, payload, 1)
 }
 
-/// Persist a **v2** typed-IR plan payload (`format_version = 2`).
+/// Persist a typed-IR `Compact` / `Archive` plan
+/// (`format_version = 2`).
 ///
-/// Used by `rocky compact` / `rocky archive` under the default
-/// `[plan_store] format = "v2"` (v1.35.0 onward). `payload` is expected
-/// to be a [`rocky_ir::CompactPlanIr`] /
-/// [`rocky_ir::ArchivePlanIr`] (or any serde value the apply path knows
-/// how to reconstruct into one).
-///
-/// The `kind` discriminator stays the same as v1 (`PlanKind::Compact` /
-/// `PlanKind::Archive`); the payload shape — not the kind — is what
-/// changes between formats. Apply-side dispatch reads
-/// [`PersistedPlan::format_version`] to pick the right deserialization
-/// arm.
-///
-/// `PromotePlan` and `RunPlan` are intentionally **not** supported by
-/// this writer: promote is held as a documented exception (Phase C
-/// audit memo §Q2 — governance audit-grep surface) and run plans were
-/// already IR-only by construction.
+/// `payload` is expected to be a [`rocky_ir::CompactPlanIr`] /
+/// [`rocky_ir::ArchivePlanIr`] envelope (or any serde value the apply
+/// path knows how to reconstruct into one). Apply-side dispatch in
+/// [`crate::commands::compact`] / [`crate::commands::archive`] reads
+/// [`PersistedPlan::format_version`] to validate the loaded plan is
+/// indeed v2 — v1-shaped compact/archive payloads on disk (written by
+/// Rocky < engine-v1.35.0) are rejected with a migration error.
 pub fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
     debug_assert!(
         matches!(kind, PlanKind::Compact | PlanKind::Archive),
@@ -188,13 +200,11 @@ pub fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> 
     write_plan_inner(root, kind, payload, 2)
 }
 
-/// Internal writer shared by [`write_plan`] (v1) and [`write_plan_v2`]
-/// (v2). Stamps `format_version` on the persisted record; the
-/// `plan_id` digest is computed over `{kind, payload}` only, so a v1
-/// `CompactOutput` payload and a v2 `CompactPlanIr` payload for the
-/// same logical compact plan yield different plan_ids (different
-/// payload bytes → different hashes), which is the desired property:
-/// the on-disk filename also disambiguates the format.
+/// Internal writer shared by [`write_plan`] and [`write_plan_v2`].
+/// Stamps `format_version` on the persisted record; the `plan_id`
+/// digest is computed over `{kind, payload}` only, so different
+/// payload shapes for the same logical plan kind yield different
+/// `plan_id`s (different payload bytes → different hashes).
 fn write_plan_inner<T: Serialize>(
     root: &Path,
     kind: PlanKind,
@@ -466,15 +476,17 @@ mod tests {
         Ok(())
     }
 
-    // ---------- Phase C — format_version tagging (C-5) ----------
+    // ---------- Phase C — format_version tagging (C-5 / C-7) ----------
 
     #[test]
     fn write_plan_tags_format_version_one() -> anyhow::Result<()> {
-        // C-5 invariant: the legacy `write_plan` entry point always tags
-        // the persisted record with `format_version = 1`. Callers that
-        // opt into the v1 on-disk shape via `[plan_store] format = "v1"`
-        // (single-model and catalog-scope compact/archive paths) keep
-        // producing v1 plans byte-for-byte.
+        // `write_plan` always tags the persisted record with
+        // `format_version = 1`. Production callers after C-7 are
+        // `Run` / `Replication` / `Promote` (whose payloads were
+        // never inline-SQL envelopes). The `PlanKind::Compact` here
+        // is a fabricated-on-disk plan used by the apply-side test
+        // that the compact-apply dispatch rejects v1 compact plans
+        // with the migration error.
         let dir = tempfile::tempdir()?;
         let payload = DummyPayload {
             model: "cat.sc.tbl",
@@ -488,9 +500,10 @@ mod tests {
 
     #[test]
     fn write_plan_v2_tags_format_version_two() -> anyhow::Result<()> {
-        // C-5 invariant: the new `write_plan_v2` entry point tags the
-        // persisted record with `format_version = 2`. The apply path
-        // uses that tag to dispatch into the IR-regeneration arm.
+        // `write_plan_v2` tags the persisted record with
+        // `format_version = 2`. This is the only loadable shape for
+        // `Compact` / `Archive` plans after C-7; the apply path uses
+        // the tag to dispatch into the IR-regeneration arm.
         let dir = tempfile::tempdir()?;
         let payload = serde_json::json!({
             "target_table": "cat.sc.tbl",
@@ -515,8 +528,11 @@ mod tests {
     fn read_plan_defaults_format_version_to_one_for_legacy_files() -> anyhow::Result<()> {
         // Backward-compat: a plan file written by a pre-C-5 binary has no
         // `format_version` field. `#[serde(default)]` must surface that
-        // file as `format_version = 1` so it parses cleanly and the apply
-        // path picks the v1 dispatch arm without any migration step.
+        // file as `format_version = 1` so it parses cleanly. After C-7
+        // the per-kind apply dispatch (compact/archive) rejects these
+        // files with a migration error — but the reader itself is
+        // format-agnostic, so this round-trip stays load-clean for
+        // tests + diagnostics + future migration tooling.
         let dir = tempfile::tempdir()?;
         let plans_dir = dir.path().join(".rocky").join("plans");
         std::fs::create_dir_all(&plans_dir)?;
@@ -540,12 +556,12 @@ mod tests {
 
     #[test]
     fn write_plan_and_write_plan_v2_yield_distinct_plan_ids() -> anyhow::Result<()> {
-        // v1 and v2 writers serialize different payload bytes for the
-        // same logical plan (full output envelope vs typed IR), so the
-        // blake3 digest — and the on-disk filename — disambiguate the
-        // two formats. This is the invariant that lets us write a v1
-        // plan and a v2 plan for the same compact target without one
-        // overwriting the other.
+        // The two writers serialize different payload bytes for the
+        // same logical plan, so the blake3 digest — and the on-disk
+        // filename — disambiguate the formats. The `write_plan`
+        // (v1-tagged) compact plan in this test is a fabricated-on-disk
+        // shape used to drive the apply-side rejection test; production
+        // compact callers go through `write_plan_v2` only.
         let dir = tempfile::tempdir()?;
         let v1_payload = DummyPayload {
             model: "cat.sc.tbl",

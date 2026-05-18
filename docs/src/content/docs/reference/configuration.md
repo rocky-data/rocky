@@ -732,31 +732,6 @@ resource "google_storage_bucket" "rocky_state" {
 
 ---
 
-## `[plan_store]`
-
-Controls how `rocky plan` persists plan artifacts to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. Unknown fields are rejected.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `format` | string | `"v1"` | Persisted plan envelope. `"v1"` writes the legacy `CompactOutput` / `ArchiveOutput` envelope with inline SQL. `"v2"` writes the typed-IR payload (`CompactPlanIr` / `ArchivePlanIr`); `rocky apply` regenerates SQL from the IR at execution time via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. |
-
-```toml
-[plan_store]
-format = "v1"   # default; legacy envelope with inline SQL
-# format = "v2"  # opt-in; typed-IR payload, SQL regenerated at apply
-```
-
-**Behaviour:**
-
-- **The default stays `"v1"`** in engine v1.33 — existing projects see no behaviour change unless they opt in.
-- **The reader accepts both formats unconditionally**, regardless of the writer config. A binary configured for v2 writes can read v1 plans on disk, and vice versa. Mixing formats across a fleet during a rollout is safe.
-- **Stdout JSON is unchanged in both formats.** `rocky plan --output json` (and `rocky compact` / `rocky archive --output json`) always carries inline SQL for human and CI consumers. The format switch only affects the JSON written to disk under `.rocky/plans/`.
-- **Only `CompactPlan` and `ArchivePlan` are configurable.** `PromotePlan` (governance) and `RunPlan` (already IR-only) are intentionally untouched.
-
-**Soft migration cycle:** v1.33 ships v2 as opt-in; a future minor release flips the default to `"v2"`; a subsequent minor drops the v1 reader. Operators who want to validate v2 on their plans before the default flip should set `format = "v2"` now and confirm `rocky apply <plan-id>` produces the same warehouse outcomes as v1.
-
----
-
 ## `[ai]`
 
 Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`). Unknown fields are rejected.

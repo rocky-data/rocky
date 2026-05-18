@@ -570,7 +570,6 @@ mod tests {
         }
         RockyConfig {
             state: Default::default(),
-            plan_store: Default::default(),
             adapters: adapter_map,
             pipelines: pipeline_map,
             hooks: Default::default(),

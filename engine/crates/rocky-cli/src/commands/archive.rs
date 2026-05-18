@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rocky_core::config::PlanStoreFormat;
 use rocky_databricks::dialect::DatabricksSqlDialect;
 use rocky_ir::ArchivePlanIr;
 use rocky_sql::validation::validate_identifier;
@@ -22,28 +21,9 @@ use crate::output::{
     ArchiveApplyOutput, ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement,
     StatementResult, print_json,
 };
-use crate::plan_store::{PlanKind, read_plan, write_plan, write_plan_v2};
+use crate::plan_store::{PlanKind, read_plan, write_plan_v2};
 use crate::registry::AdapterRegistry;
 use crate::scope::resolve_managed_tables_in_catalog;
-
-/// Resolve the persisted-plan format from the project config. When no
-/// config can be loaded falls back to [`PlanStoreFormat::default`] (v2
-/// as of v1.35.0).
-fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
-    let Some(path) = config_path else {
-        return PlanStoreFormat::default();
-    };
-    match rocky_core::config::load_rocky_config(path) {
-        Ok(cfg) => cfg.plan_store.format,
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "failed to load rocky config for [plan_store] lookup; using default writer format"
-            );
-            PlanStoreFormat::default()
-        }
-    }
-}
 
 /// Build the per-table `ArchivePlanIr` that mirrors the CLI's inline
 /// `generate_archive_sql` inputs for a `model` / `days` pair. Matches
@@ -62,32 +42,27 @@ fn build_archive_ir(model: Option<&str>, days: u64) -> ArchivePlanIr {
     }
 }
 
-/// Persist an archive plan using the configured `[plan_store]` format.
-/// See [`persist_compact_plan`] in [`super::compact`] for the symmetric
-/// rationale; the only difference here is the payload-envelope shape
-/// (carries `older_than` / `older_than_days` in addition to the per-table
-/// IR list).
+/// Persist an archive plan as the typed-IR v2 envelope. After C-7 this
+/// is the only loadable shape for `Archive` plans — `rocky apply`
+/// regenerates SQL at execution time via `sql_gen::archive_from_ir`.
+/// Mirrors [`super::compact::persist_compact_plan`]; the only
+/// difference is the envelope shape (carries `older_than` /
+/// `older_than_days` in addition to the per-table IR list).
 fn persist_archive_plan(
     root: &Path,
-    format: PlanStoreFormat,
     output: &ArchiveOutput,
     ir_payloads: &[ArchivePlanIr],
 ) -> Result<String> {
-    match format {
-        PlanStoreFormat::V1 => write_plan(root, PlanKind::Archive, output),
-        PlanStoreFormat::V2 => {
-            let v2_payload = serde_json::json!({
-                "model": output.model,
-                "catalog": output.catalog,
-                "scope": output.scope,
-                "older_than": output.older_than,
-                "older_than_days": output.older_than_days,
-                "dry_run": output.dry_run,
-                "plans": ir_payloads,
-            });
-            write_plan_v2(root, PlanKind::Archive, &v2_payload)
-        }
-    }
+    let v2_payload = serde_json::json!({
+        "model": output.model,
+        "catalog": output.catalog,
+        "scope": output.scope,
+        "older_than": output.older_than,
+        "older_than_days": output.older_than_days,
+        "dry_run": output.dry_run,
+        "plans": ir_payloads,
+    });
+    write_plan_v2(root, PlanKind::Archive, &v2_payload)
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -96,13 +71,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
 /// (relative to the current working directory) so it can be applied later
-/// via `rocky archive apply <plan_id>`.
-///
-/// The persisted-plan format is selected by `[plan_store] format` in
-/// `config_path` (defaults to v2 as of v1.35.0). The stdout JSON shape is
-/// unchanged either way — it always carries SQL for human + CI consumers.
+/// via `rocky archive apply <plan_id>`. The persisted shape is the
+/// typed-IR v2 envelope (`ArchivePlanIr`); the stdout JSON shape always
+/// carries SQL for human + CI consumers.
 pub fn run_archive(
-    config_path: &Path,
+    _config_path: &Path,
     model: Option<&str>,
     older_than: &str,
     dry_run: bool,
@@ -138,11 +111,10 @@ pub fn run_archive(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_format = resolve_plan_store_format(Some(config_path));
     let ir_payloads = vec![build_archive_ir(model, days)];
-    match persist_archive_plan(&cwd, plan_format, &output, &ir_payloads) {
+    match persist_archive_plan(&cwd, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, format = %plan_format, "archive plan persisted");
+            tracing::info!(plan_id = %id, "archive plan persisted");
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -237,13 +209,11 @@ pub async fn run_archive_catalog(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_format = resolve_plan_store_format(Some(config_path));
-    match persist_archive_plan(&cwd, plan_format, &output, &ir_payloads) {
+    match persist_archive_plan(&cwd, &output, &ir_payloads) {
         Ok(id) => {
             tracing::info!(
                 plan_id = %id,
                 catalog = %scope.catalog,
-                format = %plan_format,
                 "archive catalog plan persisted"
             );
             output.plan_id = Some(id);
@@ -430,21 +400,25 @@ pub(crate) async fn run_archive_apply_in(
         );
     }
 
-    // Phase C — "SQL as `.o` files" — dispatch on the persisted-plan
-    // format version. v1 plans carry `ArchiveOutput` with inline SQL;
-    // v2 plans carry an `ArchivePlanIr` envelope and SQL is regenerated
-    // here via `sql_gen::archive_from_ir`.
+    // Phase C — "SQL as `.o` files" — v2 plans carry an `ArchivePlanIr`
+    // envelope and SQL is regenerated here via `sql_gen::archive_from_ir`.
+    // The v1 inline-SQL envelope was retired in C-7; v1-shaped archive
+    // payloads on disk (written by Rocky < engine-v1.35.0) are rejected
+    // with a migration error pointing at the recipe.
     let statements: Vec<NamedStatement> = match plan.format_version {
-        1 => {
-            let archive_output: ArchiveOutput = serde_json::from_value(plan.payload.clone())
-                .context("failed to deserialize archive plan payload (v1)")?;
-            archive_output.statements
-        }
+        1 => bail!(
+            "archive plan '{}' is in format v1, which is no longer supported \
+             (this plan was written by Rocky < engine-v1.35.0). \
+             Re-run `rocky archive` to write a fresh v2 plan. \
+             See https://docs.rocky-data.com/concepts/plan-store-v1-to-v2 \
+             for the migration guide.",
+            plan_id,
+        ),
         2 => regenerate_v2_archive_statements(plan_id, &plan.payload)?,
         other => bail!(
             "archive plan '{}' has unknown format_version {}. \
-             This binary supports v1 (legacy ArchiveOutput) and v2 (typed ArchivePlanIr) \
-             persisted plans; the file is from a newer engine — upgrade and re-apply.",
+             This binary supports v2 (typed ArchivePlanIr) persisted plans; \
+             the file is from a newer engine — upgrade and re-apply.",
             plan_id,
             other
         ),
@@ -463,18 +437,16 @@ pub(crate) async fn run_archive_apply_in(
     let mut overall_success = true;
 
     for stmt in &statements {
-        // After the v1/v2 dispatch above, `sql` is always populated:
-        // v1 payloads write `Some(sql)` from `generate_archive_sql`,
-        // and v2 regeneration goes through `archive_from_ir` which
-        // also returns `Some(sql)` for every statement. A `None` here
-        // means a v1 plan was malformed (written with `sql: None` by
-        // some unknown caller).
+        // After the v2 dispatch above, `sql` is always populated:
+        // `archive_from_ir` returns `Some(sql)` for every statement.
+        // A `None` here means a malformed plan file — surface a clear
+        // error rather than executing an empty statement.
         let sql = match stmt.sql.as_deref() {
             Some(sql) => sql,
             None => bail!(
-                "archive plan '{}' carries a v1 statement without inline SQL \
-                 (purpose: '{}'). v1 plans must persist SQL; this is a \
-                 malformed plan file.",
+                "archive plan '{}' carries a statement without inline SQL \
+                 (purpose: '{}'). This is a malformed plan file — re-run \
+                 `rocky archive` to write a fresh plan.",
                 plan_id,
                 stmt.purpose,
             ),
@@ -605,19 +577,24 @@ mod tests {
     /// Integration test for `rocky archive apply` against a real DuckDB.
     ///
     /// DuckDB does not support the Databricks-style `VACUUM ... RETAIN HOURS`
-    /// syntax, and `DELETE FROM` on a table with a Databricks-specific column
-    /// (`_fivetran_synced`) will fail too. The apply path must surface adapter
-    /// errors via `StatementResult.error` and `success: false` rather than
-    /// panicking. This test verifies that contract.
+    /// C-7 — `archive apply` rejects v1-shaped archive plans on disk
+    /// with a clear migration error pointing at the recipe. Before C-7
+    /// this test exercised the round-trip apply path against a real
+    /// DuckDB; after C-7 the v1 inline-SQL envelope is no longer a
+    /// loadable shape for archive plans, so the apply path errors out
+    /// before reaching the adapter. The DuckDB feature gate stays
+    /// because we still spin up a minimal database for the rocky.toml
+    /// adapter to point at.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn archive_apply_surfaces_duckdb_errors_cleanly() -> anyhow::Result<()> {
+    async fn archive_apply_rejects_v1_plan_with_migration_error() -> anyhow::Result<()> {
+        use crate::plan_store::write_plan;
         use anyhow::anyhow;
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("test_arc_apply.duckdb");
+        let db_path = dir.path().join("test_arc_v1_reject.duckdb");
 
         {
             let adapter = DuckDbWarehouseAdapter::open(&db_path)
@@ -653,7 +630,9 @@ schema_template = "staging__{{source}}"
             ),
         )?;
 
-        // Write an archive plan using the standard generated SQL.
+        // Fabricate a v1-shaped archive plan on disk (`write_plan` tags
+        // `format_version = 1` with an `ArchiveOutput` payload — the
+        // legacy inline-SQL envelope written by Rocky < engine-v1.35.0).
         let plan_id = write_plan(
             dir.path(),
             PlanKind::Archive,
@@ -666,30 +645,37 @@ schema_template = "staging__{{source}}"
                 older_than: "90d".to_string(),
                 older_than_days: 90,
                 dry_run: false,
-                statements: vec![
-                    NamedStatement {
-                        purpose: "delete rows older than 90 days".to_string(),
-                        sql: Some("DELETE FROM events WHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())".to_string()),
-                    },
-                    NamedStatement {
-                        purpose: "reclaim storage after deletion".to_string(),
-                        sql: Some("VACUUM events RETAIN 0 HOURS".to_string()),
-                    },
-                ],
+                statements: vec![NamedStatement {
+                    purpose: "delete rows older than 90 days".to_string(),
+                    sql: Some(
+                        "DELETE FROM events WHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())"
+                            .to_string(),
+                    ),
+                }],
                 tables: None,
                 totals: None,
                 plan_id: None,
             },
         )?;
 
-        // Apply the plan using the inner function with an explicit root, so we
-        // don't need to change the process-global current directory.
-        run_archive_apply_in(dir.path(), &config_path, &plan_id, false).await?;
-
-        // Plan round-trip sanity.
+        // Sanity check: the file is on disk and parses as v1.
         let plan = read_plan(dir.path(), &plan_id)?;
         assert_eq!(plan.kind, PlanKind::Archive);
+        assert_eq!(plan.format_version, 1);
 
+        // Apply must reject with the migration error.
+        let err = run_archive_apply_in(dir.path(), &config_path, &plan_id, false)
+            .await
+            .expect_err("v1 archive plan must be rejected by apply");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("format v1") || msg.contains("v1 plan"),
+            "error should call out v1 format, got: {msg}"
+        );
+        assert!(
+            msg.contains("plan-store-v1-to-v2"),
+            "error should point at the migration guide, got: {msg}"
+        );
         Ok(())
     }
 
@@ -737,7 +723,7 @@ schema_template = "staging__{{source}}"
         )?;
 
         // Write a compact plan (wrong kind for archive apply).
-        let plan_id = write_plan(
+        let plan_id = crate::plan_store::write_plan(
             dir.path(),
             PlanKind::Compact,
             &serde_json::json!({"dummy": true}),

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Codegen pickup of engine `[plan_store]` removal (Cluster 3 C — C-7).** The `PlanStoreConfig` and `PlanStoreFormat` Pydantic models drop out of `dagster_rocky/types_generated/rocky_project_schema.py` along with the `plan_store` field on the root `RockyConfig`. Dagster code that constructs `RockyResource` configs no longer accepts a `plan_store` block (the engine now rejects it at parse time). Pure codegen cascade; no new dagster API surface.
+
 ### Fixed
 
 - **`TableError.failure_kind` now surfaces on `RunResult.errors[*]`.** The legacy hand-written `TableError` Pydantic model previously stripped the engine's `failure_kind` field during parsing — only the generated `TableErrorOutput` model exposed it. Added `failure_kind: str = "unknown"` to the legacy model so downstream Dagster assets that read `RunResult.errors[*].failure_kind` see the engine-emitted classifier directly. Strictly additive; the default makes the field forward-compatible with older engine binaries that don't emit it.

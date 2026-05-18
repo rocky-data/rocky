@@ -18,7 +18,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
-use rocky_core::config::PlanStoreFormat;
 use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
@@ -31,74 +30,35 @@ use crate::output::{
     CompactTotals, DedupPair, DedupSummary, NamedStatement, StatementResult,
     TableDedupContribution, print_json,
 };
-use crate::plan_store::{PlanKind, read_plan, write_plan, write_plan_v2};
+use crate::plan_store::{PlanKind, read_plan, write_plan_v2};
 use crate::registry::{AdapterRegistry, resolve_pipeline};
 use crate::scope::{
     managed_catalog_set, resolve_managed_tables, resolve_managed_tables_in_catalog,
 };
 
-/// Resolve the persisted-plan format from the project config. When no
-/// config can be loaded (e.g. running outside a Rocky project), falls
-/// back to [`PlanStoreFormat::default`] (v2 as of v1.35.0).
-///
-/// `config_path` is optional because today's single-model `run_compact`
-/// / `run_archive` entry points don't take a config path on every code
-/// path — when absent we use the default writer format and skip the
-/// lookup entirely.
-fn resolve_plan_store_format(config_path: Option<&Path>) -> PlanStoreFormat {
-    let Some(path) = config_path else {
-        return PlanStoreFormat::default();
-    };
-    match rocky_core::config::load_rocky_config(path) {
-        Ok(cfg) => cfg.plan_store.format,
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "failed to load rocky config for [plan_store] lookup; using default writer format"
-            );
-            PlanStoreFormat::default()
-        }
-    }
-}
-
-/// Persist a compact plan using the configured `[plan_store]` format.
-///
-/// For `PlanStoreFormat::V1` emits the legacy `CompactOutput` payload
-/// byte-for-byte — every existing plan on disk stays reproducible. For
-/// `PlanStoreFormat::V2` (default as of v1.35.0) emits a `CompactPlanIr`
-/// payload (the apply path regenerates SQL at execution time via
-/// `sql_gen::compact_from_ir`).
+/// Persist a compact plan as the typed-IR v2 envelope. After C-7 this
+/// is the only loadable shape for `Compact` plans — `rocky apply`
+/// regenerates SQL at execution time via `sql_gen::compact_from_ir`.
 ///
 /// `ir_payloads` carries one `CompactPlanIr` per logical table in the
-/// plan (single-model invocations have one entry; catalog-scope
-/// invocations have one per managed table). For the v1 path the
-/// argument is unused — `output` carries the canonical SQL strings
-/// already.
+/// plan (single-model invocations have len 1; catalog-scope
+/// invocations have len == scope.tables.len()). Wrapped in a stable
+/// envelope shape so the apply-side reader doesn't have to switch on
+/// scope.
 fn persist_compact_plan(
     root: &Path,
-    format: PlanStoreFormat,
     output: &CompactOutput,
     ir_payloads: &[CompactPlanIr],
 ) -> Result<String> {
-    match format {
-        PlanStoreFormat::V1 => write_plan(root, PlanKind::Compact, output),
-        PlanStoreFormat::V2 => {
-            // Per-table IR list is what the apply path replays through
-            // `compact_from_ir`. Single-model invocations have len 1;
-            // catalog-scope invocations have len == scope.tables.len().
-            // Wrap in an envelope so the apply-side reader has a stable
-            // payload shape regardless of scope.
-            let v2_payload = serde_json::json!({
-                "model": output.model,
-                "catalog": output.catalog,
-                "scope": output.scope,
-                "dry_run": output.dry_run,
-                "target_size_mb": output.target_size_mb,
-                "plans": ir_payloads,
-            });
-            write_plan_v2(root, PlanKind::Compact, &v2_payload)
-        }
-    }
+    let v2_payload = serde_json::json!({
+        "model": output.model,
+        "catalog": output.catalog,
+        "scope": output.scope,
+        "dry_run": output.dry_run,
+        "target_size_mb": output.target_size_mb,
+        "plans": ir_payloads,
+    });
+    write_plan_v2(root, PlanKind::Compact, &v2_payload)
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -107,13 +67,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
 /// (relative to the current working directory) so it can be applied later
-/// via `rocky compact apply <plan_id>`.
-///
-/// The persisted-plan format is selected by `[plan_store] format` in
-/// `config_path` (defaults to v2 as of v1.35.0). The stdout JSON shape is
-/// unchanged either way — it always carries SQL for human + CI consumers.
+/// via `rocky compact apply <plan_id>`. The persisted shape is the
+/// typed-IR v2 envelope (`CompactPlanIr`); the stdout JSON shape always
+/// carries SQL for human + CI consumers.
 pub fn run_compact(
-    config_path: &Path,
+    _config_path: &Path,
     model: &str,
     target_size: Option<&str>,
     dry_run: bool,
@@ -155,11 +113,10 @@ pub fn run_compact(
 
     // Persist the plan (plan_id field is None, so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_format = resolve_plan_store_format(Some(config_path));
     let ir_payloads = vec![CompactPlanIr::for_table(model, target_mb)];
-    match persist_compact_plan(&cwd, plan_format, &output, &ir_payloads) {
+    match persist_compact_plan(&cwd, &output, &ir_payloads) {
         Ok(id) => {
-            tracing::info!(plan_id = %id, format = %plan_format, "compact plan persisted");
+            tracing::info!(plan_id = %id, "compact plan persisted");
             output.plan_id = Some(id);
         }
         Err(e) => {
@@ -269,13 +226,11 @@ pub async fn run_compact_catalog(
 
     // Persist the plan (plan_id is None so the hash is stable).
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_format = resolve_plan_store_format(Some(config_path));
-    match persist_compact_plan(&cwd, plan_format, &output, &ir_payloads) {
+    match persist_compact_plan(&cwd, &output, &ir_payloads) {
         Ok(id) => {
             tracing::info!(
                 plan_id = %id,
                 catalog = %scope.catalog,
-                format = %plan_format,
                 "compact catalog plan persisted"
             );
             output.plan_id = Some(id);
@@ -1406,22 +1361,25 @@ pub(crate) async fn run_compact_apply_in(
         );
     }
 
-    // Phase C — "SQL as `.o` files" — dispatch on the persisted-plan
-    // format version. v1 plans carry `CompactOutput` with inline SQL;
-    // v2 plans carry a `CompactPlanIr` envelope and SQL is regenerated
-    // here via `sql_gen::compact_from_ir`. Both formats land on the
-    // same `Vec<NamedStatement>` shape the apply loop consumes below.
+    // Phase C — "SQL as `.o` files" — v2 plans carry a `CompactPlanIr`
+    // envelope and SQL is regenerated here via `sql_gen::compact_from_ir`.
+    // The v1 inline-SQL envelope was retired in C-7; v1-shaped compact
+    // payloads on disk (written by Rocky < engine-v1.35.0) are rejected
+    // with a migration error pointing at the recipe.
     let statements: Vec<NamedStatement> = match plan.format_version {
-        1 => {
-            let compact_output: CompactOutput = serde_json::from_value(plan.payload.clone())
-                .context("failed to deserialize compact plan payload (v1)")?;
-            compact_output.statements
-        }
+        1 => bail!(
+            "compact plan '{}' is in format v1, which is no longer supported \
+             (this plan was written by Rocky < engine-v1.35.0). \
+             Re-run `rocky compact` to write a fresh v2 plan. \
+             See https://docs.rocky-data.com/concepts/plan-store-v1-to-v2 \
+             for the migration guide.",
+            plan_id,
+        ),
         2 => regenerate_v2_compact_statements(plan_id, &plan.payload)?,
         other => bail!(
             "compact plan '{}' has unknown format_version {}. \
-             This binary supports v1 (legacy CompactOutput) and v2 (typed CompactPlanIr) \
-             persisted plans; the file is from a newer engine — upgrade and re-apply.",
+             This binary supports v2 (typed CompactPlanIr) persisted plans; \
+             the file is from a newer engine — upgrade and re-apply.",
             plan_id,
             other
         ),
@@ -1440,19 +1398,16 @@ pub(crate) async fn run_compact_apply_in(
     let mut overall_success = true;
 
     for stmt in &statements {
-        // After the v1/v2 dispatch above, `sql` is always populated:
-        // v1 payloads write `Some(sql)` from `generate_compact_sql`,
-        // and v2 regeneration goes through `compact_from_ir` which
-        // also returns `Some(sql)` for every statement. A `None` here
-        // would mean a v1 plan was written with `sql: None` by some
-        // unknown caller — surface a clear error rather than executing
-        // an empty statement.
+        // After the v2 dispatch above, `sql` is always populated:
+        // `compact_from_ir` returns `Some(sql)` for every statement.
+        // A `None` here means a malformed plan file — surface a clear
+        // error rather than executing an empty statement.
         let sql = match stmt.sql.as_deref() {
             Some(sql) => sql,
             None => bail!(
-                "compact plan '{}' carries a v1 statement without inline SQL \
-                 (purpose: '{}'). v1 plans must persist SQL; this is a \
-                 malformed plan file.",
+                "compact plan '{}' carries a statement without inline SQL \
+                 (purpose: '{}'). This is a malformed plan file — re-run \
+                 `rocky compact` to write a fresh plan.",
                 plan_id,
                 stmt.purpose,
             ),
@@ -2172,22 +2127,27 @@ schema_template = "staging__{{source}}"
     /// Integration test for `rocky compact apply` against a real DuckDB.
     ///
     /// DuckDB does not support the `OPTIMIZE` / `VACUUM ... RETAIN HOURS`
-    /// Databricks syntax. The apply path must surface adapter errors cleanly
-    /// via `StatementResult.error` and `success: false` rather than panicking
-    /// or returning an opaque failure. This test verifies that contract.
-    ///
-    /// The test also verifies that once the first statement fails, subsequent
-    /// statements are recorded as `skipped` rather than executed.
+    /// C-7 — `compact apply` rejects v1-shaped compact plans on disk
+    /// with a clear migration error pointing at the recipe. Before C-7
+    /// this test exercised the round-trip apply path against a real
+    /// DuckDB; after C-7 the v1 inline-SQL envelope is no longer a
+    /// loadable shape for compact plans, so the apply path errors out
+    /// before reaching the adapter. The DuckDB feature gate stays
+    /// because we still spin up a minimal database for the rocky.toml
+    /// adapter to point at — `run_compact_apply_in` loads the config
+    /// before dispatching on `format_version`, so the adapter wiring
+    /// has to be resolvable.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn compact_apply_surfaces_duckdb_errors_cleanly() -> anyhow::Result<()> {
+    async fn compact_apply_rejects_v1_plan_with_migration_error() -> anyhow::Result<()> {
+        use crate::plan_store::write_plan;
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("test_apply.duckdb");
+        let db_path = dir.path().join("test_v1_reject.duckdb");
 
-        // Create a minimal DuckDB database.
+        // Create a minimal DuckDB database so config loads cleanly.
         {
             let adapter = DuckDbWarehouseAdapter::open(&db_path)
                 .map_err(|e| anyhow!("setup: open DuckDB: {e}"))?;
@@ -2197,7 +2157,6 @@ schema_template = "staging__{{source}}"
                 .map_err(|e| anyhow!("setup: {e}"))?;
         }
 
-        // Write a minimal rocky.toml.
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
             &config_path,
@@ -2223,7 +2182,9 @@ schema_template = "staging__{{source}}"
             ),
         )?;
 
-        // Generate a compact plan for a table (syntax is Databricks-only).
+        // Fabricate a v1-shaped compact plan on disk (`write_plan` tags
+        // `format_version = 1` with a `CompactOutput` payload — the
+        // legacy inline-SQL envelope written by Rocky < engine-v1.35.0).
         let plan_id = write_plan(
             dir.path(),
             PlanKind::Compact,
@@ -2235,31 +2196,34 @@ schema_template = "staging__{{source}}"
                 scope: None,
                 dry_run: false,
                 target_size_mb: 256,
-                statements: vec![
-                    NamedStatement {
-                        purpose: "compact small files".to_string(),
-                        sql: Some("OPTIMIZE orders WHERE true".to_string()),
-                    },
-                    NamedStatement {
-                        purpose: "remove stale data files".to_string(),
-                        sql: Some("VACUUM orders RETAIN 168 HOURS".to_string()),
-                    },
-                ],
+                statements: vec![NamedStatement {
+                    purpose: "compact small files".to_string(),
+                    sql: Some("OPTIMIZE orders WHERE true".to_string()),
+                }],
                 tables: None,
                 totals: None,
                 plan_id: None,
             },
         )?;
 
-        // Apply the plan using the inner function that takes an explicit root,
-        // so we don't need to change the process-global current directory.
-        // apply completes (per-statement errors are not fatal to the function).
-        run_compact_apply_in(dir.path(), &config_path, &plan_id, false).await?;
-
-        // Verify the plan was read back correctly by reading it.
+        // Sanity check: the file is on disk and parses as v1.
         let plan = read_plan(dir.path(), &plan_id)?;
         assert_eq!(plan.kind, PlanKind::Compact);
+        assert_eq!(plan.format_version, 1);
 
+        // Apply must reject with the migration error.
+        let err = run_compact_apply_in(dir.path(), &config_path, &plan_id, false)
+            .await
+            .expect_err("v1 compact plan must be rejected by apply");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("format v1") || msg.contains("v1 plan"),
+            "error should call out v1 format, got: {msg}"
+        );
+        assert!(
+            msg.contains("plan-store-v1-to-v2"),
+            "error should point at the migration guide, got: {msg}"
+        );
         Ok(())
     }
 
@@ -2306,7 +2270,7 @@ schema_template = "staging__{{source}}"
         )?;
 
         // Write an archive plan (wrong kind for compact apply).
-        let plan_id = write_plan(
+        let plan_id = crate::plan_store::write_plan(
             dir.path(),
             PlanKind::Archive,
             &serde_json::json!({"dummy": true}),
