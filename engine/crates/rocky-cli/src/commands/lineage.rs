@@ -117,11 +117,24 @@ pub fn run_lineage(
                 .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
                 .map(to_edge_record)
                 .collect();
+            // Look up typed columns for this model from the typecheck
+            // pass so each `LineageColumnDef` can carry its inferred
+            // `data_type`. The typed schema may be absent (e.g. on a
+            // model that failed typecheck) or report `RockyType::Unknown`
+            // for columns it couldn't resolve — both map to `None`.
+            let typed_cols = result.type_check.typed_models.get(model_name);
             let columns: Vec<LineageColumnDef> = schema
                 .columns
                 .iter()
-                .map(|c| LineageColumnDef {
-                    name: c.name.clone(),
+                .map(|c| {
+                    let data_type = typed_cols
+                        .and_then(|cols| cols.iter().find(|t| t.name == c.name))
+                        .filter(|t| !matches!(t.data_type, rocky_ir::types::RockyType::Unknown))
+                        .map(|t| t.data_type.to_string());
+                    LineageColumnDef {
+                        name: c.name.clone(),
+                        data_type,
+                    }
                 })
                 .collect();
             let output = LineageOutput {

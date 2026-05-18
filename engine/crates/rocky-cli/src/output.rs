@@ -1697,6 +1697,13 @@ pub struct ColumnLineageOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct LineageColumnDef {
     pub name: String,
+    /// Inferred column type, rendered as a Rocky type string (e.g.
+    /// `STRING`, `INT64`, `DECIMAL(10,2)`, `TIMESTAMP`). Omitted when
+    /// the type could not be inferred — typically a `SELECT *` against
+    /// an upstream whose schema isn't cached, or a model that did not
+    /// pass typecheck.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
