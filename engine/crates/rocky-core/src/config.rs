@@ -203,6 +203,12 @@ pub enum ConfigError {
         "pipeline '{pipeline}' source.discovery.adapter = '{adapter}' points to an adapter whose `kind` excludes discovery"
     )]
     PipelineDiscoveryAdapterNotDiscovery { pipeline: String, adapter: String },
+
+    #[error(
+        "pipeline '{pipeline}' uses strategy = \"merge\" but neither merge_keys nor merge_keys_fallback is configured. \
+         Set [pipeline.{pipeline}.merge_keys = [\"col1\", \"col2\"]] in your rocky.toml."
+    )]
+    ReplicationMergeMissingKeys { pipeline: String },
 }
 
 /// Concurrency strategy for table processing.
@@ -2611,13 +2617,34 @@ impl PipelineConfig {
 // schema; everything outside the pipeline section stays strict.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReplicationPipelineConfig {
-    /// Replication strategy: "incremental" or "full_refresh".
+    /// Replication strategy: `"incremental"`, `"full_refresh"`, or `"merge"`.
+    ///
+    /// `"merge"` upserts the watermarked delta into the target via
+    /// `MERGE INTO ... USING (delta) ON merge_keys WHEN MATCHED UPDATE SET *
+    /// WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or
+    /// `merge_keys_fallback`) to be set.
     #[serde(default = "default_strategy")]
     pub strategy: String,
 
     /// Timestamp column for incremental strategy.
     #[serde(default = "default_timestamp_column")]
     pub timestamp_column: String,
+
+    /// Unique-key columns for `strategy = "merge"`. The `MERGE` statement
+    /// joins source rows onto the target on these columns; matched rows are
+    /// updated, unmatched rows are inserted.
+    ///
+    /// Required when `strategy = "merge"` and `merge_keys_fallback` is
+    /// absent. Ignored for other strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_keys: Option<Vec<String>>,
+
+    /// Fallback unique-key columns used when `merge_keys` is not configured.
+    /// Provides a single source of merge-key defaults for callers that
+    /// derive keys from another source (e.g. the discovery adapter) but
+    /// still want pipeline-level control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_keys_fallback: Option<Vec<String>>,
 
     /// Metadata columns added during replication.
     #[serde(default)]
@@ -3185,6 +3212,34 @@ pub fn validate_adapter_kinds(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// Collects strategy-level issues on replication pipelines.
+///
+/// Today this checks one rule: `strategy = "merge"` requires
+/// `merge_keys` (or `merge_keys_fallback`). Surfacing it here means
+/// `rocky validate` can emit the issue as a structured diagnostic, and
+/// production load paths (via [`load_rocky_config`]) fail fast before
+/// any network call.
+///
+/// Returns one error per offending pipeline. Other strategy strings
+/// (`"incremental"`, `"full_refresh"`, anything else) pass through
+/// unchanged — unknown values still fall back to `FullRefresh` at
+/// dispatch time. Tightening that fallback into a typed error is a
+/// follow-up.
+pub fn validate_replication_strategies(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        if replication.strategy == "merge" && replication.resolved_merge_keys().is_none() {
+            errors.push(ConfigError::ReplicationMergeMissingKeys {
+                pipeline: pipeline_name.clone(),
+            });
+        }
+    }
+    errors
+}
+
 /// Does this adapter actively serve `role`?
 ///
 /// An adapter block actively serves a role when:
@@ -3311,6 +3366,9 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     if let Some(first) = validate_adapter_kinds(&config).into_iter().next() {
         return Err(first);
     }
+    if let Some(first) = validate_replication_strategies(&config).into_iter().next() {
+        return Err(first);
+    }
     Ok(config)
 }
 
@@ -3382,6 +3440,14 @@ impl ReplicationPipelineConfig {
     /// Builds a SchemaPattern from the source configuration.
     pub fn schema_pattern(&self) -> Result<SchemaPattern, crate::schema::SchemaError> {
         self.source.schema_pattern.to_schema_pattern()
+    }
+
+    /// Returns the resolved merge keys, preferring `merge_keys` over
+    /// `merge_keys_fallback`. `None` when neither is set.
+    pub fn resolved_merge_keys(&self) -> Option<&Vec<String>> {
+        self.merge_keys
+            .as_ref()
+            .or(self.merge_keys_fallback.as_ref())
     }
 }
 
@@ -6583,6 +6649,311 @@ max_rows = 1000
         assert!(
             msg.contains("backend") || msg.contains("unknown field"),
             "error should mention the unknown field, got: {msg}"
+        );
+    }
+
+    /// Returns a baseline replication-pipeline TOML used by the merge-strategy
+    /// tests. Callers concatenate strategy-specific overrides on top.
+    fn merge_pipeline_toml_base() -> &'static str {
+        r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+"#
+    }
+
+    #[test]
+    fn replication_strategy_merge_parses_merge_keys() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+merge_keys = ["id", "tenant_id"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        assert_eq!(pipeline.strategy, "merge");
+        assert_eq!(
+            pipeline.merge_keys.as_deref(),
+            Some(&["id".to_string(), "tenant_id".to_string()][..])
+        );
+        assert!(pipeline.merge_keys_fallback.is_none());
+        // resolved_merge_keys prefers merge_keys.
+        assert_eq!(
+            pipeline.resolved_merge_keys(),
+            Some(&vec!["id".to_string(), "tenant_id".to_string()])
+        );
+    }
+
+    #[test]
+    fn replication_strategy_merge_falls_back_to_merge_keys_fallback() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+merge_keys_fallback = ["pk"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        assert!(pipeline.merge_keys.is_none());
+        assert_eq!(
+            pipeline.merge_keys_fallback.as_deref(),
+            Some(&["pk".to_string()][..])
+        );
+        assert_eq!(
+            pipeline.resolved_merge_keys(),
+            Some(&vec!["pk".to_string()])
+        );
+    }
+
+    #[test]
+    fn replication_strategy_merge_prefers_merge_keys_over_fallback() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+merge_keys = ["primary"]
+merge_keys_fallback = ["fallback_only"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        assert_eq!(
+            pipeline.resolved_merge_keys(),
+            Some(&vec!["primary".to_string()])
+        );
+    }
+
+    #[test]
+    fn validate_replication_strategies_rejects_merge_without_keys() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_strategies(&config);
+        assert_eq!(errors.len(), 1);
+        // Pin the exact error string — it's the contract callers (CLI / `rocky
+        // validate`) surface to operators and must stay stable.
+        assert_eq!(
+            errors[0].to_string(),
+            "pipeline 'bronze' uses strategy = \"merge\" but neither merge_keys \
+             nor merge_keys_fallback is configured. \
+             Set [pipeline.bronze.merge_keys = [\"col1\", \"col2\"]] in your rocky.toml."
+        );
+        assert!(
+            matches!(errors[0], ConfigError::ReplicationMergeMissingKeys { .. }),
+            "wrong variant: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_replication_strategies_accepts_merge_with_keys() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+merge_keys = ["id"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_strategies(&config);
+        assert!(
+            errors.is_empty(),
+            "merge with merge_keys should validate cleanly, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_replication_strategies_accepts_merge_with_fallback_only() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+merge_keys_fallback = ["id"]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_replication_strategies(&config);
+        assert!(
+            errors.is_empty(),
+            "merge with merge_keys_fallback should validate cleanly, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_replication_strategies_skips_non_merge_strategies() {
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+timestamp_column = "_synced"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        // No merge_keys, but strategy != "merge" — must not produce errors.
+        let errors = validate_replication_strategies(&config);
+        assert!(
+            errors.is_empty(),
+            "non-merge strategies must pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn load_rocky_config_fails_fast_on_merge_without_keys() {
+        use std::io::Write;
+
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "merge"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(toml_str.as_bytes()).expect("write");
+        let err = load_rocky_config(tmp.path())
+            .expect_err("load_rocky_config should reject merge without keys");
+        assert!(
+            matches!(err, ConfigError::ReplicationMergeMissingKeys { ref pipeline }
+                if pipeline == "bronze"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_keys_omitted_from_serialized_output_when_none() {
+        // `skip_serializing_if = "Option::is_none"` keeps the JSON / TOML
+        // shape stable for existing replication pipelines — adding the
+        // field doesn't perturb projects that never opt into merge.
+        let mut toml_str = String::from(merge_pipeline_toml_base());
+        toml_str.push_str(
+            r#"
+strategy = "incremental"
+timestamp_column = "_synced"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let pipeline = config.pipelines["bronze"].as_replication().unwrap();
+        let json = serde_json::to_string(pipeline).unwrap();
+        assert!(
+            !json.contains("merge_keys"),
+            "JSON output should omit unset merge_keys/merge_keys_fallback: {json}"
         );
     }
 }

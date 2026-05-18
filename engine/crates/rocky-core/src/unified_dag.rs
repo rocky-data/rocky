@@ -941,6 +941,8 @@ mod tests {
         PipelineConfig::Replication(Box::new(ReplicationPipelineConfig {
             strategy: "incremental".into(),
             timestamp_column: "_fivetran_synced".into(),
+            merge_keys: None,
+            merge_keys_fallback: None,
             metadata_columns: vec![],
             source: PipelineSourceConfig {
                 adapter: "default".into(),

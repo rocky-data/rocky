@@ -750,6 +750,16 @@ export interface ReplicationPipelineConfig {
    */
   execution?: ExecutionConfig;
   /**
+   * Unique-key columns for `strategy = "merge"`. The `MERGE` statement joins source rows onto the target on these columns; matched rows are updated, unmatched rows are inserted.
+   *
+   * Required when `strategy = "merge"` and `merge_keys_fallback` is absent. Ignored for other strategies.
+   */
+  merge_keys?: string[] | null;
+  /**
+   * Fallback unique-key columns used when `merge_keys` is not configured. Provides a single source of merge-key defaults for callers that derive keys from another source (e.g. the discovery adapter) but still want pipeline-level control.
+   */
+  merge_keys_fallback?: string[] | null;
+  /**
    * Metadata columns added during replication.
    */
   metadata_columns?: MetadataColumnConfig[];
@@ -758,7 +768,9 @@ export interface ReplicationPipelineConfig {
    */
   source: PipelineSourceConfig;
   /**
-   * Replication strategy: "incremental" or "full_refresh".
+   * Replication strategy: `"incremental"`, `"full_refresh"`, or `"merge"`.
+   *
+   * `"merge"` upserts the watermarked delta into the target via `MERGE INTO ... USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set.
    */
   strategy?: string;
   /**
