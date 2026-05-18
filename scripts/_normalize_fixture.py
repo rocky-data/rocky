@@ -2,9 +2,14 @@
 """Zero out timing fields and replace wall-clock timestamps in a fixture JSON.
 
 Invoked by scripts/regen_fixtures.sh after each `rocky` capture so the
-corpus is byte-stable across regen runs. A future engine change that makes
-`last_value` / `watermark` data-derived rather than wall-clock would need to
-drop them from ``WALL_CLOCK_FIELDS``.
+corpus is byte-stable across regen runs.
+
+``last_value`` / ``watermark`` are kept in ``WALL_CLOCK_FIELDS`` even though
+the source-side migration made them data-derived (engine v1.37 onward — the
+runner queries ``MAX(ts) FROM source`` and persists that). Reason: the live
+playground POC the corpus is captured from re-seeds source on every run, so
+the underlying timestamps still wiggle across regens. Promoting these to
+real assertions only makes sense once the playground seeds are pinned.
 """
 from __future__ import annotations
 

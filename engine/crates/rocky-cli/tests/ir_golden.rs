@@ -146,7 +146,11 @@ fn run_entry(
         Entry::ReplicationCreateTableAs => {
             sql_gen::generate_create_table_as_sql(ir, dialect).map(|s| vec![s])
         }
-        Entry::ReplicationInsert => sql_gen::generate_insert_sql(ir, dialect).map(|s| vec![s]),
+        Entry::ReplicationInsert => {
+            // Golden tests render the first-run shape (no prior watermark
+            // in state), so the dialect substitutes the 1970-01-01 sentinel.
+            sql_gen::generate_insert_sql(ir, dialect, None).map(|s| vec![s])
+        }
         Entry::ReplicationMerge => sql_gen::generate_merge_sql(ir, dialect).map(|s| vec![s]),
         Entry::Transformation => sql_gen::generate_transformation_sql(ir, dialect),
         Entry::MaterializedView => {

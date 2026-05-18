@@ -462,7 +462,17 @@ pub trait SqlDialect: Send + Sync {
     ) -> AdapterResult<String>;
 
     /// WHERE clause for incremental watermark filtering.
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String>;
+    ///
+    /// The watermark value is supplied as a literal `DateTime<Utc>` read
+    /// from the host runtime's state store — the previous run's max source
+    /// timestamp. The dialect formats it as a warehouse-native timestamp
+    /// literal. `None` (first run or after `delete_watermark`) yields the
+    /// `1970-01-01` sentinel so the whole source is scanned.
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&DateTime<Utc>>,
+    ) -> AdapterResult<String>;
 
     /// Generate one or more SQL statements that atomically replace the rows
     /// in `target` matching `partition_filter` with the result of `select_sql`.

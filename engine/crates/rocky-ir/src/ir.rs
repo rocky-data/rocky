@@ -37,14 +37,16 @@ use crate::time_grain::TimeGrain;
 pub enum MaterializationStrategy {
     /// Drop and recreate the entire table.
     FullRefresh,
-    /// Append rows newer than the watermark.
+    /// Append rows newer than the source-side watermark.
     ///
     /// The watermark value itself is not carried on the strategy: it is
-    /// runtime state read from the embedded state store (see
-    /// [`crate::state::StateStore::get_watermark`]) and the SQL generator
-    /// emits a `WHERE ts > (SELECT MAX(ts) FROM target)` subquery that
-    /// resolves the bound at execution time. Keeping the field off the
-    /// strategy means recipe-hash inputs are runtime-state-free.
+    /// runtime state read from the embedded state store before SQL
+    /// generation. The SQL generator threads it into the dialect's
+    /// `watermark_where` as a literal — `WHERE ts > TIMESTAMP '<prior>'`
+    /// — so the WHERE clause references source only. After a successful
+    /// execute the runner re-queries `MAX(ts) FROM source` and persists
+    /// that as the next watermark. Keeping the field off the strategy
+    /// means recipe-hash inputs are runtime-state-free.
     Incremental { timestamp_column: String },
     /// Upsert based on unique key columns.
     Merge {
@@ -204,9 +206,15 @@ pub struct GovernanceConfig {
 }
 
 /// Tracks the last-seen watermark for incremental loads.
+///
+/// `last_value` is **source-side**: the `MAX(timestamp_column) FROM source`
+/// observed during the last successful run. The runner re-queries source
+/// post-execute and persists the value here; the next run reads it back
+/// and threads it into the dialect's `watermark_where` clause as a literal
+/// (no correlated subquery against target).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatermarkState {
-    /// The MAX(timestamp_column) from the last successful run.
+    /// The `MAX(timestamp_column) FROM source` from the last successful run.
     pub last_value: DateTime<Utc>,
     /// When this watermark was recorded.
     pub updated_at: DateTime<Utc>,

@@ -106,14 +106,16 @@ impl SqlDialect for TestDialect {
         Ok(sql)
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> AdapterResult<String> {
         rocky_sql::validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        Ok(format!(
-            "WHERE {timestamp_col} > (\n\
-             \x20   SELECT COALESCE(MAX({timestamp_col}), TIMESTAMP '1970-01-01')\n\
-             \x20   FROM {target_ref}\n\
-             )"
-        ))
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -249,53 +251,55 @@ fn test_incremental_pipeline_with_watermark() {
 
     let table_key = "acme_warehouse.staging__us_west__shopify.orders";
 
-    // Set a watermark (simulating a previous successful run)
-    let now = chrono::Utc::now();
+    // Set a source-side watermark (simulating a previous successful run that
+    // recorded `MAX(_fivetran_synced) FROM source`).
+    let prior_watermark = chrono::Utc::now();
     store
         .set_watermark(
             table_key,
             &WatermarkState {
-                last_value: now,
-                updated_at: now,
+                last_value: prior_watermark,
+                updated_at: prior_watermark,
             },
         )
         .unwrap();
 
-    // Build an incremental plan; the watermark itself is read from the
-    // state store at SQL-generation time, not carried on the strategy.
-    let _wm = store.get_watermark(table_key).unwrap();
+    // The runner reads the watermark from the state store before SQL gen
+    // and threads it in. The dialect then substitutes a literal — no
+    // correlated subquery against target.
+    let stored = store.get_watermark(table_key).unwrap().unwrap();
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&stored.last_value)).unwrap();
 
-    // Generate INSERT INTO ... SELECT SQL (incremental append)
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
-
-    // Verify incremental SQL structure
+    // Verify incremental SQL structure.
     assert!(
         sql.contains("INSERT INTO"),
         "expected INSERT INTO, got: {sql}"
     );
     assert!(
-        sql.contains("acme_warehouse.staging__us_west__shopify.orders"),
-        "expected target ref"
+        sql.contains("FROM source_catalog.src__acme__us_west__shopify.orders"),
+        "expected source ref in FROM"
     );
     assert!(
-        sql.contains("_fivetran_synced"),
-        "expected timestamp column in WHERE"
+        sql.contains("INTO acme_warehouse.staging__us_west__shopify.orders"),
+        "expected target ref in INTO"
     );
     assert!(
-        sql.contains("WHERE _fivetran_synced > ("),
-        "expected watermark WHERE clause"
+        sql.contains("WHERE _fivetran_synced > TIMESTAMP '"),
+        "expected literal source-side watermark WHERE clause: {sql}"
     );
+    // No correlated subquery against target.
     assert!(
-        sql.contains("COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')"),
-        "expected watermark subquery"
+        !sql.contains("SELECT COALESCE(MAX"),
+        "source-side watermark must not emit a correlated MAX subquery: {sql}"
     );
 
-    // Verify the watermark was persisted
+    // State store keeps the prior watermark; the runner re-records it at
+    // end-of-run from a fresh `SELECT MAX(ts) FROM source` query.
     let stored_wm = store.get_watermark(table_key).unwrap().unwrap();
-    assert_eq!(stored_wm.last_value, now);
+    assert_eq!(stored_wm.last_value, prior_watermark);
 }
 
 // ===========================================================================
@@ -840,7 +844,7 @@ fn test_sql_injection_prevention() {
         table: "table".into(),
     });
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect, None).is_err(),
         "should reject SQL injection in catalog name"
     );
 
@@ -852,7 +856,7 @@ fn test_sql_injection_prevention() {
         table: "tbl".into(),
     });
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect, None).is_err(),
         "should reject SQL injection in schema name"
     );
 
@@ -864,7 +868,7 @@ fn test_sql_injection_prevention() {
         value: "NULL".into(),
     }];
     assert!(
-        sql_gen::generate_select_sql(&bad_plan, &dialect).is_err(),
+        sql_gen::generate_select_sql(&bad_plan, &dialect, None).is_err(),
         "should reject SQL injection in metadata column name"
     );
 
@@ -919,15 +923,16 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let wm = store.get_watermark(table_key).unwrap();
     assert!(wm.is_some(), "watermark should exist after first run");
 
-    // The watermark value lives in the state store and is consulted by the
-    // SQL generator at execution time; the strategy itself no longer
-    // carries it.
+    // The runner reads the prior watermark from the state store and
+    // threads it into SQL generation. The dialect substitutes a literal
+    // in the WHERE clause (source-side semantics).
+    let prior_wm = wm.unwrap();
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&prior_wm.last_value)).unwrap();
     assert!(sql.contains("INSERT INTO"));
-    assert!(sql.contains("WHERE _fivetran_synced > ("));
+    assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '"));
 
     // Simulate successful run: update watermark
     let t2 = chrono::Utc::now();
@@ -1010,22 +1015,42 @@ fn test_anomaly_detection_with_state() {
 // ===========================================================================
 
 #[test]
-fn test_exact_incremental_sql_output() {
+fn test_exact_incremental_sql_output_first_run() {
     let dialect = TestDialect;
 
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
 
-    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
+    // First run: no prior watermark in state, dialect emits the
+    // 1970-01-01 sentinel literal.
+    let sql = sql_gen::generate_select_sql(&plan, &dialect, None).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM source_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM acme_warehouse.staging__us_west__shopify.orders
-)";
+WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'";
+
+    assert_eq!(sql, expected, "incremental SELECT SQL must match exactly");
+}
+
+#[test]
+fn test_exact_incremental_sql_output_with_prior_watermark() {
+    use chrono::TimeZone;
+    let dialect = TestDialect;
+
+    let plan = sample_replication_ir(MaterializationStrategy::Incremental {
+        timestamp_column: "_fivetran_synced".into(),
+    });
+
+    // Second run: state has the previous run's `MAX(ts) FROM source` value.
+    let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+    let sql = sql_gen::generate_select_sql(&plan, &dialect, Some(&prior)).unwrap();
+
+    let expected = "\
+SELECT *, CAST(NULL AS STRING) AS _loaded_by
+FROM source_catalog.src__acme__us_west__shopify.orders
+WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'";
 
     assert_eq!(sql, expected, "incremental SELECT SQL must match exactly");
 }
@@ -1035,7 +1060,7 @@ fn test_exact_full_refresh_sql_output() {
     let dialect = TestDialect;
 
     let plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
-    let sql = sql_gen::generate_select_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_select_sql(&plan, &dialect, None).unwrap();
 
     let expected = "\
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
@@ -1060,22 +1085,19 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
 }
 
 #[test]
-fn test_exact_insert_sql_output() {
+fn test_exact_insert_sql_output_first_run() {
     let dialect = TestDialect;
 
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect, None).unwrap();
 
     let expected = "\
 INSERT INTO acme_warehouse.staging__us_west__shopify.orders
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM source_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM acme_warehouse.staging__us_west__shopify.orders
-)";
+WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'";
 
     assert_eq!(sql, expected, "INSERT SQL must match exactly");
 }
