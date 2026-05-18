@@ -234,6 +234,13 @@ class AnomalyResult(BaseModel):
 class TableError(BaseModel):
     asset_key: list[str]
     error: str
+    #: Coarse classification of the failure so orchestrators can branch on
+    #: kind (retry, page, surface) without parsing ``error``. One of
+    #: ``connection-failed``, ``auth-failed``, ``query-rejected``,
+    #: ``transient``, ``quota-exceeded``, ``not-found``, ``unknown``.
+    #: Defaults to ``"unknown"`` for older engine binaries that omit the
+    #: field.
+    failure_kind: str = "unknown"
 
 
 class ExcludedTable(BaseModel):
