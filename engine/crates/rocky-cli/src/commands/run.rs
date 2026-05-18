@@ -4341,6 +4341,47 @@ fn accumulate_bytes(acc: Option<u64>, next: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Maps a `ReplicationPipelineConfig.strategy` string onto a
+/// `MaterializationStrategy` variant for the replication runner.
+///
+/// `"incremental"` → `Incremental { timestamp_column }`.
+/// `"merge"` → `Merge { unique_key, update_columns: ColumnSelection::All }`,
+///   reading keys from `resolved_merge_keys()` (`merge_keys` falls back to
+///   `merge_keys_fallback`). `merge` requires keys; absence is treated as
+///   a defensive `anyhow!` because `validate_replication_strategies` should
+///   have rejected it at config load time.
+/// Anything else → `FullRefresh` (backwards-compatible fallback; see follow-up
+///   note in PR body about tightening unknown strategy values).
+///
+/// Note: the watermark-filter clause (`WHERE ts > MAX(target.ts)`) lives in
+/// `sql_gen::generate_select_sql` and applies for `Incremental` only; `merge`
+/// upserts the entire source via the dialect-specific `MERGE INTO`. The
+/// runner advances the watermark timestamp after each tick regardless of
+/// strategy (via `DeferredWatermark`).
+fn build_replication_strategy(
+    pipeline: &ReplicationPipelineConfig,
+) -> Result<MaterializationStrategy> {
+    match pipeline.strategy.as_str() {
+        "incremental" => Ok(MaterializationStrategy::Incremental {
+            timestamp_column: pipeline.timestamp_column.clone(),
+        }),
+        "merge" => {
+            let keys = pipeline.resolved_merge_keys().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "strategy = \"merge\" requires merge_keys or merge_keys_fallback \
+                     (this should have been caught by load_rocky_config)"
+                )
+            })?;
+            let unique_key: Vec<Arc<str>> = keys.iter().map(|k| Arc::from(k.as_str())).collect();
+            Ok(MaterializationStrategy::Merge {
+                unique_key,
+                update_columns: ColumnSelection::All,
+            })
+        }
+        _ => Ok(MaterializationStrategy::FullRefresh),
+    }
+}
+
 /// Processes a single table: drift detection + replication.
 ///
 /// Uses `WarehouseAdapter` for all SQL execution and schema introspection,
@@ -4520,13 +4561,7 @@ async fn process_table(
     }
 
     // Build replication IR directly.
-    let strategy = if pipeline.strategy == "incremental" {
-        MaterializationStrategy::Incremental {
-            timestamp_column: pipeline.timestamp_column.clone(),
-        }
-    } else {
-        MaterializationStrategy::FullRefresh
-    };
+    let strategy = build_replication_strategy(pipeline)?;
     let model_ir = ModelIr::replication(
         TargetRef {
             catalog: task.target_catalog.clone(),
@@ -5855,5 +5890,145 @@ schema = "mart"
 
         // Should return without panicking or propagating.
         auto_sweep_retention_at_end_of_run(&blocked, &StateRetentionConfig::default()).await;
+    }
+
+    /// Pipeline TOML fragment used by `build_replication_strategy` tests.
+    /// Strategy + merge-key fields are concatenated on top per-case.
+    fn pipeline_toml_for_strategy_test() -> &'static str {
+        r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+"#
+    }
+
+    fn parse_pipeline(extra: &str) -> ReplicationPipelineConfig {
+        let mut toml_str = String::from(pipeline_toml_for_strategy_test());
+        toml_str.push_str(extra);
+        toml_str.push_str(
+            r#"
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        let config: rocky_core::config::RockyConfig = toml::from_str(&toml_str).unwrap();
+        config.pipelines["bronze"].as_replication().unwrap().clone()
+    }
+
+    #[test]
+    fn build_replication_strategy_incremental() {
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "_synced_at"
+"#,
+        );
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Incremental { timestamp_column } => {
+                assert_eq!(timestamp_column, "_synced_at");
+            }
+            other => panic!("expected Incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_replication_strategy_full_refresh() {
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        assert!(matches!(strategy, MaterializationStrategy::FullRefresh));
+    }
+
+    #[test]
+    fn build_replication_strategy_merge_with_merge_keys() {
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys = ["id", "tenant_id"]
+"#,
+        );
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Merge {
+                unique_key,
+                update_columns,
+            } => {
+                let keys: Vec<&str> = unique_key.iter().map(AsRef::as_ref).collect();
+                assert_eq!(keys, vec!["id", "tenant_id"]);
+                assert!(matches!(update_columns, ColumnSelection::All));
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_replication_strategy_merge_falls_back_to_merge_keys_fallback() {
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys_fallback = ["pk"]
+"#,
+        );
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Merge { unique_key, .. } => {
+                let keys: Vec<&str> = unique_key.iter().map(AsRef::as_ref).collect();
+                assert_eq!(keys, vec!["pk"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_replication_strategy_merge_prefers_merge_keys_over_fallback() {
+        let pipeline = parse_pipeline(
+            r#"strategy = "merge"
+merge_keys = ["primary"]
+merge_keys_fallback = ["fallback_only"]
+"#,
+        );
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        match strategy {
+            MaterializationStrategy::Merge { unique_key, .. } => {
+                let keys: Vec<&str> = unique_key.iter().map(AsRef::as_ref).collect();
+                assert_eq!(keys, vec!["primary"]);
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_replication_strategy_merge_without_keys_errors() {
+        // Defensive guard: `load_rocky_config` rejects this earlier via
+        // `validate_replication_strategies`, but callers that build the
+        // config struct in-process and bypass that path must still get
+        // a clean error.
+        let pipeline = parse_pipeline(r#"strategy = "merge""#);
+        let err = build_replication_strategy(&pipeline).expect_err("merge without keys must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge_keys"),
+            "error should name merge_keys: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_replication_strategy_unknown_falls_back_to_full_refresh() {
+        // Preserves prior behavior: any strategy string other than
+        // "incremental" / "merge" maps to FullRefresh. Tightening this
+        // into a typed error is a follow-up.
+        let pipeline = parse_pipeline(r#"strategy = "totally_made_up""#);
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        assert!(matches!(strategy, MaterializationStrategy::FullRefresh));
     }
 }

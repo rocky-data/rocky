@@ -2053,6 +2053,16 @@ class ReplicationPipelineConfig(BaseModel):
     """
     Execution settings (concurrency, retries, etc.).
     """
+    merge_keys: list[str] | None = None
+    """
+    Unique-key columns for `strategy = "merge"`. The `MERGE` statement joins source rows onto the target on these columns; matched rows are updated, unmatched rows are inserted.
+
+    Required when `strategy = "merge"` and `merge_keys_fallback` is absent. Ignored for other strategies.
+    """
+    merge_keys_fallback: list[str] | None = None
+    """
+    Fallback unique-key columns used when `merge_keys` is not configured. Provides a single source of merge-key defaults for callers that derive keys from another source (e.g. the discovery adapter) but still want pipeline-level control.
+    """
     metadata_columns: list[MetadataColumnConfig] | None = Field(
         [], validate_default=True
     )
@@ -2065,7 +2075,9 @@ class ReplicationPipelineConfig(BaseModel):
     """
     strategy: str | None = "incremental"
     """
-    Replication strategy: "incremental" or "full_refresh".
+    Replication strategy: `"incremental"`, `"full_refresh"`, or `"merge"`.
+
+    `"merge"` upserts the watermarked delta into the target via `MERGE INTO ... USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set.
     """
     target: PipelineTargetConfig
     """
