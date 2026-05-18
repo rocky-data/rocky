@@ -1756,3 +1756,169 @@ fn test_grace_period_column_reappears() {
     store.delete_grace_period(table_key, "status").unwrap();
     assert!(store.list_grace_periods(table_key).unwrap().is_empty());
 }
+
+// ===========================================================================
+// Test 12: Merge strategy end-to-end against in-process DuckDB
+// ===========================================================================
+//
+// Pins idempotency: re-emitting the same source delta across repeated
+// `rocky run` invocations must converge to a stable target — the row count
+// must not grow, and matched rows must reflect the latest source values.
+//
+// Uses the real `rocky-duckdb` dialect via `DuckDbConnector::in_memory()` so
+// the test exercises the same SQL Rocky would emit at runtime, including
+// DuckDB's unqualified-LHS quirk in `UPDATE SET`.
+mod merge_strategy_e2e {
+    use rocky_core::sql_gen;
+    use rocky_core::traits::SqlDialect;
+    use rocky_duckdb::DuckDbConnector;
+    use rocky_duckdb::dialect::DuckDbSqlDialect;
+    use rocky_ir::{
+        ColumnSelection, GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef,
+    };
+
+    /// Build a replication ModelIr that merges from `main.src_customers` into
+    /// `main.dim_customers` on `id`, updating `ts` and `val`.
+    fn merge_ir() -> ModelIr {
+        ModelIr::replication(
+            TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "dim_customers".into(),
+            },
+            MaterializationStrategy::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: ColumnSelection::Explicit(vec!["ts".into(), "val".into()]),
+            },
+            SourceRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "src_customers".into(),
+            },
+            ColumnSelection::Explicit(vec!["id".into(), "ts".into(), "val".into()]),
+            vec![],
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        )
+    }
+
+    /// Refresh `main.src_customers` with the given two rows. Mirrors what a
+    /// Fivetran-style replication run would do upstream of MERGE.
+    fn refresh_source(conn: &DuckDbConnector, ts: &str, val_a: &str, val_b: &str) {
+        conn.execute_sql("DROP TABLE IF EXISTS main.src_customers")
+            .expect("drop src");
+        conn.execute_sql("CREATE TABLE main.src_customers (id INTEGER, ts TIMESTAMP, val VARCHAR)")
+            .expect("create src");
+        conn.execute_sql(&format!(
+            "INSERT INTO main.src_customers VALUES \
+             (1, TIMESTAMP '{ts}', '{val_a}'), \
+             (2, TIMESTAMP '{ts}', '{val_b}')",
+        ))
+        .expect("seed src");
+    }
+
+    #[test]
+    fn test_duckdb_merge_idempotent_under_whole_table_resync() {
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        let dialect = DuckDbSqlDialect;
+
+        // Bootstrap an empty target table with the merge column schema.
+        conn.execute_sql("CREATE TABLE main.dim_customers (id INTEGER, ts TIMESTAMP, val VARCHAR)")
+            .expect("create target");
+
+        let ir = merge_ir();
+        let merge_sql = sql_gen::generate_merge_sql(&ir, &dialect as &dyn SqlDialect)
+            .expect("generate MERGE SQL");
+
+        // --- Run 1: empty target → 2 inserts ---
+        refresh_source(&conn, "2026-01-01 00:00:00", "a", "b");
+        conn.execute_sql(&merge_sql).expect("merge run 1");
+
+        let after_1 = conn
+            .execute_sql("SELECT id, val, ts FROM main.dim_customers ORDER BY id")
+            .expect("query post-run-1");
+        assert_eq!(after_1.rows.len(), 2, "first merge should insert 2 rows");
+        assert_eq!(after_1.rows[0][1].as_str(), Some("a"));
+        assert_eq!(after_1.rows[1][1].as_str(), Some("b"));
+        let ts_after_1 = after_1.rows[0][2].clone();
+
+        // --- Run 2: same keys, refreshed ts, id=2 value changed → no row growth ---
+        refresh_source(&conn, "2026-02-01 00:00:00", "a", "b_updated");
+        conn.execute_sql(&merge_sql).expect("merge run 2");
+
+        let after_2 = conn
+            .execute_sql("SELECT id, val, ts FROM main.dim_customers ORDER BY id")
+            .expect("query post-run-2");
+        assert_eq!(
+            after_2.rows.len(),
+            2,
+            "merge must not duplicate rows on resync"
+        );
+        assert_eq!(after_2.rows[0][1].as_str(), Some("a"), "id=1 val unchanged");
+        assert_eq!(
+            after_2.rows[1][1].as_str(),
+            Some("b_updated"),
+            "id=2 val updated from source"
+        );
+        // Both rows now carry the refreshed timestamp.
+        assert_ne!(
+            after_2.rows[0][2], ts_after_1,
+            "timestamp on id=1 must be refreshed by MERGE UPDATE"
+        );
+        assert_eq!(
+            after_2.rows[0][2], after_2.rows[1][2],
+            "both rows should share the refreshed timestamp"
+        );
+
+        // --- Run 3: same source again → still 2 rows, still latest values ---
+        conn.execute_sql(&merge_sql).expect("merge run 3");
+
+        let after_3 = conn
+            .execute_sql("SELECT id, val FROM main.dim_customers ORDER BY id")
+            .expect("query post-run-3");
+        assert_eq!(after_3.rows.len(), 2, "third merge must still be 2 rows");
+        assert_eq!(after_3.rows[0][1].as_str(), Some("a"));
+        assert_eq!(after_3.rows[1][1].as_str(), Some("b_updated"));
+    }
+
+    /// Sanity: DuckDB MERGE with `update_columns = All` must still fail-fast.
+    /// Mirrors `test_merge_rejects_update_set_star` in `rocky-duckdb` so a
+    /// regression that silently emits `UPDATE SET *` from the sql_gen path
+    /// is caught here too.
+    #[test]
+    fn test_duckdb_merge_rejects_update_set_star_via_sql_gen() {
+        let dialect = DuckDbSqlDialect;
+        let ir = ModelIr::replication(
+            TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "dim_customers".into(),
+            },
+            MaterializationStrategy::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: ColumnSelection::All,
+            },
+            SourceRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "src_customers".into(),
+            },
+            ColumnSelection::All,
+            vec![],
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        );
+
+        let result = sql_gen::generate_merge_sql(&ir, &dialect as &dyn SqlDialect);
+        assert!(
+            result.is_err(),
+            "DuckDB MERGE with update_columns = All must error in sql_gen"
+        );
+    }
+}
