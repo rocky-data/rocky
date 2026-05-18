@@ -3974,6 +3974,7 @@ dependencies = [
  "parquet",
  "percent-encoding",
  "reqwest",
+ "rocky-catalog-core",
  "rocky-core",
  "rocky-databricks",
  "serde",

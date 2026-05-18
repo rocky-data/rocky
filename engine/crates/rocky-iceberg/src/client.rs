@@ -86,6 +86,66 @@ pub struct TableIdentifierResponse {
     pub name: String,
 }
 
+/// Response body for `GET /v1/namespaces/{ns}/tables/{name}` — the Iceberg
+/// REST "load table" endpoint.
+///
+/// Wraps the [`TableMetadata`] payload that the spec returns. Other
+/// top-level fields (`metadata-location`, `config`, signed storage
+/// credentials) are intentionally not modelled here because PR-2 only
+/// consumes the schema.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadTableResponse {
+    /// The table metadata document, as defined by the Iceberg spec.
+    pub metadata: TableMetadata,
+}
+
+/// Partial view of the Iceberg `TableMetadata` document.
+///
+/// The on-the-wire document is large (snapshots, manifests, partition
+/// specs, sort orders, refs, properties); this struct only models the
+/// fields needed to project the current column schema onto a
+/// `TableSchema`. Unknown fields are ignored by serde's default
+/// behaviour.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TableMetadata {
+    /// Schema id of the current schema, used to pick the right entry
+    /// out of `schemas`. The field is camel-cased on the wire as
+    /// `current-schema-id`.
+    #[serde(rename = "current-schema-id")]
+    pub current_schema_id: i64,
+    /// The set of schemas the table has ever had; the entry with
+    /// `schema-id == current_schema_id` is the active one.
+    pub schemas: Vec<IcebergSchema>,
+}
+
+/// One entry in [`TableMetadata::schemas`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct IcebergSchema {
+    /// Unique identifier for this schema revision.
+    #[serde(rename = "schema-id")]
+    pub schema_id: i64,
+    /// Columns in declaration order.
+    pub fields: Vec<IcebergField>,
+}
+
+/// One column in an [`IcebergSchema`].
+///
+/// `type` is left as a [`serde_json::Value`] because the Iceberg spec
+/// allows it to be either a primitive type name (`"long"`,
+/// `"timestamp"`) or a nested JSON object describing a list/map/struct.
+/// Distillation into a string happens at consume time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IcebergField {
+    /// Column name as the catalog stores it.
+    pub name: String,
+    /// Whether the column is required (i.e. `NOT NULL`). The catalog-side
+    /// `nullable` projection is the inverse of this flag.
+    pub required: bool,
+    /// Type representation; either a primitive string or a JSON object.
+    #[serde(rename = "type")]
+    pub type_repr: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -170,6 +230,39 @@ impl IcebergCatalogClient {
         Ok(tables)
     }
 
+    /// Load a single table's metadata.
+    ///
+    /// Targets `GET /v1/namespaces/{ns}/tables/{name}`, the Iceberg REST
+    /// "load table" endpoint. The full [`LoadTableResponse`] is returned;
+    /// callers that only want the column-level schema should reach into
+    /// [`LoadTableResponse::metadata`] and select the schema entry whose
+    /// `schema-id` matches `current-schema-id`.
+    ///
+    /// `namespace` is the multi-level namespace as a slice of parts;
+    /// the parts are percent-encoded and joined with the spec-required
+    /// `%1F` separator. `name` is the unqualified table name and is
+    /// percent-encoded individually so caller-supplied names cannot
+    /// inject path-altering bytes into the URL.
+    pub async fn load_table(
+        &self,
+        namespace: &[String],
+        name: &str,
+    ) -> Result<LoadTableResponse, IcebergError> {
+        let encoded_ns = encode_namespace_parts(namespace);
+        let encoded_name = utf8_percent_encode(name, PATH_SAFE).to_string();
+        let url = format!(
+            "{}/v1/namespaces/{}/tables/{}",
+            self.base_url, encoded_ns, encoded_name
+        );
+        let resp: LoadTableResponse = self.get(&url).await?;
+        debug!(
+            namespace = ?namespace,
+            name,
+            "loaded Iceberg table metadata"
+        );
+        Ok(resp)
+    }
+
     /// Internal GET with retry on transient errors.
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, IcebergError> {
         for attempt in 0..=self.retry.max_retries {
@@ -243,22 +336,36 @@ impl IcebergCatalogClient {
     }
 }
 
+/// Byte set used when percent-encoding individual namespace / table-name
+/// parts. Allows the RFC 3986 unreserved chars (`-`, `_`, `~`,
+/// alphanumerics) and encodes everything else — including `.`, so `..`
+/// traversal cannot escape the catalog prefix.
+const PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
+
 /// Encode a dot-separated namespace for the URL path.
 ///
 /// The Iceberg REST spec uses `%1F` (unit separator) to encode multi-level
 /// namespaces in URL paths. Each level is also percent-encoded so
 /// caller-supplied namespace parts cannot inject `/`, `?`, `#`, `..`, or
-/// other path-altering bytes into the URL. The encoding allows RFC 3986
-/// unreserved chars (`-`, `_`, `~`, alphanumerics) but explicitly encodes
-/// `.` so `..` traversal cannot escape the catalog prefix.
+/// other path-altering bytes into the URL.
 ///
 /// Order matters: split on `.`, percent-encode each part, then join with
 /// the literal `%1F` separator. Encoding after the join would re-encode
 /// the `%` of `%1F` to `%25` and break the spec-required separator.
 fn encode_namespace(namespace: &str) -> String {
-    const PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
     namespace
         .split('.')
+        .map(|part| utf8_percent_encode(part, PATH_SAFE).to_string())
+        .collect::<Vec<_>>()
+        .join("%1F")
+}
+
+/// Encode a multi-part namespace (already split into parts) for the URL
+/// path. Mirrors [`encode_namespace`] but accepts the spec-native
+/// representation (a slice of parts) instead of a dot-joined string.
+pub(crate) fn encode_namespace_parts(parts: &[String]) -> String {
+    parts
+        .iter()
         .map(|part| utf8_percent_encode(part, PATH_SAFE).to_string())
         .collect::<Vec<_>>()
         .join("%1F")
