@@ -20,6 +20,13 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = { workspace = true }
+# FR-B per-host rate-limit budget (advisory file lock + atomic state file).
+fs4 = { workspace = true }
+# FR-B account-id hashing for the per-host coordination file + OTLP attr.
+sha2 = { workspace = true }
+# FR-B Retry-After header parsing — accepts both integer-seconds and
+# RFC 7231 / 9110 HTTP-date forms.
+httpdate = "1"
 
 [features]
 test-support = []
@@ -32,6 +39,7 @@ required-features = ["test-support"]
 tokio = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
