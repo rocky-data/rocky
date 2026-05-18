@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-05-18
+
+Companion release to engine `v1.34.0`. The dagster bindings pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` via the regenerated Pydantic models. No new dagster API surface — pure codegen cascade. The engine-side `run.rs` typed-error-preserving refactor that ships in `v1.34.0` is what makes the discriminator practically useful in production: downstream Dagster assets that key off run-output errors can now branch on a stable classification rather than `unknown`. Wheel re-cut against the v1.34.0 engine binary.
+
+### Added
+
+- **`RunOutput.errors[*].failure_kind`** typed discriminator (engine `v1.34.0`). Pydantic model regenerated from the engine's JSON schema; the field is an enum with values `connection-failed`, `auth-failed`, `query-rejected`, `transient`, `quota-exceeded`, `not-found`, `unknown`. Strictly additive — re-exported from `dagster_rocky.types` under both the generated and legacy import paths so existing consumers see no breakage. Dagster code that reads `RunResult.errors[...]` can now pattern-match on `.failure_kind` to drive retry / alerting / on-call-routing decisions instead of grepping the error string.
+
 ## [1.31.0] — 2026-05-17
 
 Companion release to engine `v1.33.0`. `RockyResource` is migrated to the canonical `rocky plan` + `rocky apply <plan-id>` flow: every Dagster materialization now persists an auditable plan artifact under `.rocky/plans/<plan_id>.json` (the same id a `rocky plan` CLI invocation would produce) and then dispatches `rocky apply` for execution. The public method signatures and return types of `run(...)`, `run_streaming(...)`, and `run_pipes(...)` are preserved. Projects without a `models/` directory next to the config keep their previous single-subprocess `rocky run` argv via an automatic replication-only fallback, so behaviour is preserved for replication-only pipelines. To keep stderr quiet for that fallback path, every subprocess invocation now sets `ROCKY_SUPPRESS_DEPRECATION=1` by default (overrideable via the env var) so the engine's `rocky run` / `rocky branch promote <name>` deprecation notices don't surface as Dagster log noise.

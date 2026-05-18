@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-05-18
+
+Two small additive changes. The TypeScript bindings under `src/types/generated/` pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` (engine `v1.34.0`); the `@rocky` chat-participant system prompt is reframed to "typed-program layer above the warehouse" so the chat participant's self-introduction matches the public README and docs site copy.
+
+### Added
+
+- **`RunOutput.errors[*].failure_kind`** typed discriminator (engine `v1.34.0`). TypeScript interface regenerated in `src/types/generated/run.ts`; the field is a union with values `"connection-failed" | "auth-failed" | "query-rejected" | "transient" | "quota-exceeded" | "not-found" | "unknown"`. Extension code consuming `rocky run --output json` via `rockyJson.ts` now type-checks against the discriminator without further hand-edits.
+
+### Changed
+
+- **`@rocky` chat-participant framing**. System prompt in `src/chatParticipant.ts` updated from "Rust-based control plane for warehouse SQL pipelines" to "typed-program layer above the warehouse" so the chat participant's self-introduction matches the README, docs site, and `CLAUDE.md` copy across the monorepo. No behavioural change for slash commands; only the natural-language fallback prompt is reframed.
+
 ## [1.18.1] — 2026-05-17
 
 Codegen-companion patch release for engine `v1.33.0`. The TypeScript bindings under `src/types/generated/` are regenerated to pick up the new `NamedStatement.sql` optionality (`compact.ts` / `archive.ts` — today's emission path still writes `sql`, so consumer code sees no behaviour change) and the new top-level `[plan_store] format = "v1" | "v2"` field on `rocky_project.ts`. No new extension commands, UI, or settings — types are available for future extension wiring.
