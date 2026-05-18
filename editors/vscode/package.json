@@ -799,7 +799,7 @@
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.2",
+    "typescript-eslint": "^8.59.4",
     "vitest": "^4.1.6"
   },
   "overrides_comment": "Force-patch transitive deps that haven't been bumped upstream yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion), and the GHSA-q3j6-qgpj-74h6 / GHSA-v39h-62p7-jpjc fast-uri path-traversal/host-confusion advisories (transitive via ajv → @vscode/test-electron). Drop these once upstreams ship the bumps.",
