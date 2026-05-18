@@ -1748,6 +1748,21 @@ pub fn infer_select_types(
                     nullable,
                 });
             }
+            // Spark SQL `SELECT expr AS (a, b, c)` — multi-alias binding.
+            // Emit one typed column per alias with the same inferred type
+            // (we don't model struct destructuring, so each alias shares the
+            // expression's inferred type — same conservative shape as
+            // `ExprWithAlias` above).
+            SelectItem::ExprWithAliases { expr, aliases } => {
+                let (data_type, nullable) = infer_expr_type(expr, &type_scope);
+                for alias in aliases {
+                    typed_cols.push(TypedColumn {
+                        name: alias.value.clone(),
+                        data_type: data_type.clone(),
+                        nullable,
+                    });
+                }
+            }
             SelectItem::Wildcard(_) => {
                 // Expand * from all tables in scope
                 for cols in scope.values() {
