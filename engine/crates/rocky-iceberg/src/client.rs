@@ -1,13 +1,15 @@
 //! Async Iceberg REST Catalog API client.
 //!
 //! Wraps the [Iceberg REST Catalog API](https://iceberg.apache.org/spec/#rest-catalog)
-//! to list namespaces and tables. This is a metadata-only client -- it does not
+//! to list namespaces and tables, load and create / drop tables, and commit
+//! multi-table transactions. This is a metadata-only client -- it does not
 //! read Iceberg data files.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 
 /// Build the shared `reqwest::Client` used for every Iceberg REST
 /// catalog call. `Client::new()` left both connect and request
@@ -104,8 +106,8 @@ pub struct LoadTableResponse {
 /// The on-the-wire document is large (snapshots, manifests, partition
 /// specs, sort orders, refs, properties); this struct only models the
 /// fields needed to project the current column schema onto a
-/// `TableSchema`. Unknown fields are ignored by serde's default
-/// behaviour.
+/// `TableSchema` and to enumerate branch / tag references. Unknown
+/// fields are ignored by serde's default behaviour.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableMetadata {
     /// Schema id of the current schema, used to pick the right entry
@@ -116,6 +118,15 @@ pub struct TableMetadata {
     /// The set of schemas the table has ever had; the entry with
     /// `schema-id == current_schema_id` is the active one.
     pub schemas: Vec<IcebergSchema>,
+    /// Named branch / tag references (keyed by ref name).
+    ///
+    /// Per the Iceberg v2 spec, `refs` is a top-level map embedded in
+    /// table metadata that names every branch (mutable head) and tag
+    /// (immutable label) attached to the table. Older catalogs may omit
+    /// the field entirely; serde defaults the missing case to an empty
+    /// map.
+    #[serde(default)]
+    pub refs: HashMap<String, SnapshotReference>,
 }
 
 /// One entry in [`TableMetadata::schemas`].
@@ -144,6 +155,111 @@ pub struct IcebergField {
     /// Type representation; either a primitive string or a JSON object.
     #[serde(rename = "type")]
     pub type_repr: serde_json::Value,
+}
+
+/// An entry in [`TableMetadata::refs`] — a named branch or tag.
+///
+/// Iceberg's spec models branches and tags as `SnapshotReference`
+/// entries embedded in table metadata. Each carries the snapshot id it
+/// points at and a `type` discriminator (`"branch"` or `"tag"`). Other
+/// fields (`max-ref-age-ms`, `min-snapshots-to-keep`, etc.) are
+/// retention hints the caller does not need to project, so they are
+/// intentionally not modelled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotReference {
+    /// The snapshot id this reference points at.
+    #[serde(rename = "snapshot-id")]
+    pub snapshot_id: i64,
+    /// Reference kind: `"branch"` for a mutable head, `"tag"` for an
+    /// immutable label. Left as a string here so unknown future
+    /// variants survive deserialisation; the catalog-agnostic
+    /// projection in `IcebergCatalogClientAdapter::list_branches`
+    /// classifies it.
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// Request body for `POST /v1/namespaces/{ns}/tables`.
+///
+/// The Iceberg REST `CreateTableRequest` carries a name and a schema at
+/// minimum; partition specs, sort orders, table properties, location
+/// hints, and stage-create flags are spec-optional and intentionally
+/// not modelled until a caller needs them. The fields are flat-cased to
+/// match the spec's wire shape (`name`, `schema`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTableRequest {
+    /// Unqualified table name. The catalog scopes it to the
+    /// `{ns}`-path namespace under which the request is issued.
+    pub name: String,
+    /// Iceberg schema (fields + types + schema-id).
+    pub schema: CreateTableSchema,
+}
+
+/// Schema payload inside [`CreateTableRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTableSchema {
+    /// Always `"struct"` for a top-level table schema. The spec models a
+    /// schema as a struct of nested fields; the type tag is required.
+    #[serde(rename = "type")]
+    pub schema_type: &'static str,
+    /// Schema-id; first revision is `0` by convention.
+    #[serde(rename = "schema-id")]
+    pub schema_id: i64,
+    /// Columns in declaration order.
+    pub fields: Vec<CreateTableField>,
+}
+
+/// One column inside [`CreateTableSchema`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTableField {
+    /// Stable field id. Assigned sequentially from 1 by the caller.
+    pub id: i64,
+    /// Column name.
+    pub name: String,
+    /// Whether the column is required (`NOT NULL`).
+    pub required: bool,
+    /// Iceberg type. Primitive types are flat strings (`"long"`,
+    /// `"string"`, `"double"`); nested types are a JSON object. The
+    /// catalog-agnostic `TableSchema` only carries a string, so this
+    /// field always serialises as a JSON string when produced from a
+    /// reverse conversion — adapters that have richer schema
+    /// information should call this method directly.
+    #[serde(rename = "type")]
+    pub type_repr: serde_json::Value,
+}
+
+/// Request body for `POST /v1/transactions/commit`.
+///
+/// The spec wraps a list of [`CommitTableRequest`] entries. Each entry
+/// targets one table and carries the CAS pre-condition (`requirements`)
+/// and the metadata mutation (`updates`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitTransactionRequest {
+    /// One entry per table in the transaction.
+    #[serde(rename = "table-changes")]
+    pub table_changes: Vec<CommitTableRequest>,
+}
+
+/// One table's contribution to a `POST /v1/transactions/commit`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitTableRequest {
+    /// Fully qualified table identifier (namespace parts + name).
+    pub identifier: CommitTableIdentifier,
+    /// Pre-conditions the commit asserts. Spec example: an
+    /// `assert-ref-snapshot-id` on `main` to pin the base snapshot.
+    pub requirements: Vec<serde_json::Value>,
+    /// Mutations the commit applies. Spec example: `set-snapshot-ref`
+    /// advancing the `main` branch to a new snapshot.
+    pub updates: Vec<serde_json::Value>,
+}
+
+/// Wire-format identifier inside [`CommitTableRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitTableIdentifier {
+    /// Namespace as a slice of parts.
+    pub namespace: Vec<String>,
+    /// Table name.
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,23 +379,186 @@ impl IcebergCatalogClient {
         Ok(resp)
     }
 
+    /// Create a new table under `namespace`.
+    ///
+    /// Targets `POST /v1/namespaces/{ns}/tables` with the
+    /// [`CreateTableRequest`] body. The catalog returns the freshly
+    /// created [`LoadTableResponse`] on success — callers that only
+    /// care about the side-effect can discard it. 404 from this
+    /// endpoint typically means the parent namespace is missing rather
+    /// than a table-not-found; the adapter rewrites the default 404
+    /// mapping accordingly.
+    pub async fn create_table(
+        &self,
+        namespace: &[String],
+        request: &CreateTableRequest,
+    ) -> Result<LoadTableResponse, IcebergError> {
+        let encoded_ns = encode_namespace_parts(namespace);
+        let url = format!("{}/v1/namespaces/{}/tables", self.base_url, encoded_ns);
+        let resp: LoadTableResponse = self.post(&url, request).await?;
+        debug!(
+            namespace = ?namespace,
+            name = %request.name,
+            "created Iceberg table"
+        );
+        Ok(resp)
+    }
+
+    /// Drop a table from the catalog.
+    ///
+    /// Targets `DELETE /v1/namespaces/{ns}/tables/{name}`. The Iceberg
+    /// REST spec returns 204 No Content on success; callers should not
+    /// assume the underlying object storage is reclaimed (that depends
+    /// on the catalog's `purge` policy).
+    pub async fn drop_table(&self, namespace: &[String], name: &str) -> Result<(), IcebergError> {
+        let encoded_ns = encode_namespace_parts(namespace);
+        let encoded_name = utf8_percent_encode(name, PATH_SAFE).to_string();
+        let url = format!(
+            "{}/v1/namespaces/{}/tables/{}",
+            self.base_url, encoded_ns, encoded_name
+        );
+        self.delete(&url).await?;
+        debug!(
+            namespace = ?namespace,
+            name,
+            "dropped Iceberg table"
+        );
+        Ok(())
+    }
+
+    /// Commit a multi-table transaction.
+    ///
+    /// Targets `POST /v1/transactions/commit`. The catalog applies all
+    /// `table-changes` atomically: every requirement passes its CAS
+    /// check and every update lands, or nothing does. A 409 response
+    /// indicates a concurrent writer landed against the same base
+    /// snapshot; the call site is expected to surface this as
+    /// [`crate::CatalogError::CommitConflict`] and let the caller retry
+    /// after re-reading state.
+    pub async fn commit_transaction(
+        &self,
+        request: &CommitTransactionRequest,
+    ) -> Result<(), IcebergError> {
+        let url = format!("{}/v1/transactions/commit", self.base_url);
+        self.post_no_response(&url, request).await?;
+        debug!(
+            table_count = request.table_changes.len(),
+            "committed Iceberg transaction"
+        );
+        Ok(())
+    }
+
     /// Internal GET with retry on transient errors.
+    ///
+    /// Thin wrapper over [`Self::send_with_retry`] specialised for
+    /// idempotent GETs: timeouts and connect failures are both safe to
+    /// retry because the request cannot have side-effected the server.
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, IcebergError> {
+        let resp = self
+            .send_with_retry("GET", url, RetryClass::Idempotent, || {
+                self.bearer(self.client.get(url))
+            })
+            .await?;
+        Self::parse_json(resp).await
+    }
+
+    /// Internal POST with retry, returning the deserialised body.
+    ///
+    /// POST is treated as non-idempotent: timeouts after the request
+    /// landed cannot be safely retried (the server may have applied the
+    /// effect), so only `is_connect()` failures are retried at the
+    /// transport layer. 429 and 5xx are still retried — 429 is the
+    /// server explicitly inviting retry, and 5xx retry on POST is
+    /// industry-common; the trade-off is documented at-least-once
+    /// semantics on the call site (`commit_transaction` specifically
+    /// notes this).
+    async fn post<TReq: serde::Serialize, TResp: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &TReq,
+    ) -> Result<TResp, IcebergError> {
+        let resp = self
+            .send_with_retry("POST", url, RetryClass::NonIdempotent, || {
+                self.bearer(self.client.post(url).json(body))
+            })
+            .await?;
+        Self::parse_json(resp).await
+    }
+
+    /// Internal POST that discards the response body.
+    ///
+    /// Same retry semantics as [`Self::post`]; used when the spec returns
+    /// 204 No Content or when the caller does not need to consume the
+    /// response (`POST /v1/transactions/commit`).
+    async fn post_no_response<TReq: serde::Serialize>(
+        &self,
+        url: &str,
+        body: &TReq,
+    ) -> Result<(), IcebergError> {
+        self.send_with_retry("POST", url, RetryClass::NonIdempotent, || {
+            self.bearer(self.client.post(url).json(body))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Internal DELETE with retry on transient errors.
+    ///
+    /// DELETE is idempotent by spec: re-issuing it against an
+    /// already-deleted resource yields a 404, which the caller is
+    /// expected to handle as `TableNotFound`. Same retry envelope as
+    /// [`Self::get`].
+    async fn delete(&self, url: &str) -> Result<(), IcebergError> {
+        self.send_with_retry("DELETE", url, RetryClass::Idempotent, || {
+            self.bearer(self.client.delete(url))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Attach Bearer auth to a request builder when a token is set.
+    fn bearer(&self, mut req: RequestBuilder) -> RequestBuilder {
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token.expose());
+        }
+        req
+    }
+
+    /// Send a request with retry, returning the raw success response.
+    ///
+    /// The `build` closure is invoked once per attempt so that POST /
+    /// PUT bodies (which `RequestBuilder` consumes by value on `send`)
+    /// can be rebuilt cleanly across retries. `class` controls which
+    /// transport-level failures are eligible for retry; see
+    /// [`RetryClass`].
+    ///
+    /// The success contract: returns `Ok(resp)` for `2xx`. Returns the
+    /// usual [`IcebergError`] for everything else, including
+    /// [`IcebergError::RateLimited`] once 429 retries are exhausted.
+    /// Non-success bodies are buffered as UTF-8 lossily — the caller
+    /// gets the response text as part of [`IcebergError::Api`].
+    async fn send_with_retry<F>(
+        &self,
+        method: &'static str,
+        url: &str,
+        class: RetryClass,
+        mut build: F,
+    ) -> Result<reqwest::Response, IcebergError>
+    where
+        F: FnMut() -> RequestBuilder,
+    {
         for attempt in 0..=self.retry.max_retries {
-            debug!(url, attempt, "GET");
+            debug!(method, url, attempt, "sending request");
 
-            let mut req = self.client.get(url);
-            if let Some(token) = &self.auth_token {
-                req = req.bearer_auth(token.expose());
-            }
-
+            let req = build();
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e)
-                    if attempt < self.retry.max_retries && (e.is_connect() || e.is_timeout()) =>
+                    if attempt < self.retry.max_retries && is_retriable_send_error(&e, class) =>
                 {
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
+                        method,
                         attempt = attempt + 1,
                         backoff_ms = backoff.as_millis() as u64,
                         error = %e,
@@ -295,6 +574,7 @@ impl IcebergCatalogClient {
                 if attempt < self.retry.max_retries {
                     let backoff = retry_backoff(&self.retry, attempt);
                     warn!(
+                        method,
                         attempt = attempt + 1,
                         backoff_ms = backoff.as_millis() as u64,
                         "rate limited, retrying"
@@ -309,6 +589,7 @@ impl IcebergCatalogClient {
                 let status = resp.status().as_u16();
                 let backoff = retry_backoff(&self.retry, attempt);
                 warn!(
+                    method,
                     attempt = attempt + 1,
                     status,
                     backoff_ms = backoff.as_millis() as u64,
@@ -327,12 +608,41 @@ impl IcebergCatalogClient {
                 });
             }
 
-            return resp.json().await.map_err(|e| {
-                IcebergError::UnexpectedResponse(format!("failed to parse response: {e}"))
-            });
+            return Ok(resp);
         }
 
         unreachable!("retry loop should always return")
+    }
+
+    /// Parse a successful response as JSON; surface deser failures as
+    /// [`IcebergError::UnexpectedResponse`] rather than transport errors.
+    async fn parse_json<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+    ) -> Result<T, IcebergError> {
+        resp.json()
+            .await
+            .map_err(|e| IcebergError::UnexpectedResponse(format!("failed to parse response: {e}")))
+    }
+}
+
+/// Whether the request is safe to retry after a partial-send failure.
+///
+/// `Idempotent` (GET, DELETE) tolerates connect and timeout errors —
+/// the server either never saw the request or, in the DELETE case,
+/// applied it once and a retry is a 404. `NonIdempotent` (POST without
+/// idempotency keys) only retries `is_connect()` failures, where the
+/// request demonstrably did not reach the server.
+#[derive(Debug, Clone, Copy)]
+enum RetryClass {
+    Idempotent,
+    NonIdempotent,
+}
+
+/// Classify a `reqwest::Error` as retriable for the given class.
+fn is_retriable_send_error(e: &reqwest::Error, class: RetryClass) -> bool {
+    match class {
+        RetryClass::Idempotent => e.is_connect() || e.is_timeout(),
+        RetryClass::NonIdempotent => e.is_connect(),
     }
 }
 

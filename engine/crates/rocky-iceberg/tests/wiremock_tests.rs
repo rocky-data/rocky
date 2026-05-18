@@ -7,14 +7,17 @@
 //! payload, and that the `CatalogClient` implementation maps REST
 //! status codes onto the appropriate `CatalogError` variants.
 
-use rocky_catalog_core::{CatalogClient, CatalogError, Grant, TableRef};
+use rocky_catalog_core::{
+    BranchKind, CatalogClient, CatalogError, ColumnSchema, Grant, TableCommit, TableRef,
+    TableSchema,
+};
 use rocky_core::source::FailedSourceErrorClass;
 use rocky_core::traits::DiscoveryAdapter;
 use rocky_iceberg::IcebergCatalogClientAdapter;
 use rocky_iceberg::adapter::IcebergDiscoveryAdapter;
 use rocky_iceberg::client::IcebergCatalogClient;
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -369,38 +372,436 @@ async fn governance_methods_all_return_unsupported_operation() {
     ));
 }
 
-#[tokio::test]
-async fn deferred_lifecycle_methods_return_unsupported_operation() {
-    let server = MockServer::start().await;
-    let client = IcebergCatalogClient::new(&server.uri(), None);
-    let adapter = IcebergCatalogClientAdapter::new(client);
-    let table = TableRef {
+// ---------------------------------------------------------------------------
+// Lifecycle method tests — PR-3
+// ---------------------------------------------------------------------------
+
+fn sample_table() -> TableRef {
+    TableRef {
         catalog: None,
         namespace: vec!["analytics".into()],
         name: "orders".into(),
-    };
-    let schema = rocky_catalog_core::TableSchema {
-        columns: vec![rocky_catalog_core::ColumnSchema {
-            name: "id".into(),
-            type_str: "long".into(),
-            nullable: false,
-        }],
-    };
+    }
+}
 
-    assert!(matches!(
-        adapter.create_table(&table, &schema).await.unwrap_err(),
-        CatalogError::UnsupportedOperation(_)
-    ));
-    assert!(matches!(
-        adapter.drop_table(&table).await.unwrap_err(),
-        CatalogError::UnsupportedOperation(_)
-    ));
-    assert!(matches!(
-        adapter.commit_transaction(&[]).await.unwrap_err(),
-        CatalogError::UnsupportedOperation(_)
-    ));
-    assert!(matches!(
-        adapter.list_branches(&table).await.unwrap_err(),
-        CatalogError::UnsupportedOperation(_)
-    ));
+fn sample_schema() -> TableSchema {
+    TableSchema {
+        columns: vec![
+            ColumnSchema {
+                name: "id".into(),
+                type_str: "long".into(),
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "amount".into(),
+                type_str: "double".into(),
+                nullable: true,
+            },
+        ],
+    }
+}
+
+/// Minimal `LoadTableResponse` body — Iceberg REST returns the freshly
+/// created table on `POST /v1/namespaces/{ns}/tables`, so the happy
+/// path needs a body that satisfies our partial deser surface.
+fn minimal_load_table_body() -> serde_json::Value {
+    json!({
+        "metadata-location": "s3://bucket/path/metadata.json",
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [{
+                "schema-id": 0,
+                "fields": [
+                    { "id": 1, "name": "id", "required": true, "type": "long" }
+                ]
+            }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn create_table_happy_path_posts_to_namespace_endpoint() {
+    let server = MockServer::start().await;
+
+    // Expected wire body: name + schema with fields + sequential ids.
+    let expected_body = json!({
+        "name": "orders",
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" },
+                { "id": 2, "name": "amount", "required": false, "type": "double" }
+            ]
+        }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/namespaces/analytics/tables"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(minimal_load_table_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    adapter
+        .create_table(&sample_table(), &sample_schema())
+        .await
+        .expect("create_table should succeed");
+}
+
+#[tokio::test]
+async fn create_table_404_maps_to_namespace_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/namespaces/missing/tables"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("namespace not found"))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["missing".into()],
+        name: "orders".into(),
+    };
+    let err = adapter
+        .create_table(&table, &sample_schema())
+        .await
+        .expect_err("404 should not succeed");
+    assert!(
+        matches!(err, CatalogError::NamespaceNotFound(_)),
+        "expected NamespaceNotFound (rewritten from default TableNotFound), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_table_409_maps_to_commit_conflict() {
+    // A 409 on create_table indicates a name collision (the catalog's
+    // serial table-name CAS rejected the new row). The trait surfaces
+    // this as `CommitConflict` because the recovery shape is the same
+    // as a transaction CAS failure: re-read state, decide whether to
+    // retry under a different name or abort.
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/namespaces/analytics/tables"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("already exists"))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let err = adapter
+        .create_table(&sample_table(), &sample_schema())
+        .await
+        .expect_err("409 should not succeed");
+    assert!(
+        matches!(err, CatalogError::CommitConflict(_)),
+        "expected CommitConflict, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn drop_table_happy_path_calls_delete() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1/namespaces/analytics/tables/orders"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    adapter
+        .drop_table(&sample_table())
+        .await
+        .expect("drop_table should succeed");
+}
+
+#[tokio::test]
+async fn drop_table_404_maps_to_table_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1/namespaces/analytics/tables/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("table does not exist"))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "missing".into(),
+    };
+    let err = adapter
+        .drop_table(&table)
+        .await
+        .expect_err("404 should not succeed");
+    assert!(
+        matches!(err, CatalogError::TableNotFound(_)),
+        "expected TableNotFound (default), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn commit_transaction_happy_path_assert_ref_snapshot_id() {
+    let server = MockServer::start().await;
+
+    let expected_body = json!({
+        "table-changes": [{
+            "identifier": {
+                "namespace": ["analytics"],
+                "name": "orders"
+            },
+            "requirements": [{
+                "type": "assert-ref-snapshot-id",
+                "ref": "main",
+                "snapshot-id": 42
+            }],
+            "updates": [{
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "type": "branch",
+                "snapshot-id": 43
+            }]
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let commit = TableCommit {
+        table: sample_table(),
+        expected_snapshot_id: Some(42),
+        new_snapshot_id: 43,
+    };
+    adapter
+        .commit_transaction(&[commit])
+        .await
+        .expect("commit_transaction should succeed");
+}
+
+#[tokio::test]
+async fn commit_transaction_assert_create_when_no_base_snapshot() {
+    let server = MockServer::start().await;
+
+    let expected_body = json!({
+        "table-changes": [{
+            "identifier": {
+                "namespace": ["analytics"],
+                "name": "orders"
+            },
+            "requirements": [{ "type": "assert-create" }],
+            "updates": [{
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "type": "branch",
+                "snapshot-id": 1
+            }]
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let commit = TableCommit {
+        table: sample_table(),
+        expected_snapshot_id: None,
+        new_snapshot_id: 1,
+    };
+    adapter
+        .commit_transaction(&[commit])
+        .await
+        .expect("commit_transaction should succeed");
+}
+
+#[tokio::test]
+async fn commit_transaction_409_maps_to_commit_conflict() {
+    // The discriminating case: 409 on `/v1/transactions/commit` is the
+    // CAS failure the trait contract surfaces as `CommitConflict`.
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .set_body_string("expected ref main at snapshot 42, found 99 — concurrent writer"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let commit = TableCommit {
+        table: sample_table(),
+        expected_snapshot_id: Some(42),
+        new_snapshot_id: 43,
+    };
+    let err = adapter
+        .commit_transaction(&[commit])
+        .await
+        .expect_err("409 should not succeed");
+    assert!(
+        matches!(err, CatalogError::CommitConflict(_)),
+        "expected CommitConflict, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn commit_transaction_empty_slice_is_a_noop() {
+    // No mock — if the adapter fires a request for an empty slice the
+    // test fails because the request is unmatched. Empty short-circuit
+    // lets callers compose commits without special-casing empty
+    // batches.
+    let server = MockServer::start().await;
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    adapter
+        .commit_transaction(&[])
+        .await
+        .expect("empty commit slice should be a no-op");
+}
+
+#[tokio::test]
+async fn list_branches_projects_refs_to_branch_refs() {
+    let server = MockServer::start().await;
+
+    // `load_table` body with two refs: main (branch, snapshot 1) and
+    // v1.0.0 (tag, snapshot 2).
+    let body = json!({
+        "metadata-location": "s3://bucket/path/metadata.json",
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [{
+                "schema-id": 0,
+                "fields": [
+                    { "id": 1, "name": "id", "required": true, "type": "long" }
+                ]
+            }],
+            "refs": {
+                "main": { "snapshot-id": 1, "type": "branch" },
+                "v1.0.0": { "snapshot-id": 2, "type": "tag" }
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let branches = adapter
+        .list_branches(&sample_table())
+        .await
+        .expect("list_branches should succeed");
+
+    // Sorted by name for determinism.
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0].name, "main");
+    assert_eq!(branches[0].snapshot_id, Some(1));
+    assert!(matches!(branches[0].kind, BranchKind::Branch));
+
+    assert_eq!(branches[1].name, "v1.0.0");
+    assert_eq!(branches[1].snapshot_id, Some(2));
+    assert!(matches!(branches[1].kind, BranchKind::Tag));
+}
+
+#[tokio::test]
+async fn list_branches_returns_empty_when_refs_missing() {
+    // Older catalogs may omit `refs` from the metadata entirely.
+    // serde's `#[serde(default)]` means we get an empty HashMap rather
+    // than a deser failure.
+    let server = MockServer::start().await;
+
+    let body = json!({
+        "metadata-location": "s3://bucket/path/metadata.json",
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [{
+                "schema-id": 0,
+                "fields": [
+                    { "id": 1, "name": "id", "required": true, "type": "long" }
+                ]
+            }]
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let branches = adapter
+        .list_branches(&sample_table())
+        .await
+        .expect("list_branches should succeed when refs absent");
+    assert!(branches.is_empty());
+}
+
+#[tokio::test]
+async fn list_branches_404_maps_to_table_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("table does not exist"))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "missing".into(),
+    };
+    let err = adapter
+        .list_branches(&table)
+        .await
+        .expect_err("404 should not succeed");
+    assert!(
+        matches!(err, CatalogError::TableNotFound(_)),
+        "expected TableNotFound, got {err:?}"
+    );
 }
