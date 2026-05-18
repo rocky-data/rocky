@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`_emit_results` no longer crashes on cross-schema same-table-name collisions.** Two independent guards in `component.py` close the failure mode where a Rocky run with row-count anomalies could fail the multi-asset op with `DagsterInvariantViolationError: ... returned an output "..._row_count_anomaly" multiple times` after every table had already been copied successfully:
+  - **Part A — resolver disambiguation.** `_build_table_resolver`'s last-segment fallback previously returned an arbitrary dict-iteration winner when a bare identifier matched multiple translator-mapped keys (e.g. the same connector/table loaded under multiple region prefixes). It now refuses to guess on ambiguity: a unique last-segment match still resolves; an ambiguous match returns `None` and logs a single WARN line. Adopters can disambiguate by emitting schema- or catalog-qualified identifiers (`schema.table` / `catalog.schema.table`) which the trailing-tuple loop resolves deterministically.
+  - **Part B — defensive emit-time dedup.** The table-check and anomaly loops in `_emit_results` now consult `yielded_checks` before emitting, so a same-`(asset_key, check_name)` duplicate is silently dropped (with a debug log) rather than reaching Dagster's duplicate-output invariant. With Part A applied this branch is unreachable for the resolver-collision shape; the dedup guards against any other path that could legitimately yield the same check twice.
+
+  Behaviour change for adopters relying on the previous fuzzy fallback: an ambiguous bare-segment lookup that previously returned an arbitrary winner now drops the event. Adopters whose translator keys are full schema-qualified suffixes (the common case) see zero change.
+
 ## [1.32.0] — 2026-05-18
 
 Companion release to engine `v1.34.0`. The dagster bindings pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` via the regenerated Pydantic models. No new dagster API surface — pure codegen cascade. The engine-side `run.rs` typed-error-preserving refactor that ships in `v1.34.0` is what makes the discriminator practically useful in production: downstream Dagster assets that key off run-output errors can now branch on a stable classification rather than `unknown`. Wheel re-cut against the v1.34.0 engine binary.
