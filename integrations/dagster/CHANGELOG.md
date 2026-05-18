@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.0] — 2026-05-18
+
+Companion release to engine `v1.35.0`. Two changes ship: (a) `RockyResource`'s replication-only fallback to `rocky run` is removed — the engine's new `PlanKind::Replication` lets the plan/apply pair handle every project shape uniformly; (b) `_emit_results` no longer crashes on cross-schema same-table-name collisions, closing a failure mode where a Rocky run with row-count anomalies could fail the multi-asset op after every table had already been copied.
+
+### Changed
+
+- **`RockyResource` replication-only path migrated from `rocky run` fallback to `rocky plan` + `rocky apply <plan-id>`** (engine `v1.35.0` — Cluster 3 B Phase 5b). With engine `v1.35.0`, `rocky plan` now returns a non-null content-addressed `plan_id` for every project shape — including replication-only projects (no `models/` directory, or `models/` with zero compiled models). All three exec methods on `RockyResource` (`run`, `run_streaming`, `run_pipes`) now route uniformly through `rocky plan` + `rocky apply <plan-id>` without the special-case fallback to `rocky run` that shipped in `v1.31.0`. A null `plan_id` from an older engine now surfaces as `dg.Failure` with an engine-`v1.34.0`+ upgrade hint instead of silently routing into the dropped fallback. **Version-skew contract:** this wheel requires engine `v1.34.0` or newer; pin `dagster-rocky<1.33` if a downgrade is needed. The public method signatures and return types of `run(...)`, `run_streaming(...)`, and `run_pipes(...)` are unchanged. `_build_run_args` and the `ROCKY_SUPPRESS_DEPRECATION` env-var stay for direct `rocky run` callers (CI scripts, bare `branch promote`) that don't go through `_apply_plan`.
+
 ### Fixed
 
 - **`_emit_results` no longer crashes on cross-schema same-table-name collisions.** Two independent guards in `component.py` close the failure mode where a Rocky run with row-count anomalies could fail the multi-asset op with `DagsterInvariantViolationError: ... returned an output "..._row_count_anomaly" multiple times` after every table had already been copied successfully:

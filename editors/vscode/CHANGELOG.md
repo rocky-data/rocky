@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] — 2026-05-18
+
+Codegen-companion patch release for engine `v1.35.0` and dagster `v1.33.0`. The regenerated TypeScript interface in `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` pick up the new `[plan_store] format` default (`"v1"` → `"v2"`) plus a doc-comment refresh on `PlanStoreFormat` / `PlanStoreConfig` reflecting the post-flip migration cycle. No new extension commands, UI, or settings — the new engine `PlanKind::Replication` variant doesn't change the TypeScript surface (`plan_kind` is a plain string).
+
+### Changed
+
+- **Codegen pickup of engine `v1.35.0` plan-store v2 default flip.** Regenerated `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json`: the default value of `PlanStoreConfig.format` flips from `"v1"` to `"v2"`, and the surrounding doc-comments are refreshed to describe the post-flip migration window (v1 is now opt-in only; the v1 reader stays through at least v1.35 + v1.36 before C-7 drops it). Extension code that consumes `rocky.toml` via the generated TypeScript types now matches the engine's persisted-plan default. No behavioural change in the extension itself.
+
 ## [1.19.0] — 2026-05-18
 
 Two small additive changes. The TypeScript bindings under `src/types/generated/` pick up the new `failure_kind` discriminator on `RunOutput.errors[*]` (engine `v1.34.0`); the `@rocky` chat-participant system prompt is reframed to "typed-program layer above the warehouse" so the chat participant's self-introduction matches the public README and docs site copy.
