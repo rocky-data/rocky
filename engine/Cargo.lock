@@ -3891,8 +3891,10 @@ version = "1.36.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "percent-encoding",
  "reqwest",
  "rocky-adapter-sdk",
+ "rocky-catalog-core",
  "rocky-core",
  "rocky-ir",
  "rocky-observe",

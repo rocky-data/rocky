@@ -10,4 +10,7 @@ pub mod permissions;
 pub mod scim;
 pub mod throttle;
 pub mod types;
+pub mod unity_catalog_client;
 pub mod workspace;
+
+pub use unity_catalog_client::{UnityCatalogClient, UnityRestError};
