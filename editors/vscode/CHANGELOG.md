@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-05-19
+
+Codegen-companion release to engine `v1.38.0`. The regenerated TypeScript bindings under `src/types/generated/` and the schema mirrors under `editors/vscode/schemas/` pick up six engine-side shape changes from this triple-cut. No new extension commands, UI, or settings — pure codegen cascade.
+
+### Changed
+
+- **Codegen pickup of `FivetranStateEnvelope`** (engine `v1.38.0` FR-C — [#583](https://github.com/rocky-data/rocky/pull/583)). New `src/types/generated/rocky_fivetran_state.ts` + schema mirror at `editors/vscode/schemas/rocky-fivetran-state.schema.json`. The canonical envelope shape Rocky writes via `rocky discover --emit-fivetran-state-to <PATH>` is now type-checkable from extension TypeScript via the `rockyJson.ts` compat shim.
+- **Codegen pickup of `FivetranCacheConfig`** (engine `v1.38.0` FR-A — [#584](https://github.com/rocky-data/rocky/pull/584)). Regenerated `src/types/generated/rocky_project.ts` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json`: Fivetran adapter blocks now accept an optional `cache?: FivetranCacheConfig | null` field with the 5-backend enum. Extension `rocky.toml` validation now permits the new block.
+- **Codegen pickup of `StrategyConfig::View` / `MaterializedView` / `DynamicTable`** (engine `v1.38.0` Wave 1 — [#585](https://github.com/rocky-data/rocky/pull/585)). Regenerated `rocky_project.ts` adds three new variants on the model `[strategy]` union, plus the `DynamicTable.target_lag` field. Snippet metadata at `editors/vscode/snippets/rocky.json` is untouched (snippets stay generic — no per-strategy snippet expansion); users authoring sidecar TOMLs declaring `type = "materialized_view"` / `"dynamic_table"` no longer trip schema-validation errors.
+- **Codegen pickup of `FivetranRatelimitConfig` / `FivetranStampedeConfig` / `FivetranCircuitBreakerConfig`** (engine `v1.38.0` resilience layers — [#589](https://github.com/rocky-data/rocky/pull/589)). Three new optional config blocks on Fivetran adapter variants in `rocky_project.ts` + schema mirror. Plus typed `AdapterConfig.retry?: RetryConfig | null` field.
+- **Codegen pickup of `ImportDbtStructuredWarning`** (engine `v1.38.0` Wave 2 — [#590](https://github.com/rocky-data/rocky/pull/590)). New `src/types/generated/import_dbt.ts` carries the `ImportDbtStructuredWarning` discriminated-union (6 variants) + `ImportDbtHookKind` enum. Extension code that consumes `rocky import-dbt --output json` via `rockyJson.ts` now type-checks against the structured warning surface.
+
 ## [1.21.0] — 2026-05-19
 
 Two batches in this cut. **VS Code engines triangle bumped to 1.120** ([#581](https://github.com/rocky-data/rocky/pull/581)). `engines.vscode`, `@types/vscode`, and the `runTest.ts` VS Code pin all move to `1.120` in lockstep, closing the drift that left the types one step ahead of the declared minimum compatibility. `@vscode/test-electron` stays at `^2.5.2` — already at the latest published version. **Codegen pickup of engine `v1.37.0`**: the regenerated TypeScript bindings under `src/types/generated/` and the schema mirror at `editors/vscode/schemas/rocky-project.schema.json` pick up three engine-side shape changes — `PlanStoreConfig` / `plan_store` field removed from `rocky_project.ts` (engine Cluster 3 C — C-7); new `[[table_overrides]]` array on `ReplicationPipelineConfig`; `target_schema` + `source_id` on lineage nodes and `data_type` on `LineageColumnDef` in `lineage.ts`. No new extension commands, UI, or settings — pure codegen cascade + engines bump.

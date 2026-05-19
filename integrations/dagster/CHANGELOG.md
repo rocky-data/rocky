@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.36.0] — 2026-05-19
+
+Companion release to engine `v1.38.0`. Pure codegen cascade — no new dagster API surface. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up six engine-side shape changes from this triple-cut:
+
+1. **`FivetranStateEnvelope`** (engine FR-C, [#583](https://github.com/rocky-data/rocky/pull/583)) — new top-level model exposing the canonical Fivetran view (destination + connectors + per-connector schemas) that `rocky discover --emit-fivetran-state-to` writes. Re-exported from `dagster_rocky.types` under both the generated name and a legacy `FivetranStateEnvelopeOutput` alias.
+2. **`FivetranCacheConfig`** (engine FR-A, [#584](https://github.com/rocky-data/rocky/pull/584)) — new optional `cache: FivetranCacheConfig | None` field on `RockyConfig`'s Fivetran adapter variant, with the 5-backend enum (`none` / `file` / `object_store` / `valkey` / `tiered`) and per-backend config fields.
+3. **`StrategyConfig::View` / `MaterializedView` / `DynamicTable`** (engine Wave 1, [#585](https://github.com/rocky-data/rocky/pull/585)) — three new strategy variants on the strategy union; `DynamicTable` carries the `target_lag` field for Snowflake dynamic tables.
+4. **`FivetranRatelimitConfig` / `FivetranStampedeConfig` / `FivetranCircuitBreakerConfig`** (engine resilience layers 2/1/3, [#589](https://github.com/rocky-data/rocky/pull/589)) — three new optional config blocks on the Fivetran adapter variant exposing the cross-pod budget backend selector, stampede-lock backend, and circuit-breaker thresholds.
+5. **`AdapterConfig.retry: RetryConfig | None`** (engine [#589](https://github.com/rocky-data/rocky/pull/589)) — typed retry-config knob now declarable from Dagster code that constructs `RockyResource` configs.
+6. **`ImportDbtStructuredWarning`** (engine Wave 2, [#590](https://github.com/rocky-data/rocky/pull/590)) — new typed warning enum on `ImportDbtOutput.structured_warnings[*]`: `UnsupportedMaterialization`, `DroppedDatabricksTags`, `DroppedHook`, `DroppedOnSchemaChange`, `UnresolvableMacro`, `MicrobatchMissingEventTime`. Plus a new `ImportDbtHookKind` enum (`pre_hook` / `post_hook`) used by the `DroppedHook` variant. Existing string-warning surface stays unchanged.
+
+Strictly additive — re-exported from `dagster_rocky.types` under both the generated and legacy import paths so existing consumers see no breakage. Wheel re-cut against the v1.38.0 engine binary.
+
 ## [1.35.0] — 2026-05-19
 
 Companion release to engine `v1.37.0`. Pydantic models regenerated via `just codegen` pick up four engine-side changes: (1) the `[plan_store]` config block is dropped from `RockyConfig` (engine Cluster 3 C — C-7); (2) the new `[[table_overrides]]` array lands on `ReplicationPipelineConfig` (engine PR-B3); (3) `LineageNode.target_schema` + `source_id` and `LineageColumnDef.data_type` enrich the `LineageOutput` model; (4) the legacy `TableError` model now exposes the engine's `failure_kind` discriminator on `RunResult.errors[*]`. Pure codegen cascade plus the one-line legacy-model patch — no new dagster API surface. Wheel re-cut against the v1.37.0 engine binary.
