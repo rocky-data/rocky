@@ -27,6 +27,10 @@ sha2 = { workspace = true }
 # FR-B Retry-After header parsing — accepts both integer-seconds and
 # RFC 7231 / 9110 HTTP-date forms.
 httpdate = "1"
+# FR-C canonical state envelope — JsonSchema for the schema-cascade codegen.
+schemars = { workspace = true }
+# FR-C envelope hash for idempotent --emit-fivetran-state-to writes.
+blake3 = { workspace = true }
 
 [features]
 test-support = []

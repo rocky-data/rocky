@@ -280,6 +280,8 @@ mod tests {
             },
             succeeded_at: None,
             failed_at: None,
+            paused: false,
+            name: None,
             config,
         }
     }

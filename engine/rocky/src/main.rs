@@ -233,6 +233,27 @@ enum Command {
         /// warm-up.
         #[arg(long)]
         with_schemas: bool,
+        /// Write a canonical Fivetran state envelope to `<PATH>` for
+        /// every Fivetran adapter declared in the project config.
+        ///
+        /// Single Fivetran adapter: the envelope is written to
+        /// `<PATH>` directly.
+        ///
+        /// Multiple Fivetran adapters: each envelope is written to
+        /// `<PATH>.<account_hash>.<destination_id>.json` where
+        /// `account_hash` is the same short SHA-256-derived token
+        /// the per-host rate-limit budget uses to namespace state
+        /// files. This keeps two adapters that share a destination_id
+        /// name (Fivetran destination ids are not globally unique)
+        /// from racing each other on the same file.
+        ///
+        /// The write is idempotent: a sibling `<PATH>.blake3` file
+        /// records the content hash. If the freshly-computed hash
+        /// matches the on-disk value the JSON file is left alone,
+        /// so downstream `stat(2)` watchers only fire when the
+        /// upstream Fivetran state actually changed.
+        #[arg(long, value_name = "PATH")]
+        emit_fivetran_state_to: Option<PathBuf>,
     },
 
     /// Generate SQL without executing (dry-run).
@@ -1781,12 +1802,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Discover {
             pipeline,
             with_schemas,
+            emit_fivetran_state_to,
         } => {
             rocky_cli::commands::discover(
                 &cli.config,
                 pipeline.as_deref(),
                 &state_path,
                 with_schemas,
+                emit_fivetran_state_to.as_deref(),
                 json,
             )
             .await

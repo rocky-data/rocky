@@ -1,10 +1,21 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Response};
+use tokio::sync::Mutex;
 
+use crate::connector as ft_connector;
+use crate::envelope::{
+    FivetranColumnConfig, FivetranConnectorStatus, FivetranConnectorSummary, FivetranDestination,
+    FivetranSchemaConfig, FivetranSchemaEntry, FivetranStateEnvelope, FivetranTableConfig,
+};
 use crate::ratelimit;
+use crate::schema as ft_schema;
 
 /// Percent-encode a single user-supplied URL path component.
 ///
@@ -77,6 +88,23 @@ pub enum FivetranError {
     RetryBudgetExhausted { limit: u32 },
 }
 
+/// Wire-decode shape for `GET /v1/destinations/{id}`. The envelope
+/// projects only a subset; this struct captures the same surface but
+/// stays narrow (no `JsonSchema`, no public re-export) so the public
+/// envelope contract isn't coupled to the upstream wire format.
+#[derive(Debug, Clone, Deserialize)]
+struct DestinationWire {
+    pub id: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub setup_status: Option<String>,
+}
+
 /// Async Fivetran REST client with Basic Auth and configurable retry.
 pub struct FivetranClient {
     client: Client,
@@ -94,6 +122,17 @@ pub struct FivetranClient {
     /// Directory holding the per-account shared rate-limit state file
     /// (FR-B). One file per account: `{ratelimit_dir}/{hash}.json`.
     ratelimit_dir: PathBuf,
+    /// In-process envelope memoization for FR-C. Keyed by
+    /// `destination_id` so a single client servicing multiple
+    /// destinations stays correct, even though the common case is one
+    /// destination per client. Wrapped in [`Arc`] so a [`FivetranClient`]
+    /// can be cloned (or shared via `Arc<FivetranClient>`) without
+    /// duplicating the cache.
+    ///
+    /// The cache is purely in-process — it scopes to the lifetime of
+    /// this client instance. Cross-process / persistent cache layers
+    /// are tracked separately (FR-A; PR-2).
+    envelope_cache: Arc<Mutex<BTreeMap<String, FivetranStateEnvelope>>>,
 }
 
 /// Standard Fivetran API envelope.
@@ -129,6 +168,7 @@ impl FivetranClient {
             retry_budget,
             account_id_hash,
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -220,6 +260,7 @@ impl FivetranClient {
             // Tests that need an isolated shared-budget file should
             // chain `.with_ratelimit_dir(...)` after construction.
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -244,6 +285,7 @@ impl FivetranClient {
             retry_budget: rocky_core::retry_budget::RetryBudget::unbounded(),
             account_id_hash,
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -610,6 +652,171 @@ fn retry_backoff(cfg: &RetryConfig, attempt: u32) -> Duration {
     };
 
     Duration::from_millis(ms)
+}
+
+impl FivetranClient {
+    /// Fetch the per-destination metadata block — `GET /v1/destinations/{id}`.
+    ///
+    /// Returns the same shape the envelope's
+    /// [`FivetranDestination`] block projects. Net-new HTTP path in
+    /// PR-1 — earlier Rocky versions discovered destinations purely
+    /// indirectly via `groups/{id}/connectors`.
+    pub async fn get_destination(
+        &self,
+        destination_id: &str,
+    ) -> Result<FivetranDestination, FivetranError> {
+        let path = format!("/v1/destinations/{}", encode_path_segment(destination_id));
+        let wire: DestinationWire = self.get(&path).await?;
+        Ok(FivetranDestination {
+            id: wire.id,
+            region: wire.region,
+            time_zone: wire.time_zone,
+            service: wire.service,
+            setup_status: wire.setup_status,
+        })
+    }
+
+    /// Fetch (or return memoized) canonical envelope for `destination_id`.
+    ///
+    /// First call against a given `destination_id` fans out:
+    ///   1. `GET /v1/destinations/{id}`
+    ///   2. `GET /v1/groups/{id}/connectors` (paginated)
+    ///   3. `GET /v1/connectors/{conn_id}/schemas` for each connector
+    ///
+    /// then constructs the envelope (with `fetched_at = Utc::now()`),
+    /// memoizes it under the destination_id key, and returns it.
+    ///
+    /// Subsequent calls with `refresh = false` return the memoized
+    /// value without issuing any HTTP. `refresh = true` always
+    /// forces a fresh fetch and overwrites the memoized copy.
+    ///
+    /// The memoization is purely in-process — scoped to the lifetime
+    /// of this [`FivetranClient`] instance. Cross-process / persistent
+    /// caches are tracked separately (FR-A; PR-2).
+    pub async fn fetch_envelope(
+        &self,
+        destination_id: &str,
+        refresh: bool,
+    ) -> Result<FivetranStateEnvelope, FivetranError> {
+        if !refresh
+            && let Some(cached) = self
+                .envelope_cache
+                .lock()
+                .await
+                .get(destination_id)
+                .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let destination = self.get_destination(destination_id).await?;
+        let connectors = ft_connector::list_connectors(self, destination_id).await?;
+
+        // Fan-out schema fetches in parallel — matches the existing
+        // discover adapter's concurrency. 10 is the same constant.
+        let connector_count = connectors.len();
+        let schema_results: Vec<(String, Result<ft_schema::SchemaConfig, FivetranError>)> =
+            stream::iter(connectors.iter().cloned())
+                .map(|conn| async move {
+                    let result = ft_schema::get_schema_config(self, &conn.id).await;
+                    (conn.id, result)
+                })
+                .buffer_unordered(10)
+                .collect()
+                .await;
+        // Stop on the first schema fetch error — the envelope is
+        // supposed to be a coherent snapshot, not a partial one.
+        // Callers that want partial-success semantics use the
+        // `FivetranDiscoveryAdapter::discover` path instead, which
+        // surfaces failed sources separately.
+        let mut schemas: BTreeMap<String, FivetranSchemaConfig> = BTreeMap::new();
+        for (conn_id, result) in schema_results {
+            let cfg = result?;
+            schemas.insert(conn_id, project_schema_config(cfg));
+        }
+
+        let summaries: Vec<FivetranConnectorSummary> = connectors
+            .into_iter()
+            .map(project_connector_summary)
+            .collect();
+
+        let envelope =
+            FivetranStateEnvelope::from_parts(Utc::now(), destination, summaries, schemas);
+
+        tracing::debug!(
+            destination_id,
+            connectors = connector_count,
+            "fivetran envelope fetched"
+        );
+
+        self.envelope_cache
+            .lock()
+            .await
+            .insert(destination_id.to_string(), envelope.clone());
+        Ok(envelope)
+    }
+}
+
+/// Project a wire-decoded [`ft_connector::Connector`] into the envelope
+/// shape. Falls back to `schema` for the `name` field when the upstream
+/// payload omits it — `connectors/{id}` and `groups/{id}/connectors`
+/// disagree on whether `connector_name` is returned, so we accept both.
+fn project_connector_summary(conn: ft_connector::Connector) -> FivetranConnectorSummary {
+    let name = conn.name.clone().unwrap_or_else(|| conn.schema.clone());
+    FivetranConnectorSummary {
+        id: conn.id,
+        name,
+        schema: conn.schema,
+        service: conn.service,
+        status: FivetranConnectorStatus {
+            setup_state: conn.status.setup_state,
+            sync_state: conn.status.sync_state,
+        },
+        paused: conn.paused,
+        succeeded_at: conn.succeeded_at,
+        failed_at: conn.failed_at,
+        group_id: Some(conn.group_id),
+    }
+}
+
+/// Project the wire-decoded schema config into the envelope shape,
+/// promoting the inner [`HashMap`](std::collections::HashMap) layers to
+/// [`BTreeMap`] for hash stability.
+fn project_schema_config(cfg: ft_schema::SchemaConfig) -> FivetranSchemaConfig {
+    let mut schemas: BTreeMap<String, FivetranSchemaEntry> = BTreeMap::new();
+    for (schema_key, entry) in cfg.schemas {
+        let mut tables: BTreeMap<String, FivetranTableConfig> = BTreeMap::new();
+        for (table_key, table) in entry.tables {
+            let mut columns: BTreeMap<String, FivetranColumnConfig> = BTreeMap::new();
+            for (col_key, col) in table.columns {
+                columns.insert(
+                    col_key,
+                    FivetranColumnConfig {
+                        enabled: col.enabled,
+                        hashed: col.hashed,
+                    },
+                );
+            }
+            tables.insert(
+                table_key,
+                FivetranTableConfig {
+                    enabled: table.enabled,
+                    name_in_destination: table.name_in_destination,
+                    sync_mode: table.sync_mode,
+                    columns,
+                },
+            );
+        }
+        schemas.insert(
+            schema_key,
+            FivetranSchemaEntry {
+                enabled: entry.enabled,
+                name_in_destination: entry.name_in_destination,
+                tables,
+            },
+        );
+    }
+    FivetranSchemaConfig { schemas }
 }
 
 impl std::fmt::Debug for FivetranClient {

@@ -1111,6 +1111,29 @@ HistoryResult = HistoryOutput
 ModelHistoryResult = ModelHistoryOutput
 
 # ---------------------------------------------------------------------------
+# Fivetran state envelope (FR-C)
+# ---------------------------------------------------------------------------
+# Canonical shape written by ``rocky discover --emit-fivetran-state-to <PATH>``
+# and the contract between Rocky and downstream consumers that want the
+# Fivetran view of a destination without re-fetching it themselves. The
+# generated Pydantic model exposes the same shape under the snake_case
+# field set the Rust ``JsonSchema`` derive produces. We re-export under
+# both the generated name and a legacy ``…Output`` alias following the
+# existing dual-export pattern.
+from .types_generated import (  # noqa: E402, F401
+    FivetranColumnConfig,
+    FivetranConnectorStatus,
+    FivetranConnectorSummary,
+    FivetranDestination,
+    FivetranSchemaConfig,
+    FivetranSchemaEntry,
+    FivetranStateEnvelope,
+    FivetranTableConfig,
+)
+
+FivetranStateEnvelopeOutput = FivetranStateEnvelope
+
+# ---------------------------------------------------------------------------
 # Union type and parser
 # ---------------------------------------------------------------------------
 

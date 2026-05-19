@@ -1137,3 +1137,192 @@ async fn fr_b_distinct_accounts_do_not_share_budget() {
         "account B should not have observed account A's budget; got {b_elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// FR-C: fetch_envelope memoization
+// ---------------------------------------------------------------------------
+
+/// Mount the three endpoints `fetch_envelope` calls for a single
+/// destination with a single connector — `expect(1)` on each so the
+/// test fails if a memoized call goes back to the wire.
+async fn mount_envelope_endpoints_once(server: &MockServer) {
+    use wiremock::ResponseTemplate;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/destinations/dest_memo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "id": "dest_memo",
+                "region": "us-east-1",
+                "time_zone": "UTC",
+                "service": "snowflake",
+                "setup_status": "connected"
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_memo/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_memo",
+                        "group_id": "dest_memo",
+                        "service": "shopify",
+                        "schema": "src__acme__na__shopify",
+                        "connector_name": "Acme Shopify NA",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "paused": false,
+                        "succeeded_at": "2026-04-10T10:00:00Z",
+                        "failed_at": null
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/connectors/conn_memo/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "schemas": {
+                    "src__acme__na__shopify": {
+                        "enabled": true,
+                        "tables": {
+                            "orders": {
+                                "enabled": true,
+                                "sync_mode": "SOFT_DELETE",
+                                "columns": {
+                                    "id": { "enabled": true, "hashed": false }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// First call to `fetch_envelope(_, false)` issues HTTP; second call
+/// must hit the in-process memoization and not re-fetch. Wiremock
+/// asserts each endpoint is touched exactly once via `expect(1)`.
+#[tokio::test]
+async fn fetch_envelope_memoizes_second_call() {
+    let server = MockServer::start().await;
+    mount_envelope_endpoints_once(&server).await;
+
+    let client = test_client(&server);
+    let first = client.fetch_envelope("dest_memo", false).await.unwrap();
+    let second = client.fetch_envelope("dest_memo", false).await.unwrap();
+
+    // The memoized value must equal the originally-fetched one — the
+    // cache returns a clone of the stored envelope.
+    assert_eq!(
+        first, second,
+        "memoized envelope must equal the originally-fetched envelope"
+    );
+
+    // Spot-check that the envelope captured the upstream values we
+    // mounted — the cache assertion above already covers shape.
+    assert_eq!(first.destination.id, "dest_memo");
+    assert_eq!(first.connectors.len(), 1);
+    assert_eq!(first.connectors[0].id, "conn_memo");
+    assert_eq!(first.connectors[0].name, "Acme Shopify NA");
+    assert!(!first.connectors[0].paused);
+
+    // The mock `.expect(1)` declarations enforce the no-extra-HTTP
+    // invariant on drop. If the second call had gone back to the
+    // wire, server drop would panic.
+    drop(server);
+}
+
+/// `fetch_envelope(_, true)` forces a fresh HTTP round-trip even when
+/// a memoized value exists. Asserts the wire is hit twice and the new
+/// value overwrites the cache.
+#[tokio::test]
+async fn fetch_envelope_refresh_true_forces_new_fetch() {
+    use wiremock::ResponseTemplate;
+
+    let server = MockServer::start().await;
+
+    // Each endpoint mounted with `expect(2)` because both calls
+    // refresh.
+    Mock::given(method("GET"))
+        .and(path("/v1/destinations/dest_refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "id": "dest_refresh",
+                "region": "us-east-1"
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_refresh/connectors"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": { "items": [], "next_cursor": null }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let first = client.fetch_envelope("dest_refresh", false).await.unwrap();
+    // Force a refresh — must re-hit the wire and overwrite memo.
+    let second = client.fetch_envelope("dest_refresh", true).await.unwrap();
+    assert_eq!(first.destination.id, "dest_refresh");
+    assert_eq!(second.destination.id, "dest_refresh");
+    // `expect(2)` on both endpoints enforces re-fetch on drop.
+    drop(server);
+}
+
+/// Distinct `destination_id`s use distinct cache entries — fetching
+/// one then the other must hit the wire for each.
+#[tokio::test]
+async fn fetch_envelope_distinct_destinations_dont_share_memo() {
+    use wiremock::ResponseTemplate;
+    let server = MockServer::start().await;
+
+    for id in ["dest_one", "dest_two"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/destinations/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "Success",
+                "data": { "id": id }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/groups/{id}/connectors")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "Success",
+                "data": { "items": [], "next_cursor": null }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = test_client(&server);
+    let one = client.fetch_envelope("dest_one", false).await.unwrap();
+    let two = client.fetch_envelope("dest_two", false).await.unwrap();
+    assert_eq!(one.destination.id, "dest_one");
+    assert_eq!(two.destination.id, "dest_two");
+    drop(server);
+}
