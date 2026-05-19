@@ -60,6 +60,28 @@ pub struct DbtNodeConfig {
     pub schema: Option<String>,
     pub unique_key: Option<UniqueKeyValue>,
     pub incremental_strategy: Option<String>,
+    /// `event_time` field (dbt 1.8+ microbatch).
+    pub event_time: Option<String>,
+    /// `batch_size` field (dbt 1.8+ microbatch). One of
+    /// `hour` / `day` / `month` / `year`.
+    pub batch_size: Option<String>,
+    /// `lookback` field (dbt 1.8+ microbatch). Number of prior batches to
+    /// recompute on each run.
+    pub lookback: Option<u32>,
+    /// `partition_by` — list of partition column names. dbt-databricks +
+    /// other warehouse-specific configs accept either a single string or a
+    /// list; both forms normalize here.
+    pub partition_by: Option<Vec<String>>,
+    /// `databricks_tags` — key/value tag pairs (dbt-databricks).
+    pub databricks_tags: std::collections::BTreeMap<String, String>,
+    /// `pre_hook` — SQL statements run before the model materializes.
+    /// Accepts dbt's string-or-list shape.
+    pub pre_hook: Vec<String>,
+    /// `post_hook` — SQL statements run after the model materializes.
+    pub post_hook: Vec<String>,
+    /// `on_schema_change` — dbt-databricks drift policy. One of `ignore`,
+    /// `fail`, `append_new_columns`, `sync_all_columns`.
+    pub on_schema_change: Option<String>,
 }
 
 /// unique_key can be a single string or a list.
@@ -156,6 +178,26 @@ struct RawNodeConfig {
     unique_key: Option<serde_json::Value>,
     #[serde(default)]
     incremental_strategy: Option<String>,
+    #[serde(default)]
+    event_time: Option<String>,
+    #[serde(default)]
+    batch_size: Option<String>,
+    #[serde(default)]
+    lookback: Option<u32>,
+    #[serde(default)]
+    partition_by: Option<serde_json::Value>,
+    #[serde(default)]
+    databricks_tags: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pre_hook: Option<serde_json::Value>,
+    #[serde(default, rename = "pre-hook")]
+    pre_hook_dashed: Option<serde_json::Value>,
+    #[serde(default)]
+    post_hook: Option<serde_json::Value>,
+    #[serde(default, rename = "post-hook")]
+    post_hook_dashed: Option<serde_json::Value>,
+    #[serde(default)]
+    on_schema_change: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +293,23 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         _ => None,
     });
 
+    let partition_by = config.partition_by.and_then(json_string_or_list);
+
+    let pre_hook = json_string_or_list(
+        config
+            .pre_hook
+            .or(config.pre_hook_dashed)
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .unwrap_or_default();
+    let post_hook = json_string_or_list(
+        config
+            .post_hook
+            .or(config.post_hook_dashed)
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .unwrap_or_default();
+
     let columns = raw
         .columns
         .into_iter()
@@ -280,12 +339,40 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             schema: config.schema,
             unique_key,
             incremental_strategy: config.incremental_strategy,
+            event_time: config.event_time,
+            batch_size: config.batch_size,
+            lookback: config.lookback,
+            partition_by,
+            databricks_tags: config.databricks_tags.unwrap_or_default(),
+            pre_hook,
+            post_hook,
+            on_schema_change: config.on_schema_change,
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),
         tags: raw.tags,
         schema: raw.schema.unwrap_or_default(),
         database: raw.database.unwrap_or_default(),
+    }
+}
+
+/// Normalize a manifest field that dbt accepts as either a single string
+/// or a list of strings into `Option<Vec<String>>`. Returns `None` for
+/// null, empty list, or non-string values.
+fn json_string_or_list(v: serde_json::Value) -> Option<Vec<String>> {
+    match v {
+        serde_json::Value::String(s) if !s.is_empty() => Some(vec![s]),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr
+                .into_iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::String(s) if !s.is_empty() => Some(s),
+                    _ => None,
+                })
+                .collect();
+            if items.is_empty() { None } else { Some(items) }
+        }
+        _ => None,
     }
 }
 
