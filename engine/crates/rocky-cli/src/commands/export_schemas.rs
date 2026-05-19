@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rocky_core::config::{AdapterConfig, RockyConfig};
+use rocky_fivetran::envelope::FivetranStateEnvelope;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 
@@ -113,6 +114,14 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // into the editor directory after this command runs.
         entry::<AdapterConfig>("adapter_config"),
         entry::<RockyConfig>("rocky_project"),
+        // FR-C canonical state envelope. Not a CLI command output —
+        // it's the on-disk shape produced by
+        // `rocky discover --emit-fivetran-state-to <PATH>` and the
+        // contract between Rocky and downstream consumers that want
+        // the Fivetran view of a destination without re-fetching it
+        // themselves. Pydantic + TypeScript bindings autogenerate
+        // off the same JSON schema as the CLI outputs.
+        entry::<FivetranStateEnvelope>("rocky_fivetran_state"),
     ]
 }
 

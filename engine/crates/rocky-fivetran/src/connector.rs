@@ -23,6 +23,18 @@ pub struct Connector {
     pub status: ConnectorStatus,
     pub succeeded_at: Option<DateTime<Utc>>,
     pub failed_at: Option<DateTime<Utc>>,
+    /// Whether the connector is paused. Fivetran returns `paused: true`
+    /// only when an operator has explicitly disabled sync; absent or
+    /// `false` means the schedule is live.
+    #[serde(default)]
+    pub paused: bool,
+    /// Human-friendly connector name. Fivetran's `groups/{id}/connectors`
+    /// payload returns `connector_name`, but `connectors/{id}` returns
+    /// the same value under `schema` and may omit the friendly name
+    /// entirely; treat as optional and fall back to `schema` at the
+    /// envelope-construction site.
+    #[serde(default, alias = "connector_name")]
+    pub name: Option<String>,
     /// Raw, service-specific connector configuration. Absent (=`Value::Null`)
     /// when Fivetran omits the field — connectors in partial setup states may
     /// not include it.
@@ -104,6 +116,8 @@ mod tests {
             },
             succeeded_at: None,
             failed_at: None,
+            paused: false,
+            name: None,
             config: serde_json::Value::Null,
         }
     }

@@ -3947,6 +3947,7 @@ name = "rocky-fivetran"
 version = "1.37.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "fs4",
  "futures",
@@ -3956,6 +3957,7 @@ dependencies = [
  "reqwest",
  "rocky-core",
  "rocky-observe",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

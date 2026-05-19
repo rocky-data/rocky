@@ -1,0 +1,263 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "EnvelopeVersion": {
+      "description": "Envelope schema version. A newtype enum (rather than a free-form string) so adding a new variant is a compile-time event and so downstream deserializers can refuse unknown versions at parse time instead of accepting a string they can't actually handle.",
+      "oneOf": [
+        {
+          "description": "Initial envelope shape.",
+          "enum": [
+            "1.0"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FivetranColumnConfig": {
+      "description": "One column entry inside the per-table schema config.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether this column is enabled for sync.",
+          "type": "boolean"
+        },
+        "hashed": {
+          "default": false,
+          "description": "Whether Fivetran is applying its column-hash transform on this column (PII masking flag).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "FivetranConnectorStatus": {
+      "description": "Sync-status block on a connector. Two fields today; left as a struct rather than flattened so future Fivetran additions land without breaking the envelope shape.",
+      "properties": {
+        "setup_state": {
+          "type": "string"
+        },
+        "sync_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "setup_state",
+        "sync_state"
+      ],
+      "type": "object"
+    },
+    "FivetranConnectorSummary": {
+      "description": "Per-connector summary projected into the envelope.\n\nStrict superset of what `dagster_fivetran.FivetranWorkspaceData` consumes — the Python side can derive that shape from this one losslessly. A round-trip parity test against the dagster-fivetran public type lives on the Python side and is tracked as a follow-up.",
+      "properties": {
+        "failed_at": {
+          "description": "Last failed sync timestamp, if any.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_id": {
+          "description": "Fivetran group ID owning this connector.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "description": "Human-friendly connector name. Fivetran returns this on the `groups/{id}/connectors` payload but the adapter currently captures only the `schema` field; the envelope surfaces both so downstream UIs can render the friendly name without re-querying. Falls back to `schema` when the upstream payload omits `name`.",
+          "type": "string"
+        },
+        "paused": {
+          "description": "Whether the connector is paused.",
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "Destination schema this connector writes into.",
+          "type": "string"
+        },
+        "service": {
+          "description": "Fivetran service tag (e.g. `\"shopify\"`).",
+          "type": "string"
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FivetranConnectorStatus"
+            }
+          ],
+          "description": "Setup + sync state at fetch time."
+        },
+        "succeeded_at": {
+          "description": "Last successful sync timestamp, if any.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "paused",
+        "schema",
+        "service",
+        "status"
+      ],
+      "type": "object"
+    },
+    "FivetranDestination": {
+      "description": "Fivetran destination metadata projected into the envelope.\n\nFields use the same names Fivetran's `GET /v1/destinations/{id}` endpoint returns — Rocky's adapter takes the wire shape verbatim so downstream consumers can move between the envelope and the upstream API without rename pain.",
+      "properties": {
+        "id": {
+          "description": "Fivetran destination identifier (e.g. `\"dest_xyz\"`). Globally unique within an account.",
+          "type": "string"
+        },
+        "region": {
+          "description": "Region the destination is hosted in (e.g. `\"us-east-1\"`). Optional — older destination records may omit it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service": {
+          "description": "Fivetran service tag for the destination warehouse (e.g. `\"snowflake\"`, `\"big_query\"`). Optional.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "setup_status": {
+          "description": "Setup status of the destination, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_zone": {
+          "description": "Destination time zone (e.g. `\"UTC\"`). Optional for the same reason as `region`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "FivetranSchemaConfig": {
+      "description": "Schema config payload from `GET /v1/connectors/{id}/schemas`, projected into envelope shape with [`BTreeMap`]s for stable iteration order.",
+      "properties": {
+        "schemas": {
+          "additionalProperties": {
+            "$ref": "#/definitions/FivetranSchemaEntry"
+          },
+          "default": {},
+          "description": "Map of logical schema key → schema entry.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "FivetranSchemaEntry": {
+      "description": "One schema entry inside the per-connector schema config.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether this destination schema is enabled.",
+          "type": "boolean"
+        },
+        "name_in_destination": {
+          "description": "Destination schema name when Fivetran has renamed it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tables": {
+          "additionalProperties": {
+            "$ref": "#/definitions/FivetranTableConfig"
+          },
+          "default": {},
+          "description": "Tables in this schema. [`BTreeMap`] for stable iteration order.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "FivetranTableConfig": {
+      "description": "One table entry inside the per-connector schema config.",
+      "properties": {
+        "columns": {
+          "additionalProperties": {
+            "$ref": "#/definitions/FivetranColumnConfig"
+          },
+          "default": {},
+          "description": "Per-column config. [`BTreeMap`] for stable iteration order so the envelope hash doesn't drift on HashMap shuffles.",
+          "type": "object"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether this table is enabled for sync.",
+          "type": "boolean"
+        },
+        "name_in_destination": {
+          "description": "Destination table name when Fivetran renames it (manual override or the `do_not_alter_` auto-prefix after a breaking schema change). The destination name is what shows up in `information_schema.tables`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sync_mode": {
+          "description": "Sync mode (e.g. `\"SOFT_DELETE\"`), when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Canonical Fivetran state envelope written by `rocky discover --emit-fivetran-state-to <PATH>`.\n\nThe envelope is the single contract between Rocky and downstream consumers that want a snapshot of the Fivetran view of a destination — connectors, their sync states, and the per-connector schema config — without re-fetching from Fivetran themselves.\n\n## Construction invariants\n\n- [`Self::connectors`] is sorted ascending by `connector.id` at construction time via [`Self::from_parts`]. - [`Self::schemas`] is a [`BTreeMap`] so iteration order is the ascending lexicographic order of `connector_id` keys.\n\nThese guarantees make the serialized bytes byte-stable across runs (modulo [`Self::fetched_at`]), which is what makes [`envelope_hash`] a useful sentinel for the idempotent emit path.",
+  "properties": {
+    "connectors": {
+      "description": "Connector summaries sorted ascending by `connector.id` — see the construction-invariant note on the type doc.",
+      "items": {
+        "$ref": "#/definitions/FivetranConnectorSummary"
+      },
+      "type": "array"
+    },
+    "destination": {
+      "$ref": "#/definitions/FivetranDestination"
+    },
+    "fetched_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "schemas": {
+      "additionalProperties": {
+        "$ref": "#/definitions/FivetranSchemaConfig"
+      },
+      "description": "Schema config keyed by connector id. [`BTreeMap`] for stable iteration order.",
+      "type": "object"
+    },
+    "version": {
+      "$ref": "#/definitions/EnvelopeVersion"
+    }
+  },
+  "required": [
+    "connectors",
+    "destination",
+    "fetched_at",
+    "schemas",
+    "version"
+  ],
+  "title": "FivetranStateEnvelope",
+  "type": "object"
+}

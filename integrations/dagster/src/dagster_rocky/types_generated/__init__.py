@@ -262,6 +262,21 @@ from .preview_cost_schema import (
     PreviewModelCostDelta,
 )
 
+# Fivetran state envelope — canonical shape written by
+# `rocky discover --emit-fivetran-state-to <PATH>` and the contract
+# between Rocky and downstream consumers reading the Fivetran view.
+from .rocky_fivetran_state_schema import (
+    EnvelopeVersion as FivetranStateEnvelopeVersion,
+    FivetranColumnConfig,
+    FivetranConnectorStatus,
+    FivetranConnectorSummary,
+    FivetranDestination,
+    FivetranSchemaConfig,
+    FivetranSchemaEntry,
+    FivetranStateEnvelope,
+    FivetranTableConfig,
+)
+
 __all__ = [
     # ai
     "AiGenerateOutput",
@@ -439,4 +454,14 @@ __all__ = [
     "PreviewCostOutput",
     "PreviewCostSummary",
     "PreviewModelCostDelta",
+    # Fivetran state envelope
+    "FivetranStateEnvelope",
+    "FivetranStateEnvelopeVersion",
+    "FivetranDestination",
+    "FivetranConnectorStatus",
+    "FivetranConnectorSummary",
+    "FivetranSchemaConfig",
+    "FivetranSchemaEntry",
+    "FivetranTableConfig",
+    "FivetranColumnConfig",
 ]
