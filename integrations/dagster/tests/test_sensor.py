@@ -354,6 +354,18 @@ def _mock_instance_with_run_count(count: int) -> MagicMock:
     return instance
 
 
+def _mock_instance_with_counts_by_tag(tag_key: str, counts: dict[str, int]) -> MagicMock:
+    """Build a mock instance whose in-flight count depends on a tag value."""
+    instance = MagicMock(spec=dg.DagsterInstance)
+
+    def _get_runs(*, filters: dg.RunsFilter, limit: int) -> list[MagicMock]:
+        tag_value = filters.tags[tag_key]
+        return [MagicMock() for _ in range(min(counts[tag_value], limit))]
+
+    instance.get_runs.side_effect = _get_runs
+    return instance
+
+
 def test_backlog_cap_none_is_unchanged_emit_path():
     """No backlog_cap → emit path stays exactly as before (regression guard
     against accidentally calling ``context.instance.get_runs`` when the
@@ -445,6 +457,84 @@ def test_backlog_cap_passes_through_when_tag_key_missing():
 
     assert len(result.run_requests) == 1
     instance.get_runs.assert_not_called()
+
+
+def test_backlog_cap_suppresses_only_sources_whose_tag_is_at_cap():
+    """A capped source is suppressed while a different tag value still emits."""
+    rocky = RockyResource()
+    discover = _discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)),
+        _source("s2", "globex", ["invoices"], _ts(2026, 4, 8, 11)),
+    )
+    instance = _mock_instance_with_counts_by_tag("rocky/source_id", {"s1": 1, "s2": 0})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=1),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert [req.tags["rocky/source_id"] for req in result.run_requests] == ["s2"]
+    cursor = json.loads(result.cursor)
+    assert cursor["s1"] == "2026-04-08T10:00:00+00:00"
+    assert cursor["s2"] == "2026-04-08T11:00:00+00:00"
+
+
+def test_backlog_cap_emits_after_new_sync_when_in_flight_drops():
+    """A later sync emits once the in-flight count falls below the cap."""
+    rocky = RockyResource()
+    capped_discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    open_instance = _mock_instance_with_run_count(1)
+
+    with patch.object(RockyResource, "discover", return_value=capped_discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=1),
+        )
+        capped_result = sensor(dg.build_sensor_context(cursor=None, instance=open_instance))
+
+    assert capped_result.run_requests == []
+
+    next_discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 11)))
+    clear_instance = _mock_instance_with_run_count(0)
+    with patch.object(RockyResource, "discover", return_value=next_discover):
+        result = sensor(
+            dg.build_sensor_context(cursor=capped_result.cursor, instance=clear_instance)
+        )
+
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+    assert json.loads(result.cursor)["s1"] == "2026-04-08T11:00:00+00:00"
+
+
+def test_backlog_cap_per_group_cursors_advance_independently():
+    """Per-group suppression still advances each group's source cursor."""
+    rocky = RockyResource()
+    discover = _discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)),
+        _source("s2", "globex", ["invoices"], _ts(2026, 4, 8, 11)),
+    )
+    instance = _mock_instance_with_counts_by_tag("rocky/group", {"acme": 1, "globex": 0})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            granularity="per_group",
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/group", max_in_flight=1),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert [req.tags["rocky/group"] for req in result.run_requests] == ["globex"]
+    cursor = json.loads(result.cursor)
+    assert cursor["s1"] == "2026-04-08T10:00:00+00:00"
+    assert cursor["s2"] == "2026-04-08T11:00:00+00:00"
 
 
 # ---------------------------------------------------------------------------
