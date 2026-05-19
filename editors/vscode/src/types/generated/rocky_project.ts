@@ -21,6 +21,10 @@ export type RedactedString = string;
  */
 export type FivetranCacheBackend = "none" | "file" | "object_store" | "valkey" | "tiered";
 /**
+ * Circuit-breaker backend selector for the Fivetran adapter (Layer 3). See [`FivetranCircuitBreakerConfig`] for the TOML shape.
+ */
+export type FivetranCircuitBreakerBackend = "none" | "valkey";
+/**
  * Role an adapter block plays in the pipeline.
  *
  * Set via `kind = "data"` or `kind = "discovery"` in an `[adapter.*]` block. Required on discovery-only adapter types (`fivetran`, `airbyte`, `iceberg`, `manual`) so the adapter's role is self-evident in the raw config file — a reader shouldn't have to know the Rust trait surface of each adapter to tell whether it moves data.
@@ -28,6 +32,14 @@ export type FivetranCacheBackend = "none" | "file" | "object_store" | "valkey" |
  * Optional on single-role warehouse types (defaults to `Data`) and on the dual-capable DuckDB adapter (absent means "register both roles").
  */
 export type AdapterKind = "data" | "discovery";
+/**
+ * Cross-pod rate-limit budget backend selector for the Fivetran adapter (FR-B Phase 2). See [`FivetranRatelimitConfig`] for the TOML shape.
+ */
+export type FivetranRatelimitBackend = "file" | "valkey";
+/**
+ * Distributed cache-stampede lock backend selector for the Fivetran adapter (Layer 1). See [`FivetranStampedeConfig`] for the TOML shape.
+ */
+export type FivetranStampedeBackend = "none" | "valkey";
 /**
  * What to do when a [`BudgetConfig`] limit is exceeded by an actual run.
  *
@@ -414,6 +426,12 @@ export interface AdapterConfig {
    * When set on a `type = "fivetran"` adapter, the resolved envelope is read from and written to the configured cache backend so concurrent `rocky` processes share one fetcher per org. Ignored on every other adapter type. When absent the adapter behaves as if `backend = "none"` — every fetch goes straight to the Fivetran API.
    */
   cache?: FivetranCacheConfig | null;
+  /**
+   * Optional per-account circuit breaker (Fivetran-only).
+   *
+   * Trips after `failure_threshold` consecutive remote failures and short-circuits subsequent HTTP attempts with a `CircuitOpen` error until a cooldown elapses. Coordinated across processes via the configured backend (Valkey). Ignored on non-fivetran adapters; absent block defaults to `AlwaysClosed` (no breaker).
+   */
+  circuit_breaker?: FivetranCircuitBreakerConfig | null;
   client_id?: string | null;
   client_secret?: RedactedString | null;
   /**
@@ -456,6 +474,12 @@ export interface AdapterConfig {
    */
   project_id?: string | null;
   /**
+   * Optional cross-pod rate-limit budget backend (Fivetran-only).
+   *
+   * Phase 1 ratelimit coordination is per-host (file in `${TMPDIR}/rocky-fivetran-ratelimit/`). Setting `backend = "valkey"` here lifts the budget into a shared store so several pods on different hosts observe the same `wake_at` window after one of them is throttled. Ignored on non-fivetran adapters. When absent the adapter falls back to the per-host file backend.
+   */
+  ratelimit?: FivetranRatelimitConfig | null;
+  /**
    * Retry policy for this adapter.
    */
   retry?: RetryConfig;
@@ -463,6 +487,12 @@ export interface AdapterConfig {
    * Snowflake role to use for the session.
    */
   role?: string | null;
+  /**
+   * Optional distributed cache-stampede lock (Fivetran-only).
+   *
+   * On a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior).
+   */
+  stampede?: FivetranStampedeConfig | null;
   timeout_secs?: number | null;
   token?: RedactedString | null;
   /**
@@ -514,6 +544,74 @@ export interface FivetranCacheConfig {
   valkey_url?: string | null;
 }
 /**
+ * Circuit-breaker config for the Fivetran adapter (Layer 3).
+ *
+ * Trips after `failure_threshold` consecutive remote failures (5xx, network errors, exhausted retries) and short-circuits subsequent HTTP attempts with `FivetranError::CircuitOpen` until `cooldown_seconds` elapses. State transitions follow the standard `Closed → Open → HalfOpen → Closed` pattern, with exponentially extended cooldown on repeated half-open failures (capped at `cooldown_max_seconds`).
+ *
+ * State is shared across processes via Valkey so a Fivetran outage trips one breaker for the entire org rather than each process independently tripping its own.
+ *
+ * ## TOML shape
+ *
+ * ```toml [adapter.fivetran.circuit_breaker] backend = "valkey" valkey_url = "rediss://valkey:6379/" failure_threshold = 5 window_seconds = 60 cooldown_seconds = 300 cooldown_max_seconds = 3600 ```
+ *
+ * ## Fail-open
+ *
+ * When the state store is unreachable the client behaves as if the breaker is `Closed` — coordination failure must not refuse live traffic.
+ */
+export interface FivetranCircuitBreakerConfig {
+  /**
+   * Which backend to instantiate. Defaults to [`FivetranCircuitBreakerBackend::None`] so a stub block with no `backend` key is well-defined.
+   */
+  backend?: FivetranCircuitBreakerBackend & string;
+  /**
+   * Upper bound on the exponentially-extended cooldown after repeated half-open failures. Defaults to 3600s.
+   */
+  cooldown_max_seconds?: number | null;
+  /**
+   * Initial cooldown (seconds) before the breaker transitions `Open → HalfOpen` for a probe. Defaults to 300s.
+   */
+  cooldown_seconds?: number | null;
+  /**
+   * Consecutive failures required to transition `Closed → Open`. Defaults to 5 when unset.
+   */
+  failure_threshold?: number | null;
+  /**
+   * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   */
+  valkey_url?: string | null;
+  /**
+   * Failure-counting window in seconds. Failures older than the window are not counted toward `failure_threshold`. Defaults to 60s when unset.
+   */
+  window_seconds?: number | null;
+}
+/**
+ * Cross-pod rate-limit budget config for the Fivetran adapter (FR-B Phase 2).
+ *
+ * Phase 1 (shipped in v1.37) writes `wake_at_epoch_ms` to a per-host file under `${TMPDIR}/rocky-fivetran-ratelimit/<account_hash>.json`. That works when several `rocky` processes share a host, but a Kubernetes deployment with one rocky-cli per pod sees N independent budgets even though every pod talks to the same Fivetran org. Lifting the budget into Valkey makes a 429 on one pod throttle every other pod for the same `Retry-After` window.
+ *
+ * ## TOML shape
+ *
+ * ```toml [adapter.fivetran.ratelimit] backend = "valkey" valkey_url = "rediss://valkey:6379/" ```
+ *
+ * ## Fail-open
+ *
+ * When the configured backend is unreachable the client falls back to the per-host file backend. The cluster regresses to Phase 1 behavior (each host enforces its own budget) rather than blocking traffic.
+ */
+export interface FivetranRatelimitConfig {
+  /**
+   * Which backend to instantiate. Defaults to [`FivetranRatelimitBackend::File`] so a stub block with no `backend` key is well-defined.
+   */
+  backend?: FivetranRatelimitBackend & string;
+  /**
+   * Cap (seconds) applied to the Valkey key's `EXPIRE` so an abandoned `wake_at` value never outlives its useful window. Defaults to 600s when unset; ignored for the file backend.
+   */
+  max_wake_seconds?: number | null;
+  /**
+   * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   */
+  valkey_url?: string | null;
+}
+/**
  * Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).
  *
  * Rocky retries transient errors with exponential backoff and optional jitter to prevent thundering herd across concurrent runs.
@@ -553,6 +651,37 @@ export interface RetryConfig {
    * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * Distributed cache-stampede protection config for the Fivetran adapter (Layer 1).
+ *
+ * On a cold-start burst, N processes can simultaneously observe the cache miss, fan out N API calls, and write back N copies of the same envelope. The stampede lock elects a single leader (via `SET <key>:lock <id> NX EX <ttl>` against Valkey) to do the API call; followers wait on the cache key with bounded polling until the leader's write becomes visible, then return.
+ *
+ * ## TOML shape
+ *
+ * ```toml [adapter.fivetran.stampede] backend = "valkey" valkey_url = "rediss://valkey:6379/" lock_ttl_seconds = 60 poll_timeout_seconds = 30 ```
+ *
+ * ## Fail-open
+ *
+ * When the lock backend is unreachable the client falls through to the direct HTTP path (no stampede protection, but no block).
+ */
+export interface FivetranStampedeConfig {
+  /**
+   * Which backend to instantiate. Defaults to [`FivetranStampedeBackend::None`] so a stub block with no `backend` key is well-defined.
+   */
+  backend?: FivetranStampedeBackend & string;
+  /**
+   * Lock TTL applied to the `SET NX EX <ttl>` call. The lock auto-expires after this many seconds so a crashed leader doesn't park every follower forever. Defaults to 60s.
+   */
+  lock_ttl_seconds?: number | null;
+  /**
+   * Hard cap on how long a follower will poll the cache before falling through to a direct HTTP fetch. Defaults to 30s.
+   */
+  poll_timeout_seconds?: number | null;
+  /**
+   * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   */
+  valkey_url?: string | null;
 }
 /**
  * Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai-sync`, `rocky ai-test`).

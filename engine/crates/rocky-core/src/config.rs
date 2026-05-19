@@ -263,6 +263,36 @@ pub enum ConfigError {
         backend: String,
         field: String,
     },
+
+    #[error(
+        "[adapter.{adapter}.ratelimit] backend = \"{backend}\" requires `{field}` — set the field \
+         under [adapter.{adapter}.ratelimit] or change `backend`"
+    )]
+    FivetranRatelimitMissingField {
+        adapter: String,
+        backend: String,
+        field: String,
+    },
+
+    #[error(
+        "[adapter.{adapter}.stampede] backend = \"{backend}\" requires `{field}` — set the field \
+         under [adapter.{adapter}.stampede] or change `backend`"
+    )]
+    FivetranStampedeMissingField {
+        adapter: String,
+        backend: String,
+        field: String,
+    },
+
+    #[error(
+        "[adapter.{adapter}.circuit_breaker] backend = \"{backend}\" requires `{field}` — set the \
+         field under [adapter.{adapter}.circuit_breaker] or change `backend`"
+    )]
+    FivetranCircuitBreakerMissingField {
+        adapter: String,
+        backend: String,
+        field: String,
+    },
 }
 
 /// Concurrency strategy for table processing.
@@ -2292,6 +2322,38 @@ pub struct AdapterConfig {
     /// straight to the Fivetran API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<FivetranCacheConfig>,
+
+    /// Optional cross-pod rate-limit budget backend (Fivetran-only).
+    ///
+    /// Phase 1 ratelimit coordination is per-host (file in
+    /// `${TMPDIR}/rocky-fivetran-ratelimit/`). Setting `backend = "valkey"`
+    /// here lifts the budget into a shared store so several pods on
+    /// different hosts observe the same `wake_at` window after one of
+    /// them is throttled. Ignored on non-fivetran adapters. When absent
+    /// the adapter falls back to the per-host file backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratelimit: Option<FivetranRatelimitConfig>,
+
+    /// Optional distributed cache-stampede lock (Fivetran-only).
+    ///
+    /// On a cold-start herd, N processes simultaneously miss the cache,
+    /// fan out N API calls, and write back N times. The stampede lock
+    /// elects a single leader to issue the API call; followers poll the
+    /// cache until the leader publishes the envelope. Ignored on
+    /// non-fivetran adapters. When absent the adapter behaves as if
+    /// every process is the leader (the pre-stampede behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stampede: Option<FivetranStampedeConfig>,
+
+    /// Optional per-account circuit breaker (Fivetran-only).
+    ///
+    /// Trips after `failure_threshold` consecutive remote failures and
+    /// short-circuits subsequent HTTP attempts with a `CircuitOpen`
+    /// error until a cooldown elapses. Coordinated across processes
+    /// via the configured backend (Valkey). Ignored on non-fivetran
+    /// adapters; absent block defaults to `AlwaysClosed` (no breaker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<FivetranCircuitBreakerConfig>,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -2321,6 +2383,9 @@ impl std::fmt::Debug for AdapterConfig {
             .field("path", &self.path)
             .field("retry", &self.retry)
             .field("cache", &self.cache)
+            .field("ratelimit", &self.ratelimit)
+            .field("stampede", &self.stampede)
+            .field("circuit_breaker", &self.circuit_breaker)
             .finish()
     }
 }
@@ -2454,6 +2519,307 @@ impl FivetranCacheConfig {
             FivetranCacheBackend::Tiered => {
                 need("object_store_url", self.object_store_url.as_ref())?;
                 need("valkey_url", self.valkey_url.as_ref())
+            }
+        }
+    }
+}
+
+/// Cross-pod rate-limit budget backend selector for the Fivetran adapter
+/// (FR-B Phase 2). See [`FivetranRatelimitConfig`] for the TOML shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FivetranRatelimitBackend {
+    /// Per-host file lock (Phase 1 behavior). Default when the block is
+    /// absent.
+    #[default]
+    File,
+    /// Shared Valkey key. Requires the `valkey` Cargo feature.
+    Valkey,
+}
+
+impl FivetranRatelimitBackend {
+    /// Stable wire-form string for log messages and OTLP attrs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FivetranRatelimitBackend::File => "file",
+            FivetranRatelimitBackend::Valkey => "valkey",
+        }
+    }
+}
+
+/// Cross-pod rate-limit budget config for the Fivetran adapter
+/// (FR-B Phase 2).
+///
+/// Phase 1 (shipped in v1.37) writes `wake_at_epoch_ms` to a per-host
+/// file under `${TMPDIR}/rocky-fivetran-ratelimit/<account_hash>.json`.
+/// That works when several `rocky` processes share a host, but a
+/// Kubernetes deployment with one rocky-cli per pod sees N independent
+/// budgets even though every pod talks to the same Fivetran org. Lifting
+/// the budget into Valkey makes a 429 on one pod throttle every other
+/// pod for the same `Retry-After` window.
+///
+/// ## TOML shape
+///
+/// ```toml
+/// [adapter.fivetran.ratelimit]
+/// backend = "valkey"
+/// valkey_url = "rediss://valkey:6379/"
+/// ```
+///
+/// ## Fail-open
+///
+/// When the configured backend is unreachable the client falls back to
+/// the per-host file backend. The cluster regresses to Phase 1 behavior
+/// (each host enforces its own budget) rather than blocking traffic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FivetranRatelimitConfig {
+    /// Which backend to instantiate. Defaults to
+    /// [`FivetranRatelimitBackend::File`] so a stub block with no
+    /// `backend` key is well-defined.
+    #[serde(default)]
+    pub backend: FivetranRatelimitBackend,
+
+    /// Connection URL for `backend = "valkey"`. Standard `redis://`
+    /// (plain) or `rediss://` (TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_url: Option<String>,
+
+    /// Cap (seconds) applied to the Valkey key's `EXPIRE` so an
+    /// abandoned `wake_at` value never outlives its useful window.
+    /// Defaults to 600s when unset; ignored for the file backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wake_seconds: Option<u64>,
+}
+
+impl FivetranRatelimitConfig {
+    /// Validate that the configured backend has all the fields it needs.
+    /// Surfaces errors at config-load time via
+    /// [`validate_fivetran_resilience`] so a misconfigured backend
+    /// doesn't silently degrade to fail-open at first request.
+    pub fn validate(&self, adapter_name: &str) -> Result<(), ConfigError> {
+        match self.backend {
+            FivetranRatelimitBackend::File => Ok(()),
+            FivetranRatelimitBackend::Valkey => {
+                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                    Err(ConfigError::FivetranRatelimitMissingField {
+                        adapter: adapter_name.to_string(),
+                        backend: self.backend.as_str().to_string(),
+                        field: "valkey_url".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Distributed cache-stampede lock backend selector for the Fivetran
+/// adapter (Layer 1). See [`FivetranStampedeConfig`] for the TOML
+/// shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FivetranStampedeBackend {
+    /// No-op lock; every caller is treated as the leader. Default when
+    /// the block is absent.
+    #[default]
+    None,
+    /// Distributed lock via Valkey `SET NX EX`. Requires the `valkey`
+    /// Cargo feature.
+    Valkey,
+}
+
+impl FivetranStampedeBackend {
+    /// Stable wire-form string for log messages and OTLP attrs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FivetranStampedeBackend::None => "none",
+            FivetranStampedeBackend::Valkey => "valkey",
+        }
+    }
+}
+
+/// Distributed cache-stampede protection config for the Fivetran
+/// adapter (Layer 1).
+///
+/// On a cold-start burst, N processes can simultaneously observe the
+/// cache miss, fan out N API calls, and write back N copies of the
+/// same envelope. The stampede lock elects a single leader (via
+/// `SET <key>:lock <id> NX EX <ttl>` against Valkey) to do the API
+/// call; followers wait on the cache key with bounded polling until
+/// the leader's write becomes visible, then return.
+///
+/// ## TOML shape
+///
+/// ```toml
+/// [adapter.fivetran.stampede]
+/// backend = "valkey"
+/// valkey_url = "rediss://valkey:6379/"
+/// lock_ttl_seconds = 60
+/// poll_timeout_seconds = 30
+/// ```
+///
+/// ## Fail-open
+///
+/// When the lock backend is unreachable the client falls through to
+/// the direct HTTP path (no stampede protection, but no block).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FivetranStampedeConfig {
+    /// Which backend to instantiate. Defaults to
+    /// [`FivetranStampedeBackend::None`] so a stub block with no
+    /// `backend` key is well-defined.
+    #[serde(default)]
+    pub backend: FivetranStampedeBackend,
+
+    /// Connection URL for `backend = "valkey"`. Standard `redis://`
+    /// (plain) or `rediss://` (TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_url: Option<String>,
+
+    /// Lock TTL applied to the `SET NX EX <ttl>` call. The lock
+    /// auto-expires after this many seconds so a crashed leader
+    /// doesn't park every follower forever. Defaults to 60s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_ttl_seconds: Option<u64>,
+
+    /// Hard cap on how long a follower will poll the cache before
+    /// falling through to a direct HTTP fetch. Defaults to 30s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_timeout_seconds: Option<u64>,
+}
+
+impl FivetranStampedeConfig {
+    /// Validate that the configured backend has all the fields it
+    /// needs. Surfaces errors at config-load time via
+    /// [`validate_fivetran_resilience`].
+    pub fn validate(&self, adapter_name: &str) -> Result<(), ConfigError> {
+        match self.backend {
+            FivetranStampedeBackend::None => Ok(()),
+            FivetranStampedeBackend::Valkey => {
+                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                    Err(ConfigError::FivetranStampedeMissingField {
+                        adapter: adapter_name.to_string(),
+                        backend: self.backend.as_str().to_string(),
+                        field: "valkey_url".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Circuit-breaker backend selector for the Fivetran adapter (Layer
+/// 3). See [`FivetranCircuitBreakerConfig`] for the TOML shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FivetranCircuitBreakerBackend {
+    /// No-op breaker; state is always `Closed`. Default when the
+    /// block is absent.
+    #[default]
+    None,
+    /// Shared per-account state machine in Valkey. Requires the
+    /// `valkey` Cargo feature.
+    Valkey,
+}
+
+impl FivetranCircuitBreakerBackend {
+    /// Stable wire-form string for log messages and OTLP attrs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FivetranCircuitBreakerBackend::None => "none",
+            FivetranCircuitBreakerBackend::Valkey => "valkey",
+        }
+    }
+}
+
+/// Circuit-breaker config for the Fivetran adapter (Layer 3).
+///
+/// Trips after `failure_threshold` consecutive remote failures (5xx,
+/// network errors, exhausted retries) and short-circuits subsequent
+/// HTTP attempts with `FivetranError::CircuitOpen` until
+/// `cooldown_seconds` elapses. State transitions follow the standard
+/// `Closed → Open → HalfOpen → Closed` pattern, with exponentially
+/// extended cooldown on repeated half-open failures (capped at
+/// `cooldown_max_seconds`).
+///
+/// State is shared across processes via Valkey so a Fivetran outage
+/// trips one breaker for the entire org rather than each process
+/// independently tripping its own.
+///
+/// ## TOML shape
+///
+/// ```toml
+/// [adapter.fivetran.circuit_breaker]
+/// backend = "valkey"
+/// valkey_url = "rediss://valkey:6379/"
+/// failure_threshold = 5
+/// window_seconds = 60
+/// cooldown_seconds = 300
+/// cooldown_max_seconds = 3600
+/// ```
+///
+/// ## Fail-open
+///
+/// When the state store is unreachable the client behaves as if the
+/// breaker is `Closed` — coordination failure must not refuse live
+/// traffic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FivetranCircuitBreakerConfig {
+    /// Which backend to instantiate. Defaults to
+    /// [`FivetranCircuitBreakerBackend::None`] so a stub block with
+    /// no `backend` key is well-defined.
+    #[serde(default)]
+    pub backend: FivetranCircuitBreakerBackend,
+
+    /// Connection URL for `backend = "valkey"`. Standard `redis://`
+    /// (plain) or `rediss://` (TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_url: Option<String>,
+
+    /// Consecutive failures required to transition `Closed → Open`.
+    /// Defaults to 5 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<u32>,
+
+    /// Failure-counting window in seconds. Failures older than the
+    /// window are not counted toward `failure_threshold`. Defaults
+    /// to 60s when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
+
+    /// Initial cooldown (seconds) before the breaker transitions
+    /// `Open → HalfOpen` for a probe. Defaults to 300s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
+
+    /// Upper bound on the exponentially-extended cooldown after
+    /// repeated half-open failures. Defaults to 3600s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_max_seconds: Option<u64>,
+}
+
+impl FivetranCircuitBreakerConfig {
+    /// Validate that the configured backend has all the fields it
+    /// needs. Surfaces errors at config-load time via
+    /// [`validate_fivetran_resilience`].
+    pub fn validate(&self, adapter_name: &str) -> Result<(), ConfigError> {
+        match self.backend {
+            FivetranCircuitBreakerBackend::None => Ok(()),
+            FivetranCircuitBreakerBackend::Valkey => {
+                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                    Err(ConfigError::FivetranCircuitBreakerMissingField {
+                        adapter: adapter_name.to_string(),
+                        backend: self.backend.as_str().to_string(),
+                        field: "valkey_url".into(),
+                    })
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -3990,6 +4356,9 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     if let Some(first) = validate_fivetran_cache(&config).into_iter().next() {
         return Err(first);
     }
+    if let Some(first) = validate_fivetran_resilience(&config).into_iter().next() {
+        return Err(first);
+    }
     Ok(config)
 }
 
@@ -4007,6 +4376,35 @@ pub fn validate_fivetran_cache(config: &RockyConfig) -> Vec<ConfigError> {
         }
         if let Some(cache_cfg) = &adapter_cfg.cache
             && let Err(e) = cache_cfg.validate(name)
+        {
+            errors.push(e);
+        }
+    }
+    errors
+}
+
+/// Validate every `[adapter.<name>.{ratelimit,stampede,circuit_breaker}]`
+/// block's cross-field requirements at config-load time so a
+/// misconfigured backend errors up front rather than at first request.
+/// Skips non-Fivetran adapter blocks; the shape is fivetran-specific.
+pub fn validate_fivetran_resilience(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, adapter_cfg) in &config.adapters {
+        if adapter_cfg.adapter_type != "fivetran" {
+            continue;
+        }
+        if let Some(rl) = &adapter_cfg.ratelimit
+            && let Err(e) = rl.validate(name)
+        {
+            errors.push(e);
+        }
+        if let Some(st) = &adapter_cfg.stampede
+            && let Err(e) = st.validate(name)
+        {
+            errors.push(e);
+        }
+        if let Some(cb) = &adapter_cfg.circuit_breaker
+            && let Err(e) = cb.validate(name)
         {
             errors.push(e);
         }
@@ -6185,6 +6583,9 @@ table = "customers_history"
             path: None,
             retry: RetryConfig::default(),
             cache: None,
+            ratelimit: None,
+            stampede: None,
+            circuit_breaker: None,
         };
 
         let debug = format!("{cfg:?}");
@@ -8285,5 +8686,262 @@ schema_template = "raw__{source}"
             errors.is_empty(),
             "non-fivetran adapter ignored: {errors:?}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // FivetranRatelimitConfig + FivetranStampedeConfig +
+    // FivetranCircuitBreakerConfig validation (resilience layers)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn validate_fivetran_resilience_passes_when_blocks_absent() {
+        let toml_str = fivetran_cache_base();
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(errors.is_empty(), "absent blocks must validate: {errors:?}");
+    }
+
+    #[test]
+    fn validate_fivetran_ratelimit_file_default_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.ratelimit]
+backend = "file"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(errors.is_empty(), "file backend must validate: {errors:?}");
+    }
+
+    #[test]
+    fn validate_fivetran_ratelimit_valkey_requires_url() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.ratelimit]
+backend = "valkey"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranRatelimitMissingField { ref field, ref backend, .. }
+                if field == "valkey_url" && backend == "valkey"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_ratelimit_valkey_with_url_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.ratelimit]
+backend = "valkey"
+valkey_url = "redis://localhost:6379/"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(
+            errors.is_empty(),
+            "valkey backend with url must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_fivetran_stampede_none_default_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.stampede]
+backend = "none"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(errors.is_empty(), "none backend must validate: {errors:?}");
+    }
+
+    #[test]
+    fn validate_fivetran_stampede_valkey_requires_url() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.stampede]
+backend = "valkey"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranStampedeMissingField { ref field, ref backend, .. }
+                if field == "valkey_url" && backend == "valkey"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_circuit_breaker_none_default_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.circuit_breaker]
+backend = "none"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(errors.is_empty(), "none backend must validate: {errors:?}");
+    }
+
+    #[test]
+    fn validate_fivetran_circuit_breaker_valkey_requires_url() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.circuit_breaker]
+backend = "valkey"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCircuitBreakerMissingField { ref field, ref backend, .. }
+                if field == "valkey_url" && backend == "valkey"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_resilience_full_block_passes() {
+        // All three blocks present with valid Valkey URLs.
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.ratelimit]
+backend = "valkey"
+valkey_url = "redis://localhost:6379/"
+
+[adapter.fivetran_main.stampede]
+backend = "valkey"
+valkey_url = "redis://localhost:6379/"
+lock_ttl_seconds = 60
+poll_timeout_seconds = 30
+
+[adapter.fivetran_main.circuit_breaker]
+backend = "valkey"
+valkey_url = "redis://localhost:6379/"
+failure_threshold = 5
+window_seconds = 60
+cooldown_seconds = 300
+cooldown_max_seconds = 3600
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_resilience(&config);
+        assert!(
+            errors.is_empty(),
+            "fully-specified resilience must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_fivetran_resilience_ignores_non_fivetran_adapter() {
+        // ratelimit block on a non-fivetran adapter is silently
+        // ignored — won't be wired in code, mustn't error in
+        // validation.
+        let toml_str = r#"
+[adapter.warehouse]
+type = "databricks"
+host = "x.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "t"
+
+[adapter.warehouse.ratelimit]
+backend = "valkey"
+# valkey_url intentionally absent — would fail validation if checked
+
+[pipeline.bronze]
+type = "replication"
+strategy = "incremental"
+adapter = "warehouse"
+
+[pipeline.bronze.source]
+adapter = "warehouse"
+catalog = "src"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#;
+        // Note: TOML parsing won't accept the ratelimit block on a
+        // non-fivetran adapter when `deny_unknown_fields` is on at
+        // AdapterConfig — but the field is declared on AdapterConfig
+        // itself (as Option<...>), so parsing succeeds; the validator
+        // is what filters.
+        let parsed: Result<RockyConfig, _> = toml::from_str(toml_str);
+        if let Ok(config) = parsed {
+            let errors = validate_fivetran_resilience(&config);
+            assert!(
+                errors.is_empty(),
+                "non-fivetran adapter must be ignored by validator: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_config_threads_through_fivetran_adapter() {
+        // Regression: the `[adapter.fivetran.retry]` block is part
+        // of AdapterConfig (shared with every adapter type). This
+        // test pins that a fivetran adapter's `retry` deserializes
+        // and round-trips through `load_rocky_config`. The bonus
+        // task item flagged this knob as "API-only"; this confirms
+        // it's also TOML-wired.
+        let toml_str = r#"
+[adapter.fivetran_main]
+type = "fivetran"
+kind = "discovery"
+api_key = "k"
+api_secret = "s"
+destination_id = "dest_x"
+
+[adapter.fivetran_main.retry]
+max_retries = 8
+initial_backoff_ms = 1000
+max_backoff_ms = 60000
+
+[pipeline.bronze]
+type = "replication"
+strategy = "incremental"
+adapter = "fivetran_main"
+
+[pipeline.bronze.source]
+adapter = "fivetran_main"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).expect("retry block must deserialize");
+        let fv = &config.adapters["fivetran_main"];
+        assert_eq!(fv.retry.max_retries, 8);
+        assert_eq!(fv.retry.initial_backoff_ms, 1000);
+        assert_eq!(fv.retry.max_backoff_ms, 60000);
     }
 }

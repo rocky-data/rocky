@@ -45,13 +45,19 @@ redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tok
 [features]
 default = []
 test-support = []
-# Pulls in the Redis client for the FR-A `ValkeyCache` backend. Mirrors
-# rocky-cache's `valkey` feature so a downstream crate enabling either
-# crate's feature sees the same shape.
+# Pulls in the Redis client for the FR-A `ValkeyCache` backend AND
+# the Phase 2 / Layer-1 / Layer-3 resilience backends (`ValkeyBudget`,
+# `ValkeyLock`, `ValkeyCircuit`). Mirrors rocky-cache's `valkey`
+# feature so a downstream crate enabling either crate's feature sees
+# the same shape.
 valkey = ["redis"]
 
 [[test]]
 name = "wiremock_tests"
+required-features = ["test-support"]
+
+[[test]]
+name = "resilience_tests"
 required-features = ["test-support"]
 
 [dev-dependencies]
