@@ -1117,19 +1117,11 @@ ModelHistoryResult = ModelHistoryOutput
 # and the contract between Rocky and downstream consumers that want the
 # Fivetran view of a destination without re-fetching it themselves. The
 # generated Pydantic model exposes the same shape under the snake_case
-# field set the Rust ``JsonSchema`` derive produces. We re-export under
-# both the generated name and a legacy ``…Output`` alias following the
-# existing dual-export pattern.
-from .types_generated import (  # noqa: E402, F401
-    FivetranColumnConfig,
-    FivetranConnectorStatus,
-    FivetranConnectorSummary,
-    FivetranDestination,
-    FivetranSchemaConfig,
-    FivetranSchemaEntry,
-    FivetranStateEnvelope,
-    FivetranTableConfig,
-)
+# field set the Rust ``JsonSchema`` derive produces. The envelope's
+# component types (``FivetranConnectorSummary`` / ``FivetranSchemaConfig``
+# / etc.) remain importable from ``dagster_rocky.types_generated`` for
+# consumers that need to type-annotate sub-fields.
+from .types_generated import FivetranStateEnvelope  # noqa: E402, F401
 
 FivetranStateEnvelopeOutput = FivetranStateEnvelope
 
