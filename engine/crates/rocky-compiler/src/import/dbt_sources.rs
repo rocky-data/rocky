@@ -103,7 +103,11 @@ struct RawSourceColumn {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    /// dbt 1.7+ deprecated `tests:` in favor of `data_tests:` on source
+    /// columns just like on model columns. Mirror the model-side alias
+    /// here so sources defined in dbt 1.7+ bundles aren't silently
+    /// stripped of their column tests.
+    #[serde(default, alias = "data_tests")]
     tests: Option<Vec<serde_yaml::Value>>,
 }
 
@@ -366,6 +370,30 @@ sources:
         assert_eq!(payments.name, "payments");
         assert_eq!(payments.columns.len(), 2);
         assert_eq!(payments.columns[0].name, "id");
+        assert_eq!(payments.columns[0].tests.len(), 2);
+        assert_eq!(payments.columns[0].tests[0].test_type, "unique");
+        assert_eq!(payments.columns[0].tests[1].test_type, "not_null");
+    }
+
+    #[test]
+    fn test_parse_data_tests_key_alias_on_source_columns() {
+        // dbt 1.7+ renamed the column-level test key from `tests:` to
+        // `data_tests:` on source columns too. Bundles emitted against
+        // modern dbt use the new key; the source-side deserializer must
+        // accept it as a synonym.
+        let yaml = r#"
+sources:
+  - name: stripe
+    tables:
+      - name: payments
+        columns:
+          - name: id
+            data_tests:
+              - unique
+              - not_null
+"#;
+        let sources = parse_sources_yaml(yaml, Path::new("_sources.yml")).unwrap();
+        let payments = &sources[0].tables[0];
         assert_eq!(payments.columns[0].tests.len(), 2);
         assert_eq!(payments.columns[0].tests[0].test_type, "unique");
         assert_eq!(payments.columns[0].tests[1].test_type, "not_null");
