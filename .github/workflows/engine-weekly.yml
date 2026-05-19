@@ -80,3 +80,14 @@ jobs:
       - name: Run POC smoke tests
         working-directory: ${{ github.workspace }}
         run: bash examples/playground/scripts/run-all-duckdb.sh
+
+      # Parse-validate credential-gated POCs with mock env vars. Catches
+      # parse-time breakage (invalid strategy variants, V032/V033 adapter
+      # role mismatches, malformed [pipeline.*]) that run-all-duckdb.sh
+      # misses because credential-gated POCs short-circuit on the missing
+      # env var before `rocky validate` runs. Marked `continue-on-error`
+      # until the V033 + materialized_view sweep PRs land — see PR body.
+      - name: Parse-validate credential-gated POCs
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true
+        run: bash examples/playground/scripts/run-all-parse-validate.sh
