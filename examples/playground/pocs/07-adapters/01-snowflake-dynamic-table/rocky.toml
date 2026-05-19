@@ -2,12 +2,23 @@
 type = "snowflake"
 # Snowflake adapter fields are picked up from env vars by the connector
 
+# Discovery adapter — Snowflake is data-only, so we declare a
+# manual discovery adapter to satisfy the pipeline's discovery
+# binding without enumerating any source tables (the POC only
+# exercises target-side dynamic-table materialization, not discovery).
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
 [pipeline.poc]
 strategy = "full_refresh"
 
 [pipeline.poc.source]
 adapter = "snowflake"
 catalog = "ANALYTICS"
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
 
 [pipeline.poc.source.schema_pattern]
 prefix = "RAW__"
