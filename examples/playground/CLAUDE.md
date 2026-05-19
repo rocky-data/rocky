@@ -114,10 +114,11 @@ rocky validate -c rocky.toml                # If POC uses pipeline path
 For the catalog as a whole:
 
 ```bash
-./scripts/run-all-duckdb.sh                 # All credential-free POCs, 60s timeout each
+./scripts/run-all-duckdb.sh                 # Credential-free POCs end-to-end, 60s timeout each
+./scripts/run-all-parse-validate.sh         # Credential-gated POCs — `rocky validate` only, with mock env vars
 ```
 
-Credential-gated POCs should fail fast with a clear `: "${VAR:?Set VAR before running}"` guard at the top of `run.sh`.
+Credential-gated POCs should fail fast with a clear `: "${VAR:?Set VAR before running}"` guard at the top of `run.sh`. The parse-validate script keys off that guard to decide which POCs to stub-validate.
 
 ## Git conventions
 
