@@ -206,6 +206,18 @@ class ImportDbtOutput(BaseModel):
     tests_converted_custom: conint(ge=0)
     tests_found: conint(ge=0)
     tests_skipped: conint(ge=0)
+    unit_tests_converted: conint(ge=0) | None = 0
+    """
+    Number of dbt unit tests written as Rocky `[[test]]` blocks in per-model sidecar TOML files.
+    """
+    unit_tests_found: conint(ge=0) | None = 0
+    """
+    Total dbt unit-test definitions (`manifest.unit_tests`) seen across all imported manifests.
+    """
+    unit_tests_skipped: conint(ge=0) | None = 0
+    """
+    Number of dbt unit tests dropped — orphan target model, non-`dict` fixture format, or otherwise unsupported shape.
+    """
     version: str
     warning_details: list[ImportDbtWarning]
     warnings: conint(ge=0)

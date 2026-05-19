@@ -145,6 +145,9 @@ pub fn run_import_dbt(
             tests_converted: import_result.tests_converted,
             tests_converted_custom: import_result.tests_converted_custom,
             tests_skipped: import_result.tests_skipped,
+            unit_tests_found: import_result.unit_tests_found,
+            unit_tests_converted: import_result.unit_tests_converted,
+            unit_tests_skipped: import_result.unit_tests_skipped,
             macros_detected: import_result.macros_detected,
             imported_models: import_result
                 .imported

@@ -24,8 +24,12 @@ use regex::Regex;
 use rocky_ir::TimeGrain;
 
 use rocky_core::models::{ModelConfig, StrategyConfig, TargetConfig};
+use rocky_core::unit_test::{TestExpectation, TestFixture, UnitTestDef};
 
-use super::dbt_manifest::{self, DbtManifest, DbtManifestNode, DbtNodeConfig, UniqueKeyValue};
+use super::dbt_manifest::{
+    self, DbtManifest, DbtManifestNode, DbtNodeConfig, DbtUnitTestExpect, DbtUnitTestGiven,
+    UniqueKeyValue,
+};
 use super::dbt_project::{self, DbtProjectConfig};
 use super::dbt_sources;
 
@@ -58,6 +62,14 @@ pub enum WarningCategory {
     /// dbt generic test outside the four canonical built-ins
     /// (`unique` / `not_null` / `accepted_values` / `relationships`).
     UnsupportedTest,
+    /// A `manifest.unit_tests` entry references a model that wasn't
+    /// imported (typo, filtered out, or upstream failure). The unit
+    /// test is dropped.
+    OrphanUnitTest,
+    /// A `manifest.unit_tests` entry uses a non-`dict` `format` for
+    /// `given.rows` or `expect.rows` (typically `csv` or `sql`). Inline
+    /// `format = "dict"` is the only shape supported today.
+    UnsupportedUnitTestFormat,
 }
 
 /// A warning produced during import.
@@ -176,6 +188,15 @@ pub struct ImportResult {
     pub macros_manifest_resolved: usize,
     /// Number of unsupported macros.
     pub macros_unsupported: usize,
+    /// Total dbt `manifest.unit_tests` entries seen.
+    pub unit_tests_found: usize,
+    /// Number of unit tests translated to Rocky `[[test]]` sidecar
+    /// blocks.
+    pub unit_tests_converted: usize,
+    /// Number of unit tests skipped — orphan target model, non-`dict`
+    /// fixture format, or any other shape the importer can't faithfully
+    /// translate.
+    pub unit_tests_skipped: usize,
 }
 
 /// A successfully imported model.
@@ -183,6 +204,10 @@ pub struct ImportedModel {
     pub name: String,
     pub sql: String,
     pub config: ModelConfig,
+    /// Unit tests harvested from `manifest.unit_tests` for this model.
+    /// Emitted as `[[test]]` blocks alongside the sidecar TOML; not yet
+    /// wired into the runtime test runner.
+    pub unit_tests: Vec<UnitTestDef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +241,16 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
         macros_expanded: 0,
         macros_manifest_resolved: 0,
         macros_unsupported: 0,
+        unit_tests_found: 0,
+        unit_tests_converted: 0,
+        unit_tests_skipped: 0,
     };
 
     for node in manifest.nodes.values() {
         import_manifest_node(node, default_target, &mut result);
     }
+
+    apply_dbt_unit_tests(manifest, &mut result);
 
     result
 }
@@ -299,6 +329,166 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
 
         attach_intent(result, model_name, model_yaml.description.as_deref());
     }
+}
+
+/// Walk `manifest.unit_tests`, translate each entry to a Rocky
+/// [`UnitTestDef`], and attach it to the matching imported model. Entries
+/// that target a model the importer didn't pick up emit an
+/// [`WarningCategory::OrphanUnitTest`] warning and are counted as
+/// skipped. Entries whose `expect.format` is anything other than `"dict"`
+/// (or absent) emit [`WarningCategory::UnsupportedUnitTestFormat`] and
+/// are also skipped — CSV / SQL fixtures aren't supported in the Rocky
+/// sidecar shape today.
+///
+/// The `unit_tests_found`, `unit_tests_converted`, and
+/// `unit_tests_skipped` counters on [`ImportResult`] are updated in
+/// place.
+pub fn apply_dbt_unit_tests(manifest: &DbtManifest, result: &mut ImportResult) {
+    for ut in manifest.unit_tests.values() {
+        result.unit_tests_found += 1;
+
+        if let Some(format) = ut.expect.format.as_deref() {
+            if !is_dict_format(format) {
+                result.warnings.push(ImportWarning {
+                    model: ut.model.clone(),
+                    category: WarningCategory::UnsupportedUnitTestFormat,
+                    message: format!(
+                        "dbt unit_test '{}' uses expect.format='{format}' — only inline `dict` rows are supported",
+                        ut.name
+                    ),
+                    suggestion: Some(
+                        "convert the expected rows to inline `format: dict` in the dbt unit_test, or hand-port to a Rocky [[test]] block".to_string(),
+                    ),
+                });
+                result.unit_tests_skipped += 1;
+                continue;
+            }
+        }
+
+        // dbt's per-given format defaults to `dict` (inline rows). Skip
+        // the whole test if any input requests a non-dict shape — we
+        // can't faithfully build a fixture from a CSV path the manifest
+        // doesn't carry.
+        let unsupported_given_format = ut.given.iter().find_map(|g| {
+            g.format
+                .as_deref()
+                .filter(|f| !is_dict_format(f))
+                .map(str::to_string)
+        });
+        if let Some(format) = unsupported_given_format {
+            result.warnings.push(ImportWarning {
+                model: ut.model.clone(),
+                category: WarningCategory::UnsupportedUnitTestFormat,
+                message: format!(
+                    "dbt unit_test '{}' uses given.format='{format}' — only inline `dict` rows are supported",
+                    ut.name
+                ),
+                suggestion: Some(
+                    "inline the CSV fixture into the dbt unit_test as `format: dict`, or hand-port to a Rocky [[test]] block".to_string(),
+                ),
+            });
+            result.unit_tests_skipped += 1;
+            continue;
+        }
+
+        let Some(imported) = result.imported.iter_mut().find(|m| m.name == ut.model) else {
+            result.warnings.push(ImportWarning {
+                model: ut.model.clone(),
+                category: WarningCategory::OrphanUnitTest,
+                message: format!(
+                    "dbt unit_test '{}' targets model '{}' which was not imported",
+                    ut.name, ut.model
+                ),
+                suggestion: Some(
+                    "drop the unit test or wait until the model imports cleanly".to_string(),
+                ),
+            });
+            result.unit_tests_skipped += 1;
+            continue;
+        };
+
+        let test_def = UnitTestDef {
+            name: ut.name.clone(),
+            description: ut.description.clone(),
+            given: ut.given.iter().map(convert_unit_test_given).collect(),
+            expect: convert_unit_test_expect(&ut.expect),
+        };
+        imported.unit_tests.push(test_def);
+        result.unit_tests_converted += 1;
+    }
+}
+
+/// `format` is treated as `dict` when absent or explicitly set to
+/// `"dict"` (case-insensitive).
+fn is_dict_format(format: &str) -> bool {
+    format.eq_ignore_ascii_case("dict")
+}
+
+fn convert_unit_test_given(g: &DbtUnitTestGiven) -> TestFixture {
+    TestFixture {
+        model_ref: strip_ref_wrapper(&g.input),
+        rows: g.rows.clone(),
+    }
+}
+
+fn convert_unit_test_expect(e: &DbtUnitTestExpect) -> TestExpectation {
+    TestExpectation {
+        rows: e.rows.clone(),
+        ordered: false,
+    }
+}
+
+/// Strip dbt's `ref('foo')` / `source('a','b')` wrappers down to a bare
+/// table ref. `ref('orders')` → `"orders"`,
+/// `source('raw','orders')` → `"raw.orders"`. Unwrapped inputs (already
+/// bare names) round-trip unchanged after trimming whitespace and
+/// quotes.
+pub(crate) fn strip_ref_wrapper(input: &str) -> String {
+    let trimmed = input.trim();
+    if let Some(inner) = strip_call(trimmed, "ref") {
+        let bare = strip_single_arg(inner);
+        if !bare.is_empty() {
+            return bare;
+        }
+    }
+    if let Some(inner) = strip_call(trimmed, "source") {
+        if let Some((src, tbl)) = split_source_args(inner) {
+            return format!("{src}.{tbl}");
+        }
+    }
+    trimmed
+        .trim_matches(|c: char| c == '\'' || c == '"')
+        .to_string()
+}
+
+/// Match `<name>(<inner>)`, returning the inner span on success.
+fn strip_call<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let after_name = input.strip_prefix(name)?.trim_start();
+    let inner = after_name.strip_prefix('(')?.strip_suffix(')')?;
+    Some(inner)
+}
+
+fn strip_single_arg(inner: &str) -> String {
+    inner
+        .trim()
+        .trim_matches(|c: char| c == '\'' || c == '"')
+        .to_string()
+}
+
+fn split_source_args(inner: &str) -> Option<(String, String)> {
+    let mut parts = inner.split(',');
+    let src = parts.next()?;
+    let tbl = parts.next()?;
+    if parts.next().is_some() {
+        // More than two args — refuse rather than guess.
+        return None;
+    }
+    let src = src.trim().trim_matches(|c: char| c == '\'' || c == '"');
+    let tbl = tbl.trim().trim_matches(|c: char| c == '\'' || c == '"');
+    if src.is_empty() || tbl.is_empty() {
+        return None;
+    }
+    Some((src.to_string(), tbl.to_string()))
 }
 
 fn attach_intent(result: &mut ImportResult, model_name: &str, description: Option<&str>) {
@@ -398,6 +588,7 @@ fn import_manifest_node(
         name: node.name.clone(),
         sql: sql.trim().to_string(),
         config,
+        unit_tests: Vec::new(),
     });
 }
 
@@ -860,6 +1051,9 @@ pub fn import_dbt_project(
         macros_expanded: 0,
         macros_manifest_resolved: 0,
         macros_unsupported: 0,
+        unit_tests_found: 0,
+        unit_tests_converted: 0,
+        unit_tests_skipped: 0,
     };
 
     // Verify at least one model directory exists
@@ -1117,6 +1311,7 @@ fn import_single_model(
             name: name.to_string(),
             sql,
             config,
+            unit_tests: Vec::new(),
         },
         warnings,
     ))
@@ -2331,5 +2526,235 @@ FROM {{ ref('stg_events') }}
             TimeGrain::Year
         );
         assert!(warnings.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Unit-test bridge: manifest.unit_tests → Rocky `[[test]]` sidecar
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_ref_wrapper_handles_ref_source_and_bare() {
+        assert_eq!(strip_ref_wrapper("ref('orders')"), "orders");
+        assert_eq!(strip_ref_wrapper(" ref('orders') "), "orders");
+        assert_eq!(strip_ref_wrapper("ref(\"orders\")"), "orders");
+        assert_eq!(strip_ref_wrapper("source('raw', 'orders')"), "raw.orders");
+        assert_eq!(
+            strip_ref_wrapper("source(\"raw\",\"orders\")"),
+            "raw.orders"
+        );
+        // Already-bare identifiers come through untouched.
+        assert_eq!(strip_ref_wrapper("orders"), "orders");
+        // Quoted bare identifiers shed the quotes.
+        assert_eq!(strip_ref_wrapper("'orders'"), "orders");
+        // Source with too many args refuses to guess.
+        assert_eq!(
+            strip_ref_wrapper("source('a','b','c')"),
+            "source('a','b','c')"
+        );
+    }
+
+    #[test]
+    fn test_apply_dbt_unit_tests_attaches_to_imported_model() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.brief__brief": {
+                    "unique_id": "model.p.brief__brief",
+                    "name": "brief__brief",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.brief__brief.stamps_permission_key": {
+                    "unique_id": "unit_test.p.brief__brief.stamps_permission_key",
+                    "name": "stamps_permission_key",
+                    "model": "brief__brief",
+                    "given": [
+                        {
+                            "input": "ref('int_brief__brief')",
+                            "rows": [{ "artifact_id": 1001, "brief_id": 50 }]
+                        }
+                    ],
+                    "expect": {
+                        "rows": [{ "permission_key": "abc", "artifact_id": 1001 }],
+                        "format": "dict"
+                    },
+                    "description": "permission key",
+                    "tags": []
+                }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 1);
+        assert_eq!(result.unit_tests_skipped, 0);
+
+        let imported = result
+            .imported
+            .iter()
+            .find(|m| m.name == "brief__brief")
+            .expect("model imported");
+        assert_eq!(imported.unit_tests.len(), 1);
+        let ut = &imported.unit_tests[0];
+        assert_eq!(ut.name, "stamps_permission_key");
+        assert_eq!(ut.description.as_deref(), Some("permission key"));
+        assert_eq!(ut.given.len(), 1);
+        assert_eq!(ut.given[0].model_ref, "int_brief__brief");
+        assert_eq!(ut.given[0].rows.len(), 1);
+        assert_eq!(ut.expect.rows.len(), 1);
+        assert!(!ut.expect.ordered);
+    }
+
+    #[test]
+    fn test_apply_dbt_unit_tests_orphan_warns_and_skips() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {},
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.missing.t": {
+                    "unique_id": "unit_test.p.missing.t",
+                    "name": "t",
+                    "model": "missing_model",
+                    "given": [],
+                    "expect": { "rows": [], "format": "dict" },
+                    "tags": []
+                }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 0);
+        assert_eq!(result.unit_tests_skipped, 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::OrphanUnitTest
+                    && w.message.contains("missing_model"))
+        );
+    }
+
+    #[test]
+    fn test_apply_dbt_unit_tests_non_dict_expect_format_skips() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.m.csv_case": {
+                    "unique_id": "unit_test.p.m.csv_case",
+                    "name": "csv_case",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [] }],
+                    "expect": { "rows": [], "format": "csv" },
+                    "tags": []
+                }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 0);
+        assert_eq!(result.unit_tests_skipped, 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::UnsupportedUnitTestFormat),
+        );
+        // Nothing pushed onto the imported model.
+        assert!(result.imported.iter().all(|m| m.unit_tests.is_empty()));
+    }
+
+    #[test]
+    fn test_apply_dbt_unit_tests_non_dict_given_format_skips() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.m.csv_given": {
+                    "unique_id": "unit_test.p.m.csv_given",
+                    "name": "csv_given",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [], "format": "csv" }],
+                    "expect": { "rows": [], "format": "dict" },
+                    "tags": []
+                }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 0);
+        assert_eq!(result.unit_tests_skipped, 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::UnsupportedUnitTestFormat),
+        );
+    }
+
+    #[test]
+    fn test_apply_dbt_unit_tests_treats_missing_format_as_dict() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.m.no_format": {
+                    "unique_id": "unit_test.p.m.no_format",
+                    "name": "no_format",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [{ "id": 1 }] }],
+                    "expect": { "rows": [{ "id": 1 }] },
+                    "tags": []
+                }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.unit_tests_converted, 1);
+        assert_eq!(result.unit_tests_skipped, 0);
+        let imported = result.imported.iter().find(|m| m.name == "m").unwrap();
+        assert_eq!(imported.unit_tests.len(), 1);
     }
 }

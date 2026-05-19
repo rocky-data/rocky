@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 
 use rocky_core::models::{ModelConfig, StrategyConfig};
 use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+use rocky_core::unit_test::UnitTestDef;
+use serde::Serialize;
 
 use super::dbt::{ImportResult, ImportedModel};
 use super::dbt_profiles::ProfileResolution;
@@ -142,6 +144,9 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
             seeds_copied,
             tests_skipped: inputs.import.tests_found,
             macros_detected: inputs.import.macros_detected,
+            unit_tests_found: inputs.import.unit_tests_found,
+            unit_tests_converted: inputs.import.unit_tests_converted,
+            unit_tests_skipped: inputs.import.unit_tests_skipped,
             warnings: &inputs.import.warnings,
             structured_warnings: &inputs.import.structured_warnings,
             failed: &inputs.import.failed,
@@ -167,6 +172,7 @@ fn clone_model(m: &ImportedModel) -> ImportedModel {
         name: m.name.clone(),
         sql: m.sql.clone(),
         config: m.config.clone(),
+        unit_tests: m.unit_tests.clone(),
     }
 }
 
@@ -217,10 +223,29 @@ fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), Str
     std::fs::write(&sql_path, annotated_sql)
         .map_err(|e| format!("failed to write {}: {e}", sql_path.display()))?;
 
-    let toml_body = render_model_sidecar(&model.config);
+    let mut toml_body = render_model_sidecar(&model.config);
+    if !model.unit_tests.is_empty() {
+        toml_body.push_str(&render_unit_tests(&model.unit_tests)?);
+    }
     std::fs::write(&toml_path, toml_body)
         .map_err(|e| format!("failed to write {}: {e}", toml_path.display()))?;
     Ok(())
+}
+
+/// Serialize a model's unit tests as `[[test]]` blocks. Uses the `toml`
+/// crate so the array-of-tables nesting (`[[test]]`, `[[test.given]]`,
+/// `[test.expect]`) matches what the [`UnitTestDef`] deserializer expects.
+fn render_unit_tests(tests: &[UnitTestDef]) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Wrapper<'a> {
+        test: &'a [UnitTestDef],
+    }
+    let body = toml::to_string(&Wrapper { test: tests })
+        .map_err(|e| format!("failed to serialize unit tests: {e}"))?;
+    let mut out = String::with_capacity(body.len() + 1);
+    out.push('\n');
+    out.push_str(&body);
+    Ok(out)
 }
 
 /// Inject a comment line above any TODO/Jinja-leftover marker so reviewers
@@ -482,6 +507,9 @@ struct MigrationContext<'a> {
     seeds_copied: usize,
     tests_skipped: usize,
     macros_detected: usize,
+    unit_tests_found: usize,
+    unit_tests_converted: usize,
+    unit_tests_skipped: usize,
     warnings: &'a [super::dbt::ImportWarning],
     structured_warnings: &'a [super::dbt::ImportDbtStructuredWarning],
     failed: &'a [super::dbt::ImportFailure],
@@ -611,6 +639,10 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
         ctx.tests_skipped
     ));
     out.push_str(&format!(
+        "- dbt unit tests detected: {} (converted to Rocky `[[test]]` sidecars: {}, skipped: {})\n",
+        ctx.unit_tests_found, ctx.unit_tests_converted, ctx.unit_tests_skipped,
+    ));
+    out.push_str(&format!(
         "- dbt macros detected (not translated — see Known limitations): {}\n",
         ctx.macros_detected
     ));
@@ -712,6 +744,7 @@ mod tests {
         ImportedModel {
             name: name.to_string(),
             sql: sql.to_string(),
+            unit_tests: vec![],
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],
@@ -756,6 +789,9 @@ mod tests {
             macros_expanded: 0,
             macros_manifest_resolved: 0,
             macros_unsupported: 0,
+            unit_tests_found: 0,
+            unit_tests_converted: 0,
+            unit_tests_skipped: 0,
         }
     }
 
@@ -942,5 +978,101 @@ mod tests {
             !notes.to_lowercase().contains("v0"),
             "GA framing: MIGRATION-NOTES must not reference 'v0'"
         );
+    }
+
+    #[test]
+    fn emits_unit_test_blocks_that_round_trip() {
+        use rocky_core::unit_test::{TestExpectation, TestFixture, UnitTestDef};
+
+        let dbt_dir = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+
+        let mut model = make_model(
+            "brief__brief",
+            StrategyConfig::FullRefresh,
+            "SELECT 1 AS id",
+        );
+        model.unit_tests = vec![UnitTestDef {
+            name: "stamps_permission_key".into(),
+            description: Some("permission key stamped via md5".into()),
+            given: vec![TestFixture {
+                model_ref: "int_brief__brief".into(),
+                rows: vec![serde_json::json!({ "artifact_id": 1001, "brief_id": 50 })],
+            }],
+            expect: TestExpectation {
+                rows: vec![serde_json::json!({ "permission_key": "abc", "artifact_id": 1001 })],
+                ordered: false,
+            },
+        }];
+
+        let result = empty_result(vec![model]);
+        let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
+
+        emit_repo(&EmitInputs {
+            dbt_project_dir: dbt_dir.path(),
+            out_dir: out_dir.path(),
+            overwrite: OverwritePolicy::ReplaceContents,
+            profile: &profile,
+            default_catalog: "warehouse",
+            default_schema: "main",
+            import: &result,
+            view_models_to_make_ephemeral: BTreeSet::new(),
+            adapter_override_label: None,
+        })
+        .unwrap();
+
+        let body = std::fs::read_to_string(out_dir.path().join("models/brief__brief.toml"))
+            .expect("sidecar written");
+        assert!(
+            body.contains("[[test]]"),
+            "sidecar must declare a [[test]] block:\n{body}"
+        );
+        assert!(body.contains("stamps_permission_key"));
+
+        // Round-trip via the public UnitTestDef deserializer. The sidecar
+        // contains other top-level keys (`name`, `[strategy]`, etc.) — we
+        // pull `test` out by hand so the assertion focuses on the new
+        // surface.
+        #[derive(serde::Deserialize)]
+        struct UnitTestsOnly {
+            #[serde(default)]
+            test: Vec<UnitTestDef>,
+        }
+        let parsed: UnitTestsOnly = toml::from_str(&body).expect("sidecar parses");
+        assert_eq!(parsed.test.len(), 1);
+        let ut = &parsed.test[0];
+        assert_eq!(ut.name, "stamps_permission_key");
+        assert_eq!(ut.given.len(), 1);
+        assert_eq!(ut.given[0].model_ref, "int_brief__brief");
+        assert_eq!(ut.expect.rows.len(), 1);
+    }
+
+    #[test]
+    fn migration_notes_counts_unit_tests() {
+        let dbt_dir = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let mut result = empty_result(vec![]);
+        result.unit_tests_found = 5;
+        result.unit_tests_converted = 4;
+        result.unit_tests_skipped = 1;
+        let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
+
+        emit_repo(&EmitInputs {
+            dbt_project_dir: dbt_dir.path(),
+            out_dir: out_dir.path(),
+            overwrite: OverwritePolicy::ReplaceContents,
+            profile: &profile,
+            default_catalog: "warehouse",
+            default_schema: "main",
+            import: &result,
+            view_models_to_make_ephemeral: BTreeSet::new(),
+            adapter_override_label: None,
+        })
+        .unwrap();
+
+        let notes = std::fs::read_to_string(out_dir.path().join("MIGRATION-NOTES.md")).unwrap();
+        assert!(notes.contains("dbt unit tests detected: 5"));
+        assert!(notes.contains("converted to Rocky `[[test]]` sidecars: 4"));
+        assert!(notes.contains("skipped: 1"));
     }
 }

@@ -2699,6 +2699,18 @@ pub struct ImportDbtOutput {
     pub tests_converted: usize,
     pub tests_converted_custom: usize,
     pub tests_skipped: usize,
+    /// Total dbt unit-test definitions (`manifest.unit_tests`) seen
+    /// across all imported manifests.
+    #[serde(default)]
+    pub unit_tests_found: usize,
+    /// Number of dbt unit tests written as Rocky `[[test]]` blocks in
+    /// per-model sidecar TOML files.
+    #[serde(default)]
+    pub unit_tests_converted: usize,
+    /// Number of dbt unit tests dropped — orphan target model, non-`dict`
+    /// fixture format, or otherwise unsupported shape.
+    #[serde(default)]
+    pub unit_tests_skipped: usize,
     pub macros_detected: usize,
     pub imported_models: Vec<String>,
     pub warning_details: Vec<ImportDbtWarning>,
