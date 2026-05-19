@@ -1,8 +1,9 @@
 # 02-schema-patterns-multi-tenant — `src__{tenant}__{regions...}__{source}`
 
 > **Category:** 04-governance
-> **Credentials:** `DATABRICKS_HOST` + `DATABRICKS_TOKEN` required
-> **Runtime:** depends on Databricks API
+> **Credentials:** `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_HTTP_PATH`,
+> `FIVETRAN_API_KEY`, `FIVETRAN_API_SECRET`, `FIVETRAN_DESTINATION_ID` required
+> **Runtime:** depends on Databricks + Fivetran APIs
 > **Rocky features:** `source.schema_pattern` with multi-component layouts
 
 ## What it shows
@@ -24,5 +25,9 @@ to per-tenant target catalogs/schemas. Components support a variadic
 ```bash
 export DATABRICKS_HOST="..."
 export DATABRICKS_TOKEN="..."
+export DATABRICKS_HTTP_PATH="..."
+export FIVETRAN_API_KEY="..."
+export FIVETRAN_API_SECRET="..."
+export FIVETRAN_DESTINATION_ID="..."
 ./run.sh
 ```

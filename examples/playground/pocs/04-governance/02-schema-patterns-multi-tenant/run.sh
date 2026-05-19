@@ -2,7 +2,10 @@
 set -euo pipefail
 : "${DATABRICKS_HOST:?Set DATABRICKS_HOST before running this POC}"
 : "${DATABRICKS_TOKEN:?Set DATABRICKS_TOKEN before running this POC}"
+: "${DATABRICKS_HTTP_PATH:?Set DATABRICKS_HTTP_PATH before running this POC}"
 : "${FIVETRAN_API_KEY:?Set FIVETRAN_API_KEY before running this POC}"
+: "${FIVETRAN_API_SECRET:?Set FIVETRAN_API_SECRET before running this POC}"
+: "${FIVETRAN_DESTINATION_ID:?Set FIVETRAN_DESTINATION_ID before running this POC}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
