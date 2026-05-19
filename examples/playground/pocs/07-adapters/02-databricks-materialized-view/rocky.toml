@@ -4,12 +4,23 @@ host = "${DATABRICKS_HOST}"
 http_path = "${DATABRICKS_HTTP_PATH}"
 token = "${DATABRICKS_TOKEN}"
 
+# Discovery adapter — Databricks is data-only, so we declare a
+# manual discovery adapter to satisfy the pipeline's discovery
+# binding without enumerating any source tables (the POC only
+# exercises target-side materialized-view DDL, not discovery).
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
 [pipeline.poc]
 strategy = "full_refresh"
 
 [pipeline.poc.source]
 adapter = "databricks_prod"
 catalog = "main"
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
 
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"
