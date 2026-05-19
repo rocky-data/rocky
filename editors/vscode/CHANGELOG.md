@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.0] — 2026-05-19
+
+Codegen-companion release to engine `v1.39.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's `rocky import-dbt` unit-test bridge ([#594](https://github.com/rocky-data/rocky/pull/594)). No new extension commands, UI, or settings — pure codegen cascade.
+
+### Changed
+
+- **Codegen pickup of unit-test counters on `ImportDbtOutput`** (engine `v1.39.0` — [#594](https://github.com/rocky-data/rocky/pull/594)). Regenerated `src/types/generated/import_dbt.ts` adds optional `unit_tests_found?: number | null` / `unit_tests_converted?: number | null` / `unit_tests_skipped?: number | null` on `ImportDbtOutput`. The `ImportWarningCategory` union gains two new variants (`orphan_unit_test`, `unsupported_unit_test_format`). Extension code that consumes `rocky import-dbt --output json` via `rockyJson.ts` now type-checks against the new fields without further hand-edits.
+
 ## [1.22.0] — 2026-05-19
 
 Codegen-companion release to engine `v1.38.0`. The regenerated TypeScript bindings under `src/types/generated/` and the schema mirrors under `editors/vscode/schemas/` pick up six engine-side shape changes from this triple-cut. No new extension commands, UI, or settings — pure codegen cascade.

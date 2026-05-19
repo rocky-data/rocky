@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.0] — 2026-05-19
+
+Companion release to engine `v1.39.0`. Pure codegen cascade plus one test-only tightening — no new dagster API surface. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up the engine's `rocky import-dbt` unit-test bridge ([#594](https://github.com/rocky-data/rocky/pull/594)): `ImportDbtOutput` gains the optional `unit_tests_found / unit_tests_converted / unit_tests_skipped` counters and `ImportWarningCategory` gains two new variants (`orphan_unit_test`, `unsupported_unit_test_format`). Strictly additive — re-exported from `dagster_rocky.types` so existing consumers see no breakage.
+
+### Changed
+
+- **Backlog cap edge-case coverage on `rocky_source_sensor`** ([#504](https://github.com/rocky-data/rocky/pull/504)). Two new test cases pin behavior at the boundary: cap exactly equal to the backlog (skip none, emit all), and cap of 1 with N > 1 tags pending (deterministic ordering by tag-key). No runtime change; this is a regression-pinning addition to the suite that landed alongside FR-015 in v1.36.0.
+
 ## [1.36.0] — 2026-05-19
 
 Companion release to engine `v1.38.0`. Pure codegen cascade — no new dagster API surface. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up six engine-side shape changes from this triple-cut:
