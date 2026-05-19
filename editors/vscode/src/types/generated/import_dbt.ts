@@ -90,6 +90,18 @@ export interface ImportDbtOutput {
   tests_converted_custom: number;
   tests_found: number;
   tests_skipped: number;
+  /**
+   * Number of dbt unit tests written as Rocky `[[test]]` blocks in per-model sidecar TOML files.
+   */
+  unit_tests_converted?: number;
+  /**
+   * Total dbt unit-test definitions (`manifest.unit_tests`) seen across all imported manifests.
+   */
+  unit_tests_found?: number;
+  /**
+   * Number of dbt unit tests dropped — orphan target model, non-`dict` fixture format, or otherwise unsupported shape.
+   */
+  unit_tests_skipped?: number;
   version: string;
   warning_details: ImportDbtWarning[];
   warnings: number;
