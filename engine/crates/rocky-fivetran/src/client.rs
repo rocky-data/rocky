@@ -16,6 +16,9 @@ use crate::envelope::{
 };
 use crate::ratelimit;
 use crate::schema as ft_schema;
+use crate::state_cache::{
+    self, FivetranStateCache, NoCache, WriteOutcome, observability as cache_obs,
+};
 
 /// Percent-encode a single user-supplied URL path component.
 ///
@@ -129,10 +132,17 @@ pub struct FivetranClient {
     /// can be cloned (or shared via `Arc<FivetranClient>`) without
     /// duplicating the cache.
     ///
-    /// The cache is purely in-process — it scopes to the lifetime of
-    /// this client instance. Cross-process / persistent cache layers
-    /// are tracked separately (FR-A; PR-2).
+    /// The cache is the FIRST layer in the three-layer envelope cache:
+    /// (1) in-process memo (this field) → (2) cross-process
+    /// [`FivetranStateCache`](crate::state_cache::FivetranStateCache)
+    /// backend → (3) live Fivetran HTTP. Both layers are bypassed when
+    /// `fetch_envelope(_, refresh = true)` is called.
     envelope_cache: Arc<Mutex<BTreeMap<String, FivetranStateEnvelope>>>,
+    /// Optional persistent state cache (FR-A). When `Some`, layer (2)
+    /// of the three-layer cache; on miss the client falls through to
+    /// the HTTP path, then write-backs to this layer + the in-process
+    /// memo on success. When `None` the cache layer is transparent.
+    state_cache: Arc<dyn FivetranStateCache>,
 }
 
 /// Standard Fivetran API envelope.
@@ -169,6 +179,7 @@ impl FivetranClient {
             account_id_hash,
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            state_cache: Arc::new(NoCache),
         }
     }
 
@@ -242,6 +253,17 @@ impl FivetranClient {
         global_event_bus().emit(evt);
     }
 
+    /// Override the persistent state cache (FR-A). Defaults to
+    /// [`NoCache`] so a client constructed without explicit wiring
+    /// behaves exactly like a pre-FR-A client. Production callers
+    /// thread the configured backend via
+    /// [`state_cache::build_state_cache`].
+    #[must_use]
+    pub fn with_state_cache(mut self, cache: Arc<dyn FivetranStateCache>) -> Self {
+        self.state_cache = cache;
+        self
+    }
+
     /// Creates a client pointing at a custom base URL (for testing with wiremock).
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_base_url(api_key: String, api_secret: String, base_url: String) -> Self {
@@ -261,6 +283,7 @@ impl FivetranClient {
             // chain `.with_ratelimit_dir(...)` after construction.
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            state_cache: Arc::new(NoCache),
         }
     }
 
@@ -286,7 +309,16 @@ impl FivetranClient {
             account_id_hash,
             ratelimit_dir: ratelimit::default_ratelimit_dir(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            state_cache: Arc::new(NoCache),
         }
+    }
+
+    /// Build the canonical cache key for `destination_id` under this
+    /// client's account hash. Exposed via `pub(crate)` so test helpers
+    /// inside the crate can validate cache plumbing without re-deriving
+    /// the encoding.
+    pub(crate) fn cache_key(&self, destination_id: &str) -> String {
+        state_cache::cache_key(&self.account_id_hash, destination_id)
     }
 
     /// Helper: try to consume one retry slot; if exhausted, return `Err(RetryBudgetExhausted)`.
@@ -678,26 +710,40 @@ impl FivetranClient {
 
     /// Fetch (or return memoized) canonical envelope for `destination_id`.
     ///
-    /// First call against a given `destination_id` fans out:
-    ///   1. `GET /v1/destinations/{id}`
-    ///   2. `GET /v1/groups/{id}/connectors` (paginated)
-    ///   3. `GET /v1/connectors/{conn_id}/schemas` for each connector
+    /// Three-layer cache walk:
     ///
-    /// then constructs the envelope (with `fetched_at = Utc::now()`),
-    /// memoizes it under the destination_id key, and returns it.
+    ///   1. In-process memo (this client's [`Self::envelope_cache`]) —
+    ///      `refresh = false`, key present → return clone.
+    ///   2. Cross-process [`FivetranStateCache`] backend (FR-A) —
+    ///      `refresh = false`, primary miss → attempt
+    ///      `state_cache.read(<account_hash>/<destination_id>)`.
+    ///      On hit: hydrate the in-process memo + return.
+    ///      On miss / error: log and fall through.
+    ///   3. Live Fivetran REST API:
+    ///      a. `GET /v1/destinations/{id}`
+    ///      b. `GET /v1/groups/{id}/connectors` (paginated)
+    ///      c. `GET /v1/connectors/{conn_id}/schemas` for each connector
     ///
-    /// Subsequent calls with `refresh = false` return the memoized
-    /// value without issuing any HTTP. `refresh = true` always
-    /// forces a fresh fetch and overwrites the memoized copy.
+    ///      then construct the envelope, write it back to layer (2)
+    ///      AND layer (1), and return.
     ///
-    /// The memoization is purely in-process — scoped to the lifetime
-    /// of this [`FivetranClient`] instance. Cross-process / persistent
-    /// caches are tracked separately (FR-A; PR-2).
+    /// `refresh = true` skips layers (1) and (2) on read and forces a
+    /// fresh HTTP fetch — but still write-backs to both layers on
+    /// success, so a subsequent caller sees the fresh data. This is the
+    /// behavior `rocky discover --no-cache` exposes.
+    ///
+    /// Cache failures (read or write) are fail-open: the HTTP path
+    /// runs regardless and the failure shows up as a span event
+    /// (`fivetran.cache_write_failed`) plus a `warn!` log line.
     pub async fn fetch_envelope(
         &self,
         destination_id: &str,
         refresh: bool,
     ) -> Result<FivetranStateEnvelope, FivetranError> {
+        let cache_key = self.cache_key(destination_id);
+        let backend = self.state_cache.backend();
+
+        // (1) In-process memo — only consulted on non-refresh.
         if !refresh
             && let Some(cached) = self
                 .envelope_cache
@@ -709,6 +755,33 @@ impl FivetranClient {
             return Ok(cached);
         }
 
+        // (2) Cross-process state cache — only consulted on
+        // non-refresh AND when the configured backend isn't NoCache.
+        // (NoCache always returns `Ok(None)` so the check is purely
+        // a perf shortcut to avoid the `read` call.)
+        if !refresh && backend != "none" {
+            match self.state_cache.read(&cache_key).await {
+                Ok(Some(env)) => {
+                    cache_obs::emit_cache_hit(backend, &cache_key, &env);
+                    self.envelope_cache
+                        .lock()
+                        .await
+                        .insert(destination_id.to_string(), env.clone());
+                    return Ok(env);
+                }
+                Ok(None) => cache_obs::emit_cache_miss(backend, &cache_key, "no-entry"),
+                Err(e) => warn!(
+                    backend,
+                    key = cache_key.as_str(),
+                    error = %e,
+                    "fivetran state cache read failed; falling through to API"
+                ),
+            }
+        } else if refresh && backend != "none" {
+            cache_obs::emit_cache_miss(backend, &cache_key, "refresh-forced");
+        }
+
+        // (3) Live API path.
         let destination = self.get_destination(destination_id).await?;
         let connectors = ft_connector::list_connectors(self, destination_id).await?;
 
@@ -749,6 +822,21 @@ impl FivetranClient {
             "fivetran envelope fetched"
         );
 
+        // Write-back to layer (2) — best-effort. A failing cache must
+        // not propagate; the HTTP path already succeeded.
+        if backend != "none" {
+            match self.state_cache.write(&cache_key, &envelope).await {
+                Ok(WriteOutcome::Written) => {
+                    cache_obs::emit_cache_write(backend, &cache_key, &envelope)
+                }
+                Ok(WriteOutcome::SkippedNoChange) => {
+                    cache_obs::emit_cache_write_skipped(backend, &cache_key, "hash-match")
+                }
+                Err(e) => cache_obs::emit_cache_write_failed(backend, &cache_key, &e),
+            }
+        }
+
+        // Write-back to layer (1) — in-process memo.
         self.envelope_cache
             .lock()
             .await

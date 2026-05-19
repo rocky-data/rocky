@@ -25,6 +25,7 @@ pub async fn discover(
     state_path: &Path,
     with_schemas: bool,
     emit_fivetran_state_to: Option<&Path>,
+    no_cache: bool,
     output_json: bool,
 ) -> Result<()> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -182,7 +183,7 @@ pub async fn discover(
     // `[adapter]` table rather than the current pipeline's source so
     // multi-destination projects emit one envelope per destination.
     if let Some(emit_path) = emit_fivetran_state_to {
-        emit_fivetran_state(&rocky_cfg, emit_path).await?;
+        emit_fivetran_state(&rocky_cfg, emit_path, no_cache).await?;
     }
 
     let checks_output = ChecksConfigOutput::from_engine(&pipeline.checks);
@@ -434,9 +435,15 @@ async fn warm_schema_cache_inner(
 ///
 /// The write is idempotent: see [`write_envelope_idempotent`] for the
 /// hash-sentinel + tmp + rename details.
+///
+/// `force_refresh` is wired to the `rocky discover --no-cache` flag.
+/// When `true`, the persistent state cache layer is skipped on read
+/// (envelope comes straight from the API) but still written back so
+/// the next call sees fresh data.
 async fn emit_fivetran_state(
     rocky_cfg: &rocky_core::config::RockyConfig,
     emit_path: &Path,
+    force_refresh: bool,
 ) -> Result<()> {
     let fivetran_adapters: Vec<(&String, &rocky_core::config::AdapterConfig)> = rocky_cfg
         .adapters
@@ -470,13 +477,27 @@ async fn emit_fivetran_state(
             .as_deref()
             .with_context(|| format!("adapters.{name}: destination_id required for fivetran"))?;
 
-        let client = FivetranClient::with_retry(
+        let mut client = FivetranClient::with_retry(
             api_key.to_string(),
             api_secret.to_string(),
             adapter_cfg.retry.clone(),
         );
+
+        // FR-A — instantiate the configured state cache backend. If
+        // the adapter has no `[adapter.<name>.cache]` block this
+        // resolves to a NoCache backend that's transparent on
+        // read/write, so a project that hasn't opted in stays on the
+        // pre-FR-A behavior.
+        if let Some(cache_cfg) = adapter_cfg.cache.as_ref() {
+            let state_cache = rocky_fivetran::state_cache::build_state_cache(cache_cfg)
+                .with_context(|| {
+                    format!("adapters.{name}: failed to build [adapter.{name}.cache] backend")
+                })?;
+            client = client.with_state_cache(state_cache);
+        }
+
         let envelope = client
-            .fetch_envelope(destination_id, false)
+            .fetch_envelope(destination_id, force_refresh)
             .await
             .with_context(|| {
                 format!("fetching Fivetran envelope for adapter '{name}' (destination '{destination_id}')")

@@ -685,6 +685,7 @@ mod tests {
             location: None,
             path: None,
             retry: rocky_core::config::RetryConfig::default(),
+            cache: None,
         }
     }
 

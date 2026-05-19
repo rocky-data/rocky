@@ -24,6 +24,93 @@ class AdapterKind2(StrEnum):
     discovery = "discovery"
 
 
+class FivetranCacheBackend1(StrEnum):
+    """
+    No-op backend; every fetch goes to the Fivetran API. Default when `[adapter.fivetran.cache]` is absent.
+    """
+
+    none = "none"
+
+
+class FivetranCacheBackend2(StrEnum):
+    """
+    Local-filesystem JSON files. Cheapest, no external dependency.
+    """
+
+    file = "file"
+
+
+class FivetranCacheBackend3(StrEnum):
+    """
+    S3 / GCS / Azure / `file://` via the `object_store` crate.
+    """
+
+    object_store = "object_store"
+
+
+class FivetranCacheBackend4(StrEnum):
+    """
+    Valkey / Redis. Requires the `valkey` Cargo feature.
+    """
+
+    valkey = "valkey"
+
+
+class FivetranCacheBackend5(StrEnum):
+    """
+    Valkey (primary) + object_store (secondary). Requires the `valkey` Cargo feature.
+    """
+
+    tiered = "tiered"
+
+
+class FivetranCacheConfig(BaseModel):
+    """
+    Persistent state cache configuration for the Fivetran adapter (FR-A).
+
+    Cache backends shared across processes let several `rocky` invocations against one Fivetran org dedupe their discover fetches — the first process pays the API cost, every subsequent process within the TTL window reads the canonical envelope from the cache. See `engine/crates/rocky-fivetran/src/state_cache/` for the implementation details.
+
+    ## TOML shape
+
+    ```toml [adapter.fivetran.cache] backend = "tiered"                              # "none" | "file" | "object_store" | "valkey" | "tiered" file_root = ".rocky/fivetran-state/"            # required for backend = "file" object_store_url = "s3://my-bucket/rocky/fv/"   # required for backend = "object_store" / "tiered" valkey_url = "rediss://valkey:6379/"            # required for backend = "valkey" / "tiered" valkey_ttl_seconds = 600                        # default 600 ```
+
+    ## Backend selection
+
+    - `none` — disable the cache; default when the block is absent. - `file` — local-filesystem JSON files under `file_root`. - `object_store` — S3 / GCS / Azure / `file://`; URL parsed by `object_store::parse_url`. Credentials come from the SDK default chain (`AWS_*` env vars, IAM role, `GOOGLE_APPLICATION_CREDENTIALS`, etc.) — Rocky doesn't introduce its own credential surface. - `valkey` — Redis / Valkey; requires building rocky-fivetran with the `valkey` Cargo feature. URL accepts `redis://` and `rediss://` (TLS). - `tiered` — composes Valkey (primary, fast) + object-store (secondary, durable). Requires both URLs.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    backend: (
+        FivetranCacheBackend1
+        | FivetranCacheBackend2
+        | FivetranCacheBackend3
+        | FivetranCacheBackend4
+        | FivetranCacheBackend5
+        | None
+    ) = "none"
+    """
+    Which backend to instantiate. Defaults to [`FivetranCacheBackend::None`] so a stub `[adapter.fivetran.cache]` block with no `backend` key is well-defined.
+    """
+    file_root: str | None = None
+    """
+    Root directory for `backend = "file"`. Required for that backend; ignored otherwise. May contain `${VAR}` / `${VAR:-default}` env-var references; resolved at config-load time.
+    """
+    object_store_url: str | None = None
+    """
+    URL passed to `object_store::parse_url` for `backend = "object_store"` or `backend = "tiered"` (secondary layer). Examples: `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`, `file:///path/`.
+    """
+    valkey_ttl_seconds: conint(ge=0) | None = None
+    """
+    TTL applied to every `SET` against the Valkey backend. Defaults to 600s when unset. Ignored for non-Valkey backends.
+    """
+    valkey_url: str | None = None
+    """
+    Connection URL for `backend = "valkey"` or `backend = "tiered"` (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
+    """
+
+
 class RetryConfig(BaseModel):
     """
     Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).
@@ -88,6 +175,12 @@ class AdapterConfig(BaseModel):
     """
     api_key: str | None = None
     api_secret: str | None = None
+    cache: FivetranCacheConfig | None = None
+    """
+    Optional cache backend for the Fivetran state envelope.
+
+    When set on a `type = "fivetran"` adapter, the resolved envelope is read from and written to the configured cache backend so concurrent `rocky` processes share one fetcher per org. Ignored on every other adapter type. When absent the adapter behaves as if `backend = "none"` — every fetch goes straight to the Fivetran API.
+    """
     client_id: str | None = None
     client_secret: str | None = None
     database: str | None = None

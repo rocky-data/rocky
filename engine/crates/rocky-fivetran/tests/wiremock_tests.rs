@@ -1326,3 +1326,200 @@ async fn fetch_envelope_distinct_destinations_dont_share_memo() {
     assert_eq!(two.destination.id, "dest_two");
     drop(server);
 }
+
+// ---------------------------------------------------------------------------
+// FR-A: pluggable state cache integration
+// ---------------------------------------------------------------------------
+
+/// `fetch_envelope` with a pre-populated state cache must serve from
+/// the cache without issuing any HTTP — wiremock mounts every endpoint
+/// with `.expect(0)` so a stray request panics on drop.
+#[tokio::test]
+async fn fetch_envelope_cache_hit_skips_http() {
+    use std::sync::Arc;
+
+    use rocky_fivetran::state_cache::{FileCache, FivetranStateCache};
+
+    let server = MockServer::start().await;
+    // Each endpoint asserts ZERO requests — proves the cache hit
+    // short-circuits the wire entirely.
+    Mock::given(method("GET"))
+        .and(path("/v1/destinations/dest_cached"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_cached/connectors"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache: Arc<dyn FivetranStateCache> =
+        Arc::new(FileCache::new(tmp.path().to_path_buf()).unwrap());
+
+    // Pre-populate the cache as if a prior process had fetched it.
+    // Construct the cache key the way `FivetranClient` will: the
+    // hash is derived from the api_key string `test-api-key`.
+    let account_hash = rocky_fivetran::ratelimit::hash_account_id("test-api-key");
+    let key = format!("{account_hash}/dest_cached");
+    let primed = sample_envelope_for_cache();
+    cache.write(&key, &primed).await.unwrap();
+
+    let client = test_client(&server).with_state_cache(cache);
+    let env = client
+        .fetch_envelope("dest_cached", false)
+        .await
+        .expect("cache hit must serve without HTTP");
+
+    assert_eq!(env.destination.id, primed.destination.id);
+    assert_eq!(env.connectors.len(), primed.connectors.len());
+    // `.expect(0)` enforces no-extra-HTTP on drop.
+    drop(server);
+}
+
+/// Cache-miss path calls HTTP, writes back to the cache, and the next
+/// in-process call hits the in-process memo (zero HTTP on the second
+/// fetch_envelope despite a fresh cache miss for the same destination).
+#[tokio::test]
+async fn fetch_envelope_cache_miss_calls_http_and_writes_back() {
+    use std::sync::Arc;
+
+    use rocky_fivetran::state_cache::{FileCache, FivetranStateCache, WriteOutcome};
+
+    let server = MockServer::start().await;
+    mount_envelope_endpoints_once(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache: Arc<dyn FivetranStateCache> =
+        Arc::new(FileCache::new(tmp.path().to_path_buf()).unwrap());
+
+    let client = test_client(&server).with_state_cache(cache.clone());
+    let env = client.fetch_envelope("dest_memo", false).await.unwrap();
+    assert_eq!(env.destination.id, "dest_memo");
+
+    // Cache populated post-fetch.
+    let account_hash = rocky_fivetran::ratelimit::hash_account_id("test-api-key");
+    let key = format!("{account_hash}/dest_memo");
+    let cached = cache
+        .read(&key)
+        .await
+        .unwrap()
+        .expect("write-back must populate");
+    assert_eq!(cached.destination.id, "dest_memo");
+
+    // Re-writing the same envelope must SkippedNoChange via dedupe.
+    let outcome = cache.write(&key, &cached).await.unwrap();
+    assert_eq!(outcome, WriteOutcome::SkippedNoChange);
+
+    drop(server);
+}
+
+/// `fetch_envelope(_, refresh = true)` (the `--no-cache` path) must
+/// SKIP the cache read but still write-back on success — the next
+/// caller sees the fresh data.
+#[tokio::test]
+async fn fetch_envelope_refresh_skips_cache_read_but_writes_back() {
+    use std::sync::Arc;
+
+    use rocky_fivetran::state_cache::{FileCache, FivetranStateCache};
+
+    let server = MockServer::start().await;
+    // Endpoints expect one hit each — the refresh path must touch the
+    // wire even though the cache is pre-populated with a stale value.
+    Mock::given(method("GET"))
+        .and(path("/v1/destinations/dest_refresh_cache"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "Success",
+                "data": { "id": "dest_refresh_cache", "region": "freshly-fetched-region" }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/groups/dest_refresh_cache/connectors"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "Success",
+                "data": { "items": [], "next_cursor": null }
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache: Arc<dyn FivetranStateCache> =
+        Arc::new(FileCache::new(tmp.path().to_path_buf()).unwrap());
+
+    // Pre-populate cache with stale envelope.
+    let account_hash = rocky_fivetran::ratelimit::hash_account_id("test-api-key");
+    let key = format!("{account_hash}/dest_refresh_cache");
+    let mut stale = sample_envelope_for_cache();
+    stale.destination.id = "dest_refresh_cache".into();
+    stale.destination.region = Some("stale-cached-region".into());
+    cache.write(&key, &stale).await.unwrap();
+
+    let client = test_client(&server).with_state_cache(cache.clone());
+    let fresh = client
+        .fetch_envelope("dest_refresh_cache", true)
+        .await
+        .expect("refresh must succeed via HTTP");
+    assert_eq!(
+        fresh.destination.region,
+        Some("freshly-fetched-region".into())
+    );
+
+    // Write-back must have happened — cache now holds the fresh
+    // envelope.
+    let after = cache.read(&key).await.unwrap().unwrap();
+    assert_eq!(
+        after.destination.region,
+        Some("freshly-fetched-region".into())
+    );
+
+    drop(server);
+}
+
+/// Helper: build a sample envelope a test can pre-write into a cache
+/// to exercise the cache-hit short-circuit.
+fn sample_envelope_for_cache() -> rocky_fivetran::envelope::FivetranStateEnvelope {
+    use std::collections::BTreeMap;
+
+    use chrono::{DateTime, Utc};
+
+    use rocky_fivetran::envelope::{
+        FivetranConnectorStatus, FivetranConnectorSummary, FivetranDestination,
+        FivetranSchemaConfig, FivetranStateEnvelope,
+    };
+
+    FivetranStateEnvelope::from_parts(
+        DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+        FivetranDestination {
+            id: "dest_cached".into(),
+            region: Some("us-east-1".into()),
+            time_zone: None,
+            service: None,
+            setup_status: None,
+        },
+        vec![FivetranConnectorSummary {
+            id: "conn_pre".into(),
+            name: "conn_pre".into(),
+            schema: "src__pre__shopify".into(),
+            service: "shopify".into(),
+            status: FivetranConnectorStatus {
+                setup_state: "connected".into(),
+                sync_state: "scheduled".into(),
+            },
+            paused: false,
+            succeeded_at: None,
+            failed_at: None,
+            group_id: None,
+        }],
+        BTreeMap::<String, FivetranSchemaConfig>::new(),
+    )
+}

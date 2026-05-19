@@ -254,6 +254,17 @@ enum Command {
         /// upstream Fivetran state actually changed.
         #[arg(long, value_name = "PATH")]
         emit_fivetran_state_to: Option<PathBuf>,
+        /// Skip the persistent state cache on read and force a fresh
+        /// API fetch. Successful fetches still write back to the
+        /// cache so a subsequent invocation picks up the fresh data.
+        ///
+        /// Useful when an operator suspects the cache is stale (e.g.
+        /// after rolling a Fivetran credential) and wants the next
+        /// envelope to come straight from the wire. The state-cache
+        /// dependencies are configured via `[adapter.<name>.cache]`
+        /// — see the Fivetran integration docs.
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Generate SQL without executing (dry-run).
@@ -1803,6 +1814,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             with_schemas,
             emit_fivetran_state_to,
+            no_cache,
         } => {
             rocky_cli::commands::discover(
                 &cli.config,
@@ -1810,6 +1822,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &state_path,
                 with_schemas,
                 emit_fivetran_state_to.as_deref(),
+                no_cache,
                 json,
             )
             .await

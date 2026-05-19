@@ -505,6 +505,7 @@ mod tests {
             location: None,
             path: None,
             retry: RetryConfig::default(),
+            cache: None,
         }
     }
 
