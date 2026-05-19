@@ -1523,3 +1523,183 @@ fn sample_envelope_for_cache() -> rocky_fivetran::envelope::FivetranStateEnvelop
         BTreeMap::<String, FivetranSchemaConfig>::new(),
     )
 }
+
+// ---------------------------------------------------------------------------
+// FR-027: tolerate connectors with no schema config in fetch_envelope
+// ---------------------------------------------------------------------------
+
+/// Mount destination + connectors-list shared by the FR-027 tests.
+/// Three connectors: `conn_ok_a`, `conn_ok_b`, `conn_broken`. The
+/// caller mounts the per-connector `/schemas` endpoints with whatever
+/// mix of 200s and 404s the test needs.
+async fn mount_envelope_skeleton_fr027(server: &MockServer, destination_id: &str) {
+    use wiremock::ResponseTemplate;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/destinations/{destination_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "id": destination_id,
+                "region": "us-east-1",
+                "time_zone": "UTC",
+                "service": "snowflake",
+                "setup_status": "connected"
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/groups/{destination_id}/connectors")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [
+                    {
+                        "id": "conn_ok_a",
+                        "group_id": destination_id,
+                        "service": "shopify",
+                        "schema": "src__acme__na__shopify",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "paused": false,
+                        "succeeded_at": "2026-04-10T10:00:00Z",
+                        "failed_at": null
+                    },
+                    {
+                        "id": "conn_ok_b",
+                        "group_id": destination_id,
+                        "service": "stripe",
+                        "schema": "src__acme__na__stripe",
+                        "status": { "setup_state": "connected", "sync_state": "scheduled" },
+                        "paused": false,
+                        "succeeded_at": "2026-04-10T10:00:00Z",
+                        "failed_at": null
+                    },
+                    {
+                        "id": "conn_broken",
+                        "group_id": destination_id,
+                        "service": "marketo",
+                        "schema": "src__acme__na__marketo",
+                        "status": { "setup_state": "incomplete", "sync_state": "paused" },
+                        "paused": true,
+                        "succeeded_at": null,
+                        "failed_at": null
+                    }
+                ],
+                "next_cursor": null
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Mount a 200 `/schemas` response for one connector.
+async fn mount_schema_ok(server: &MockServer, connector_id: &str) {
+    use wiremock::ResponseTemplate;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/connectors/{connector_id}/schemas")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "schemas": {
+                    "src": {
+                        "enabled": true,
+                        "tables": {
+                            "orders": {
+                                "enabled": true,
+                                "sync_mode": "SOFT_DELETE",
+                                "columns": { "id": { "enabled": true, "hashed": false } }
+                            }
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Mount a 404 `NotFound_SchemaConfig` `/schemas` response — the exact
+/// shape Fivetran returns for connectors in `incomplete`/`broken`/
+/// paused-pre-schema state, per FR-027.
+async fn mount_schema_404(server: &MockServer, connector_id: &str) {
+    use wiremock::ResponseTemplate;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/connectors/{connector_id}/schemas")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "code": "NotFound_SchemaConfig",
+            "message": format!("Connection with id '{connector_id}' doesn't have schema config")
+        })))
+        .mount(server)
+        .await;
+}
+
+/// FR-027 acceptance: a mix of healthy + missing-schema-config
+/// connectors must produce a written envelope holding the healthy
+/// ones, while the broken connector still appears in the `connectors`
+/// summary list with its status fields.
+#[tokio::test]
+async fn fetch_envelope_skips_404_schema_connectors() {
+    let server = MockServer::start().await;
+    mount_envelope_skeleton_fr027(&server, "dest_fr027_mixed").await;
+    mount_schema_ok(&server, "conn_ok_a").await;
+    mount_schema_ok(&server, "conn_ok_b").await;
+    mount_schema_404(&server, "conn_broken").await;
+
+    let client = test_client(&server);
+    let env = client
+        .fetch_envelope("dest_fr027_mixed", false)
+        .await
+        .expect("envelope must be written when at least one connector has a schema_config");
+
+    let schema_keys: Vec<&str> = env.schemas.keys().map(String::as_str).collect();
+    assert_eq!(
+        schema_keys,
+        vec!["conn_ok_a", "conn_ok_b"],
+        "broken connector must be excluded from schemas map"
+    );
+    let connector_ids: Vec<&str> = env.connectors.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        connector_ids,
+        vec!["conn_broken", "conn_ok_a", "conn_ok_b"],
+        "broken connector must still appear in connectors summary list"
+    );
+    let broken = env
+        .connectors
+        .iter()
+        .find(|c| c.id == "conn_broken")
+        .expect("broken connector must be in the summary list");
+    assert_eq!(broken.status.setup_state, "incomplete");
+    assert!(broken.paused, "broken connector's status fields preserved");
+
+    drop(server);
+}
+
+/// FR-027 acceptance: when every connector returns 404 the envelope
+/// is not written and the error surfaces as `NoHealthyConnectors`.
+#[tokio::test]
+async fn fetch_envelope_errors_when_all_schemas_404() {
+    let server = MockServer::start().await;
+    mount_envelope_skeleton_fr027(&server, "dest_fr027_all_404").await;
+    mount_schema_404(&server, "conn_ok_a").await;
+    mount_schema_404(&server, "conn_ok_b").await;
+    mount_schema_404(&server, "conn_broken").await;
+
+    let client = test_client(&server);
+    let err = client
+        .fetch_envelope("dest_fr027_all_404", false)
+        .await
+        .expect_err("envelope must error when no connector returns a schema_config");
+
+    match err {
+        FivetranError::NoHealthyConnectors { total } => {
+            assert_eq!(total, 3, "all 3 fetches accounted for in the error");
+        }
+        other => panic!("expected NoHealthyConnectors, got {other:?}"),
+    }
+
+    drop(server);
+}

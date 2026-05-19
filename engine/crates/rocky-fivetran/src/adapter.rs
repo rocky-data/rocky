@@ -121,6 +121,9 @@ fn classify_fivetran_error(err: &FivetranError) -> FailedSourceErrorClass {
         // off and re-attempt on the next discover cycle.
         FivetranError::CircuitOpen => FailedSourceErrorClass::Transient,
         FivetranError::UnexpectedResponse(_) => FailedSourceErrorClass::Unknown,
+        // Per-account upstream state ("every connector 404s on
+        // schema_config"); not a transient transport thing.
+        FivetranError::NoHealthyConnectors { .. } => FailedSourceErrorClass::Unknown,
         // `code` here is either the raw HTTP status display (e.g. "503
         // Service Unavailable") from `client::get`, or the API envelope's
         // `code` field (e.g. "Unauthorized"). Lead-digit + canonical-reason

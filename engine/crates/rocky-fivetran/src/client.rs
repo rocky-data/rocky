@@ -94,6 +94,11 @@ pub enum FivetranError {
 
     #[error("Fivetran circuit breaker open for account; no HTTP attempted")]
     CircuitOpen,
+
+    #[error(
+        "emit-fivetran-state: all {total} connector(s) returned missing schema_config; no healthy connectors found"
+    )]
+    NoHealthyConnectors { total: usize },
 }
 
 /// Wire-decode shape for `GET /v1/destinations/{id}`. The envelope
@@ -1116,11 +1121,47 @@ impl FivetranClient {
                 .buffer_unordered(10)
                 .collect()
                 .await;
+        // Tolerate per-connector 404s from `connectors/{id}/schemas` —
+        // a connector in `incomplete`/`broken`/paused-pre-schema state
+        // returns 404 here as normal upstream signal, not a failure.
+        // Skip the offending connector (it still appears in the
+        // `connectors` summary list with its status fields), WARN with
+        // its id, and abort only when every connector 404s (which
+        // would indicate a credential or quota problem upstream).
+        let total_schema_fetches = schema_results.len();
         let mut schemas: BTreeMap<String, FivetranSchemaConfig> = BTreeMap::new();
+        let mut skipped_count: usize = 0;
         for (conn_id, result) in schema_results {
-            let cfg = result?;
-            schemas.insert(conn_id, project_schema_config(cfg));
+            match result {
+                Ok(cfg) => {
+                    schemas.insert(conn_id, project_schema_config(cfg));
+                }
+                Err(e) if is_missing_schema_config(&e) => {
+                    skipped_count += 1;
+                    tracing::warn!(
+                        target: "rocky_fivetran::emit",
+                        connector_id = %conn_id,
+                        reason = %e,
+                        "emit-fivetran-state: skipping connector (schema_config not available); continuing"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
+        if total_schema_fetches > 0 && schemas.is_empty() {
+            return Err(FivetranError::NoHealthyConnectors {
+                total: total_schema_fetches,
+            });
+        }
+        tracing::info!(
+            target: "rocky_fivetran::emit",
+            written = schemas.len(),
+            skipped = skipped_count,
+            total = total_schema_fetches,
+            "emit-fivetran-state: envelope built ({} connector schemas, {} skipped due to missing schema_config)",
+            schemas.len(),
+            skipped_count
+        );
 
         let summaries: Vec<FivetranConnectorSummary> = connectors
             .into_iter()
@@ -1224,6 +1265,25 @@ fn is_remote_failure(err: &FivetranError) -> bool {
         FivetranError::RateLimited => false, // see doc comment above
         FivetranError::UnexpectedResponse(_) => false, // local decode error
         FivetranError::CircuitOpen => false,
+        // Per-account upstream state, not a transport failure — don't
+        // trip the breaker. A retry on the next discover cycle won't
+        // help unless the operator fixes the connectors upstream.
+        FivetranError::NoHealthyConnectors { .. } => false,
+    }
+}
+
+/// Recognise the missing-schema-config 404 shape from
+/// `GET /v1/connectors/{id}/schemas`. Fivetran returns 404 with a
+/// `NotFound_SchemaConfig` payload for connectors in `incomplete`,
+/// `broken`, or paused-pre-schema states — normal upstream state,
+/// not a failure condition. The HTTP non-success path in
+/// [`FivetranClient::get`] sets `code` to the status display
+/// (e.g. `"404 Not Found"`) so a leading-digit match captures the
+/// whole 404 family from this endpoint.
+fn is_missing_schema_config(err: &FivetranError) -> bool {
+    match err {
+        FivetranError::Api { code, .. } => code.starts_with("404"),
+        _ => false,
     }
 }
 

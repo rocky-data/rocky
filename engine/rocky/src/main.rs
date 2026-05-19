@@ -252,6 +252,14 @@ enum Command {
         /// matches the on-disk value the JSON file is left alone,
         /// so downstream `stat(2)` watchers only fire when the
         /// upstream Fivetran state actually changed.
+        ///
+        /// Connectors whose `connectors/{id}/schemas` endpoint returns
+        /// 404 (state `incomplete`/`broken`/paused-pre-schema, etc.)
+        /// are excluded from the envelope's `schemas` map and logged
+        /// at WARN; they still appear in `connectors` with their
+        /// status fields. Exits non-zero only when every connector
+        /// returns 404, so the envelope count won't always match the
+        /// Fivetran UI total.
         #[arg(long, value_name = "PATH")]
         emit_fivetran_state_to: Option<PathBuf>,
         /// Skip the persistent state cache on read and force a fresh
