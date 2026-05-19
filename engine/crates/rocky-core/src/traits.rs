@@ -341,6 +341,17 @@ pub trait WarehouseAdapter: Send + Sync {
         false
     }
 
+    /// Compute warehouse name, if this adapter has one.
+    ///
+    /// Used by SQL generators that emit `WAREHOUSE = …` clauses (currently
+    /// only Snowflake's `CREATE DYNAMIC TABLE`). Returns `None` for
+    /// adapters without a compute-warehouse concept (Databricks routes
+    /// to a configured SQL endpoint instead, BigQuery is serverless,
+    /// DuckDB is in-process).
+    fn warehouse_name(&self) -> Option<&str> {
+        None
+    }
+
     /// List table names in a given catalog + schema.
     ///
     /// Used by `rocky discover` to verify which tables actually exist
@@ -708,6 +719,50 @@ pub trait SqlDialect: Send + Sync {
 
     /// DROP TABLE IF EXISTS.
     fn drop_table_sql(&self, table_ref: &str) -> String;
+
+    /// `CREATE OR REPLACE VIEW <target> AS <select>`.
+    ///
+    /// SQL views are supported on every Rocky-targeted warehouse — the
+    /// default impl emits the ANSI-portable form. Override only if the
+    /// warehouse uses different syntax (e.g. Trino's connector-gated
+    /// `CREATE OR REPLACE VIEW` semantics).
+    fn view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
+        Ok(format!("CREATE OR REPLACE VIEW {target} AS\n{select_sql}"))
+    }
+
+    /// `CREATE OR REPLACE MATERIALIZED VIEW <target> AS <select>`.
+    ///
+    /// Materialized views are warehouse-managed: the warehouse decides
+    /// when to refresh based on its own scheduler. Default returns an
+    /// error — DuckDB and Trino have no MV equivalent today. Databricks,
+    /// Snowflake, and BigQuery override to emit the warehouse-native form.
+    fn materialized_view_ddl(&self, _target: &str, _select_sql: &str) -> AdapterResult<String> {
+        Err(AdapterError::msg(
+            "MATERIALIZED VIEW strategy is not supported by this warehouse",
+        ))
+    }
+
+    /// `CREATE OR REPLACE DYNAMIC TABLE <target> TARGET_LAG = '<lag>' WAREHOUSE = <wh> AS <select>`.
+    ///
+    /// Dynamic tables are a Snowflake-specific construct: the warehouse
+    /// refreshes the target on a declared lag against its upstream. Default
+    /// returns an error; only the Snowflake adapter overrides.
+    ///
+    /// `target_lag` is a Snowflake lag specifier (e.g. `"1 minute"`,
+    /// `"1 hour"`, `"downstream"`); `warehouse` is the compute warehouse
+    /// that owns refresh execution. Both are validated by the implementation.
+    fn dynamic_table_ddl(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _target_lag: &str,
+        _warehouse: &str,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(
+            "DYNAMIC TABLE strategy is not supported by this warehouse \
+             (Snowflake-only)",
+        ))
+    }
 
     /// CREATE CATALOG IF NOT EXISTS. Returns None if the warehouse
     /// doesn't support catalogs (e.g., DuckDB, Postgres).

@@ -90,6 +90,19 @@ impl DialectKind {
         DialectKind::Snowflake,
     ];
 
+    /// Warehouses that natively support `MATERIALIZED VIEW`. DuckDB has
+    /// no MV equivalent; the dialect's default trait impl surfaces an
+    /// unsupported-dialect error, so the snapshot test skips DuckDB for
+    /// MV fixtures.
+    const MV_SUPPORTED: &'static [DialectKind] = &[
+        DialectKind::Databricks,
+        DialectKind::BigQuery,
+        DialectKind::Snowflake,
+    ];
+
+    /// Warehouses that natively support `DYNAMIC TABLE`. Snowflake only.
+    const SNOWFLAKE_ONLY: &'static [DialectKind] = &[DialectKind::Snowflake];
+
     fn name(self) -> &'static str {
         match self {
             DialectKind::DuckDb => "duckdb",
@@ -123,6 +136,8 @@ enum Entry {
     ReplicationMerge,
     /// `generate_transformation_sql` — transformation, dispatches by strategy.
     Transformation,
+    /// `generate_view_sql` — transformation, plain SQL view.
+    View,
     /// `generate_materialized_view_sql` — transformation, MV.
     MaterializedView,
     /// `generate_dynamic_table_sql` — transformation, Snowflake dynamic table.
@@ -153,6 +168,7 @@ fn run_entry(
         }
         Entry::ReplicationMerge => sql_gen::generate_merge_sql(ir, dialect).map(|s| vec![s]),
         Entry::Transformation => sql_gen::generate_transformation_sql(ir, dialect),
+        Entry::View => sql_gen::generate_view_sql(ir, dialect).map(|s| vec![s]),
         Entry::MaterializedView => {
             sql_gen::generate_materialized_view_sql(ir, dialect).map(|s| vec![s])
         }
@@ -246,7 +262,11 @@ const FIXTURES: &[Fixture] = &[
         name: "07-transformation-materialized-view",
         builder: build_07_transformation_materialized_view,
         entry: Entry::MaterializedView,
-        dialects: DialectKind::ALL,
+        // DuckDB has no materialized-view concept; Wave 1 deliberately
+        // surfaces that as an unsupported-dialect error rather than
+        // emitting wrong SQL. Run the snapshot for the three warehouses
+        // that genuinely support MV.
+        dialects: DialectKind::MV_SUPPORTED,
         recipe_hash: "80307cf6df8abc20560abe3977825195a9ec4322dbce564fbe71f945ee8ad99b",
     },
     Fixture {
@@ -256,8 +276,21 @@ const FIXTURES: &[Fixture] = &[
             target_lag: "1 hour",
             warehouse: "compute_wh",
         },
-        dialects: DialectKind::ALL,
+        // Dynamic tables are Snowflake-only; the other dialects return
+        // the unsupported-dialect error from the default trait impl, which
+        // would fail the golden snapshot test. Pin the snapshot against
+        // Snowflake only.
+        dialects: DialectKind::SNOWFLAKE_ONLY,
         recipe_hash: "c313f449a16b0b08843b0b398cd4b6e66e07a8556794cab642c77f732a7d80a1",
+    },
+    Fixture {
+        name: "13-transformation-view",
+        builder: build_13_transformation_view,
+        entry: Entry::View,
+        // Plain views are supported on every Rocky-targeted warehouse;
+        // the default trait impl emits the ANSI form across all four.
+        dialects: DialectKind::ALL,
+        recipe_hash: "92b8d0b3d664dd74158f30ee293219256a237d035d77cb951d034fcf62b152a1",
     },
     Fixture {
         name: "09-transformation-time-interval-bootstrap",
@@ -632,6 +665,26 @@ fn build_11_transformation_multi_source_join() -> ModelIr {
         None,
     );
     ir.name = Arc::from("fct_order_lines");
+    ir
+}
+
+fn build_13_transformation_view() -> ModelIr {
+    let mut ir = ModelIr::transformation(
+        marts_target("v_active_customers"),
+        MaterializationStrategy::View,
+        vec![SourceRef {
+            catalog: TGT_CATALOG.into(),
+            schema: "marts__demo".into(),
+            table: "dim_customers".into(),
+        }],
+        "SELECT customer_id, name, email FROM tgtwarehouse.marts__demo.dim_customers \
+         WHERE status = 'active'"
+            .into(),
+        baseline_governance(),
+        None,
+        None,
+    );
+    ir.name = Arc::from("v_active_customers");
     ir
 }
 

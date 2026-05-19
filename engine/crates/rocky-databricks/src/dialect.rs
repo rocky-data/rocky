@@ -188,6 +188,16 @@ impl SqlDialect for DatabricksSqlDialect {
         format!("`{name}`")
     }
 
+    fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
+        // Unity Catalog managed materialized views — refresh schedule is
+        // configured server-side via `ALTER MATERIALIZED VIEW … SET
+        // SCHEDULE …`. Rocky emits the `CREATE OR REPLACE` form so the SQL
+        // is idempotent across runs.
+        Ok(format!(
+            "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
+        ))
+    }
+
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
         if columns.is_empty() {
             return Err(AdapterError::msg(
@@ -406,6 +416,44 @@ mod tests {
         assert!(
             sql.contains("table_schema = 'staging__orders'"),
             "sql: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_emits_create_or_replace_view() {
+        let d = dialect();
+        let sql = d.view_ddl("cat.sch.tbl", "SELECT * FROM src").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW cat.sch.tbl AS\nSELECT * FROM src"
+        );
+    }
+
+    #[test]
+    fn test_materialized_view_ddl_emits_create_or_replace_mv() {
+        let d = dialect();
+        let sql = d
+            .materialized_view_ddl(
+                "cat.sch.mv",
+                "SELECT customer_id, SUM(total) FROM orders GROUP BY 1",
+            )
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE MATERIALIZED VIEW cat.sch.mv AS\n\
+             SELECT customer_id, SUM(total) FROM orders GROUP BY 1"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_unsupported_on_databricks() {
+        let d = dialect();
+        let err = d
+            .dynamic_table_ddl("cat.sch.dt", "SELECT 1", "1 minute", "wh")
+            .expect_err("Databricks has no dynamic-table concept");
+        assert!(
+            err.to_string().contains("DYNAMIC TABLE"),
+            "error message should mention DT unsupported: {err}"
         );
     }
 

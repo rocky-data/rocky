@@ -500,6 +500,56 @@
           "type": "object"
         },
         {
+          "description": "SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.",
+          "properties": {
+            "type": {
+              "enum": [
+                "view"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a \"not supported\" error at SQL-gen time.",
+          "properties": {
+            "type": {
+              "enum": [
+                "materialized_view"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Snowflake dynamic table — warehouse manages lag-based refresh. `target_lag` is a Snowflake lag specifier (e.g. `\"1 minute\"`, `\"5 hours\"`, `\"downstream\"`). Non-Snowflake adapters surface a \"not supported\" error at SQL-gen time.",
+          "properties": {
+            "target_lag": {
+              "description": "Snowflake lag specifier — alphanumeric + space only. Examples: `\"1 minute\"`, `\"5 hours\"`, `\"downstream\"`.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "dynamic_table"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "target_lag",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.",
           "properties": {
             "partition_columns": {

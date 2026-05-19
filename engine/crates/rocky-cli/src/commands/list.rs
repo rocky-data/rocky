@@ -116,6 +116,9 @@ pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
                 rocky_core::models::StrategyConfig::Ephemeral => "ephemeral",
                 rocky_core::models::StrategyConfig::Microbatch { .. } => "microbatch",
                 rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
+                rocky_core::models::StrategyConfig::View => "view",
+                rocky_core::models::StrategyConfig::MaterializedView => "materialized_view",
+                rocky_core::models::StrategyConfig::DynamicTable { .. } => "dynamic_table",
             }
             .to_string();
             ListModelEntry {

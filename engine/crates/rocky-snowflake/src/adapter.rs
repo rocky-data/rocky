@@ -38,6 +38,10 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         &self.dialect
     }
 
+    fn warehouse_name(&self) -> Option<&str> {
+        Some(self.connector.warehouse())
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)

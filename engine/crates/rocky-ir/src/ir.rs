@@ -53,7 +53,13 @@ pub enum MaterializationStrategy {
         unique_key: Vec<Arc<str>>,
         update_columns: ColumnSelection,
     },
-    /// Databricks Materialized View — warehouse manages refresh.
+    /// SQL view — no physical storage. Each query against the target
+    /// re-executes the model SELECT. Cheap to refresh, expensive to read
+    /// repeatedly. Supported on every warehouse (`CREATE OR REPLACE VIEW`).
+    View,
+    /// Materialized view — warehouse manages refresh. Supported on
+    /// Databricks, Snowflake, and BigQuery. Adapters that don't support it
+    /// surface a clear error at SQL-gen time.
     MaterializedView,
     /// Snowflake Dynamic Table — warehouse manages lag-based refresh.
     DynamicTable {

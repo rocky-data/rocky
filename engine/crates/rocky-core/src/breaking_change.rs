@@ -775,6 +775,7 @@ fn strategy_tag(s: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::FullRefresh => "full_refresh",
         MaterializationStrategy::Incremental { .. } => "incremental",
         MaterializationStrategy::Merge { .. } => "merge",
+        MaterializationStrategy::View => "view",
         MaterializationStrategy::MaterializedView => "materialized_view",
         MaterializationStrategy::DynamicTable { .. } => "dynamic_table",
         MaterializationStrategy::TimeInterval { .. } => "time_interval",

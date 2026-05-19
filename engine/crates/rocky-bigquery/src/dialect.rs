@@ -210,6 +210,17 @@ impl SqlDialect for BigQueryDialect {
         format!("`{name}`")
     }
 
+    fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
+        // BigQuery supports `CREATE OR REPLACE MATERIALIZED VIEW` as of
+        // GA — the same form Databricks + Snowflake emit. Refresh schedule
+        // is configured via the OPTIONS clause; Rocky's first-pass DDL
+        // leaves it at BigQuery's default (auto-refresh on table change)
+        // so callers can layer refresh-policy DDL on top later.
+        Ok(format!(
+            "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
+        ))
+    }
+
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
         if columns.is_empty() {
             return Err(AdapterError::msg(
@@ -323,6 +334,44 @@ mod tests {
             .unwrap();
         assert!(sql.contains("MERGE INTO"));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT ROW"));
+    }
+
+    #[test]
+    fn test_view_ddl_emits_create_or_replace_view() {
+        let d = BigQueryDialect;
+        let sql = d.view_ddl("`p`.`d`.`v`", "SELECT * FROM src").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW `p`.`d`.`v` AS\nSELECT * FROM src"
+        );
+    }
+
+    #[test]
+    fn test_materialized_view_ddl_emits_create_or_replace_mv() {
+        let d = BigQueryDialect;
+        let sql = d
+            .materialized_view_ddl(
+                "`p`.`d`.`mv`",
+                "SELECT customer_id, SUM(total) FROM orders GROUP BY 1",
+            )
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE MATERIALIZED VIEW `p`.`d`.`mv` AS\n\
+             SELECT customer_id, SUM(total) FROM orders GROUP BY 1"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_unsupported_on_bigquery() {
+        let d = BigQueryDialect;
+        let err = d
+            .dynamic_table_ddl("t", "SELECT 1", "1 minute", "wh")
+            .expect_err("BigQuery has no dynamic-table concept");
+        assert!(
+            err.to_string().contains("DYNAMIC TABLE"),
+            "error message should mention DT unsupported: {err}"
+        );
     }
 
     #[test]

@@ -184,6 +184,16 @@ impl SnowflakeConnector {
         self
     }
 
+    /// Compute warehouse name from the connector config.
+    ///
+    /// Surfaced to the adapter layer via
+    /// [`rocky_core::traits::WarehouseAdapter::warehouse_name`] so SQL
+    /// generators that need the warehouse (e.g. dynamic-table DDL) can
+    /// read it without depending on Snowflake-specific types.
+    pub fn warehouse(&self) -> &str {
+        &self.config.warehouse
+    }
+
     /// Creates a connector that points at a custom base URL (for testing with wiremock).
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]

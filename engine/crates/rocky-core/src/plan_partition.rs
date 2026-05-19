@@ -380,6 +380,9 @@ fn strategy_label(s: &StrategyConfig) -> &'static str {
         StrategyConfig::DeleteInsert { .. } => "delete_insert",
         StrategyConfig::Microbatch { .. } => "microbatch",
         StrategyConfig::ContentAddressed { .. } => "content_addressed",
+        StrategyConfig::View => "view",
+        StrategyConfig::MaterializedView => "materialized_view",
+        StrategyConfig::DynamicTable { .. } => "dynamic_table",
     }
 }
 

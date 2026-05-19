@@ -275,6 +275,26 @@ pub enum StrategyConfig {
         #[serde(default = "default_microbatch_granularity")]
         granularity: TimeGrain,
     },
+    /// SQL view — no physical storage. Every read against the target
+    /// re-runs the model SELECT. Supported on every Rocky-targeted
+    /// warehouse.
+    #[serde(rename = "view")]
+    View,
+    /// Materialized view — warehouse manages refresh. Supported on
+    /// Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a
+    /// "not supported" error at SQL-gen time.
+    #[serde(rename = "materialized_view")]
+    MaterializedView,
+    /// Snowflake dynamic table — warehouse manages lag-based refresh.
+    /// `target_lag` is a Snowflake lag specifier (e.g. `"1 minute"`,
+    /// `"5 hours"`, `"downstream"`). Non-Snowflake adapters surface a
+    /// "not supported" error at SQL-gen time.
+    #[serde(rename = "dynamic_table")]
+    DynamicTable {
+        /// Snowflake lag specifier — alphanumeric + space only. Examples:
+        /// `"1 minute"`, `"5 hours"`, `"downstream"`.
+        target_lag: String,
+    },
     /// Content-addressed write to a Delta UniForm table via the
     /// `rocky-iceberg` writer. The runtime executes the model SQL,
     /// converts the result to Arrow, blake3-hashes the Parquet bytes,
@@ -662,6 +682,11 @@ impl Model {
             } => MaterializationStrategy::ContentAddressed {
                 storage_prefix: storage_prefix.clone(),
                 partition_columns: partition_columns.clone(),
+            },
+            StrategyConfig::View => MaterializationStrategy::View,
+            StrategyConfig::MaterializedView => MaterializationStrategy::MaterializedView,
+            StrategyConfig::DynamicTable { target_lag } => MaterializationStrategy::DynamicTable {
+                target_lag: target_lag.clone(),
             },
         };
 
@@ -1112,6 +1137,89 @@ SELECT id, name, status FROM raw.src
                 update_columns,
                 rocky_ir::ColumnSelection::Explicit(_)
             ));
+        }
+    }
+
+    #[test]
+    fn test_parse_model_view_lowers_to_ir() {
+        // `type = "view"` deserializes via `#[serde(rename = "view")]` on
+        // `StrategyConfig::View` and lowers to `MaterializationStrategy::View`.
+        let content = r#"---toml
+name = "v_active_customers"
+depends_on = ["dim_customers"]
+
+[strategy]
+type = "view"
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "v_active_customers"
+---
+SELECT customer_id, name FROM analytics.marts.dim_customers WHERE status = 'active'
+"#;
+        let model = parse_model_inline(content, "v_active_customers.sql", None).unwrap();
+        assert!(matches!(model.config.strategy, StrategyConfig::View));
+        let ir = model.to_model_ir();
+        assert!(matches!(ir.materialization, MaterializationStrategy::View));
+    }
+
+    #[test]
+    fn test_parse_model_materialized_view_lowers_to_ir() {
+        let content = r#"---toml
+name = "mv_orders_daily"
+
+[strategy]
+type = "materialized_view"
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "mv_orders_daily"
+---
+SELECT DATE(created_at) AS day, COUNT(*) FROM analytics.marts.fct_orders GROUP BY 1
+"#;
+        let model = parse_model_inline(content, "mv_orders_daily.sql", None).unwrap();
+        assert!(matches!(
+            model.config.strategy,
+            StrategyConfig::MaterializedView
+        ));
+        let ir = model.to_model_ir();
+        assert!(matches!(
+            ir.materialization,
+            MaterializationStrategy::MaterializedView
+        ));
+    }
+
+    #[test]
+    fn test_parse_model_dynamic_table_lowers_to_ir() {
+        let content = r#"---toml
+name = "dt_orders_recent"
+
+[strategy]
+type = "dynamic_table"
+target_lag = "1 minute"
+
+[target]
+catalog = "analytics"
+schema = "marts"
+table = "dt_orders_recent"
+---
+SELECT id, customer_id, total FROM analytics.marts.fct_orders
+"#;
+        let model = parse_model_inline(content, "dt_orders_recent.sql", None).unwrap();
+        match &model.config.strategy {
+            StrategyConfig::DynamicTable { target_lag } => {
+                assert_eq!(target_lag, "1 minute");
+            }
+            other => panic!("expected DynamicTable, got {other:?}"),
+        }
+        let ir = model.to_model_ir();
+        match &ir.materialization {
+            MaterializationStrategy::DynamicTable { target_lag } => {
+                assert_eq!(target_lag, "1 minute");
+            }
+            other => panic!("expected IR DynamicTable, got {other:?}"),
         }
     }
 

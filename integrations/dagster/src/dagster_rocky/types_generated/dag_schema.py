@@ -75,7 +75,7 @@ class Type(StrEnum):
     full_refresh = "full_refresh"
 
 
-class StrategyConfig9(BaseModel):
+class StrategyConfig12(BaseModel):
     """
     Materialization strategy for a model, defaulting to full refresh.
     """
@@ -83,54 +83,54 @@ class StrategyConfig9(BaseModel):
     type: Type
 
 
-class Type9(StrEnum):
+class Type12(StrEnum):
     incremental = "incremental"
 
 
-class StrategyConfig10(BaseModel):
+class StrategyConfig13(BaseModel):
     """
     Materialization strategy for a model, defaulting to full refresh.
     """
 
     timestamp_column: str
-    type: Type9
-
-
-class Type10(StrEnum):
-    merge = "merge"
-
-
-class StrategyConfig11(BaseModel):
-    """
-    Materialization strategy for a model, defaulting to full refresh.
-    """
-
-    type: Type10
-    unique_key: list[str]
-    update_columns: list[str] | None = None
-
-
-class Type11(StrEnum):
-    time_interval = "time_interval"
-
-
-class Type12(StrEnum):
-    ephemeral = "ephemeral"
-
-
-class StrategyConfig13(BaseModel):
-    """
-    Ephemeral model — inlined as CTE in downstream queries, no table created.
-    """
-
     type: Type12
 
 
 class Type13(StrEnum):
-    delete_insert = "delete_insert"
+    merge = "merge"
 
 
 class StrategyConfig14(BaseModel):
+    """
+    Materialization strategy for a model, defaulting to full refresh.
+    """
+
+    type: Type13
+    unique_key: list[str]
+    update_columns: list[str] | None = None
+
+
+class Type14(StrEnum):
+    time_interval = "time_interval"
+
+
+class Type15(StrEnum):
+    ephemeral = "ephemeral"
+
+
+class StrategyConfig16(BaseModel):
+    """
+    Ephemeral model — inlined as CTE in downstream queries, no table created.
+    """
+
+    type: Type15
+
+
+class Type16(StrEnum):
+    delete_insert = "delete_insert"
+
+
+class StrategyConfig17(BaseModel):
     """
     Delete+Insert: delete matching rows by partition key, then insert.
     """
@@ -139,18 +139,58 @@ class StrategyConfig14(BaseModel):
     """
     Column(s) used to identify the partition to delete.
     """
-    type: Type13
+    type: Type16
 
 
-class Type14(StrEnum):
+class Type17(StrEnum):
     microbatch = "microbatch"
 
 
-class Type15(StrEnum):
+class Type18(StrEnum):
+    view = "view"
+
+
+class StrategyConfig19(BaseModel):
+    """
+    SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.
+    """
+
+    type: Type18
+
+
+class Type19(StrEnum):
+    materialized_view = "materialized_view"
+
+
+class StrategyConfig20(BaseModel):
+    """
+    Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a "not supported" error at SQL-gen time.
+    """
+
+    type: Type19
+
+
+class Type20(StrEnum):
+    dynamic_table = "dynamic_table"
+
+
+class StrategyConfig21(BaseModel):
+    """
+    Snowflake dynamic table — warehouse manages lag-based refresh. `target_lag` is a Snowflake lag specifier (e.g. `"1 minute"`, `"5 hours"`, `"downstream"`). Non-Snowflake adapters surface a "not supported" error at SQL-gen time.
+    """
+
+    target_lag: str
+    """
+    Snowflake lag specifier — alphanumeric + space only. Examples: `"1 minute"`, `"5 hours"`, `"downstream"`.
+    """
+    type: Type20
+
+
+class Type21(StrEnum):
     content_addressed = "content_addressed"
 
 
-class StrategyConfig16(BaseModel):
+class StrategyConfig22(BaseModel):
     """
     Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.
     """
@@ -163,7 +203,7 @@ class StrategyConfig16(BaseModel):
     """
     Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
     """
-    type: Type15
+    type: Type21
 
 
 class TargetConfig(BaseModel):
@@ -198,7 +238,7 @@ class LineageEdgeRecord(BaseModel):
     """
 
 
-class StrategyConfig12(BaseModel):
+class StrategyConfig15(BaseModel):
     """
     Partition-keyed materialization. Each run targets specific partitions rather than appending past a watermark. Idempotent and backfill-friendly.
 
@@ -225,10 +265,10 @@ class StrategyConfig12(BaseModel):
     """
     Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.
     """
-    type: Type11
+    type: Type14
 
 
-class StrategyConfig15(BaseModel):
+class StrategyConfig18(BaseModel):
     """
     Microbatch: alias for time_interval with hourly defaults. dbt-compatible naming for partition-based incremental processing.
     """
@@ -241,7 +281,7 @@ class StrategyConfig15(BaseModel):
     """
     Timestamp column for micro-batch boundaries.
     """
-    type: Type14
+    type: Type17
 
 
 class DagNodeOutput(BaseModel):
@@ -280,14 +320,17 @@ class DagNodeOutput(BaseModel):
     Pipeline name from `rocky.toml`, if applicable.
     """
     strategy: (
-        StrategyConfig9
-        | StrategyConfig10
-        | StrategyConfig11
-        | StrategyConfig12
+        StrategyConfig12
         | StrategyConfig13
         | StrategyConfig14
         | StrategyConfig15
         | StrategyConfig16
+        | StrategyConfig17
+        | StrategyConfig18
+        | StrategyConfig19
+        | StrategyConfig20
+        | StrategyConfig21
+        | StrategyConfig22
         | None
     ) = None
     """

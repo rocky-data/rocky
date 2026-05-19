@@ -795,9 +795,9 @@ export interface ReplicationPipelineConfig {
    */
   source: PipelineSourceConfig;
   /**
-   * Replication strategy: `"incremental"`, `"full_refresh"`, or `"merge"`.
+   * Replication strategy. Accepted values:
    *
-   * `"merge"` upserts the watermarked delta into the target via `MERGE INTO ... USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set.
+   * - `"incremental"` — append rows past the source-side watermark. - `"full_refresh"` — `CREATE OR REPLACE TABLE … AS SELECT …`. - `"merge"` — upserts the watermarked delta into the target via `MERGE INTO … USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set. - `"view"` — emits a `CREATE OR REPLACE VIEW` over the source. Every read against the target re-runs the SELECT; no row movement. - `"materialized_view"` — warehouse-managed materialized view. Supported on Databricks, Snowflake, and BigQuery; DuckDB/Trino surface an unsupported-dialect error. - `"dynamic_table"` — Snowflake-only. Not configurable at the pipeline level today (the strategy needs a `target_lag` specifier that the pipeline block doesn't expose); declare it on a transformation model's sidecar TOML instead.
    */
   strategy?: string;
   /**
