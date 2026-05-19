@@ -21,6 +21,12 @@ Two commands for migrating off dbt:
 That example shows hand-written before/after equivalents. This POC
 demonstrates the **automated** import path on a real (small) dbt project.
 
+`dbt_project/models/schema.yml` uses the legacy `tests:` key. As of engine
+v1.39.0 the importer also accepts the dbt-1.7+ `data_tests:` spelling on the
+same column tests — swap one for the other and the import is identical.
+See sibling POC `19-import-dbt-unit-tests/` for the manifest path that also
+imports `manifest.unit_tests` entries onto Rocky `[[test]]` sidecars.
+
 ## Layout
 
 ```

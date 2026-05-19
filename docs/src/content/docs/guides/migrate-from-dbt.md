@@ -586,11 +586,16 @@ Then compare row counts, column types, and data values between the dbt-generated
 
 ## 9. Convert dbt Tests to Rocky Tests and Contracts
 
-`rocky import-dbt` already translates the four canonical dbt generic tests into Rocky `[[tests]]` blocks on each model sidecar. Anything beyond that — column-level type/nullability contracts, project-defined generics, singular tests — needs a manual step.
+`rocky import-dbt` translates two kinds of dbt tests onto Rocky sidecars:
+
+- The **four canonical column-level generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) — emitted as `[[tests]]` blocks on each model sidecar.
+- **Unit tests from `manifest.unit_tests`** (dbt 1.8+) — emitted as `[[test]]` blocks on the matching model sidecar. Manifest-only; the regex path does not see unit tests.
+
+Anything else — column-level type/nullability contracts, project-defined generics, singular tests — still needs a manual step.
 
 ### Generic test mapping
 
-For these dbt tests in `schema.yml`:
+For these dbt tests in `schema.yml` (dbt 1.7+ also accepts `data_tests:`, which the importer reads as a synonym for `tests:`):
 
 ```yaml
 models:
@@ -644,6 +649,52 @@ column = "customer_id"
 | `relationships` | `type = "relationships"` + `to_table` + `to_column` + `column` |
 
 Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined generics, model-level tests) is surfaced as an `UnsupportedTest` warning with the model, column, and test name. Rewrite those as a Rocky `expression` test or a quality-pipeline check — the importer does not stub them in the emitted TOML.
+
+### dbt unit tests (manifest path)
+
+If your dbt project has compiled to a `manifest.json` and declares `unit_tests:` blocks (dbt 1.8+), `rocky import-dbt --manifest target/manifest.json` walks `manifest.unit_tests` and emits each entry as a `[[test]]` block in the matching model's sidecar TOML. `ref('upstream_model')` / `source('s', 't')` wrappers on `given.input` are stripped to bare references.
+
+```yaml
+# dbt: models/fct_orders.yml
+unit_tests:
+  - name: stamps_status_when_completed
+    model: fct_orders
+    given:
+      - input: ref('stg_orders')
+        rows:
+          - { order_id: 1, status: 'completed' }
+    expect:
+      format: dict
+      rows:
+        - { order_id: 1, status: 'completed' }
+```
+
+```toml
+# Rocky: models/fct_orders.toml — emitted by `rocky import-dbt`
+[[test]]
+name = "stamps_status_when_completed"
+
+[[test.given]]
+ref = "stg_orders"
+
+[[test.given.rows]]
+order_id = 1
+status = "completed"
+
+[test.expect]
+ordered = false
+
+[[test.expect.rows]]
+order_id = 1
+status = "completed"
+```
+
+The importer also surfaces three new counters on the `--output json` payload and in `MIGRATION-NOTES.md` — `unit_tests_found`, `unit_tests_converted`, `unit_tests_skipped` — plus two warning variants:
+
+- `OrphanUnitTest` — the unit test targets a model the importer didn't pick up. Skipped and counted as skipped.
+- `UnsupportedUnitTestFormat` — `expect.format = "csv"` / `"sql"`, fixture references, or any other shape Rocky's `UnitTestDef` doesn't yet model. Skipped.
+
+CSV / SQL fixtures and `overrides:` blocks are deferred until Rocky's runtime test runner grows the matching surface; emitted `[[test]]` blocks deserialize through Rocky today but aren't yet wired into `rocky test` execution.
 
 ### Column-level contracts (manual)
 

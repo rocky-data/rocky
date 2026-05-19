@@ -1,0 +1,64 @@
+version: 2
+
+# Demonstrates two import-dbt features added in engine v1.39.0:
+#
+#  1. `data_tests:` accepted as an alias for the legacy `tests:` key.
+#     dbt 1.7+ renamed the column-level key; both spellings now flow
+#     into the same canonical-four mapping (unique / not_null /
+#     accepted_values / relationships).
+#
+#  2. `unit_tests:` (declared here for readability; the importer reads
+#     them from `target/manifest.json`'s `unit_tests` block — see
+#     run.sh).
+models:
+  - name: stg_orders
+    description: Staged orders, one row per order, with a normalised status.
+    columns:
+      - name: order_id
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_id
+        data_tests:
+          - not_null
+      - name: status
+        data_tests:
+          - accepted_values:
+              values: ['pending', 'completed', 'shipped']
+
+  - name: fct_revenue
+    description: Per-customer revenue rollup.
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+
+unit_tests:
+  - name: stamps_status_when_completed
+    model: stg_orders
+    description: status normalises to lower-case for any case-mix input
+    given:
+      - input: source('raw', 'orders')
+        rows:
+          - { order_id: 1, customer_id: 100, amount: 50, status: 'Completed' }
+          - { order_id: 2, customer_id: 100, amount: 75, status: 'SHIPPED' }
+    expect:
+      rows:
+        - { order_id: 1, customer_id: 100, amount: 50, status: 'completed' }
+        - { order_id: 2, customer_id: 100, amount: 75, status: 'shipped' }
+      format: dict
+
+  - name: rolls_up_revenue_per_customer
+    model: fct_revenue
+    given:
+      - input: ref('stg_orders')
+        rows:
+          - { order_id: 1, customer_id: 100, amount: 50, status: 'completed' }
+          - { order_id: 2, customer_id: 100, amount: 75, status: 'shipped' }
+          - { order_id: 3, customer_id: 200, amount: 30, status: 'completed' }
+    expect:
+      rows:
+        - { customer_id: 100, total_revenue: 125, order_count: 2 }
+        - { customer_id: 200, total_revenue: 30, order_count: 1 }
+      format: dict

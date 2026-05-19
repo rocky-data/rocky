@@ -132,9 +132,9 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 | [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
 
-### 06 — Developer Experience (17 POCs · DuckDB)
+### 06 — Developer Experience (19 POCs · DuckDB)
 
-Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes.
+Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes, view strategy, dbt unit-test import.
 
 | POC | Feature |
 |---|---|
@@ -155,6 +155,8 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [15-semantic-breaking-change-gate](pocs/06-developer-experience/15-semantic-breaking-change-gate) | `rocky ci-diff --semantic` (informational) + `rocky branch promote --base-ref / --allow-breaking` — pre-promote gate blocks column drops; override is recorded as a `BreakingChangesAllowed` audit event |
 | [16-history-rolling-stats](pocs/06-developer-experience/16-history-rolling-stats) | `rocky history --model <name> --rolling-stats --window N` — per-model mean / std-dev / z-score / composite `health_score` over the rolling window |
 | [17-trace-replay-cost-combo](pocs/06-developer-experience/17-trace-replay-cost-combo) | One `RunRecord`, three views — `rocky trace` + `rocky cost` + `rocky replay` all project from the same run id |
+| [18-view-strategy](pocs/06-developer-experience/18-view-strategy) | `[strategy] type = "view"` — model compiles to `CREATE OR REPLACE VIEW <target>` on every warehouse |
+| [19-import-dbt-unit-tests](pocs/06-developer-experience/19-import-dbt-unit-tests) | `rocky import-dbt --manifest` walks `manifest.unit_tests` into Rocky `[[test]]` sidecars; `data_tests:` accepted as alias for `tests:` on column tests (dbt 1.7+) |
 
 ### 07 — Adapters (7 POCs · mixed)
 
