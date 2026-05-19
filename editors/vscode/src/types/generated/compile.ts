@@ -83,6 +83,22 @@ export type StrategyConfig =
       [k: string]: unknown;
     }
   | {
+      type: "view";
+      [k: string]: unknown;
+    }
+  | {
+      type: "materialized_view";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Snowflake lag specifier — alphanumeric + space only. Examples: `"1 minute"`, `"5 hours"`, `"downstream"`.
+       */
+      target_lag: string;
+      type: "dynamic_table";
+      [k: string]: unknown;
+    }
+  | {
       /**
        * Logical partition column names. Empty for unpartitioned tables. The runtime asserts this matches the table's declared partition columns at materialization time.
        */

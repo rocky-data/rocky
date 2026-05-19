@@ -221,6 +221,12 @@ impl SqlDialect for DuckDbSqlDialect {
         Ok(format!("regexp_matches({column}, '{pattern}')"))
     }
 
+    // `view_ddl` defaults to `CREATE OR REPLACE VIEW <target> AS …`, which
+    // DuckDB accepts natively — no override needed.
+    //
+    // DuckDB has no materialized-view or dynamic-table equivalent; the
+    // default trait impls emit a clear "not supported" error.
+
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
         if columns.is_empty() {
             return Err(AdapterError::msg(
@@ -479,6 +485,73 @@ mod tests {
         assert_eq!(after.rows[0][1].as_str(), Some("new"));
         assert_eq!(after.rows[1][1].as_str(), Some("keep"));
         assert_eq!(after.rows[2][1].as_str(), Some("fresh"));
+    }
+
+    #[test]
+    fn test_view_ddl_emits_create_or_replace_view() {
+        let d = dialect();
+        let sql = d.view_ddl("sch.tbl", "SELECT * FROM src").unwrap();
+        assert_eq!(sql, "CREATE OR REPLACE VIEW sch.tbl AS\nSELECT * FROM src");
+    }
+
+    #[test]
+    fn test_materialized_view_ddl_unsupported_on_duckdb() {
+        let d = dialect();
+        let err = d
+            .materialized_view_ddl("sch.tbl", "SELECT 1")
+            .expect_err("DuckDB has no MV concept");
+        assert!(
+            err.to_string()
+                .contains("MATERIALIZED VIEW strategy is not supported"),
+            "error message should mention MV unsupported: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_unsupported_on_duckdb() {
+        let d = dialect();
+        let err = d
+            .dynamic_table_ddl("sch.tbl", "SELECT 1", "1 minute", "wh")
+            .expect_err("DuckDB has no dynamic-table concept");
+        assert!(
+            err.to_string().contains("DYNAMIC TABLE"),
+            "error message should mention DT unsupported: {err}"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_round_trips_against_live_duckdb() {
+        // Pair the byte-pinned `view_ddl` snapshot with an execute test so
+        // the SQL we generate actually parses+materialises on a live
+        // DuckDB. Mirrors the `test_merge_executes_against_live_duckdb`
+        // pattern in this file (memory:
+        // `feedback_sql_dialect_live_execute_tests`).
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+
+        // Seed a base table the view will read from.
+        conn.execute_sql(
+            "CREATE TABLE src (id INTEGER, name VARCHAR, status VARCHAR);\n\
+             INSERT INTO src VALUES (1, 'a', 'active'), (2, 'b', 'inactive');",
+        )
+        .expect("seed src table");
+
+        // Generate the VIEW DDL the way Rocky's sql_gen would.
+        let view_sql = dialect()
+            .view_ddl(
+                "active_only",
+                "SELECT id, name FROM src WHERE status = 'active'",
+            )
+            .expect("build view DDL");
+
+        conn.execute_sql(&view_sql).expect("VIEW must execute");
+
+        // Verify the view round-trips a query (1 active row).
+        let after = conn
+            .execute_sql("SELECT id, name FROM active_only")
+            .expect("query the view");
+        assert_eq!(after.rows.len(), 1, "view should expose 1 active row");
+        assert_eq!(after.rows[0][1].as_str(), Some("a"));
     }
 
     #[test]

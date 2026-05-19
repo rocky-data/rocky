@@ -154,6 +154,9 @@ pub fn generate_report(
             rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
             rocky_core::models::StrategyConfig::Microbatch { .. } => "microbatch",
             rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
+            rocky_core::models::StrategyConfig::View => "view",
+            rocky_core::models::StrategyConfig::MaterializedView => "materialized_view",
+            rocky_core::models::StrategyConfig::DynamicTable { .. } => "dynamic_table",
         };
         *by_materialization.entry(mat.to_string()).or_default() += 1;
 

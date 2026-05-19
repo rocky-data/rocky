@@ -613,19 +613,19 @@ class Type(StrEnum):
     replication = "replication"
 
 
-class Type17(StrEnum):
+class Type23(StrEnum):
     transformation = "transformation"
 
 
-class Type18(StrEnum):
+class Type24(StrEnum):
     quality = "quality"
 
 
-class Type19(StrEnum):
+class Type25(StrEnum):
     snapshot = "snapshot"
 
 
-class Type20(StrEnum):
+class Type26(StrEnum):
     load = "load"
 
 
@@ -649,51 +649,51 @@ class PortabilityConfig(BaseModel):
     """
 
 
-class Type21(StrEnum):
+class Type27(StrEnum):
     not_null = "not_null"
 
 
-class Type22(StrEnum):
+class Type28(StrEnum):
     unique = "unique"
 
 
-class Type23(StrEnum):
+class Type29(StrEnum):
     accepted_values = "accepted_values"
 
 
-class Type24(StrEnum):
+class Type30(StrEnum):
     relationships = "relationships"
 
 
-class Type25(StrEnum):
+class Type31(StrEnum):
     expression = "expression"
 
 
-class Type26(StrEnum):
+class Type32(StrEnum):
     row_count_range = "row_count_range"
 
 
-class Type27(StrEnum):
+class Type33(StrEnum):
     in_range = "in_range"
 
 
-class Type28(StrEnum):
+class Type34(StrEnum):
     regex_match = "regex_match"
 
 
-class Type29(StrEnum):
+class Type35(StrEnum):
     aggregate = "aggregate"
 
 
-class Type30(StrEnum):
+class Type36(StrEnum):
     composite = "composite"
 
 
-class Type31(StrEnum):
+class Type37(StrEnum):
     not_in_future = "not_in_future"
 
 
-class Type32(StrEnum):
+class Type38(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -1416,7 +1416,7 @@ class QualityAssertion1(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type21
+    type: Type27
 
 
 class QualityAssertion2(BaseModel):
@@ -1448,7 +1448,7 @@ class QualityAssertion2(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type22
+    type: Type28
 
 
 class QualityAssertion3(BaseModel):
@@ -1480,7 +1480,7 @@ class QualityAssertion3(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type23
+    type: Type29
     values: list[str]
     """
     The allowed values. Compared as string literals.
@@ -1524,7 +1524,7 @@ class QualityAssertion4(BaseModel):
     """
     Fully-qualified target table (`catalog.schema.table`).
     """
-    type: Type24
+    type: Type30
 
 
 class QualityAssertion5(BaseModel):
@@ -1560,7 +1560,7 @@ class QualityAssertion5(BaseModel):
     """
     A SQL boolean expression. Rows where `NOT (expression)` are failures.
     """
-    type: Type25
+    type: Type31
 
 
 class QualityAssertion6(BaseModel):
@@ -1600,7 +1600,7 @@ class QualityAssertion6(BaseModel):
     """
     Minimum row count (inclusive). `None` means no lower bound.
     """
-    type: Type26
+    type: Type32
 
 
 class QualityAssertion7(BaseModel):
@@ -1642,7 +1642,7 @@ class QualityAssertion7(BaseModel):
     """
     Minimum value (inclusive). `None` means no lower bound.
     """
-    type: Type27
+    type: Type33
 
 
 class QualityAssertion8(BaseModel):
@@ -1682,7 +1682,7 @@ class QualityAssertion8(BaseModel):
     """
     The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
     """
-    type: Type28
+    type: Type34
 
 
 class QualityAssertion9(BaseModel):
@@ -1724,7 +1724,7 @@ class QualityAssertion9(BaseModel):
     """
     Aggregate operator.
     """
-    type: Type29
+    type: Type35
     value: str
     """
     Threshold to compare against. Parsed as `f64`.
@@ -1770,7 +1770,7 @@ class QualityAssertion10(BaseModel):
     """
     The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
     """
-    type: Type30
+    type: Type36
 
 
 class QualityAssertion11(BaseModel):
@@ -1802,7 +1802,7 @@ class QualityAssertion11(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type31
+    type: Type37
 
 
 class QualityAssertion12(BaseModel):
@@ -1838,7 +1838,7 @@ class QualityAssertion12(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type32
+    type: Type38
 
 
 class QuarantineConfig(BaseModel):
@@ -2198,9 +2198,9 @@ class ReplicationPipelineConfig(BaseModel):
     """
     strategy: str | None = "incremental"
     """
-    Replication strategy: `"incremental"`, `"full_refresh"`, or `"merge"`.
+    Replication strategy. Accepted values:
 
-    `"merge"` upserts the watermarked delta into the target via `MERGE INTO ... USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set.
+    - `"incremental"` — append rows past the source-side watermark. - `"full_refresh"` — `CREATE OR REPLACE TABLE … AS SELECT …`. - `"merge"` — upserts the watermarked delta into the target via `MERGE INTO … USING (delta) ON merge_keys WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or `merge_keys_fallback`) to be set. - `"view"` — emits a `CREATE OR REPLACE VIEW` over the source. Every read against the target re-runs the SELECT; no row movement. - `"materialized_view"` — warehouse-managed materialized view. Supported on Databricks, Snowflake, and BigQuery; DuckDB/Trino surface an unsupported-dialect error. - `"dynamic_table"` — Snowflake-only. Not configurable at the pipeline level today (the strategy needs a `target_lag` specifier that the pipeline block doesn't expose); declare it on a transformation model's sidecar TOML instead.
     """
     table_overrides: list[TableOverride] | None = None
     """
@@ -2464,7 +2464,7 @@ class PipelineConfig3(QualityPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type18
+    type: Type24
 
 
 class PipelineConfig5(LoadPipelineConfig):
@@ -2472,7 +2472,7 @@ class PipelineConfig5(LoadPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type20
+    type: Type26
 
 
 class SnapshotPipelineConfig(BaseModel):
@@ -2606,7 +2606,7 @@ class PipelineConfig2(TransformationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type17
+    type: Type23
 
 
 class PipelineConfig4(SnapshotPipelineConfig):
@@ -2614,7 +2614,7 @@ class PipelineConfig4(SnapshotPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type19
+    type: Type25
 
 
 class RockyConfig(BaseModel):

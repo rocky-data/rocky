@@ -1,0 +1,26 @@
+{
+  "name": "v_active_customers",
+  "sql": "SELECT customer_id, name, email FROM tgtwarehouse.marts__demo.dim_customers WHERE status = 'active'",
+  "typed_columns": [],
+  "lineage_edges": [],
+  "materialization": {
+    "strategy": "View"
+  },
+  "governance": {
+    "permissions_file": null,
+    "auto_create_catalogs": false,
+    "auto_create_schemas": false
+  },
+  "target": {
+    "catalog": "tgtwarehouse",
+    "schema": "marts__demo",
+    "table": "v_active_customers"
+  },
+  "sources": [
+    {
+      "catalog": "tgtwarehouse",
+      "schema": "marts__demo",
+      "table": "dim_customers"
+    }
+  ]
+}

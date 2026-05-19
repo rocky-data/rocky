@@ -215,9 +215,15 @@ pub fn generate_merge_sql(
 /// Returns `Vec<String>` rather than `String` because some materialization
 /// strategies (notably `time_interval`) decompose into multiple statements
 /// that the runtime must execute in order. For single-statement strategies
-/// (`FullRefresh`, `Incremental`, `Merge`, `MaterializedView`) the vec
-/// contains exactly one entry; callers that need a single string can pattern-
-/// match `&[only]` or call `.join("\n")` if cosmetic concatenation is fine.
+/// (`FullRefresh`, `Incremental`, `Merge`, `View`, `MaterializedView`) the
+/// vec contains exactly one entry; callers that need a single string can
+/// pattern-match `&[only]` or call `.join("\n")` if cosmetic concatenation
+/// is fine.
+///
+/// `DynamicTable` requires the warehouse name; this entry returns an
+/// `InvalidRequest` for that strategy and points callers at
+/// [`generate_transformation_sql_with_warehouse`] (or the direct
+/// [`generate_dynamic_table_sql`]) for the wired-up path.
 ///
 /// # Errors
 ///
@@ -226,6 +232,28 @@ pub fn generate_merge_sql(
 pub fn generate_transformation_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
+) -> Result<Vec<String>, SqlGenError> {
+    generate_transformation_sql_with_warehouse(model_ir, dialect, None)
+}
+
+/// Generates transformation SQL using the given dialect, with an optional
+/// compute-warehouse name for Snowflake `DynamicTable` strategies.
+///
+/// Same as [`generate_transformation_sql`] for every other strategy.
+/// `warehouse` is read from the adapter via
+/// [`crate::traits::WarehouseAdapter::warehouse_name`] at the runner
+/// dispatch site and passed through; non-Snowflake adapters return `None`
+/// and `DynamicTable` falls through to the dialect's unsupported error.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// a transformation-variant [`ModelIr`], or when `DynamicTable` is the
+/// strategy but `warehouse` is `None`.
+pub fn generate_transformation_sql_with_warehouse(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    warehouse: Option<&str>,
 ) -> Result<Vec<String>, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
@@ -282,16 +310,21 @@ pub fn generate_transformation_sql(
             let stmt = dialect.merge_into(&target, &model_ir.sql, unique_key, update_columns)?;
             Ok(vec![stmt])
         }
+        MaterializationStrategy::View => Ok(vec![generate_view_sql(model_ir, dialect)?]),
         MaterializationStrategy::MaterializedView => {
             Ok(vec![generate_materialized_view_sql(model_ir, dialect)?])
         }
-        MaterializationStrategy::DynamicTable { .. } => {
-            // Dynamic tables require a warehouse parameter not available in the plan.
-            // Use generate_dynamic_table_sql directly when warehouse is known.
-            Err(SqlGenError::InvalidRequest(
-                "DynamicTable strategy requires calling generate_dynamic_table_sql with warehouse parameter".to_string(),
-            ))
-        }
+        MaterializationStrategy::DynamicTable { target_lag } => match warehouse {
+            Some(wh) => Ok(vec![generate_dynamic_table_sql(
+                model_ir, target_lag, wh, dialect,
+            )?]),
+            None => Err(SqlGenError::InvalidRequest(
+                "DynamicTable strategy requires a Snowflake compute warehouse — \
+                 call generate_transformation_sql_with_warehouse(... , Some(<wh>)) \
+                 or generate_dynamic_table_sql directly"
+                    .to_string(),
+            )),
+        },
         MaterializationStrategy::TimeInterval {
             time_column,
             window,
@@ -517,7 +550,39 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
     )
 }
 
+/// Generates CREATE OR REPLACE VIEW SQL for a transformation model.
+///
+/// Delegates to the dialect's [`SqlDialect::view_ddl`] so per-warehouse
+/// quirks can be expressed there; the default trait impl emits the
+/// ANSI-portable form, which every Rocky-targeted warehouse accepts.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// a transformation-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
+pub fn generate_view_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<String, SqlGenError> {
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
+    let target = dialect.format_table_ref(
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
+    )?;
+
+    Ok(dialect.view_ddl(&target, &model_ir.sql)?)
+}
+
 /// Generates CREATE MATERIALIZED VIEW SQL for a transformation model.
+///
+/// Delegates to the dialect's [`SqlDialect::materialized_view_ddl`] so
+/// per-warehouse quirks (refresh-policy DDL, MV vs. streaming-table)
+/// stay in the dialect. The default trait impl returns an unsupported
+/// error — warehouses without an MV concept (DuckDB, Trino) surface that
+/// at SQL-gen time rather than silently emitting wrong SQL.
 ///
 /// # Errors
 ///
@@ -536,13 +601,14 @@ pub fn generate_materialized_view_sql(
         &model_ir.target.table,
     )?;
 
-    Ok(format!(
-        "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{sql}",
-        sql = model_ir.sql
-    ))
+    Ok(dialect.materialized_view_ddl(&target, &model_ir.sql)?)
 }
 
 /// Generates CREATE DYNAMIC TABLE SQL for a transformation model (Snowflake).
+///
+/// Delegates to the dialect's [`SqlDialect::dynamic_table_ddl`]. The
+/// Snowflake adapter is the only one that overrides; others return a
+/// clear unsupported error so misconfigured projects fail loud.
 ///
 /// # Errors
 ///
@@ -563,14 +629,7 @@ pub fn generate_dynamic_table_sql(
         &model_ir.target.table,
     )?;
 
-    // Validate target_lag and warehouse to prevent injection
-    validate_sql_type(target_lag)?;
-    validation::validate_identifier(warehouse)?;
-
-    Ok(format!(
-        "CREATE OR REPLACE DYNAMIC TABLE {target}\n  TARGET_LAG = '{target_lag}'\n  WAREHOUSE = {warehouse}\nAS\n{sql}",
-        sql = model_ir.sql
-    ))
+    Ok(dialect.dynamic_table_ddl(&target, &model_ir.sql, target_lag, warehouse)?)
 }
 
 /// Regenerate `(purpose, sql)` pairs for a `rocky compact` plan from its
@@ -1061,6 +1120,44 @@ mod tests {
             Ok(vec![format!(
                 "INSERT INTO {target} REPLACE WHERE {partition_filter}\n{select_sql}"
             )])
+        }
+
+        fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
+            // Mirror Databricks/Snowflake/BigQuery emitted form so the
+            // in-crate sql_gen tests can byte-pin without depending on
+            // the per-warehouse dialect crates.
+            Ok(format!(
+                "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
+            ))
+        }
+
+        fn dynamic_table_ddl(
+            &self,
+            target: &str,
+            select_sql: &str,
+            target_lag: &str,
+            warehouse: &str,
+        ) -> AdapterResult<String> {
+            // Same shape the Snowflake dialect emits — TestDialect
+            // mirrors the cross-warehouse "happy path" for the sql_gen
+            // dispatch tests. Validate target_lag with the same alphanumeric
+            // + space allowlist the Snowflake dialect uses so injection
+            // tests covering `generate_dynamic_table_sql` still trip.
+            if target_lag.is_empty()
+                || !target_lag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ' ')
+            {
+                return Err(AdapterError::msg(format!(
+                    "invalid target_lag: {target_lag:?}"
+                )));
+            }
+            rocky_sql::validation::validate_identifier(warehouse).map_err(AdapterError::new)?;
+            Ok(format!(
+                "CREATE OR REPLACE DYNAMIC TABLE {target}\n  \
+                 TARGET_LAG = '{target_lag}'\n  \
+                 WAREHOUSE = {warehouse}\nAS\n{select_sql}"
+            ))
         }
     }
 

@@ -164,6 +164,19 @@ impl SqlDialect for TrinoDialect {
         ])
     }
 
+    // `view_ddl` defaults to `CREATE OR REPLACE VIEW <target> AS …`,
+    // which Trino accepts natively (connector-gated — Iceberg + Hive
+    // both support it) so the default impl is correct here.
+    //
+    // `materialized_view_ddl` defaults to a fail-loud error. Trino has
+    // materialized-view support through its `system` catalog for some
+    // connectors, but the surface is heterogeneous and Rocky v0 hasn't
+    // wired it up; falling back to the trait default keeps the error
+    // surface honest.
+    //
+    // `dynamic_table_ddl` is Snowflake-specific; the default error is
+    // the right behaviour for Trino.
+
     // `quote_identifier` defaults to `"name"` on the trait, which is
     // exactly Trino's quoting style — leaving the default intact.
 
@@ -304,6 +317,42 @@ mod tests {
         assert_eq!(
             d.tablesample_clause(10).unwrap(),
             "TABLESAMPLE BERNOULLI (10)"
+        );
+    }
+
+    #[test]
+    fn view_ddl_emits_create_or_replace_view() {
+        let d = TrinoDialect::new();
+        let sql = d
+            .view_ddl("\"c\".\"s\".\"v\"", "SELECT * FROM src")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW \"c\".\"s\".\"v\" AS\nSELECT * FROM src"
+        );
+    }
+
+    #[test]
+    fn materialized_view_ddl_unsupported_on_trino() {
+        let d = TrinoDialect::new();
+        let err = d
+            .materialized_view_ddl("\"c\".\"s\".\"mv\"", "SELECT 1")
+            .expect_err("Trino v0 doesn't wire MV");
+        assert!(
+            err.to_string().contains("MATERIALIZED VIEW"),
+            "error message should mention MV unsupported: {err}"
+        );
+    }
+
+    #[test]
+    fn dynamic_table_ddl_unsupported_on_trino() {
+        let d = TrinoDialect::new();
+        let err = d
+            .dynamic_table_ddl("\"c\".\"s\".\"dt\"", "SELECT 1", "1 minute", "wh")
+            .expect_err("Trino has no dynamic-table concept");
+        assert!(
+            err.to_string().contains("DYNAMIC TABLE"),
+            "error message should mention DT unsupported: {err}"
         );
     }
 

@@ -222,6 +222,42 @@ impl SqlDialect for SnowflakeSqlDialect {
         format!("\"{name}\"")
     }
 
+    fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
+        Ok(format!(
+            "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
+        ))
+    }
+
+    fn dynamic_table_ddl(
+        &self,
+        target: &str,
+        select_sql: &str,
+        target_lag: &str,
+        warehouse: &str,
+    ) -> AdapterResult<String> {
+        // `target_lag` is a Snowflake lag specifier — accepted values are
+        // either a duration string like `"1 minute"` / `"5 hours"` or the
+        // literal `"downstream"`. Hand-validate the allowlist here rather
+        // than reaching into rocky-core (which would invert the layering):
+        // alphanumeric + space only, non-empty.
+        if target_lag.is_empty()
+            || !target_lag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ' ')
+        {
+            return Err(AdapterError::msg(format!(
+                "invalid target_lag for Snowflake dynamic table: {target_lag:?} \
+                 (expected e.g. \"1 minute\", \"5 hours\", or \"downstream\")"
+            )));
+        }
+        validation::validate_identifier(warehouse).map_err(AdapterError::new)?;
+        Ok(format!(
+            "CREATE OR REPLACE DYNAMIC TABLE {target}\n  \
+             TARGET_LAG = '{target_lag}'\n  \
+             WAREHOUSE = {warehouse}\nAS\n{select_sql}"
+        ))
+    }
+
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
         if columns.is_empty() {
             return Err(AdapterError::msg(
@@ -425,6 +461,93 @@ mod tests {
         let d = dialect();
         // Identifier-injection attempt: column name carrying a quote.
         assert!(d.row_hash_expr(&["a\"; DROP TABLE x; --".into()]).is_err());
+    }
+
+    #[test]
+    fn test_view_ddl_emits_create_or_replace_view() {
+        let d = dialect();
+        let sql = d
+            .view_ddl("\"db\".\"sch\".\"v\"", "SELECT * FROM src")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW \"db\".\"sch\".\"v\" AS\nSELECT * FROM src"
+        );
+    }
+
+    #[test]
+    fn test_materialized_view_ddl_emits_create_or_replace_mv() {
+        let d = dialect();
+        let sql = d
+            .materialized_view_ddl(
+                "\"db\".\"sch\".\"mv\"",
+                "SELECT customer_id, SUM(total) FROM orders GROUP BY 1",
+            )
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE MATERIALIZED VIEW \"db\".\"sch\".\"mv\" AS\n\
+             SELECT customer_id, SUM(total) FROM orders GROUP BY 1"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_threads_warehouse() {
+        let d = dialect();
+        let sql = d
+            .dynamic_table_ddl(
+                "\"db\".\"sch\".\"dt\"",
+                "SELECT id, value FROM src",
+                "1 minute",
+                "compute_wh",
+            )
+            .unwrap();
+        // Pin the exact Snowflake syntax — refresh-policy clause + WAREHOUSE
+        // ident is positional-required.
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE DYNAMIC TABLE \"db\".\"sch\".\"dt\"\n  \
+             TARGET_LAG = '1 minute'\n  \
+             WAREHOUSE = compute_wh\nAS\n\
+             SELECT id, value FROM src"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_rejects_target_lag_injection() {
+        let d = dialect();
+        // Single-quote injection — the lag specifier is interpolated into a
+        // single-quoted SQL string so a free quote would break out.
+        let err = d
+            .dynamic_table_ddl("t", "SELECT 1", "1'; DROP TABLE x; --", "wh")
+            .expect_err("rejects target_lag carrying quotes");
+        assert!(
+            err.to_string().to_lowercase().contains("target_lag"),
+            "error should mention target_lag: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_rejects_empty_target_lag() {
+        let d = dialect();
+        let err = d
+            .dynamic_table_ddl("t", "SELECT 1", "", "wh")
+            .expect_err("rejects empty target_lag");
+        assert!(
+            err.to_string().to_lowercase().contains("target_lag"),
+            "error should mention target_lag: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_table_ddl_rejects_warehouse_injection() {
+        let d = dialect();
+        let err = d
+            .dynamic_table_ddl("t", "SELECT 1", "1 minute", "wh; DROP TABLE x; --")
+            .expect_err("rejects warehouse carrying SQL");
+        // The identifier-validation error message; just make sure we
+        // surface SOMETHING rather than emitting the bad SQL.
+        let _ = err;
     }
 
     #[test]

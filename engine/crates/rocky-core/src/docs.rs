@@ -75,6 +75,9 @@ fn strategy_label(strategy: &StrategyConfig) -> String {
         StrategyConfig::DeleteInsert { .. } => "delete_insert".into(),
         StrategyConfig::Microbatch { .. } => "microbatch".into(),
         StrategyConfig::ContentAddressed { .. } => "content_addressed".into(),
+        StrategyConfig::View => "view".into(),
+        StrategyConfig::MaterializedView => "materialized_view".into(),
+        StrategyConfig::DynamicTable { .. } => "dynamic_table".into(),
     }
 }
 

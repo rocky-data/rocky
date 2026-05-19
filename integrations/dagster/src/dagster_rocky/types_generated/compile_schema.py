@@ -211,10 +211,50 @@ class Type6(StrEnum):
 
 
 class Type7(StrEnum):
-    content_addressed = "content_addressed"
+    view = "view"
 
 
 class StrategyConfig8(BaseModel):
+    """
+    SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.
+    """
+
+    type: Type7
+
+
+class Type8(StrEnum):
+    materialized_view = "materialized_view"
+
+
+class StrategyConfig9(BaseModel):
+    """
+    Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a "not supported" error at SQL-gen time.
+    """
+
+    type: Type8
+
+
+class Type9(StrEnum):
+    dynamic_table = "dynamic_table"
+
+
+class StrategyConfig10(BaseModel):
+    """
+    Snowflake dynamic table — warehouse manages lag-based refresh. `target_lag` is a Snowflake lag specifier (e.g. `"1 minute"`, `"5 hours"`, `"downstream"`). Non-Snowflake adapters surface a "not supported" error at SQL-gen time.
+    """
+
+    target_lag: str
+    """
+    Snowflake lag specifier — alphanumeric + space only. Examples: `"1 minute"`, `"5 hours"`, `"downstream"`.
+    """
+    type: Type9
+
+
+class Type10(StrEnum):
+    content_addressed = "content_addressed"
+
+
+class StrategyConfig11(BaseModel):
     """
     Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.
     """
@@ -227,7 +267,7 @@ class StrategyConfig8(BaseModel):
     """
     Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
     """
-    type: Type7
+    type: Type10
 
 
 class TargetConfig(BaseModel):
@@ -369,6 +409,9 @@ class ModelDetail(BaseModel):
         | StrategyConfig6
         | StrategyConfig7
         | StrategyConfig8
+        | StrategyConfig9
+        | StrategyConfig10
+        | StrategyConfig11
     )
     """
     Materialization strategy as the wire-shape `StrategyConfig` (`{"type": "...", ...}`).

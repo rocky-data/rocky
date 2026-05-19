@@ -1,0 +1,8 @@
+depends_on = ["dim_customers"]
+
+[strategy]
+type = "view"
+
+[target]
+catalog = "poc"
+schema = "marts"

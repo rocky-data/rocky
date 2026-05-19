@@ -3910,7 +3910,14 @@ pub(crate) async fn execute_models(
                 }
             }
 
-            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect)?;
+            // Thread the Snowflake compute warehouse (when applicable) so
+            // `DynamicTable` strategies can emit `WAREHOUSE = …`. Other
+            // adapters return `None` and the helper short-circuits.
+            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
+                &model_ir,
+                dialect,
+                warehouse.warehouse_name(),
+            )?;
 
             info!(
                 model = model_name.as_str(),
@@ -4020,6 +4027,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
         MaterializationStrategy::FullRefresh => "full_refresh",
         MaterializationStrategy::Incremental { .. } => "incremental",
         MaterializationStrategy::Merge { .. } => "merge",
+        MaterializationStrategy::View => "view",
         MaterializationStrategy::MaterializedView => "materialized_view",
         MaterializationStrategy::DynamicTable { .. } => "dynamic_table",
         MaterializationStrategy::TimeInterval { .. } => "time_interval",
@@ -4535,6 +4543,17 @@ fn build_replication_strategy_with_override(
                 update_columns: ColumnSelection::All,
             })
         }
+        "view" => Ok(MaterializationStrategy::View),
+        "materialized_view" => Ok(MaterializationStrategy::MaterializedView),
+        // `dynamic_table` requires a target_lag specifier — the
+        // replication pipeline doesn't currently expose one, so we
+        // surface a clear error rather than silently dropping to
+        // full-refresh.
+        "dynamic_table" => Err(anyhow::anyhow!(
+            "dynamic_table strategy is not configurable from a replication pipeline \
+             without a target_lag specifier — declare it on a transformation model's \
+             sidecar TOML instead"
+        )),
         _ => Ok(MaterializationStrategy::FullRefresh),
     }
 }
@@ -4858,13 +4877,94 @@ async fn process_table(
                 strategy_name = "merge";
                 sql_gen::generate_merge_sql(&model_ir, dialect)?
             }
-            MaterializationStrategy::MaterializedView => {
-                strategy_name = "materialized_view";
-                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
+            MaterializationStrategy::View => {
+                // Views on a replication table create a thin DDL pointing
+                // at the source; no row movement. Only useful when the
+                // user wants a "passthrough" replication endpoint.
+                strategy_name = "view";
+                // Reuse the transformation dispatch — the strategy is the
+                // same shape on either pipeline kind. We hand-build the
+                // SELECT * FROM <source> here so `generate_view_sql`'s
+                // Transformation-variant guard is satisfied via a wrapper.
+                let select = dialect.select_clause(
+                    model_ir
+                        .columns
+                        .as_ref()
+                        .expect("Replication variant guarantees columns"),
+                    &model_ir.metadata_columns,
+                )?;
+                let source = model_ir
+                    .source
+                    .as_ref()
+                    .expect("Replication variant guarantees source");
+                let source_ref =
+                    dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+                let view_target = dialect.format_table_ref(
+                    &model_ir.target.catalog,
+                    &model_ir.target.schema,
+                    &model_ir.target.table,
+                )?;
+                let body = format!("{select}\nFROM {source_ref}");
+                dialect.view_ddl(&view_target, &body)?
             }
-            MaterializationStrategy::DynamicTable { .. } => {
+            MaterializationStrategy::MaterializedView => {
+                // Dispatch to the dialect's MV generator so DuckDB / Trino
+                // fail loud rather than silently emitting plain CTAS.
+                strategy_name = "materialized_view";
+                let select = dialect.select_clause(
+                    model_ir
+                        .columns
+                        .as_ref()
+                        .expect("Replication variant guarantees columns"),
+                    &model_ir.metadata_columns,
+                )?;
+                let source = model_ir
+                    .source
+                    .as_ref()
+                    .expect("Replication variant guarantees source");
+                let source_ref =
+                    dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+                let mv_target = dialect.format_table_ref(
+                    &model_ir.target.catalog,
+                    &model_ir.target.schema,
+                    &model_ir.target.table,
+                )?;
+                let body = format!("{select}\nFROM {source_ref}");
+                dialect.materialized_view_ddl(&mv_target, &body)?
+            }
+            MaterializationStrategy::DynamicTable { target_lag } => {
+                // Snowflake-only on the replication path. Threading the
+                // warehouse from the adapter mirrors the transformation
+                // dispatch so the SQL is identical regardless of pipeline
+                // kind. Non-Snowflake adapters surface the unsupported
+                // error from the dialect's default impl.
                 strategy_name = "dynamic_table";
-                sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
+                let warehouse_name = warehouse.warehouse_name().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dynamic_table strategy requires a compute warehouse \
+                         (Snowflake-only) — current adapter does not expose one"
+                    )
+                })?;
+                let select = dialect.select_clause(
+                    model_ir
+                        .columns
+                        .as_ref()
+                        .expect("Replication variant guarantees columns"),
+                    &model_ir.metadata_columns,
+                )?;
+                let source = model_ir
+                    .source
+                    .as_ref()
+                    .expect("Replication variant guarantees source");
+                let source_ref =
+                    dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+                let dt_target = dialect.format_table_ref(
+                    &model_ir.target.catalog,
+                    &model_ir.target.schema,
+                    &model_ir.target.table,
+                )?;
+                let body = format!("{select}\nFROM {source_ref}");
+                dialect.dynamic_table_ddl(&dt_target, &body, target_lag, warehouse_name)?
             }
             MaterializationStrategy::TimeInterval { .. } => {
                 // time_interval is a transformation strategy (silver-layer
@@ -6240,6 +6340,41 @@ timestamp_column = "_synced_at"
         let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
         let strategy = build_replication_strategy(&pipeline).expect("strategy build");
         assert!(matches!(strategy, MaterializationStrategy::FullRefresh));
+    }
+
+    #[test]
+    fn build_replication_strategy_view() {
+        let pipeline = parse_pipeline(r#"strategy = "view""#);
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        assert!(matches!(strategy, MaterializationStrategy::View));
+    }
+
+    #[test]
+    fn build_replication_strategy_materialized_view() {
+        // The fix to the legacy "silently fall through to full_refresh"
+        // behaviour: `materialized_view` now resolves to the right IR
+        // variant instead of dropping to FullRefresh.
+        let pipeline = parse_pipeline(r#"strategy = "materialized_view""#);
+        let strategy = build_replication_strategy(&pipeline).expect("strategy build");
+        assert!(matches!(
+            strategy,
+            MaterializationStrategy::MaterializedView
+        ));
+    }
+
+    #[test]
+    fn build_replication_strategy_dynamic_table_requires_target_lag() {
+        // dynamic_table on a replication pipeline today errors out because
+        // the strategy string can't carry a target_lag specifier. Pinning
+        // the error here so a future config-shape change must update both
+        // sides of the contract.
+        let pipeline = parse_pipeline(r#"strategy = "dynamic_table""#);
+        let err = build_replication_strategy(&pipeline)
+            .expect_err("dynamic_table without target_lag should error");
+        assert!(
+            err.to_string().contains("dynamic_table"),
+            "error should mention dynamic_table: {err}"
+        );
     }
 
     #[test]
