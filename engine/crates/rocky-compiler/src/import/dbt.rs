@@ -256,10 +256,15 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
 }
 
 /// Walk a dbt project's `models/` tree for `schema.yml` files, convert any
-/// `tests:` entries to canonical Rocky [`TestDecl`]s, attach them to the
-/// matching imported model, and emit structured warnings for tests outside
-/// the four canonical built-ins. Counter fields on [`ImportResult`] are
-/// updated in place.
+/// `tests:` / `data_tests:` entries to canonical Rocky [`TestDecl`]s, attach
+/// them to the matching imported model, and emit structured warnings for
+/// tests outside the four canonical built-ins. Counter fields on
+/// [`ImportResult`] are updated in place.
+///
+/// Both spellings of the key are accepted (`data_tests:` is dbt 1.7+; the
+/// legacy `tests:` form still works on the dbt side and on the Rocky
+/// importer). Unit tests from `manifest.unit_tests` are handled separately
+/// by [`apply_dbt_unit_tests`].
 ///
 /// The caller passes the dbt project root (or any directory the YAMLs live
 /// under). Both the `models/` regex path and the manifest path use this

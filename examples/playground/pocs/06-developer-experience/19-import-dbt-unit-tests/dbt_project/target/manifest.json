@@ -1,0 +1,132 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12/manifest.json",
+    "dbt_version": "1.8.0",
+    "generated_at": "2026-05-19T00:00:00Z",
+    "project_name": "ecommerce"
+  },
+  "nodes": {
+    "model.ecommerce.stg_orders": {
+      "unique_id": "model.ecommerce.stg_orders",
+      "name": "stg_orders",
+      "resource_type": "model",
+      "compiled_code": "SELECT\n    order_id,\n    customer_id,\n    amount,\n    LOWER(status) AS status\nFROM raw.orders\nWHERE status != 'cancelled'",
+      "raw_code": "SELECT\n    order_id,\n    customer_id,\n    amount,\n    LOWER(status) AS status\nFROM {{ source('raw', 'orders') }}\nWHERE status != 'cancelled'",
+      "depends_on": {
+        "nodes": ["source.ecommerce.raw.orders"],
+        "macros": []
+      },
+      "config": {
+        "materialized": "table"
+      },
+      "columns": {
+        "order_id":    { "name": "order_id" },
+        "customer_id": { "name": "customer_id" },
+        "amount":      { "name": "amount" },
+        "status":      { "name": "status" }
+      },
+      "description": "Staged orders, one row per order, with a normalised status.",
+      "tags": [],
+      "schema": "staging",
+      "database": "warehouse"
+    },
+    "model.ecommerce.fct_revenue": {
+      "unique_id": "model.ecommerce.fct_revenue",
+      "name": "fct_revenue",
+      "resource_type": "model",
+      "compiled_code": "SELECT\n    customer_id,\n    SUM(amount) AS total_revenue,\n    COUNT(*) AS order_count\nFROM warehouse.staging.stg_orders\nGROUP BY customer_id",
+      "raw_code": "SELECT\n    customer_id,\n    SUM(amount) AS total_revenue,\n    COUNT(*) AS order_count\nFROM {{ ref('stg_orders') }}\nGROUP BY customer_id",
+      "depends_on": {
+        "nodes": ["model.ecommerce.stg_orders"],
+        "macros": []
+      },
+      "config": {
+        "materialized": "table"
+      },
+      "columns": {
+        "customer_id":   { "name": "customer_id" },
+        "total_revenue": { "name": "total_revenue" },
+        "order_count":   { "name": "order_count" }
+      },
+      "description": "Per-customer revenue rollup.",
+      "tags": [],
+      "schema": "marts",
+      "database": "warehouse"
+    }
+  },
+  "sources": {
+    "source.ecommerce.raw.orders": {
+      "unique_id": "source.ecommerce.raw.orders",
+      "name": "orders",
+      "source_name": "raw",
+      "database": "warehouse",
+      "schema": "raw"
+    }
+  },
+  "unit_tests": {
+    "unit_test.ecommerce.stg_orders.stamps_status_when_completed": {
+      "unique_id": "unit_test.ecommerce.stg_orders.stamps_status_when_completed",
+      "name": "stamps_status_when_completed",
+      "model": "stg_orders",
+      "given": [
+        {
+          "input": "source('raw', 'orders')",
+          "rows": [
+            { "order_id": 1, "customer_id": 100, "amount": 50, "status": "Completed" },
+            { "order_id": 2, "customer_id": 100, "amount": 75, "status": "SHIPPED" }
+          ]
+        }
+      ],
+      "expect": {
+        "rows": [
+          { "order_id": 1, "customer_id": 100, "amount": 50, "status": "completed" },
+          { "order_id": 2, "customer_id": 100, "amount": 75, "status": "shipped" }
+        ],
+        "format": "dict"
+      },
+      "description": "status normalises to lower-case for any case-mix input",
+      "tags": []
+    },
+    "unit_test.ecommerce.fct_revenue.rolls_up_revenue_per_customer": {
+      "unique_id": "unit_test.ecommerce.fct_revenue.rolls_up_revenue_per_customer",
+      "name": "rolls_up_revenue_per_customer",
+      "model": "fct_revenue",
+      "given": [
+        {
+          "input": "ref('stg_orders')",
+          "rows": [
+            { "order_id": 1, "customer_id": 100, "amount": 50, "status": "completed" },
+            { "order_id": 2, "customer_id": 100, "amount": 75, "status": "shipped" },
+            { "order_id": 3, "customer_id": 200, "amount": 30, "status": "completed" }
+          ]
+        }
+      ],
+      "expect": {
+        "rows": [
+          { "customer_id": 100, "total_revenue": 125, "order_count": 2 },
+          { "customer_id": 200, "total_revenue": 30,  "order_count": 1 }
+        ],
+        "format": "dict"
+      },
+      "tags": []
+    },
+    "unit_test.ecommerce.fct_revenue.csv_fixture_skipped": {
+      "unique_id": "unit_test.ecommerce.fct_revenue.csv_fixture_skipped",
+      "name": "csv_fixture_skipped",
+      "model": "fct_revenue",
+      "given": [
+        {
+          "input": "ref('stg_orders')",
+          "rows": "order_id,customer_id,amount,status\n1,100,50,completed\n",
+          "format": "csv"
+        }
+      ],
+      "expect": {
+        "rows": "customer_id,total_revenue,order_count\n100,50,1\n",
+        "format": "csv"
+      },
+      "description": "Deliberate CSV fixture — surfaces as UnsupportedUnitTestFormat",
+      "tags": []
+    }
+  }
+}
