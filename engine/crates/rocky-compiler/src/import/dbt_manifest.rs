@@ -18,6 +18,9 @@ pub struct DbtManifest {
     pub metadata: DbtManifestMetadata,
     pub nodes: HashMap<String, DbtManifestNode>,
     pub sources: HashMap<String, DbtManifestSource>,
+    /// Unit-test definitions keyed by `unit_test.<project>.<model>.<name>`.
+    /// Empty when the manifest predates dbt's unit-test feature.
+    pub unit_tests: HashMap<String, DbtManifestUnitTest>,
 }
 
 /// Manifest-level metadata.
@@ -98,6 +101,45 @@ pub struct DbtManifestColumn {
     pub description: Option<String>,
 }
 
+/// A unit-test definition extracted from `manifest.unit_tests`.
+///
+/// Maps 1:1 to dbt's unit-test schema (v12+): a name, a target model, a
+/// list of `given` input fixtures, a single `expect` expectation, and
+/// optional description/tags. `overrides` is intentionally not captured —
+/// it's rare in practice and the importer skips it with a warning.
+#[derive(Debug, Clone)]
+pub struct DbtManifestUnitTest {
+    pub unique_id: String,
+    pub name: String,
+    /// Bare model name the unit test asserts on (no `ref()` wrapper).
+    pub model: String,
+    pub given: Vec<DbtUnitTestGiven>,
+    pub expect: DbtUnitTestExpect,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// One input fixture for a unit test. `input` is the dbt-side reference
+/// (typically `ref('upstream')` or `source('a','b')`); the converter
+/// strips the wrapper down to a bare ref before emitting.
+#[derive(Debug, Clone)]
+pub struct DbtUnitTestGiven {
+    pub input: String,
+    pub rows: Vec<serde_json::Value>,
+    /// dbt fixture format. `None` or `Some("dict")` means inline rows;
+    /// `csv` / `sql` are recognised but unsupported by the importer
+    /// (skipped with a warning).
+    pub format: Option<String>,
+}
+
+/// Expectation block for a unit test. `format` follows the same rule as
+/// `DbtUnitTestGiven::format`.
+#[derive(Debug, Clone)]
+pub struct DbtUnitTestExpect {
+    pub rows: Vec<serde_json::Value>,
+    pub format: Option<String>,
+}
+
 /// A source definition in the manifest.
 #[derive(Debug, Clone)]
 pub struct DbtManifestSource {
@@ -118,6 +160,44 @@ struct RawManifest {
     nodes: HashMap<String, RawNode>,
     #[serde(default)]
     sources: HashMap<String, RawManifestSource>,
+    #[serde(default)]
+    unit_tests: HashMap<String, RawUnitTest>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUnitTest {
+    #[serde(default)]
+    unique_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    given: Vec<RawUnitTestGiven>,
+    #[serde(default)]
+    expect: Option<RawUnitTestExpect>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUnitTestGiven {
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    rows: serde_json::Value,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUnitTestExpect {
+    #[serde(default)]
+    rows: serde_json::Value,
+    #[serde(default)]
+    format: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -266,11 +346,62 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         })
         .collect();
 
+    let unit_tests = raw
+        .unit_tests
+        .into_iter()
+        .map(|(id, ut)| (id, convert_unit_test(ut)))
+        .collect();
+
     Ok(DbtManifest {
         metadata,
         nodes,
         sources,
+        unit_tests,
     })
+}
+
+fn convert_unit_test(raw: RawUnitTest) -> DbtManifestUnitTest {
+    let given = raw.given.into_iter().map(convert_given).collect();
+    let expect = raw.expect.map(convert_expect).unwrap_or(DbtUnitTestExpect {
+        rows: Vec::new(),
+        format: None,
+    });
+    DbtManifestUnitTest {
+        unique_id: raw.unique_id,
+        name: raw.name,
+        model: raw.model,
+        given,
+        expect,
+        description: raw.description.filter(|d| !d.is_empty()),
+        tags: raw.tags,
+    }
+}
+
+fn convert_given(raw: RawUnitTestGiven) -> DbtUnitTestGiven {
+    DbtUnitTestGiven {
+        input: raw.input,
+        rows: rows_from_json(raw.rows),
+        format: raw.format.filter(|s| !s.is_empty()),
+    }
+}
+
+fn convert_expect(raw: RawUnitTestExpect) -> DbtUnitTestExpect {
+    DbtUnitTestExpect {
+        rows: rows_from_json(raw.rows),
+        format: raw.format.filter(|s| !s.is_empty()),
+    }
+}
+
+/// Normalize a `rows` field. dbt emits this as an array of objects when
+/// `format = "dict"`; for `csv`/`sql` fixtures the field can be a string
+/// or absent. We retain the JSON array form and let downstream stages
+/// decide what to do with non-array shapes.
+fn rows_from_json(v: serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Null => Vec::new(),
+        other => vec![other],
+    }
 }
 
 fn convert_node(raw: RawNode) -> DbtManifestNode {
@@ -660,6 +791,99 @@ mod tests {
             node.config.unique_key,
             Some(UniqueKeyValue::Multiple(ref keys)) if keys == &["id", "date"]
         ));
+    }
+
+    #[test]
+    fn test_parse_unit_tests_basic() {
+        let json = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {},
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.brief__brief.stamps_permission_key": {
+                    "unique_id": "unit_test.p.brief__brief.stamps_permission_key",
+                    "name": "stamps_permission_key",
+                    "model": "brief__brief",
+                    "given": [
+                        {
+                            "input": "ref('int_brief__brief')",
+                            "rows": [{ "artifact_id": 1001, "brief_id": 50 }]
+                        }
+                    ],
+                    "expect": {
+                        "rows": [{ "permission_key": "abc", "artifact_id": 1001 }],
+                        "format": "dict"
+                    },
+                    "description": "permission key stamped via md5",
+                    "tags": ["mart"]
+                }
+            }
+        })
+        .to_string();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, json).unwrap();
+
+        let manifest = parse_manifest(&path).unwrap();
+        assert_eq!(manifest.unit_tests.len(), 1);
+        let ut = &manifest.unit_tests["unit_test.p.brief__brief.stamps_permission_key"];
+        assert_eq!(ut.name, "stamps_permission_key");
+        assert_eq!(ut.model, "brief__brief");
+        assert_eq!(ut.given.len(), 1);
+        assert_eq!(ut.given[0].input, "ref('int_brief__brief')");
+        assert_eq!(ut.given[0].rows.len(), 1);
+        assert_eq!(ut.expect.rows.len(), 1);
+        assert_eq!(ut.expect.format.as_deref(), Some("dict"));
+        assert_eq!(
+            ut.description.as_deref(),
+            Some("permission key stamped via md5")
+        );
+        assert_eq!(ut.tags, vec!["mart"]);
+    }
+
+    #[test]
+    fn test_parse_unit_tests_absent_field_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, sample_manifest_json()).unwrap();
+
+        let manifest = parse_manifest(&path).unwrap();
+        // Sample manifest predates the unit_tests collection.
+        assert!(manifest.unit_tests.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unit_tests_csv_format_round_trips() {
+        let json = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {},
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.m.csv_case": {
+                    "unique_id": "unit_test.p.m.csv_case",
+                    "name": "csv_case",
+                    "model": "m",
+                    "given": [
+                        { "input": "ref('u')", "rows": "id,amount\n1,10\n", "format": "csv" }
+                    ],
+                    "expect": { "rows": "id\n1\n", "format": "csv" },
+                    "tags": []
+                }
+            }
+        })
+        .to_string();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, json).unwrap();
+
+        let manifest = parse_manifest(&path).unwrap();
+        let ut = &manifest.unit_tests["unit_test.p.m.csv_case"];
+        // CSV format is round-tripped as `format` metadata; downstream
+        // stages decide whether to skip it.
+        assert_eq!(ut.expect.format.as_deref(), Some("csv"));
+        assert_eq!(ut.given[0].format.as_deref(), Some("csv"));
     }
 
     #[test]

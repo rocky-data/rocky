@@ -499,6 +499,9 @@ mod tests {
             macros_expanded: 0,
             macros_manifest_resolved: 0,
             macros_unsupported: 0,
+            unit_tests_found: 0,
+            unit_tests_converted: 0,
+            unit_tests_skipped: 0,
         }
     }
 
@@ -506,6 +509,7 @@ mod tests {
         ImportedModel {
             name: name.to_string(),
             sql: "SELECT 1".to_string(),
+            unit_tests: vec![],
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],
