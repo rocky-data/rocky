@@ -496,6 +496,35 @@ async fn emit_fivetran_state(
             client = client.with_state_cache(state_cache);
         }
 
+        // FR-B Phase 2 + Layer 1 + Layer 3 — coordination backends.
+        // Each factory returns the default no-op backend when the
+        // block is absent, so a project that hasn't opted in stays
+        // on the per-host file / NoLock / AlwaysClosed behavior.
+        let budget =
+            rocky_fivetran::ratelimit::build_ratelimit_budget(adapter_cfg.ratelimit.as_ref())
+                .with_context(|| {
+                    format!("adapters.{name}: failed to build [adapter.{name}.ratelimit] backend")
+                })?;
+        client = client.with_ratelimit_budget(budget);
+
+        let (stampede, stampede_tunables) =
+            rocky_fivetran::stampede::build_stampede_lock(adapter_cfg.stampede.as_ref())
+                .with_context(|| {
+                    format!("adapters.{name}: failed to build [adapter.{name}.stampede] backend")
+                })?;
+        client = client
+            .with_stampede_lock(stampede)
+            .with_stampede_lock_ttl(stampede_tunables.lock_ttl)
+            .with_stampede_poll_timeout(stampede_tunables.poll_timeout);
+
+        let breaker = rocky_fivetran::circuit_breaker::build_circuit_breaker(
+            adapter_cfg.circuit_breaker.as_ref(),
+        )
+        .with_context(|| {
+            format!("adapters.{name}: failed to build [adapter.{name}.circuit_breaker] backend")
+        })?;
+        client = client.with_circuit_breaker(breaker);
+
         let envelope = client
             .fetch_envelope(destination_id, force_refresh)
             .await

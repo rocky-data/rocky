@@ -115,6 +115,11 @@ fn classify_fivetran_error(err: &FivetranError) -> FailedSourceErrorClass {
     match err {
         FivetranError::RateLimited => FailedSourceErrorClass::RateLimit,
         FivetranError::RetryBudgetExhausted { .. } => FailedSourceErrorClass::Transient,
+        // The circuit breaker tripped before HTTP was attempted; the
+        // cause is "Fivetran (or our perception of it) is unhealthy"
+        // — surface as Transient so downstream retries know to back
+        // off and re-attempt on the next discover cycle.
+        FivetranError::CircuitOpen => FailedSourceErrorClass::Transient,
         FivetranError::UnexpectedResponse(_) => FailedSourceErrorClass::Unknown,
         // `code` here is either the raw HTTP status display (e.g. "503
         // Service Unavailable") from `client::get`, or the API envelope's

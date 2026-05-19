@@ -107,6 +107,195 @@
       },
       "type": "object"
     },
+    "FivetranCircuitBreakerBackend": {
+      "description": "Circuit-breaker backend selector for the Fivetran adapter (Layer 3). See [`FivetranCircuitBreakerConfig`] for the TOML shape.",
+      "oneOf": [
+        {
+          "description": "No-op breaker; state is always `Closed`. Default when the block is absent.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared per-account state machine in Valkey. Requires the `valkey` Cargo feature.",
+          "enum": [
+            "valkey"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FivetranCircuitBreakerConfig": {
+      "additionalProperties": false,
+      "description": "Circuit-breaker config for the Fivetran adapter (Layer 3).\n\nTrips after `failure_threshold` consecutive remote failures (5xx, network errors, exhausted retries) and short-circuits subsequent HTTP attempts with `FivetranError::CircuitOpen` until `cooldown_seconds` elapses. State transitions follow the standard `Closed → Open → HalfOpen → Closed` pattern, with exponentially extended cooldown on repeated half-open failures (capped at `cooldown_max_seconds`).\n\nState is shared across processes via Valkey so a Fivetran outage trips one breaker for the entire org rather than each process independently tripping its own.\n\n## TOML shape\n\n```toml [adapter.fivetran.circuit_breaker] backend = \"valkey\" valkey_url = \"rediss://valkey:6379/\" failure_threshold = 5 window_seconds = 60 cooldown_seconds = 300 cooldown_max_seconds = 3600 ```\n\n## Fail-open\n\nWhen the state store is unreachable the client behaves as if the breaker is `Closed` — coordination failure must not refuse live traffic.",
+      "properties": {
+        "backend": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FivetranCircuitBreakerBackend"
+            }
+          ],
+          "default": "none",
+          "description": "Which backend to instantiate. Defaults to [`FivetranCircuitBreakerBackend::None`] so a stub block with no `backend` key is well-defined."
+        },
+        "cooldown_max_seconds": {
+          "description": "Upper bound on the exponentially-extended cooldown after repeated half-open failures. Defaults to 3600s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cooldown_seconds": {
+          "description": "Initial cooldown (seconds) before the breaker transitions `Open → HalfOpen` for a probe. Defaults to 300s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "failure_threshold": {
+          "description": "Consecutive failures required to transition `Closed → Open`. Defaults to 5 when unset.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "valkey_url": {
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_seconds": {
+          "description": "Failure-counting window in seconds. Failures older than the window are not counted toward `failure_threshold`. Defaults to 60s when unset.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "FivetranRatelimitBackend": {
+      "description": "Cross-pod rate-limit budget backend selector for the Fivetran adapter (FR-B Phase 2). See [`FivetranRatelimitConfig`] for the TOML shape.",
+      "oneOf": [
+        {
+          "description": "Per-host file lock (Phase 1 behavior). Default when the block is absent.",
+          "enum": [
+            "file"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared Valkey key. Requires the `valkey` Cargo feature.",
+          "enum": [
+            "valkey"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FivetranRatelimitConfig": {
+      "additionalProperties": false,
+      "description": "Cross-pod rate-limit budget config for the Fivetran adapter (FR-B Phase 2).\n\nPhase 1 (shipped in v1.37) writes `wake_at_epoch_ms` to a per-host file under `${TMPDIR}/rocky-fivetran-ratelimit/<account_hash>.json`. That works when several `rocky` processes share a host, but a Kubernetes deployment with one rocky-cli per pod sees N independent budgets even though every pod talks to the same Fivetran org. Lifting the budget into Valkey makes a 429 on one pod throttle every other pod for the same `Retry-After` window.\n\n## TOML shape\n\n```toml [adapter.fivetran.ratelimit] backend = \"valkey\" valkey_url = \"rediss://valkey:6379/\" ```\n\n## Fail-open\n\nWhen the configured backend is unreachable the client falls back to the per-host file backend. The cluster regresses to Phase 1 behavior (each host enforces its own budget) rather than blocking traffic.",
+      "properties": {
+        "backend": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FivetranRatelimitBackend"
+            }
+          ],
+          "default": "file",
+          "description": "Which backend to instantiate. Defaults to [`FivetranRatelimitBackend::File`] so a stub block with no `backend` key is well-defined."
+        },
+        "max_wake_seconds": {
+          "description": "Cap (seconds) applied to the Valkey key's `EXPIRE` so an abandoned `wake_at` value never outlives its useful window. Defaults to 600s when unset; ignored for the file backend.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "valkey_url": {
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "FivetranStampedeBackend": {
+      "description": "Distributed cache-stampede lock backend selector for the Fivetran adapter (Layer 1). See [`FivetranStampedeConfig`] for the TOML shape.",
+      "oneOf": [
+        {
+          "description": "No-op lock; every caller is treated as the leader. Default when the block is absent.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Distributed lock via Valkey `SET NX EX`. Requires the `valkey` Cargo feature.",
+          "enum": [
+            "valkey"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FivetranStampedeConfig": {
+      "additionalProperties": false,
+      "description": "Distributed cache-stampede protection config for the Fivetran adapter (Layer 1).\n\nOn a cold-start burst, N processes can simultaneously observe the cache miss, fan out N API calls, and write back N copies of the same envelope. The stampede lock elects a single leader (via `SET <key>:lock <id> NX EX <ttl>` against Valkey) to do the API call; followers wait on the cache key with bounded polling until the leader's write becomes visible, then return.\n\n## TOML shape\n\n```toml [adapter.fivetran.stampede] backend = \"valkey\" valkey_url = \"rediss://valkey:6379/\" lock_ttl_seconds = 60 poll_timeout_seconds = 30 ```\n\n## Fail-open\n\nWhen the lock backend is unreachable the client falls through to the direct HTTP path (no stampede protection, but no block).",
+      "properties": {
+        "backend": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FivetranStampedeBackend"
+            }
+          ],
+          "default": "none",
+          "description": "Which backend to instantiate. Defaults to [`FivetranStampedeBackend::None`] so a stub block with no `backend` key is well-defined."
+        },
+        "lock_ttl_seconds": {
+          "description": "Lock TTL applied to the `SET NX EX <ttl>` call. The lock auto-expires after this many seconds so a crashed leader doesn't park every follower forever. Defaults to 60s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "poll_timeout_seconds": {
+          "description": "Hard cap on how long a follower will poll the cache before falling through to a direct HTTP fetch. Defaults to 30s.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "valkey_url": {
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RedactedString": {
       "type": "string"
     },
@@ -216,6 +405,17 @@
         }
       ],
       "description": "Optional cache backend for the Fivetran state envelope.\n\nWhen set on a `type = \"fivetran\"` adapter, the resolved envelope is read from and written to the configured cache backend so concurrent `rocky` processes share one fetcher per org. Ignored on every other adapter type. When absent the adapter behaves as if `backend = \"none\"` — every fetch goes straight to the Fivetran API."
+    },
+    "circuit_breaker": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FivetranCircuitBreakerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional per-account circuit breaker (Fivetran-only).\n\nTrips after `failure_threshold` consecutive remote failures and short-circuits subsequent HTTP attempts with a `CircuitOpen` error until a cooldown elapses. Coordinated across processes via the configured backend (Valkey). Ignored on non-fivetran adapters; absent block defaults to `AlwaysClosed` (no breaker)."
     },
     "client_id": {
       "type": [
@@ -331,6 +531,17 @@
         "null"
       ]
     },
+    "ratelimit": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FivetranRatelimitConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional cross-pod rate-limit budget backend (Fivetran-only).\n\nPhase 1 ratelimit coordination is per-host (file in `${TMPDIR}/rocky-fivetran-ratelimit/`). Setting `backend = \"valkey\"` here lifts the budget into a shared store so several pods on different hosts observe the same `wake_at` window after one of them is throttled. Ignored on non-fivetran adapters. When absent the adapter falls back to the per-host file backend."
+    },
     "retry": {
       "allOf": [
         {
@@ -355,6 +566,17 @@
         "string",
         "null"
       ]
+    },
+    "stampede": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FivetranStampedeConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional distributed cache-stampede lock (Fivetran-only).\n\nOn a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior)."
     },
     "timeout_secs": {
       "format": "uint64",

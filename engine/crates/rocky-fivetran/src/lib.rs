@@ -1,8 +1,12 @@
 pub mod adapter;
+pub mod circuit_breaker;
 pub mod client;
 pub mod connector;
 pub mod envelope;
 pub mod ratelimit;
+#[cfg(feature = "valkey")]
+pub mod ratelimit_valkey;
 pub mod schema;
+pub mod stampede;
 pub mod state_cache;
 pub mod sync;

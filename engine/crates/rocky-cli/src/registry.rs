@@ -259,6 +259,45 @@ impl AdapterRegistry {
                         client = client.with_state_cache(state_cache);
                     }
 
+                    // FR-B Phase 2 — cross-pod rate-limit budget. When
+                    // the block is absent the factory returns the
+                    // per-host file backend (Phase 1 behavior).
+                    let budget = rocky_fivetran::ratelimit::build_ratelimit_budget(
+                        adapter_cfg.ratelimit.as_ref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "adapters.{name}: failed to build [adapter.{name}.ratelimit] backend"
+                        )
+                    })?;
+                    client = client.with_ratelimit_budget(budget);
+
+                    // Layer 1 — cache-stampede lock. Absent → NoLock.
+                    let (stampede, stampede_tunables) =
+                        rocky_fivetran::stampede::build_stampede_lock(
+                            adapter_cfg.stampede.as_ref(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "adapters.{name}: failed to build [adapter.{name}.stampede] backend"
+                            )
+                        })?;
+                    client = client
+                        .with_stampede_lock(stampede)
+                        .with_stampede_lock_ttl(stampede_tunables.lock_ttl)
+                        .with_stampede_poll_timeout(stampede_tunables.poll_timeout);
+
+                    // Layer 3 — circuit breaker. Absent → AlwaysClosed.
+                    let breaker = rocky_fivetran::circuit_breaker::build_circuit_breaker(
+                        adapter_cfg.circuit_breaker.as_ref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "adapters.{name}: failed to build [adapter.{name}.circuit_breaker] backend"
+                        )
+                    })?;
+                    client = client.with_circuit_breaker(breaker);
+
                     let adapter = Arc::new(FivetranDiscoveryAdapter::new(
                         client,
                         destination_id.to_string(),

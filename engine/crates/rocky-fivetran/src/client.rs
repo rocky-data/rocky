@@ -9,13 +9,15 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Response};
 use tokio::sync::Mutex;
 
+use crate::circuit_breaker::{AlwaysClosed, CircuitState, FailureKind, FivetranCircuitBreaker};
 use crate::connector as ft_connector;
 use crate::envelope::{
     FivetranColumnConfig, FivetranConnectorStatus, FivetranConnectorSummary, FivetranDestination,
     FivetranSchemaConfig, FivetranSchemaEntry, FivetranStateEnvelope, FivetranTableConfig,
 };
-use crate::ratelimit;
+use crate::ratelimit::{self, FileBudget, RatelimitBudget};
 use crate::schema as ft_schema;
+use crate::stampede::{self, NoLock, StampedeLock};
 use crate::state_cache::{
     self, FivetranStateCache, NoCache, WriteOutcome, observability as cache_obs,
 };
@@ -89,6 +91,9 @@ pub enum FivetranError {
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+
+    #[error("Fivetran circuit breaker open for account; no HTTP attempted")]
+    CircuitOpen,
 }
 
 /// Wire-decode shape for `GET /v1/destinations/{id}`. The envelope
@@ -123,7 +128,9 @@ pub struct FivetranClient {
     /// the credential on a hot path.
     account_id_hash: String,
     /// Directory holding the per-account shared rate-limit state file
-    /// (FR-B). One file per account: `{ratelimit_dir}/{hash}.json`.
+    /// (FR-B Phase 1 file backend). Retained even when a Valkey budget
+    /// is wired so that fail-open of the Valkey path can degrade to
+    /// the per-host file backend without losing scope.
     ratelimit_dir: PathBuf,
     /// In-process envelope memoization for FR-C. Keyed by
     /// `destination_id` so a single client servicing multiple
@@ -143,6 +150,24 @@ pub struct FivetranClient {
     /// the HTTP path, then write-backs to this layer + the in-process
     /// memo on success. When `None` the cache layer is transparent.
     state_cache: Arc<dyn FivetranStateCache>,
+    /// Cross-pod rate-limit budget (FR-B Phase 2). Defaults to a
+    /// [`FileBudget`] rooted at [`Self::ratelimit_dir`] so a client
+    /// constructed without explicit wiring behaves exactly like a
+    /// pre-Phase-2 client.
+    budget: Arc<dyn RatelimitBudget>,
+    /// Distributed cache-stampede lock (Layer 1). Defaults to
+    /// [`NoLock`] so callers without coordination configured always
+    /// take the leader path.
+    stampede: Arc<dyn StampedeLock>,
+    /// Per-account circuit breaker (Layer 3). Defaults to
+    /// [`AlwaysClosed`] so callers without coordination configured
+    /// never short-circuit.
+    circuit: Arc<dyn FivetranCircuitBreaker>,
+    /// Lock TTL passed to [`StampedeLock::acquire`]. 0 means use the
+    /// crate default.
+    stampede_lock_ttl: Duration,
+    /// Follower-poll timeout for the cache-poll loop.
+    stampede_poll_timeout: Duration,
 }
 
 /// Standard Fivetran API envelope.
@@ -169,6 +194,7 @@ impl FivetranClient {
         let retry_budget =
             rocky_core::retry_budget::RetryBudget::from_config(retry.max_retries_per_run);
         let account_id_hash = ratelimit::hash_account_id(&api_key);
+        let ratelimit_dir = ratelimit::default_ratelimit_dir();
         FivetranClient {
             client: build_http_client(),
             base_url: "https://api.fivetran.com".to_string(),
@@ -177,9 +203,14 @@ impl FivetranClient {
             retry,
             retry_budget,
             account_id_hash,
-            ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            ratelimit_dir: ratelimit_dir.clone(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
             state_cache: Arc::new(NoCache),
+            budget: Arc::new(FileBudget::new(ratelimit_dir)),
+            stampede: Arc::new(NoLock),
+            circuit: Arc::new(AlwaysClosed),
+            stampede_lock_ttl: stampede::DEFAULT_LOCK_TTL,
+            stampede_poll_timeout: stampede::DEFAULT_POLL_TIMEOUT,
         }
     }
 
@@ -191,32 +222,87 @@ impl FivetranClient {
         self
     }
 
-    /// Override the per-host rate-limit state directory (FR-B). Tests
-    /// pass a per-test [`tempfile::tempdir()`] so concurrent runs don't
-    /// collide on the default `${TMPDIR}/rocky-fivetran-ratelimit/`
-    /// location. Production callers should leave the default in place
-    /// so every `rocky-cli` process on the host shares a single file.
+    /// Override the per-host rate-limit state directory (FR-B Phase 1
+    /// file backend). Tests pass a per-test [`tempfile::tempdir()`]
+    /// so concurrent runs don't collide on the default
+    /// `${TMPDIR}/rocky-fivetran-ratelimit/` location. Production
+    /// callers should leave the default in place so every `rocky-cli`
+    /// process on the host shares a single file.
+    ///
+    /// Also re-wires the default file-backed [`RatelimitBudget`] to
+    /// point at the same directory — so a test that overrides the
+    /// dir without explicitly setting a Valkey budget still sees the
+    /// per-test isolation.
     #[must_use]
     pub fn with_ratelimit_dir(mut self, dir: PathBuf) -> Self {
-        self.ratelimit_dir = dir;
+        self.ratelimit_dir = dir.clone();
+        // Only replace the budget if it's still the default file
+        // backend; an explicitly-wired Valkey budget should survive
+        // a ratelimit-dir override (callers don't expect that to
+        // clobber their cross-pod store).
+        if self.budget.backend() == "file" {
+            self.budget = Arc::new(FileBudget::new(dir));
+        }
         self
     }
 
-    /// Resolve the per-account state file under [`Self::ratelimit_dir`].
-    fn ratelimit_path(&self) -> PathBuf {
-        ratelimit::account_state_path(&self.ratelimit_dir, &self.account_id_hash)
+    /// Override the cross-pod rate-limit budget (FR-B Phase 2). Default
+    /// is a [`FileBudget`] rooted at [`Self::ratelimit_dir`]; production
+    /// callers swap in a [`ValkeyBudget`](crate::ratelimit_valkey::ValkeyBudget)
+    /// to share the wake_at window across hosts.
+    #[must_use]
+    pub fn with_ratelimit_budget(mut self, budget: Arc<dyn RatelimitBudget>) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Override the cache-stampede lock (Layer 1). Default is
+    /// [`NoLock`]; production callers swap in
+    /// [`ValkeyLock`](crate::stampede::ValkeyLock) to elect a single
+    /// leader on cold-start herds.
+    #[must_use]
+    pub fn with_stampede_lock(mut self, lock: Arc<dyn StampedeLock>) -> Self {
+        self.stampede = lock;
+        self
+    }
+
+    /// Override the per-account circuit breaker (Layer 3). Default
+    /// is [`AlwaysClosed`]; production callers swap in
+    /// [`ValkeyCircuit`](crate::circuit_breaker::ValkeyCircuit) to
+    /// short-circuit during Fivetran outages.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, cb: Arc<dyn FivetranCircuitBreaker>) -> Self {
+        self.circuit = cb;
+        self
+    }
+
+    /// Override the stampede lock TTL (Layer 1). Caps how long a
+    /// leader can hold the lock before followers are allowed to elect
+    /// a new leader.
+    #[must_use]
+    pub fn with_stampede_lock_ttl(mut self, ttl: Duration) -> Self {
+        self.stampede_lock_ttl = ttl;
+        self
+    }
+
+    /// Override the cap on the follower-poll loop (Layer 1).
+    #[must_use]
+    pub fn with_stampede_poll_timeout(mut self, timeout: Duration) -> Self {
+        self.stampede_poll_timeout = timeout;
+        self
     }
 
     /// Block on any active shared rate-limit window before sending a
-    /// request. Fail-open — see [`ratelimit::pre_request_wait`].
+    /// request. Fail-open — see [`ratelimit::pre_request_wait_budget`].
     async fn observe_shared_budget(&self) {
-        ratelimit::pre_request_wait(&self.ratelimit_path()).await;
+        ratelimit::pre_request_wait_budget(self.budget.as_ref(), &self.account_id_hash).await;
     }
 
     /// Record a new shared rate-limit window so other rocky-cli
-    /// processes on the host observe the same backoff. Called when we
-    /// receive a 429 / 503 with `Retry-After`. Also emits the
-    /// `fivetran.rate_limit_observed` OTLP span event.
+    /// processes (on the host AND across the cluster, when the
+    /// Valkey-backed budget is wired) observe the same backoff.
+    /// Called when we receive a 429 / 503 with `Retry-After`. Also
+    /// emits the `fivetran.rate_limit_observed` OTLP span event.
     ///
     /// `sleep_for` is the effective wait the caller is about to
     /// perform (already `max(header, fixed_backoff)` when `source =
@@ -224,7 +310,13 @@ impl FivetranClient {
     /// the upstream header (None for `source = Fallback`). Splitting
     /// the two lets dashboards see "upstream said 100ms but we slept
     /// 1s because backoff dominated" without conflating the signals.
-    fn publish_rate_limit_observation(
+    ///
+    /// The write goes through the configured [`RatelimitBudget`] —
+    /// `FileBudget` for the default Phase-1 per-host behavior or
+    /// `ValkeyBudget` (Phase 2) for the cross-pod variant. Errors
+    /// are fail-open: a Valkey outage degrades to the next request
+    /// re-discovering the throttle on its own.
+    async fn publish_rate_limit_observation(
         &self,
         sleep_for: Duration,
         header_value: Option<Duration>,
@@ -232,7 +324,13 @@ impl FivetranClient {
         status: u16,
     ) {
         let wake_at = SystemTime::now() + sleep_for;
-        ratelimit::record_wake_at(&self.ratelimit_path(), wake_at);
+        // Dispatch the budget write via the trait so a Valkey budget
+        // shares the wake_at across pods. Awaited inline so a
+        // short-lived CLI invocation can't exit before the persist
+        // lands — matches the pre-refactor file-backend's synchronous
+        // contract.
+        ratelimit::record_wake_at_budget(self.budget.as_ref(), &self.account_id_hash, wake_at)
+            .await;
 
         let to_ms = |d: Duration| -> u64 {
             d.as_millis()
@@ -245,6 +343,7 @@ impl FivetranClient {
             .with_metadata("retry_after_ms", to_ms(sleep_for))
             .with_metadata("source", source.as_str())
             .with_metadata("account_id", self.account_id_hash.clone())
+            .with_metadata("ratelimit_backend", self.budget.backend())
             .with_metadata("status", u64::from(status));
         if let Some(h) = header_value {
             evt = evt.with_metadata("header_retry_after_ms", to_ms(h));
@@ -268,6 +367,7 @@ impl FivetranClient {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_base_url(api_key: String, api_secret: String, base_url: String) -> Self {
         let account_id_hash = ratelimit::hash_account_id(&api_key);
+        let ratelimit_dir = ratelimit::default_ratelimit_dir();
         FivetranClient {
             client: build_http_client(),
             base_url,
@@ -281,9 +381,14 @@ impl FivetranClient {
             account_id_hash,
             // Tests that need an isolated shared-budget file should
             // chain `.with_ratelimit_dir(...)` after construction.
-            ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            ratelimit_dir: ratelimit_dir.clone(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
             state_cache: Arc::new(NoCache),
+            budget: Arc::new(FileBudget::new(ratelimit_dir)),
+            stampede: Arc::new(NoLock),
+            circuit: Arc::new(AlwaysClosed),
+            stampede_lock_ttl: stampede::DEFAULT_LOCK_TTL,
+            stampede_poll_timeout: stampede::DEFAULT_POLL_TIMEOUT,
         }
     }
 
@@ -299,6 +404,7 @@ impl FivetranClient {
         retry: RetryConfig,
     ) -> Self {
         let account_id_hash = ratelimit::hash_account_id(&api_key);
+        let ratelimit_dir = ratelimit::default_ratelimit_dir();
         FivetranClient {
             client: build_http_client(),
             base_url,
@@ -307,9 +413,14 @@ impl FivetranClient {
             retry,
             retry_budget: rocky_core::retry_budget::RetryBudget::unbounded(),
             account_id_hash,
-            ratelimit_dir: ratelimit::default_ratelimit_dir(),
+            ratelimit_dir: ratelimit_dir.clone(),
             envelope_cache: Arc::new(Mutex::new(BTreeMap::new())),
             state_cache: Arc::new(NoCache),
+            budget: Arc::new(FileBudget::new(ratelimit_dir)),
+            stampede: Arc::new(NoLock),
+            circuit: Arc::new(AlwaysClosed),
+            stampede_lock_ttl: stampede::DEFAULT_LOCK_TTL,
+            stampede_poll_timeout: stampede::DEFAULT_POLL_TIMEOUT,
         }
     }
 
@@ -388,7 +499,7 @@ impl FivetranClient {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
                     self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
-                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429);
+                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429).await;
                     warn!(
                         attempt = attempt + 1,
                         backoff_ms = sleep_for.as_millis() as u64,
@@ -406,7 +517,7 @@ impl FivetranClient {
                 self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
                 // 503 Service Unavailable carries `Retry-After` per
                 // RFC 9110 §10.2.3 — honor it the same way as 429.
-                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status);
+                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status).await;
                 warn!(
                     attempt = attempt + 1,
                     status,
@@ -519,7 +630,7 @@ impl FivetranClient {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()?;
                     self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
-                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429);
+                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429).await;
                     warn!(
                         attempt = attempt + 1,
                         backoff_ms = sleep_for.as_millis() as u64,
@@ -535,7 +646,7 @@ impl FivetranClient {
                 self.check_retry_budget()?;
                 let status = resp.status().as_u16();
                 self.emit_retry_event(attempt, &format!("HTTP {status}"), ErrorClass::Transient);
-                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status);
+                let sleep_for = self.compute_throttle_sleep(&resp, attempt, status).await;
                 warn!(
                     attempt = attempt + 1,
                     status,
@@ -583,7 +694,7 @@ impl FivetranClient {
     /// existing per-attempt exponential backoff and tag the event as
     /// `"fallback"` so dashboards can spot adapters that aren't getting
     /// the upstream signal.
-    fn compute_throttle_sleep(&self, resp: &Response, attempt: u32, status: u16) -> Duration {
+    async fn compute_throttle_sleep(&self, resp: &Response, attempt: u32, status: u16) -> Duration {
         let backoff = retry_backoff(&self.retry, attempt);
         match parse_retry_after(resp) {
             Some(retry_after) => {
@@ -593,7 +704,8 @@ impl FivetranClient {
                     Some(retry_after),
                     RateLimitSource::Header,
                     status,
-                );
+                )
+                .await;
                 sleep_for
             }
             None => {
@@ -602,7 +714,8 @@ impl FivetranClient {
                     None,
                     RateLimitSource::Fallback,
                     status,
-                );
+                )
+                .await;
                 backoff
             }
         }
@@ -710,31 +823,38 @@ impl FivetranClient {
 
     /// Fetch (or return memoized) canonical envelope for `destination_id`.
     ///
-    /// Three-layer cache walk:
+    /// Five-layer walk:
     ///
-    ///   1. In-process memo (this client's [`Self::envelope_cache`]) —
-    ///      `refresh = false`, key present → return clone.
-    ///   2. Cross-process [`FivetranStateCache`] backend (FR-A) —
-    ///      `refresh = false`, primary miss → attempt
-    ///      `state_cache.read(<account_hash>/<destination_id>)`.
-    ///      On hit: hydrate the in-process memo + return.
-    ///      On miss / error: log and fall through.
-    ///   3. Live Fivetran REST API:
-    ///      a. `GET /v1/destinations/{id}`
-    ///      b. `GET /v1/groups/{id}/connectors` (paginated)
-    ///      c. `GET /v1/connectors/{conn_id}/schemas` for each connector
+    ///   L0. In-process memo (this client's [`Self::envelope_cache`])
+    ///       — `refresh = false`, key present → return clone.
+    ///   L2. Cross-process [`FivetranStateCache`] backend (FR-A) —
+    ///       `refresh = false`, primary miss → attempt
+    ///       `state_cache.read(<account_hash>/<destination_id>)`.
+    ///       On hit: hydrate the in-process memo + return.
+    ///   L1. Cache-stampede lock (NEW, Layer 1) — on cache miss the
+    ///       client tries to acquire `<key>:lock NX EX <ttl>`. The
+    ///       leader proceeds to the HTTP path; followers wait on the
+    ///       cache key with bounded polling until the leader's write
+    ///       becomes visible.
+    ///   L4. Per-account circuit breaker (NEW, Layer 3) — checked
+    ///       BEFORE every HTTP attempt. `Open` short-circuits with
+    ///       [`FivetranError::CircuitOpen`]; `HalfOpen`/`Closed`
+    ///       proceed. After the HTTP path the outcome is recorded so
+    ///       the breaker transitions on its own.
+    ///   L3. Cross-pod rate-limit budget (already shared via the
+    ///       `RatelimitBudget` trait inside [`get`]).
+    ///   L5. Retry-After + exponential backoff (already inside
+    ///       [`get`]).
     ///
-    ///      then construct the envelope, write it back to layer (2)
-    ///      AND layer (1), and return.
+    /// `refresh = true` skips L0, L2, and L1 on read; the breaker
+    /// (L4) is still consulted so an `Open` circuit short-circuits
+    /// even on `--no-cache` refreshes.
     ///
-    /// `refresh = true` skips layers (1) and (2) on read and forces a
-    /// fresh HTTP fetch — but still write-backs to both layers on
-    /// success, so a subsequent caller sees the fresh data. This is the
-    /// behavior `rocky discover --no-cache` exposes.
-    ///
-    /// Cache failures (read or write) are fail-open: the HTTP path
-    /// runs regardless and the failure shows up as a span event
-    /// (`fivetran.cache_write_failed`) plus a `warn!` log line.
+    /// Fail-open posture:
+    /// - L1 lock backend unreachable → fall through to direct HTTP
+    ///   (no stampede protection, but no block).
+    /// - L4 breaker read fails → treat as `Closed` (don't refuse
+    ///   live traffic because coordination is down).
     pub async fn fetch_envelope(
         &self,
         destination_id: &str,
@@ -743,7 +863,7 @@ impl FivetranClient {
         let cache_key = self.cache_key(destination_id);
         let backend = self.state_cache.backend();
 
-        // (1) In-process memo — only consulted on non-refresh.
+        // (L0) In-process memo — only consulted on non-refresh.
         if !refresh
             && let Some(cached) = self
                 .envelope_cache
@@ -755,10 +875,8 @@ impl FivetranClient {
             return Ok(cached);
         }
 
-        // (2) Cross-process state cache — only consulted on
+        // (L2) Cross-process state cache — only consulted on
         // non-refresh AND when the configured backend isn't NoCache.
-        // (NoCache always returns `Ok(None)` so the check is purely
-        // a perf shortcut to avoid the `read` call.)
         if !refresh && backend != "none" {
             match self.state_cache.read(&cache_key).await {
                 Ok(Some(env)) => {
@@ -781,7 +899,208 @@ impl FivetranClient {
             cache_obs::emit_cache_miss(backend, &cache_key, "refresh-forced");
         }
 
-        // (3) Live API path.
+        // (L1) Stampede protection — only for non-refresh callers.
+        // `refresh = true` means "I explicitly want fresh data";
+        // waiting on another leader's TTL window would violate that
+        // intent.
+        if !refresh && self.stampede.backend() != "none" {
+            match self
+                .stampede
+                .acquire(&cache_key, self.stampede_lock_ttl)
+                .await
+            {
+                Ok(Some(_guard)) => {
+                    // Leader path: fall through to the HTTP fetch
+                    // below; the guard is held across the HTTP
+                    // call + cache write-back so followers can't
+                    // observe the half-state.
+                    record_span_event(
+                        &PipelineEvent::new("fivetran.stampede_acquired")
+                            .with_metadata("key", cache_key.clone())
+                            .with_metadata("ttl_seconds", self.stampede_lock_ttl.as_secs())
+                            .with_metadata("backend", self.stampede.backend()),
+                    );
+                    let env = self
+                        .fetch_envelope_from_api_with_circuit(destination_id, &cache_key, backend)
+                        .await?;
+                    // Hold _guard alive until here; releases on drop
+                    // at function-end via the LockGuard contract.
+                    drop(_guard);
+                    return Ok(env);
+                }
+                Ok(None) => {
+                    // Follower path: poll the cache for the leader's
+                    // write.
+                    let started_at = std::time::Instant::now();
+                    match self
+                        .poll_cache_until_present(&cache_key, self.stampede_poll_timeout)
+                        .await
+                    {
+                        Some(env) => {
+                            record_span_event(
+                                &PipelineEvent::new("fivetran.stampede_polled")
+                                    .with_metadata("key", cache_key.clone())
+                                    .with_metadata(
+                                        "waited_ms",
+                                        started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                                            as u64,
+                                    )
+                                    .with_metadata("outcome", "cache_hit"),
+                            );
+                            self.envelope_cache
+                                .lock()
+                                .await
+                                .insert(destination_id.to_string(), env.clone());
+                            return Ok(env);
+                        }
+                        None => {
+                            record_span_event(
+                                &PipelineEvent::new("fivetran.stampede_polled")
+                                    .with_metadata("key", cache_key.clone())
+                                    .with_metadata(
+                                        "waited_ms",
+                                        started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                                            as u64,
+                                    )
+                                    .with_metadata("outcome", "timeout_direct_fetch"),
+                            );
+                            // Follower timed out — fall through to
+                            // a direct HTTP fetch (no protection).
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        backend = self.stampede.backend(),
+                        "stampede lock unavailable; falling through to direct fetch"
+                    );
+                    record_span_event(
+                        &PipelineEvent::new("fivetran.stampede_unavailable")
+                            .with_metadata("backend", self.stampede.backend())
+                            .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        // Direct fetch path: either the stampede backend was NoLock,
+        // the leader returned, the follower timed out, or the lock
+        // backend failed. All routes converge here and through the
+        // circuit-protected API path.
+        self.fetch_envelope_from_api_with_circuit(destination_id, &cache_key, backend)
+            .await
+    }
+
+    /// HTTP fetch wrapped in the circuit-breaker check + record
+    /// transitions. Used both by the stampede leader path and the
+    /// non-stampede / fall-through path.
+    async fn fetch_envelope_from_api_with_circuit(
+        &self,
+        destination_id: &str,
+        cache_key: &str,
+        cache_backend: &str,
+    ) -> Result<FivetranStateEnvelope, FivetranError> {
+        // (L4) Circuit-breaker check.
+        let circuit_state = match self.circuit.state(&self.account_id_hash).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Fail-open — never refuse traffic because the
+                // coordination store is down.
+                warn!(
+                    error = %e,
+                    backend = self.circuit.backend(),
+                    "circuit breaker state read failed; treating as Closed"
+                );
+                CircuitState::Closed
+            }
+        };
+        if circuit_state == CircuitState::Open {
+            record_span_event(
+                &PipelineEvent::new("fivetran.circuit_state_change")
+                    .with_metadata("account_id", self.account_id_hash.clone())
+                    .with_metadata("from_state", "open")
+                    .with_metadata("to_state", "open")
+                    .with_metadata("reason", "request_short_circuited")
+                    .with_metadata("backend", self.circuit.backend()),
+            );
+            return Err(FivetranError::CircuitOpen);
+        }
+
+        let api_outcome = self
+            .fetch_envelope_from_api(destination_id, cache_key, cache_backend)
+            .await;
+
+        // Record success / failure to drive future transitions.
+        match &api_outcome {
+            Ok(_) => {
+                let prev_state = circuit_state;
+                if let Err(e) = self.circuit.record_success(&self.account_id_hash).await {
+                    warn!(error = %e, "circuit record_success failed; fail-open");
+                } else if prev_state == CircuitState::HalfOpen {
+                    record_span_event(
+                        &PipelineEvent::new("fivetran.circuit_state_change")
+                            .with_metadata("account_id", self.account_id_hash.clone())
+                            .with_metadata("from_state", "half_open")
+                            .with_metadata("to_state", "closed")
+                            .with_metadata("reason", "probe_success")
+                            .with_metadata("backend", self.circuit.backend()),
+                    );
+                }
+            }
+            Err(e) if is_remote_failure(e) => {
+                if let Err(rec_err) = self
+                    .circuit
+                    .record_failure(&self.account_id_hash, FailureKind::Remote)
+                    .await
+                {
+                    warn!(error = %rec_err, "circuit record_failure failed; fail-open");
+                } else {
+                    // Re-read state so the event reflects the actual
+                    // transition (if any). The breaker may have
+                    // tripped from Closed→Open or HalfOpen→Open, or
+                    // it may still be Closed if the consecutive
+                    // failure count is below the threshold.
+                    let new_state = self
+                        .circuit
+                        .state(&self.account_id_hash)
+                        .await
+                        .unwrap_or(circuit_state);
+                    if new_state != circuit_state {
+                        record_span_event(
+                            &PipelineEvent::new("fivetran.circuit_state_change")
+                                .with_metadata("account_id", self.account_id_hash.clone())
+                                .with_metadata("from_state", circuit_state.as_str())
+                                .with_metadata("to_state", new_state.as_str())
+                                .with_metadata("reason", "remote_failure")
+                                .with_metadata("backend", self.circuit.backend()),
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                // Local error — record as Local so backends with
+                // telemetry can count them without affecting the
+                // state machine.
+                let _ = self
+                    .circuit
+                    .record_failure(&self.account_id_hash, FailureKind::Local)
+                    .await;
+            }
+        }
+
+        api_outcome
+    }
+
+    /// Internal: do the actual HTTP fetch + cache write-back. Split
+    /// out from [`Self::fetch_envelope`] so the stampede leader path
+    /// and the fall-through direct path share one implementation.
+    async fn fetch_envelope_from_api(
+        &self,
+        destination_id: &str,
+        cache_key: &str,
+        cache_backend: &str,
+    ) -> Result<FivetranStateEnvelope, FivetranError> {
         let destination = self.get_destination(destination_id).await?;
         let connectors = ft_connector::list_connectors(self, destination_id).await?;
 
@@ -797,11 +1116,6 @@ impl FivetranClient {
                 .buffer_unordered(10)
                 .collect()
                 .await;
-        // Stop on the first schema fetch error — the envelope is
-        // supposed to be a coherent snapshot, not a partial one.
-        // Callers that want partial-success semantics use the
-        // `FivetranDiscoveryAdapter::discover` path instead, which
-        // surfaces failed sources separately.
         let mut schemas: BTreeMap<String, FivetranSchemaConfig> = BTreeMap::new();
         for (conn_id, result) in schema_results {
             let cfg = result?;
@@ -822,26 +1136,94 @@ impl FivetranClient {
             "fivetran envelope fetched"
         );
 
-        // Write-back to layer (2) — best-effort. A failing cache must
-        // not propagate; the HTTP path already succeeded.
-        if backend != "none" {
-            match self.state_cache.write(&cache_key, &envelope).await {
+        // Write-back to L2 cache — best-effort.
+        if cache_backend != "none" {
+            match self.state_cache.write(cache_key, &envelope).await {
                 Ok(WriteOutcome::Written) => {
-                    cache_obs::emit_cache_write(backend, &cache_key, &envelope)
+                    cache_obs::emit_cache_write(cache_backend, cache_key, &envelope)
                 }
                 Ok(WriteOutcome::SkippedNoChange) => {
-                    cache_obs::emit_cache_write_skipped(backend, &cache_key, "hash-match")
+                    cache_obs::emit_cache_write_skipped(cache_backend, cache_key, "hash-match")
                 }
-                Err(e) => cache_obs::emit_cache_write_failed(backend, &cache_key, &e),
+                Err(e) => cache_obs::emit_cache_write_failed(cache_backend, cache_key, &e),
             }
         }
 
-        // Write-back to layer (1) — in-process memo.
+        // Write-back to L0 in-process memo.
         self.envelope_cache
             .lock()
             .await
             .insert(destination_id.to_string(), envelope.clone());
         Ok(envelope)
+    }
+
+    /// Follower-side cache poll. Returns the envelope when the
+    /// configured [`FivetranStateCache`] backend has the key, or
+    /// `None` on timeout. Exponential backoff: 100ms → 200ms → ... →
+    /// 2s, total budget = `timeout`.
+    async fn poll_cache_until_present(
+        &self,
+        cache_key: &str,
+        timeout: Duration,
+    ) -> Option<FivetranStateEnvelope> {
+        if self.state_cache.backend() == "none" {
+            // No cache → nothing to poll.
+            return None;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut attempt: u32 = 0;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match self.state_cache.read(cache_key).await {
+                Ok(Some(env)) => return Some(env),
+                Ok(None) => {} // continue polling
+                Err(e) => {
+                    warn!(error = %e, "cache poll read failed; falling through");
+                    return None;
+                }
+            }
+            let backoff = stampede::poll_backoff(attempt);
+            attempt = attempt.saturating_add(1);
+            // Don't oversleep past the deadline.
+            let now = std::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_for = backoff.min(remaining);
+            if sleep_for.is_zero() {
+                return None;
+            }
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+}
+
+/// Classify a [`FivetranError`] as a remote (Fivetran-side) failure.
+/// Only remote failures trip the circuit breaker; local errors
+/// (parsing, serialization) do not.
+///
+/// 429 errors are intentionally *not* counted as remote failures —
+/// rate limiting is a soft signal that Fivetran is responsive but
+/// busy, and `RateLimited` only surfaces from [`Self::get`] when the
+/// retry budget is exhausted. The shared [`RatelimitBudget`] (L3) is
+/// the right tool for 429 propagation; tripping the breaker on every
+/// 429-storm would refuse traffic for an unrelated reason.
+fn is_remote_failure(err: &FivetranError) -> bool {
+    match err {
+        FivetranError::Http(e) => {
+            // Connect refused, TLS error, timeout — all remote
+            // (network) failures that the breaker should count.
+            e.is_connect() || e.is_timeout() || e.is_request()
+        }
+        FivetranError::Api { code, .. } => {
+            // 5xx status codes — surfaced when retries are
+            // exhausted on a server error.
+            code.starts_with('5')
+        }
+        FivetranError::RetryBudgetExhausted { .. } => true,
+        FivetranError::RateLimited => false, // see doc comment above
+        FivetranError::UnexpectedResponse(_) => false, // local decode error
+        FivetranError::CircuitOpen => false,
     }
 }
 

@@ -686,6 +686,9 @@ mod tests {
             path: None,
             retry: rocky_core::config::RetryConfig::default(),
             cache: None,
+            ratelimit: None,
+            stampede: None,
+            circuit_breaker: None,
         }
     }
 

@@ -36,9 +36,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use tracing::{debug, trace, warn};
 
 /// Default subdirectory under `TMPDIR` for the shared rate-limit state.
@@ -238,6 +240,193 @@ pub fn record_wake_at(path: &Path, wake_at: SystemTime) {
         _ => wake_at,
     };
     write_wake_at(path, effective);
+}
+
+/// Default cap on the Valkey backend's `EXPIRE` for an abandoned
+/// `wake_at` value (10 minutes). Matches the upstream throttle window
+/// typical for Fivetran's documented Retry-After values; long enough
+/// to bridge a 429 burst, short enough that a stale value disappears
+/// on its own.
+pub const DEFAULT_MAX_WAKE_SECONDS: u64 = 600;
+
+/// Errors surfaced by [`RatelimitBudget`] implementations.
+///
+/// Coarse-grained on purpose — the budget is fail-open at every call
+/// site, so the caller's only useful response is `warn!` + fall back
+/// to a permissive default.
+#[derive(Debug, Error)]
+pub enum BudgetError {
+    /// Local filesystem I/O error (file backend).
+    #[error("ratelimit I/O: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON serialize / deserialize failure on the persisted state.
+    #[error("ratelimit serialize: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// Valkey / Redis transport failure.
+    #[error("ratelimit valkey: {0}")]
+    Valkey(String),
+    /// Misconfigured backend — surfaced from `build_ratelimit_budget`
+    /// rather than from a request.
+    #[error("ratelimit config: {0}")]
+    Config(String),
+}
+
+/// Cross-process shared rate-limit budget.
+///
+/// `wake_at` is the upper-bound SystemTime that every observer (every
+/// rocky-cli process that shares the budget) should refuse to issue a
+/// fresh Fivetran request before. Implementations are responsible for
+/// deduping concurrent writes such that the *larger* of the existing
+/// and new `wake_at` wins — a brief 100ms `Retry-After` should never
+/// shorten an in-flight 30s window.
+#[async_trait]
+pub trait RatelimitBudget: Send + Sync + std::fmt::Debug {
+    /// Read the current wake-at for `account_hash`. Returns `Ok(None)`
+    /// on a clean miss; `Err(_)` on transport failure.
+    async fn wake_at(&self, account_hash: &str) -> Result<Option<SystemTime>, BudgetError>;
+    /// Persist `wake_at` for `account_hash`, max-merging with any
+    /// existing value (later wins).
+    async fn set_wake_at(&self, account_hash: &str, wake_at: SystemTime)
+    -> Result<(), BudgetError>;
+    /// Stable backend tag for log + OTLP attributes.
+    fn backend(&self) -> &'static str;
+}
+
+/// Per-host file-backed budget. Wraps the original FR-B Phase 1 file
+/// code in a [`RatelimitBudget`] trait object so the cross-pod
+/// Valkey backend (FR-B Phase 2) can sit alongside it.
+#[derive(Debug, Clone)]
+pub struct FileBudget {
+    dir: PathBuf,
+}
+
+impl FileBudget {
+    /// Construct a budget rooted at `dir`. The directory is created
+    /// lazily on first write.
+    pub fn new(dir: PathBuf) -> Self {
+        FileBudget { dir }
+    }
+
+    /// Default location under `${TMPDIR}/rocky-fivetran-ratelimit/`.
+    pub fn default_dir() -> Self {
+        FileBudget::new(default_ratelimit_dir())
+    }
+
+    fn path(&self, account_hash: &str) -> PathBuf {
+        account_state_path(&self.dir, account_hash)
+    }
+}
+
+#[async_trait]
+impl RatelimitBudget for FileBudget {
+    async fn wake_at(&self, account_hash: &str) -> Result<Option<SystemTime>, BudgetError> {
+        // The original file backend is sync + fail-open; lift its
+        // result into the async trait surface without losing the
+        // fail-open contract — a missing / corrupt file still maps
+        // to `Ok(None)`.
+        Ok(read_wake_at(&self.path(account_hash)))
+    }
+
+    async fn set_wake_at(
+        &self,
+        account_hash: &str,
+        wake_at: SystemTime,
+    ) -> Result<(), BudgetError> {
+        // `record_wake_at` is sync + fail-open; never returns an
+        // error to surface.
+        record_wake_at(&self.path(account_hash), wake_at);
+        Ok(())
+    }
+
+    fn backend(&self) -> &'static str {
+        "file"
+    }
+}
+
+/// Async pre-request wait against any [`RatelimitBudget`].
+///
+/// Returns immediately on a missing entry, a past `wake_at`, or any
+/// backend error (fail-open). Capped at [`MAX_OBSERVED_WAIT`] so a
+/// stale value can't park forever.
+pub async fn pre_request_wait_budget(budget: &dyn RatelimitBudget, account_hash: &str) {
+    let wake_at = match budget.wake_at(account_hash).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return,
+        Err(e) => {
+            trace!(error = %e, "ratelimit budget read failed; fail-open");
+            return;
+        }
+    };
+    let now = SystemTime::now();
+    let Ok(remaining) = wake_at.duration_since(now) else {
+        return;
+    };
+    if remaining.is_zero() {
+        return;
+    }
+    let bounded = remaining.min(MAX_OBSERVED_WAIT);
+    debug!(
+        wait_ms = bounded.as_millis() as u64,
+        backend = budget.backend(),
+        "observing shared rate-limit budget"
+    );
+    tokio::time::sleep(bounded).await;
+}
+
+/// Persist a wake-at via any [`RatelimitBudget`]. Backend errors are
+/// logged at `warn!` and swallowed (fail-open).
+pub async fn record_wake_at_budget(
+    budget: &dyn RatelimitBudget,
+    account_hash: &str,
+    wake_at: SystemTime,
+) {
+    if let Err(e) = budget.set_wake_at(account_hash, wake_at).await {
+        warn!(
+            error = %e,
+            backend = budget.backend(),
+            "ratelimit budget write failed; fail-open"
+        );
+    }
+}
+
+/// Construct the rate-limit budget backend described by `config`.
+/// Returns an [`Arc<dyn RatelimitBudget>`] so the caller can clone
+/// cheaply. Defaults to [`FileBudget::default_dir`] when `config` is
+/// `None`.
+///
+/// # Errors
+///
+/// - [`BudgetError::Config`] — the configured backend is missing a
+///   required field (e.g. `valkey_url` for `backend = "valkey"`).
+/// - [`BudgetError::Valkey`] — the Redis client refused the URL.
+pub fn build_ratelimit_budget(
+    config: Option<&rocky_core::config::FivetranRatelimitConfig>,
+) -> Result<std::sync::Arc<dyn RatelimitBudget>, BudgetError> {
+    use rocky_core::config::FivetranRatelimitBackend;
+    let Some(cfg) = config else {
+        return Ok(std::sync::Arc::new(FileBudget::default_dir()));
+    };
+    match cfg.backend {
+        FivetranRatelimitBackend::File => Ok(std::sync::Arc::new(FileBudget::default_dir())),
+        #[cfg(feature = "valkey")]
+        FivetranRatelimitBackend::Valkey => {
+            let url = cfg.valkey_url.as_ref().ok_or_else(|| {
+                BudgetError::Config(
+                    "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.ratelimit]"
+                        .into(),
+                )
+            })?;
+            let max_wake =
+                Duration::from_secs(cfg.max_wake_seconds.unwrap_or(DEFAULT_MAX_WAKE_SECONDS));
+            let budget = crate::ratelimit_valkey::ValkeyBudget::from_url(url, max_wake)?;
+            Ok(std::sync::Arc::new(budget))
+        }
+        #[cfg(not(feature = "valkey"))]
+        FivetranRatelimitBackend::Valkey => Err(BudgetError::Config(
+            "backend = \"valkey\" requires building rocky-fivetran with the `valkey` feature"
+                .into(),
+        )),
+    }
 }
 
 #[cfg(test)]
