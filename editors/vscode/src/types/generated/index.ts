@@ -146,6 +146,8 @@ export type {
   ImportDbtOutput,
   ImportDbtWarning,
   ImportDbtFailure,
+  ImportDbtHookKind,
+  ImportDbtStructuredWarning,
 } from "./import_dbt";
 
 // Hooks list + test

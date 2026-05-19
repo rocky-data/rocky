@@ -78,6 +78,174 @@
       ],
       "type": "object"
     },
+    "ImportDbtHookKind": {
+      "description": "Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].",
+      "enum": [
+        "pre",
+        "post"
+      ],
+      "type": "string"
+    },
+    "ImportDbtStructuredWarning": {
+      "description": "Typed structured warning for dbt config that Rocky can't translate automatically. Each variant carries the source payload so the downstream UI (Dagster, VS Code) can route specific kinds into per-kind UI affordances without parsing free-form text.",
+      "oneOf": [
+        {
+          "description": "A dbt materialization with no direct Rocky equivalent. The importer fell back to the closest match (typically `full_refresh`).",
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "dbt_materialization": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "unsupported_materialization"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "dbt_materialization",
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`databricks_tags` block dropped — Rocky's `[classification]` block + `rocky-databricks` governance surface covers the same use case but requires manual config.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "dropped_databricks_tags"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "tags": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "tags"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`pre_hook` or `post_hook` dropped — Rocky supports lifecycle hooks via the `[[hook]]` block in `rocky.toml`.",
+          "properties": {
+            "hook_kind": {
+              "$ref": "#/definitions/ImportDbtHookKind"
+            },
+            "kind": {
+              "enum": [
+                "dropped_hook"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "hook_kind",
+            "kind",
+            "model",
+            "sql"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`on_schema_change` dropped — Rocky exposes the equivalent via per-pipeline `[drift]` policy.",
+          "properties": {
+            "dbt_value": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "dropped_on_schema_change"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "rocky_equivalent": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dbt_value",
+            "kind",
+            "model",
+            "rocky_equivalent"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A custom Jinja macro call survived `dbt compile` — defined out-of-tree. The user needs to hand-port the macro.",
+          "properties": {
+            "first_call_site_line": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "unresolvable_macro"
+              ],
+              "type": "string"
+            },
+            "macro_name": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "first_call_site_line",
+            "kind",
+            "macro_name",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A microbatch model is missing the required `event_time` field — the importer fell back to `full_refresh`.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "microbatch_missing_event_time"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ImportDbtWarning": {
       "properties": {
         "category": {
@@ -174,6 +342,14 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "structured_warnings": {
+      "default": [],
+      "description": "Typed structured warnings — payload-carrying variants for dbt config Rocky can't auto-translate (dropped tags, dropped hooks, unresolvable macros, etc.). Coexists with `warning_details` — orchestrators that don't know about this field still see the flat string warnings under `warning_details`.",
+      "items": {
+        "$ref": "#/definitions/ImportDbtStructuredWarning"
+      },
+      "type": "array"
     },
     "tests_converted": {
       "format": "uint",

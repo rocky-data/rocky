@@ -2702,6 +2702,13 @@ pub struct ImportDbtOutput {
     pub macros_detected: usize,
     pub imported_models: Vec<String>,
     pub warning_details: Vec<ImportDbtWarning>,
+    /// Typed structured warnings — payload-carrying variants for dbt
+    /// config Rocky can't auto-translate (dropped tags, dropped hooks,
+    /// unresolvable macros, etc.). Coexists with `warning_details` —
+    /// orchestrators that don't know about this field still see the
+    /// flat string warnings under `warning_details`.
+    #[serde(default)]
+    pub structured_warnings: Vec<ImportDbtStructuredWarning>,
     pub failed_details: Vec<ImportDbtFailure>,
     /// Free-form per-model migration report payload.
     pub report: serde_json::Value,
@@ -2749,6 +2756,62 @@ pub struct ImportDbtWarning {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
+}
+
+/// Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportDbtHookKind {
+    Pre,
+    Post,
+}
+
+/// Typed structured warning for dbt config that Rocky can't translate
+/// automatically. Each variant carries the source payload so the
+/// downstream UI (Dagster, VS Code) can route specific kinds into
+/// per-kind UI affordances without parsing free-form text.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportDbtStructuredWarning {
+    /// A dbt materialization with no direct Rocky equivalent. The
+    /// importer fell back to the closest match (typically
+    /// `full_refresh`).
+    UnsupportedMaterialization {
+        model: String,
+        dbt_materialization: String,
+        action: String,
+    },
+    /// `databricks_tags` block dropped — Rocky's `[classification]`
+    /// block + `rocky-databricks` governance surface covers the same
+    /// use case but requires manual config.
+    DroppedDatabricksTags {
+        model: String,
+        tags: std::collections::BTreeMap<String, String>,
+    },
+    /// `pre_hook` or `post_hook` dropped — Rocky supports lifecycle
+    /// hooks via the `[[hook]]` block in `rocky.toml`.
+    DroppedHook {
+        model: String,
+        hook_kind: ImportDbtHookKind,
+        sql: String,
+    },
+    /// `on_schema_change` dropped — Rocky exposes the equivalent via
+    /// per-pipeline `[drift]` policy.
+    DroppedOnSchemaChange {
+        model: String,
+        dbt_value: String,
+        rocky_equivalent: String,
+    },
+    /// A custom Jinja macro call survived `dbt compile` — defined
+    /// out-of-tree. The user needs to hand-port the macro.
+    UnresolvableMacro {
+        model: String,
+        macro_name: String,
+        first_call_site_line: usize,
+    },
+    /// A microbatch model is missing the required `event_time` field —
+    /// the importer fell back to `full_refresh`.
+    MicrobatchMissingEventTime { model: String },
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

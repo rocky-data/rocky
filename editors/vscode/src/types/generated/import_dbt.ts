@@ -6,6 +6,56 @@
  */
 
 /**
+ * Typed structured warning for dbt config that Rocky can't translate automatically. Each variant carries the source payload so the downstream UI (Dagster, VS Code) can route specific kinds into per-kind UI affordances without parsing free-form text.
+ */
+export type ImportDbtStructuredWarning =
+  | {
+      action: string;
+      dbt_materialization: string;
+      kind: "unsupported_materialization";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "dropped_databricks_tags";
+      model: string;
+      tags: {
+        [k: string]: string;
+      };
+      [k: string]: unknown;
+    }
+  | {
+      hook_kind: ImportDbtHookKind;
+      kind: "dropped_hook";
+      model: string;
+      sql: string;
+      [k: string]: unknown;
+    }
+  | {
+      dbt_value: string;
+      kind: "dropped_on_schema_change";
+      model: string;
+      rocky_equivalent: string;
+      [k: string]: unknown;
+    }
+  | {
+      first_call_site_line: number;
+      kind: "unresolvable_macro";
+      macro_name: string;
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "microbatch_missing_event_time";
+      model: string;
+      [k: string]: unknown;
+    };
+/**
+ * Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
+ */
+export type ImportDbtHookKind = "pre" | "post";
+
+/**
  * JSON output for `rocky import-dbt`.
  *
  * The `report` field is the per-model migration report from `rocky_compiler::import::report::generate_report`. We hold it as `serde_json::Value` (typed as `any` in JSON Schema) to avoid pulling `JsonSchema` derives all the way through `rocky-compiler::import`. The downstream Pydantic/TS bindings will see it as a free-form object.
@@ -32,6 +82,10 @@ export interface ImportDbtOutput {
   };
   sources_found: number;
   sources_mapped: number;
+  /**
+   * Typed structured warnings — payload-carrying variants for dbt config Rocky can't auto-translate (dropped tags, dropped hooks, unresolvable macros, etc.). Coexists with `warning_details` — orchestrators that don't know about this field still see the flat string warnings under `warning_details`.
+   */
+  structured_warnings?: ImportDbtStructuredWarning[];
   tests_converted: number;
   tests_converted_custom: number;
   tests_found: number;

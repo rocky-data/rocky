@@ -176,7 +176,12 @@ from .apply_schema import ApplyOutput
 from .profile_storage_schema import EncodingRecommendationOutput, ProfileStorageOutput
 
 # Import-dbt command
-from .import_dbt_schema import ImportDbtFailure, ImportDbtOutput, ImportDbtWarning
+from .import_dbt_schema import (
+    ImportDbtFailure,
+    ImportDbtHookKind,
+    ImportDbtOutput,
+    ImportDbtWarning,
+)
 
 # Hooks list + test
 from .hooks_list_schema import HookEntry, HooksListOutput
@@ -388,6 +393,7 @@ __all__ = [
     "ImportDbtOutput",
     "ImportDbtWarning",
     "ImportDbtFailure",
+    "ImportDbtHookKind",
     # hooks
     "HooksListOutput",
     "HookEntry",

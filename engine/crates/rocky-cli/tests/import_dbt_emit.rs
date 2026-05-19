@@ -9,7 +9,8 @@
 //! - `seeds/` mirrors the source `seeds/` verbatim.
 //! - `MIGRATION-NOTES.md` exists and lists the known limitations.
 //! - The translated model sidecars use the documented mapping
-//!   (`view → ephemeral`, `incremental → merge|incremental`, default → full_refresh).
+//!   (`view → view`, `materialized_view → materialized_view`,
+//!   `incremental → merge|incremental`, default → full_refresh).
 //! - `dbt_packages/` and `snapshots/` trees are left untouched (no models, no failures).
 //! - A model with `{% if target.name %}` lands as imported + JinjaControlFlow warning
 //!   with the `dbt-jinja-not-translated` marker in the emitted SQL.
@@ -20,8 +21,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use rocky_compiler::import::{
-    dbt::{self, ImportResult},
-    dbt_profiles,
+    dbt, dbt_profiles,
     emit::{self, EmitInputs, OverwritePolicy},
 };
 use rocky_core::config;
@@ -29,18 +29,6 @@ use rocky_core::models::{StrategyConfig, TargetConfig};
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dbt-rich")
-}
-
-fn collect_view_flattened(result: &ImportResult) -> BTreeSet<String> {
-    result
-        .warnings
-        .iter()
-        .filter(|w| {
-            matches!(w.category, dbt::WarningCategory::UnsupportedMaterialization)
-                && w.message.contains("'view'")
-        })
-        .map(|w| w.model.clone())
-        .collect()
 }
 
 #[test]
@@ -77,10 +65,12 @@ fn emit_runnable_repo_from_rich_fixture() {
         "fct_orders should be in imported models"
     );
 
-    let view_models = collect_view_flattened(&result);
+    // Wave 2: `view → StrategyConfig::View` directly; no flattening
+    // compensation needed at emit time.
     assert!(
-        view_models.contains("stg_customers"),
-        "stg_customers materialized='view' should be flagged for ephemeral rewrite"
+        result.imported.iter().any(|m| m.name == "stg_customers"
+            && matches!(m.config.strategy, StrategyConfig::View)),
+        "stg_customers materialized='view' should map to StrategyConfig::View"
     );
 
     let emission = emit::emit_repo(&EmitInputs {
@@ -91,7 +81,7 @@ fn emit_runnable_repo_from_rich_fixture() {
         default_catalog: &default_target.catalog,
         default_schema: &default_target.schema,
         import: &result,
-        view_models_to_make_ephemeral: view_models,
+        view_models_to_make_ephemeral: BTreeSet::new(),
         adapter_override_label: None,
     })
     .expect("emit_repo writes a runnable repo");
@@ -159,12 +149,12 @@ fn emit_runnable_repo_from_rich_fixture() {
         assert!(toml.exists(), "{name}.toml exists");
     }
 
-    // Strategy mapping check.
+    // Strategy mapping check. Wave 2: view → view (was: view → ephemeral).
     let stg_customers_toml =
         std::fs::read_to_string(models_dir.join("stg_customers.toml")).unwrap();
     assert!(
-        stg_customers_toml.contains("type = \"ephemeral\""),
-        "view → ephemeral mapping must apply"
+        stg_customers_toml.contains("type = \"view\""),
+        "view → view mapping must apply, got: {stg_customers_toml}"
     );
     let stg_orders_toml = std::fs::read_to_string(models_dir.join("stg_orders.toml")).unwrap();
     // incremental + unique_key → merge in the existing importer
@@ -201,7 +191,7 @@ fn emit_runnable_repo_from_rich_fixture() {
         .unwrap();
     assert!(matches!(
         stg_customers.config.strategy,
-        StrategyConfig::Ephemeral
+        StrategyConfig::View
     ));
     let fct_orders = models
         .iter()

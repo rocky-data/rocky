@@ -30,7 +30,7 @@ use anyhow::Result;
 
 use rocky_compiler::import::{
     dbt,
-    dbt::{ImportResult, WarningCategory},
+    dbt::{HookKind, ImportDbtStructuredWarning as CompilerStructuredWarning, ImportResult},
     dbt_manifest, dbt_profiles,
     dbt_profiles::{AdapterKind, ProfileResolution, StubReason},
     emit,
@@ -40,7 +40,8 @@ use rocky_compiler::import::{
 use rocky_core::models::TargetConfig;
 
 use crate::output::{
-    ImportDbtEmission, ImportDbtFailure, ImportDbtOutput, ImportDbtWarning, print_json,
+    ImportDbtEmission, ImportDbtFailure, ImportDbtHookKind, ImportDbtOutput,
+    ImportDbtStructuredWarning, ImportDbtWarning, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -100,6 +101,12 @@ pub fn run_import_dbt(
             })
             .collect();
 
+        let structured_warnings: Vec<ImportDbtStructuredWarning> = import_result
+            .structured_warnings
+            .iter()
+            .map(to_cli_structured_warning)
+            .collect();
+
         let failed_details: Vec<ImportDbtFailure> = import_result
             .failed
             .iter()
@@ -145,6 +152,7 @@ pub fn run_import_dbt(
                 .map(|m| m.name.clone())
                 .collect(),
             warning_details,
+            structured_warnings,
             failed_details,
             report: serde_json::to_value(&migration_report).unwrap_or(serde_json::Value::Null),
             emission: Some(emission_payload),
@@ -266,14 +274,68 @@ fn run_importer(
     }
 }
 
-fn collect_view_flattened_models(result: &ImportResult) -> BTreeSet<String> {
-    result
-        .warnings
-        .iter()
-        .filter(|w| {
-            w.category == WarningCategory::UnsupportedMaterialization
-                && w.message.contains("'view'")
-        })
-        .map(|w| w.model.clone())
-        .collect()
+fn collect_view_flattened_models(_result: &ImportResult) -> BTreeSet<String> {
+    // Wave 2: `view` maps to `StrategyConfig::View` directly, so there's
+    // no longer a flattening step to compensate for at emit time. The
+    // BTreeSet is retained on `EmitInputs` for back-compat and always
+    // empty here.
+    BTreeSet::new()
+}
+
+/// Translate a `rocky-compiler`-side structured warning into the
+/// CLI-output flavor (which has `JsonSchema` derives + serde tags
+/// suitable for codegen cascade).
+fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructuredWarning {
+    match w {
+        CompilerStructuredWarning::UnsupportedMaterialization {
+            model,
+            dbt_materialization,
+            action,
+        } => ImportDbtStructuredWarning::UnsupportedMaterialization {
+            model: model.clone(),
+            dbt_materialization: dbt_materialization.clone(),
+            action: action.clone(),
+        },
+        CompilerStructuredWarning::DroppedDatabricksTags { model, tags } => {
+            ImportDbtStructuredWarning::DroppedDatabricksTags {
+                model: model.clone(),
+                tags: tags.clone(),
+            }
+        }
+        CompilerStructuredWarning::DroppedHook {
+            model,
+            hook_kind,
+            sql,
+        } => ImportDbtStructuredWarning::DroppedHook {
+            model: model.clone(),
+            hook_kind: match hook_kind {
+                HookKind::Pre => ImportDbtHookKind::Pre,
+                HookKind::Post => ImportDbtHookKind::Post,
+            },
+            sql: sql.clone(),
+        },
+        CompilerStructuredWarning::DroppedOnSchemaChange {
+            model,
+            dbt_value,
+            rocky_equivalent,
+        } => ImportDbtStructuredWarning::DroppedOnSchemaChange {
+            model: model.clone(),
+            dbt_value: dbt_value.clone(),
+            rocky_equivalent: rocky_equivalent.clone(),
+        },
+        CompilerStructuredWarning::UnresolvableMacro {
+            model,
+            macro_name,
+            first_call_site_line,
+        } => ImportDbtStructuredWarning::UnresolvableMacro {
+            model: model.clone(),
+            macro_name: macro_name.clone(),
+            first_call_site_line: *first_call_site_line,
+        },
+        CompilerStructuredWarning::MicrobatchMissingEventTime { model } => {
+            ImportDbtStructuredWarning::MicrobatchMissingEventTime {
+                model: model.clone(),
+            }
+        }
+    }
 }

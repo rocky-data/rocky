@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use rocky_core::models::{ModelConfig, StrategyConfig};
 use rocky_core::tests::{TestDecl, TestSeverity, TestType};
 
-use super::dbt::{ImportResult, ImportedModel, WarningCategory};
+use super::dbt::{ImportResult, ImportedModel};
 use super::dbt_profiles::ProfileResolution;
 
 /// Outcome of emitting a Rocky repo on disk.
@@ -68,11 +68,12 @@ pub struct EmitInputs<'a> {
     pub default_catalog: &'a str,
     pub default_schema: &'a str,
     pub import: &'a ImportResult,
-    /// Extra models that need their `view → ephemeral` mapping applied at
-    /// emit time. The caller has already constructed `import.imported`
-    /// using the regex/manifest path (where `view` flattens to
-    /// `full_refresh`); this set lets the emitter rewrite the strategy
-    /// to `Ephemeral` after the fact without forking the import path.
+    /// Legacy: extra models whose `view` materialization was flattened to
+    /// `full_refresh` by an older version of the importer. The Wave 2
+    /// `view → StrategyConfig::View` mapping eliminates this code path
+    /// for new imports, but the field is retained as the BTreeSet
+    /// surface for callers that still pass it (always empty in
+    /// post-Wave-2 callers).
     pub view_models_to_make_ephemeral: BTreeSet<String>,
     /// Adapter override applied via `--target-adapter`, if any. Drives
     /// MIGRATION-NOTES wording.
@@ -103,12 +104,18 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         translated += 1;
     }
 
-    // Collect `materialized` values that fell through to FullRefresh-with-TODO.
-    for w in &inputs.import.warnings {
-        if w.category == WarningCategory::UnsupportedMaterialization
-            && !unknown_materializations.contains(&w.model)
+    // Collect models whose dbt materialization had no Rocky equivalent
+    // and fell back to FullRefresh. Sourced from the typed structured
+    // warnings (Wave 2) so we don't false-flag models that hit warnings
+    // for unrelated reasons (dropped tags, hooks, on_schema_change).
+    for w in &inputs.import.structured_warnings {
+        if let super::dbt::ImportDbtStructuredWarning::UnsupportedMaterialization {
+            model, ..
+        } = w
         {
-            unknown_materializations.push(w.model.clone());
+            if !unknown_materializations.contains(model) {
+                unknown_materializations.push(model.clone());
+            }
         }
     }
 
@@ -136,6 +143,7 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
             tests_skipped: inputs.import.tests_found,
             macros_detected: inputs.import.macros_detected,
             warnings: &inputs.import.warnings,
+            structured_warnings: &inputs.import.structured_warnings,
             failed: &inputs.import.failed,
             unknown_materializations: &unknown_materializations,
             profile: inputs.profile,
@@ -273,10 +281,38 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         StrategyConfig::Ephemeral => {
             out.push_str("type = \"ephemeral\"\n");
         }
-        // The remaining variants don't arise from the dbt importer
-        // (TimeInterval, DeleteInsert, Microbatch). If we ever hit one,
-        // fall back to full_refresh — the dbt importer doesn't currently
-        // produce them so there's no test to break.
+        StrategyConfig::View => {
+            out.push_str("type = \"view\"\n");
+        }
+        StrategyConfig::MaterializedView => {
+            out.push_str("type = \"materialized_view\"\n");
+        }
+        StrategyConfig::DynamicTable { target_lag } => {
+            out.push_str("type = \"dynamic_table\"\n");
+            out.push_str(&format!("target_lag = \"{target_lag}\"\n"));
+        }
+        StrategyConfig::Microbatch {
+            timestamp_column,
+            granularity,
+        } => {
+            out.push_str("type = \"microbatch\"\n");
+            out.push_str(&format!("timestamp_column = \"{timestamp_column}\"\n"));
+            let g = match granularity {
+                rocky_ir::TimeGrain::Hour => "hour",
+                rocky_ir::TimeGrain::Day => "day",
+                rocky_ir::TimeGrain::Month => "month",
+                rocky_ir::TimeGrain::Year => "year",
+            };
+            out.push_str(&format!("granularity = \"{g}\"\n"));
+        }
+        StrategyConfig::DeleteInsert { partition_by } => {
+            out.push_str("type = \"delete_insert\"\n");
+            let keys: Vec<String> = partition_by.iter().map(|k| format!("\"{k}\"")).collect();
+            out.push_str(&format!("partition_by = [{}]\n", keys.join(", ")));
+        }
+        // TimeInterval + ContentAddressed don't arise from the dbt
+        // importer today; if we ever hit one, fall back to full_refresh
+        // (the user can hand-edit the sidecar).
         _ => {
             out.push_str("type = \"full_refresh\"\n");
         }
@@ -447,10 +483,97 @@ struct MigrationContext<'a> {
     tests_skipped: usize,
     macros_detected: usize,
     warnings: &'a [super::dbt::ImportWarning],
+    structured_warnings: &'a [super::dbt::ImportDbtStructuredWarning],
     failed: &'a [super::dbt::ImportFailure],
     unknown_materializations: &'a [String],
     profile: &'a ProfileResolution,
     adapter_override_label: Option<&'a str>,
+}
+
+/// Render the structured-warnings block of `MIGRATION-NOTES.md`. Each
+/// variant gets a per-model bullet that includes the dropped payload
+/// (tag values, hook SQL, macro names) so the user can paste it
+/// directly into the Rocky config.
+fn write_structured_warnings(
+    out: &mut String,
+    warnings: &[super::dbt::ImportDbtStructuredWarning],
+) {
+    use super::dbt::{HookKind, ImportDbtStructuredWarning as W};
+    // Group warnings by model to keep the output scannable.
+    let mut by_model: std::collections::BTreeMap<&str, Vec<&W>> = std::collections::BTreeMap::new();
+    for w in warnings {
+        let model = match w {
+            W::UnsupportedMaterialization { model, .. }
+            | W::DroppedDatabricksTags { model, .. }
+            | W::DroppedHook { model, .. }
+            | W::DroppedOnSchemaChange { model, .. }
+            | W::UnresolvableMacro { model, .. }
+            | W::MicrobatchMissingEventTime { model } => model.as_str(),
+        };
+        by_model.entry(model).or_default().push(w);
+    }
+    for (model, items) in by_model {
+        out.push_str(&format!("### `{model}`\n\n"));
+        for w in items {
+            match w {
+                W::UnsupportedMaterialization {
+                    dbt_materialization,
+                    action,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "- **Unsupported materialization** `{dbt_materialization}` — {action}\n"
+                    ));
+                }
+                W::DroppedDatabricksTags { tags, .. } => {
+                    out.push_str(
+                        "- **Dropped `databricks_tags`** — copy into the model sidecar's `[classification]` block or wire via `rocky-databricks` governance:\n",
+                    );
+                    for (k, v) in tags {
+                        out.push_str(&format!("  - `{k}` = `{v}`\n"));
+                    }
+                }
+                W::DroppedHook { hook_kind, sql, .. } => {
+                    let event = match hook_kind {
+                        HookKind::Pre => "on_model_start",
+                        HookKind::Post => "on_model_end",
+                    };
+                    let kind_label = match hook_kind {
+                        HookKind::Pre => "pre_hook",
+                        HookKind::Post => "post_hook",
+                    };
+                    out.push_str(&format!(
+                        "- **Dropped `{kind_label}`** — translate into `[[hook]] event = \"{event}\"` in `rocky.toml`:\n"
+                    ));
+                    out.push_str(&format!("  ```sql\n  {sql}\n  ```\n"));
+                }
+                W::DroppedOnSchemaChange {
+                    dbt_value,
+                    rocky_equivalent,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "- **Dropped `on_schema_change = '{dbt_value}'`** — set Rocky `[drift]` policy: {rocky_equivalent}\n"
+                    ));
+                }
+                W::UnresolvableMacro {
+                    macro_name,
+                    first_call_site_line,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "- **Unresolvable Jinja macro** `{macro_name}()` first called at line {first_call_site_line} — hand-port the macro logic\n"
+                    ));
+                }
+                W::MicrobatchMissingEventTime { .. } => {
+                    out.push_str(
+                        "- **Microbatch missing `event_time`** — fell back to `full_refresh`. Add `event_time = '<timestamp_column>'` to the model's dbt config block\n",
+                    );
+                }
+            }
+        }
+        out.push('\n');
+    }
 }
 
 fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), String> {
@@ -540,6 +663,14 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
     }
     out.push('\n');
 
+    if !ctx.structured_warnings.is_empty() {
+        out.push_str("## Items to translate manually\n\n");
+        out.push_str(
+            "The dbt config below couldn't be auto-translated. Each entry points at the matching Rocky surface.\n\n",
+        );
+        write_structured_warnings(&mut out, ctx.structured_warnings);
+    }
+
     if !ctx.warnings.is_empty() {
         out.push_str("## Warnings\n\n");
         for w in ctx.warnings {
@@ -610,6 +741,7 @@ mod tests {
         ImportResult {
             imported,
             warnings: vec![],
+            structured_warnings: vec![],
             failed: vec![],
             sources_found: 0,
             sources_mapped: 0,

@@ -484,6 +484,7 @@ mod tests {
         ImportResult {
             imported,
             warnings,
+            structured_warnings: vec![],
             failed,
             sources_found,
             sources_mapped,

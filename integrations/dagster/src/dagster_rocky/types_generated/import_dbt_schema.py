@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, conint
 
 
 class ImportDbtEmission(BaseModel):
@@ -58,6 +59,102 @@ class ImportDbtFailure(BaseModel):
     reason: str
 
 
+class ImportDbtHookKind(StrEnum):
+    """
+    Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
+    """
+
+    pre = "pre"
+    post = "post"
+
+
+class Kind(StrEnum):
+    unsupported_materialization = "unsupported_materialization"
+
+
+class ImportDbtStructuredWarning1(BaseModel):
+    """
+    A dbt materialization with no direct Rocky equivalent. The importer fell back to the closest match (typically `full_refresh`).
+    """
+
+    action: str
+    dbt_materialization: str
+    kind: Kind
+    model: str
+
+
+class Kind33(StrEnum):
+    dropped_databricks_tags = "dropped_databricks_tags"
+
+
+class ImportDbtStructuredWarning2(BaseModel):
+    """
+    `databricks_tags` block dropped — Rocky's `[classification]` block + `rocky-databricks` governance surface covers the same use case but requires manual config.
+    """
+
+    kind: Kind33
+    model: str
+    tags: dict[str, str]
+
+
+class Kind34(StrEnum):
+    dropped_hook = "dropped_hook"
+
+
+class ImportDbtStructuredWarning3(BaseModel):
+    """
+    `pre_hook` or `post_hook` dropped — Rocky supports lifecycle hooks via the `[[hook]]` block in `rocky.toml`.
+    """
+
+    hook_kind: ImportDbtHookKind
+    kind: Kind34
+    model: str
+    sql: str
+
+
+class Kind35(StrEnum):
+    dropped_on_schema_change = "dropped_on_schema_change"
+
+
+class ImportDbtStructuredWarning4(BaseModel):
+    """
+    `on_schema_change` dropped — Rocky exposes the equivalent via per-pipeline `[drift]` policy.
+    """
+
+    dbt_value: str
+    kind: Kind35
+    model: str
+    rocky_equivalent: str
+
+
+class Kind36(StrEnum):
+    unresolvable_macro = "unresolvable_macro"
+
+
+class ImportDbtStructuredWarning5(BaseModel):
+    """
+    A custom Jinja macro call survived `dbt compile` — defined out-of-tree. The user needs to hand-port the macro.
+    """
+
+    first_call_site_line: conint(ge=0)
+    kind: Kind36
+    macro_name: str
+    model: str
+
+
+class Kind37(StrEnum):
+    microbatch_missing_event_time = "microbatch_missing_event_time"
+
+
+class ImportDbtStructuredWarning6(BaseModel):
+    """
+    A microbatch model is missing the required `event_time` field — the importer fell back to `full_refresh`.
+    """
+
+    kind: Kind37
+    model: str
+
+
 class ImportDbtWarning(BaseModel):
     category: str
     message: str
@@ -91,6 +188,20 @@ class ImportDbtOutput(BaseModel):
     """
     sources_found: conint(ge=0)
     sources_mapped: conint(ge=0)
+    structured_warnings: (
+        list[
+            ImportDbtStructuredWarning1
+            | ImportDbtStructuredWarning2
+            | ImportDbtStructuredWarning3
+            | ImportDbtStructuredWarning4
+            | ImportDbtStructuredWarning5
+            | ImportDbtStructuredWarning6
+        ]
+        | None
+    ) = Field([], validate_default=True)
+    """
+    Typed structured warnings — payload-carrying variants for dbt config Rocky can't auto-translate (dropped tags, dropped hooks, unresolvable macros, etc.). Coexists with `warning_details` — orchestrators that don't know about this field still see the flat string warnings under `warning_details`.
+    """
     tests_converted: conint(ge=0)
     tests_converted_custom: conint(ge=0)
     tests_found: conint(ge=0)

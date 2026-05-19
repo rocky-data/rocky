@@ -17,14 +17,15 @@
 //! **Not supported (produces diagnostics):**
 //! - Custom Jinja macros, `{% for %}`, `{{ var() }}`, Python models
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use regex::Regex;
+use rocky_ir::TimeGrain;
 
 use rocky_core::models::{ModelConfig, StrategyConfig, TargetConfig};
 
-use super::dbt_manifest::{self, DbtManifest, DbtManifestNode, UniqueKeyValue};
+use super::dbt_manifest::{self, DbtManifest, DbtManifestNode, DbtNodeConfig, UniqueKeyValue};
 use super::dbt_project::{self, DbtProjectConfig};
 use super::dbt_sources;
 
@@ -68,6 +69,67 @@ pub struct ImportWarning {
     pub suggestion: Option<String>,
 }
 
+/// Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookKind {
+    Pre,
+    Post,
+}
+
+/// A structured warning carrying typed payload data for dbt-side config
+/// that Rocky can't translate automatically. Surfaces in
+/// `ImportDbtOutput.structured_warnings` so callers (Dagster, vscode) can
+/// route specific kinds (e.g. dropped tags, dropped hooks) into UI
+/// affordances without parsing free-form `message` text.
+///
+/// Coexists with the flat `ImportWarning` surface — string warnings stay
+/// for back-compat with existing orchestrators.
+#[derive(Debug, Clone)]
+pub enum ImportDbtStructuredWarning {
+    /// dbt materialization that has no direct Rocky equivalent. The
+    /// importer fell back to the closest match (typically `FullRefresh`).
+    UnsupportedMaterialization {
+        model: String,
+        dbt_materialization: String,
+        action: String,
+    },
+    /// dbt-databricks `databricks_tags` block was dropped — Rocky's
+    /// `[classification]` block + `rocky-databricks` governance surface
+    /// covers the same use case but requires manual config.
+    DroppedDatabricksTags {
+        model: String,
+        tags: BTreeMap<String, String>,
+    },
+    /// A `pre_hook` or `post_hook` was dropped — Rocky supports lifecycle
+    /// hooks via the `[[hook]]` block in `rocky.toml` but the importer
+    /// doesn't auto-translate per-model dbt hooks.
+    DroppedHook {
+        model: String,
+        hook_kind: HookKind,
+        sql: String,
+    },
+    /// `on_schema_change` was dropped — Rocky exposes the equivalent
+    /// behavior via per-pipeline `[drift]` policy.
+    DroppedOnSchemaChange {
+        model: String,
+        dbt_value: String,
+        rocky_equivalent: String,
+    },
+    /// A custom Jinja macro call survived compilation (i.e. dbt's compile
+    /// step didn't inline it because it's defined out-of-tree). The user
+    /// has to hand-port the macro or rewrite the model.
+    UnresolvableMacro {
+        model: String,
+        macro_name: String,
+        first_call_site_line: usize,
+    },
+    /// A microbatch model is missing `event_time` — dbt-databricks
+    /// requires this field. The importer falls back to `FullRefresh` and
+    /// surfaces the gap so the user can either add `event_time` to the
+    /// dbt source or pick a non-microbatch strategy.
+    MicrobatchMissingEventTime { model: String },
+}
+
 /// A model that failed to import.
 #[derive(Debug, Clone)]
 pub struct ImportFailure {
@@ -79,8 +141,13 @@ pub struct ImportFailure {
 pub struct ImportResult {
     /// Successfully imported models (name, SQL, config).
     pub imported: Vec<ImportedModel>,
-    /// Structured warnings.
+    /// Free-form warnings — string `message` + category enum. Existing
+    /// orchestrator-visible surface; kept stable for back-compat.
     pub warnings: Vec<ImportWarning>,
+    /// Typed structured warnings — payload-carrying variants that
+    /// downstream UIs can pattern-match on (e.g. dropped tags, dropped
+    /// hooks). New in Wave 2.
+    pub structured_warnings: Vec<ImportDbtStructuredWarning>,
     /// Models that could not be imported.
     pub failed: Vec<ImportFailure>,
     /// Number of dbt source definitions found.
@@ -130,6 +197,7 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
     let mut result = ImportResult {
         imported: Vec::new(),
         warnings: Vec::new(),
+        structured_warnings: Vec::new(),
         failed: Vec::new(),
         sources_found: manifest.sources.len(),
         sources_mapped: manifest.sources.len(),
@@ -264,9 +332,26 @@ fn import_manifest_node(
         }
     };
 
-    // Map strategy from manifest config
-    let (strategy, strategy_warnings) = manifest_config_to_strategy(&node.config, &node.name);
+    // Map strategy from manifest config — covers all dbt materializations
+    // (`table`, `view`, `materialized_view`, `incremental`, `ephemeral`,
+    // `microbatch`) plus the `incremental_strategy` discriminator.
+    let StrategyMappingOutput {
+        strategy,
+        warnings: strategy_warnings,
+        structured,
+    } = map_manifest_strategy(&node.config, &node.name);
     result.warnings.extend(strategy_warnings);
+    result.structured_warnings.extend(structured);
+
+    // Surface dbt-databricks specifics that Rocky doesn't auto-translate
+    // (databricks_tags, pre/post hooks, on_schema_change). Emitted as
+    // structured warnings so the downstream UI can route them.
+    collect_dropped_config_warnings(&node.config, &node.name, result);
+
+    // Detect unresolvable Jinja macros that survived `dbt compile`. dbt's
+    // compile step inlines in-tree macros, so anything still present
+    // points at an out-of-tree macro the user needs to hand-port.
+    collect_unresolvable_macros(&sql, &node.name, result);
 
     // Map dependencies
     let depends_on = dbt_manifest::depends_on_to_rocky(&node.depends_on.nodes);
@@ -316,57 +401,396 @@ fn import_manifest_node(
     });
 }
 
-fn manifest_config_to_strategy(
-    config: &super::dbt_manifest::DbtNodeConfig,
-    model_name: &str,
-) -> (StrategyConfig, Vec<ImportWarning>) {
-    let mut warnings = Vec::new();
+/// Output of mapping a dbt node config to a Rocky strategy. Returns the
+/// chosen [`StrategyConfig`] plus both warning kinds (the back-compat
+/// string warnings + the new structured variants).
+struct StrategyMappingOutput {
+    strategy: StrategyConfig,
+    warnings: Vec<ImportWarning>,
+    structured: Vec<ImportDbtStructuredWarning>,
+}
 
-    match config.materialized.as_str() {
-        "incremental" => {
-            if let Some(ref uk) = config.unique_key {
-                let keys = match uk {
-                    UniqueKeyValue::Single(s) => vec![s.clone()],
-                    UniqueKeyValue::Multiple(v) => v.clone(),
-                };
-                (
-                    StrategyConfig::Merge {
-                        unique_key: keys,
-                        update_columns: None,
-                    },
-                    warnings,
-                )
-            } else {
-                (
-                    StrategyConfig::Incremental {
-                        timestamp_column: "updated_at".to_string(),
-                    },
-                    warnings,
-                )
-            }
-        }
-        "view" => {
-            warnings.push(ImportWarning {
-                model: model_name.to_string(),
-                category: WarningCategory::UnsupportedMaterialization,
-                message: "materialized='view' not supported — using full_refresh".to_string(),
-                suggestion: Some(
-                    "consider using materialized='table' or 'incremental' in Rocky".to_string(),
-                ),
-            });
-            (StrategyConfig::FullRefresh, warnings)
-        }
+/// Map a dbt node config to a Rocky [`StrategyConfig`].
+///
+/// Covers `table` / `view` / `materialized_view` / `incremental`
+/// (across all `incremental_strategy` values) / `ephemeral` /
+/// `microbatch`. Unknown materializations fall back to `FullRefresh` with
+/// a warning.
+fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMappingOutput {
+    let mut warnings = Vec::new();
+    let mut structured = Vec::new();
+
+    let strategy = match config.materialized.as_str() {
+        "table" => StrategyConfig::FullRefresh,
+        "view" => StrategyConfig::View,
+        "materialized_view" => StrategyConfig::MaterializedView,
         "ephemeral" => {
             warnings.push(ImportWarning {
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
-                message: "materialized='ephemeral' not supported — using full_refresh".to_string(),
-                suggestion: Some("inline the SQL into downstream models".to_string()),
+                message: "materialized='ephemeral' has no Rocky equivalent — using full_refresh"
+                    .to_string(),
+                suggestion: Some(
+                    "ephemeral models inline into downstream queries; consider folding the SQL into the consumer or keeping it as a `full_refresh` table".to_string(),
+                ),
             });
-            (StrategyConfig::FullRefresh, warnings)
+            structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
+                model: model_name.to_string(),
+                dbt_materialization: "ephemeral".to_string(),
+                action: "fell back to full_refresh".to_string(),
+            });
+            StrategyConfig::FullRefresh
         }
-        _ => (StrategyConfig::FullRefresh, warnings),
+        "incremental" => map_incremental_strategy(config, model_name, &mut warnings),
+        "microbatch" => map_microbatch_strategy(config, model_name, &mut warnings, &mut structured),
+        other => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: format!(
+                    "materialized='{other}' not recognized by Rocky — using full_refresh"
+                ),
+                suggestion: Some(
+                    "set `type` in the emitted strategy block to a Rocky-supported value (full_refresh / incremental / merge / view / materialized_view / dynamic_table / time_interval / delete_insert / microbatch)".to_string(),
+                ),
+            });
+            structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
+                model: model_name.to_string(),
+                dbt_materialization: other.to_string(),
+                action: "fell back to full_refresh".to_string(),
+            });
+            StrategyConfig::FullRefresh
+        }
+    };
+
+    StrategyMappingOutput {
+        strategy,
+        warnings,
+        structured,
     }
+}
+
+/// Map `materialized='incremental'` + `incremental_strategy=<...>` to the
+/// appropriate Rocky strategy variant.
+fn map_incremental_strategy(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    warnings: &mut Vec<ImportWarning>,
+) -> StrategyConfig {
+    let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
+        UniqueKeyValue::Single(s) => vec![s.clone()],
+        UniqueKeyValue::Multiple(v) => v.clone(),
+    });
+
+    // Default discriminator: `append` if no unique_key, else `merge`.
+    // dbt-databricks treats unique_key as implying merge semantics when
+    // incremental_strategy is unset.
+    let strategy_kind = config
+        .incremental_strategy
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            if unique_keys.is_some() {
+                "merge".to_string()
+            } else {
+                "append".to_string()
+            }
+        });
+
+    match strategy_kind.as_str() {
+        "merge" => match unique_keys {
+            Some(keys) if !keys.is_empty() => StrategyConfig::Merge {
+                unique_key: keys,
+                update_columns: None,
+            },
+            _ => {
+                warnings.push(ImportWarning {
+                    model: model_name.to_string(),
+                    category: WarningCategory::UnsupportedMaterialization,
+                    message: "incremental_strategy='merge' requires unique_key — falling back to incremental(updated_at)".to_string(),
+                    suggestion: Some(
+                        "add unique_key to the model config or pick a non-merge incremental_strategy".to_string(),
+                    ),
+                });
+                StrategyConfig::Incremental {
+                    timestamp_column: "updated_at".to_string(),
+                }
+            }
+        },
+        "append" => StrategyConfig::Incremental {
+            timestamp_column: "updated_at".to_string(),
+        },
+        "delete+insert" | "delete_insert" => {
+            let partition_by = config.partition_by.clone().or_else(|| unique_keys.clone());
+            match partition_by {
+                Some(keys) => StrategyConfig::DeleteInsert { partition_by: keys },
+                None => {
+                    warnings.push(ImportWarning {
+                        model: model_name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: "incremental_strategy='delete+insert' has no partition_by or unique_key — emitted placeholder partition column".to_string(),
+                        suggestion: Some(
+                            "set `partition_by = ['<column>']` in the dbt config or override the emitted Rocky sidecar's [strategy] block".to_string(),
+                        ),
+                    });
+                    StrategyConfig::DeleteInsert {
+                        partition_by: vec!["partition_key".to_string()],
+                    }
+                }
+            }
+        }
+        "insert_overwrite" => {
+            // insert_overwrite is partition-overwrite semantics — map to
+            // DeleteInsert by default. Time-partition variants need
+            // time_interval which the user can opt into explicitly.
+            let partition_by = config.partition_by.clone();
+            let final_partition_by = match partition_by {
+                Some(keys) => {
+                    warnings.push(ImportWarning {
+                        model: model_name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: "incremental_strategy='insert_overwrite' mapped to delete_insert — review partition semantics".to_string(),
+                        suggestion: Some(
+                            "if the model is time-partitioned, set `type = \"time_interval\"` instead and define `time_column` / `granularity`".to_string(),
+                        ),
+                    });
+                    keys
+                }
+                None => {
+                    warnings.push(ImportWarning {
+                        model: model_name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: "incremental_strategy='insert_overwrite' has no partition_by — emitted placeholder partition column".to_string(),
+                        suggestion: Some(
+                            "set `partition_by = ['<column>']` in the dbt config or override the emitted Rocky sidecar's [strategy] block".to_string(),
+                        ),
+                    });
+                    vec!["partition_key".to_string()]
+                }
+            };
+            StrategyConfig::DeleteInsert {
+                partition_by: final_partition_by,
+            }
+        }
+        "microbatch" => {
+            // Re-dispatch through the microbatch path so we get the
+            // same event_time validation + granularity translation.
+            let mut structured = Vec::new();
+            map_microbatch_strategy(config, model_name, warnings, &mut structured)
+        }
+        other => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: format!(
+                    "incremental_strategy='{other}' not recognized — falling back to incremental(updated_at)"
+                ),
+                suggestion: Some(
+                    "use one of: append, merge, delete+insert, insert_overwrite, microbatch".to_string(),
+                ),
+            });
+            StrategyConfig::Incremental {
+                timestamp_column: "updated_at".to_string(),
+            }
+        }
+    }
+}
+
+/// Map `materialized='microbatch'` (or `incremental_strategy='microbatch'`)
+/// to [`StrategyConfig::Microbatch`]. Emits a
+/// [`ImportDbtStructuredWarning::MicrobatchMissingEventTime`] + falls back
+/// to `FullRefresh` if `event_time` is absent.
+fn map_microbatch_strategy(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    warnings: &mut Vec<ImportWarning>,
+    structured: &mut Vec<ImportDbtStructuredWarning>,
+) -> StrategyConfig {
+    let Some(event_time) = config.event_time.clone() else {
+        warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: "microbatch model is missing required `event_time` config — falling back to full_refresh".to_string(),
+            suggestion: Some(
+                "add `event_time = '<timestamp_column>'` to the model's dbt config block".to_string(),
+            ),
+        });
+        structured.push(ImportDbtStructuredWarning::MicrobatchMissingEventTime {
+            model: model_name.to_string(),
+        });
+        return StrategyConfig::FullRefresh;
+    };
+    let granularity = config
+        .batch_size
+        .as_deref()
+        .map(|s| batch_size_to_grain(s, model_name, warnings))
+        .unwrap_or(TimeGrain::Day);
+
+    StrategyConfig::Microbatch {
+        timestamp_column: event_time,
+        granularity,
+    }
+}
+
+/// Translate a dbt `batch_size` string to a Rocky [`TimeGrain`]. Falls
+/// back to `Day` on unrecognized values with a warning.
+fn batch_size_to_grain(
+    raw: &str,
+    model_name: &str,
+    warnings: &mut Vec<ImportWarning>,
+) -> TimeGrain {
+    match raw.to_ascii_lowercase().as_str() {
+        "hour" => TimeGrain::Hour,
+        "day" => TimeGrain::Day,
+        "month" => TimeGrain::Month,
+        "year" => TimeGrain::Year,
+        other => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: format!(
+                    "batch_size='{other}' not recognized — defaulting to `day` granularity"
+                ),
+                suggestion: Some("set batch_size to one of: hour, day, month, year".to_string()),
+            });
+            TimeGrain::Day
+        }
+    }
+}
+
+/// Collect structured warnings for dbt config Rocky can't auto-translate
+/// (databricks_tags, pre/post hooks, on_schema_change). These are
+/// dropped-on-purpose with an explicit pointer at the Rocky equivalent.
+fn collect_dropped_config_warnings(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    result: &mut ImportResult,
+) {
+    if !config.databricks_tags.is_empty() {
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedDatabricksTags {
+                model: model_name.to_string(),
+                tags: config.databricks_tags.clone(),
+            });
+        result.warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!(
+                "{} databricks tag(s) dropped — Rocky's [classification] block + rocky-databricks governance surface covers the same use case",
+                config.databricks_tags.len()
+            ),
+            suggestion: Some(
+                "copy the dropped tags into the model sidecar's [classification] block, or configure them via rocky-databricks governance".to_string(),
+            ),
+        });
+    }
+
+    for sql in &config.pre_hook {
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedHook {
+                model: model_name.to_string(),
+                hook_kind: HookKind::Pre,
+                sql: sql.clone(),
+            });
+        result.warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: "pre_hook dropped — Rocky supports lifecycle hooks via the [[hook]] block in rocky.toml".to_string(),
+            suggestion: Some(
+                "translate the pre-hook SQL into an `[[hook]] event = \"on_model_start\"` entry in the emitted rocky.toml".to_string(),
+            ),
+        });
+    }
+
+    for sql in &config.post_hook {
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedHook {
+                model: model_name.to_string(),
+                hook_kind: HookKind::Post,
+                sql: sql.clone(),
+            });
+        result.warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: "post_hook dropped — Rocky supports lifecycle hooks via the [[hook]] block in rocky.toml".to_string(),
+            suggestion: Some(
+                "translate the post-hook SQL into an `[[hook]] event = \"on_model_end\"` entry in the emitted rocky.toml".to_string(),
+            ),
+        });
+    }
+
+    if let Some(value) = config.on_schema_change.as_deref() {
+        let rocky_equivalent = on_schema_change_to_rocky(value);
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedOnSchemaChange {
+                model: model_name.to_string(),
+                dbt_value: value.to_string(),
+                rocky_equivalent: rocky_equivalent.clone(),
+            });
+        result.warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!(
+                "on_schema_change='{value}' dropped — Rocky exposes the equivalent via per-pipeline [drift] policy ({rocky_equivalent})"
+            ),
+            suggestion: Some(
+                "set the matching [drift] policy in the pipeline section of the emitted rocky.toml".to_string(),
+            ),
+        });
+    }
+}
+
+/// Translate dbt's `on_schema_change` values to a human-readable Rocky
+/// drift-policy hint. Used for the structured warning's
+/// `rocky_equivalent` field.
+fn on_schema_change_to_rocky(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "ignore" => "drift policy 'ignore' (skip drift detection)".to_string(),
+        "fail" => "drift policy 'strict' (fail on drift)".to_string(),
+        "append_new_columns" => {
+            "drift policy 'evolve' (allow safe widening + new columns)".to_string()
+        }
+        "sync_all_columns" => "drift policy 'evolve' with column-removal allowed".to_string(),
+        other => format!("(no direct equivalent for '{other}' — set [drift] manually)"),
+    }
+}
+
+/// Detect Jinja macro calls that survived `dbt compile` and surface each
+/// distinct macro as an `UnresolvableMacro` structured warning. dbt
+/// resolves in-tree macros at compile time, so anything still present
+/// points at an out-of-tree macro (e.g. a custom org-wide library).
+fn collect_unresolvable_macros(sql: &str, model_name: &str, result: &mut ImportResult) {
+    let usages = super::dbt_macros::detect_macros(sql);
+    if usages.is_empty() {
+        return;
+    }
+    // Track first occurrence per (package, name) so we emit one warning
+    // per macro, not per call site. dbt projects often call the same
+    // macro 100+ times within a single model body.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for u in &usages {
+        let full_name = match &u.package {
+            Some(pkg) => format!("{pkg}.{}", u.name),
+            None => u.name.clone(),
+        };
+        if !seen.insert(full_name.clone()) {
+            continue;
+        }
+        let line = sql[..u.span.0].matches('\n').count() + 1;
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::UnresolvableMacro {
+                model: model_name.to_string(),
+                macro_name: full_name,
+                first_call_site_line: line,
+            });
+    }
+    result.macros_detected += seen.len();
+    result.macros_unsupported += seen.len();
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +845,7 @@ pub fn import_dbt_project(
     let mut result = ImportResult {
         imported: Vec::new(),
         warnings: Vec::new(),
+        structured_warnings: Vec::new(),
         failed: Vec::new(),
         sources_found,
         sources_mapped,
@@ -615,13 +1040,18 @@ fn import_single_model(
                     };
                 }
                 "view" => {
+                    strategy = StrategyConfig::View;
+                }
+                "materialized_view" => {
+                    strategy = StrategyConfig::MaterializedView;
+                }
+                "ephemeral" => {
                     warnings.push(ImportWarning {
                         model: name.to_string(),
                         category: WarningCategory::UnsupportedMaterialization,
-                        message: "project config materialized='view' — using full_refresh"
-                            .to_string(),
+                        message: "project config materialized='ephemeral' has no Rocky equivalent — using full_refresh".to_string(),
                         suggestion: Some(
-                            "override per-model with `type = \"full_refresh\"` or `\"ephemeral\"` in the sidecar".to_string(),
+                            "override per-model with `type = \"full_refresh\"` or fold the SQL into downstream models".to_string(),
                         ),
                     });
                 }
@@ -769,64 +1199,109 @@ fn extract_timestamp_from_where(block: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Extract strategy from dbt `{{ config() }}` block.
+///
+/// Parses the `materialized` + `incremental_strategy` + `unique_key`
+/// fields, dispatching through [`map_manifest_strategy`] so the regex
+/// path stays in sync with the manifest path. Other config fields
+/// (`event_time`, `batch_size`, `databricks_tags`, `pre_hook`,
+/// `post_hook`, `on_schema_change`) are best-effort — the regex path
+/// gives up on multi-line / structured values and falls back to the
+/// manifest path for richer recovery.
+///
+/// Returns the chosen [`StrategyConfig`] plus a list of free-form
+/// warning messages.
+///
+/// Note: structured warnings produced by [`map_manifest_strategy`] are
+/// discarded here on purpose — the regex path emits string warnings
+/// only (the manifest path is the canonical surface for
+/// structured-warning consumers).
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
-    let mut warnings = Vec::new();
+    let mut messages = Vec::new();
 
     let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").unwrap();
-    if let Some(captures) = config_re.captures(content) {
-        let config_str = &captures[1];
+    let Some(captures) = config_re.captures(content) else {
+        return (StrategyConfig::FullRefresh, messages);
+    };
 
-        // Parse materialized
-        let mat_re = Regex::new(r#"materialized\s*=\s*['"](\w+)['"]"#).unwrap();
-        let materialized = mat_re
-            .captures(config_str)
-            .map(|c| c[1].to_string())
-            .unwrap_or_else(|| "table".to_string());
+    let config_str = &captures[1];
 
-        match materialized.as_str() {
-            "incremental" => {
-                // Extract unique_key for merge strategy
-                let key_re = Regex::new(r#"unique_key\s*=\s*['"](\w+)['"]"#).unwrap();
-                if let Some(key_cap) = key_re.captures(config_str) {
-                    return (
-                        StrategyConfig::Merge {
-                            unique_key: vec![key_cap[1].to_string()],
-                            update_columns: None,
-                        },
-                        warnings,
-                    );
-                }
-                // Incremental without unique_key -> append
-                let ts_re = Regex::new(r#"(?:incremental_strategy|timestamp)\s*=\s*['"](\w+)['"]"#)
-                    .unwrap();
-                let ts_col = ts_re
-                    .captures(config_str)
-                    .map(|c| c[1].to_string())
-                    .unwrap_or_else(|| "updated_at".to_string());
-                (
-                    StrategyConfig::Incremental {
-                        timestamp_column: ts_col,
-                    },
-                    warnings,
-                )
-            }
-            "view" => {
-                warnings.push(
-                    "materialized='view' not supported in Rocky — using full_refresh".to_string(),
-                );
-                (StrategyConfig::FullRefresh, warnings)
-            }
-            "ephemeral" => {
-                warnings.push(
-                    "materialized='ephemeral' not supported — using full_refresh".to_string(),
-                );
-                (StrategyConfig::FullRefresh, warnings)
-            }
-            _ => (StrategyConfig::FullRefresh, warnings),
-        }
-    } else {
-        (StrategyConfig::FullRefresh, warnings)
+    // Parse materialized
+    let mat_re = Regex::new(r#"materialized\s*=\s*['"](\w+)['"]"#).unwrap();
+    let materialized = mat_re
+        .captures(config_str)
+        .map(|c| c[1].to_string())
+        .unwrap_or_else(|| "table".to_string());
+
+    // Parse unique_key — accepts string-form (`unique_key='id'`) or
+    // single-line list (`unique_key=['user_id', 'date']`).
+    let unique_key = parse_dbt_unique_key(config_str);
+
+    // Parse incremental_strategy as the strategy discriminator (NOT a
+    // column name). This fixes the long-standing bug where
+    // `incremental_strategy='merge'` was treated as
+    // `timestamp_column = 'merge'`.
+    let incremental_strategy = single_string_value(config_str, "incremental_strategy");
+
+    // dbt-microbatch fields
+    let event_time = single_string_value(config_str, "event_time");
+    let batch_size = single_string_value(config_str, "batch_size");
+    let lookback = single_string_value(config_str, "lookback").and_then(|s| s.parse::<u32>().ok());
+
+    // Build a synthetic DbtNodeConfig — the regex path doesn't recover
+    // databricks_tags / hooks / on_schema_change (they're multi-line in
+    // practice), so they're left empty.
+    let synthetic = DbtNodeConfig {
+        materialized: materialized.clone(),
+        schema: None,
+        unique_key,
+        incremental_strategy,
+        event_time,
+        batch_size,
+        lookback,
+        partition_by: None,
+        databricks_tags: BTreeMap::new(),
+        pre_hook: Vec::new(),
+        post_hook: Vec::new(),
+        on_schema_change: None,
+    };
+
+    let mapping = map_manifest_strategy(&synthetic, "<regex-path>");
+    for w in mapping.warnings {
+        messages.push(w.message);
     }
+
+    (mapping.strategy, messages)
+}
+
+/// Parse `unique_key=...` from a dbt config block. Accepts both
+/// `unique_key='id'` and `unique_key=['user_id', 'date']` shapes.
+/// Returns `None` if the field is absent or malformed.
+fn parse_dbt_unique_key(config_str: &str) -> Option<UniqueKeyValue> {
+    let single = Regex::new(r#"unique_key\s*=\s*['"](\w+)['"]"#).unwrap();
+    if let Some(c) = single.captures(config_str) {
+        return Some(UniqueKeyValue::Single(c[1].to_string()));
+    }
+    let list = Regex::new(r#"unique_key\s*=\s*\[([^\]]+)\]"#).unwrap();
+    if let Some(c) = list.captures(config_str) {
+        let raw = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        let keys: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !keys.is_empty() {
+            return Some(UniqueKeyValue::Multiple(keys));
+        }
+    }
+    None
+}
+
+/// Best-effort extraction of `key='value'` from a dbt config block.
+/// Returns `None` if the key is absent.
+fn single_string_value(config_str: &str, key: &str) -> Option<String> {
+    let pattern = format!(r#"\b{key}\s*=\s*['"]([^'"]+)['"]"#);
+    let re = Regex::new(&pattern).ok()?;
+    re.captures(config_str).map(|c| c[1].to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -949,11 +1424,63 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_config_view_warning() {
+    fn test_extract_config_view_maps_to_view_strategy() {
+        // Wave 2: `materialized='view'` now maps to StrategyConfig::View
+        // (no warning) instead of FullRefresh + warning.
         let input = "{{ config(materialized='view') }}";
+        let (strategy, warnings) = extract_dbt_config(input);
+        assert!(matches!(strategy, StrategyConfig::View));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_config_materialized_view() {
+        // Wave 2: `materialized='materialized_view'` now maps to
+        // StrategyConfig::MaterializedView (previously: dropped silently).
+        let input = "{{ config(materialized='materialized_view') }}";
+        let (strategy, _) = extract_dbt_config(input);
+        assert!(matches!(strategy, StrategyConfig::MaterializedView));
+    }
+
+    #[test]
+    fn test_extract_config_ephemeral_warns() {
+        let input = "{{ config(materialized='ephemeral') }}";
         let (strategy, warnings) = extract_dbt_config(input);
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_config_merge_with_unique_key_list() {
+        // Regression: `incremental_strategy='merge'` + `unique_key=['user_id']`
+        // must map to StrategyConfig::Merge, NOT to
+        // `Incremental { timestamp_column: "merge" }`.
+        let input = "{{ config(materialized='incremental', incremental_strategy='merge', unique_key=['user_id']) }}";
+        let (strategy, _) = extract_dbt_config(input);
+        match strategy {
+            StrategyConfig::Merge {
+                unique_key,
+                update_columns: _,
+            } => assert_eq!(unique_key, vec!["user_id"]),
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_config_incremental_strategy_is_not_a_column_name() {
+        // Pin the parse-bug fix: `incremental_strategy='merge'` previously
+        // captured 'merge' as a timestamp column. Assert that does NOT
+        // happen anymore.
+        let input = "{{ config(materialized='incremental', incremental_strategy='merge') }}";
+        let (strategy, _) = extract_dbt_config(input);
+        // Without unique_key, this should fall back to Incremental(updated_at)
+        // because merge requires unique_key — but the timestamp must not be 'merge'.
+        if let StrategyConfig::Incremental { timestamp_column } = strategy {
+            assert_ne!(
+                timestamp_column, "merge",
+                "BUG REGRESSION: incremental_strategy must NOT be parsed as a timestamp column"
+            );
+        }
     }
 
     #[test]
@@ -1152,7 +1679,9 @@ FROM raw.orders
     }
 
     #[test]
-    fn test_import_from_manifest_view_warning() {
+    fn test_import_from_manifest_view_maps_to_view() {
+        // Wave 2: `materialized='view'` now maps to StrategyConfig::View
+        // directly (previously: FullRefresh + warning).
         let manifest_json = serde_json::json!({
             "metadata": { "project_name": "proj" },
             "nodes": {
@@ -1185,9 +1714,19 @@ FROM raw.orders
         };
         let result = import_from_manifest(&manifest, &target);
 
-        assert!(result.warnings.iter().any(|w| {
-            w.category == WarningCategory::UnsupportedMaterialization && w.message.contains("view")
-        }));
+        assert_eq!(result.imported.len(), 1);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::View
+        ));
+        // No "view not supported" warning anymore.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| !w.message.contains("'view'")),
+            "view should no longer emit an 'unsupported' warning"
+        );
     }
 
     // --- Full project import tests ---
@@ -1335,5 +1874,462 @@ FROM {{ ref('stg_events') }}
         assert!(result.warnings.iter().any(|w| {
             w.category == WarningCategory::MissingSource && w.message.contains("missing")
         }));
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2: dbt materialization mapping tests
+    // ---------------------------------------------------------------------
+
+    /// Helper: parse a manifest from a JSON value and run import.
+    fn import_from_manifest_json(manifest_json: &serde_json::Value) -> ImportResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        import_from_manifest(&manifest, &target)
+    }
+
+    #[test]
+    fn test_manifest_view_maps_to_view_strategy() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.dim_customers": {
+                    "unique_id": "model.p.dim_customers",
+                    "name": "dim_customers",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "view" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.imported.len(), 1);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::View
+        ));
+    }
+
+    #[test]
+    fn test_manifest_materialized_view_maps_to_materialized_view() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.fct_revenue_mv": {
+                    "unique_id": "model.p.fct_revenue_mv",
+                    "name": "fct_revenue_mv",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "materialized_view" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.imported.len(), 1);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::MaterializedView
+        ));
+    }
+
+    #[test]
+    fn test_manifest_microbatch_maps_to_microbatch() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_daily": {
+                    "unique_id": "model.p.events_daily",
+                    "name": "events_daily",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "microbatch",
+                        "event_time": "event_ts",
+                        "batch_size": "day"
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.imported.len(), 1);
+        match &result.imported[0].config.strategy {
+            StrategyConfig::Microbatch {
+                timestamp_column,
+                granularity,
+            } => {
+                assert_eq!(timestamp_column, "event_ts");
+                assert_eq!(*granularity, TimeGrain::Day);
+            }
+            other => panic!("expected Microbatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_manifest_microbatch_missing_event_time_warns_and_falls_back() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.broken_microbatch": {
+                    "unique_id": "model.p.broken_microbatch",
+                    "name": "broken_microbatch",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "microbatch", "batch_size": "hour" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::FullRefresh
+        ));
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(
+                w,
+                ImportDbtStructuredWarning::MicrobatchMissingEventTime { model } if model == "broken_microbatch"
+            )),
+            "missing event_time must emit a structured warning"
+        );
+    }
+
+    #[test]
+    fn test_manifest_ephemeral_emits_warning() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.eph": {
+                    "unique_id": "model.p.eph",
+                    "name": "eph",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "ephemeral" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::FullRefresh
+        ));
+        assert!(result.structured_warnings.iter().any(|w| matches!(
+            w,
+            ImportDbtStructuredWarning::UnsupportedMaterialization { dbt_materialization, .. }
+                if dbt_materialization == "ephemeral"
+        )));
+    }
+
+    #[test]
+    fn test_incremental_strategy_merge_regression() {
+        // Pin the parse-bug fix: a manifest with
+        // `incremental_strategy='merge'` + `unique_key=['user_id']` must
+        // map to StrategyConfig::Merge, NOT
+        // `Incremental { timestamp_column: "merge" }`.
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.fct_users": {
+                    "unique_id": "model.p.fct_users",
+                    "name": "fct_users",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "incremental",
+                        "incremental_strategy": "merge",
+                        "unique_key": ["user_id"]
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        match &result.imported[0].config.strategy {
+            StrategyConfig::Merge {
+                unique_key,
+                update_columns: _,
+            } => {
+                assert_eq!(unique_key, &vec!["user_id".to_string()]);
+            }
+            other => panic!(
+                "BUG REGRESSION: expected Merge {{ unique_key: ['user_id'] }}, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_incremental_strategy_append_maps_to_incremental() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_append": {
+                    "unique_id": "model.p.events_append",
+                    "name": "events_append",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "incremental",
+                        "incremental_strategy": "append"
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        match &result.imported[0].config.strategy {
+            StrategyConfig::Incremental { timestamp_column } => {
+                assert_ne!(timestamp_column, "merge");
+                assert_ne!(timestamp_column, "append");
+            }
+            other => panic!("expected Incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_incremental_strategy_delete_insert_maps_to_delete_insert() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.partitioned": {
+                    "unique_id": "model.p.partitioned",
+                    "name": "partitioned",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "incremental",
+                        "incremental_strategy": "delete+insert",
+                        "unique_key": ["dt"],
+                        "partition_by": ["dt"]
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        match &result.imported[0].config.strategy {
+            StrategyConfig::DeleteInsert { partition_by } => {
+                assert_eq!(partition_by, &vec!["dt".to_string()]);
+            }
+            other => panic!("expected DeleteInsert, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2: structured warning tests
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_dropped_databricks_tags_warning() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.dim_users": {
+                    "unique_id": "model.p.dim_users",
+                    "name": "dim_users",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "table",
+                        "databricks_tags": { "owner": "data-team", "pii": "true" }
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let found = result
+            .structured_warnings
+            .iter()
+            .find_map(|w| match w {
+                ImportDbtStructuredWarning::DroppedDatabricksTags { model, tags }
+                    if model == "dim_users" =>
+                {
+                    Some(tags.clone())
+                }
+                _ => None,
+            })
+            .expect("expected DroppedDatabricksTags warning");
+        assert_eq!(found.get("owner").map(String::as_str), Some("data-team"));
+        assert_eq!(found.get("pii").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn test_dropped_hook_warning() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.fct_orders": {
+                    "unique_id": "model.p.fct_orders",
+                    "name": "fct_orders",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "table",
+                        "pre_hook": "ANALYZE TABLE foo COMPUTE STATISTICS",
+                        "post_hook": ["GRANT SELECT ON {{ this }} TO ROLE analyst"]
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let pre = result.structured_warnings.iter().find(|w| {
+            matches!(
+                w,
+                ImportDbtStructuredWarning::DroppedHook { hook_kind, sql, .. }
+                    if *hook_kind == HookKind::Pre && sql.contains("ANALYZE TABLE")
+            )
+        });
+        assert!(pre.is_some(), "expected pre_hook structured warning");
+        let post = result.structured_warnings.iter().find(|w| {
+            matches!(
+                w,
+                ImportDbtStructuredWarning::DroppedHook { hook_kind, sql, .. }
+                    if *hook_kind == HookKind::Post && sql.contains("GRANT SELECT")
+            )
+        });
+        assert!(post.is_some(), "expected post_hook structured warning");
+    }
+
+    #[test]
+    fn test_dropped_on_schema_change_warning() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.dim_x": {
+                    "unique_id": "model.p.dim_x",
+                    "name": "dim_x",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": {
+                        "materialized": "incremental",
+                        "unique_key": "id",
+                        "on_schema_change": "append_new_columns"
+                    },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let found = result.structured_warnings.iter().find_map(|w| match w {
+            ImportDbtStructuredWarning::DroppedOnSchemaChange {
+                dbt_value,
+                rocky_equivalent,
+                model,
+            } if model == "dim_x" => Some((dbt_value.clone(), rocky_equivalent.clone())),
+            _ => None,
+        });
+        let (dbt_value, rocky_equivalent) = found.expect("expected DroppedOnSchemaChange warning");
+        assert_eq!(dbt_value, "append_new_columns");
+        assert!(rocky_equivalent.contains("evolve"));
+    }
+
+    #[test]
+    fn test_unresolvable_macro_warning() {
+        // Synthetic: a compiled_sql with a {{ custom_macro(...) }} call
+        // that dbt's compile step couldn't inline (i.e. the macro is
+        // defined out-of-tree). The importer surfaces this as an
+        // UnresolvableMacro structured warning with the call-site line.
+        let compiled_sql = "SELECT id,\n  {{ custom_helper('a', 'b') }} AS computed\nFROM raw.t";
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.uses_macro": {
+                    "unique_id": "model.p.uses_macro",
+                    "name": "uses_macro",
+                    "resource_type": "model",
+                    "compiled_code": compiled_sql,
+                    "raw_code": compiled_sql,
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let found = result.structured_warnings.iter().find_map(|w| match w {
+            ImportDbtStructuredWarning::UnresolvableMacro {
+                model,
+                macro_name,
+                first_call_site_line,
+            } if model == "uses_macro" => Some((macro_name.clone(), *first_call_site_line)),
+            _ => None,
+        });
+        let (macro_name, line) = found.expect("expected UnresolvableMacro warning");
+        assert_eq!(macro_name, "custom_helper");
+        assert_eq!(line, 2, "macro is on line 2 of the compiled SQL");
+    }
+
+    #[test]
+    fn test_batch_size_to_grain_unknown_warns_default_day() {
+        let mut warnings = Vec::new();
+        let g = batch_size_to_grain("week", "m", &mut warnings);
+        assert_eq!(g, TimeGrain::Day);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_batch_size_to_grain_each_supported() {
+        let mut warnings = Vec::new();
+        assert_eq!(
+            batch_size_to_grain("hour", "m", &mut warnings),
+            TimeGrain::Hour
+        );
+        assert_eq!(
+            batch_size_to_grain("day", "m", &mut warnings),
+            TimeGrain::Day
+        );
+        assert_eq!(
+            batch_size_to_grain("month", "m", &mut warnings),
+            TimeGrain::Month
+        );
+        assert_eq!(
+            batch_size_to_grain("year", "m", &mut warnings),
+            TimeGrain::Year
+        );
+        assert!(warnings.is_empty());
     }
 }
