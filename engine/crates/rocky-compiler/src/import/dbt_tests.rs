@@ -76,7 +76,17 @@ struct RawColumn {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    /// Column-level generic tests.
+    ///
+    /// dbt 1.7+ renamed the YAML key from `tests:` to `data_tests:` (the
+    /// legacy `tests:` key remains accepted for back-compat). Modern dbt
+    /// bundles emitted by dbt-databricks / dbt-core 1.7+ use the new key
+    /// almost exclusively, so projects whose schema.yml files were
+    /// generated against dbt 1.7+ would silently see zero tests imported
+    /// when the deserializer only knew about `tests:`. Accept both shapes
+    /// — at most one of the two may appear per column (serde-yaml errors
+    /// on duplicate keys), which matches dbt's own validation.
+    #[serde(default, alias = "data_tests")]
     tests: Option<Vec<serde_yaml::Value>>,
 }
 
@@ -818,6 +828,98 @@ sources:
 "#;
         let models = parse_model_yaml_content(yaml).unwrap();
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_parse_data_tests_key_alias() {
+        // dbt 1.7+ renamed the column-level test key from `tests:` to
+        // `data_tests:`. Bundles emitted against modern dbt use the new
+        // key; the importer must treat both as the same field.
+        let yaml = r#"
+models:
+  - name: fct_orders
+    columns:
+      - name: order_id
+        data_tests:
+          - unique
+          - not_null
+      - name: status
+        data_tests:
+          - accepted_values:
+              values: ['completed', 'pending']
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        assert_eq!(models.len(), 1);
+        let fct = &models[0];
+
+        // Both simple tests on order_id should round-trip via the
+        // `data_tests:` alias.
+        assert_eq!(fct.columns[0].name, "order_id");
+        assert_eq!(fct.columns[0].tests.len(), 2);
+        assert!(matches!(&fct.columns[0].tests[0], DbtTestDef::Simple(s) if s == "unique"));
+        assert!(matches!(&fct.columns[0].tests[1], DbtTestDef::Simple(s) if s == "not_null"));
+
+        // Configured test on status should also come through.
+        assert_eq!(fct.columns[1].tests.len(), 1);
+        assert!(matches!(
+            &fct.columns[1].tests[0],
+            DbtTestDef::Configured { name, .. } if name == "accepted_values"
+        ));
+    }
+
+    #[test]
+    fn test_parse_data_tests_alias_converts_to_decls() {
+        // End-to-end: a column-level `data_tests:` block must convert to
+        // canonical `TestDecl`s exactly like `tests:` does. Pins the
+        // FR-026 fix at the boundary the importer actually cares about.
+        let yaml = r#"
+models:
+  - name: dim_users
+    columns:
+      - name: user_id
+        data_tests:
+          - unique
+          - not_null
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 2);
+        assert!(
+            decls.iter().any(|d| matches!(d.test_type, TestType::Unique)
+                && d.column.as_deref() == Some("user_id"))
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d.test_type, TestType::NotNull)
+                    && d.column.as_deref() == Some("user_id"))
+        );
+    }
+
+    #[test]
+    fn test_parse_data_tests_and_tests_keys_mutually_exclusive() {
+        // dbt itself errors when both `tests:` and `data_tests:` appear on
+        // the same column. serde_yaml 0.9 mirrors that: duplicate field
+        // names (after alias resolution) produce a parse error rather
+        // than a silent merge or last-write-wins. Pin that behavior so a
+        // future serde_yaml upgrade can't silently change semantics.
+        let yaml = r#"
+models:
+  - name: fct_orders
+    columns:
+      - name: order_id
+        tests:
+          - unique
+        data_tests:
+          - not_null
+"#;
+        let result = parse_model_yaml_content(yaml);
+        assert!(
+            result.is_err(),
+            "expected error when both `tests:` and `data_tests:` are present, got {result:?}"
+        );
     }
 
     #[test]
