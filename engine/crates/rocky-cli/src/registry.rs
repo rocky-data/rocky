@@ -243,6 +243,21 @@ impl AdapterRegistry {
                     if let Some(ref budget) = shared_retry_budget {
                         client = client.with_retry_budget(budget.clone());
                     }
+                    // FR-A — plug in the configured persistent cache
+                    // backend so cross-process `rocky` invocations
+                    // share their Fivetran fetches. When absent the
+                    // backend defaults to NoCache and the adapter
+                    // behaves exactly as it did pre-FR-A.
+                    if let Some(cache_cfg) = adapter_cfg.cache.as_ref() {
+                        let state_cache =
+                            rocky_fivetran::state_cache::build_state_cache(cache_cfg)
+                                .with_context(|| {
+                                    format!(
+                                        "adapters.{name}: failed to build [adapter.{name}.cache] backend"
+                                    )
+                                })?;
+                        client = client.with_state_cache(state_cache);
+                    }
 
                     let adapter = Arc::new(FivetranDiscoveryAdapter::new(
                         client,

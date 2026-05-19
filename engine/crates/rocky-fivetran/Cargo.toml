@@ -30,10 +30,25 @@ httpdate = "1"
 # FR-C canonical state envelope — JsonSchema for the schema-cascade codegen.
 schemars = { workspace = true }
 # FR-C envelope hash for idempotent --emit-fivetran-state-to writes.
+# Also used by the FR-A state-cache hash-dedupe check.
 blake3 = { workspace = true }
+# FR-A pluggable state cache — object-store backend (S3/GCS/Azure/local).
+object_store = { workspace = true }
+url = { workspace = true }
+bytes = { workspace = true }
+# FR-A object-store backend — single-part S3 ETag dedupe = MD5(body).
+md-5 = { workspace = true }
+# FR-A Valkey/Redis backend, gated behind the optional `valkey` feature
+# so the default build doesn't pull the Redis client transitively.
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"], optional = true }
 
 [features]
+default = []
 test-support = []
+# Pulls in the Redis client for the FR-A `ValkeyCache` backend. Mirrors
+# rocky-cache's `valkey` feature so a downstream crate enabling either
+# crate's feature sees the same shape.
+valkey = ["redis"]
 
 [[test]]
 name = "wiremock_tests"

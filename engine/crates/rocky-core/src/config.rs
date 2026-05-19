@@ -253,6 +253,16 @@ pub enum ConfigError {
          `table` and `id` are reserved for `--filter` and `[[table_overrides]]`."
     )]
     SchemaPatternReservedComponent { pipeline: String, component: String },
+
+    #[error(
+        "[adapter.{adapter}.cache] backend = \"{backend}\" requires `{field}` — set the field \
+         under [adapter.{adapter}.cache] or change `backend`"
+    )]
+    FivetranCacheMissingField {
+        adapter: String,
+        backend: String,
+        field: String,
+    },
 }
 
 /// Concurrency strategy for table processing.
@@ -2271,6 +2281,17 @@ pub struct AdapterConfig {
     /// Retry policy for this adapter.
     #[serde(default)]
     pub retry: RetryConfig,
+
+    /// Optional cache backend for the Fivetran state envelope.
+    ///
+    /// When set on a `type = "fivetran"` adapter, the resolved
+    /// envelope is read from and written to the configured cache
+    /// backend so concurrent `rocky` processes share one fetcher per
+    /// org. Ignored on every other adapter type. When absent the
+    /// adapter behaves as if `backend = "none"` — every fetch goes
+    /// straight to the Fivetran API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<FivetranCacheConfig>,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -2299,7 +2320,142 @@ impl std::fmt::Debug for AdapterConfig {
             .field("location", &self.location)
             .field("path", &self.path)
             .field("retry", &self.retry)
+            .field("cache", &self.cache)
             .finish()
+    }
+}
+
+/// Persistent state cache configuration for the Fivetran adapter (FR-A).
+///
+/// Cache backends shared across processes let several `rocky` invocations
+/// against one Fivetran org dedupe their discover fetches — the first
+/// process pays the API cost, every subsequent process within the TTL
+/// window reads the canonical envelope from the cache. See
+/// `engine/crates/rocky-fivetran/src/state_cache/` for the implementation
+/// details.
+///
+/// ## TOML shape
+///
+/// ```toml
+/// [adapter.fivetran.cache]
+/// backend = "tiered"                              # "none" | "file" | "object_store" | "valkey" | "tiered"
+/// file_root = ".rocky/fivetran-state/"            # required for backend = "file"
+/// object_store_url = "s3://my-bucket/rocky/fv/"   # required for backend = "object_store" / "tiered"
+/// valkey_url = "rediss://valkey:6379/"            # required for backend = "valkey" / "tiered"
+/// valkey_ttl_seconds = 600                        # default 600
+/// ```
+///
+/// ## Backend selection
+///
+/// - `none` — disable the cache; default when the block is absent.
+/// - `file` — local-filesystem JSON files under `file_root`.
+/// - `object_store` — S3 / GCS / Azure / `file://`; URL parsed by
+///   `object_store::parse_url`. Credentials come from the SDK default
+///   chain (`AWS_*` env vars, IAM role, `GOOGLE_APPLICATION_CREDENTIALS`,
+///   etc.) — Rocky doesn't introduce its own credential surface.
+/// - `valkey` — Redis / Valkey; requires building rocky-fivetran with
+///   the `valkey` Cargo feature. URL accepts `redis://` and `rediss://`
+///   (TLS).
+/// - `tiered` — composes Valkey (primary, fast) + object-store
+///   (secondary, durable). Requires both URLs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FivetranCacheConfig {
+    /// Which backend to instantiate. Defaults to
+    /// [`FivetranCacheBackend::None`] so a stub `[adapter.fivetran.cache]`
+    /// block with no `backend` key is well-defined.
+    #[serde(default)]
+    pub backend: FivetranCacheBackend,
+
+    /// Root directory for `backend = "file"`. Required for that
+    /// backend; ignored otherwise. May contain `${VAR}` / `${VAR:-default}`
+    /// env-var references; resolved at config-load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_root: Option<String>,
+
+    /// URL passed to `object_store::parse_url` for `backend = "object_store"`
+    /// or `backend = "tiered"` (secondary layer). Examples:
+    /// `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`,
+    /// `file:///path/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_store_url: Option<String>,
+
+    /// Connection URL for `backend = "valkey"` or `backend = "tiered"`
+    /// (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_url: Option<String>,
+
+    /// TTL applied to every `SET` against the Valkey backend. Defaults
+    /// to 600s when unset. Ignored for non-Valkey backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_ttl_seconds: Option<u64>,
+}
+
+/// Cache backend selector for [`FivetranCacheConfig`]. See the parent
+/// struct for the TOML shape and per-backend semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FivetranCacheBackend {
+    /// No-op backend; every fetch goes to the Fivetran API. Default
+    /// when `[adapter.fivetran.cache]` is absent.
+    #[default]
+    None,
+    /// Local-filesystem JSON files. Cheapest, no external dependency.
+    File,
+    /// S3 / GCS / Azure / `file://` via the `object_store` crate.
+    ObjectStore,
+    /// Valkey / Redis. Requires the `valkey` Cargo feature.
+    Valkey,
+    /// Valkey (primary) + object_store (secondary). Requires the
+    /// `valkey` Cargo feature.
+    Tiered,
+}
+
+impl FivetranCacheBackend {
+    /// Stable wire-form string used in error messages and OTLP attrs.
+    /// Pinned so a refactor can't silently re-tag the backend tags
+    /// dashboards filter on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FivetranCacheBackend::None => "none",
+            FivetranCacheBackend::File => "file",
+            FivetranCacheBackend::ObjectStore => "object_store",
+            FivetranCacheBackend::Valkey => "valkey",
+            FivetranCacheBackend::Tiered => "tiered",
+        }
+    }
+}
+
+impl FivetranCacheConfig {
+    /// Validate the cross-field requirements (which fields are
+    /// required for which backend). Returns the first error
+    /// encountered so the caller can surface it at config-load time
+    /// rather than at first cache touch.
+    pub fn validate(&self, adapter_name: &str) -> Result<(), ConfigError> {
+        let backend = self.backend;
+        let need = |field: &str, value: Option<&String>| -> Result<(), ConfigError> {
+            if value.map(String::is_empty).unwrap_or(true) {
+                Err(ConfigError::FivetranCacheMissingField {
+                    adapter: adapter_name.to_string(),
+                    backend: backend.as_str().to_string(),
+                    field: field.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        match self.backend {
+            FivetranCacheBackend::None => Ok(()),
+            FivetranCacheBackend::File => need("file_root", self.file_root.as_ref()),
+            FivetranCacheBackend::ObjectStore => {
+                need("object_store_url", self.object_store_url.as_ref())
+            }
+            FivetranCacheBackend::Valkey => need("valkey_url", self.valkey_url.as_ref()),
+            FivetranCacheBackend::Tiered => {
+                need("object_store_url", self.object_store_url.as_ref())?;
+                need("valkey_url", self.valkey_url.as_ref())
+            }
+        }
     }
 }
 
@@ -3820,7 +3976,31 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     if let Some(first) = validate_replication_overrides(&config).into_iter().next() {
         return Err(first);
     }
+    if let Some(first) = validate_fivetran_cache(&config).into_iter().next() {
+        return Err(first);
+    }
     Ok(config)
+}
+
+/// Validate every `[adapter.<name>.cache]` block's cross-field
+/// requirements at config-load time so a misconfigured backend errors
+/// up front rather than at the first cache touch. Skips non-Fivetran
+/// adapter blocks even if they accidentally carry a `cache` key — the
+/// shape is fivetran-specific and a future change can lift that gate
+/// without breaking the call shape here.
+pub fn validate_fivetran_cache(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, adapter_cfg) in &config.adapters {
+        if adapter_cfg.adapter_type != "fivetran" {
+            continue;
+        }
+        if let Some(cache_cfg) = &adapter_cfg.cache
+            && let Err(e) = cache_cfg.validate(name)
+        {
+            errors.push(e);
+        }
+    }
+    errors
 }
 
 /// Checks a raw TOML string for deprecated config keys without loading
@@ -5993,6 +6173,7 @@ table = "customers_history"
             location: None,
             path: None,
             retry: RetryConfig::default(),
+            cache: None,
         };
 
         let debug = format!("{cfg:?}");
@@ -7875,6 +8056,223 @@ schema_template = "raw__{source}"
         assert!(
             !json.contains("merge_keys"),
             "JSON output should omit unset merge_keys/merge_keys_fallback: {json}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // FivetranCacheConfig validation (FR-A)
+    // ---------------------------------------------------------------
+
+    fn fivetran_cache_base() -> String {
+        // Minimal scaffolding so the fivetran adapter parses cleanly
+        // (api_key + api_secret + destination_id required) and the
+        // `validate_fivetran_cache` walk has something to find.
+        r#"
+[adapter.fivetran_main]
+type = "fivetran"
+kind = "discovery"
+api_key = "k"
+api_secret = "s"
+destination_id = "dest_x"
+
+[pipeline.bronze]
+type = "replication"
+strategy = "incremental"
+adapter = "fivetran_main"
+
+[pipeline.bronze.source]
+adapter = "fivetran_main"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn validate_fivetran_cache_passes_when_block_absent() {
+        let toml_str = fivetran_cache_base();
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert!(
+            errors.is_empty(),
+            "no cache block must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_fivetran_cache_none_backend_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "none"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert!(errors.is_empty(), "none backend must validate: {errors:?}");
+    }
+
+    #[test]
+    fn validate_fivetran_cache_file_requires_file_root() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "file"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCacheMissingField { ref field, ref backend, .. }
+                if field == "file_root" && backend == "file"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_cache_object_store_requires_url() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "object_store"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCacheMissingField { ref field, ref backend, .. }
+                if field == "object_store_url" && backend == "object_store"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_cache_valkey_requires_url() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "valkey"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCacheMissingField { ref field, ref backend, .. }
+                if field == "valkey_url" && backend == "valkey"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_cache_tiered_requires_both_urls() {
+        // Both URLs missing — validate returns the first one
+        // encountered (object_store_url, by current source order).
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "tiered"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCacheMissingField { ref field, ref backend, .. }
+                if (field == "object_store_url" || field == "valkey_url") && backend == "tiered"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_cache_tiered_partial_misses_valkey() {
+        // object_store_url present; valkey_url missing — must error
+        // on `valkey_url`.
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "tiered"
+object_store_url = "s3://b/p/"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            ConfigError::FivetranCacheMissingField { ref field, .. } if field == "valkey_url"
+        ));
+    }
+
+    #[test]
+    fn validate_fivetran_cache_tiered_fully_specified_passes() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "tiered"
+object_store_url = "s3://b/p/"
+valkey_url = "redis://localhost:6379/"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert!(
+            errors.is_empty(),
+            "fully-specified tiered must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_fivetran_cache_ignores_non_fivetran_adapter() {
+        // A cache block dangling off a databricks adapter (won't be
+        // wired in code, but mustn't fail validation either — the
+        // walk filters by adapter type).
+        let toml_str = r#"
+[adapter.warehouse]
+type = "databricks"
+host = "x.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "t"
+
+[pipeline.bronze]
+type = "replication"
+strategy = "incremental"
+adapter = "warehouse"
+
+[pipeline.bronze.source]
+adapter = "warehouse"
+catalog = "src"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let errors = validate_fivetran_cache(&config);
+        assert!(
+            errors.is_empty(),
+            "non-fivetran adapter ignored: {errors:?}"
         );
     }
 }

@@ -3948,12 +3948,16 @@ version = "1.37.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "bytes",
  "chrono",
  "fs4",
  "futures",
  "httpdate",
  "indexmap",
+ "md-5",
+ "object_store",
  "percent-encoding",
+ "redis",
  "reqwest",
  "rocky-core",
  "rocky-observe",
@@ -3965,6 +3969,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
 ]
 
