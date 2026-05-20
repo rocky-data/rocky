@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig } from "./config";
+import { shellQuote } from "./shell";
 
 const SUPPORTED_EXTENSIONS = new Set([".rocky", ".sql"]);
 
@@ -82,23 +83,14 @@ function makeLens(
 }
 
 /**
- * Single-quote an argument for POSIX shells; on Windows quote with `"` and
- * double any embedded quotes. Callers route through `terminal.sendText`, which
- * goes through the user's shell, so every interpolated token must be escaped.
- */
-function shellQuote(arg: string): string {
-  if (process.platform === "win32") {
-    return `"${arg.replace(/"/g, '""')}"`;
-  }
-  return `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-/**
  * Runs `rocky run --filter name=<model>` in the integrated terminal.
  */
 function runModelInTerminal(modelName: string): void {
   const cfg = getConfig();
-  const cmd = `${shellQuote(cfg.serverPath)} run --filter name=${shellQuote(modelName)} --output json`;
+  // Quote the entire `name=<model>` token together so the `name=` prefix sits
+  // inside the same shell-quoted argv slot as the value — keeps it a single
+  // argv element even if the model name contains shell metacharacters.
+  const cmd = `${shellQuote(cfg.serverPath)} run --filter ${shellQuote(`name=${modelName}`)} --output json`;
   const terminal = vscode.window.createTerminal({
     name: `Rocky: run ${modelName}`,
     iconPath: new vscode.ThemeIcon("play"),

@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
-import { getWorkspaceFolder } from "../config";
+import { getConfig, getWorkspaceFolder } from "../config";
 import { getOutputChannel } from "../output";
 import { clearCliVersionCache } from "../rockyCli";
+import { shellQuote } from "../shell";
 
 const URLS = {
   documentation: "https://github.com/rocky-data/rocky#readme",
@@ -28,26 +29,28 @@ export function viewMarketplace(): Thenable<boolean> {
 
 /**
  * Open an integrated terminal in the workspace root and run a Rocky CLI
- * command. Used by the Get Started panel for `rocky init` and
+ * subcommand. Used by the Get Started panel for `rocky init` and
  * `rocky playground`. The terminal is shown so the user can watch progress
  * and answer any prompts the CLI asks.
  *
- * The command is sent via {@link vscode.Terminal.sendText} (no shell quoting
- * required for these argv-free commands).
+ * The server path comes from `rocky.server.path` (default `"rocky"`) and is
+ * shell-quoted so a user-configured path with spaces still resolves to a
+ * single argv token.
  */
-function runInTerminal(name: string, command: string): void {
+function runInTerminal(name: string, subcommand: string): void {
   const cwd = getWorkspaceFolder();
+  const { serverPath } = getConfig();
   const terminal = vscode.window.createTerminal({ name, cwd });
   terminal.show(true);
-  terminal.sendText(command);
+  terminal.sendText(`${shellQuote(serverPath)} ${subcommand}`);
 }
 
 export function init(): void {
-  runInTerminal("Rocky: Init", "rocky init");
+  runInTerminal("Rocky: Init", "init");
 }
 
 export function playground(): void {
-  runInTerminal("Rocky: Playground", "rocky playground");
+  runInTerminal("Rocky: Playground", "playground");
 }
 
 /**
