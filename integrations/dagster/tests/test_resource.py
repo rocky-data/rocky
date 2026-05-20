@@ -1800,8 +1800,6 @@ def test_run_pipes_warns_when_timeout_seconds_is_non_default(caplog):
     the mismatch in the run log instead of silently relying on a
     timeout that will never fire.
     """
-    import logging
-
     rocky = RockyResource(timeout_seconds=60)  # any non-default value
     context = MagicMock(spec=dg.AssetExecutionContext)
     context.log = MagicMock()
@@ -1827,8 +1825,6 @@ def test_run_pipes_warning_fires_once_per_resource_lifetime(caplog):
     """Pin the de-duplication contract — repeated ``run_pipes`` calls on
     the same resource only emit the warning once, otherwise long-lived
     Dagster code servers would flood their logs."""
-    import logging
-
     rocky = RockyResource(timeout_seconds=120)
     context = MagicMock(spec=dg.AssetExecutionContext)
     context.log = MagicMock()
@@ -1854,8 +1850,6 @@ def test_run_pipes_warning_fires_once_per_resource_lifetime(caplog):
 def test_run_pipes_does_not_warn_with_default_timeout(caplog):
     """The warning fires only when ``timeout_seconds`` was actively
     customised. Default-config users see no log noise."""
-    import logging
-
     rocky = RockyResource()  # default timeout_seconds
     context = MagicMock(spec=dg.AssetExecutionContext)
     context.log = MagicMock()
