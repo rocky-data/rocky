@@ -22,10 +22,10 @@ rocky-duckdb = { path = "../rocky-duckdb", optional = true }
 rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-bigquery = { path = "../rocky-bigquery" }
 rocky-trino = { path = "../rocky-trino" }
-rocky-fivetran = { path = "../rocky-fivetran" }
+rocky-fivetran = { path = "../rocky-fivetran", features = ["valkey"] }
 rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-iceberg = { path = "../rocky-iceberg" }
-rocky-cache = { path = "../rocky-cache" }
+rocky-cache = { path = "../rocky-cache", features = ["valkey"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }
