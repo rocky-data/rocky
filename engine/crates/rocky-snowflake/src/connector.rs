@@ -392,12 +392,26 @@ impl SnowflakeConnector {
         // session parameters so Snowflake parses + runs them as one
         // transactional unit. Single-statement calls keep the parameters
         // map empty so the body is byte-identical to the pre-Bug-1 payload.
+        //
+        // For multi-statement scripts we also set `TRANSACTION_ABORT_ON_ERROR
+        // = TRUE`. Without it, a failed DML rolls back only its own changes
+        // and leaves the transaction open — subsequent statements (including
+        // the trailing `COMMIT`) are skipped, and the in-flight transaction
+        // only rolls back implicitly when the REST session ends. That
+        // session-close cleanup is incidental, not contractual: setting
+        // `ABORT_ON_ERROR` makes Snowflake roll back the entire transaction
+        // at the moment of error, which is what `insert_overwrite_partition`
+        // semantically requires.
         let statement_count = count_statements(sql);
         let mut parameters = std::collections::BTreeMap::new();
         if statement_count > 1 {
             parameters.insert(
                 "MULTI_STATEMENT_COUNT".to_string(),
                 statement_count.to_string(),
+            );
+            parameters.insert(
+                "TRANSACTION_ABORT_ON_ERROR".to_string(),
+                "TRUE".to_string(),
             );
         }
         let body = SubmitRequest {
