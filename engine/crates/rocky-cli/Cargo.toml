@@ -24,6 +24,7 @@ rocky-bigquery = { path = "../rocky-bigquery" }
 rocky-trino = { path = "../rocky-trino" }
 rocky-fivetran = { path = "../rocky-fivetran", features = ["valkey"] }
 rocky-airbyte = { path = "../rocky-airbyte" }
+rocky-catalog-core = { path = "../rocky-catalog-core" }
 rocky-iceberg = { path = "../rocky-iceberg" }
 rocky-cache = { path = "../rocky-cache", features = ["valkey"] }
 clap = { workspace = true }

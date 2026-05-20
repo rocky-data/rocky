@@ -34,6 +34,7 @@ use rocky_airbyte::client::AirbyteClient;
 use rocky_fivetran::adapter::FivetranDiscoveryAdapter;
 use rocky_fivetran::client::FivetranClient;
 
+use rocky_iceberg::IcebergCatalogClientAdapter;
 use rocky_iceberg::adapter::IcebergDiscoveryAdapter;
 use rocky_iceberg::client::IcebergCatalogClient;
 
@@ -80,6 +81,12 @@ pub struct AdapterRegistry {
     /// `INFORMATION_SCHEMA.COLUMNS` describe query through the same
     /// authenticated HTTP client that the generic warehouse adapter uses.
     bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>>,
+    /// Iceberg catalog-client adapters keyed by adapter name.  Stored here
+    /// so the plan-time catalog-stats lookup can call
+    /// `CatalogClient::table_stats` without going through the
+    /// `IcebergDiscoveryAdapter` wrapper (which owns the underlying
+    /// `IcebergCatalogClient` and does not expose it).
+    iceberg_clients: HashMap<String, Arc<IcebergCatalogClientAdapter>>,
     adapter_configs: HashMap<String, AdapterConfig>,
 }
 
@@ -108,6 +115,7 @@ impl AdapterRegistry {
         let mut connectors = HashMap::new();
         let mut snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>> = HashMap::new();
         let mut bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>> = HashMap::new();
+        let mut iceberg_clients: HashMap<String, Arc<IcebergCatalogClientAdapter>> = HashMap::new();
         let mut adapter_configs = HashMap::new();
 
         // Cross-adapter run-level retry budget (follow-up to §P2.7). When
@@ -322,13 +330,26 @@ impl AdapterRegistry {
                     ))?;
                     let auth_token = adapter_cfg.token.as_ref().map(|s| s.expose().to_string());
 
-                    let client = IcebergCatalogClient::with_retry(
+                    let client_for_discovery = IcebergCatalogClient::with_retry(
                         catalog_url,
-                        auth_token,
+                        auth_token.clone(),
                         adapter_cfg.retry.clone(),
                     );
+                    // Construct a second, independent client with the same
+                    // config for the plan-time `CatalogClient::table_stats`
+                    // path. `IcebergDiscoveryAdapter::new` takes ownership,
+                    // so we can't share the struct without Clone; two thin
+                    // HTTP clients with the same config is the zero-friction
+                    // alternative.
+                    let stats_client =
+                        IcebergCatalogClientAdapter::new(IcebergCatalogClient::with_retry(
+                            catalog_url,
+                            auth_token,
+                            adapter_cfg.retry.clone(),
+                        ));
+                    iceberg_clients.insert(name.clone(), Arc::new(stats_client));
 
-                    let adapter = Arc::new(IcebergDiscoveryAdapter::new(client));
+                    let adapter = Arc::new(IcebergDiscoveryAdapter::new(client_for_discovery));
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "manual" => {
@@ -483,6 +504,7 @@ impl AdapterRegistry {
             connectors,
             snowflake_connectors,
             bigquery_adapters,
+            iceberg_clients,
             adapter_configs,
         })
     }
@@ -509,6 +531,18 @@ impl AdapterRegistry {
             .get(name)
             .cloned()
             .context(format!("no databricks connector named '{name}'"))
+    }
+
+    /// Return the Iceberg catalog-client adapter for the named adapter, if
+    /// one was registered.  Returns `None` for adapters that are not of
+    /// type `"iceberg"`.  The returned adapter implements
+    /// `CatalogClient::table_stats` via the Iceberg snapshot-summary path.
+    ///
+    /// Used by the plan-time catalog-stats lookup (D-3 stage 2) to call
+    /// `table_stats` without going through the `IcebergDiscoveryAdapter`
+    /// wrapper that takes ownership of the inner client.
+    pub fn iceberg_client(&self, name: &str) -> Option<Arc<IcebergCatalogClientAdapter>> {
+        self.iceberg_clients.get(name).cloned()
     }
 
     /// Get the adapter config by name.

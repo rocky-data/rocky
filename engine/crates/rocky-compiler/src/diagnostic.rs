@@ -217,6 +217,48 @@ impl Diagnostic {
         ))
     }
 
+    /// Build a **warning**-severity E027 USD budget diagnostic.
+    ///
+    /// Used at plan time when the model's `on_breach = "warn"` policy means a
+    /// ceiling breach should be surfaced as advisory rather than blocking.
+    /// The message is identical to [`Self::budget_exceeded`]; only severity
+    /// differs.
+    #[must_use]
+    pub fn budget_exceeded_warn(model: &str, projected_usd: f64, ceiling_usd: f64) -> Self {
+        Self::warning(
+            E027,
+            model,
+            format!("budget exceeded — projected ${projected_usd:.4} > ceiling ${ceiling_usd:.4}",),
+        )
+        .with_suggestion(format!(
+            "raise [budget] max_usd above ${ceiling_usd:.4} in the model sidecar, \
+             or optimize the query to reduce scan volume"
+        ))
+    }
+
+    /// Build a **warning**-severity E027 bytes-scanned budget diagnostic.
+    ///
+    /// Used at plan time when the model's `on_breach = "warn"` policy means a
+    /// ceiling breach should be surfaced as advisory rather than blocking.
+    #[must_use]
+    pub fn budget_exceeded_bytes_warn(
+        model: &str,
+        projected_bytes: u64,
+        ceiling_bytes: u64,
+    ) -> Self {
+        Self::warning(
+            E027,
+            model,
+            format!(
+                "budget exceeded — projected {projected_bytes} bytes > ceiling {ceiling_bytes} bytes scanned",
+            ),
+        )
+        .with_suggestion(format!(
+            "raise [budget] max_bytes_scanned above {ceiling_bytes} in the model sidecar, \
+             or optimize the query to reduce scan volume"
+        ))
+    }
+
     /// Is this an error?
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error

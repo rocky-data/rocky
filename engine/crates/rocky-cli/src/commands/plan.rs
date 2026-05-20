@@ -252,6 +252,11 @@ pub async fn plan(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("models");
+    tracing::debug!(
+        models_dir = %models_dir.display(),
+        models_dir_exists = models_dir.exists(),
+        "plan: models_dir check"
+    );
     if models_dir.exists() {
         let adapter_type = rocky_cfg
             .adapters
@@ -260,6 +265,49 @@ pub async fn plan(
             .unwrap_or("");
         populate_governance_actions(&rocky_cfg, &models_dir, env, adapter_type, &mut output)
             .context("failed to compute governance action preview")?;
+    }
+
+    // --- D-3 stage 2: per-model budget ceiling check (real catalog stats) --
+    //
+    // When models exist and the target adapter is Databricks or Iceberg, fetch
+    // per-table byte statistics from the warehouse, propagate costs through the
+    // DAG, and emit E027 diagnostics for any model whose projected cost exceeds
+    // its declared `[budget]` ceiling.
+    //
+    // This replaces the stub stats used at compile time with real catalog data.
+    // Compile stays offline; plan is the natural budget-enforcement surface.
+    //
+    // A/B/C decision: **B (rocky plan)** — plan already performs live
+    // warehouse I/O (discovery, governance) and is the pre-run validation
+    // surface.  Compile stays CI/pre-commit/LSP-safe (offline); run is too
+    // late (partial execution possible).  If catalog stats are unavailable
+    // (adapter not Databricks/Iceberg, table not found, network error) the
+    // check degrades gracefully — no diagnostic is emitted rather than
+    // blocking on missing data.
+    //
+    // Leaf-table decision: the model's own TARGET table is used as the stat
+    // source (option A in advisor review).  This proxies "current run ≈
+    // current table size," maps 1:1 to `DESCRIBE DETAIL`, and avoids the
+    // N-source aggregation problem for joins. Databricks-Unity returns only
+    // `sizeInBytes` (no row count without ANALYZE); the stat is stored as
+    // row_count=1 / avg_row_bytes=sizeInBytes so `estimated_bytes` equals
+    // the real table size.  `max_bytes_scanned` is therefore the correct
+    // ceiling lever for Databricks; `max_usd` estimates are unreliable
+    // without per-row cost data.  The live-verify target
+    // (`dev_hcv2_uniform.spike.uniform_t1`) tests the `max_bytes_scanned`
+    // path end-to-end.
+    //
+    // on_breach policy: per-model `on_breach` is honoured — "warn" → Warning
+    // diagnostic (does not set has_budget_errors), "error" → Error diagnostic
+    // (sets has_budget_errors).  Default is "warn" per `BudgetBreachAction`.
+    if models_dir.exists() {
+        let budget_diagnostics =
+            check_plan_budget(&models_dir, &pipeline.target.adapter, &adapter_registry).await;
+        let has_errors = budget_diagnostics
+            .iter()
+            .any(|d| d.severity == rocky_compiler::diagnostic::Severity::Error);
+        output.budget_diagnostics = budget_diagnostics;
+        output.has_budget_errors = has_errors;
     }
 
     // --- Plan-spine persistence (Cluster 3 B, Phase 2 + Phase 5b) ---------
@@ -350,6 +398,7 @@ pub async fn plan(
             println!();
         }
         render_governance_preview_text(&output);
+        render_budget_diagnostics_text(&output);
         if let Some(ref plan_id) = output.plan_id {
             println!();
             match output.plan_kind.as_deref() {
@@ -614,6 +663,212 @@ fn populate_governance_actions(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// D-3 stage 2 — real-catalog budget check
+// ---------------------------------------------------------------------------
+
+/// Collect per-leaf-model byte statistics from the warehouse catalog and
+/// check each model's `[budget]` ceiling against the propagated estimates.
+///
+/// Returns a (possibly empty) list of E027 diagnostics.  Severity follows
+/// the per-model `on_breach` policy (`warn` or `error`).
+///
+/// # Leaf-table convention
+///
+/// Each model's **target** table is used as the stat source.  This is a
+/// proxy for "next run ≈ current table size" and is consistent with the
+/// single-table lookup shape of `DESCRIBE DETAIL` and
+/// `CatalogClient::table_stats`.  Multi-source join aggregation is deferred
+/// to a future wave.
+///
+/// # Graceful degradation
+///
+/// - Adapter not Databricks/Iceberg → returns empty vec (no stats available)
+/// - Table not found / network error → model is skipped (no diagnostic)
+/// - `max_usd` ceiling on Databricks-Unity → stored as row_count=1 /
+///   avg_row_bytes=sizeInBytes so estimated_bytes is correct, but per-row
+///   cost is unreliable without ANALYZE data; `max_bytes_scanned` is the
+///   correct ceiling lever for Databricks
+async fn check_plan_budget(
+    models_dir: &Path,
+    target_adapter_name: &str,
+    adapter_registry: &crate::registry::AdapterRegistry,
+) -> Vec<rocky_compiler::diagnostic::Diagnostic> {
+    use rocky_catalog_core::CatalogClient as _;
+    use rocky_compiler::cost_check;
+    use rocky_core::cost::{TableStats as CostTableStats, WarehouseType, propagate_costs};
+    use std::collections::HashMap;
+
+    tracing::debug!(
+        models_dir = %models_dir.display(),
+        target_adapter_name,
+        "plan budget check: invoked"
+    );
+
+    // Compile models offline — no catalog I/O here.
+    let compile_cfg = rocky_compiler::compile::CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        source_column_info: HashMap::new(),
+        mask: std::collections::BTreeMap::new(),
+        allow_unmasked: vec![],
+    };
+    let result = match rocky_compiler::compile::compile(&compile_cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "plan budget check: compile failed; skipping budget check"
+            );
+            return vec![];
+        }
+    };
+    if result.project.models.is_empty() {
+        return vec![];
+    }
+
+    // Determine the warehouse type for cost-model pricing constants.
+    let warehouse_type = adapter_registry
+        .adapter_config(target_adapter_name)
+        .and_then(|cfg| WarehouseType::from_adapter_type(&cfg.adapter_type))
+        .unwrap_or(WarehouseType::Databricks);
+
+    // Build base_stats by fetching real catalog data for each model's
+    // target table.  Models for which we get no stats are skipped
+    // (propagate_costs handles missing entries gracefully).
+    let mut base_stats: HashMap<String, CostTableStats> = HashMap::new();
+
+    // Databricks path: call `DESCRIBE DETAIL` via the connector.
+    let db_connector_result = adapter_registry.databricks_connector(target_adapter_name);
+    tracing::debug!(
+        target_adapter_name,
+        ok = db_connector_result.is_ok(),
+        "plan budget check: databricks_connector lookup"
+    );
+    if let Ok(db_connector) = db_connector_result {
+        for model in &result.project.models {
+            let target = &model.config.target;
+            match db_connector
+                .describe_detail_stats(&target.catalog, &target.schema, &target.table)
+                .await
+            {
+                Ok(Some(detail)) => {
+                    tracing::debug!(
+                        model = model.config.name,
+                        size_bytes = ?detail.size_bytes,
+                        "plan budget check: describe_detail_stats returned"
+                    );
+                    if let Some(size_bytes) = detail.size_bytes {
+                        // Databricks-Unity returns `sizeInBytes` but no
+                        // row count without ANALYZE.  Use row_count=1 with
+                        // avg_row_bytes=size_bytes so that
+                        // `estimate_table_scan_cost` produces
+                        // `estimated_bytes = 1 * size_bytes = size_bytes`.
+                        // `max_bytes_scanned` ceilings are the correct lever
+                        // for Databricks at plan time; `max_usd` ceilings
+                        // will estimate $0 per-row cost and should not be
+                        // relied on without ANALYZE data.
+                        base_stats.insert(
+                            model.config.name.clone(),
+                            CostTableStats {
+                                row_count: 1,
+                                avg_row_bytes: size_bytes,
+                            },
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // Table not found — new model, no pre-existing table. Skip.
+                    tracing::debug!(
+                        model = model.config.name,
+                        "plan budget check: target table not found; skipping model"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        model = model.config.name,
+                        error = %e,
+                        "plan budget check: describe_detail_stats failed; skipping model"
+                    );
+                }
+            }
+        }
+    }
+
+    // Iceberg path: call `table_stats` via the catalog-client adapter.
+    if let Some(iceberg_client) = adapter_registry.iceberg_client(target_adapter_name) {
+        for model in &result.project.models {
+            if base_stats.contains_key(&model.config.name) {
+                // Already populated by Databricks path (shouldn't happen in
+                // practice, but be explicit).
+                continue;
+            }
+            let target = &model.config.target;
+            let table_ref = rocky_catalog_core::TableRef {
+                catalog: if target.catalog.is_empty() {
+                    None
+                } else {
+                    Some(target.catalog.clone())
+                },
+                namespace: vec![target.schema.clone()],
+                name: target.table.clone(),
+            };
+            match iceberg_client.table_stats(&table_ref).await {
+                Ok(stats) => {
+                    // Convert from catalog TableStats to cost::TableStats.
+                    // Both row_count and total_bytes must be present to derive
+                    // avg_row_bytes; when either is missing we skip this model.
+                    if let (Some(row_count), Some(total_bytes)) =
+                        (stats.row_count, stats.total_bytes)
+                    {
+                        let avg_row_bytes = total_bytes.checked_div(row_count).unwrap_or(0);
+                        base_stats.insert(
+                            model.config.name.clone(),
+                            CostTableStats {
+                                row_count,
+                                avg_row_bytes,
+                            },
+                        );
+                    }
+                }
+                Err(rocky_catalog_core::CatalogError::UnsupportedOperation(_)) => {
+                    // Iceberg catalog signals no stats endpoint.  Degrade.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        model = model.config.name,
+                        error = %e,
+                        "plan budget check: iceberg table_stats failed; skipping model"
+                    );
+                }
+            }
+        }
+    }
+
+    // If we got no real stats for any model, skip the ceiling check —
+    // the stub estimates from compile already ran.
+    if base_stats.is_empty() {
+        return vec![];
+    }
+
+    // Propagate cost estimates through the DAG using real stats.
+    let dag_nodes = &result.project.dag_nodes;
+    let estimates = match propagate_costs(dag_nodes, &base_stats, warehouse_type) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "plan budget check: propagate_costs failed; skipping budget check"
+            );
+            return vec![];
+        }
+    };
+
+    // Check ceilings; honor per-model on_breach policy.
+    cost_check::check_cost_ceilings_plan(&result.project.models, &estimates)
+}
+
 /// Render the warehouse-native SQL Rocky would emit for a retention
 /// policy, or `None` on adapters without a first-class retention knob
 /// (BigQuery, DuckDB).
@@ -693,6 +948,28 @@ fn render_governance_preview_text(output: &PlanOutput) {
             model = a.model,
             days = a.duration_days,
         );
+    }
+}
+
+/// Render budget diagnostics under the text output mode.
+///
+/// Prints E027 diagnostics (one per breached ceiling) with their severity
+/// prefix so CLI users see the same information as JSON consumers.
+fn render_budget_diagnostics_text(output: &PlanOutput) {
+    if output.budget_diagnostics.is_empty() {
+        return;
+    }
+    println!("-- budget check --");
+    for d in &output.budget_diagnostics {
+        let prefix = if d.severity == rocky_compiler::diagnostic::Severity::Error {
+            "error"
+        } else {
+            "warning"
+        };
+        println!("[{prefix}][E027] {}: {}", d.model, d.message);
+        if let Some(ref suggestion) = d.suggestion {
+            println!("  hint: {suggestion}");
+        }
     }
 }
 

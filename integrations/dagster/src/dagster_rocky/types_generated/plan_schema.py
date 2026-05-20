@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import AwareDatetime, BaseModel, conint
 
 
@@ -73,6 +75,61 @@ class RetentionAction(BaseModel):
     """
 
 
+class Severity(StrEnum):
+    """
+    Severity level of a diagnostic.
+
+    Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+    """
+
+    Error = "Error"
+    Warning = "Warning"
+    Info = "Info"
+
+
+class SourceSpan(BaseModel):
+    """
+    Location in a source file.
+    """
+
+    col: conint(ge=0)
+    file: str
+    line: conint(ge=0)
+
+
+class Diagnostic(BaseModel):
+    """
+    A compiler diagnostic (error, warning, or informational message).
+
+    `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+    """
+
+    code: str
+    """
+    Diagnostic code (e.g., "E001", "W001").
+    """
+    message: str
+    """
+    Human-readable message.
+    """
+    model: str
+    """
+    Which model this diagnostic relates to.
+    """
+    severity: Severity
+    """
+    Severity level.
+    """
+    span: SourceSpan | None = None
+    """
+    Source location (if available).
+    """
+    suggestion: str | None = None
+    """
+    Suggested fix (if any).
+    """
+
+
 class PlanOutput(BaseModel):
     """
     JSON output for `rocky plan`.
@@ -84,6 +141,10 @@ class PlanOutput(BaseModel):
     `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
     """
 
+    budget_diagnostics: list[Diagnostic] | None = None
+    """
+    Per-model E027 budget-exceeded diagnostics produced at plan time using real catalog statistics. Severity reflects the model's `on_breach` policy (`"warn"` or `"error"`). Empty when no ceiling was exceeded or no real stats were available.
+    """
     classification_actions: list[ClassificationAction] | None = None
     """
     Column-tag applications the governance reconciler would issue via `apply_column_tags`. One row per `(model, column, tag)` triple declared in a model sidecar's `[classification]` block.
@@ -102,6 +163,10 @@ class PlanOutput(BaseModel):
     Execution layers (topological order) as a list-of-lists of model names. Models within a layer can execute concurrently. Informational — re-derived at apply time. Empty for replication-only plans.
     """
     filter: str
+    has_budget_errors: bool | None = None
+    """
+    `true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = "error"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.
+    """
     mask_actions: list[MaskAction] | None = None
     """
     Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.
