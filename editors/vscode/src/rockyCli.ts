@@ -1,8 +1,38 @@
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import type { ExecFileException } from "child_process";
 import * as vscode from "vscode";
 import { getConfig, getWorkspaceFolder } from "./config";
 import { getOutputChannel } from "./output";
+
+/**
+ * Subcommands whose stdout can exceed the 16 MiB `execFile` `maxBuffer` cap
+ * on a real warehouse. We route these through {@link runRockyUnbounded},
+ * which streams stdout via `spawn()` and accumulates it manually instead of
+ * relying on Node's bounded internal buffer.
+ *
+ * Keep the set conservative — anything in here pays a slightly heavier
+ * stream-assembly cost than `execFile`. Add a subcommand only when its
+ * output has a credible chance of exceeding 16 MiB.
+ */
+const UNBOUNDED_OUTPUT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "catalog",
+  "history",
+  "optimize",
+  "discover",
+]);
+
+/**
+ * Returns `true` when {@link args} begins with a subcommand listed in
+ * {@link UNBOUNDED_OUTPUT_SUBCOMMANDS}. Top-level flags such as `--output`
+ * never count, so the check looks for the first non-flag token.
+ */
+function isUnboundedOutputCommand(args: readonly string[]): boolean {
+  for (const arg of args) {
+    if (arg.startsWith("-")) continue;
+    return UNBOUNDED_OUTPUT_SUBCOMMANDS.has(arg);
+  }
+  return false;
+}
 
 export interface RunRockyOptions {
   /** Working directory for the spawned process. Defaults to the workspace root. */
@@ -51,11 +81,18 @@ export class RockyCliError extends Error {
  *
  * Every invocation is logged to the shared "Rocky" output channel so the user
  * can audit what the extension is running.
+ *
+ * Subcommands whose output can exceed `execFile`'s 16 MiB cap (catalog,
+ * history, optimize, discover) are streamed through `spawn()` instead so the
+ * full payload survives. See {@link UNBOUNDED_OUTPUT_SUBCOMMANDS}.
  */
 export function runRocky(
   args: string[],
   opts: RunRockyOptions = {},
 ): Promise<RockyResult> {
+  if (isUnboundedOutputCommand(args)) {
+    return runRockyUnbounded(args, opts);
+  }
   const { serverPath } = getConfig();
   const cwd = opts.cwd ?? getWorkspaceFolder();
   const channel = getOutputChannel();
@@ -100,6 +137,125 @@ export function runRocky(
         resolve({ stdout, stderr });
       },
     );
+
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        child.kill("SIGTERM");
+      } else {
+        const onAbort = (): void => {
+          child.kill("SIGTERM");
+        };
+        opts.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = (): void => {
+          opts.signal!.removeEventListener("abort", onAbort);
+        };
+      }
+    }
+  });
+}
+
+/**
+ * Stream-based counterpart to {@link runRocky}. Used for subcommands whose
+ * stdout can exceed `execFile`'s 16 MiB `maxBuffer` cap — `rocky catalog`,
+ * `rocky history`, `rocky optimize`, and `rocky discover` against a real
+ * warehouse all reproducibly cross this line.
+ *
+ * The contract matches {@link runRocky} exactly: identical `RockyResult`
+ * shape on success, identical {@link RockyCliError} shape on failure
+ * (including `stdout` captured on non-zero exit, so callers like the doctor
+ * handler still recover their JSON payload). Timeout, abort-signal, and
+ * output-channel logging all behave the same.
+ */
+function runRockyUnbounded(
+  args: string[],
+  opts: RunRockyOptions = {},
+): Promise<RockyResult> {
+  const { serverPath } = getConfig();
+  const cwd = opts.cwd ?? getWorkspaceFolder();
+  const channel = getOutputChannel();
+  const start = Date.now();
+
+  channel.appendLine(`$ ${serverPath} ${args.join(" ")}`);
+
+  return new Promise((resolve, reject) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let removeAbortListener: (() => void) | undefined;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    let timedOut = false;
+
+    const child = spawn(serverPath, args, { cwd });
+
+    const settle = (
+      err: (Error & { code?: number | string }) | null,
+      exitCode: number | string | null,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      removeAbortListener?.();
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      const elapsed = Date.now() - start;
+
+      if (err) {
+        if (stderr) channel.appendLine(stderr.trimEnd());
+        channel.appendLine(
+          `[${elapsed}ms] command failed (exit ${exitCode ?? "?"}): ${err.message}`,
+        );
+        reject(
+          new RockyCliError(
+            err.message,
+            stderr,
+            exitCode,
+            err,
+            stdout,
+          ),
+        );
+        return;
+      }
+      channel.appendLine(`[${elapsed}ms] ok`);
+      resolve({ stdout, stderr });
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+    });
+    child.on("error", (err) => {
+      // spawn failure (e.g. ENOENT) — surfaces here instead of via `close`.
+      settle(err as Error & { code?: string }, null);
+    });
+    child.on("close", (code, signal) => {
+      if (timedOut) {
+        const err = Object.assign(new Error("Command timed out"), {
+          code: "ETIMEDOUT",
+        });
+        settle(err, code ?? signal ?? null);
+        return;
+      }
+      if (code === 0) {
+        settle(null, 0);
+        return;
+      }
+      const exitCode = code ?? signal ?? null;
+      const err = Object.assign(
+        new Error(`Command failed with exit code ${exitCode ?? "?"}`),
+        { code: exitCode ?? undefined },
+      );
+      settle(err, exitCode);
+    });
+
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, opts.timeoutMs);
+    }
 
     if (opts.signal) {
       if (opts.signal.aborted) {
