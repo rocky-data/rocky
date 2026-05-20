@@ -868,6 +868,25 @@ pub trait SqlDialect: Send + Sync {
         "CURRENT_TIMESTAMP"
     }
 
+    /// Build a NULL-safe inequality predicate: `lhs` differs from `rhs`,
+    /// treating two NULLs as equal and a single NULL as a real difference.
+    /// Used by SCD2 change detection on the watermark / check columns —
+    /// bare SQL `!=` returns NULL when either side is NULL, which silently
+    /// drops rows that transition NULL ↔ value.
+    ///
+    /// Default: `<lhs> IS DISTINCT FROM <rhs>` — supported by Snowflake,
+    /// Databricks (Spark SQL), DuckDB, Trino, and BigQuery. Dialects
+    /// without `IS DISTINCT FROM` must override (e.g. MySQL would emit
+    /// `NOT (<lhs> <=> <rhs>)`).
+    ///
+    /// Callers are responsible for SQL-validating any identifiers they
+    /// interpolate into `lhs` / `rhs` — this method does no validation of
+    /// its arguments and treats them as already-trusted SQL fragments
+    /// (table-qualified column references in the SCD2 callers).
+    fn null_safe_neq(&self, lhs: &str, rhs: &str) -> String {
+        format!("{lhs} IS DISTINCT FROM {rhs}")
+    }
+
     /// Quote a column / table identifier for safe interpolation into
     /// generated SQL. The caller has already validated `name` against
     /// the SQL-identifier allowlist; this method picks the dialect's
