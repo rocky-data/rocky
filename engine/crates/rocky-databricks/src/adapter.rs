@@ -5,21 +5,35 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use rocky_catalog_core::{
+    CatalogClient, CatalogError, TableRef as CatalogTableRef, TableSchema as CatalogTableSchema,
+};
 use rocky_core::traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats, FreshnessResult,
     PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
+use tracing::debug;
 
 use crate::batch::{self, BatchTableRef};
 use crate::connector::DatabricksConnector;
 use crate::dialect::DatabricksSqlDialect;
+use crate::unity_catalog_client::UnityCatalogClient;
 
 /// Databricks warehouse adapter wrapping [`DatabricksConnector`] behind the
 /// [`WarehouseAdapter`] trait.
+///
+/// An optional [`UnityCatalogClient`] can be wired in via
+/// [`DatabricksWarehouseAdapter::with_catalog_client`] to route read-side
+/// catalog operations (today: [`WarehouseAdapter::describe_table`] and
+/// [`WarehouseAdapter::list_tables`]) through Unity's REST surface instead
+/// of `DESCRIBE TABLE` / `information_schema` SQL. The SQL path remains the
+/// default and the fallback whenever the REST attempt returns
+/// [`CatalogError::UnsupportedOperation`] or [`CatalogError::Transport`].
 pub struct DatabricksWarehouseAdapter {
     connector: DatabricksConnector,
     dialect: DatabricksSqlDialect,
+    catalog_client: Option<UnityCatalogClient>,
 }
 
 impl DatabricksWarehouseAdapter {
@@ -27,13 +41,91 @@ impl DatabricksWarehouseAdapter {
         Self {
             connector,
             dialect: DatabricksSqlDialect,
+            catalog_client: None,
         }
+    }
+
+    /// Attach a [`UnityCatalogClient`] for REST-backed catalog reads.
+    ///
+    /// When set, [`WarehouseAdapter::describe_table`] and
+    /// [`WarehouseAdapter::list_tables`] try the Unity REST path first and
+    /// fall back to the existing SQL path on
+    /// [`CatalogError::UnsupportedOperation`] or
+    /// [`CatalogError::Transport`]. Any other catalog error (auth,
+    /// permission, table-not-found, malformed response) is surfaced as
+    /// [`AdapterError`] without falling through, so credential or shape
+    /// problems on the REST side aren't silently masked.
+    #[must_use]
+    pub fn with_catalog_client(mut self, client: UnityCatalogClient) -> Self {
+        self.catalog_client = Some(client);
+        self
     }
 
     /// Access the underlying connector (for adapter-specific operations).
     pub fn connector(&self) -> &DatabricksConnector {
         &self.connector
     }
+
+    /// Access the optionally-wired Unity REST catalog client.
+    pub fn catalog_client(&self) -> Option<&UnityCatalogClient> {
+        self.catalog_client.as_ref()
+    }
+}
+
+/// Project a warehouse-side three-part [`rocky_ir::TableRef`] onto the
+/// catalog-agnostic [`rocky_catalog_core::TableRef`] shape.
+///
+/// Unity is rigidly `catalog.schema.table`, so the IR's three fields map
+/// straight onto `catalog = Some(_)`, `namespace = [schema]`, `name = table`.
+/// Adapters that target multi-level Iceberg namespaces would project
+/// differently; this helper is Databricks-specific.
+fn ir_to_catalog_ref(table: &TableRef) -> CatalogTableRef {
+    CatalogTableRef {
+        catalog: Some(table.catalog.clone()),
+        namespace: vec![table.schema.clone()],
+        name: table.table.clone(),
+    }
+}
+
+/// Project a [`CatalogTableSchema`] onto the engine's `Vec<ColumnInfo>` shape.
+///
+/// The trait carries `name + type_str + nullable` per column; the warehouse-
+/// side `ColumnInfo` carries `name + data_type + nullable`. The projection is
+/// one-to-one — no caller of [`WarehouseAdapter::describe_table`] reads any
+/// REST-richer field (storage location, owner, etc.) so this lossless
+/// mapping is sufficient.
+fn catalog_schema_to_column_info(schema: CatalogTableSchema) -> Vec<ColumnInfo> {
+    schema
+        .columns
+        .into_iter()
+        .map(|c| ColumnInfo {
+            name: c.name,
+            data_type: c.type_str,
+            nullable: c.nullable,
+        })
+        .collect()
+}
+
+/// Whether a [`CatalogError`] should fall through to the SQL path.
+///
+/// Only [`CatalogError::UnsupportedOperation`] and
+/// [`CatalogError::Transport`] are recoverable here:
+///
+/// - `UnsupportedOperation` is the catalog telling us it doesn't serve this
+///   surface over REST (today: any catalog that wires a stub client).
+/// - `Transport` is a network / 5xx blip that the SQL path may navigate
+///   around (the SQL connector has its own retry layer).
+///
+/// All other variants — `AuthFailed`, `PermissionDenied`, `TableNotFound`,
+/// `NamespaceNotFound`, `InvalidResponse`, `CommitConflict` — are
+/// deterministic catalog answers we'd rather surface than mask by silently
+/// routing to SQL (e.g. a Unity-side auth misconfig should not look like a
+/// successful SQL describe).
+fn catalog_error_is_fallback(err: &CatalogError) -> bool {
+    matches!(
+        err,
+        CatalogError::UnsupportedOperation(_) | CatalogError::Transport(_)
+    )
 }
 
 #[async_trait]
@@ -77,6 +169,38 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        // Try the Unity REST path first when a catalog client is wired —
+        // `GET /api/2.1/unity-catalog/tables/{full_name}` returns the column
+        // list directly without paying the latency of a `DESCRIBE TABLE`
+        // round-trip against the SQL warehouse. Fall back to the SQL path
+        // on `UnsupportedOperation` or `Transport` errors; everything else
+        // (auth, permission, table-not-found, invalid shape) surfaces as
+        // `AdapterError` to avoid masking real REST-side problems.
+        if let Some(client) = &self.catalog_client {
+            let catalog_ref = ir_to_catalog_ref(table);
+            match client.describe_table(&catalog_ref).await {
+                Ok(schema) => {
+                    debug!(
+                        catalog = %table.catalog,
+                        schema = %table.schema,
+                        table = %table.table,
+                        "describe_table served from Unity REST"
+                    );
+                    return Ok(catalog_schema_to_column_info(schema));
+                }
+                Err(e) if catalog_error_is_fallback(&e) => {
+                    debug!(
+                        catalog = %table.catalog,
+                        schema = %table.schema,
+                        table = %table.table,
+                        error = %e,
+                        "describe_table REST path declined; falling back to SQL"
+                    );
+                }
+                Err(e) => return Err(AdapterError::new(e)),
+            }
+        }
+
         let catalog_mgr = crate::catalog::CatalogManager::new(&self.connector);
         catalog_mgr
             .describe_table(table)
@@ -85,6 +209,36 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
     }
 
     async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
+        // Same shape as `describe_table`: try the Unity REST path first
+        // (`GET /api/2.1/unity-catalog/tables?catalog_name=X&schema_name=Y`),
+        // fall back on `UnsupportedOperation` or `Transport` only. The
+        // trait contract is "table names returned lowercase" so both paths
+        // post-process identically — REST returns Unity's as-stored
+        // identifiers and we lowercase before returning.
+        if let Some(client) = &self.catalog_client {
+            let namespace = [catalog.to_string(), schema.to_string()];
+            match client.list_tables(&namespace).await {
+                Ok(tables) => {
+                    debug!(
+                        catalog,
+                        schema,
+                        count = tables.len(),
+                        "list_tables served from Unity REST"
+                    );
+                    return Ok(tables.into_iter().map(|t| t.name.to_lowercase()).collect());
+                }
+                Err(e) if catalog_error_is_fallback(&e) => {
+                    debug!(
+                        catalog,
+                        schema,
+                        error = %e,
+                        "list_tables REST path declined; falling back to SQL"
+                    );
+                }
+                Err(e) => return Err(AdapterError::new(e)),
+            }
+        }
+
         let catalog_mgr = crate::catalog::CatalogManager::new(&self.connector);
         catalog_mgr
             .list_tables(catalog, schema)
@@ -365,4 +519,131 @@ fn parse_databricks_i128(v: &serde_json::Value) -> AdapterResult<i128> {
     Err(AdapterError::msg(format!(
         "Databricks checksum_chunks result column had unexpected JSON shape: {v:?}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocky_catalog_core::{ColumnSchema as CatalogColumnSchema, TableSchema as CatalogSchema};
+
+    #[test]
+    fn ir_to_catalog_ref_projects_three_part_name() {
+        let ir = TableRef {
+            catalog: "hc_cat".into(),
+            schema: "hc_sch".into(),
+            table: "hc_tbl".into(),
+        };
+        let catalog_ref = ir_to_catalog_ref(&ir);
+        assert_eq!(catalog_ref.catalog.as_deref(), Some("hc_cat"));
+        assert_eq!(catalog_ref.namespace, vec!["hc_sch".to_string()]);
+        assert_eq!(catalog_ref.name, "hc_tbl");
+    }
+
+    #[test]
+    fn catalog_schema_to_column_info_preserves_fields() {
+        let schema = CatalogSchema {
+            columns: vec![
+                CatalogColumnSchema {
+                    name: "id".into(),
+                    type_str: "bigint".into(),
+                    nullable: false,
+                },
+                CatalogColumnSchema {
+                    name: "amount".into(),
+                    type_str: "decimal(10,2)".into(),
+                    nullable: true,
+                },
+            ],
+        };
+        let cols = catalog_schema_to_column_info(schema);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].data_type, "bigint");
+        assert!(!cols[0].nullable);
+        assert_eq!(cols[1].name, "amount");
+        assert_eq!(cols[1].data_type, "decimal(10,2)");
+        assert!(cols[1].nullable);
+    }
+
+    #[test]
+    fn catalog_error_is_fallback_only_for_unsupported_and_transport() {
+        // Recoverable: caller should fall through to SQL.
+        assert!(catalog_error_is_fallback(
+            &CatalogError::UnsupportedOperation("nope")
+        ));
+        assert!(catalog_error_is_fallback(&CatalogError::Transport(
+            Box::new(std::io::Error::other("network blip"))
+        )));
+
+        // Non-recoverable: caller must surface as AdapterError.
+        assert!(!catalog_error_is_fallback(&CatalogError::AuthFailed(
+            "bad token".into()
+        )));
+        assert!(!catalog_error_is_fallback(&CatalogError::PermissionDenied(
+            "denied".into()
+        )));
+        assert!(!catalog_error_is_fallback(&CatalogError::TableNotFound(
+            "missing".into()
+        )));
+        assert!(!catalog_error_is_fallback(
+            &CatalogError::NamespaceNotFound("missing".into())
+        ));
+        assert!(!catalog_error_is_fallback(&CatalogError::InvalidResponse(
+            "bad json".into()
+        )));
+        assert!(!catalog_error_is_fallback(&CatalogError::CommitConflict(
+            "cas".into()
+        )));
+    }
+
+    #[test]
+    fn adapter_defaults_to_no_catalog_client() {
+        // Constructor signature must stay backward-compatible: existing
+        // `::new(connector)` call sites get SQL-only behaviour. Build a
+        // real connector pointed at an unreachable host — `::new` doesn't
+        // hit the network, so the test stays offline.
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "offline.databricks.test".into(),
+            token: Some("offline-token".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .expect("PAT auth is infallible");
+        let config = crate::connector::ConnectorConfig {
+            host: "offline.databricks.test".into(),
+            warehouse_id: "noop".into(),
+            timeout: std::time::Duration::from_secs(1),
+            retry: Default::default(),
+        };
+        let connector = DatabricksConnector::new(config, auth);
+        let adapter = DatabricksWarehouseAdapter::new(connector);
+        assert!(
+            adapter.catalog_client().is_none(),
+            "default constructor must not wire a catalog client"
+        );
+    }
+
+    #[test]
+    fn with_catalog_client_attaches_the_client() {
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "offline.databricks.test".into(),
+            token: Some("offline-token".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .expect("PAT auth is infallible");
+        let config = crate::connector::ConnectorConfig {
+            host: "offline.databricks.test".into(),
+            warehouse_id: "noop".into(),
+            timeout: std::time::Duration::from_secs(1),
+            retry: Default::default(),
+        };
+        let connector = DatabricksConnector::new(config, auth.clone());
+        let client = UnityCatalogClient::new("offline.databricks.test".into(), auth);
+        let adapter = DatabricksWarehouseAdapter::new(connector).with_catalog_client(client);
+        assert!(
+            adapter.catalog_client().is_some(),
+            "with_catalog_client must populate the catalog_client slot"
+        );
+    }
 }

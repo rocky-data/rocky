@@ -34,6 +34,10 @@ required-features = ["test-support"]
 name = "unity_catalog_client_wiremock"
 required-features = ["test-support"]
 
+[[test]]
+name = "catalog_first_delegation"
+required-features = ["test-support"]
+
 [dev-dependencies]
 rocky-core = { path = "../rocky-core" }
 rocky-ir = { path = "../rocky-ir" }
