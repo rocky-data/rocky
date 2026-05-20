@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.24.0] — 2026-05-20
+
+Codegen-companion release to engine `v1.40.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's per-model cost-ceiling surface from PR [#606](https://github.com/rocky-data/rocky/pull/606). No new extension commands, UI, or settings — pure codegen cascade.
+
+### Changed
+
+- **Codegen pickup of `PlanOutput.budget_diagnostics` + `has_budget_errors`** (engine `v1.40.0` — [#606](https://github.com/rocky-data/rocky/pull/606)). Regenerated `src/types/generated/plan.ts` adds optional `budget_diagnostics?: DiagnosticPayload[] | null` and `has_budget_errors?: boolean | null` fields on `PlanOutput`. The fields surface per-model `[budget]` ceiling breaches that `rocky plan` now emits when projected scan size (from real Iceberg snapshot summaries or Databricks `DESCRIBE DETAIL`) exceeds the declared ceiling. Extension code consuming `rocky plan --output json` via `rockyJson.ts` now type-checks against the new fields without further hand-edits.
+
 ## [1.23.0] — 2026-05-19
 
 Codegen-companion release to engine `v1.39.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's `rocky import-dbt` unit-test bridge ([#594](https://github.com/rocky-data/rocky/pull/594)). No new extension commands, UI, or settings — pure codegen cascade.
