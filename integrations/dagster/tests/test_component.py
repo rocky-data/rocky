@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -534,6 +535,84 @@ def test_write_state_creates_parent_dir(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     component.write_state_to_path(state_path)
     assert state_path.exists()
+
+
+def test_write_state_is_atomic_on_failed_replace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """``write_state_to_path`` must not leave a half-written canonical
+    state file behind. The implementation serialises into a sibling
+    ``.tmp`` and then ``os.replace``-s it into place.
+
+    Simulates a crash mid-replace: when ``os.replace`` raises, the
+    canonical state file at the original path is untouched. Without the
+    atomic-write pattern, a SIGKILL during the in-place ``write_text``
+    would truncate the canonical file and break the next
+    ``build_defs_from_state`` load.
+    """
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"existing": "content"}', encoding="utf-8")
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated rename crash")
+
+    monkeypatch.setattr("dagster_rocky.component.os.replace", _boom)
+
+    with pytest.raises(OSError, match="simulated rename crash"):
+        component.write_state_to_path(state_path)
+
+    # Canonical state file unchanged — atomicity preserved the prior payload.
+    assert state_path.read_text(encoding="utf-8") == '{"existing": "content"}'
+
+
+def test_write_state_writes_to_tmp_then_replaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Verify the tmp + os.replace sequence: the temp file is created
+    as a sibling of the state file before being moved into place.
+
+    Pins the implementation contract relied on by
+    ``test_write_state_is_atomic_on_failed_replace`` — without the tmp
+    sibling lying on the same filesystem, ``os.replace`` would not be
+    atomic on POSIX or Windows.
+    """
+    discover = _make_discover_result()
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state.json"
+
+    captured: dict[str, Path] = {}
+    real_replace = os.replace
+
+    def _tracking_replace(src: str | Path, dst: str | Path) -> None:
+        captured["src"] = Path(src)
+        captured["dst"] = Path(dst)
+        real_replace(src, dst)
+
+    monkeypatch.setattr("dagster_rocky.component.os.replace", _tracking_replace)
+    component.write_state_to_path(state_path)
+
+    assert captured["dst"] == state_path
+    assert captured["src"].parent == state_path.parent
+    assert captured["src"].name.endswith(".tmp")
+    assert state_path.exists()
+    # tmp file moved out — should not still exist.
+    assert not captured["src"].exists()
 
 
 # ---------------------------------------------------------------------------
