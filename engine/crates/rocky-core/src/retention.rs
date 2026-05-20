@@ -377,6 +377,12 @@ pub struct SweepReport {
     pub audit_deleted: u64,
     /// Quality snapshots kept.
     pub audit_kept: u64,
+    /// JSONL trace files (`.rocky/traces/*.jsonl`) deleted by the
+    /// last-N-by-mtime sweep. Independent of `applies_to` (traces are
+    /// always swept up to `ROCKY_TRACE_RETAIN_RUNS`, default 20); stays
+    /// at zero for the explicit `rocky state retention sweep` command,
+    /// which only touches the redb-backed domains.
+    pub traces_deleted: u64,
     /// Wall-clock duration of the sweep, in milliseconds.
     pub duration_ms: u64,
 }

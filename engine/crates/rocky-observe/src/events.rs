@@ -237,7 +237,25 @@ pub fn global_event_bus() -> &'static EventBus {
 /// breached). Span boundaries (`pipeline_start` / `pipeline_complete`)
 /// stay as bus events and are *not* converted — the per-run lifecycle
 /// span is the OTel-native shape for those.
+///
+/// Also emits a structured `tracing::event!` so the local JSONL trace
+/// layer (`rocky_observe::traces`) sees the annotation. `OpenTelemetrySpanExt::add_event`
+/// alone writes only to the OTel span and is invisible to the fmt
+/// dispatcher; the paired `event!` makes the same annotation land in
+/// `.rocky/traces/{ts}-{pid}.jsonl` regardless of whether the `otel`
+/// feature is enabled.
 pub fn record_span_event(event: &PipelineEvent) {
+    // Local JSONL bridge: emit a tracing event so the fmt::json layer
+    // picks the annotation up. Kept terse — the OTel branch below
+    // mirrors the same fields for the OTLP exporter.
+    tracing::event!(
+        tracing::Level::INFO,
+        rocky.event = event.event_type.as_str(),
+        target = event.target.as_deref().unwrap_or(""),
+        error = event.error.as_deref().unwrap_or(""),
+        attempt = event.attempt.unwrap_or(0),
+        max_attempts = event.max_attempts.unwrap_or(0),
+    );
     #[cfg(feature = "otel")]
     {
         use opentelemetry::KeyValue;

@@ -2003,6 +2003,11 @@ pub struct RetentionSweepOutput {
     pub audit_deleted: u64,
     /// Quality snapshots remaining.
     pub audit_kept: u64,
+    /// JSONL trace files removed by the last-N-by-mtime sweep. Always
+    /// zero for the explicit `rocky state retention sweep` command —
+    /// the trace sweep is only invoked from `rocky run`'s end-of-run
+    /// auto-sweep (Arc 4 span retention).
+    pub traces_deleted: u64,
     /// Wall-clock duration of the sweep in milliseconds.
     pub duration_ms: u64,
 }
@@ -3623,6 +3628,7 @@ impl RetentionSweepOutput {
             lineage_kept: report.lineage_kept,
             audit_deleted: report.audit_deleted,
             audit_kept: report.audit_kept,
+            traces_deleted: report.traces_deleted,
             duration_ms: report.duration_ms,
         }
     }
