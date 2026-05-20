@@ -86,7 +86,15 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 # Minimum Rocky binary version this dagster-rocky release is compatible with.
 # Checked lazily on first CLI invocation. If the binary is older, the resource
 # raises a ``dg.Failure`` with a clear message pointing at the install URL.
-MIN_ROCKY_VERSION = "1.0.0"
+#
+# Floor set to 1.34.0: every run-path (``run`` / ``run_streaming`` / ``run_pipes``)
+# routes through ``rocky plan`` + ``rocky apply <plan-id>`` and hard-requires a
+# content-addressed ``plan_id`` from the plan step (see ``_apply_plan`` and
+# ``run_pipes`` — both raise ``dg.Failure`` when ``plan_id is None``). Engine
+# v1.34 is the first release that content-addresses every project shape
+# (including replication-only); 1.0–1.33 binaries pass the gate then crash on
+# every run with "rocky plan did not emit a plan_id".
+MIN_ROCKY_VERSION = "1.34.0"
 
 # Number of bytes of stdout/stderr surfaced back to the operator when a Rocky
 # command returns malformed or schema-violating JSON. Enough to spot a stray

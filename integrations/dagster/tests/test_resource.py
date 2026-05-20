@@ -2041,8 +2041,9 @@ def test_verify_version_caches_result():
 
 
 def test_verify_version_semver_comparison_logic():
-    """Test that tuple comparison works correctly for semver:
-    (1, 0, 0) >= (1, 0, 0), (0, 99, 99) < (1, 0, 0), etc."""
+    """Test that tuple comparison works correctly against the live
+    ``MIN_ROCKY_VERSION`` floor — equality passes, anything strictly
+    below fails, anything strictly above passes."""
     rocky = RockyResource()
 
     # Equal to minimum — should pass
@@ -2053,22 +2054,26 @@ def test_verify_version_semver_comparison_logic():
     object.__setattr__(rocky, "_version_checked", False)
 
     # Major version ahead — should pass
-    with _patched_run(return_value=_version_completed("rocky 2.0.0")):
+    with _patched_run(return_value=_version_completed("rocky 99.0.0")):
         rocky._verify_engine_version()
 
     # Reset for next check
     object.__setattr__(rocky, "_version_checked", False)
 
-    # Minor version ahead, same major — should pass
-    with _patched_run(return_value=_version_completed("rocky 1.1.0")):
+    # One patch above the floor (same major+minor) — should pass.
+    min_major, min_minor, min_patch = (int(p) for p in MIN_ROCKY_VERSION.split("."))
+    above = f"{min_major}.{min_minor}.{min_patch + 1}"
+    with _patched_run(return_value=_version_completed(f"rocky {above}")):
         rocky._verify_engine_version()
 
     # Reset for next check
     object.__setattr__(rocky, "_version_checked", False)
 
-    # Below minimum — should fail
+    # Below minimum — should fail. ``1.0.0`` is the pre-Cluster 3 B
+    # release line that triggered this floor bump (no content-addressed
+    # plan_id support), so it's the canonical "too old" case.
     with (
-        _patched_run(return_value=_version_completed("rocky 0.99.99")),
+        _patched_run(return_value=_version_completed("rocky 1.0.0")),
         pytest.raises(dg.Failure, match="below the minimum"),
     ):
         rocky._verify_engine_version()
