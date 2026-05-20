@@ -72,6 +72,15 @@ vi.mock("../output", () => ({
   getOutputChannel: () => ({ appendLine: vi.fn() }),
 }));
 
+// `views/getStartedView` exposes the hasRockyProject() / onDidChangeRockyProject
+// signal used to gate CLI invocations. Tests assume a Rocky project is
+// present so the provider actually fetches data; the onDidChange event is a
+// no-op subscription.
+vi.mock("../views/getStartedView", () => ({
+  hasRockyProject: (): boolean => true,
+  onDidChangeRockyProject: () => ({ dispose: (): void => undefined }),
+}));
+
 // ---------------------------------------------------------------------------
 // Imports — must follow vi.mock calls (hoisting works, but named bindings need
 // to come AFTER the mock declarations so the mock factory runs first)

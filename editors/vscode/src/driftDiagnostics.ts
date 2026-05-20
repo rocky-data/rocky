@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
 import { getOutputChannel } from "./output";
 import type { CompileOutput, Diagnostic, Severity } from "./types/generated/compile";
+import { hasRockyProject, onDidChangeRockyProject } from "./views/getStartedView";
 
 const SUPPORTED_EXTENSIONS = new Set([".rocky", ".sql"]);
 
@@ -207,9 +208,18 @@ export function registerDriftDiagnostics(
       .get<boolean>("diagnostics.enabled", true);
   }
 
+  /**
+   * The CLI can only run when both the user has diagnostics enabled and a
+   * Rocky project is present in the workspace — otherwise `rocky compile`
+   * just fails with "no rocky.toml found".
+   */
+  function shouldRunCli(): boolean {
+    return isDiagnosticsEnabled() && hasRockyProject();
+  }
+
   /** Schedule a debounced diagnostic refresh (500ms). */
   function scheduleRefresh(document: vscode.TextDocument): void {
-    if (!isDiagnosticsEnabled()) {
+    if (!shouldRunCli()) {
       collection.clear();
       return;
     }
@@ -230,7 +240,7 @@ export function registerDriftDiagnostics(
   // Refresh on file open.
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((document) => {
-      if (!isDiagnosticsEnabled()) return;
+      if (!shouldRunCli()) return;
       void refreshDiagnostics(document, collection);
     }),
   );
@@ -266,8 +276,28 @@ export function registerDriftDiagnostics(
     }),
   );
 
-  // Run on any already-open model files at activation time.
-  if (isDiagnosticsEnabled()) {
+  // When the workspace gains or loses a rocky.toml, re-sweep open documents
+  // (gain) or clear stale diagnostics (loss).
+  context.subscriptions.push(
+    onDidChangeRockyProject((has) => {
+      if (!has) {
+        collection.clear();
+        for (const timer of pendingTimers.values()) clearTimeout(timer);
+        pendingTimers.clear();
+        return;
+      }
+      if (!isDiagnosticsEnabled()) return;
+      for (const document of vscode.workspace.textDocuments) {
+        void refreshDiagnostics(document, collection);
+      }
+    }),
+  );
+
+  // Run on any already-open model files at activation time — but only when
+  // a Rocky project is present. `hasRockyProject()` resolves to true
+  // asynchronously after activation; the onDidChangeRockyProject listener
+  // above catches that transition.
+  if (shouldRunCli()) {
     for (const document of vscode.workspace.textDocuments) {
       void refreshDiagnostics(document, collection);
     }

@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import type { OptimizeOutput, OptimizeRecommendation } from "./types/generated/optimize";
 import { getOutputChannel } from "./output";
 import { runRockyJson } from "./rockyCli";
+import { hasRockyProject, onDidChangeRockyProject } from "./views/getStartedView";
 
 const COST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -107,8 +108,16 @@ export class CostCodeLensProvider implements vscode.CodeLensProvider {
    * Trigger a data fetch, then fire `onDidChangeCodeLenses` so VS Code
    * re-evaluates every open model file. Safe to call repeatedly — the second
    * call while a fetch is in-flight will just see the freshly-populated cache.
+   *
+   * No-ops (without fetching) when the workspace has no `rocky.toml`, so the
+   * extension never shells out to `rocky optimize` in a non-Rocky project.
    */
   async refresh(): Promise<void> {
+    if (!hasRockyProject()) {
+      invalidateCostCache();
+      this.emitter.fire();
+      return;
+    }
     await fetchCostData();
     this.emitter.fire();
   }
@@ -191,9 +200,22 @@ export function registerCostCodeLensProvider(
         provider.fireChange();
       }
     }),
+
+    // When the project-detection signal flips (e.g. the user just ran
+    // `rocky init` and a rocky.toml appears), trigger a fresh fetch so cost
+    // lenses light up without requiring a manual refresh.
+    onDidChangeRockyProject((has) => {
+      if (has) {
+        void provider.refresh();
+      } else {
+        invalidateCostCache();
+        provider.fireChange();
+      }
+    }),
   );
 
-  // Initial background fetch — silently no-ops if rocky optimize fails.
+  // Initial background fetch — `refresh()` itself gates on hasRockyProject(),
+  // so this is a no-op in workspaces without a rocky.toml.
   void provider.refresh();
 
   return provider;
