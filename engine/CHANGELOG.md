@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.39.1] — 2026-05-20
+
+Patch release fixing a packaging regression that made the v1.38.0 / v1.39.0 Fivetran adapter-resilience layers unreachable from the prebuilt CLI.
+
+### Fixed
+
+- **`rocky-cli`: enable the `valkey` feature on the `rocky-fivetran` + `rocky-cache` dep edges** ([bac858a](https://github.com/rocky-data/rocky/commit/bac858a)). The shipped `rocky` binary depended on `rocky-fivetran` and `rocky-cache` without enabling either crate's optional `valkey` cargo feature, and the release workflow builds with `cargo build --release --bin rocky` (no `--features`). Every prebuilt binary on the GitHub release page therefore fell through to the `#[cfg(not(feature = "valkey"))]` arm in the four `[adapter.fivetran.*]` resilience backends (`cache` / `ratelimit` / `stampede` / `circuit_breaker`) and refused to construct them whenever `backend` selected `tiered` or `valkey` — none of those backends were reachable from a stock release. Two-line fix on the `rocky-cli` dep edges; every future release picks it up with no workflow change. A new `release-build-smoke` job in `engine-ci.yml` mirrors the release-workflow flags and greps for the specific construction error so the regression can't reappear silently; `cargo test --all-features` couldn't catch it because workspace-level `--all-features` force-enables every feature regardless of how dep edges are wired.
+
 ## [1.39.0] — 2026-05-19
 
 Three small but high-leverage changes this cut. **`rocky import-dbt` dbt-1.7+ catch-up.** dbt 1.7 renamed the column-level test YAML key from `tests:` to `data_tests:`; the importer's deserializer only knew the legacy spelling, so any `schema.yml` written against modern dbt round-tripped to zero converted column tests. A serde alias on `RawColumn.tests` + `RawSourceColumn.tests` restores the canonical-four (`unique` / `not_null` / `accepted_values` / `relationships`) conversion path for those projects without changing existing behavior. **`rocky import-dbt` unit-test bridge.** The importer now walks `manifest.unit_tests` and emits each entry as a Rocky `[[test]]` block in the matching model's sidecar TOML — closing the gap between *Rocky has dbt-style unit tests* (true: `rocky-core/unit_test.rs`) and *Rocky imports dbt unit tests* (false until now). CSV fixtures, `overrides:`, and non-`dict` `expect.format` are deferred to follow-ups. **Fivetran tolerance for connectors with no schema config.** `FivetranClient::fetch_envelope` previously errored when a connector lacked a `schema` config block on the API side; it now logs and continues, so a single misconfigured connector no longer blocks the rest of the envelope.
