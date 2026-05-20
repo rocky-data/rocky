@@ -13,6 +13,7 @@ use rocky_core::traits::WarehouseAdapter;
 use rocky_databricks::adapter::DatabricksWarehouseAdapter;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+use rocky_databricks::unity_catalog_client::UnityCatalogClient;
 use rocky_ir::TableRef;
 
 fn connector_from_env() -> Option<DatabricksConnector> {
@@ -270,4 +271,185 @@ async fn describe_detail_stats_nonexistent_table_returns_none() {
         result.is_none(),
         "missing table should return None, not an error",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Catalog-first delegation parity (live)
+// ---------------------------------------------------------------------------
+//
+// These tests run two `DatabricksWarehouseAdapter` instances against the
+// same sandbox — one with a `UnityCatalogClient` wired (REST path), one
+// without (SQL path) — and assert the results are equal. They're the
+// real source of truth for the "REST and SQL paths converge" claim;
+// wiremock parity in `catalog_first_delegation.rs` only proves the
+// projection shape.
+//
+// Required env vars (mirrors the existing live-test convention):
+//   DATABRICKS_HOST
+//   DATABRICKS_HTTP_PATH
+//   DATABRICKS_TOKEN (or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET)
+//   DATABRICKS_TEST_CATALOG  — must already exist on the sandbox
+//   DATABRICKS_TEST_SCHEMA   — optional; defaults to `default`
+
+fn unity_client_from_env() -> Option<UnityCatalogClient> {
+    let host = std::env::var("DATABRICKS_HOST").ok()?;
+    let auth = Auth::from_config(AuthConfig {
+        host: host.clone(),
+        token: std::env::var("DATABRICKS_TOKEN").ok(),
+        client_id: std::env::var("DATABRICKS_CLIENT_ID").ok(),
+        client_secret: std::env::var("DATABRICKS_CLIENT_SECRET").ok(),
+    })
+    .ok()?;
+    Some(UnityCatalogClient::new(host, auth))
+}
+
+/// `describe_table` returns identical column-name + data-type sequences
+/// regardless of whether the adapter routes through Unity REST or
+/// `DESCRIBE TABLE` SQL. Creates an ephemeral `hc_phase1a_` schema
+/// scoped to the test, populates a tiny table, then describes it via
+/// both adapter instances and asserts parity. Cleans up unconditionally.
+#[tokio::test]
+#[ignore]
+async fn live_describe_table_rest_and_sql_paths_agree() {
+    let connector = connector_from_env().expect("Databricks env vars not set");
+    let unity = unity_client_from_env().expect("Unity client env not set");
+
+    let catalog = std::env::var("DATABRICKS_TEST_CATALOG")
+        .or_else(|_| std::env::var("DATABRICKS_CATALOG_PREFIX"))
+        .expect("DATABRICKS_TEST_CATALOG or DATABRICKS_CATALOG_PREFIX must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let schema = format!("hc_phase1a_desc_{suffix}");
+    let table = "hc_probe";
+
+    // Use the SQL-only adapter for setup/teardown so we never depend on
+    // REST writes (which we explicitly aren't wiring in this PR).
+    let sql_adapter = DatabricksWarehouseAdapter::new(connector);
+
+    sql_adapter
+        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"))
+        .await
+        .expect("create schema");
+    sql_adapter
+        .execute_statement(&format!(
+            "CREATE OR REPLACE TABLE {catalog}.{schema}.{table} \
+             (id BIGINT, amount DECIMAL(10,2), name STRING)"
+        ))
+        .await
+        .expect("create probe table");
+
+    let table_ref = TableRef {
+        catalog: catalog.clone(),
+        schema: schema.clone(),
+        table: table.to_string(),
+    };
+
+    // Run both paths against the same logical table, capturing each
+    // result *before* any assertion so cleanup always runs even if one
+    // side errors. Mirrors the pattern in `test_clone_table_for_branch_shallow_clone`.
+    let sql_result = sql_adapter.describe_table(&table_ref).await;
+
+    // Rebuild a parallel adapter that wraps the SAME warehouse but with
+    // a `UnityCatalogClient` wired. Using a separate connector instance
+    // keeps the two adapters independent at the SQL layer.
+    let rest_connector = connector_from_env().expect("Databricks env vars not set");
+    let rest_adapter = DatabricksWarehouseAdapter::new(rest_connector).with_catalog_client(unity);
+    let rest_result = rest_adapter.describe_table(&table_ref).await;
+
+    // Cleanup unconditionally before any assertion fires.
+    let _ = sql_adapter
+        .execute_statement(&format!("DROP SCHEMA IF EXISTS {catalog}.{schema} CASCADE"))
+        .await;
+
+    let sql_cols = sql_result.expect("SQL describe_table");
+    let rest_cols = rest_result.expect("REST describe_table");
+
+    // Compare on (name, data_type). `DESCRIBE TABLE` doesn't reliably
+    // surface nullability so the SQL path defaults to `true` — Unity
+    // reports the declared nullability faithfully. We intentionally
+    // don't assert on `nullable` because the two paths diverge by
+    // design (and no caller of `describe_table` reads it for drift
+    // detection on Databricks).
+    let sql_names: Vec<(String, String)> = sql_cols
+        .into_iter()
+        .map(|c| (c.name.to_lowercase(), c.data_type.to_lowercase()))
+        .collect();
+    let rest_names: Vec<(String, String)> = rest_cols
+        .into_iter()
+        .map(|c| (c.name.to_lowercase(), c.data_type.to_lowercase()))
+        .collect();
+
+    assert_eq!(
+        sql_names, rest_names,
+        "REST and SQL describe_table paths must agree on (name, data_type)"
+    );
+    assert!(
+        sql_names.iter().any(|(n, _)| n == "id" || n.contains("id")),
+        "probe table should surface an `id` column; got {sql_names:?}"
+    );
+}
+
+/// `list_tables` returns the same set (lowercased) regardless of path.
+/// Creates an ephemeral schema with a known table set, lists via both
+/// paths, asserts the sets are equal. Cleans up unconditionally.
+#[tokio::test]
+#[ignore]
+async fn live_list_tables_rest_and_sql_paths_agree() {
+    let connector = connector_from_env().expect("Databricks env vars not set");
+    let unity = unity_client_from_env().expect("Unity client env not set");
+
+    let catalog = std::env::var("DATABRICKS_TEST_CATALOG")
+        .or_else(|_| std::env::var("DATABRICKS_CATALOG_PREFIX"))
+        .expect("DATABRICKS_TEST_CATALOG or DATABRICKS_CATALOG_PREFIX must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let schema = format!("hc_phase1a_list_{suffix}");
+
+    let sql_adapter = DatabricksWarehouseAdapter::new(connector);
+    sql_adapter
+        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"))
+        .await
+        .expect("create schema");
+    for t in ["hc_alpha", "hc_beta", "hc_gamma"] {
+        sql_adapter
+            .execute_statement(&format!(
+                "CREATE OR REPLACE TABLE {catalog}.{schema}.{t} (id BIGINT)"
+            ))
+            .await
+            .expect("create probe table");
+    }
+
+    let sql_result = sql_adapter.list_tables(&catalog, &schema).await;
+
+    let rest_connector = connector_from_env().expect("Databricks env vars not set");
+    let rest_adapter = DatabricksWarehouseAdapter::new(rest_connector).with_catalog_client(unity);
+    let rest_result = rest_adapter.list_tables(&catalog, &schema).await;
+
+    // Cleanup unconditionally before any assertion.
+    let _ = sql_adapter
+        .execute_statement(&format!("DROP SCHEMA IF EXISTS {catalog}.{schema} CASCADE"))
+        .await;
+
+    let mut sql_tables = sql_result.expect("SQL list_tables");
+    let mut rest_tables = rest_result.expect("REST list_tables");
+    sql_tables.sort();
+    rest_tables.sort();
+
+    assert_eq!(
+        sql_tables, rest_tables,
+        "REST and SQL list_tables must surface the same set"
+    );
+    // Every probe table we created should appear on both paths.
+    for t in ["hc_alpha", "hc_beta", "hc_gamma"] {
+        assert!(
+            sql_tables.iter().any(|name| name == t),
+            "expected {t} in listing; got {sql_tables:?}"
+        );
+    }
 }
