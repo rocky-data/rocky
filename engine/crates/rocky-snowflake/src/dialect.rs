@@ -196,10 +196,18 @@ impl SqlDialect for SnowflakeSqlDialect {
         // no-op. To get true atomicity we submit the four statements as a
         // single semicolon-joined script in one call; the connector sets
         // `MULTI_STATEMENT_COUNT` in `parameters` so Snowflake accepts the
-        // multi-statement body and runs them in one session. On any
-        // sub-statement error Snowflake auto-rolls-back the in-flight
-        // transaction. This mirrors BigQuery's `BEGIN TRANSACTION; ...;
-        // COMMIT TRANSACTION` single-script form.
+        // multi-statement body and runs them in one session.
+        //
+        // The connector ALSO sets `TRANSACTION_ABORT_ON_ERROR = TRUE` for
+        // multi-statement bodies. Without that parameter, a failed DML in
+        // a Snowflake transaction rolls back only its own changes and leaves
+        // the transaction open — subsequent statements (including the
+        // trailing `COMMIT`) are skipped, and the in-flight transaction only
+        // unwinds implicitly when the REST session ends. That session-close
+        // cleanup is incidental, not contractual: `ABORT_ON_ERROR` makes
+        // Snowflake roll back the whole transaction at error-time, which
+        // is what partition-replace semantically requires. Mirrors BigQuery's
+        // single-script `BEGIN TRANSACTION; ...; COMMIT TRANSACTION` form.
         Ok(vec![format!(
             "BEGIN;\n\
              DELETE FROM {target} WHERE {partition_filter};\n\
