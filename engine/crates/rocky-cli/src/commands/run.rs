@@ -3785,6 +3785,40 @@ pub(crate) async fn execute_models(
                             file_path = summary.file_path.as_str(),
                             "content_addressed model materialized"
                         );
+                        // Persist the content-hash artifact to the
+                        // `OUTPUT_ARTIFACTS` redb table so Phase 6 VACUUM
+                        // refcount can query "which runs touched this
+                        // hash?" without re-reading the Delta log. Best-
+                        // effort: a failed insert logs + continues
+                        // rather than failing the run (the run is
+                        // already durable in the Delta log; missing
+                        // refcount data is recoverable, an aborted run
+                        // is not). TODO(Phase 6): the partitioned write
+                        // loop in `execute_content_addressed_model` only
+                        // returns the *last* group's hash here — every
+                        // group's artifact needs to be recorded for the
+                        // refcount sweep to be correct on partitioned
+                        // tables. Tracked on the spike memo.
+                        if let Some(store) = state_store {
+                            let artifact = rocky_core::state::ArtifactRecord {
+                                blake3_hash: summary.blake3_hash.clone(),
+                                run_id: run_id.to_string(),
+                                model_name: model_name.to_string(),
+                                file_path: summary.file_path.clone(),
+                                commit_version: summary.commit_version,
+                                size_bytes: summary.size_bytes,
+                                written_at: Utc::now(),
+                            };
+                            if let Err(e) = store.record_artifact(&artifact) {
+                                warn!(
+                                    error = %e,
+                                    model = model_name.as_str(),
+                                    blake3 = summary.blake3_hash.as_str(),
+                                    "failed to persist content-addressed artifact record \
+                                     (run still successful; Phase 6 refcount may be incomplete)"
+                                );
+                            }
+                        }
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
                                 .fire(&HookContext::after_model_run(

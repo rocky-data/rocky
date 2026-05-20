@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky-core`: `OUTPUT_ARTIFACTS` state table for the content-addressed write ledger.** New `ArtifactRecord` struct + `record_artifact` / `list_artifacts_by_hash` / `list_artifacts_for_run` / `count_artifacts` methods on `StateStore`. Persists the `blake3_hash` returned by `rocky_iceberg::uniform_writer::WriteResult` (previously logged via `tracing::info!` and dropped on process exit) so a future VACUUM refcount sweep can answer "which runs reference hash X?" without re-reading the Delta log. Wired at the existing `execute_content_addressed_model` success branch — best-effort write that logs + continues on failure (the run is already durable in the Delta log; a missing ledger row is recoverable). State schema bumps v6 → v7; the upgrade is purely additive (v6 databases auto-create the empty table on next open and stamp themselves v7). Replicates across backends by default — recipe-canonical artifact metadata is not machine-local. Internal `rocky-core` symbol only; no JSON output schema cascade. **Known gap:** the partitioned write loop in `execute_content_addressed_model` only returns the *last* group's hash, so partitioned tables currently record one row per run instead of one row per partition group — TODO at the call site, picked up by the eventual Phase 6 refcount PR.
+
 ## [1.39.1] — 2026-05-20
 
 Patch release fixing a packaging regression that made the v1.38.0 / v1.39.0 Fivetran adapter-resilience layers unreachable from the prebuilt CLI.
