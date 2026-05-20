@@ -1,10 +1,11 @@
 # dagster-rocky
 
-Dagster integration for the [Rocky](https://github.com/rocky-data/rocky) SQL transformation engine.
+Dagster integration for [Rocky](https://github.com/rocky-data/rocky) — the trust plane for your warehouse.
 
 `dagster-rocky` wraps the `rocky` CLI as a Dagster `ConfigurableResource` and exposes Rocky-managed
-tables as materializable Dagster assets — complete with check results, lineage, drift detection
-and quality metrics surfaced as native Dagster events.
+tables as materializable Dagster assets. Compile-time contracts, column-level lineage, schema-drift
+detection, quality check results, and per-model cost surface as native Dagster events — so the
+guarantees Rocky enforces at compile time appear directly in the Dagster asset graph.
 
 ## Install
 

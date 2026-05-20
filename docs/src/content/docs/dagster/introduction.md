@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-`dagster-rocky` bridges Rocky's Rust binary with Dagster orchestration. You keep Rocky for the SQL transformation layer (DAG resolution, incremental logic, schema drift, permissions) and gain Dagster's scheduling, retries, alerts, and asset-centric UI.
+`dagster-rocky` bridges Rocky's Rust binary with Dagster orchestration. Rocky is the **trust plane** — typed compiler, compile-time contracts, column-level lineage, schema drift detection, branches + replay, per-model cost. Dagster is the orchestrator — scheduling, retries, alerts, the asset-centric UI. The guarantees Rocky enforces at compile time surface as native Dagster events (asset checks, materializations, metadata) so the asset graph reflects the same trust contract.
 
 ## Quick start
 

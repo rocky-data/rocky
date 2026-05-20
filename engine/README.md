@@ -1,10 +1,23 @@
 # Rocky
 
-A typed-program layer above the warehouse: branches, replay, column-level lineage, compile-time type safety, per-model cost attribution. Single static binary; storage and compute stay with your warehouse.
+**The trust plane for your warehouse.** Rocky is a typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data — named branches, deterministic replay, column-level lineage, compile-time contracts, per-model cost attribution. A single static Rust binary; storage and compute stay where they are.
 
-**Rocky is not a warehouse.** Storage and compute stay with your warehouse; Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost.
+**Rocky is not a warehouse, and not a templating layer.** It's a real compiler with type inference, diagnostic codes, and an IDE — so the failures that quietly cost data teams the most (silent schema drift, column rename blast radius, dialect divergence, cost spikes nobody can attribute) become compile errors and blocked PRs, not pages and post-mortems.
 
 No Jinja. No manifest. No parse step.
+
+## Why Rocky exists
+
+The expensive failures in modern data platforms aren't slow queries. They're trust failures:
+
+- A source column type changes upstream and a revenue dashboard quietly diverges for three days.
+- An engineer renames a column on `stg_orders` and 47 downstream models break in production.
+- A `SELECT *` pulls a new column nobody designed for; a downstream join silently double-counts.
+- A Snowflake-only function lands in a Databricks-targeted project and only fails in prod.
+- Warehouse spend doubles in a month and nobody can attribute which model caused it.
+- An auditor asks who changed `fct_revenue.amount`, when, and why — and the answer involves `git blame` and screenshots.
+
+dbt, by design, is a templating engine — it can't catch any of these at compile time. SQLMesh moved correctness to the planner. Rocky moved it to the compiler. Each failure above maps to a Rocky diagnostic code, a CI gate, or a content-addressed replay artifact.
 
 ## Scope on the ELT spectrum
 
@@ -17,15 +30,15 @@ No Jinja. No manifest. No parse step.
 | Quality | ✅ | Inline assertions during `rocky run` |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` standalone |
 
-## What Rocky does
+## The seven trust dimensions
 
-1. **Branches + replay + column-level lineage** — `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>`. Branch and replay workflow on top of your warehouse.
-2. **Cost attribution + budgets** — per-model cost on every run; `[budget]` block in `rocky.toml`; `budget_breach` hook event.
-3. **Resume + circuit breakers** — three-state `CircuitBreaker`, checkpointed run state, deploy safety.
-4. **Observability** — `rocky trace` Gantt output, OpenTelemetry OTLP export (feature-gated).
-5. **Schema-grounded AI** — every AI feature gated through the compiler; generated SQL type-checks before it lands.
-6. **Polyglot correctness** — dialect-divergence lint across Databricks / Snowflake / BigQuery / DuckDB.
-7. **SQL as first-class with types** — type inference over raw `.sql`, `SELECT *` blast-radius lint, DAG-aware refactoring.
+1. **SQL as a typed, compiled language.** Real type inference, real diagnostic codes (`E001`–`E026`, `W001`–`W011`, `P001`–`P002`), real LSP. Not text macros, not runtime checks — a compiler. This is the moat.
+2. **Compile-time column-level lineage.** Rocky knows the lineage of every column before a row is written. Block a PR when a downstream contract breaks. `rocky lineage-diff main` per-changed-column at PR time.
+3. **Branches + deterministic replay.** `rocky branch create`, `rocky run --branch`, `rocky replay <run_id>` — branches are isolated schemas, replays are content-addressed artifacts. Inputs + code → outputs is a pure function, recorded.
+4. **Per-model cost attribution.** Cost is a column on every run record — not a dashboard you have to opt into. `[budget]` blocks fail the run; `budget_breach` fires the hook; `rocky preview cost` projects spend at PR time.
+5. **AI gated through the compiler.** Every AI suggestion goes through type-check before it lands. The `Attempts: 2` retry loop on `rocky ai` is the signature: generate → type-check → auto-fix → land.
+6. **Dialect-divergence lint.** Cross-warehouse teams write SQL once; `P001` catches Snowflake-only constructs in a Databricks project at compile time. Useful the day you start a migration; essential the day you finish one.
+7. **Declarative governance.** RBAC as code with GRANT/REVOKE diffing, Unity Catalog tags, workspace isolation, masking strategies bound to classification tags. Compliance becomes a CI check, not a quarterly fire drill.
 
 ## Quick start
 
