@@ -11,7 +11,7 @@ Rocky is a monorepo with three shipping subprojects + a playground catalog. Most
 
 | Path | Language | Ships as | Build | Test |
 |---|---|---|---|---|
-| `engine/` | Rust (21 crates) | `rocky` CLI binary | `cargo build --release` | `cargo test` |
+| `engine/` | Rust (22 crates) | `rocky` CLI binary | `cargo build --release` | `cargo test` |
 | `integrations/dagster/` | Python | `dagster-rocky` wheel | `uv build --wheel` | `uv run pytest` |
 | `editors/vscode/` | TypeScript | Rocky VSIX | `npm run compile` | `npm run test:unit` |
 | `examples/playground/` | Config | (not published) | `./run.sh` per POC | `./scripts/run-all-duckdb.sh` |
@@ -102,7 +102,7 @@ See the `rocky-release` skill for the full checklist.
 - `CLAUDE.md` (root) — monorepo-wide cascade rules
 - `engine/CLAUDE.md` — engine coding standards, JSON output schema table, Databricks SQL patterns, auth flows
 - `integrations/dagster/CLAUDE.md` — dagster layer architecture, "Adding support for a new Rocky CLI command" 9-step checklist
-- `editors/vscode/CLAUDE.md` — vscode extension architecture, 30 command list
+- `editors/vscode/CLAUDE.md` — vscode extension architecture, 50-command list
 - `examples/playground/CLAUDE.md` — POC authoring conventions
 - `justfile` (root) — orchestration recipes (build, test, lint, codegen, release, fixtures)
 - `.github/workflows/` — path-filtered CI per subproject
