@@ -3,7 +3,8 @@
 //! Snowflake differences from Databricks:
 //! - Uses `database.schema.table` naming (not catalog)
 //! - Double-quoted identifiers for special characters
-//! - No `UPDATE SET *` in MERGE — must enumerate columns
+//! - No `UPDATE SET *` or `INSERT *` shorthand in MERGE — must enumerate
+//!   columns for both the `WHEN MATCHED` and `WHEN NOT MATCHED` branches
 //! - `SAMPLE (N ROWS)` instead of `TABLESAMPLE (N PERCENT)`
 //! - Tags via TAG objects (separate DDL)
 
@@ -62,38 +63,62 @@ impl SqlDialect for SnowflakeSqlDialect {
             validation::validate_identifier(key).map_err(AdapterError::new)?;
         }
 
+        // Snowflake folds unquoted identifiers to UPPERCASE at parse time —
+        // any lowercase / mixed-case column in the source/target table is
+        // case-sensitive and only resolves under explicit double-quoting.
+        // Mirror `format_table_ref`'s policy here: every identifier the
+        // MERGE clause references is double-quoted via `quote_identifier`.
         let on_clause = keys
             .iter()
-            .map(|k| format!("t.{k} = s.{k}"))
+            .map(|k| {
+                let q = self.quote_identifier(k);
+                format!("t.{q} = s.{q}")
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
 
-        // Snowflake does NOT support `UPDATE SET *` — must enumerate columns
-        let update_clause = match update_cols {
+        // Snowflake does NOT support `UPDATE SET *` or `INSERT *` shorthand
+        // in MERGE — must enumerate columns for both branches. The replication
+        // runner resolves `ColumnSelection::All` against the discovered source
+        // schema before SQL-gen, so the call site under
+        // `commands/run.rs::process_table` always reaches us with `Explicit`.
+        // Transformation pipelines specify `update_columns` on the model
+        // sidecar TOML; absence (`All`) is a config error surfaced here.
+        let (update_clause, insert_clause) = match update_cols {
             ColumnSelection::All => {
                 return Err(AdapterError::msg(
-                    "Snowflake MERGE does not support UPDATE SET *. Use explicit update_columns.",
+                    "Snowflake MERGE does not support UPDATE SET * / INSERT *. \
+                     Use explicit update_columns.",
                 ));
             }
             ColumnSelection::Explicit(cols) => {
-                let sets = cols
-                    .iter()
-                    .map(|c| {
-                        validation::validate_identifier(c).map_err(AdapterError::new)?;
-                        Ok(format!("t.{c} = s.{c}"))
-                    })
-                    .collect::<AdapterResult<Vec<_>>>()?;
-                format!("UPDATE SET {}", sets.join(", "))
+                let mut sets = Vec::with_capacity(cols.len());
+                let mut col_list = Vec::with_capacity(cols.len());
+                let mut value_list = Vec::with_capacity(cols.len());
+                for c in cols {
+                    validation::validate_identifier(c).map_err(AdapterError::new)?;
+                    let q = self.quote_identifier(c);
+                    sets.push(format!("t.{q} = s.{q}"));
+                    col_list.push(q.clone());
+                    value_list.push(format!("s.{q}"));
+                }
+                (
+                    format!("UPDATE SET {}", sets.join(", ")),
+                    format!(
+                        "INSERT ({}) VALUES ({})",
+                        col_list.join(", "),
+                        value_list.join(", ")
+                    ),
+                )
             }
         };
 
-        // Snowflake requires explicit column list for INSERT
         Ok(format!(
             "MERGE INTO {target} AS t\n\
              USING (\n{source_sql}\n) AS s\n\
              ON {on_clause}\n\
              WHEN MATCHED THEN {update_clause}\n\
-             WHEN NOT MATCHED THEN INSERT *"
+             WHEN NOT MATCHED THEN {insert_clause}"
         ))
     }
 
@@ -377,7 +402,31 @@ mod tests {
                 &ColumnSelection::Explicit(vec!["name".into(), "status".into()]),
             )
             .unwrap();
-        assert!(sql.contains("UPDATE SET t.name = s.name, t.status = s.status"));
+        // Identifiers double-quoted so they survive Snowflake's
+        // case-fold-on-unquoted rule — source/target tables created with
+        // lowercase column names (the common case for Fivetran-loaded
+        // raw tables) only resolve under explicit quoting.
+        assert!(
+            sql.contains("ON t.\"id\" = s.\"id\""),
+            "expected double-quoted ON-clause keys, got: {sql}"
+        );
+        assert!(
+            sql.contains("UPDATE SET t.\"name\" = s.\"name\", t.\"status\" = s.\"status\""),
+            "expected double-quoted UPDATE SET cols, got: {sql}"
+        );
+        // Snowflake's MERGE rejects `INSERT *` shorthand too — the
+        // WHEN NOT MATCHED branch must emit explicit
+        // `INSERT (cols) VALUES (s.cols)`. Pin both clauses; a regression
+        // that re-introduces `INSERT *` against Snowflake fails at the
+        // parser, not at the runner.
+        assert!(
+            sql.contains("INSERT (\"name\", \"status\") VALUES (s.\"name\", s.\"status\")"),
+            "expected explicit INSERT column list with double-quoted idents, got: {sql}"
+        );
+        assert!(
+            !sql.contains("INSERT *"),
+            "Snowflake MERGE must not emit `INSERT *`, got: {sql}"
+        );
     }
 
     #[test]

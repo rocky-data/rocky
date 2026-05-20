@@ -4544,7 +4544,13 @@ fn accumulate_bytes(acc: Option<u64>, next: Option<u64>) -> Option<u64> {
 ///   reading keys from `resolved_merge_keys()` (`merge_keys` falls back to
 ///   `merge_keys_fallback`). `merge` requires keys; absence is treated as
 ///   a defensive `anyhow!` because `validate_replication_strategies` should
-///   have rejected it at config load time.
+///   have rejected it at config load time. The `ColumnSelection::All`
+///   placeholder is replaced by the explicit source-schema column list in
+///   `process_table` BEFORE the IR reaches SQL-gen — Snowflake's MERGE
+///   rejects `UPDATE SET *`, so threading discovered columns is required for
+///   adapter parity. This function stays warehouse-free; the resolution
+///   happens at the call site where `describe_table(&source_table)` is
+///   already awaited for drift detection.
 /// Anything else → `FullRefresh` (backwards-compatible fallback; see follow-up
 ///   note in PR body about tightening unknown strategy values).
 ///
@@ -4628,6 +4634,52 @@ fn build_replication_strategy_with_override(
              sidecar TOML instead"
         )),
         _ => Ok(MaterializationStrategy::FullRefresh),
+    }
+}
+
+/// Resolves `ColumnSelection::All` on a `Merge` strategy against the
+/// discovered source schema so the SQL-gen layer can emit an explicit
+/// `UPDATE SET t.col1 = s.col1, ...` clause.
+///
+/// Returns the input strategy untouched when:
+/// - the strategy is not `Merge`, OR
+/// - `source_cols` is empty (prefetch miss + describe failure).
+///
+/// The explicit form mirrors `UPDATE SET *` on Databricks/DuckDB: every
+/// source column plus every metadata column projected by SELECT. Merge
+/// keys are included — `t.id = s.id` under `ON t.id = s.id` is a no-op
+/// and matches `*` semantics on the other adapters; excluding them would
+/// be a behavior change.
+///
+/// When `source_cols` is empty, the strategy is returned with its existing
+/// `ColumnSelection::All` so other adapters preserve current behavior and
+/// Snowflake's dialect still surfaces its clear "Snowflake MERGE does not
+/// support UPDATE SET *" error.
+fn resolve_merge_update_columns(
+    strategy: &MaterializationStrategy,
+    source_cols: &[ColumnInfo],
+    metadata_columns: &[MetadataColumn],
+) -> MaterializationStrategy {
+    let MaterializationStrategy::Merge {
+        unique_key,
+        update_columns: _,
+    } = strategy
+    else {
+        return strategy.clone();
+    };
+    if source_cols.is_empty() {
+        return strategy.clone();
+    }
+    let mut cols: Vec<Arc<str>> = source_cols
+        .iter()
+        .map(|c| Arc::from(c.name.as_str()))
+        .collect();
+    for m in metadata_columns {
+        cols.push(Arc::from(m.name.as_str()));
+    }
+    MaterializationStrategy::Merge {
+        unique_key: unique_key.clone(),
+        update_columns: ColumnSelection::Explicit(cols),
     }
 }
 
@@ -4890,13 +4942,23 @@ async fn process_table(
         .as_deref()
         .unwrap_or(pipeline.timestamp_column.as_str())
         .to_string();
+
+    // For `strategy = "merge"`, resolve `ColumnSelection::All` against the
+    // discovered source schema BEFORE handing the IR to SQL-gen. Snowflake's
+    // MERGE rejects `UPDATE SET *` (Databricks / BigQuery / DuckDB accept it),
+    // so emitting the literal `*` from the replication runner makes
+    // Snowflake-merge unusable. We already awaited `describe_table(&source_table)`
+    // above for drift detection; `source_cols` is in scope and free. Reuse it.
+    let resolved_strategy =
+        resolve_merge_update_columns(&strategy, &source_cols, &task.metadata_columns);
+
     let model_ir = ModelIr::replication(
         TargetRef {
             catalog: task.target_catalog.clone(),
             schema: task.target_schema.clone(),
             table: task.table_name.clone(),
         },
-        strategy.clone(),
+        resolved_strategy.clone(),
         SourceRef {
             catalog: task.source_catalog.clone(),
             schema: task.source_schema.clone(),
@@ -6504,6 +6566,99 @@ merge_keys_fallback = ["fallback_only"]
             }
             other => panic!("expected Merge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_merge_update_columns_expands_all_to_source_schema() {
+        // Snowflake's MERGE rejects `UPDATE SET *`; the replication runner
+        // resolves `ColumnSelection::All` against the discovered source
+        // schema before SQL-gen so the explicit form lands. This test pins
+        // that resolution against a representative source-schema + metadata
+        // column list, mirroring the production call site in
+        // `process_table`.
+        let strategy = MaterializationStrategy::Merge {
+            unique_key: vec![Arc::from("id")],
+            update_columns: ColumnSelection::All,
+        };
+        let source_cols = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "INTEGER".to_string(),
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                data_type: "STRING".to_string(),
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "amount".to_string(),
+                data_type: "DECIMAL(10,2)".to_string(),
+                nullable: true,
+            },
+        ];
+        let metadata = vec![MetadataColumn {
+            name: "_loaded_at".to_string(),
+            data_type: "TIMESTAMP".to_string(),
+            value: "CURRENT_TIMESTAMP()".to_string(),
+        }];
+
+        let resolved = resolve_merge_update_columns(&strategy, &source_cols, &metadata);
+
+        match resolved {
+            MaterializationStrategy::Merge {
+                update_columns: ColumnSelection::Explicit(cols),
+                ..
+            } => {
+                let names: Vec<&str> = cols.iter().map(AsRef::as_ref).collect();
+                // Source-column order preserved; metadata appended. Merge
+                // keys included — matches `UPDATE SET *` semantics on
+                // Databricks/DuckDB.
+                assert_eq!(names, vec!["id", "name", "amount", "_loaded_at"]);
+            }
+            other => panic!("expected Merge with Explicit columns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_merge_update_columns_falls_back_to_all_when_source_cols_empty() {
+        // Prefetch miss + describe failure: `source_cols` arrives empty.
+        // Resolving against zero columns would emit `UPDATE SET ` (invalid).
+        // Fall back to `ColumnSelection::All` so other adapters preserve
+        // current behavior and Snowflake's dialect still surfaces its clear
+        // "MERGE does not support UPDATE SET *" error.
+        let strategy = MaterializationStrategy::Merge {
+            unique_key: vec![Arc::from("id")],
+            update_columns: ColumnSelection::All,
+        };
+        let resolved = resolve_merge_update_columns(&strategy, &[], &[]);
+        assert!(matches!(
+            resolved,
+            MaterializationStrategy::Merge {
+                update_columns: ColumnSelection::All,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_merge_update_columns_is_noop_for_non_merge_strategy() {
+        // Non-merge strategies pass through unchanged. The resolver is
+        // strictly a Merge-IR rewrite; Incremental/FullRefresh/etc. don't
+        // carry an `update_columns` field.
+        let strategy = MaterializationStrategy::Incremental {
+            timestamp_column: "ts".to_string(),
+        };
+        let source_cols = vec![ColumnInfo {
+            name: "id".to_string(),
+            data_type: "INTEGER".to_string(),
+            nullable: false,
+        }];
+        let resolved = resolve_merge_update_columns(&strategy, &source_cols, &[]);
+        assert!(matches!(
+            resolved,
+            MaterializationStrategy::Incremental { .. }
+        ));
     }
 
     #[test]
