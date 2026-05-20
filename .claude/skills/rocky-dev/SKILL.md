@@ -59,6 +59,9 @@ Each subproject's native tool (`cargo`, `uv`, `npm`) also works directly from in
 ### "Something Dagster-specific"
 → Also install and use the **`dagster-expert`** Claude Code skill (marketplace). The integration at `integrations/dagster/` leans on Dagster's current component/pipes/asset model, which evolves quickly.
 
+### "Size a PR / write a design memo's effort line / answer 'how long will X take?'"
+→ **`rocky-sizing`** skill. Captures the observed velocity on rocky-data and the reference PRs that anchor common shapes. Most Rocky PRs land in 0.5–1 day; advisor / agent estimates that read "3–5 days" usually need recalibrating against an anchor.
+
 ## Cross-cascade reference table
 
 When a change touches X, what else moves?
