@@ -409,10 +409,7 @@ impl SnowflakeConnector {
                 "MULTI_STATEMENT_COUNT".to_string(),
                 statement_count.to_string(),
             );
-            parameters.insert(
-                "TRANSACTION_ABORT_ON_ERROR".to_string(),
-                "TRUE".to_string(),
-            );
+            parameters.insert("TRANSACTION_ABORT_ON_ERROR".to_string(), "TRUE".to_string());
         }
         let body = SubmitRequest {
             statement: sql.to_string(),
