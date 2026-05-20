@@ -82,13 +82,16 @@ impl WorkspaceBindingDiff {
 /// workspace bindings. `rocky plan` / `rocky run` group these deltas
 /// together because both flow from the same governance block.
 ///
-/// `applied` reports which grant changes actually landed and which
-/// failed mid-batch — added so callers can surface partial-apply
-/// outcomes without losing visibility into the underlying diff.
+/// `apply_diff` reports per-grant outcomes via [`AppliedPermissionDiff`]
+/// (and surfaces failures as [`PermissionError::PartialApply`]) — those
+/// outcomes are collapsed into a single error at the `reconcile` boundary
+/// so `AccessDiff` only carries the desired-vs-current delta. If a future
+/// caller wants the structured outcome, expose `applied` here and have
+/// `reconcile_with_bindings` thread it through instead of calling
+/// [`AppliedPermissionDiff::into_result`].
 #[derive(Debug, Clone, Default)]
 pub struct AccessDiff {
     pub permissions: PermissionDiff,
-    pub applied: AppliedPermissionDiff,
     pub bindings: WorkspaceBindingDiff,
 }
 
@@ -310,14 +313,19 @@ impl<'a> PermissionManager<'a> {
 
     /// Full reconciliation: get current grants, compute diff, apply.
     ///
-    /// Returns the desired-vs-current [`PermissionDiff`] together with
-    /// the [`AppliedPermissionDiff`] outcome so callers can tell which
-    /// changes landed and which need a retry on the next run.
+    /// Returns the desired-vs-current [`PermissionDiff`]. Per-grant
+    /// warehouse failures are collapsed into
+    /// [`PermissionError::PartialApply`] via [`apply_diff`]'s structured
+    /// outcome; this surfaces the failure to the caller without leaking
+    /// the catalog into a half-applied state silently. If a future caller
+    /// needs the structured `AppliedPermissionDiff` outcome (e.g. to
+    /// thread `granted`/`revoked`/`failed` into a run summary), call
+    /// [`apply_diff`] directly instead of `reconcile`.
     pub async fn reconcile(
         &self,
         desired: &[Grant],
         target: &GrantTarget,
-    ) -> Result<(PermissionDiff, AppliedPermissionDiff), PermissionError> {
+    ) -> Result<PermissionDiff, PermissionError> {
         let current = match target {
             GrantTarget::Catalog(cat) => self.get_catalog_grants(cat).await?,
             GrantTarget::Schema { catalog, schema } => {
@@ -326,8 +334,13 @@ impl<'a> PermissionManager<'a> {
         };
 
         let diff = Self::compute_diff(desired, &current);
-        let applied = self.apply_diff(&diff).await?;
-        Ok((diff, applied))
+        // Collapse the structured `AppliedPermissionDiff` into a flat
+        // `Result<(), _>`: per-grant failures surface as
+        // `PermissionError::PartialApply` so the caller can't silently
+        // ignore them. The desired-vs-current `diff` is still returned
+        // for the `AccessDiff` summary.
+        self.apply_diff(&diff).await?.into_result()?;
+        Ok(diff)
     }
 
     /// Computes the binding diff between desired and current workspace bindings.
@@ -428,7 +441,7 @@ impl<'a> PermissionManager<'a> {
         ws_mgr: Option<&WorkspaceManager>,
         desired_bindings: &[WorkspaceBindingDesired],
     ) -> Result<AccessDiff, PermissionError> {
-        let (permissions, applied) = self.reconcile(desired_grants, target).await?;
+        let permissions = self.reconcile(desired_grants, target).await?;
 
         let bindings = match (ws_mgr, target) {
             (Some(mgr), GrantTarget::Catalog(catalog)) => {
@@ -452,7 +465,6 @@ impl<'a> PermissionManager<'a> {
 
         Ok(AccessDiff {
             permissions,
-            applied,
             bindings,
         })
     }
