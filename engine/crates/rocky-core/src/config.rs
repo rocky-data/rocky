@@ -6627,6 +6627,78 @@ table = "customers_history"
         assert!(debug.contains("client_123"), "client_id missing: {debug}");
     }
 
+    /// Integration guard for the `ReplicationPlan.config_snapshot` leak
+    /// path: a `RockyConfig` containing populated `AdapterConfig`
+    /// credentials must serialize through `serde_json::to_value` with
+    /// every secret replaced by `"***"`. This is the same code path
+    /// `rocky-cli/src/commands/plan.rs:build_and_persist_replication_plan`
+    /// takes when snapshotting config into the plan payload — without
+    /// the default-redact `Serialize` impl on `RedactedString`, the
+    /// snapshot would embed cleartext credentials into orchestrator-
+    /// visible JSON.
+    #[test]
+    fn rocky_config_serde_json_redacts_adapter_secrets() {
+        let cfg = parse(
+            r#"
+[adapter.dbx]
+type = "databricks"
+host = "workspace.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "dapi_SUPER_SECRET_TOKEN"
+client_id = "client_123"
+client_secret = "oauth_SECRET_VALUE"
+
+[adapter.fv]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d1"
+api_key = "fivetran_KEY_SECRET"
+api_secret = "fivetran_SECRET_VALUE"
+
+[adapter.sf]
+type = "snowflake"
+account = "acct"
+warehouse = "wh"
+database = "db"
+username = "u"
+password = "db_PASSWORD_123"
+oauth_token = "oauth_TOKEN_XYZ"
+pat = "pat_LEAKED_HERE"
+"#,
+        );
+
+        let serialized =
+            serde_json::to_string(&cfg).expect("RockyConfig must serialize via serde_json");
+
+        // None of the cleartext secrets may appear anywhere in the
+        // snapshot.
+        for cleartext in [
+            "dapi_SUPER_SECRET_TOKEN",
+            "oauth_SECRET_VALUE",
+            "fivetran_KEY_SECRET",
+            "fivetran_SECRET_VALUE",
+            "db_PASSWORD_123",
+            "oauth_TOKEN_XYZ",
+            "pat_LEAKED_HERE",
+        ] {
+            assert!(
+                !serialized.contains(cleartext),
+                "{cleartext} leaked into serde_json output: {serialized}"
+            );
+        }
+        // Redaction placeholder must appear in the snapshot.
+        assert!(serialized.contains("***"), "missing *** in {serialized}");
+        // Non-secret fields still serialize normally.
+        assert!(
+            serialized.contains("workspace.cloud.databricks.com"),
+            "host missing from snapshot"
+        );
+        assert!(
+            serialized.contains("client_123"),
+            "client_id missing from snapshot"
+        );
+    }
+
     // --- Config deprecation framework tests ---
 
     /// Helper: temporarily override DEPRECATED_KEYS for testing by calling
