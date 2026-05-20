@@ -58,4 +58,8 @@ class RetentionSweepOutput(BaseModel):
     """
     Run records remaining after the sweep.
     """
+    traces_deleted: conint(ge=0)
+    """
+    JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep (Arc 4 span retention).
+    """
     version: str
