@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -567,7 +568,16 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 state["dag"] = dag_payload
 
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        # Atomic write: serialise to a sibling ``.tmp`` file then ``os.replace``
+        # into place. A SIGKILL / OOM / disk-full event mid-``write_text``
+        # would otherwise leave the canonical state file truncated, and the
+        # next :meth:`build_defs_from_state` would fail to JSON-parse it and
+        # ship an empty graph. ``os.replace`` is atomic on POSIX and Windows
+        # provided both paths sit on the same filesystem; keeping the tmp
+        # file as a sibling under ``state_path.parent`` guarantees that.
+        tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.replace(tmp_path, state_path)
 
         if self.post_state_write_hook is not None:
             try:
