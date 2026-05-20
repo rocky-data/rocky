@@ -193,6 +193,44 @@ def test_run_rocky_failure_metadata_carries_stderr_tail():
     assert "ERROR fatal: connection refused" in tail
 
 
+def test_run_rocky_forwards_stderr_to_step_process_fd(capfd: pytest.CaptureFixture[str]):
+    """Each non-empty stderr line is mirrored to the step process's
+    ``sys.stderr`` fd in addition to the configured ``log_line`` sink.
+
+    The forwarding exists so Dagster Cloud's compute-log capture (which
+    only reads the step process's actual stderr stream) preserves rocky's
+    tracing output. Without this mirror, the buffered code-server path
+    (``GoldRockyComponent.build_defs`` / ``_log_rocky_healthcheck``)
+    routes through the ``dagster_rocky.resource`` module logger, which
+    isn't guaranteed to land in the captured-log stream — leaving every
+    ``dg.Failure: Rocky command failed (exit N)`` opaque from the user-
+    visible Dagster error chain (CI ``dg plus deploy finish``, GraphQL
+    ``locationOrLoadError``, the run viewer's ``capturedLogs``). The
+    in-process ``stderr_tail`` metadata is still attached to the
+    Failure for callers that want a structured tail, but the line-by-
+    line mirror is what the operator actually sees in the UI / pod logs.
+    """
+    rocky = RockyResource()
+    proc = _popen_mock(
+        stdout="not json",
+        stderr_lines=[
+            "INFO discovering sources",
+            "ERROR fatal: connection refused",
+        ],
+        returncode=2,
+    )
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        pytest.raises(dg.Failure),
+    ):
+        rocky._run_rocky(["discover"])
+
+    captured_stderr = capfd.readouterr().err
+    assert "INFO discovering sources" in captured_stderr
+    assert "ERROR fatal: connection refused" in captured_stderr
+
+
 def test_run_rocky_streams_stderr_to_module_logger(caplog: pytest.LogCaptureFixture):
     """Each non-empty stderr line reaches the ``dagster_rocky.resource`` logger.
 

@@ -25,6 +25,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -388,6 +389,30 @@ def _forward_stderr_to_sink(
                 continue
             sink.append(line)
             log_line(line)
+            # Mirror to the parent process's stderr fd so Dagster's
+            # compute-log capture (which only sees the step process's
+            # actual stdout/stderr streams) preserves rocky's tracing
+            # output. Without this, the only path to the binary's
+            # stderr is the in-process ``sink`` — exposed as
+            # ``dg.Failure.metadata["stderr_tail"]`` on subprocess
+            # failure — and metadata doesn't propagate into the
+            # user-visible Dagster error chain (CI log, GraphQL
+            # locationOrLoadError, computeLogs API), so cold-start
+            # adapter-construction errors, ``rocky plan`` runtime
+            # failures, and Databricks auth errors all reduce to the
+            # opaque ``Rocky command failed (exit N)`` message with no
+            # actionable detail unless the operator can ``kubectl exec``
+            # into the failing pod. The ``log_line`` sink stays the
+            # primary surface (streaming asset → ``context.log`` shows
+            # in run viewer; buffered path → ``_log`` for module-logger
+            # consumers), but ``log_line`` routes through Python logging
+            # which is not guaranteed to land in the step process's own
+            # stderr fd — so we forward unconditionally here. Forwarding
+            # is best-effort: ``OSError`` / ``ValueError`` (e.g. closed
+            # step stderr during interpreter teardown or fd redirection)
+            # are swallowed so we never take down the reader thread.
+            with contextlib.suppress(OSError, ValueError):
+                print(line, file=sys.stderr, flush=True)
     except (OSError, ValueError) as exc:
         # OSError covers broken-pipe / EBADF / closed-file on the subprocess
         # stderr handle. ValueError covers "I/O operation on closed file"
