@@ -26,6 +26,7 @@ vi.mock("vscode", () => ({
 
 vi.mock("child_process", () => ({
   execFile: vi.fn(),
+  spawn: vi.fn(),
 }));
 
 // Imports must follow vi.mock so the mocked modules are bound.
@@ -45,6 +46,7 @@ type ExecCallback = (
 ) => void;
 
 const execFileMock = cp.execFile as unknown as ReturnType<typeof vi.fn>;
+const spawnMock = cp.spawn as unknown as ReturnType<typeof vi.fn>;
 
 function fakeChild(): { kill: ReturnType<typeof vi.fn> } {
   return { kill: vi.fn() };
@@ -265,5 +267,179 @@ describe("getCliVersion", () => {
     mockSuccess("rocky 1.27.0");
     expect(await getCliVersion()).toBe("1.27.0");
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unbounded-output spawn path — used for catalog/history/optimize/discover so
+// large warehouse output doesn't hit execFile's 16 MiB maxBuffer cap.
+// ---------------------------------------------------------------------------
+
+interface FakeChildHandlers {
+  stdout: { on: ReturnType<typeof vi.fn> };
+  stderr: { on: ReturnType<typeof vi.fn> };
+  on: ReturnType<typeof vi.fn>;
+  kill: ReturnType<typeof vi.fn>;
+}
+
+interface FakeSpawnDriver {
+  emitStdout: (chunk: string) => void;
+  emitStderr: (chunk: string) => void;
+  emitClose: (code: number | null, signal?: string | null) => void;
+  emitError: (err: Error) => void;
+  child: FakeChildHandlers;
+}
+
+function mockSpawnOnce(): FakeSpawnDriver {
+  const stdoutListeners: ((chunk: Buffer) => void)[] = [];
+  const stderrListeners: ((chunk: Buffer) => void)[] = [];
+  const closeListeners: ((code: number | null, signal?: string | null) => void)[] = [];
+  const errorListeners: ((err: Error) => void)[] = [];
+
+  const child: FakeChildHandlers = {
+    stdout: {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === "data") stdoutListeners.push(cb);
+      }),
+    },
+    stderr: {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === "data") stderrListeners.push(cb);
+      }),
+    },
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      if (event === "close") {
+        closeListeners.push(
+          cb as (code: number | null, signal?: string | null) => void,
+        );
+      } else if (event === "error") {
+        errorListeners.push(cb as (err: Error) => void);
+      }
+    }),
+    kill: vi.fn(),
+  };
+
+  spawnMock.mockImplementationOnce(() => child);
+
+  return {
+    emitStdout: (chunk: string): void => {
+      for (const l of stdoutListeners) l(Buffer.from(chunk, "utf8"));
+    },
+    emitStderr: (chunk: string): void => {
+      for (const l of stderrListeners) l(Buffer.from(chunk, "utf8"));
+    },
+    emitClose: (code: number | null, signal: string | null = null): void => {
+      for (const l of closeListeners) l(code, signal);
+    },
+    emitError: (err: Error): void => {
+      for (const l of errorListeners) l(err);
+    },
+    child,
+  };
+}
+
+describe("runRocky (unbounded subcommands → spawn)", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    spawnMock.mockReset();
+  });
+
+  it("routes `catalog` through spawn, not execFile", async () => {
+    const driver = mockSpawnOnce();
+    const promise = runRocky(["catalog", "--output", "json"]);
+    driver.emitStdout('{"rows":42}');
+    driver.emitClose(0);
+    const result = await promise;
+    expect(result.stdout).toBe('{"rows":42}');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(spawnMock.mock.calls[0][0]).toBe("/usr/local/bin/rocky");
+    expect(spawnMock.mock.calls[0][1]).toEqual(["catalog", "--output", "json"]);
+  });
+
+  it.each(["catalog", "history", "optimize", "discover"])(
+    "routes `%s` through spawn",
+    async (subcommand) => {
+      const driver = mockSpawnOnce();
+      const promise = runRocky([subcommand]);
+      driver.emitStdout('{"ok":true}');
+      driver.emitClose(0);
+      await promise;
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("keeps bounded subcommands (compile, run, doctor) on execFile", async () => {
+    mockSuccess('{"ok":true}');
+    await runRocky(["compile"]);
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores top-level flags when classifying the subcommand", async () => {
+    const driver = mockSpawnOnce();
+    const promise = runRocky(["--verbose", "catalog"]);
+    driver.emitStdout("{}");
+    driver.emitClose(0);
+    await promise;
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("accumulates multiple stdout chunks into a single payload", async () => {
+    const driver = mockSpawnOnce();
+    const promise = runRocky(["catalog"]);
+    driver.emitStdout('{"part1": "');
+    driver.emitStdout('value", "part2": ');
+    driver.emitStdout('"more"}');
+    driver.emitClose(0);
+    const result = await promise;
+    expect(result.stdout).toBe('{"part1": "value", "part2": "more"}');
+  });
+
+  it("rejects with RockyCliError on non-zero exit and preserves stdout", async () => {
+    const driver = mockSpawnOnce();
+    const promise = runRocky(["catalog"]);
+    driver.emitStdout('{"partial":true}');
+    driver.emitStderr("catalog: warehouse offline");
+    driver.emitClose(2);
+    await expect(promise).rejects.toMatchObject({
+      stderr: "catalog: warehouse offline",
+      stdout: '{"partial":true}',
+      exitCode: 2,
+    });
+  });
+
+  it("rejects with RockyCliError on spawn `error` event (ENOENT)", async () => {
+    const driver = mockSpawnOnce();
+    const promise = runRocky(["catalog"]);
+    driver.emitError(
+      Object.assign(new Error("spawn rocky ENOENT"), { code: "ENOENT" }),
+    );
+    await expect(promise).rejects.toMatchObject({
+      exitCode: null,
+    });
+  });
+
+  it("kills the child when the abort signal fires", async () => {
+    const driver = mockSpawnOnce();
+    const controller = new AbortController();
+    void runRocky(["catalog"], { signal: controller.signal });
+    controller.abort();
+    expect(driver.child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("kills the child and rejects when the timeout fires", async () => {
+    vi.useFakeTimers();
+    try {
+      const driver = mockSpawnOnce();
+      const promise = runRocky(["catalog"], { timeoutMs: 100 });
+      vi.advanceTimersByTime(100);
+      expect(driver.child.kill).toHaveBeenCalledWith("SIGTERM");
+      // Caller still has to observe the close event before the promise settles.
+      driver.emitClose(null, "SIGTERM");
+      await expect(promise).rejects.toBeInstanceOf(RockyCliError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
