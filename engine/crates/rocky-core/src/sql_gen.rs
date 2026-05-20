@@ -890,12 +890,20 @@ pub fn generate_snapshot_sql(
     );
     stmts.push(bootstrap);
 
-    // Statement 2: Close changed rows (set valid_to) and insert new versions
+    // Statement 2: Close changed rows (set valid_to) and insert new versions.
+    // Change detection uses the dialect's NULL-safe inequality so rows
+    // transitioning NULL ↔ value on the watermark column are still
+    // captured — bare SQL `!=` returns NULL on either side being NULL,
+    // which evaluates as false and silently drops the row.
+    let change_predicate = dialect.null_safe_neq(
+        &format!("source.{updated_at}"),
+        &format!("target.{updated_at}"),
+    );
     let merge = format!(
         "MERGE INTO {target} AS target \
          USING {source} AS source \
          ON {join_cond} AND target.valid_to IS NULL \
-         WHEN MATCHED AND source.{updated_at} != target.{updated_at} THEN \
+         WHEN MATCHED AND {change_predicate} THEN \
            UPDATE SET valid_to = CURRENT_TIMESTAMP \
          WHEN NOT MATCHED THEN \
            INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)",
@@ -2254,6 +2262,66 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         assert!(
             msg.contains("found transformation"),
             "error should name the actual variant via `variant()`, got: {msg}"
+        );
+    }
+
+    /// Build a snapshot-variant ModelIr. Inline (rather than reusing
+    /// rocky-ir's test-only `sample_snapshot_model`) because the fixture
+    /// lives behind `#[cfg(test)]` in another crate.
+    fn sample_snapshot_ir() -> ModelIr {
+        use std::sync::Arc;
+        ModelIr {
+            name: Arc::from("dim_users_history"),
+            sql: String::new(),
+            typed_columns: vec![],
+            lineage_edges: vec![],
+            materialization: MaterializationStrategy::FullRefresh,
+            governance: GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            target: TargetRef {
+                catalog: "cat".into(),
+                schema: "snapshots".into(),
+                table: "dim_users_history".into(),
+            },
+            column_masks: vec![],
+            source: Some(SourceRef {
+                catalog: "cat".into(),
+                schema: "marts".into(),
+                table: "dim_users".into(),
+            }),
+            sources: vec![],
+            columns: None,
+            metadata_columns: vec![],
+            unique_key: vec![Arc::from("user_id")],
+            updated_at: Some("updated_at".into()),
+            invalidate_hard_deletes: false,
+            format: None,
+            format_options: None,
+            cost_ceiling: None,
+        }
+    }
+
+    /// SCD2 MERGE must use the dialect's NULL-safe inequality on the
+    /// `updated_at` column, not bare SQL `!=`. Bare `!=` returns NULL
+    /// when either side is NULL, evaluates as false, and silently drops
+    /// rows that transition NULL ↔ value on the watermark column.
+    #[test]
+    fn snapshot_merge_uses_null_safe_neq_on_updated_at() {
+        let ir = sample_snapshot_ir();
+        let stmts = generate_snapshot_sql(&ir, &dialect()).expect("snapshot SQL gen");
+
+        // The MERGE is the second statement (after the bootstrap CREATE).
+        let merge = &stmts[1];
+        assert!(
+            merge.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+            "MERGE must use IS DISTINCT FROM for NULL-safe change detection, got: {merge}"
+        );
+        assert!(
+            !merge.contains("source.updated_at != target.updated_at"),
+            "bare SQL `!=` is NULL-unsafe and must not appear in MERGE, got: {merge}"
         );
     }
 }

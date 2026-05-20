@@ -212,13 +212,22 @@ pub fn generate_snapshot_sql(
     let join_cond = build_join_condition(&config.unique_key, "target", "source");
 
     // Build the change-detection predicate for WHEN MATCHED.
+    //
+    // Both strategies must be NULL-safe: bare SQL `!=` returns NULL on
+    // either side being NULL, which evaluates as false and silently drops
+    // rows that transition NULL ↔ value on the tracked column(s). The
+    // Check strategy already used `IS DISTINCT FROM` directly; the
+    // Timestamp strategy used bare `!=` and was buggy. Routing both
+    // through the dialect's `null_safe_neq` keeps the two branches
+    // consistent and lets non-ANSI dialects (e.g. MySQL) override.
     let change_predicate = match &config.strategy {
-        SnapshotStrategy::Timestamp { updated_at } => {
-            format!("source.{updated_at} != target.{updated_at}")
-        }
+        SnapshotStrategy::Timestamp { updated_at } => dialect.null_safe_neq(
+            &format!("source.{updated_at}"),
+            &format!("target.{updated_at}"),
+        ),
         SnapshotStrategy::Check { check_columns } => check_columns
             .iter()
-            .map(|c| format!("source.{c} IS DISTINCT FROM target.{c}"))
+            .map(|c| dialect.null_safe_neq(&format!("source.{c}"), &format!("target.{c}")))
             .collect::<Vec<_>>()
             .join(" OR "),
     };
@@ -607,8 +616,14 @@ mod tests {
             "should only match current rows: {merge}"
         );
         assert!(
-            merge.contains("source.updated_at != target.updated_at"),
-            "timestamp strategy should compare updated_at: {merge}"
+            merge.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+            "timestamp strategy should compare updated_at via NULL-safe \
+             IS DISTINCT FROM (bare `!=` silently drops NULL↔value \
+             transitions): {merge}"
+        );
+        assert!(
+            !merge.contains("source.updated_at != target.updated_at"),
+            "bare SQL `!=` is NULL-unsafe and must not appear: {merge}"
         );
         assert!(
             merge.contains("valid_to = CURRENT_TIMESTAMP"),
