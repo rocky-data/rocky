@@ -699,7 +699,7 @@ async fn finalize_idempotency_on_success(
 
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip_all, name = "run")]
+#[tracing::instrument(skip_all, name = "run", fields(run_id))]
 pub async fn run(
     config_path: &Path,
     filter: Option<&str>,
@@ -742,6 +742,12 @@ pub async fn run(
     // cross-reference a `skipped_by_run_id` directly against
     // `rocky history`.
     let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+    // Record `run_id` on the `run` span declared by `#[tracing::instrument]`
+    // above so every event nested under this scope (and emitted into the
+    // JSONL trace file) carries the identifier in its `spans[]` chain.
+    // The macro reserves the field at span entry with an empty value;
+    // this call fills it in once minted.
+    tracing::Span::current().record("run_id", run_id.as_str());
 
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).
@@ -3361,14 +3367,39 @@ async fn auto_sweep_retention_at_end_of_run(
     state_path: &Path,
     policy: &rocky_core::retention::StateRetentionConfig,
 ) {
+    // JSONL trace sweep (Arc 4 span retention) runs first and is
+    // independent of the redb-backed retention policy:
+    //   * not gated by `applies_to.is_empty()` (state-retention disabled
+    //     doesn't imply trace-retention disabled),
+    //   * not gated by `state_path.exists()` (fresh project still emits
+    //     trace files via the JSONL fmt layer),
+    //   * not gated by the `sweep_interval_seconds` window (trace files
+    //     are cheap to enumerate and `ROCKY_TRACE_RETAIN_RUNS` is a
+    //     fixed file-count budget, not a time budget).
+    //
+    // Honors `ROCKY_TRACE_DISABLE=1` by skipping the sweep — when the
+    // JSONL layer is off there's nothing to retain.
+    let traces_deleted = if std::env::var_os(rocky_observe::traces::TRACE_DISABLE_ENV).is_some() {
+        0
+    } else {
+        let keep = rocky_observe::traces::retain_runs_from_env();
+        let dir = std::path::Path::new(rocky_observe::traces::TRACE_DIR);
+        rocky_observe::traces::sweep_traces(dir, keep)
+    };
+    if traces_deleted > 0 {
+        tracing::debug!(traces_deleted, "auto-sweep: JSONL trace files removed");
+    }
+
     if policy.applies_to.is_empty() {
-        // Sweep disabled by config. Don't stamp the timestamp — flipping
-        // `applies_to` back on should trigger a sweep next run.
+        // State-retention sweep disabled by config. Don't stamp the
+        // timestamp — flipping `applies_to` back on should trigger a
+        // sweep next run. Trace sweep above has already fired.
         return;
     }
 
     if !state_path.exists() {
-        // Fresh project on an ephemeral runner; nothing to sweep.
+        // Fresh project on an ephemeral runner; nothing to sweep on the
+        // redb side. Trace sweep above has already fired.
         return;
     }
 
@@ -3411,7 +3442,7 @@ async fn auto_sweep_retention_at_end_of_run(
     }
 
     let started = std::time::Instant::now();
-    let report = match store.sweep_retention(policy) {
+    let mut report = match store.sweep_retention(policy) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "auto-sweep: sweep_retention failed");
@@ -3420,6 +3451,12 @@ async fn auto_sweep_retention_at_end_of_run(
             return;
         }
     };
+    // Carry the trace-file delete count from the JSONL sweep above into
+    // the SweepReport for parity with `runs_deleted`/`lineage_deleted`/
+    // `audit_deleted`. The redb sweep itself never touches JSONL files,
+    // so we splice the count in at the CLI layer where both sweeps are
+    // observed.
+    report.traces_deleted = traces_deleted;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if elapsed_ms > policy.sweep_budget_ms {
@@ -3430,6 +3467,7 @@ async fn auto_sweep_retention_at_end_of_run(
             runs_deleted = report.runs_deleted,
             lineage_deleted = report.lineage_deleted,
             audit_deleted = report.audit_deleted,
+            traces_deleted = report.traces_deleted,
             "auto-sweep: budget exceeded; consider running `rocky state retention sweep` \
              out-of-band or shortening max_age_days"
         );
@@ -3440,6 +3478,7 @@ async fn auto_sweep_retention_at_end_of_run(
             runs_deleted = report.runs_deleted,
             lineage_deleted = report.lineage_deleted,
             audit_deleted = report.audit_deleted,
+            traces_deleted = report.traces_deleted,
             "auto-sweep: complete"
         );
     }

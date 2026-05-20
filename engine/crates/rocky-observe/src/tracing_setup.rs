@@ -100,6 +100,26 @@ pub fn init_tracing(json: bool) -> TracingGuard {
             .boxed()
     };
 
+    // JSONL trace layer (Arc 4 span retention) — file-per-process under
+    // `.rocky/traces/{ts}-{pid}.jsonl`. Skipped for `rocky lsp` (long-
+    // lived daemon — would leak files into every LSP session) and when
+    // the operator opts out via `ROCKY_TRACE_DISABLE=1`.
+    let trace_layer = if jsonl_layer_disabled() {
+        None
+    } else {
+        let mw = crate::traces::JsonlMakeWriter::new(chrono::Utc::now());
+        Some(
+            fmt::layer()
+                .json()
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_span_list(true)
+                .with_current_span(false)
+                .with_writer(mw)
+                .boxed(),
+        )
+    };
+
     #[cfg(feature = "otel")]
     {
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
@@ -111,6 +131,7 @@ pub fn init_tracing(json: bool) -> TracingGuard {
                     tracing_subscriber::registry()
                         .with(filter)
                         .with(fmt_layer)
+                        .with(trace_layer)
                         .with(otel_layer)
                         .init();
                     install_propagator();
@@ -126,6 +147,7 @@ pub fn init_tracing(json: bool) -> TracingGuard {
                     tracing_subscriber::registry()
                         .with(filter)
                         .with(fmt_layer)
+                        .with(trace_layer)
                         .init();
                     tracing::warn!(
                         error = %e,
@@ -140,8 +162,24 @@ pub fn init_tracing(json: bool) -> TracingGuard {
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
+        .with(trace_layer)
         .init();
     TracingGuard::new_disabled()
+}
+
+/// Returns `true` when the JSONL trace layer should be skipped.
+///
+/// Two gates: (D2) `rocky lsp` runs as a daemon and never resets between
+/// editor sessions, so persistent JSONL would grow unbounded; we detect
+/// it by peeking the first positional CLI argument. (D6) the
+/// `ROCKY_TRACE_DISABLE` env var is the explicit escape hatch for
+/// shared-filesystem users or anyone who's having a bad day with disk
+/// quota.
+fn jsonl_layer_disabled() -> bool {
+    if std::env::var_os(crate::traces::TRACE_DISABLE_ENV).is_some() {
+        return true;
+    }
+    matches!(std::env::args().nth(1).as_deref(), Some("lsp"))
 }
 
 #[cfg(feature = "otel")]
