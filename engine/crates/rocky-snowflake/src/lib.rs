@@ -7,7 +7,8 @@
 //! Key Snowflake differences from Databricks:
 //! - Double-quoted identifiers (not backticks)
 //! - `CREATE DATABASE` instead of `CREATE CATALOG`
-//! - Explicit column lists in MERGE (no `UPDATE SET *`)
+//! - Explicit column lists in MERGE for both branches (no `UPDATE SET *`,
+//!   no `INSERT *` shorthand)
 //! - `SAMPLE` instead of `TABLESAMPLE`
 //! - `NUMBER(p,s)` instead of `DECIMAL(p,s)` (aliases)
 //! - TAG objects for metadata (different from Databricks ALTER SET TAGS)
