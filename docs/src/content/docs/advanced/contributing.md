@@ -11,7 +11,7 @@ Rocky is a monorepo with four subprojects:
 
 ```
 rocky-data/
-├── engine/                     # Rust CLI + engine (21-crate Cargo workspace)
+├── engine/                     # Rust CLI + engine (22-crate Cargo workspace)
 ├── integrations/dagster/       # dagster-rocky Python package
 ├── editors/vscode/             # VS Code extension (LSP client)
 ├── examples/playground/        # POC catalog + benchmarks

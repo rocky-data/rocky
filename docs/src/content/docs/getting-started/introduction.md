@@ -88,7 +88,7 @@ New adapters plug in via the [Adapter SDK](/concepts/adapters/) without modifyin
 
 | Path | Artifact | Language |
 |---|---|---|
-| `engine/` | `rocky` CLI | Rust (21-crate workspace) |
+| `engine/` | `rocky` CLI | Rust (22-crate workspace) |
 | `integrations/dagster/` | `dagster-rocky` wheel | Python |
 | `editors/vscode/` | Rocky VSIX | TypeScript |
 | `examples/playground/` | POC catalog | TOML / SQL |
