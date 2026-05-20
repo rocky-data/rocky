@@ -315,12 +315,18 @@ async function launchClient(): Promise<void> {
  * is `Stopped (1) | Running (2) | Starting (3)`. A Running→Stopped flip
  * outside a deliberate restart/shutdown means the server crashed; surface
  * it on the status bar and offer a Restart action.
+ *
+ * We only fire on `Running → Stopped`. A `Starting → Stopped` transition
+ * means `client.start()` rejected, and the catch block in `launchClient`
+ * already reports that via {@link handleStartupFailure}. Without this
+ * filter the user would see two error dialogs on initial startup failure.
  */
-function handleStateChange(_oldState: State, newState: State): void {
+function handleStateChange(oldState: State, newState: State): void {
   // During a deliberate stop or restart we own the status bar text and
   // {@link setLspState}, so silently ignore the transition.
   if (expectedStop) return;
   if (newState !== State.Stopped) return;
+  if (oldState !== State.Running) return;
   // The startup-failure path already calls {@link setLspState}; don't
   // double-report when start() rejected.
   if (currentLspState.status === "Failed") return;
