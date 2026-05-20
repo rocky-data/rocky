@@ -204,3 +204,70 @@ async fn test_describe_table() {
     assert!(col_names.contains(&"table_catalog"));
     assert!(col_names.contains(&"table_name"));
 }
+
+/// Live-infrastructure test for `DatabricksConnector::describe_detail_stats`.
+///
+/// Uses the Delta table at `dev_hcv2_uniform.spike.uniform_t1` on the
+/// sandbox workspace.  Reads connection params from environment variables
+/// so workspace identifiers are never committed to the repository.
+///
+/// Required env vars:
+///   DATABRICKS_HOST          — workspace hostname (no https://)
+///   DATABRICKS_HTTP_PATH     — SQL warehouse HTTP path
+///   DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET
+///
+/// Run with:
+///   cargo test -p rocky-databricks --test integration \
+///     describe_detail_stats_returns_size_bytes -- --ignored
+#[tokio::test]
+#[ignore]
+async fn describe_detail_stats_returns_size_bytes() {
+    let connector = connector_from_env().expect("Databricks env vars not set");
+
+    // The sandbox table used here is the UniForm test table from Exp-4.
+    // Replace with any Delta table in your sandbox if this one is dropped.
+    let catalog = "dev_hcv2_uniform";
+    let schema = "spike";
+    let table = "uniform_t1";
+
+    let stats = connector
+        .describe_detail_stats(catalog, schema, table)
+        .await
+        .expect("describe_detail_stats should not fail");
+
+    let stats = stats.expect("expected Some(DescribeDetailStats), got None");
+
+    // Delta's DESCRIBE DETAIL always populates sizeInBytes.
+    assert!(
+        stats.size_bytes.is_some(),
+        "sizeInBytes should be present for a Delta table; got None",
+    );
+    let size = stats.size_bytes.unwrap();
+    // Sanity: the spike table is small but non-zero.
+    assert!(
+        size > 0,
+        "sizeInBytes should be > 0 for a non-empty table; got {size}",
+    );
+}
+
+/// Verify that `describe_detail_stats` returns `Ok(None)` for a table that
+/// does not exist, rather than propagating the error.
+#[tokio::test]
+#[ignore]
+async fn describe_detail_stats_nonexistent_table_returns_none() {
+    let connector = connector_from_env().expect("Databricks env vars not set");
+
+    let result = connector
+        .describe_detail_stats(
+            "dev_hcv2_uniform",
+            "spike",
+            "definitely_does_not_exist_xxxxxxx",
+        )
+        .await
+        .expect("should not error on missing table");
+
+    assert!(
+        result.is_none(),
+        "missing table should return None, not an error",
+    );
+}

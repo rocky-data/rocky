@@ -49,13 +49,11 @@ pub const E025: &str = "E025";
 pub const E026: &str = "E026";
 /// Budget exceeded — projected spend exceeds the declared per-model cost ceiling.
 ///
-/// Emitted when Rocky can determine before execution that the projected cost
-/// (USD or bytes scanned) would exceed the value declared in the model's
-/// `[budget]` sidecar block.
-///
-/// The diagnostic is constructible and serializable today but is **not yet
-/// emitted** by `propagate_costs`. Enforcement is deferred until the
-/// `CatalogClient::table_stats` provider (D-2 spike) reaches a go-decision.
+/// Emitted by `rocky compile` when the DAG-propagated cost estimate for a
+/// model exceeds either `max_usd` or `max_bytes_scanned` declared in the
+/// model's `[budget]` sidecar block.  Estimates are computed by
+/// [`rocky_core::cost::propagate_costs`] using catalog-sourced table stats
+/// when available, falling back to conservative stub statistics.
 pub const E027: &str = "E027";
 
 // Warnings
@@ -182,27 +180,39 @@ impl Diagnostic {
         self
     }
 
-    /// Build an E027 budget-exceeded diagnostic.
+    /// Build an E027 budget-exceeded diagnostic for a USD cost ceiling.
     ///
-    /// Constructs a ready-to-emit error diagnostic for the case where the
-    /// projected USD cost for a single model run exceeds the ceiling declared
-    /// in the model's `[budget]` sidecar block.
-    ///
-    /// # Not yet called
-    ///
-    /// The builder exists today so the diagnostic code is registered and
-    /// the type-system path is verified. Actual emission from
-    /// `propagate_costs` is gated on the D-2 `CatalogClient::table_stats`
-    /// provider spike.
+    /// Emitted when the DAG-propagated cost estimate for a model exceeds the
+    /// `max_usd` value declared in the model's `[budget]` sidecar block.
     #[must_use]
     pub fn budget_exceeded(model: &str, projected_usd: f64, ceiling_usd: f64) -> Self {
         Self::error(
             E027,
             model,
-            format!("budget exceeded — projected ${projected_usd:.2} > ceiling ${ceiling_usd:.2}",),
+            format!("budget exceeded — projected ${projected_usd:.4} > ceiling ${ceiling_usd:.4}",),
         )
         .with_suggestion(format!(
-            "raise [budget] max_usd above ${ceiling_usd:.2} in the model sidecar, \
+            "raise [budget] max_usd above ${ceiling_usd:.4} in the model sidecar, \
+             or optimize the query to reduce scan volume"
+        ))
+    }
+
+    /// Build an E027 budget-exceeded diagnostic for a bytes-scanned ceiling.
+    ///
+    /// Emitted when the DAG-propagated byte estimate for a model exceeds the
+    /// `max_bytes_scanned` value declared in the model's `[budget]` sidecar
+    /// block.
+    #[must_use]
+    pub fn budget_exceeded_bytes(model: &str, projected_bytes: u64, ceiling_bytes: u64) -> Self {
+        Self::error(
+            E027,
+            model,
+            format!(
+                "budget exceeded — projected {projected_bytes} bytes > ceiling {ceiling_bytes} bytes scanned",
+            ),
+        )
+        .with_suggestion(format!(
+            "raise [budget] max_bytes_scanned above {ceiling_bytes} in the model sidecar, \
              or optimize the query to reduce scan volume"
         ))
     }
@@ -425,12 +435,12 @@ mod tests {
         assert_eq!(d.code.as_ref(), E027);
         assert_eq!(d.model, "fct_orders");
         assert!(
-            d.message.contains("12.50"),
+            d.message.contains("12.5000"),
             "message must include projected cost, got: {}",
             d.message
         );
         assert!(
-            d.message.contains("10.00"),
+            d.message.contains("10.0000"),
             "message must include ceiling cost, got: {}",
             d.message
         );
@@ -438,6 +448,26 @@ mod tests {
             d.suggestion.is_some(),
             "budget_exceeded must include a suggestion"
         );
+        assert!(d.is_error());
+    }
+
+    #[test]
+    fn test_budget_exceeded_bytes_constructs_correctly() {
+        let d = Diagnostic::budget_exceeded_bytes("fct_orders", 5_000_000, 1_000_000);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.code.as_ref(), E027);
+        assert_eq!(d.model, "fct_orders");
+        assert!(
+            d.message.contains("5000000"),
+            "message must include projected bytes, got: {}",
+            d.message
+        );
+        assert!(
+            d.message.contains("1000000"),
+            "message must include ceiling bytes, got: {}",
+            d.message
+        );
+        assert!(d.suggestion.is_some());
         assert!(d.is_error());
     }
 
