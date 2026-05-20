@@ -69,7 +69,7 @@ from .observability import (
     optimize_metadata_for_keys,
     retention_observations,
 )
-from .resource import RockyResource
+from .resource import DEFAULT_TIMEOUT_SECONDS, Resolver, RockyResource
 from .sensor import rocky_source_sensor
 from .translator import RockyDagsterTranslator
 from .types import (
@@ -249,6 +249,27 @@ def _reject_post_state_write_hook_in_yaml(value: object) -> None:
         raise dg.DagsterInvalidConfigError(
             "post_state_write_hook cannot be set from YAML — set it programmatically "
             "on a RockyComponent subclass instead.",
+            errors=[],
+            config_value=value,
+        )
+    return None
+
+
+def _reject_resolver_callable_in_yaml(field_name: str, value: object) -> None:
+    """Mirror :func:`_reject_post_state_write_hook_in_yaml` for the three
+    per-call resolver callables forwarded to :class:`RockyResource`.
+
+    The resolvers (``shadow_suffix_fn``, ``governance_override_fn``,
+    ``idempotency_key_fn``) are arbitrary :class:`ResolverContext`
+    callables — not config-shaped values — so they cannot be expressed
+    in ``defs.yaml`` and must be set programmatically on a
+    :class:`RockyComponent` subclass.
+    """
+    if value is not None:
+        raise dg.DagsterInvalidConfigError(
+            f"{field_name} cannot be set from YAML — set it programmatically "
+            "on a RockyComponent subclass instead. See the branch_deploy module "
+            "for the canonical shadow_suffix_fn use case.",
             errors=[],
             config_value=value,
         )
@@ -438,6 +459,78 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: segment. Default ``False`` because N derived models = N CLI
     #: invocations on every code-server load.
     surface_column_lineage: bool = False
+    #: Subprocess timeout for any one ``rocky`` CLI invocation, in
+    #: seconds. Forwarded to :attr:`RockyResource.timeout_seconds` so
+    #: every ``rocky plan`` / ``rocky apply`` / ``rocky discover`` /
+    #: ``rocky compile`` invocation made by the component honours the
+    #: same wall-clock cap. Defaults to one hour, matching the
+    #: resource-level default. The Pipes apply step does **not** honour
+    #: this timeout — see :meth:`RockyResource.run_pipes` for the Pipes
+    #: timeout contract.
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    #: Optional URL for a running ``rocky serve`` instance. When set, the
+    #: resource's ``compile()`` / ``lineage()`` / ``metrics()`` calls hit
+    #: the HTTP API instead of spawning a subprocess. Forwarded to
+    #: :attr:`RockyResource.server_url`.
+    server_url: str | None = None
+    #: Optional resolver that produces a ``shadow_suffix`` per ``rocky run``
+    #: invocation. The component-backed multi-asset forwards this directly
+    #: to :attr:`RockyResource.shadow_suffix_fn`, so users following
+    #: :mod:`.branch_deploy` patterns (e.g.
+    #: :func:`branch_deploy.shadow_suffix_resolver`) get the same
+    #: branch-deploy shadowing semantics under
+    #: :class:`RockyComponent` as they do constructing a bare
+    #: :class:`RockyResource`. Set programmatically in a subclass —
+    #: callables are not YAML-resolvable, so the YAML schema for this
+    #: field accepts only ``null``.
+    shadow_suffix_fn: Annotated[
+        Resolver | None,
+        dg.Resolver(
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
+                "shadow_suffix_fn", _val
+            ),
+            model_field_type=type(None),
+            description=(
+                "Reserved — set programmatically in a subclass. Cannot be "
+                "configured from YAML; arbitrary callables are not "
+                "YAML-resolvable. See branch_deploy.shadow_suffix_resolver."
+            ),
+        ),
+    ] = None
+    #: Optional resolver for ``governance_override``. Forwarded to
+    #: :attr:`RockyResource.governance_override_fn`. Same YAML-rejection
+    #: contract as :attr:`shadow_suffix_fn`.
+    governance_override_fn: Annotated[
+        Resolver | None,
+        dg.Resolver(
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
+                "governance_override_fn", _val
+            ),
+            model_field_type=type(None),
+            description=(
+                "Reserved — set programmatically in a subclass. Cannot be "
+                "configured from YAML; arbitrary callables are not "
+                "YAML-resolvable."
+            ),
+        ),
+    ] = None
+    #: Optional resolver for ``idempotency_key``. Forwarded to
+    #: :attr:`RockyResource.idempotency_key_fn`. Same YAML-rejection
+    #: contract as :attr:`shadow_suffix_fn`.
+    idempotency_key_fn: Annotated[
+        Resolver | None,
+        dg.Resolver(
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
+                "idempotency_key_fn", _val
+            ),
+            model_field_type=type(None),
+            description=(
+                "Reserved — set programmatically in a subclass. Cannot be "
+                "configured from YAML; arbitrary callables are not "
+                "YAML-resolvable."
+            ),
+        ),
+    ] = None
     #: When ``True``, several "log and swallow" paths in :meth:`build_defs`
     #: are converted into hard failures. Use when an empty Rocky asset
     #: graph is never an acceptable outcome — better to fail the
@@ -477,6 +570,12 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     # ------------------------------------------------------------------ #
 
     def _get_rocky_resource(self) -> RockyResource:
+        # Thread every field RockyResource accepts so users adopting
+        # RockyComponent get parity with a bare RockyResource. Skipping
+        # any of these caused silent footguns — most notably users
+        # following the branch_deploy.shadow_suffix_resolver pattern who
+        # then adopted RockyComponent would lose shadowing and write to
+        # production tables on PR runs.
         return RockyResource(
             binary_path=self.binary_path,
             config_path=self.config_path,
@@ -485,6 +584,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             contracts_dir=self.contracts_dir,
             strict_doctor=self.strict_doctor,
             strict_doctor_checks=self.strict_doctor_checks,
+            timeout_seconds=self.timeout_seconds,
+            server_url=self.server_url,
+            shadow_suffix_fn=self.shadow_suffix_fn,
+            governance_override_fn=self.governance_override_fn,
+            idempotency_key_fn=self.idempotency_key_fn,
         )
 
     def _get_translator(self) -> RockyDagsterTranslator:
