@@ -111,7 +111,7 @@ use tracing::debug;
 
 use rocky_catalog_core::{
     BranchRef, CatalogClient, CatalogError, CatalogResult, ColumnSchema, Grant, TableCommit,
-    TableRef, TableSchema,
+    TableRef, TableSchema, TableStats,
 };
 
 use crate::auth::{Auth, AuthError};
@@ -675,6 +675,32 @@ impl CatalogClient for UnityCatalogClient {
         ))
     }
 
+    async fn table_stats(&self, _table: &TableRef) -> CatalogResult<TableStats> {
+        // Unity Catalog REST exposes no table-stats surface:
+        //
+        // - `GET /api/2.1/unity-catalog/tables/{full_name}` returns
+        //   schema + storage metadata only (modelled by `TableInfo`
+        //   above); no row count, no byte total, no file count.
+        // - `INFORMATION_SCHEMA.TABLES` on Databricks does not carry
+        //   `row_count` or `table_size_bytes` columns (verified live
+        //   2026-05-20 against the dev_hcv2_uniform.information_schema
+        //   sandbox).
+        // - The only working paths to stats are
+        //   `DESCRIBE DETAIL <table>.sizeInBytes` (bytes, no ANALYZE
+        //   prereq) and `DESCRIBE EXTENDED <table>` (parses the
+        //   `Statistics` row, present only after `ANALYZE TABLE
+        //   COMPUTE STATISTICS`). Both run through the SQL Statement
+        //   Execution API, which lives on
+        //   [`crate::connector::DatabricksConnector`], not here. This
+        //   client is REST-only by design (see module-level doc).
+        //
+        // Consistent with `tag_table` / `commit_transaction` /
+        // `list_branches`: REST gap, caller routes via the SQL path.
+        Err(CatalogError::UnsupportedOperation(
+            "Unity Catalog REST exposes no stats endpoint; route via DatabricksConnector SQL (DESCRIBE DETAIL / ANALYZE TABLE)",
+        ))
+    }
+
     async fn tag_table(&self, _table: &TableRef, _key: &str, _value: &str) -> CatalogResult<()> {
         // Unity has no general-purpose table-tag REST endpoint in
         // Databricks runtime — `ALTER TABLE SET TAGS` SQL is the only
@@ -1214,6 +1240,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_stats_returns_unsupported() {
+        // Unity Catalog REST exposes no stats surface. The trait
+        // contract is to fail with UnsupportedOperation before any
+        // network hop so callers route to the SQL-side stats path
+        // (DESCRIBE DETAIL / ANALYZE TABLE on DatabricksConnector).
+        // This is consistent with tag_table / commit_transaction /
+        // list_branches — all surfaces Unity REST does not natively
+        // serve.
+        let client = make_offline_client();
+        let err = client.table_stats(&sample_table_ref()).await.unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UnsupportedOperation(_)),
+            "expected UnsupportedOperation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_branches_returns_unsupported() {
         let client = make_offline_client();
         let err = client.list_branches(&sample_table_ref()).await.unwrap_err();
@@ -1356,6 +1399,35 @@ mod live_tests {
             assert_eq!(t.namespace.len(), 1);
             assert!(!t.name.is_empty());
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ROCKY_TEST_DATABRICKS_* env vars; run with --ignored"]
+    async fn live_table_stats_returns_unsupported_operation() {
+        // Anchor the "Unity REST exposes no stats endpoint" contract
+        // against a live workspace: the impl must short-circuit with
+        // UnsupportedOperation before any HTTP traffic. Sandbox stats
+        // (rows / bytes) come through the SQL path on
+        // DatabricksConnector, not this client.
+        let Some((host, token, catalog, schema)) = read_env() else {
+            eprintln!("skipping: ROCKY_TEST_DATABRICKS_* not set");
+            return;
+        };
+        let client = live_client(host, token);
+        let table =
+            std::env::var("ROCKY_TEST_DATABRICKS_TABLE").unwrap_or_else(|_| "hc_probe".into());
+        let err = client
+            .table_stats(&TableRef {
+                catalog: Some(catalog),
+                namespace: vec![schema],
+                name: table,
+            })
+            .await
+            .expect_err("Unity table_stats must surface as UnsupportedOperation");
+        assert!(
+            matches!(err, CatalogError::UnsupportedOperation(_)),
+            "expected UnsupportedOperation, got {err:?}"
+        );
     }
 
     #[tokio::test]

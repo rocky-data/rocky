@@ -9,7 +9,7 @@
 
 use rocky_catalog_core::{
     BranchKind, CatalogClient, CatalogError, ColumnSchema, Grant, TableCommit, TableRef,
-    TableSchema,
+    TableSchema, TableStats,
 };
 use rocky_core::source::FailedSourceErrorClass;
 use rocky_core::traits::DiscoveryAdapter;
@@ -776,6 +776,245 @@ async fn list_branches_returns_empty_when_refs_missing() {
         .await
         .expect("list_branches should succeed when refs absent");
     assert!(branches.is_empty());
+}
+
+/// `load_table` body with two snapshots; only snapshot 2 is current
+/// and carries the spec-defined summary keys. Used to verify
+/// `table_stats` picks the current snapshot's summary, not snapshot 1.
+fn load_table_body_with_snapshots() -> serde_json::Value {
+    json!({
+        "metadata-location": "s3://bucket/path/metadata.json",
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [
+                {
+                    "schema-id": 0,
+                    "fields": [
+                        { "id": 1, "name": "id", "required": true, "type": "long" }
+                    ]
+                }
+            ],
+            "current-snapshot-id": 2,
+            "snapshots": [
+                {
+                    "snapshot-id": 1,
+                    "summary": {
+                        "operation": "append",
+                        "total-records": "100",
+                        "total-files-size": "1024",
+                        "total-data-files": "1"
+                    }
+                },
+                {
+                    "snapshot-id": 2,
+                    "summary": {
+                        "operation": "append",
+                        "added-records": "150",
+                        "total-records": "250",
+                        "total-files-size": "4096",
+                        "total-data-files": "4"
+                    }
+                }
+            ]
+        }
+    })
+}
+
+#[tokio::test]
+async fn table_stats_happy_path_parses_current_snapshot_summary() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(load_table_body_with_snapshots()))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "orders".into(),
+    };
+
+    let stats = adapter
+        .table_stats(&table)
+        .await
+        .expect("table_stats should succeed");
+
+    // Picked snapshot-id == 2 (current); snapshot 1's summary is ignored.
+    // `total-records` (cumulative) is the source-of-truth, NOT
+    // `added-records` (delta).
+    assert_eq!(stats.row_count, Some(250));
+    assert_eq!(stats.total_bytes, Some(4096));
+    assert_eq!(stats.file_count, Some(4));
+}
+
+#[tokio::test]
+async fn table_stats_returns_empty_when_no_current_snapshot() {
+    // Freshly-created Iceberg tables have no snapshots yet — the spec
+    // permits `current-snapshot-id` to be absent (or `null`).
+    let server = MockServer::start().await;
+
+    let body = json!({
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [
+                { "schema-id": 0, "fields": [] }
+            ]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/empty"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "empty".into(),
+    };
+
+    let stats = adapter
+        .table_stats(&table)
+        .await
+        .expect("table_stats should succeed even with no snapshots");
+    assert_eq!(stats, TableStats::empty());
+}
+
+#[tokio::test]
+async fn table_stats_returns_partial_when_summary_keys_missing() {
+    // Writers populate the summary inconsistently — the Unity
+    // foreign-Iceberg path is known to lag spec compliance. We must
+    // surface what's there without failing the whole call when a key
+    // is absent.
+    let server = MockServer::start().await;
+
+    let body = json!({
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [
+                { "schema-id": 0, "fields": [] }
+            ],
+            "current-snapshot-id": 7,
+            "snapshots": [
+                {
+                    "snapshot-id": 7,
+                    "summary": {
+                        "operation": "append",
+                        "total-files-size": "2048"
+                        // total-records + total-data-files intentionally
+                        // absent
+                    }
+                }
+            ]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/partial"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "partial".into(),
+    };
+
+    let stats = adapter
+        .table_stats(&table)
+        .await
+        .expect("partial summary should not error");
+    assert_eq!(stats.row_count, None);
+    assert_eq!(stats.total_bytes, Some(2048));
+    assert_eq!(stats.file_count, None);
+}
+
+#[tokio::test]
+async fn table_stats_ignores_unparseable_summary_values() {
+    // Catalogs occasionally emit non-numeric values (e.g. `"unknown"`,
+    // or scientific notation). Trait contract: silent fall-back to
+    // None rather than failing the whole `table_stats` call.
+    let server = MockServer::start().await;
+
+    let body = json!({
+        "metadata": {
+            "current-schema-id": 0,
+            "schemas": [
+                { "schema-id": 0, "fields": [] }
+            ],
+            "current-snapshot-id": 1,
+            "snapshots": [
+                {
+                    "snapshot-id": 1,
+                    "summary": {
+                        "total-records": "not_a_number",
+                        "total-files-size": "1024",
+                        "total-data-files": "1.5e3"
+                    }
+                }
+            ]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/weird"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "weird".into(),
+    };
+
+    let stats = adapter
+        .table_stats(&table)
+        .await
+        .expect("unparseable values must not error");
+    assert_eq!(stats.row_count, None, "not_a_number → None");
+    assert_eq!(stats.total_bytes, Some(1024));
+    assert_eq!(
+        stats.file_count, None,
+        "scientific notation is not a u64 → None"
+    );
+}
+
+#[tokio::test]
+async fn table_stats_404_maps_to_table_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/analytics/tables/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+    let table = TableRef {
+        catalog: None,
+        namespace: vec!["analytics".into()],
+        name: "missing".into(),
+    };
+
+    let err = adapter
+        .table_stats(&table)
+        .await
+        .expect_err("404 should not succeed");
+    assert!(
+        matches!(err, CatalogError::TableNotFound(_)),
+        "expected TableNotFound, got {err:?}"
+    );
 }
 
 #[tokio::test]

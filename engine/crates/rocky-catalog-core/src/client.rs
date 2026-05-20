@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::error::CatalogResult;
-use crate::types::{BranchRef, Grant, TableCommit, TableRef, TableSchema};
+use crate::types::{BranchRef, Grant, TableCommit, TableRef, TableSchema, TableStats};
 
 /// A read/write client for a data catalog.
 ///
@@ -103,6 +103,30 @@ pub trait CatalogClient: Send + Sync {
     /// diverge sharply between catalogs and belong on per-adapter
     /// extension surfaces.
     async fn list_branches(&self, table: &TableRef) -> CatalogResult<Vec<BranchRef>>;
+
+    // ---------------------------------------------------------------------
+    // Statistics
+    // ---------------------------------------------------------------------
+
+    /// Return the row count, byte total, and file count for `table` as
+    /// the catalog currently reports them.
+    ///
+    /// Each field of [`TableStats`] is `Option<u64>` because catalogs
+    /// disagree on what they expose: Iceberg REST returns
+    /// `total-records` and `total-files-size` only when the writer
+    /// populated them in the current snapshot's `summary` map; Unity
+    /// Catalog REST exposes none of them and surfaces this method as
+    /// [`crate::CatalogError::UnsupportedOperation`]. Callers consuming
+    /// the result for cost estimation are expected to treat a `None`
+    /// field as "fall through to upstream-inferred estimate" rather
+    /// than a hard failure.
+    ///
+    /// The trait does not promise that the numbers are recent — they
+    /// are whatever the catalog has at read time. For Iceberg this is
+    /// the head snapshot summary; for catalogs that go through this
+    /// trait via a SQL-execution shim (out of scope today) it would be
+    /// whatever `DESCRIBE DETAIL` or `ANALYZE TABLE` last populated.
+    async fn table_stats(&self, table: &TableRef) -> CatalogResult<TableStats>;
 
     // ---------------------------------------------------------------------
     // Governance

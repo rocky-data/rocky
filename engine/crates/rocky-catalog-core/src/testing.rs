@@ -21,7 +21,7 @@ use async_trait::async_trait;
 
 use crate::client::CatalogClient;
 use crate::error::{CatalogError, CatalogResult};
-use crate::types::{BranchRef, Grant, TableCommit, TableRef, TableSchema};
+use crate::types::{BranchRef, Grant, TableCommit, TableRef, TableSchema, TableStats};
 
 /// In-memory [`CatalogClient`] stub backed by a [`HashMap`] of
 /// `(namespace, table-name)` to [`TableSchema`].
@@ -40,6 +40,13 @@ use crate::types::{BranchRef, Grant, TableCommit, TableRef, TableSchema};
 #[derive(Debug, Default)]
 pub struct InMemoryCatalogClient {
     tables: Mutex<HashMap<Key, TableSchema>>,
+    /// Per-table stub stats, indexed by the same `(namespace, name)`
+    /// key as [`Self::tables`]. Populated by
+    /// [`InMemoryCatalogClient::set_table_stats`]; lookups return
+    /// [`TableStats::empty()`] when no stats are registered, matching
+    /// the "table exists but catalog reports no stats" case from real
+    /// catalogs.
+    stats: Mutex<HashMap<Key, TableStats>>,
 }
 
 /// Internal key used by the stub. Equivalent to `(namespace, name)`.
@@ -62,6 +69,17 @@ impl InMemoryCatalogClient {
     /// Construct an empty stub.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register stub statistics for `table`.
+    ///
+    /// Test helper used by downstream crates to feed deterministic
+    /// stats into a cost-propagation test without standing up a real
+    /// catalog. Overwrites any previously registered stats for the same
+    /// `(namespace, name)` key.
+    pub fn set_table_stats(&self, table: &TableRef, stats: TableStats) {
+        let mut guard = self.stats.lock().expect("stats mutex poisoned");
+        guard.insert(Key::from_ref(table), stats);
     }
 }
 
@@ -102,6 +120,26 @@ impl CatalogClient for InMemoryCatalogClient {
             .remove(&Key::from_ref(table))
             .map(|_| ())
             .ok_or_else(|| CatalogError::TableNotFound(format_table(table)))
+    }
+
+    async fn table_stats(&self, table: &TableRef) -> CatalogResult<TableStats> {
+        // The stub honours stats explicitly registered via
+        // [`Self::set_table_stats`]; otherwise the table is required to
+        // exist (`describe_table`-style semantics) and we return the
+        // empty-stats baseline — mirrors what a catalog returns when a
+        // table exists but the writer never populated the summary keys.
+        let stats_guard = self.stats.lock().expect("stats mutex poisoned");
+        let key = Key::from_ref(table);
+        if let Some(stats) = stats_guard.get(&key) {
+            return Ok(stats.clone());
+        }
+        drop(stats_guard);
+        let tables_guard = self.tables.lock().expect("tables mutex poisoned");
+        if tables_guard.contains_key(&key) {
+            Ok(TableStats::empty())
+        } else {
+            Err(CatalogError::TableNotFound(format_table(table)))
+        }
     }
 
     async fn commit_transaction(&self, _commits: &[TableCommit]) -> CatalogResult<()> {
