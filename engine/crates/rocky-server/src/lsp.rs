@@ -397,16 +397,26 @@ impl RockyLsp {
         )
         .await;
 
+        // Load `rocky.toml` so the W004 classification-tag check fires in
+        // the LSP. Without `mask` + `allow_unmasked` populated, the
+        // compiler's `check_classification_tags` is a no-op and the IDE
+        // never sees the warning. Project root = `models_dir.parent()`
+        // (the same assumption the schema-cache loader makes above).
+        // Missing or unreadable `rocky.toml` falls back to empty defaults.
+        let (mask, allow_unmasked) = dir_path
+            .parent()
+            .map(|root| root.join("rocky.toml"))
+            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
+            .map(|c| (c.mask, c.classifications.allow_unmasked))
+            .unwrap_or_default();
+
         let config = CompilerConfig {
-            models_dir: dir_path,
+            models_dir: dir_path.clone(),
             contracts_dir: None,
             source_schemas,
             source_column_info: HashMap::new(),
-            // W004 is gated on a loaded RockyConfig; the LSP init path
-            // doesn't currently hold one, so leave the defaults empty.
-            // Follow-up: thread `rocky.toml` through initialize_params
-            // so IDEs surface unresolved-classification warnings live.
-            ..Default::default()
+            mask,
+            allow_unmasked,
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -416,8 +426,65 @@ impl RockyLsp {
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                // `ProjectError::RockyParse` aborts the compile pipeline
+                // before any `Diagnostic` is built, so the LSP would
+                // otherwise leave the editor with no feedback at all.
+                // Re-parse each `.rocky` file in `models_dir` and publish
+                // a synthetic E028 diagnostic for any that fail — this
+                // feeds the AI auto-fix arm in `code_action`.
+                self.publish_dsl_parse_diagnostics(&dir_path).await;
             }
         }
+    }
+
+    /// Re-parse every `.rocky` file under `models_dir` and publish a
+    /// synthetic LSP diagnostic with code `E028` for any that fail. Runs
+    /// only on a compile-pipeline failure — the compiler's own diagnostic
+    /// stream is empty in that case because the project loader bails on
+    /// the first parse error before any `Diagnostic` is produced.
+    async fn publish_dsl_parse_diagnostics(&self, models_dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(models_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rocky") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Err(parse_err) = rocky_lang::parse(&content) else {
+                continue;
+            };
+            let (range, message) = lsp_range_from_parse_error(&parse_err, &content);
+
+            let Ok(uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            let diag = Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String(E028.to_string())),
+                source: Some("rocky".to_string()),
+                message,
+                ..Default::default()
+            };
+            self.client.publish_diagnostics(uri, vec![diag], None).await;
+        }
+    }
+
+    /// Read `rocky.toml` from the project root and return its URI + raw
+    /// contents. Returns `None` when no `models_dir` is configured or the
+    /// file is unreadable — callers fall back to skipping arms that need
+    /// to edit the project config.
+    async fn load_rocky_toml(&self) -> Option<(tower_lsp::lsp_types::Url, String)> {
+        let models_dir = self.models_dir.read().await;
+        let dir = models_dir.as_ref()?;
+        let toml_path = std::path::PathBuf::from(dir).parent()?.join("rocky.toml");
+        let text = std::fs::read_to_string(&toml_path).ok()?;
+        let uri = Url::from_file_path(&toml_path).ok()?;
+        Some((uri, text))
     }
 
     /// Load the persisted schema cache for use as
@@ -1854,6 +1921,65 @@ impl LanguageServer for RockyLsp {
                         actions.push(CodeActionOrCommand::CodeAction(action));
                     }
                 }
+                Some("W004") => {
+                    // W004 — classification tag on a column doesn't resolve
+                    // to any `[mask]` / `[mask.<env>]` strategy. AI fallback
+                    // proposes a `[mask.<tag>]` block appended to
+                    // `rocky.toml`. The deterministic suggestion (from
+                    // `Diagnostic::with_suggestion`) is also surfaced by the
+                    // catch-all arm below; the AI action is the executable
+                    // fix that actually edits the file.
+                    let model_name = self
+                        .model_for_uri(result, uri)
+                        .map(|m| m.config.name.clone())
+                        .or_else(|| {
+                            find_compiler_diagnostic(result, diag).map(|d| d.model.to_string())
+                        });
+                    let Some(model_name) = model_name else {
+                        continue;
+                    };
+
+                    let Some((rocky_toml_uri, rocky_toml_text)) = self.load_rocky_toml().await
+                    else {
+                        // No `rocky.toml` resolvable — the AI action would
+                        // have no file to edit. Skip rather than emit a
+                        // useless action.
+                        continue;
+                    };
+
+                    if let Some(action) = build_ai_classification_action(
+                        &diag.message,
+                        &model_name,
+                        &rocky_toml_uri,
+                        &rocky_toml_text,
+                        diag,
+                    ) {
+                        actions.push(CodeActionOrCommand::CodeAction(action));
+                    }
+                }
+                Some("E028") => {
+                    // E028 — `.rocky` DSL parse failure synthesized by
+                    // `recompile()` when the project loader's `RockyParse`
+                    // short-circuits the compile pipeline. AI fallback
+                    // proposes a corrected DSL pipeline. No deterministic
+                    // structural fix is available today — the DSL grammar
+                    // is too open for a localized auto-edit.
+                    let rocky_source = self
+                        .documents
+                        .read()
+                        .await
+                        .get(uri.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    if rocky_source.is_empty() {
+                        continue;
+                    }
+                    if let Some(action) =
+                        build_ai_dsl_action(&diag.message, &rocky_source, uri, diag)
+                    {
+                        actions.push(CodeActionOrCommand::CodeAction(action));
+                    }
+                }
                 _ => {
                     // For any diagnostic with a suggestion, offer it
                     if let Some(compiler_diag) = find_compiler_diagnostic(result, diag) {
@@ -1877,12 +2003,13 @@ impl LanguageServer for RockyLsp {
         }
     }
 
-    /// Resolve a deferred code action — currently only the AI fallback for
-    /// E010 / E013 contract diagnostics. Synchronous code actions
-    /// (deterministic E010 / E013, E001, E002, E003, suggestion arm) are
-    /// already fully populated when emitted from `code_action` and pass
-    /// through this handler unchanged on the rare client that still calls
-    /// resolve on them.
+    /// Resolve a deferred code action. Dispatches on the `kind` field of
+    /// the JSON payload so each AI arm (contract / classification / DSL)
+    /// can carry its own typed payload while sharing the resolve channel.
+    /// Synchronous code actions (deterministic E010 / E013, E001, E002,
+    /// E003, suggestion arm) are already fully populated when emitted
+    /// from `code_action` and pass through this handler unchanged on the
+    /// rare client that still calls resolve on them.
     async fn code_action_resolve(&self, mut action: CodeAction) -> Result<CodeAction> {
         let Some(data) = action.data.take() else {
             // Nothing to resolve — return the action as-is. tower-lsp / VS
@@ -1891,47 +2018,74 @@ impl LanguageServer for RockyLsp {
             return Ok(action);
         };
 
-        let resolved_data: AiContractActionData = match serde_json::from_value(data.clone()) {
-            Ok(v) => v,
-            Err(e) => {
-                // Unknown deferred shape — surface a diagnostic on the
-                // action and short-circuit. This keeps a future resolve-using
-                // arm (different `kind` field) from accidentally crashing
-                // the LSP if it forgets to register here.
-                tracing::warn!(error = %e, raw = ?data, "code_action_resolve received unknown data shape");
+        // Peek at the `kind` discriminator before committing to a payload
+        // type. An unknown `kind` is surfaced as a warning + no-op so a
+        // future arm that lands here without registering doesn't crash
+        // the LSP.
+        let kind = data
+            .as_object()
+            .and_then(|m| m.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match kind.as_str() {
+            AI_CONTRACT_FIX_KIND => {
+                let resolved_data: AiContractActionData = match serde_json::from_value(data.clone())
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, raw = ?data, "code_action_resolve: contract payload parse failed");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+
+                // Compile-result snapshot — typed schemas for upstream
+                // models ground the prompt in real columns rather than
+                // guessed ones. If the compile result has cycled (e.g.
+                // user typed since the action was emitted), we still
+                // proceed with the snapshot in `data` — the prompt is
+                // best-effort.
+                let lock = self.compile_result.read().await;
+                let typed_models = lock
+                    .as_ref()
+                    .map(|r| r.type_check.typed_models.clone())
+                    .unwrap_or_default();
+                drop(lock);
+
+                let outcome = resolve_ai_contract_action(&resolved_data, &typed_models).await;
+                apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
+            }
+            AI_CLASSIFICATION_FIX_KIND => {
+                let resolved_data: AiClassificationActionData = match serde_json::from_value(
+                    data.clone(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, raw = ?data, "code_action_resolve: classification payload parse failed");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+                let outcome = resolve_ai_classification_action(&resolved_data).await;
+                apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
+            }
+            AI_DSL_FIX_KIND => {
+                let resolved_data: AiDslActionData = match serde_json::from_value(data.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, raw = ?data, "code_action_resolve: DSL payload parse failed");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+                let outcome = resolve_ai_dsl_action(&resolved_data).await;
+                apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
+            }
+            _ => {
+                tracing::warn!(raw = ?data, "code_action_resolve received unknown payload kind");
                 action.data = Some(data);
-                return Ok(action);
-            }
-        };
-
-        // Compile-result snapshot — we need typed schemas for the upstream
-        // models so the prompt is grounded in real columns, not guessed
-        // ones. If the compile result has cycled (e.g. user typed since the
-        // action was emitted), we still proceed with the snapshot in `data`
-        // — the prompt is best-effort, the LLM gets enough context to fix
-        // the SQL even if upstream schemas have shifted.
-        let lock = self.compile_result.read().await;
-        let typed_models = lock
-            .as_ref()
-            .map(|r| r.type_check.typed_models.clone())
-            .unwrap_or_default();
-        drop(lock);
-
-        let outcome = resolve_ai_contract_action(&resolved_data, &typed_models).await;
-        match outcome {
-            AiResolveOutcome::Edit(edit) => {
-                let mut changes = HashMap::new();
-                changes.insert(resolved_data.uri.clone(), vec![edit]);
-                action.edit = Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                });
-            }
-            AiResolveOutcome::Disabled(reason) => {
-                // Surface the reason in the title so VS Code shows it in the
-                // quick-fix menu rather than silently doing nothing. The
-                // action stays selectable; selecting it is a no-op.
-                action.title = format!("{} ({reason})", action.title);
             }
         }
 
@@ -2569,14 +2723,30 @@ pub(crate) fn build_contract_quickfix(
     ))
 }
 
-// ── AI fallback for E010 / E013 ────────────────────────────────────────────
+// ── AI fallback action payloads ────────────────────────────────────────────
 
-/// Marker on the deferred `CodeAction.data` payload so
-/// [`code_action_resolve`] can tell our payload apart from any other
-/// resolve-using code action that lands later.
+/// Marker on the deferred `CodeAction.data` payload for E010 / E013
+/// contract diagnostics. [`code_action_resolve`] dispatches on the `kind`
+/// field of the JSON payload so multiple arm payloads can coexist on the
+/// same `data` channel.
 const AI_CONTRACT_FIX_KIND: &str = "rocky.ai-contract-fix.v1";
 
-/// Environment variable that gates the AI fallback. Only env-var-based;
+/// Marker for the W004 unresolved classification-tag arm. Suggests a
+/// `[mask.<tag>]` block appended to `rocky.toml`.
+const AI_CLASSIFICATION_FIX_KIND: &str = "rocky.ai-classification-fix.v1";
+
+/// Marker for the `.rocky` DSL parse-error arm. Suggests a corrected
+/// DSL pipeline for the affected file.
+const AI_DSL_FIX_KIND: &str = "rocky.ai-dsl-fix.v1";
+
+/// Diagnostic code for a `.rocky` DSL parse failure. The compile-result
+/// diagnostic stream short-circuits on a `ProjectError::RockyParse`, so
+/// the LSP re-parses each `.rocky` file in the project on recompile
+/// failure and publishes a synthetic diagnostic with this code so
+/// `code_action` can hook the AI fix.
+const E028: &str = "E028";
+
+/// Environment variable that gates every AI fallback arm. Only env-var-based;
 /// the LSP server doesn't currently surface a richer credentials channel
 /// and matching `rocky ai`'s behaviour keeps the rules predictable.
 const AI_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -2832,6 +3002,401 @@ fn build_contract_fix_prompt(
     );
 
     (system, user)
+}
+
+/// Apply an [`AiResolveOutcome`] to a `CodeAction`. Shared across the
+/// three AI arms — wraps the `TextEdit` in a `WorkspaceEdit` keyed by the
+/// arm's target URI, or appends the disable reason to the title so the
+/// user sees in the quick-fix menu why selecting it didn't change
+/// anything.
+fn apply_ai_outcome(
+    action: &mut CodeAction,
+    outcome: AiResolveOutcome,
+    target_uri: &tower_lsp::lsp_types::Url,
+) {
+    match outcome {
+        AiResolveOutcome::Edit(edit) => {
+            let mut changes = HashMap::new();
+            changes.insert(target_uri.clone(), vec![edit]);
+            action.edit = Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            });
+        }
+        AiResolveOutcome::Disabled(reason) => {
+            action.title = format!("{} ({reason})", action.title);
+        }
+    }
+}
+
+// ── AI fallback for W004 unresolved classification tag ─────────────────────
+
+/// Serializable payload threaded from [`code_action`] into
+/// [`code_action_resolve`] for the W004 arm. The suggested fix is a
+/// `[mask.<tag>]` block appended to `rocky.toml`, so the `rocky.toml`
+/// URI is carried inline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AiClassificationActionData {
+    /// Marker matching [`AI_CLASSIFICATION_FIX_KIND`].
+    kind: String,
+    /// The unresolved classification tag (e.g. `"pii"`).
+    tag: String,
+    /// Column name carrying the tag.
+    column: String,
+    /// Model name where the unresolved tag was declared.
+    model_name: String,
+    /// LSP URI of `rocky.toml` — the file the `WorkspaceEdit` appends to.
+    rocky_toml_uri: tower_lsp::lsp_types::Url,
+    /// Current contents of `rocky.toml` captured at code-action time.
+    /// Used both to compute the append range and to give the LLM grounding
+    /// context (so the proposed `[mask.<tag>]` block doesn't collide with
+    /// an existing one).
+    rocky_toml_text: String,
+}
+
+/// Parse the tag + column out of a W004 diagnostic message. Returns
+/// `None` if the message doesn't match the shape the compiler emits — the
+/// same rationale as [`parse_contract_column`].
+fn parse_classification_message(message: &str) -> Option<(&str, &str)> {
+    // Compiler shape (see `typecheck::check_classification_tags`):
+    // "classification tag '<tag>' on column '<column>' has no matching `[mask]` strategy"
+    let rest = message.strip_prefix("classification tag '")?;
+    let (tag, rest) = rest.split_once("' on column '")?;
+    let column = rest.strip_suffix("' has no matching `[mask]` strategy")?;
+    Some((tag, column))
+}
+
+/// Build the deferred AI code-action for a W004 diagnostic. Returns
+/// `None` if the message doesn't parse as W004 — divergence here is a
+/// compiler regression rather than untrusted input.
+pub(crate) fn build_ai_classification_action(
+    message: &str,
+    model_name: &str,
+    rocky_toml_uri: &tower_lsp::lsp_types::Url,
+    rocky_toml_text: &str,
+    diag: &Diagnostic,
+) -> Option<CodeAction> {
+    let (tag, column) = parse_classification_message(message)?;
+    let title = format!("AI fix: add `[mask.{tag}]` block to rocky.toml");
+
+    let data = AiClassificationActionData {
+        kind: AI_CLASSIFICATION_FIX_KIND.to_string(),
+        tag: tag.to_string(),
+        column: column.to_string(),
+        model_name: model_name.to_string(),
+        rocky_toml_uri: rocky_toml_uri.clone(),
+        rocky_toml_text: rocky_toml_text.to_string(),
+    };
+
+    Some(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: None,
+        data: Some(serde_json::to_value(data).ok()?),
+        ..Default::default()
+    })
+}
+
+/// Resolve a W004 AI action — call the LLM, extract a `[mask.<tag>]`
+/// TOML snippet, and emit a `TextEdit` that appends it to the end of
+/// `rocky.toml`. Appending (rather than splicing into an existing
+/// `[mask]` table) keeps the edit logic predictable when the project
+/// has no `[mask]` section at all.
+async fn resolve_ai_classification_action(data: &AiClassificationActionData) -> AiResolveOutcome {
+    let api_key = match std::env::var(AI_API_KEY_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return AiResolveOutcome::Disabled(format!(
+                "{AI_API_KEY_ENV} not set in the LSP environment"
+            ));
+        }
+    };
+
+    let (system_prompt, user_prompt) = build_classification_fix_prompt(
+        &data.tag,
+        &data.column,
+        &data.model_name,
+        &data.rocky_toml_text,
+    );
+
+    let ai_config = rocky_ai::client::AiConfig {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        api_key: rocky_core::redacted::RedactedString::new(api_key),
+        default_format: "toml".to_string(),
+        max_attempts: 1,
+        max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+    };
+
+    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+        Ok(c) => c,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+
+    let response = match client.generate(&system_prompt, &user_prompt, None).await {
+        Ok(r) => r,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI request failed: {e}")),
+    };
+
+    let extracted = rocky_ai::generate::extract_code(&response.content);
+    let snippet = extracted.trim();
+    if snippet.is_empty() {
+        return AiResolveOutcome::Disabled(
+            "AI response did not contain a TOML code block".to_string(),
+        );
+    }
+
+    let append_position = end_of_document_position(&data.rocky_toml_text);
+    let prefix = if data.rocky_toml_text.is_empty() || data.rocky_toml_text.ends_with("\n\n") {
+        ""
+    } else if data.rocky_toml_text.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let new_text = format!("{prefix}{snippet}\n");
+
+    AiResolveOutcome::Edit(TextEdit {
+        range: Range::new(append_position, append_position),
+        new_text,
+    })
+}
+
+/// Build the LLM prompt for a W004 classification-tag fix. The system
+/// half encodes the role + output-format constraint; the user half
+/// supplies the per-call context. Splitting this way keeps the system
+/// portion stable across resolves for prompt caching.
+fn build_classification_fix_prompt(
+    tag: &str,
+    column: &str,
+    model_name: &str,
+    rocky_toml_text: &str,
+) -> (String, String) {
+    let system = "You are an expert Rocky data-pipeline reviewer. Your task is to \
+                 propose a TOML `[mask.<tag>]` block for the project's `rocky.toml` \
+                 so that an unresolved classification tag now resolves. Choose a \
+                 reasonable masking strategy for the tag based on its name (e.g. \
+                 `pii` / `email` → `hash`; `lineage_only` → `null`; `secret` → \
+                 `redact`). Output ONLY the new TOML block inside a single ```toml \
+                 fenced block — no commentary, no explanation, no diff. The block \
+                 must start with `[mask.<tag>]` on its own line."
+        .to_string();
+
+    let user = format!(
+        "Unresolved classification tag: `{tag}`\n\
+         Declared on column: `{column}` (model `{model_name}`)\n\n\
+         Current `rocky.toml`:\n```toml\n{rocky_toml_text}\n```\n\n\
+         Emit a `[mask.{tag}]` block that picks a sensible `strategy` for this \
+         tag. Do not duplicate or modify any existing block."
+    );
+
+    (system, user)
+}
+
+/// LSP `Position` pointing at the byte after the last character of `text`.
+/// Used as the insertion point for appending a TOML block to
+/// `rocky.toml`. Empty text yields `(0, 0)`; text ending in a newline
+/// yields the start of the next line; otherwise yields the end of the
+/// last non-empty line.
+fn end_of_document_position(text: &str) -> Position {
+    if text.is_empty() {
+        return Position::new(0, 0);
+    }
+    let line_count = text.lines().count() as u32;
+    let last_line_len = text.lines().last().map_or(0, str::len) as u32;
+    if text.ends_with('\n') {
+        Position::new(line_count, 0)
+    } else {
+        Position::new(line_count.saturating_sub(1), last_line_len)
+    }
+}
+
+// ── AI fallback for `.rocky` DSL parse errors (E028) ───────────────────────
+
+/// Serializable payload threaded from [`code_action`] into
+/// [`code_action_resolve`] for the DSL auto-fix arm. Mirrors
+/// [`AiContractActionData`] but carries the raw `.rocky` source rather
+/// than a SQL model body — parse failure means no `Model` was
+/// constructed, so there's no `upstream_models` context to inline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AiDslActionData {
+    /// Marker matching [`AI_DSL_FIX_KIND`].
+    kind: String,
+    /// Diagnostic message verbatim (carries the parse-error reason from
+    /// [`rocky_lang::ParseError`]).
+    diagnostic_message: String,
+    /// Raw `.rocky` source captured at code-action time.
+    rocky_source: String,
+    /// LSP URI of the `.rocky` file.
+    uri: tower_lsp::lsp_types::Url,
+}
+
+/// Build the deferred AI code-action for an E028 DSL parse diagnostic.
+/// Returns `None` if the URI doesn't point at a `.rocky` file — a
+/// belt-and-braces guard mirroring the contract arm's `.sql`-only check.
+pub(crate) fn build_ai_dsl_action(
+    message: &str,
+    rocky_source: &str,
+    uri: &tower_lsp::lsp_types::Url,
+    diag: &Diagnostic,
+) -> Option<CodeAction> {
+    if uri_extension(uri.as_str()) != "rocky" {
+        return None;
+    }
+
+    let title = "AI fix: rewrite `.rocky` pipeline to resolve parse error".to_string();
+
+    let data = AiDslActionData {
+        kind: AI_DSL_FIX_KIND.to_string(),
+        diagnostic_message: message.to_string(),
+        rocky_source: rocky_source.to_string(),
+        uri: uri.clone(),
+    };
+
+    Some(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: None,
+        data: Some(serde_json::to_value(data).ok()?),
+        ..Default::default()
+    })
+}
+
+/// Resolve a DSL AI action — call the LLM, extract a corrected `.rocky`
+/// pipeline, and emit a `TextEdit` that replaces the entire file body.
+async fn resolve_ai_dsl_action(data: &AiDslActionData) -> AiResolveOutcome {
+    let api_key = match std::env::var(AI_API_KEY_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return AiResolveOutcome::Disabled(format!(
+                "{AI_API_KEY_ENV} not set in the LSP environment"
+            ));
+        }
+    };
+
+    let (system_prompt, user_prompt) =
+        build_dsl_fix_prompt(&data.diagnostic_message, &data.rocky_source);
+
+    let ai_config = rocky_ai::client::AiConfig {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        api_key: rocky_core::redacted::RedactedString::new(api_key),
+        default_format: "rocky".to_string(),
+        max_attempts: 1,
+        max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+    };
+
+    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+        Ok(c) => c,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+
+    let response = match client.generate(&system_prompt, &user_prompt, None).await {
+        Ok(r) => r,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI request failed: {e}")),
+    };
+
+    let extracted = rocky_ai::generate::extract_code(&response.content);
+    let revised = extracted.trim();
+    if revised.is_empty() {
+        return AiResolveOutcome::Disabled(
+            "AI response did not contain a `.rocky` code block".to_string(),
+        );
+    }
+
+    AiResolveOutcome::Edit(TextEdit {
+        range: full_document_range(&data.rocky_source),
+        new_text: revised.to_string(),
+    })
+}
+
+/// Build the LLM prompt for a `.rocky` DSL parse-error fix. The system
+/// half pins the DSL grammar surface so the LLM doesn't invent
+/// keywords; the user half supplies the broken file + parse error.
+fn build_dsl_fix_prompt(error_message: &str, rocky_source: &str) -> (String, String) {
+    let system = "You are an expert Rocky DSL author. Rocky DSL files use the `.rocky` \
+                 extension and define a pipeline as a sequence of top-to-bottom steps. \
+                 Recognized steps are: `from <model>`, `where <predicate>`, \
+                 `group <keys> { agg: func(...) }`, `derive { name: expr }`, \
+                 `select { col1, col2 }`, `join <model> as <alias> on <key> { keep ... }`, \
+                 `sort <col> asc|desc`, `take <n>`, `distinct`, `replicate <source>`. \
+                 Pipelines always start with `from`, `replicate`, or `select`. The DSL \
+                 uses `!=` for NULL-safe inequality (compiles to `IS DISTINCT FROM`). \
+                 Your task is to rewrite the user's `.rocky` source so it parses \
+                 cleanly. Output ONLY the revised `.rocky` source inside a single \
+                 ```rocky fenced block — no commentary, no explanation. Preserve the \
+                 user's intent and column names; only change what's necessary to clear \
+                 the parse error."
+        .to_string();
+
+    let user = format!(
+        "Parse error: {error_message}\n\n\
+         Current `.rocky` source:\n```rocky\n{rocky_source}\n```\n\n\
+         Rewrite this `.rocky` pipeline so it parses cleanly. Keep the change minimal."
+    );
+
+    (system, user)
+}
+
+/// Convert a [`rocky_lang::ParseError`] into a `Range` + display message
+/// suitable for publishing as an LSP diagnostic. The error carries a
+/// byte offset which we map to a `(line, character)` `Position` by
+/// scanning newlines in `source`. The diagnostic spans one character so
+/// the squiggle lands at the offending token rather than a full line.
+fn lsp_range_from_parse_error(err: &rocky_lang::ParseError, source: &str) -> (Range, String) {
+    use rocky_lang::ParseError;
+
+    let (offset, message) = match err {
+        ParseError::UnexpectedToken {
+            expected,
+            found,
+            offset,
+        } => (Some(*offset), format!("expected {expected}, found {found}")),
+        ParseError::UnexpectedEof { expected } => (
+            Some(source.len().saturating_sub(1)),
+            format!("unexpected end of file: expected {expected}"),
+        ),
+        ParseError::InvalidNumber { value } => (None, format!("invalid number: {value}")),
+        ParseError::EmptyFile => (None, "empty file: no pipeline steps found".to_string()),
+        ParseError::TooDeeplyNested {
+            depth,
+            limit,
+            offset,
+        } => (
+            Some(*offset),
+            format!("expression nested too deeply: depth {depth} exceeds limit {limit}"),
+        ),
+    };
+
+    let position = offset
+        .map(|off| byte_offset_to_position(source, off))
+        .unwrap_or_else(|| Position::new(0, 0));
+    let end = Position::new(position.line, position.character.saturating_add(1));
+    (Range::new(position, end), message)
+}
+
+/// Convert a byte offset into an LSP `(line, character)` `Position` by
+/// scanning `source`. UTF-16 alignment isn't applied — the same
+/// approximation `publish_diagnostics` makes for compiler diagnostics,
+/// since they don't carry exact character widths either.
+fn byte_offset_to_position(source: &str, offset: usize) -> Position {
+    let offset = offset.min(source.len());
+    let mut line = 0u32;
+    let mut col = 0u32;
+    for (i, ch) in source.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line = line.saturating_add(1);
+            col = 0;
+        } else {
+            col = col.saturating_add(1);
+        }
+    }
+    Position::new(line, col)
 }
 
 /// Collect semantic tokens from a parsed query.
@@ -4355,5 +4920,321 @@ mod tests {
             }
             AiResolveOutcome::Edit(_) => panic!("must not produce an edit without an API key"),
         }
+    }
+
+    // ── W004 classification-tag AI arm ─────────────────────────────────────
+
+    #[test]
+    fn parse_classification_message_extracts_tag_and_column() {
+        let msg = "classification tag 'pii' on column 'email' has no matching `[mask]` strategy";
+        assert_eq!(parse_classification_message(msg), Some(("pii", "email")));
+
+        let msg2 =
+            "classification tag 'pii_v2' on column 'user_id' has no matching `[mask]` strategy";
+        assert_eq!(
+            parse_classification_message(msg2),
+            Some(("pii_v2", "user_id"))
+        );
+
+        assert!(parse_classification_message("unrelated diagnostic body").is_none());
+    }
+
+    #[test]
+    fn ai_classification_action_carries_payload() {
+        let toml_uri = tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap();
+        let toml_text = "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let msg = "classification tag 'pii' on column 'email' has no matching `[mask]` strategy";
+        let diag = synth_diag("W004", msg);
+
+        let action = build_ai_classification_action(msg, "users", &toml_uri, toml_text, &diag)
+            .expect("AI classification arm must emit an action for a parseable W004");
+        assert_eq!(action.title, "AI fix: add `[mask.pii]` block to rocky.toml");
+        assert!(action.edit.is_none(), "resolve must fill in `edit`");
+
+        let data = action
+            .data
+            .as_ref()
+            .expect("data carries the resolve payload");
+        let parsed: AiClassificationActionData =
+            serde_json::from_value(data.clone()).expect("payload round-trips");
+        assert_eq!(parsed.kind, AI_CLASSIFICATION_FIX_KIND);
+        assert_eq!(parsed.tag, "pii");
+        assert_eq!(parsed.column, "email");
+        assert_eq!(parsed.model_name, "users");
+        assert_eq!(parsed.rocky_toml_uri, toml_uri);
+        assert_eq!(parsed.rocky_toml_text, toml_text);
+    }
+
+    #[test]
+    fn ai_classification_action_skipped_on_unparseable_message() {
+        let toml_uri = tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap();
+        let msg = "not a W004 shape";
+        let diag = synth_diag("W004", msg);
+        assert!(
+            build_ai_classification_action(msg, "users", &toml_uri, "", &diag).is_none(),
+            "must skip when diagnostic message doesn't parse"
+        );
+    }
+
+    #[test]
+    fn end_of_document_position_handles_edge_cases() {
+        assert_eq!(end_of_document_position(""), Position::new(0, 0));
+        assert_eq!(end_of_document_position("abc"), Position::new(0, 3));
+        assert_eq!(end_of_document_position("abc\n"), Position::new(1, 0));
+        assert_eq!(end_of_document_position("ab\ncde"), Position::new(1, 3));
+    }
+
+    #[test]
+    fn build_classification_fix_prompt_includes_required_substrings() {
+        let (system, user) = build_classification_fix_prompt(
+            "pii",
+            "email",
+            "users",
+            "[adapter]\ntype=\"duckdb\"\n",
+        );
+        assert!(system.contains("Rocky"));
+        assert!(system.contains("```toml"));
+        assert!(user.contains("pii"));
+        assert!(user.contains("email"));
+        assert!(user.contains("users"));
+        assert!(user.contains("[adapter]"));
+        assert!(user.contains("[mask.pii]"));
+    }
+
+    #[tokio::test]
+    async fn resolve_classification_returns_disabled_when_api_key_missing() {
+        // SAFETY: tests run single-threaded inside a `#[tokio::test]`
+        // current-thread runtime; nothing else is reading the env right
+        // now.
+        unsafe {
+            std::env::remove_var(AI_API_KEY_ENV);
+        }
+        let data = AiClassificationActionData {
+            kind: AI_CLASSIFICATION_FIX_KIND.into(),
+            tag: "pii".into(),
+            column: "email".into(),
+            model_name: "users".into(),
+            rocky_toml_uri: tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap(),
+            rocky_toml_text: "[adapter]\ntype = \"duckdb\"\n".into(),
+        };
+        match resolve_ai_classification_action(&data).await {
+            AiResolveOutcome::Disabled(reason) => assert!(
+                reason.contains(AI_API_KEY_ENV),
+                "disabled reason should name the missing env var, got `{reason}`"
+            ),
+            AiResolveOutcome::Edit(_) => panic!("must not produce an edit without an API key"),
+        }
+    }
+
+    // ── `.rocky` DSL parse-error AI arm (E028) ─────────────────────────────
+
+    #[test]
+    fn ai_dsl_action_carries_payload() {
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/m/broken.rocky").unwrap();
+        let source = "from upstream\nselct { id }\n";
+        let diag = synth_diag("E028", "expected `{`, found `selct`");
+
+        let action = build_ai_dsl_action(&diag.message, source, &uri, &diag)
+            .expect("AI DSL arm must emit an action on a `.rocky` URI");
+        assert_eq!(
+            action.title,
+            "AI fix: rewrite `.rocky` pipeline to resolve parse error"
+        );
+        assert!(action.edit.is_none(), "resolve must fill in `edit`");
+
+        let data = action
+            .data
+            .as_ref()
+            .expect("data carries the resolve payload");
+        let parsed: AiDslActionData =
+            serde_json::from_value(data.clone()).expect("payload round-trips");
+        assert_eq!(parsed.kind, AI_DSL_FIX_KIND);
+        assert_eq!(parsed.uri, uri);
+        assert_eq!(parsed.rocky_source, source);
+        assert!(parsed.diagnostic_message.contains("selct"));
+    }
+
+    #[test]
+    fn ai_dsl_action_skipped_on_sql_uri() {
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/m/model.sql").unwrap();
+        let diag = synth_diag("E028", "anything");
+        assert!(
+            build_ai_dsl_action("anything", "SELECT 1", &uri, &diag).is_none(),
+            "must skip non-`.rocky` URIs — belt-and-braces guard"
+        );
+    }
+
+    #[test]
+    fn build_dsl_fix_prompt_includes_grammar_anchors() {
+        let (system, user) = build_dsl_fix_prompt(
+            "expected `{`, found `selct`",
+            "from upstream\nselct { id }\n",
+        );
+        assert!(system.contains("from <model>"));
+        assert!(system.contains("select { col1, col2 }"));
+        assert!(system.contains("```rocky"));
+        assert!(user.contains("selct"));
+        assert!(user.contains("from upstream"));
+    }
+
+    #[test]
+    fn lsp_range_from_parse_error_maps_offset() {
+        use rocky_lang::ParseError;
+
+        let source = "from upstream\nselct { id }\n";
+        // Offset 14 = start of line 1 ('s' in `selct`).
+        let err = ParseError::UnexpectedToken {
+            expected: "`{`".into(),
+            found: "selct".into(),
+            offset: 14,
+        };
+        let (range, message) = lsp_range_from_parse_error(&err, source);
+        assert_eq!(range.start, Position::new(1, 0));
+        assert_eq!(range.end, Position::new(1, 1));
+        assert!(message.contains("selct"));
+
+        let (range, message) = lsp_range_from_parse_error(&ParseError::EmptyFile, "");
+        assert_eq!(range.start, Position::new(0, 0));
+        assert!(message.contains("empty file"));
+    }
+
+    #[test]
+    fn byte_offset_to_position_handles_multiline() {
+        let source = "abc\ndefg\nhi";
+        assert_eq!(byte_offset_to_position(source, 0), Position::new(0, 0));
+        assert_eq!(byte_offset_to_position(source, 4), Position::new(1, 0));
+        assert_eq!(byte_offset_to_position(source, 9), Position::new(2, 0));
+        let pos = byte_offset_to_position(source, 100);
+        assert_eq!(pos.line, 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_dsl_returns_disabled_when_api_key_missing() {
+        // SAFETY: tests run single-threaded inside a `#[tokio::test]`
+        // current-thread runtime; nothing else is reading the env right
+        // now.
+        unsafe {
+            std::env::remove_var(AI_API_KEY_ENV);
+        }
+        let data = AiDslActionData {
+            kind: AI_DSL_FIX_KIND.into(),
+            diagnostic_message: "expected `{`, found `selct`".into(),
+            rocky_source: "from upstream\nselct { id }\n".into(),
+            uri: tower_lsp::lsp_types::Url::parse("file:///tmp/m/broken.rocky").unwrap(),
+        };
+        match resolve_ai_dsl_action(&data).await {
+            AiResolveOutcome::Disabled(reason) => assert!(
+                reason.contains(AI_API_KEY_ENV),
+                "disabled reason should name the missing env var, got `{reason}`"
+            ),
+            AiResolveOutcome::Edit(_) => panic!("must not produce an edit without an API key"),
+        }
+    }
+
+    // ── code_action_resolve dispatch ───────────────────────────────────────
+
+    #[test]
+    fn ai_action_kinds_are_distinct() {
+        // Sanity check on the dispatcher discriminators — duplicates would
+        // route one arm's payload through another arm's resolver and
+        // crash the LSP at runtime.
+        assert_ne!(AI_CONTRACT_FIX_KIND, AI_CLASSIFICATION_FIX_KIND);
+        assert_ne!(AI_CONTRACT_FIX_KIND, AI_DSL_FIX_KIND);
+        assert_ne!(AI_CLASSIFICATION_FIX_KIND, AI_DSL_FIX_KIND);
+    }
+
+    // ── W004 end-to-end: production compile pipeline ──────────────────────
+
+    /// End-to-end test for the W004 wiring. Mirrors the production
+    /// `recompile()` flow: load `rocky.toml` for `mask` + `allow_unmasked`,
+    /// run `compile`, and assert a W004 diagnostic surfaces with the
+    /// expected message shape. Without this test the AI arm would be
+    /// unit-tested in isolation against a diagnostic that never actually
+    /// fires through the LSP — exactly the failure mode
+    /// `feedback_helpers_without_call_sites` calls out.
+    #[test]
+    fn w004_fires_through_compile_when_rocky_toml_declares_no_mask() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        // rocky.toml declares no `[mask]` block — `pii` is unresolved.
+        fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\n\
+             type = \"duckdb\"\n\
+             path = \":memory:\"\n",
+        )
+        .unwrap();
+
+        // Model declares a classification tag on a column.
+        fs::write(
+            models_dir.join("users.sql"),
+            "SELECT id, email FROM raw_users\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\
+             [strategy]\n\
+             type = \"full_refresh\"\n\
+             [target]\n\
+             catalog = \"warehouse\"\n\
+             schema = \"gold\"\n\
+             table = \"users\"\n\
+             [classification]\n\
+             email = \"pii\"\n",
+        )
+        .unwrap();
+
+        // Mirror `recompile()`'s mask/allow_unmasked threading.
+        let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
+        let compile_config = rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            source_column_info: HashMap::new(),
+            mask: cfg.mask,
+            allow_unmasked: cfg.classifications.allow_unmasked,
+        };
+        let result = rocky_compiler::compile::compile(&compile_config).unwrap();
+
+        let w004: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W004")
+            .collect();
+        assert_eq!(
+            w004.len(),
+            1,
+            "expected one W004 from unresolved `pii` tag, got: {:?}",
+            result.diagnostics
+        );
+        let msg = w004[0].message.to_string();
+        assert!(
+            parse_classification_message(&msg).is_some(),
+            "W004 message must match the shape parsed by `parse_classification_message`: {msg}"
+        );
+    }
+
+    /// E028 wiring test — `lsp_range_from_parse_error` over a real
+    /// `rocky_lang::parse` failure yields a non-(0,0) span and a
+    /// non-empty message. Mirrors what `publish_dsl_parse_diagnostics`
+    /// does at runtime on every `.rocky` file that fails to parse.
+    #[test]
+    fn e028_synthetic_diagnostic_from_broken_rocky_file() {
+        let source = "from upstream\nselct { id }\n";
+        let err = rocky_lang::parse(source).expect_err("must fail to parse");
+        let (range, message) = lsp_range_from_parse_error(&err, source);
+
+        assert!(
+            range.start.line >= 1 || range.start.character > 0,
+            "expected non-zero span for a broken token on line 1, got {range:?}"
+        );
+        assert!(!message.is_empty(), "diagnostic message must be non-empty");
     }
 }
