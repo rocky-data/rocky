@@ -446,6 +446,40 @@ pub struct ColumnMask {
     pub strategy: crate::mask::MaskStrategy,
 }
 
+/// Per-model cost ceiling — the maximum allowed spend for a single run.
+///
+/// Both fields are optional; a `CostBudget` with both fields `None` is
+/// collapsed to `cost_ceiling = None` by the sidecar-to-IR conversion in
+/// `rocky-core::models::Model::to_model_ir()`. Callers that want to check
+/// whether the budget carries any constraint should use [`CostBudget::is_empty`].
+///
+/// This type carries only the *cost dimensions* (`max_usd`,
+/// `max_bytes_scanned`). Policy fields (`on_breach`, `max_duration_ms`) live
+/// on `rocky-core::config::ModelBudgetConfig` and are not part of the IR.
+///
+/// Serialized following the canonical-JSON rule: each `Option` field is
+/// omitted when `None` so the recipe-hash never sees a stale `null`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostBudget {
+    /// Maximum allowed cost in USD for a single run of this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    /// Maximum bytes scanned for a single run of this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_scanned: Option<u64>,
+}
+
+impl CostBudget {
+    /// Returns `true` when neither cost field is set.
+    ///
+    /// Used by `to_model_ir()` to avoid storing a vacuous
+    /// `Some(CostBudget { None, None })` which would pollute recipe-hashes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.max_usd.is_none() && self.max_bytes_scanned.is_none()
+    }
+}
+
 /// Per-model intermediate representation.
 ///
 /// Carries everything Rocky needs to know about a single model to generate
@@ -549,6 +583,20 @@ pub struct ModelIr {
     /// `None` for non-transformation models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_options: Option<LakehouseOptions>,
+    /// Declared per-model cost ceiling from the `[budget]` sidecar block.
+    ///
+    /// `None` means no ceiling was declared (or only policy fields like
+    /// `on_breach` were set — those stay in `rocky-core::config`). `Some`
+    /// means the user declared at least one cost dimension in their sidecar.
+    ///
+    /// # Runtime wiring
+    ///
+    /// TODO(D-2): wire into `propagate_costs` once the
+    /// `CatalogClient::table_stats` provider spike (D-2) reaches a
+    /// go-decision. The field is populated today; the enforcement check is
+    /// not yet called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_ceiling: Option<CostBudget>,
 }
 
 /// Inferred variant tag for a [`ModelIr`].
@@ -625,6 +673,7 @@ impl ModelIr {
             invalidate_hard_deletes: false,
             format: None,
             format_options: None,
+            cost_ceiling: None,
         }
     }
 
@@ -668,6 +717,7 @@ impl ModelIr {
             invalidate_hard_deletes: false,
             format,
             format_options,
+            cost_ceiling: None,
         }
     }
 
@@ -708,6 +758,7 @@ impl ModelIr {
             invalidate_hard_deletes,
             format: None,
             format_options: None,
+            cost_ceiling: None,
         }
     }
 
@@ -1018,6 +1069,7 @@ mod tests {
             invalidate_hard_deletes: false,
             format: None,
             format_options: None,
+            cost_ceiling: None,
         }
     }
 
@@ -1079,6 +1131,7 @@ mod tests {
             invalidate_hard_deletes: false,
             format: None,
             format_options: None,
+            cost_ceiling: None,
         }
     }
 
@@ -1113,6 +1166,7 @@ mod tests {
             invalidate_hard_deletes: true,
             format: None,
             format_options: None,
+            cost_ceiling: None,
         }
     }
 
@@ -1531,5 +1585,91 @@ mod tests {
         assert_eq!(ModelIrVariant::Transformation.as_str(), "transformation");
         assert_eq!(ModelIrVariant::Snapshot.as_str(), "snapshot");
         assert_eq!(format!("{}", ModelIrVariant::Replication), "replication");
+    }
+
+    // ----- CostBudget / cost_ceiling tests -----
+
+    #[test]
+    fn cost_ceiling_none_omitted_from_serialization() {
+        // Canonical-JSON rule: `None` Option fields must be absent from JSON.
+        let m = sample_replication_model(); // cost_ceiling is None
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("cost_ceiling"),
+            "absent cost_ceiling must be skipped, got: {json}"
+        );
+    }
+
+    #[test]
+    fn cost_ceiling_roundtrip_byte_stable() {
+        let mut m = sample_transformation_model();
+        m.cost_ceiling = Some(CostBudget {
+            max_usd: Some(10.0),
+            max_bytes_scanned: Some(1_000_000_000),
+        });
+        let json1 = serde_json::to_string(&m).unwrap();
+        let back: ModelIr = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2, "cost_ceiling round-trip must be byte-stable");
+        let cb = back.cost_ceiling.unwrap();
+        assert_eq!(cb.max_usd, Some(10.0));
+        assert_eq!(cb.max_bytes_scanned, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn recipe_hash_changes_when_cost_ceiling_changes() {
+        let mut m = sample_transformation_model();
+        let h1 = m.recipe_hash();
+        m.cost_ceiling = Some(CostBudget {
+            max_usd: Some(5.0),
+            max_bytes_scanned: None,
+        });
+        let h2 = m.recipe_hash();
+        assert_ne!(h1, h2, "adding cost_ceiling must change the recipe hash");
+    }
+
+    #[test]
+    fn cost_budget_is_empty() {
+        let empty = CostBudget {
+            max_usd: None,
+            max_bytes_scanned: None,
+        };
+        assert!(empty.is_empty(), "both-None CostBudget must be empty");
+
+        let with_usd = CostBudget {
+            max_usd: Some(1.0),
+            max_bytes_scanned: None,
+        };
+        assert!(
+            !with_usd.is_empty(),
+            "CostBudget with max_usd must not be empty"
+        );
+
+        let with_bytes = CostBudget {
+            max_usd: None,
+            max_bytes_scanned: Some(500_000),
+        };
+        assert!(
+            !with_bytes.is_empty(),
+            "CostBudget with max_bytes_scanned must not be empty"
+        );
+    }
+
+    #[test]
+    fn cost_budget_partial_none_omitted() {
+        // A CostBudget with only max_usd set must omit max_bytes_scanned from JSON.
+        let cb = CostBudget {
+            max_usd: Some(3.5),
+            max_bytes_scanned: None,
+        };
+        let json = serde_json::to_string(&cb).unwrap();
+        assert!(
+            json.contains("max_usd"),
+            "present max_usd must appear in JSON"
+        );
+        assert!(
+            !json.contains("max_bytes_scanned"),
+            "absent max_bytes_scanned must be skipped, got: {json}"
+        );
     }
 }
