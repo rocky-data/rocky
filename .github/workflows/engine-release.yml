@@ -85,7 +85,7 @@ jobs:
       # that ships with the runner image.
       - name: Install NASM (Windows only)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
 
       # Linux: free disk space and add swap (DuckDB C++ is memory-hungry)
       - name: Free disk space and add swap
@@ -97,7 +97,7 @@ jobs:
       # Linux: install zig + cargo-zigbuild for portable glibc builds
       - name: Install zig
         if: matrix.zigbuild
-        uses: mlugg/setup-zig@v2.2.1
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.1
 
