@@ -27,6 +27,7 @@ from dagster_rocky.resource import (
     DEFAULT_HTTP_TIMEOUT_SECONDS,
     MIN_ROCKY_VERSION,
     RockyResource,
+    _parse_run_or_apply,
     _redact_argv,
     _truncate_stderr_for_metadata,
     _validate_governance_override,
@@ -1593,6 +1594,51 @@ def test_metrics_uses_http_when_server_url_is_set():
 # ---------------------------------------------------------------------------
 # Phase 5 plan/apply orchestration
 # ---------------------------------------------------------------------------
+
+
+def test_parse_run_or_apply_raises_on_success_false_envelope():
+    """Engine emits ``success: false`` with a parseable ``result`` even
+    when the apply did not actually succeed. Silently unwrapping the
+    inner ``RunResult`` would surface a green materialization on top of
+    a failed apply, so ``_parse_run_or_apply`` must raise ``dg.Failure``
+    in that case.
+    """
+    inner = json.loads(_run_json())
+    envelope = json.dumps(
+        {
+            "version": "0.3.0",
+            "command": "apply",
+            "plan_id": "b" * 64,
+            "plan_kind": "run",
+            "success": False,
+            "result": inner,
+        }
+    )
+
+    with pytest.raises(dg.Failure) as excinfo:
+        _parse_run_or_apply(envelope, command="run")
+
+    desc = excinfo.value.description or ""
+    assert "success=false" in desc
+    metadata = excinfo.value.metadata or {}
+    assert metadata["plan_id"].text == "b" * 64
+    assert metadata["plan_kind"].text == "run"
+    # The inner payload preview is surfaced so operators can triage the
+    # underlying engine result without grepping the run viewer log.
+    assert "inner_result_preview" in metadata
+
+
+def test_parse_run_or_apply_unwraps_on_success_true_envelope():
+    """Pin the happy path: ``success: true`` envelopes still unwrap to
+    the inner ``RunResult`` exactly as before. Regression guard for the
+    new ``success=false`` branch."""
+    inner = json.loads(_run_json())
+    envelope = _apply_envelope_json(inner=inner)
+
+    result = _parse_run_or_apply(envelope, command="run")
+
+    assert result.command == "run"
+    assert result.tables_copied == 1
 
 
 def test_run_dispatches_plan_then_apply_when_plan_id_persisted():
