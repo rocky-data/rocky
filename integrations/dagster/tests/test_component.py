@@ -537,9 +537,7 @@ def test_write_state_creates_parent_dir(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert state_path.exists()
 
 
-def test_write_state_is_atomic_on_failed_replace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+def test_write_state_is_atomic_on_failed_replace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """``write_state_to_path`` must not leave a half-written canonical
     state file behind. The implementation serialises into a sibling
     ``.tmp`` and then ``os.replace``-s it into place.
@@ -574,9 +572,7 @@ def test_write_state_is_atomic_on_failed_replace(
     assert state_path.read_text(encoding="utf-8") == '{"existing": "content"}'
 
 
-def test_write_state_writes_to_tmp_then_replaces(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+def test_write_state_writes_to_tmp_then_replaces(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Verify the tmp + os.replace sequence: the temp file is created
     as a sibling of the state file before being moved into place.
 
@@ -1230,9 +1226,7 @@ def test_rocky_component_yaml_rejects_resolver_callable_values():
 
     for field_name in ("shadow_suffix_fn", "governance_override_fn", "idempotency_key_fn"):
         with pytest.raises(ResolutionException):
-            RockyComponent.resolve_from_yaml(
-                f"config_path: rocky.toml\n{field_name}: some_value\n"
-            )
+            RockyComponent.resolve_from_yaml(f"config_path: rocky.toml\n{field_name}: some_value\n")
 
 
 def test_rocky_component_yaml_resolves_with_default_resource_fields(tmp_path: Path):

@@ -815,6 +815,10 @@ class RockyResource(dg.ConfigurableResource):
 
     # Instance-level cache for the version check (not a Dagster config field).
     _version_checked: bool = False
+    # Instance-level cache so the Pipes-timeout warning fires exactly once
+    # per resource lifetime instead of on every materialize. Not a Dagster
+    # config field.
+    _pipes_timeout_warned: bool = False
 
     # ------------------------------------------------------------------ #
     # Per-call kwarg resolvers                                           #
@@ -1955,6 +1959,48 @@ class RockyResource(dg.ConfigurableResource):
             )
         return apply_runner(["apply", plan_id])
 
+    def _maybe_warn_pipes_timeout_ignored(
+        self, context: dg.AssetExecutionContext | dg.OpExecutionContext | None
+    ) -> None:
+        """Emit a one-time warning when ``run_pipes`` is called with a
+        non-default ``timeout_seconds``.
+
+        ``dagster.PipesSubprocessClient`` owns its subprocess and exposes
+        no public kill/cancel hook, so the resource cannot enforce a
+        watchdog around the apply step in Pipes mode. Users who tuned
+        ``timeout_seconds`` (typically to cap a known-slow warehouse)
+        would expect Pipes mode to honour it; surfacing the mismatch
+        loudly in the run log avoids the silent "hangs forever" failure
+        mode. The Dagster-side knobs to use are documented in
+        :meth:`run_pipes`.
+
+        The warning fires exactly once per resource lifetime via
+        ``_pipes_timeout_warned``. Both ``context.log`` (when an
+        execution context is supplied) and the module logger receive the
+        message so it lands in the run viewer *and* in the code-server
+        / executor compute log.
+        """
+        if self.timeout_seconds == DEFAULT_TIMEOUT_SECONDS or self._pipes_timeout_warned:
+            return
+        msg = (
+            f"RockyResource.timeout_seconds={self.timeout_seconds} is "
+            "ignored by run_pipes — dagster.PipesSubprocessClient owns "
+            "the apply subprocess and exposes no kill hook. The plan "
+            "step is still watchdog-bound, but a warehouse hang during "
+            "apply will pin the Dagster step process indefinitely. "
+            "Configure a Dagster-side run timeout for hard bounding, or "
+            "use RockyResource.run_streaming() if you need the "
+            "resource-level watchdog."
+        )
+        if context is not None and getattr(context, "log", None) is not None:
+            with contextlib.suppress(Exception):
+                context.log.warning(msg)
+        _log.warning(msg)
+        # ``ConfigurableResource`` is pydantic-immutable at runtime so
+        # we set via ``object.__setattr__`` — same pattern as the
+        # adjacent ``_version_checked`` flag.
+        object.__setattr__(self, "_pipes_timeout_warned", True)
+
     def run_pipes(
         self,
         context: dg.AssetExecutionContext | dg.OpExecutionContext,
@@ -2011,6 +2057,22 @@ class RockyResource(dg.ConfigurableResource):
         ``.get_results()`` to extract the materialization events
         Dagster constructed from the Pipes messages.
 
+        **Timeout contract.** ``timeout_seconds`` does **not** apply to
+        the apply step in Pipes mode. The plan step still routes through
+        :meth:`_run_rocky` and is watchdog-bound; the apply step is
+        delegated to :class:`dagster.PipesSubprocessClient`, which owns
+        the subprocess internally and exposes no kill / cancel hook. A
+        warehouse hang during the apply step will therefore pin the
+        Dagster step process indefinitely. Configure a Dagster-side run
+        timeout (``dagster.RunRetryPolicy`` or executor-level
+        ``run_timeout``) for hard bounding. The resource emits a
+        one-time warning via the module logger on the first
+        ``run_pipes`` call when ``timeout_seconds`` is non-default, so
+        operators see the mismatch in the run log. Use
+        :meth:`run_streaming` if you need the resource-level watchdog
+        and don't strictly need Pipes-native ``MaterializationEvent``
+        emission.
+
         Args:
             context: Dagster execution context. Same as
                 :meth:`run_streaming` — required for Pipes context
@@ -2051,6 +2113,7 @@ class RockyResource(dg.ConfigurableResource):
                 propagates a Failure when the subprocess crashes
                 without sending a Pipes ``closed`` message.
         """
+        self._maybe_warn_pipes_timeout_ignored(context)
         resolved = self._apply_resolvers(
             context=context,
             method="run_pipes",

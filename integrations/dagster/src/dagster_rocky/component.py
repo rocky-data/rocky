@@ -486,9 +486,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     shadow_suffix_fn: Annotated[
         Resolver | None,
         dg.Resolver(
-            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
-                "shadow_suffix_fn", _val
-            ),
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml("shadow_suffix_fn", _val),
             model_field_type=type(None),
             description=(
                 "Reserved — set programmatically in a subclass. Cannot be "
@@ -503,9 +501,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     governance_override_fn: Annotated[
         Resolver | None,
         dg.Resolver(
-            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
-                "governance_override_fn", _val
-            ),
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml("governance_override_fn", _val),
             model_field_type=type(None),
             description=(
                 "Reserved — set programmatically in a subclass. Cannot be "
@@ -520,9 +516,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     idempotency_key_fn: Annotated[
         Resolver | None,
         dg.Resolver(
-            lambda _ctx, _val: _reject_resolver_callable_in_yaml(
-                "idempotency_key_fn", _val
-            ),
+            lambda _ctx, _val: _reject_resolver_callable_in_yaml("idempotency_key_fn", _val),
             model_field_type=type(None),
             description=(
                 "Reserved — set programmatically in a subclass. Cannot be "

@@ -1793,6 +1793,90 @@ def test_run_pipes_raises_when_engine_returns_null_plan_id():
     assert "plan_id" in str(exc.value)
 
 
+def test_run_pipes_warns_when_timeout_seconds_is_non_default(caplog):
+    """``timeout_seconds`` does not bound the apply step in Pipes mode
+    (``PipesSubprocessClient`` owns the subprocess and exposes no kill
+    hook). Surface that loudly as a one-time warning so operators see
+    the mismatch in the run log instead of silently relying on a
+    timeout that will never fire.
+    """
+    import logging
+
+    rocky = RockyResource(timeout_seconds=60)  # any non-default value
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    with (
+        caplog.at_level(logging.WARNING, logger="dagster_rocky.resource"),
+        _patch_pipes_plan_step(),
+    ):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    # Module logger emits the warning.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("timeout_seconds=60" in r.message for r in warnings)
+    assert any("ignored by run_pipes" in r.message for r in warnings)
+    # Context logger also receives it so it lands in the run viewer.
+    context.log.warning.assert_called_once()
+    assert "ignored by run_pipes" in context.log.warning.call_args.args[0]
+
+
+def test_run_pipes_warning_fires_once_per_resource_lifetime(caplog):
+    """Pin the de-duplication contract — repeated ``run_pipes`` calls on
+    the same resource only emit the warning once, otherwise long-lived
+    Dagster code servers would flood their logs."""
+    import logging
+
+    rocky = RockyResource(timeout_seconds=120)
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    with (
+        caplog.at_level(logging.WARNING, logger="dagster_rocky.resource"),
+        _patch_pipes_plan_step(),
+    ):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "ignored by run_pipes" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_run_pipes_does_not_warn_with_default_timeout(caplog):
+    """The warning fires only when ``timeout_seconds`` was actively
+    customised. Default-config users see no log noise."""
+    import logging
+
+    rocky = RockyResource()  # default timeout_seconds
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+
+    with (
+        caplog.at_level(logging.WARNING, logger="dagster_rocky.resource"),
+        _patch_pipes_plan_step(),
+    ):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "ignored by run_pipes" in r.message
+    ]
+    assert warnings == []
+    context.log.warning.assert_not_called()
+
+
 def test_extract_plan_id_returns_none_for_malformed_payload():
     """``_extract_plan_id`` is the gate keeping malformed plan output
     from sending the apply step into a broken state. Treat any
