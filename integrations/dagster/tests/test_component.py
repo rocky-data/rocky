@@ -1185,6 +1185,68 @@ def test_rocky_component_python_kwarg_post_state_write_hook_preserved(tmp_path: 
     assert calls == [tmp_path]
 
 
+def test_get_rocky_resource_threads_all_fields():
+    """``_get_rocky_resource`` must forward every field ``RockyResource``
+    accepts. Previously the component dropped ``shadow_suffix_fn``,
+    ``governance_override_fn``, ``idempotency_key_fn``, ``timeout_seconds``,
+    and ``server_url`` — users following the branch_deploy docstring
+    silently lost shadowing under :class:`RockyComponent` and PR runs
+    wrote to production tables.
+    """
+
+    def _suffix(_ctx: Any) -> str:
+        return "shadow_x"
+
+    def _override(_ctx: Any) -> dict:
+        return {"workspace_ids": ["ws-1"]}
+
+    def _idemp(_ctx: Any) -> str:
+        return "key-123"
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        timeout_seconds=42,
+        server_url="https://rocky.example/",
+        shadow_suffix_fn=_suffix,
+        governance_override_fn=_override,
+        idempotency_key_fn=_idemp,
+    )
+
+    resource = component._get_rocky_resource()
+
+    # Config-shaped fields propagate by value.
+    assert resource.timeout_seconds == 42
+    assert resource.server_url == "https://rocky.example/"
+    # Callables propagate by identity.
+    assert resource.shadow_suffix_fn is _suffix
+    assert resource.governance_override_fn is _override
+    assert resource.idempotency_key_fn is _idemp
+
+
+def test_rocky_component_yaml_rejects_resolver_callable_values():
+    """The three resolver callable fields share the post_state_write_hook
+    contract: setting them in YAML raises rather than silently dropping."""
+    from dagster.components.resolved.errors import ResolutionException
+
+    for field_name in ("shadow_suffix_fn", "governance_override_fn", "idempotency_key_fn"):
+        with pytest.raises(ResolutionException):
+            RockyComponent.resolve_from_yaml(
+                f"config_path: rocky.toml\n{field_name}: some_value\n"
+            )
+
+
+def test_rocky_component_yaml_resolves_with_default_resource_fields(tmp_path: Path):
+    """YAML payloads that omit the new fields resolve cleanly to defaults."""
+    yaml_payload = "config_path: rocky.toml\nbinary_path: rocky\n"
+    component = RockyComponent.resolve_from_yaml(yaml_payload)
+    assert component.shadow_suffix_fn is None
+    assert component.governance_override_fn is None
+    assert component.idempotency_key_fn is None
+    assert component.server_url is None
+    # Default mirrors RockyResource — one hour.
+    assert component.timeout_seconds == 3600
+
+
 def test_build_defs_survives_duplicate_table_records(tmp_path: Path, caplog):
     """Defensive: a duplicate ``(asset_key, name)`` from ``rocky discover``
     must not bring down the whole asset graph.
