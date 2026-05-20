@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+use rocky_core::config::BudgetBreachAction;
+
 use crate::diagnostic::Diagnostic;
 
 /// Check every model's declared cost ceiling against its propagated estimate.
@@ -70,6 +72,79 @@ pub fn check_cost_ceilings(
                     projected,
                     ceiling_bytes,
                 ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Plan-time budget ceiling check that honours each model's `on_breach` policy.
+///
+/// Identical to [`check_cost_ceilings`] in breach detection, but emits
+/// **warning**-severity diagnostics when the model's `on_breach` field is
+/// `"warn"` (the default) and **error**-severity diagnostics when it is
+/// `"error"`.  This respects the user's declared intent: at plan time a
+/// `warn` model merely surfaces an advisory; an `error` model will set
+/// `PlanOutput::has_budget_errors = true`, signalling to CI/orchestration
+/// that this plan should not proceed.
+///
+/// At compile time (offline, no real stats) [`check_cost_ceilings`] is used
+/// unchanged — stub estimates deliberately err on the side of always-error so
+/// tests remain deterministic.  Plan time uses this variant because the
+/// estimates come from real catalog data and the user's policy should govern
+/// whether that constitutes a blocking signal.
+#[must_use]
+pub fn check_cost_ceilings_plan(
+    models: &[rocky_core::models::Model],
+    estimates: &HashMap<String, rocky_core::cost::CostEstimate>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for model in models {
+        let budget = match model.config.budget.as_ref() {
+            Some(b) => b,
+            None => continue,
+        };
+        let estimate = match estimates.get(&model.config.name) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Resolve breach action: per-model `on_breach` when set, otherwise default (Warn).
+        let breach_action = budget.on_breach.unwrap_or(BudgetBreachAction::Warn);
+
+        if let Some(ceiling_usd) = budget.max_usd {
+            let projected = estimate.estimated_compute_cost_usd;
+            if projected > ceiling_usd {
+                let d = match breach_action {
+                    BudgetBreachAction::Error => {
+                        Diagnostic::budget_exceeded(&model.config.name, projected, ceiling_usd)
+                    }
+                    BudgetBreachAction::Warn => {
+                        Diagnostic::budget_exceeded_warn(&model.config.name, projected, ceiling_usd)
+                    }
+                };
+                diagnostics.push(d);
+            }
+        }
+
+        if let Some(ceiling_bytes) = budget.max_bytes_scanned {
+            let projected = estimate.estimated_bytes;
+            if projected > ceiling_bytes {
+                let d = match breach_action {
+                    BudgetBreachAction::Error => Diagnostic::budget_exceeded_bytes(
+                        &model.config.name,
+                        projected,
+                        ceiling_bytes,
+                    ),
+                    BudgetBreachAction::Warn => Diagnostic::budget_exceeded_bytes_warn(
+                        &model.config.name,
+                        projected,
+                        ceiling_bytes,
+                    ),
+                };
+                diagnostics.push(d);
             }
         }
     }

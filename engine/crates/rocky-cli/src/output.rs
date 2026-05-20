@@ -868,6 +868,32 @@ pub struct PlanOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
 
+    // ---- D-3 stage 2: pre-execution budget diagnostics ------------------
+    //
+    // E027 diagnostics emitted when `rocky plan` resolves real catalog
+    // stats (via `DESCRIBE DETAIL` / Iceberg snapshot summary) and finds
+    // a model whose projected cost exceeds its declared `[budget]`
+    // ceiling. Empty when no models have a `[budget]` block, when no
+    // real stats are available (non-Databricks / non-Iceberg adapters),
+    // or when the project has no `models/` directory.
+    //
+    // A non-empty list does NOT by itself fail `rocky plan` — severity
+    // follows the per-model `on_breach` policy (`warn` or `error`).
+    // Callers that want strict pre-flight enforcement should check
+    // `has_budget_errors` instead.
+    /// Per-model E027 budget-exceeded diagnostics produced at plan time
+    /// using real catalog statistics. Severity reflects the model's
+    /// `on_breach` policy (`"warn"` or `"error"`). Empty when no
+    /// ceiling was exceeded or no real stats were available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_diagnostics: Vec<Diagnostic>,
+    /// `true` when at least one entry in `budget_diagnostics` has
+    /// error-level severity (`on_breach = "error"`). Callers can use
+    /// this flag to fail a pipeline-as-code check without inspecting
+    /// individual diagnostic severities.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_budget_errors: bool,
+
     // ---- Phase 2 plan-spine fields (Cluster 3 B) ------------------------
     //
     // Populated when `rocky plan` compiles a `models/` directory and
@@ -3546,6 +3572,8 @@ impl PlanOutput {
             classification_actions: vec![],
             mask_actions: vec![],
             retention_actions: vec![],
+            budget_diagnostics: vec![],
+            has_budget_errors: false,
             plan_id: None,
             plan_kind: None,
             created_at: None,

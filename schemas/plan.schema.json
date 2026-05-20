@@ -24,6 +24,56 @@
       ],
       "type": "object"
     },
+    "Diagnostic": {
+      "description": "A compiler diagnostic (error, warning, or informational message).\n\n`code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.",
+      "properties": {
+        "code": {
+          "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Which model this diagnostic relates to.",
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ],
+          "description": "Severity level."
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source location (if available)."
+        },
+        "suggestion": {
+          "description": "Suggested fix (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "model",
+        "severity"
+      ],
+      "type": "object"
+    },
     "MaskAction": {
       "description": "Masking-policy application row in `PlanOutput.mask_actions`.",
       "properties": {
@@ -97,10 +147,50 @@
         "model"
       ],
       "type": "object"
+    },
+    "Severity": {
+      "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
+      "enum": [
+        "Error",
+        "Warning",
+        "Info"
+      ],
+      "type": "string"
+    },
+    "SourceSpan": {
+      "description": "Location in a source file.",
+      "properties": {
+        "col": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "file",
+        "line"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.\n\n## Phase 2 additions (Cluster 3 B)\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.",
   "properties": {
+    "budget_diagnostics": {
+      "description": "Per-model E027 budget-exceeded diagnostics produced at plan time using real catalog statistics. Severity reflects the model's `on_breach` policy (`\"warn\"` or `\"error\"`). Empty when no ceiling was exceeded or no real stats were available.",
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      },
+      "type": "array"
+    },
     "classification_actions": {
       "description": "Column-tag applications the governance reconciler would issue via `apply_column_tags`. One row per `(model, column, tag)` triple declared in a model sidecar's `[classification]` block.",
       "items": {
@@ -138,6 +228,10 @@
     },
     "filter": {
       "type": "string"
+    },
+    "has_budget_errors": {
+      "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",
+      "type": "boolean"
     },
     "mask_actions": {
       "description": "Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.",

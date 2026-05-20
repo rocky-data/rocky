@@ -3794,6 +3794,7 @@ dependencies = [
  "rocky-airbyte",
  "rocky-bigquery",
  "rocky-cache",
+ "rocky-catalog-core",
  "rocky-compiler",
  "rocky-core",
  "rocky-databricks",
