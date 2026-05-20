@@ -357,6 +357,65 @@ def test_run_passes_governance_override_as_json():
     assert '"workspace_ids"' in captured[0][idx + 1]
 
 
+def _capture_discover_args(rocky: RockyResource, discover_json: str, **kwargs: Any) -> list[str]:
+    """Invoke ``rocky.discover(**kwargs)`` against a captured-argv fake.
+
+    Returns the argv list passed to ``_run_rocky`` so callers can assert
+    flag presence / value / coercion without spinning up the full
+    Popen + parse pipeline.
+    """
+    captured: list[list[str]] = []
+
+    def fake_run(self: RockyResource, args: list[str], allow_partial: bool = False) -> str:
+        captured.append(args)
+        return discover_json
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True) as run_mock:
+        run_mock.side_effect = fake_run
+        rocky.discover(**kwargs)
+    assert captured, "_run_rocky was not called"
+    return captured[0]
+
+
+def test_discover_omits_emit_fivetran_state_to_by_default(discover_json: str):
+    """No kwarg → no ``--emit-fivetran-state-to`` flag on the argv."""
+    args = _capture_discover_args(RockyResource(), discover_json)
+    assert args == ["discover"]
+
+
+def test_discover_passes_emit_fivetran_state_to_str(discover_json: str):
+    """``str`` path lands verbatim after ``--emit-fivetran-state-to``."""
+    args = _capture_discover_args(
+        RockyResource(), discover_json, emit_fivetran_state_to="/tmp/envelope.json"
+    )
+    assert args == ["discover", "--emit-fivetran-state-to", "/tmp/envelope.json"]
+
+
+def test_discover_coerces_pathlib_emit_fivetran_state_to(discover_json: str):
+    """``Path`` input is stringified — the CLI takes a path-string, not a Path."""
+    args = _capture_discover_args(
+        RockyResource(), discover_json, emit_fivetran_state_to=Path("/tmp/envelope.json")
+    )
+    assert args == ["discover", "--emit-fivetran-state-to", "/tmp/envelope.json"]
+
+
+def test_discover_emit_fivetran_state_to_composes_with_pipeline(discover_json: str):
+    """``--pipeline`` and ``--emit-fivetran-state-to`` coexist; order matches build."""
+    args = _capture_discover_args(
+        RockyResource(),
+        discover_json,
+        pipeline="raw_replication",
+        emit_fivetran_state_to="/tmp/envelope.json",
+    )
+    assert args == [
+        "discover",
+        "--pipeline",
+        "raw_replication",
+        "--emit-fivetran-state-to",
+        "/tmp/envelope.json",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # FR-009 — governance_override.workspace_ids safety validator
 # ---------------------------------------------------------------------------

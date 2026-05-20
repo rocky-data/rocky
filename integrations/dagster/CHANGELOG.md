@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.38.0] — 2026-05-20
+
+One small addition this cut: `RockyResource.discover()` now accepts an optional `emit_fivetran_state_to: str | Path | None` kwarg that passes through to the engine's `rocky discover --emit-fivetran-state-to <PATH>` flag (shipped in engine `v1.38.0`). Designed for orchestrator hooks that ship Rocky's canonical Fivetran view to a downstream consumer (S3, Valkey, a sibling sensor) without re-fetching from the Fivetran API — the engine writes the envelope atomically (tmp + rename) and idempotently (blake3 sentinel; mtime stable on no-op rewrite), so a watcher can rely on the file path without coordinating with Rocky. The envelope is only delivered to the file; `DiscoverResult` is unchanged.
+
+### Added
+
+- **`RockyResource.discover(emit_fivetran_state_to=...)`**. New optional kwarg. `str` and `pathlib.Path` inputs both work — `Path` is stringified at argv-build time. Composes cleanly with the existing `pipeline` kwarg (`--pipeline` first, `--emit-fivetran-state-to` second). Four new tests in `tests/test_resource.py` pin: omit-by-default, `str` pass-through, `Path` coercion, and composition with `pipeline`.
+
 ## [1.37.0] — 2026-05-19
 
 Companion release to engine `v1.39.0`. Pure codegen cascade plus one test-only tightening — no new dagster API surface. The regenerated Pydantic models in `dagster_rocky/types_generated/` pick up the engine's `rocky import-dbt` unit-test bridge ([#594](https://github.com/rocky-data/rocky/pull/594)): `ImportDbtOutput` gains the optional `unit_tests_found / unit_tests_converted / unit_tests_skipped` counters and `ImportWarningCategory` gains two new variants (`orphan_unit_test`, `unsupported_unit_test_format`). Strictly additive — re-exported from `dagster_rocky.types` so existing consumers see no breakage.

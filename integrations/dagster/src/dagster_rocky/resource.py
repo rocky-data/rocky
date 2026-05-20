@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from typing import IO, TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 import dagster as dg
@@ -1368,16 +1369,35 @@ class RockyResource(dg.ConfigurableResource):
     # Discovery & execution (always CLI)                                 #
     # ------------------------------------------------------------------ #
 
-    def discover(self, *, pipeline: str | None = None) -> DiscoverResult:
+    def discover(
+        self,
+        *,
+        pipeline: str | None = None,
+        emit_fivetran_state_to: str | Path | None = None,
+    ) -> DiscoverResult:
         """Run ``rocky discover`` and return the parsed result.
 
         Args:
             pipeline: Pipeline name (required when multiple pipelines are
                 defined in ``rocky.toml``).
+            emit_fivetran_state_to: Optional path to write the canonical
+                :class:`FivetranStateEnvelope` to as a side effect, via the
+                CLI's ``--emit-fivetran-state-to`` flag. Rocky writes the
+                envelope atomically (tmp + rename) and idempotently — a
+                sibling ``<path>.blake3`` sentinel file holds the previous
+                envelope's hash, so unchanged upstream state produces no
+                write and ``stat(2)`` watchers don't fire. Designed for
+                orchestrator hooks that ship Rocky's view of a destination
+                to a downstream consumer (S3, Valkey, a sibling sensor)
+                without re-fetching from the Fivetran API. The envelope is
+                **only** delivered to the file — it is not included in the
+                returned :class:`DiscoverResult`.
         """
         args = ["discover"]
         if pipeline is not None:
             args.extend(["--pipeline", pipeline])
+        if emit_fivetran_state_to is not None:
+            args.extend(["--emit-fivetran-state-to", str(emit_fivetran_state_to)])
         return _parse_rocky_json(self._run_rocky(args), DiscoverResult, command="discover")
 
     def plan(
