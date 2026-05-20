@@ -89,26 +89,33 @@ runs:
     # Mirrors `.github/actions/rocky-preview` install logic. install.sh
     # filters by `engine-v*` tag prefix and verifies SHA256 against the
     # published checksums.
+    # `inputs.rocky_version` is routed through an `env:` block rather
+    # than interpolated directly into the `run:` body. See the matching
+    # rocky-preview action for the security rationale.
     - name: Install rocky (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
         set -euo pipefail
         export ROCKY_INSTALL_DIR="$HOME/.local/bin"
         mkdir -p "$ROCKY_INSTALL_DIR"
-        if [ "${{ inputs.rocky_version }}" = "latest" ]; then
+        if [ "$ROCKY_VERSION_INPUT" = "latest" ]; then
           curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
         else
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "${{ inputs.rocky_version }}"
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "$ROCKY_VERSION_INPUT"
         fi
         echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
 
     - name: Install rocky (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
-        if ('${{ inputs.rocky_version }}' -ne 'latest') {
-          $env:ROCKY_VERSION = '${{ inputs.rocky_version }}'
+        if ($env:ROCKY_VERSION_INPUT -ne 'latest') {
+          $env:ROCKY_VERSION = $env:ROCKY_VERSION_INPUT
         }
         irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
         Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
@@ -132,12 +139,16 @@ runs:
       id: collect
       shell: bash
       env:
+        # `working_directory` is routed via env: so the `cd` below
+        # quotes it as a shell parameter rather than as script text.
+        # See rocky-preview action for the full rationale.
         BASE_REF: ${{ inputs.base_ref }}
         MODELS_DIR: ${{ inputs.models_dir }}
         DIFF_BYTE_LIMIT: ${{ inputs.diff_byte_limit }}
+        ROCKY_WORKING_DIR: ${{ inputs.working_directory }}
       run: |
         set -uo pipefail
-        cd "${{ inputs.working_directory }}"
+        cd "$ROCKY_WORKING_DIR"
 
         WORK="$RUNNER_TEMP/rocky-ai-review"
         mkdir -p "$WORK"
@@ -272,6 +283,31 @@ runs:
             messages: [{role: "user", content: $prompt}]
           }' > "$REQ"
 
+        # Redact credential-bearing header names and Bearer / API-key
+        # tokens before any Anthropic response body is inlined into the
+        # PR comment. The API echoes some headers (e.g. `x-api-key`) in
+        # error envelopes, and future debug fields could surface more.
+        # This is the only branch in the action that posts API-side
+        # content verbatim — `rocky` subcommand stderr (line ~232/242/
+        # 252/262) is already redacted upstream by the engine.
+        #
+        # Patterns are POSIX-portable (no `I` flag) so the action works
+        # on Linux/Windows GNU sed and macOS BSD sed alike. Each header
+        # name is enumerated with both common casings — adding more is
+        # cheap if a new envelope shape ships.
+        redact_response_body() {
+          # Header-line patterns consume up to a comma/quote/brace so
+          # `Authorization: Bearer xyz` collapses to `Authorization: ***`
+          # in plain-text envelopes, not just the value half of it.
+          sed -E \
+            -e 's/(([Aa]uthorization|AUTHORIZATION)[[:space:]]*:[[:space:]]*)[^",}]+/\1***/g' \
+            -e 's/(([Xx]-[Aa]pi-[Kk]ey|X-API-KEY|x-api-key)[[:space:]]*:[[:space:]]*)[^",}]+/\1***/g' \
+            -e 's/("([Aa]uthorization|AUTHORIZATION)"[[:space:]]*:[[:space:]]*")[^"]*(")/\1***\3/g' \
+            -e 's/("([Xx]-[Aa]pi-[Kk]ey|X-API-KEY|x-api-key)"[[:space:]]*:[[:space:]]*")[^"]*(")/\1***\3/g' \
+            -e 's/([Bb]earer|BEARER)[[:space:]]+[A-Za-z0-9._\-]+/Bearer ***/g' \
+            -e 's/(sk-ant-[A-Za-z0-9_\-]{4})[A-Za-z0-9_\-]+/\1***/g'
+        }
+
         # ---- POST to Anthropic ----
         RESP="$WORK_DIR/response.json"
         HTTP_CODE=$(curl -sS -w '%{http_code}' -o "$RESP" \
@@ -286,7 +322,11 @@ runs:
           {
             printf '### :x: Anthropic API call failed\n\n'
             printf 'HTTP status: `%s`\n\n```json\n' "$HTTP_CODE"
-            head -c 4096 "$RESP" 2>/dev/null || printf '(no response body)'
+            if [ -s "$RESP" ]; then
+              head -c 4096 "$RESP" | redact_response_body
+            else
+              printf '(no response body)'
+            fi
             printf '\n```\n'
           } > "$WORK_DIR/review.md"
           exit 0
@@ -306,7 +346,7 @@ runs:
           echo "review_status=failed" >> "$GITHUB_OUTPUT"
           {
             printf '### :x: Anthropic response did not contain a text block\n\n```json\n'
-            head -c 4096 "$RESP"
+            head -c 4096 "$RESP" | redact_response_body
             printf '\n```\n'
           } > "$WORK_DIR/review.md"
         fi

