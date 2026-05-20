@@ -70,6 +70,12 @@
       "minimum": 0.0,
       "type": "integer"
     },
+    "traces_deleted": {
+      "description": "JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep (Arc 4 span retention).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
     "version": {
       "type": "string"
     }
@@ -87,6 +93,7 @@
     "min_runs_kept",
     "runs_deleted",
     "runs_kept",
+    "traces_deleted",
     "version"
   ],
   "title": "RetentionSweepOutput",
