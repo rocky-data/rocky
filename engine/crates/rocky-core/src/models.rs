@@ -12,7 +12,7 @@ use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
 use rocky_ir::dag::DagNode;
 use rocky_ir::{
-    GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TimeGrain,
+    CostBudget, GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TimeGrain,
 };
 
 /// Errors from loading and parsing model files.
@@ -690,6 +690,21 @@ impl Model {
             },
         };
 
+        // Collapse a fully-absent budget (both cost fields None) into
+        // cost_ceiling = None to keep the recipe-hash clean. Policy-only
+        // sidecars (e.g. only `on_breach = "warn"` set) also yield None.
+        let cost_ceiling = self.config.budget.as_ref().and_then(|b| {
+            let candidate = CostBudget {
+                max_usd: b.max_usd,
+                max_bytes_scanned: b.max_bytes_scanned,
+            };
+            if candidate.is_empty() {
+                None
+            } else {
+                Some(candidate)
+            }
+        });
+
         ModelIr {
             name: std::sync::Arc::from(self.config.name.as_str()),
             sql: self.sql.clone(),
@@ -725,6 +740,7 @@ impl Model {
             invalidate_hard_deletes: false,
             format: self.config.format.clone(),
             format_options: self.config.format_options.clone(),
+            cost_ceiling,
         }
     }
 }
@@ -2176,5 +2192,70 @@ SELECT 1
         assert_eq!(model.config.target.table, "stg_orders");
         assert_eq!(model.config.name_declared, "stg_orders");
         assert_eq!(model.config.target_table_declared, "stg_orders");
+    }
+
+    // ----- cost_ceiling / CostBudget sidecar tests -----
+
+    #[test]
+    fn test_sidecar_budget_populates_cost_ceiling() {
+        let content = r#"---toml
+[target]
+catalog = "analytics"
+schema = "marts"
+
+[budget]
+max_usd = 5.0
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let ir = model.to_model_ir();
+        let ceiling = ir
+            .cost_ceiling
+            .expect("cost_ceiling must be Some when [budget] max_usd is set");
+        assert_eq!(ceiling.max_usd, Some(5.0));
+        assert_eq!(ceiling.max_bytes_scanned, None);
+    }
+
+    #[test]
+    fn test_sidecar_budget_policy_only_yields_none_cost_ceiling() {
+        // A sidecar with only `on_breach` set (no cost dimensions) must NOT
+        // produce a cost_ceiling — collapsing vacuous budgets keeps recipe-hashes clean.
+        let content = r#"---toml
+[target]
+catalog = "analytics"
+schema = "marts"
+
+[budget]
+on_breach = "warn"
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let ir = model.to_model_ir();
+        assert!(
+            ir.cost_ceiling.is_none(),
+            "policy-only [budget] must yield cost_ceiling = None"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_no_budget_yields_none_cost_ceiling() {
+        let content = r#"---toml
+[target]
+catalog = "analytics"
+schema = "marts"
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let ir = model.to_model_ir();
+        assert!(
+            ir.cost_ceiling.is_none(),
+            "absent [budget] block must yield cost_ceiling = None"
+        );
     }
 }
