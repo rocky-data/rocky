@@ -159,7 +159,10 @@ impl AppliedPermissionDiff {
             .take(3)
             .map(|f| {
                 let verb = if f.adding { "GRANT" } else { "REVOKE" };
-                format!("{verb} {} to {}: {}", f.grant.permission, f.grant.principal, f.error)
+                format!(
+                    "{verb} {} to {}: {}",
+                    f.grant.permission, f.grant.principal, f.error
+                )
             })
             .collect::<Vec<_>>()
             .join("; ");
