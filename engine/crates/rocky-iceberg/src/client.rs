@@ -127,6 +127,52 @@ pub struct TableMetadata {
     /// map.
     #[serde(default)]
     pub refs: HashMap<String, SnapshotReference>,
+
+    /// The snapshot id of the current snapshot. `None` on a freshly
+    /// created table that has not yet been committed against.
+    ///
+    /// Used by the catalog-agnostic `table_stats` projection to pick
+    /// the right entry out of [`Self::snapshots`] when distilling the
+    /// summary fields. The field is camel-cased on the wire as
+    /// `current-snapshot-id` per the Iceberg spec.
+    #[serde(rename = "current-snapshot-id", default)]
+    pub current_snapshot_id: Option<i64>,
+
+    /// The full snapshot history of the table.
+    ///
+    /// Each entry carries the snapshot id and a `summary` map of
+    /// writer-populated metrics (`total-records`, `total-files-size`,
+    /// `total-data-files`, etc.). The entry whose `snapshot-id`
+    /// matches [`Self::current_snapshot_id`] is the active one;
+    /// `table_stats` parses its summary into a
+    /// [`rocky_catalog_core::TableStats`]. Older catalogs may omit
+    /// the field entirely on freshly-created tables; serde defaults
+    /// the missing case to an empty vector.
+    #[serde(default)]
+    pub snapshots: Vec<Snapshot>,
+}
+
+/// One entry in [`TableMetadata::snapshots`].
+///
+/// Carries the snapshot id and the writer-populated `summary` map.
+/// Per the Iceberg spec, `summary` is an unconstrained string-to-string
+/// map; the well-known keys this client cares about are
+/// `total-records`, `total-files-size`, and `total-data-files` (all
+/// cumulative across the snapshot — *not* the deltas applied by the
+/// most recent op, which live on `added-records` / `added-files-size`
+/// in the same map). Stays a `HashMap` so unknown summary keys don't
+/// trip deser.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Snapshot {
+    /// Unique identifier for this snapshot.
+    #[serde(rename = "snapshot-id")]
+    pub snapshot_id: i64,
+    /// Writer-populated summary metrics for this snapshot. The values
+    /// are strings on the wire (Iceberg's spec models the map as
+    /// `Map<String, String>`); callers parse the relevant keys to
+    /// `u64` at consume time.
+    #[serde(default)]
+    pub summary: HashMap<String, String>,
 }
 
 /// One entry in [`TableMetadata::schemas`].

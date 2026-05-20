@@ -119,6 +119,52 @@ pub struct ColumnSchema {
     pub nullable: bool,
 }
 
+/// Per-table statistics that a catalog can serve back without running a
+/// scan-cost query against the warehouse.
+///
+/// Every field is `Option<u64>` because catalogs vary in what they
+/// natively expose. Iceberg REST returns `total-records` and
+/// `total-files-size` in a snapshot's `summary` map when the writer
+/// populated them — older or pre-aggregation snapshots may omit either.
+/// Unity Catalog's REST surface does not serve table stats at all, so
+/// [`crate::CatalogClient::table_stats`] returns
+/// [`crate::CatalogError::UnsupportedOperation`] from that impl; the
+/// SQL-driven stats path (`DESCRIBE DETAIL` for bytes, `ANALYZE TABLE`
+/// or `SELECT COUNT(*)` for rows) lives on the per-adapter surface
+/// rather than this trait.
+///
+/// Callers that need the cost-model's `rocky_core::cost::TableStats`
+/// (which requires both `row_count` and `avg_row_bytes`) convert at the
+/// binding site: skip the model when either field is `None`,
+/// `propagate_costs` then falls through to upstream-inferred estimates
+/// for that node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableStats {
+    /// Total row count across all files in the current snapshot, if the
+    /// catalog reports it.
+    pub row_count: Option<u64>,
+    /// Total size in bytes across all data files in the current
+    /// snapshot, if the catalog reports it.
+    pub total_bytes: Option<u64>,
+    /// Number of data files in the current snapshot, if the catalog
+    /// reports it.
+    pub file_count: Option<u64>,
+}
+
+impl TableStats {
+    /// Construct an empty `TableStats` with every field `None`.
+    ///
+    /// Used by implementations that want to populate fields
+    /// individually as they parse the catalog response.
+    pub fn empty() -> Self {
+        Self {
+            row_count: None,
+            total_bytes: None,
+            file_count: None,
+        }
+    }
+}
+
 /// One table's contribution to a multi-table transaction.
 ///
 /// A [`crate::CatalogClient::commit_transaction`] call applies a slice of

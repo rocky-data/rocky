@@ -42,7 +42,7 @@ use serde_json::json;
 
 use rocky_catalog_core::{
     BranchKind, BranchRef, CatalogClient, CatalogError, CatalogResult, ColumnSchema, Grant,
-    TableCommit, TableRef, TableSchema,
+    TableCommit, TableRef, TableSchema, TableStats,
 };
 
 use crate::client::{
@@ -219,6 +219,32 @@ impl CatalogClient for IcebergCatalogClientAdapter {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    async fn table_stats(&self, table: &TableRef) -> CatalogResult<TableStats> {
+        let resp = self
+            .inner
+            .load_table(&table.namespace, &table.name)
+            .await
+            .map_err(icebergerror_into_catalog)?;
+
+        let metadata = resp.metadata;
+        // Find the snapshot that matches `current-snapshot-id`. If the
+        // table has no current snapshot (freshly created) or the
+        // catalog elided the snapshots list, return empty stats — the
+        // table exists in the catalog but no summary keys are
+        // populated yet.
+        let Some(current_id) = metadata.current_snapshot_id else {
+            return Ok(TableStats::empty());
+        };
+        let Some(snapshot) = metadata
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == current_id)
+        else {
+            return Ok(TableStats::empty());
+        };
+        Ok(parse_snapshot_summary(&snapshot.summary))
     }
 
     async fn tag_table(&self, _table: &TableRef, _key: &str, _value: &str) -> CatalogResult<()> {
@@ -398,6 +424,37 @@ fn build_commit_table_request(commit: &TableCommit) -> CommitTableRequest {
         },
         requirements: vec![requirement],
         updates: vec![update],
+    }
+}
+
+/// Distil an Iceberg snapshot's `summary` map into a catalog-agnostic
+/// [`TableStats`].
+///
+/// The well-known keys the Iceberg spec defines for a snapshot summary
+/// are documented at
+/// <https://iceberg.apache.org/spec/#snapshot-summary>:
+/// `total-records` (cumulative row count), `total-files-size`
+/// (cumulative bytes across all data files), `total-data-files`
+/// (cumulative file count), plus delta keys (`added-records`,
+/// `deleted-records`, etc.) describing the most recent op. Only the
+/// cumulative keys go into [`TableStats`]; the delta keys are
+/// per-snapshot relative metrics and would mislead a cost-model that
+/// needs the current shape of the table.
+///
+/// Each key is independently optional — older writers may emit a
+/// subset, and the Unity-foreign-Iceberg path is known to lag spec
+/// compliance on summary completeness. Unparseable string values
+/// silently produce `None` rather than failing the whole call; the
+/// caller's cost-model treats `None` fields as "fall through to
+/// upstream-inferred estimate" rather than a hard failure.
+fn parse_snapshot_summary(summary: &std::collections::HashMap<String, String>) -> TableStats {
+    fn read_u64(summary: &std::collections::HashMap<String, String>, key: &str) -> Option<u64> {
+        summary.get(key).and_then(|s| s.parse::<u64>().ok())
+    }
+    TableStats {
+        row_count: read_u64(summary, "total-records"),
+        total_bytes: read_u64(summary, "total-files-size"),
+        file_count: read_u64(summary, "total-data-files"),
     }
 }
 

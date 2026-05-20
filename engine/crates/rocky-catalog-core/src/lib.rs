@@ -35,4 +35,6 @@ pub mod testing;
 
 pub use client::CatalogClient;
 pub use error::{CatalogError, CatalogResult};
-pub use types::{BranchKind, BranchRef, ColumnSchema, Grant, TableCommit, TableRef, TableSchema};
+pub use types::{
+    BranchKind, BranchRef, ColumnSchema, Grant, TableCommit, TableRef, TableSchema, TableStats,
+};
