@@ -69,6 +69,27 @@ const SCHEMA_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("schema_
 /// in [`LOCAL_ONLY_TABLE_NAMES`] so tiered-backend snapshots surface the
 /// same stamp to other pods after upload.
 const IDEMPOTENCY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("idempotency_keys");
+/// Per-write content-addressed artifact ledger.
+///
+/// Key format: `"{run_id}|{model_name}|{file_path}"`. Value: serialized
+/// [`ArtifactRecord`]. One row per content-addressed parquet file written
+/// (so a partitioned model produces one row per partition group, an
+/// unpartitioned model produces one row per run).
+///
+/// Records the `blake3_hash` returned by
+/// `rocky_iceberg::uniform_writer::WriteResult` so the Phase 6 VACUUM
+/// refcount sweep can answer "which runs touched hash X" without
+/// re-reading every Delta log. Today's call site is
+/// `rocky_cli::commands::run_content_addressed::execute_content_addressed_model`'s
+/// success branch; refcount semantics (decrement, is-unreferenced,
+/// physical removal) land in the Phase 6 PR.
+///
+/// Replicates across backends by default — the table is intentionally
+/// NOT in [`LOCAL_ONLY_TABLE_NAMES`] so tiered-backend snapshots surface
+/// the artifact ledger to other pods. Recipe-as-canonical-versioning
+/// treats the artifact ledger as global ground truth, not machine-local
+/// scratch.
+const OUTPUT_ARTIFACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("output_artifacts");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -100,7 +121,12 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   is required. See the `RunRecord` docs for the default-value
 ///   contract (`hostname = "unknown"`, `rocky_version = "<pre-audit>"`,
 ///   `session_source = Cli`).
-const CURRENT_SCHEMA_VERSION: u32 = 6;
+/// - **v7** — adds the [`OUTPUT_ARTIFACTS`] table for the content-addressed
+///   write ledger (Arc 4 / Arc 1 wave 2 Phase 6 input). Pure additive
+///   schema change: v6 databases auto-create the empty table on next
+///   open and stamp themselves as v7. No blob migration needed; existing
+///   tables are untouched.
+const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -294,6 +320,7 @@ impl StateStore {
             let _table = txn.open_table(BRANCHES)?;
             let _table = txn.open_table(SCHEMA_CACHE)?;
             let _table = txn.open_table(IDEMPOTENCY_KEYS)?;
+            let _table = txn.open_table(OUTPUT_ARTIFACTS)?;
         }
         txn.commit()?;
 
@@ -1901,6 +1928,94 @@ impl StateStore {
     }
 
     // -----------------------------------------------------------------------
+    // Output artifacts (content-addressed write ledger; Phase 6 input)
+    // -----------------------------------------------------------------------
+
+    /// Record one content-addressed parquet write.
+    ///
+    /// Called once per
+    /// `rocky_iceberg::uniform_writer::WriteResult` produced by
+    /// `execute_content_addressed_model` — i.e. once for an unpartitioned
+    /// write and once per partition group for a partitioned write. The
+    /// ledger is the source of truth for Phase 6 VACUUM refcount
+    /// queries; the present method only writes, it does not decrement.
+    ///
+    /// Key composition: `"{run_id}|{model_name}|{file_path}"`. The triple
+    /// is globally unique (`file_path` already incorporates the per-table
+    /// storage prefix; same run + same model + same file_path means
+    /// we're idempotently re-recording the same write, e.g. on a
+    /// cond-put retry winner that overwrites a loser's stamp).
+    pub fn record_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StateError> {
+        let key = artifact_key(&artifact.run_id, &artifact.model_name, &artifact.file_path);
+        let bytes = serde_json::to_vec(artifact)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(OUTPUT_ARTIFACTS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Return every artifact record whose `blake3_hash` matches.
+    ///
+    /// Phase 6 VACUUM uses this to answer "is this file still referenced
+    /// by any run?" — an empty result means the parquet bytes are
+    /// orphan candidates. O(N) full table scan today; if N grows past
+    /// the comfortable single-digit-millisecond range a secondary
+    /// `ARTIFACTS_BY_HASH` index can back this method without changing
+    /// the signature.
+    pub fn list_artifacts_by_hash(
+        &self,
+        blake3_hash: &str,
+    ) -> Result<Vec<ArtifactRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            if record.blake3_hash == blake3_hash {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    /// List every artifact recorded for a given run.
+    ///
+    /// Walks the table keyed-prefix-style on `"{run_id}|"`. Useful for
+    /// the eventual `rocky history --artifacts` surface and for tests
+    /// that need to assert the per-run write count.
+    pub fn list_artifacts_for_run(&self, run_id: &str) -> Result<Vec<ArtifactRecord>, StateError> {
+        let prefix = format!("{run_id}|");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(&prefix) {
+                let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Total artifact count. Cheap sanity-check used by tests; future
+    /// retention sweep planning will key off this too.
+    pub fn count_artifacts(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut count: u64 = 0;
+        for entry in table.iter()? {
+            entry?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
     // Branches (schema-prefix virtual branches)
     // -----------------------------------------------------------------------
 
@@ -2065,6 +2180,59 @@ pub struct BranchRecord {
 /// Builds the key for the LOADED_FILES table.
 fn loaded_file_key(pipeline: &str, file_path: &str) -> String {
     format!("{pipeline}|{file_path}")
+}
+
+/// Builds the key for the [`OUTPUT_ARTIFACTS`] table.
+///
+/// Composition: `"{run_id}|{model_name}|{file_path}"`. The triple is
+/// globally unique today (`file_path` already incorporates the per-table
+/// storage prefix; the `run_id` prefix anchors the row to a single run).
+/// The same separator pattern as `PARTITIONS` / `LOADED_FILES` keeps
+/// prefix scans cheap (`starts_with("{run_id}|")` for "all artifacts in
+/// run X").
+fn artifact_key(run_id: &str, model_name: &str, file_path: &str) -> String {
+    format!("{run_id}|{model_name}|{file_path}")
+}
+
+/// One row in the content-addressed write ledger ([`OUTPUT_ARTIFACTS`]).
+///
+/// Recorded once per `WriteResult` from
+/// `rocky_iceberg::uniform_writer` — i.e. once per unpartitioned commit,
+/// once per partition group on a partitioned commit. Persists the
+/// `blake3_hash` that the writer returns so Phase 6 VACUUM refcount can
+/// answer "which runs touched this hash" without walking the Delta log
+/// of every content-addressed table.
+///
+/// Shape is 1:1 with the writer's `WriteResult` plus the (`run_id`,
+/// `model_name`, `written_at`) join fields needed to anchor the
+/// artifact back to a `RunRecord`. Adding fields later is forward-
+/// compatible via `#[serde(default)]` — same pattern that took
+/// `RunRecord` from v5 to v6.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    /// Hex-encoded blake3 of the parquet body. The Phase 6 refcount
+    /// query keys off this; mirrors `WriteResult.blake3_hash`.
+    pub blake3_hash: String,
+    /// Run that produced this artifact. Joins to `RunRecord.run_id`.
+    pub run_id: String,
+    /// Model that produced this artifact. Matches
+    /// `ModelExecution.model_name` for the same `run_id`.
+    pub model_name: String,
+    /// Object-store path of the parquet file, including the per-table
+    /// storage prefix. Globally unique across tables in the same
+    /// bucket — see `uniform_writer::mod.rs::parquet_path` for the
+    /// construction.
+    pub file_path: String,
+    /// Delta commit version this artifact was attached to. Lets an
+    /// operator correlate an artifact row with the Delta `_delta_log`
+    /// entry when debugging a hash mismatch.
+    pub commit_version: u64,
+    /// Parquet file size in bytes. Mirrors `WriteResult.size_bytes`.
+    pub size_bytes: u64,
+    /// Best-effort wall clock when the artifact was recorded. Not the
+    /// same as the write's Delta `modification_time_millis` (that's in
+    /// the log); close enough for retention sweep windows.
+    pub written_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Record of a successfully loaded file, stored in the state database.
@@ -4301,5 +4469,234 @@ mod tests {
         }
         let store = StateStore::open(&path).unwrap();
         assert_eq!(store.get_last_retention_sweep_at().unwrap(), Some(stamped));
+    }
+
+    // -----------------------------------------------------------------------
+    // Output artifacts (Arc 4 — Phase 6 refcount input)
+    // -----------------------------------------------------------------------
+
+    fn make_artifact(
+        run_id: &str,
+        model: &str,
+        hash: &str,
+        path: &str,
+        size: u64,
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            blake3_hash: hash.to_string(),
+            run_id: run_id.to_string(),
+            model_name: model.to_string(),
+            file_path: path.to_string(),
+            commit_version: 1,
+            size_bytes: size,
+            written_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn artifact_round_trip_by_hash() {
+        // Record one artifact, look it up by its blake3 hash.
+        let (store, _dir) = temp_store();
+        let art = make_artifact(
+            "run-1",
+            "fct_orders",
+            "blake3:abc",
+            "s3://bucket/prefix/abc.parquet",
+            1024,
+        );
+        store.record_artifact(&art).unwrap();
+
+        let by_hash = store.list_artifacts_by_hash("blake3:abc").unwrap();
+        assert_eq!(by_hash.len(), 1);
+        assert_eq!(by_hash[0], art);
+
+        // Different hash → no hit.
+        let miss = store.list_artifacts_by_hash("blake3:not-there").unwrap();
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn artifact_list_for_run_filters_by_prefix() {
+        // Two artifacts on run-1, one on run-2; list_for_run isolates them.
+        let (store, _dir) = temp_store();
+        store
+            .record_artifact(&make_artifact(
+                "run-1",
+                "a",
+                "h1",
+                "s3://b/p/h1.parquet",
+                100,
+            ))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact(
+                "run-1",
+                "b",
+                "h2",
+                "s3://b/p/h2.parquet",
+                200,
+            ))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact(
+                "run-2",
+                "a",
+                "h3",
+                "s3://b/p/h3.parquet",
+                300,
+            ))
+            .unwrap();
+
+        let run1 = store.list_artifacts_for_run("run-1").unwrap();
+        assert_eq!(run1.len(), 2);
+        assert!(run1.iter().any(|a| a.blake3_hash == "h1"));
+        assert!(run1.iter().any(|a| a.blake3_hash == "h2"));
+
+        let run2 = store.list_artifacts_for_run("run-2").unwrap();
+        assert_eq!(run2.len(), 1);
+        assert_eq!(run2[0].blake3_hash, "h3");
+
+        let run_none = store.list_artifacts_for_run("run-3").unwrap();
+        assert!(run_none.is_empty());
+    }
+
+    #[test]
+    fn artifact_list_for_run_does_not_prefix_collide() {
+        // "run-1" must not match "run-10" — the `|` separator after the
+        // run_id is what keeps the prefix scan safe.
+        let (store, _dir) = temp_store();
+        store
+            .record_artifact(&make_artifact("run-1", "m", "h", "s3://b/p/a.parquet", 10))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact("run-10", "m", "h", "s3://b/p/b.parquet", 20))
+            .unwrap();
+
+        let run1 = store.list_artifacts_for_run("run-1").unwrap();
+        assert_eq!(run1.len(), 1, "run-1 must not match run-10 by prefix");
+        assert_eq!(run1[0].file_path, "s3://b/p/a.parquet");
+    }
+
+    #[test]
+    fn artifact_count_matches_inserts() {
+        let (store, _dir) = temp_store();
+        assert_eq!(store.count_artifacts().unwrap(), 0);
+        store
+            .record_artifact(&make_artifact("r", "m", "h1", "s3://b/p/x.parquet", 1))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact("r", "m", "h2", "s3://b/p/y.parquet", 1))
+            .unwrap();
+        assert_eq!(store.count_artifacts().unwrap(), 2);
+    }
+
+    #[test]
+    fn artifact_record_is_idempotent_on_same_key() {
+        // Re-recording the same (run, model, file_path) overwrites — a
+        // cond-put retry winner replacing a loser's stamp should not
+        // produce a second row for Phase 6 refcount to double-count.
+        let (store, _dir) = temp_store();
+        let first = make_artifact("r", "m", "h", "s3://b/p/x.parquet", 100);
+        store.record_artifact(&first).unwrap();
+        let second = make_artifact("r", "m", "h", "s3://b/p/x.parquet", 200);
+        store.record_artifact(&second).unwrap();
+
+        assert_eq!(store.count_artifacts().unwrap(), 1);
+        let fetched = store.list_artifacts_for_run("r").unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].size_bytes, 200, "second insert wins");
+    }
+
+    #[test]
+    fn artifact_multiple_runs_share_hash() {
+        // Two runs materialize the same content (same blake3 hash) into
+        // different file paths. `list_by_hash` returns both. This is the
+        // shape Phase 6 needs: "which (run, model) tuples reference
+        // hash X?".
+        let (store, _dir) = temp_store();
+        store
+            .record_artifact(&make_artifact(
+                "run-a",
+                "m",
+                "shared-hash",
+                "s3://b/p1/shared.parquet",
+                1,
+            ))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact(
+                "run-b",
+                "m",
+                "shared-hash",
+                "s3://b/p2/shared.parquet",
+                1,
+            ))
+            .unwrap();
+
+        let refs = store.list_artifacts_by_hash("shared-hash").unwrap();
+        assert_eq!(refs.len(), 2);
+        let run_ids: std::collections::BTreeSet<&str> =
+            refs.iter().map(|a| a.run_id.as_str()).collect();
+        assert!(run_ids.contains("run-a"));
+        assert!(run_ids.contains("run-b"));
+    }
+
+    #[test]
+    fn artifact_persists_across_reopen() {
+        // Record an artifact, close the DB, reopen, look it up — proves
+        // the table is durable on disk (not just in-memory between
+        // method calls).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let art = make_artifact("r", "m", "h", "s3://b/p/x.parquet", 42);
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.record_artifact(&art).unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        let fetched = store.list_artifacts_by_hash("h").unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0], art);
+    }
+
+    #[test]
+    fn artifact_table_auto_created_on_v6_reopen() {
+        // v6→v7 upgrade contract: opening a state DB previously stamped
+        // at v6 must (a) succeed, (b) auto-create the OUTPUT_ARTIFACTS
+        // table on the existing open path, and (c) stamp the DB as v7
+        // so a subsequent open by an older binary fails loudly rather
+        // than silently misreading. We simulate "v6 on disk" by opening
+        // the DB at the current binary version, then rewriting the
+        // schema_version blob to "6" via a raw redb transaction.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            // Force the metadata blob back to "6" so the next open
+            // exercises the upgrade path.
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut metadata = txn.open_table(METADATA).unwrap();
+                metadata.insert("schema_version", "6").unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        // Reopening the v6 DB should bump the stamp to v7 and not fail
+        // even though the OUTPUT_ARTIFACTS table was created.
+        let store = StateStore::open(&path).unwrap();
+        // The artifact table is usable.
+        let art = make_artifact("r", "m", "h", "s3://b/p/x.parquet", 1);
+        store.record_artifact(&art).unwrap();
+        assert_eq!(store.count_artifacts().unwrap(), 1);
+
+        // The version stamp is now v7.
+        let txn = store.db.begin_read().unwrap();
+        let metadata = txn.open_table(METADATA).unwrap();
+        let stored = metadata
+            .get("schema_version")
+            .unwrap()
+            .map(|g| g.value().to_string())
+            .unwrap();
+        assert_eq!(stored, "7");
     }
 }
