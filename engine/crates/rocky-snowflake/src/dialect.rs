@@ -186,17 +186,26 @@ impl SqlDialect for SnowflakeSqlDialect {
         select_sql: &str,
     ) -> AdapterResult<Vec<String>> {
         // Snowflake has no native partition-replace operation. We wrap a
-        // DELETE + INSERT in an explicit transaction; the runtime issues
-        // each statement as a separate REST API call (Snowflake's SQL
-        // Statement Execution API runs one statement per call by default
-        // and rejects multi-statement bodies without MULTI_STATEMENT_COUNT).
-        // On any failure mid-batch the runtime issues `ROLLBACK`.
-        Ok(vec![
-            "BEGIN".into(),
-            format!("DELETE FROM {target} WHERE {partition_filter}"),
-            format!("INSERT INTO {target}\n{select_sql}"),
-            "COMMIT".into(),
-        ])
+        // DELETE + INSERT in an explicit `BEGIN ... COMMIT` transaction.
+        //
+        // Snowflake's `/api/v2/statements` runs ONE statement per call by
+        // default — every call opens an independent session, so emitting
+        // BEGIN/DELETE/INSERT/COMMIT as four separate REST calls is silently
+        // non-transactional: each call autocommits, `BEGIN` is discarded, the
+        // `DELETE` autocommits, and the trailing `COMMIT`/`ROLLBACK` is a
+        // no-op. To get true atomicity we submit the four statements as a
+        // single semicolon-joined script in one call; the connector sets
+        // `MULTI_STATEMENT_COUNT` in `parameters` so Snowflake accepts the
+        // multi-statement body and runs them in one session. On any
+        // sub-statement error Snowflake auto-rolls-back the in-flight
+        // transaction. This mirrors BigQuery's `BEGIN TRANSACTION; ...;
+        // COMMIT TRANSACTION` single-script form.
+        Ok(vec![format!(
+            "BEGIN;\n\
+             DELETE FROM {target} WHERE {partition_filter};\n\
+             INSERT INTO {target}\n{select_sql};\n\
+             COMMIT"
+        )])
     }
 
     fn regex_match_predicate(
@@ -551,10 +560,14 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_overwrite_partition_four_statement_transaction() {
-        // Snowflake's REST API runs one statement per call by default — so we
-        // emit 4 statements: BEGIN; DELETE; INSERT; COMMIT. The runtime
-        // executes them in order and rolls back on partial failure.
+    fn test_insert_overwrite_partition_single_script_transaction() {
+        // Snowflake's `/api/v2/statements` runs one statement per call by
+        // default; each call is its own session, so emitting BEGIN/DELETE/
+        // INSERT/COMMIT as four separate calls is silently non-transactional.
+        // Emit a single semicolon-joined script — the connector sets
+        // `MULTI_STATEMENT_COUNT` so Snowflake runs all four in one session
+        // and auto-rolls-back on partial failure. Mirrors BigQuery's
+        // single-script transaction form.
         let d = dialect();
         let stmts = d
             .insert_overwrite_partition(
@@ -563,11 +576,18 @@ mod tests {
                 "SELECT order_date, COUNT(*) FROM stg_orders GROUP BY 1",
             )
             .unwrap();
-        assert_eq!(stmts.len(), 4, "Snowflake emits BEGIN/DELETE/INSERT/COMMIT");
-        assert_eq!(stmts[0], "BEGIN");
-        assert!(stmts[1].starts_with("DELETE FROM warehouse.marts.fct_daily_orders WHERE "));
-        assert!(stmts[1].contains("order_date >= '2026-04-07 00:00:00'"));
-        assert!(stmts[2].starts_with("INSERT INTO warehouse.marts.fct_daily_orders"));
-        assert_eq!(stmts[3], "COMMIT");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "Snowflake emits one semicolon-joined script"
+        );
+        let script = &stmts[0];
+        assert!(script.starts_with("BEGIN;\n"));
+        assert!(script.contains(
+            "DELETE FROM warehouse.marts.fct_daily_orders WHERE \
+             order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';"
+        ));
+        assert!(script.contains("INSERT INTO warehouse.marts.fct_daily_orders"));
+        assert!(script.ends_with("COMMIT"));
     }
 }

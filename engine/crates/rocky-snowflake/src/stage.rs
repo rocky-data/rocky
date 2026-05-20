@@ -163,24 +163,24 @@ pub fn copy_into_sql(target_ref: &str, stage: &StageName) -> String {
     format!("COPY INTO {target_ref} FROM {}", stage.reference())
 }
 
-/// Generate a short, unique stage name (suffix of nanos-since-epoch + random salt).
+/// Generate a unique stage name suffixed with a v4 UUID.
 ///
-/// Used to avoid collisions when multiple pipelines run concurrently.
+/// Used to avoid collisions when multiple pipelines run concurrently. The
+/// previous implementation suffixed `SystemTime::now().subsec_nanos()`, but
+/// macOS resolves `subsec_nanos()` at sub-microsecond granularity (not true
+/// nanoseconds), so two parallel `load()` calls hitting `generate_stage_name`
+/// in the same microsecond produced identical stage names — leading to
+/// cross-table contamination when both COPY INTOs read from the same stage.
+///
+/// A v4 UUID's `simple()` formatting (32 lowercase hex chars, no hyphens) is
+/// alphanumeric and passes [`StageName`]'s identifier validation. The 122-bit
+/// random payload collapses the collision probability to astronomical even
+/// under unbounded concurrency.
 pub fn generate_stage_name() -> StageName {
-    // `SystemTime::now()` is not injection-safe in theory, but we only use
-    // nanos + a simple hash — no user input is interpolated here.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
     // Already-validated name (alphanumeric + underscore): safe to construct
     // directly.
-    StageName(format!("ROCKY_LOAD_{secs}_{nanos}"))
+    StageName(format!("ROCKY_LOAD_{suffix}"))
 }
 
 #[cfg(test)]
@@ -315,5 +315,58 @@ mod tests {
         assert!(n.as_str().starts_with("ROCKY_LOAD_"));
         // Should pass validation.
         assert!(StageName::new(n.as_str()).is_ok());
+    }
+
+    #[test]
+    fn test_generate_stage_name_unique_under_tight_loop() {
+        // Tight serial loop — the previous implementation could collide here
+        // because `SystemTime::now().subsec_nanos()` resolves at
+        // sub-microsecond granularity on macOS. The v4 UUID suffix collapses
+        // the collision probability to astronomical regardless of timing.
+        let n = 1_000;
+        let mut names = std::collections::HashSet::with_capacity(n);
+        for _ in 0..n {
+            let name = generate_stage_name().as_str().to_string();
+            assert!(
+                names.insert(name.clone()),
+                "duplicate stage name {name} generated in tight loop"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_stage_name_unique_under_thread_race() {
+        // True parallel race — N threads each generate M names; the
+        // combined set must have N*M distinct entries.
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let threads = 8;
+        let per_thread = 200;
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let collected = Arc::clone(&collected);
+            handles.push(thread::spawn(move || {
+                let mut local = Vec::with_capacity(per_thread);
+                for _ in 0..per_thread {
+                    local.push(generate_stage_name().as_str().to_string());
+                }
+                collected.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        let all = collected.lock().unwrap();
+        let unique: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            unique.len(),
+            threads * per_thread,
+            "expected {} unique names across {} threads, got {}",
+            threads * per_thread,
+            threads,
+            unique.len(),
+        );
     }
 }
