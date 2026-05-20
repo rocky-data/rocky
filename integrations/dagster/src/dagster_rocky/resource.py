@@ -346,6 +346,26 @@ def _parse_run_or_apply(output: str, *, command: str) -> RunResult:
                     "plan_kind": dg.MetadataValue.text(str(payload.get("plan_kind", ""))),
                 },
             )
+        # Surface engine-reported apply failures as ``dg.Failure``. The engine
+        # may emit ``success: false`` with a parseable ``result`` payload
+        # (e.g. partial write that failed mid-way) — silently unwrapping
+        # would surface a green materialization on top of a failed apply
+        # and the operator would never see the problem in the run viewer.
+        if payload.get("success") is False:
+            inner_preview = json.dumps(inner)[:_JSON_ERROR_PREVIEW_BYTES]
+            raise dg.Failure(
+                description=(
+                    f"rocky {command} reported success=false on the apply envelope — "
+                    "the engine ran the plan but signalled the apply did not succeed. "
+                    "See metadata for the inner result payload."
+                ),
+                metadata={
+                    "command": dg.MetadataValue.text(command),
+                    "plan_id": dg.MetadataValue.text(str(payload.get("plan_id", ""))),
+                    "plan_kind": dg.MetadataValue.text(str(payload.get("plan_kind", ""))),
+                    "inner_result_preview": dg.MetadataValue.text(inner_preview),
+                },
+            )
         return _parse_rocky_json(json.dumps(inner), RunResult, command=command)
 
     # Legacy fallback path — `rocky run` shape, already a RunResult.
