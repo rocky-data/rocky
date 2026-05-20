@@ -80,6 +80,14 @@ struct SubmitRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
     timeout: u64,
+    /// Snowflake session parameters threaded through the SQL REST API.
+    ///
+    /// Used to set `MULTI_STATEMENT_COUNT` when the caller submits a
+    /// semicolon-joined script. Skipped when empty so single-statement
+    /// requests stay byte-identical to the pre-multi-statement payload
+    /// (the wiremock tests pin the canonical single-statement body).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    parameters: std::collections::BTreeMap<String, String>,
 }
 
 /// Response from the Snowflake SQL REST API.
@@ -374,6 +382,24 @@ impl SnowflakeConnector {
 
         debug!(sql, "submitting SQL statement to Snowflake");
 
+        // Snowflake's `/api/v2/statements` runs ONE statement per call by
+        // default — submitting a semicolon-joined body without
+        // `MULTI_STATEMENT_COUNT` returns code `000008` ("Multiple SQL
+        // statements in a single API call are not supported"). When the
+        // dialect emits a multi-statement script (e.g. the
+        // `BEGIN; DELETE; INSERT; COMMIT` transaction for
+        // `insert_overwrite_partition`), thread the statement count through
+        // session parameters so Snowflake parses + runs them as one
+        // transactional unit. Single-statement calls keep the parameters
+        // map empty so the body is byte-identical to the pre-Bug-1 payload.
+        let statement_count = count_statements(sql);
+        let mut parameters = std::collections::BTreeMap::new();
+        if statement_count > 1 {
+            parameters.insert(
+                "MULTI_STATEMENT_COUNT".to_string(),
+                statement_count.to_string(),
+            );
+        }
         let body = SubmitRequest {
             statement: sql.to_string(),
             warehouse: self.config.warehouse.clone(),
@@ -381,6 +407,7 @@ impl SnowflakeConnector {
             schema: self.config.schema.clone(),
             role: self.config.role.clone(),
             timeout: self.config.timeout.as_secs(),
+            parameters,
         };
 
         let request = self
@@ -469,6 +496,65 @@ impl SnowflakeConnector {
 
         Ok(())
     }
+}
+
+/// Count the number of top-level SQL statements in `sql` for Snowflake's
+/// `MULTI_STATEMENT_COUNT` session parameter.
+///
+/// Counts semicolons that terminate distinct statements, then adds 1 for the
+/// final un-terminated statement. Skips semicolons inside SQL string literals
+/// (`'...'`) and single-line comments (`-- ...`). Rocky-generated SQL never
+/// embeds semicolons in identifiers, so identifier-quoting is not considered.
+///
+/// Trailing-only whitespace after the last semicolon counts the same as a
+/// terminator (one fewer statement). Empty / whitespace-only input returns 0.
+fn count_statements(sql: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = sql.chars().peekable();
+    let mut in_string = false;
+    let mut saw_non_ws_since_terminator = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            if c == '\'' {
+                // Snowflake doubles single quotes to escape (`''`); treat as
+                // staying inside the literal.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_string = true;
+                saw_non_ws_since_terminator = true;
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Skip to end of line.
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        break;
+                    }
+                }
+            }
+            ';' => {
+                if saw_non_ws_since_terminator {
+                    count += 1;
+                }
+                saw_non_ws_since_terminator = false;
+            }
+            c if c.is_whitespace() => {}
+            _ => {
+                saw_non_ws_since_terminator = true;
+            }
+        }
+    }
+    if saw_non_ws_since_terminator {
+        count += 1;
+    }
+    count
 }
 
 fn classify_statement_kind(sql: &str) -> &'static str {
@@ -588,6 +674,52 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_count_statements_single() {
+        assert_eq!(count_statements("SELECT 1"), 1);
+        assert_eq!(count_statements("SELECT 1;"), 1);
+        assert_eq!(count_statements("  SELECT 1  ;  "), 1);
+    }
+
+    #[test]
+    fn test_count_statements_empty() {
+        assert_eq!(count_statements(""), 0);
+        assert_eq!(count_statements("   "), 0);
+        assert_eq!(count_statements(";;;"), 0);
+    }
+
+    #[test]
+    fn test_count_statements_multi() {
+        let script = "BEGIN;\nDELETE FROM t WHERE x = 1;\nINSERT INTO t SELECT 2;\nCOMMIT";
+        assert_eq!(count_statements(script), 4);
+        // Trailing semicolon after COMMIT should still count 4.
+        let script = "BEGIN;\nDELETE FROM t WHERE x = 1;\nINSERT INTO t SELECT 2;\nCOMMIT;";
+        assert_eq!(count_statements(script), 4);
+    }
+
+    #[test]
+    fn test_count_statements_ignores_semicolon_in_string_literal() {
+        // Snowflake's API treats `';'` as part of a string literal, not a
+        // statement terminator. Our counter must agree, otherwise
+        // MULTI_STATEMENT_COUNT will be off-by-one and the request fails.
+        let sql = "INSERT INTO t VALUES ('a;b;c'); INSERT INTO t VALUES ('d')";
+        assert_eq!(count_statements(sql), 2);
+    }
+
+    #[test]
+    fn test_count_statements_ignores_semicolon_in_doubled_quote_string() {
+        // `'it''s'` is one literal containing `it's` — embedded semicolons
+        // inside the literal still shouldn't terminate.
+        let sql = "INSERT INTO t VALUES ('it''s;ok'); SELECT 1";
+        assert_eq!(count_statements(sql), 2);
+    }
+
+    #[test]
+    fn test_count_statements_ignores_semicolon_in_line_comment() {
+        let sql = "-- here; is; a; comment\nSELECT 1; SELECT 2";
+        assert_eq!(count_statements(sql), 2);
+    }
 
     #[test]
     fn test_classify_statement_kind_query() {

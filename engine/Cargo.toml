@@ -167,6 +167,13 @@ wasm-bindgen = "0.2"
 # Testing
 wiremock = "0.6"
 
+# UUID v4 — used by Snowflake stage-name generation to avoid collisions on
+# parallel loads. `SystemTime::now().subsec_nanos()` resolves to
+# sub-microseconds on macOS, so two concurrent `load()` calls can produce
+# identical stage names; v4 UUIDs collapse the collision probability to
+# astronomical.
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
 # OpenTelemetry (feature-gated in rocky-observe).
 # `tracing-opentelemetry` major versions track `opentelemetry` minor
 # versions: 0.32 pairs with opentelemetry 0.31 — pin the pair together.
