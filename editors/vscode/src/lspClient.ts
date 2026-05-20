@@ -5,6 +5,7 @@ import {
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
+  State,
   TransportKind,
 } from "vscode-languageclient/node";
 import { getConfig } from "./config";
@@ -12,6 +13,23 @@ import { getOutputChannel } from "./output";
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
+
+/** Disposable for the current client's `onDidChangeState` subscription. */
+let stateSubscription: vscode.Disposable | undefined;
+
+/**
+ * `true` while we're deliberately stopping the client as part of a restart
+ * or shutdown. Suppresses the crash handler so a normal Running→Stopped
+ * transition doesn't flap the status bar into a "Failed" state.
+ */
+let expectedStop = false;
+
+/**
+ * In-flight restart promise. While set, additional `restartLspClient()` calls
+ * await the same promise instead of racing a second `client.stop()` /
+ * `new LanguageClient(...)` pair.
+ */
+let pendingRestart: Promise<void> | undefined;
 
 interface DiagnosticTotals {
   errors: number;
@@ -275,6 +293,13 @@ async function launchClient(): Promise<void> {
     clientOptions,
   );
 
+  // Dispose any previous state listener before subscribing on the new client
+  // — without this, listeners accumulate across every restart.
+  stateSubscription?.dispose();
+  stateSubscription = client.onDidChangeState((event) => {
+    handleStateChange(event.oldState, event.newState);
+  });
+
   try {
     await client.start();
     statusBarItem.text = `$(check) Rocky: Ready${buildSegmentSuffix()}`;
@@ -283,6 +308,49 @@ async function launchClient(): Promise<void> {
   } catch (err) {
     handleStartupFailure(err as Error);
   }
+}
+
+/**
+ * React to LSP state transitions. The vscode-languageclient state machine
+ * is `Stopped (1) | Running (2) | Starting (3)`. A Running→Stopped flip
+ * outside a deliberate restart/shutdown means the server crashed; surface
+ * it on the status bar and offer a Restart action.
+ */
+function handleStateChange(_oldState: State, newState: State): void {
+  // During a deliberate stop or restart we own the status bar text and
+  // {@link setLspState}, so silently ignore the transition.
+  if (expectedStop) return;
+  if (newState !== State.Stopped) return;
+  // The startup-failure path already calls {@link setLspState}; don't
+  // double-report when start() rejected.
+  if (currentLspState.status === "Failed") return;
+
+  const channel = getOutputChannel();
+  channel.appendLine(
+    "Rocky language server stopped unexpectedly. Diagnostics will not refresh until it is restarted.",
+  );
+
+  statusBarItem.text = "$(error) Rocky: Stopped";
+  statusBarItem.backgroundColor = new vscode.ThemeColor(
+    "statusBarItem.errorBackground",
+  );
+  statusBarItem.tooltip = "Rocky language server stopped — click to restart";
+
+  setLspState("Failed", "Language server stopped unexpectedly");
+
+  vscode.window
+    .showErrorMessage(
+      "Rocky language server stopped unexpectedly.",
+      "Restart",
+      "Show Logs",
+    )
+    .then((choice) => {
+      if (choice === "Restart") {
+        void restartLspClient();
+      } else if (choice === "Show Logs") {
+        channel.show();
+      }
+    });
 }
 
 /**
@@ -378,15 +446,35 @@ function handleStartupFailure(err: Error): void {
 }
 
 export async function restartLspClient(): Promise<void> {
+  // Serialize concurrent restarts. Without this guard, two near-simultaneous
+  // config changes can each call `await client.stop()` (fast on an already-
+  // stopped client) and then both enter `launchClient()`, where they assign
+  // `client = new LanguageClient(...)` back-to-back. The first instance is
+  // orphaned but its child process keeps running.
+  if (pendingRestart) {
+    return pendingRestart;
+  }
+  pendingRestart = doRestart();
+  try {
+    await pendingRestart;
+  } finally {
+    pendingRestart = undefined;
+  }
+}
+
+async function doRestart(): Promise<void> {
   statusBarItem.text = "$(loading~spin) Rocky: Restarting...";
   setLspState("Restarting");
   if (client) {
+    expectedStop = true;
     try {
       await client.stop();
     } catch (err) {
       getOutputChannel().appendLine(
         `Error stopping language server: ${(err as Error).message}`,
       );
+    } finally {
+      expectedStop = false;
     }
   }
   await launchClient();
@@ -396,7 +484,14 @@ export async function restartLspClient(): Promise<void> {
 }
 
 export async function stopLspClient(): Promise<void> {
-  await client?.stop();
+  expectedStop = true;
+  try {
+    await client?.stop();
+  } finally {
+    expectedStop = false;
+  }
+  stateSubscription?.dispose();
+  stateSubscription = undefined;
   client = undefined;
   setLspState("Stopped");
 }
