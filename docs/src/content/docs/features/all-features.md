@@ -1,9 +1,21 @@
 ---
 title: All Features
-description: Complete list of Rocky capabilities across compilation, execution, governance, and developer experience
+description: The full capability surface organized around the seven trust dimensions Rocky enforces.
 sidebar:
   order: 11
 ---
+
+Rocky organizes its capabilities around **seven trust dimensions** — the failure modes that quietly cost data teams the most. Each dimension below maps to specific commands, diagnostic codes, and configuration knobs.
+
+1. **Typed compiler** — `rocky compile`, 35+ diagnostics
+2. **Column-level lineage** — `rocky lineage`, `rocky lineage-diff`
+3. **Branches + replay** — `rocky branch`, `rocky replay`
+4. **Cost attribution** — `RunOutput.cost_summary`, `[budget]`, `rocky cost`
+5. **AI gated through the compiler** — `rocky ai`, `rocky ai-sync`
+6. **Dialect-divergence lint** — `P001` portability lint
+7. **Declarative governance** — RBAC diff, masking, classification, `rocky compliance`
+
+The capability detail follows. For positioning vs other tools, see [Comparison](/features/comparison/). For honest scope (Databricks-first, Snowflake/BigQuery Beta, Iceberg-native on the roadmap), see [Where Rocky is today](/getting-started/introduction/#where-rocky-is-today).
 
 ## Warehouse Support
 

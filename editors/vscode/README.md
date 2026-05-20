@@ -7,7 +7,7 @@
 
 # Rocky VS Code Extension
 
-Language support for the [Rocky](https://github.com/rocky-data/rocky) SQL transformation engine — full LSP, lineage visualization, and AI model generation.
+Editor support for [Rocky](https://github.com/rocky-data/rocky) — the trust plane for your warehouse. Real LSP (not Jinja-aware text completion), interactive column-level lineage, compile-time diagnostics inline, and AI model generation gated through the compiler.
 
 ## Features
 

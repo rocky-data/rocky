@@ -1,14 +1,18 @@
 ---
-title: Rocky — typed-program layer above the warehouse
-description: A typed-program layer above the warehouse — branches, replay, column-level lineage, compile-time type safety, per-model cost attribution.
+title: Rocky — the trust plane for your warehouse
+description: A typed compiler over Databricks / Snowflake / BigQuery / DuckDB — branches, replay, column-level lineage, compile-time contracts, and per-model cost attribution.
 template: splash
 hero:
-  tagline: A compiled SQL transformation engine in Rust. Type-safe compilation, column-level lineage, and an AI intent layer — for data pipelines that don't break.
+  tagline: The trust plane for your warehouse — a typed compiler with branches, replay, column-level lineage, contracts, and per-model cost. Storage and compute stay where they are.
   actions:
     - text: Get Started in 60 Seconds
       link: /guides/playground/
       icon: right-arrow
       variant: primary
+    - text: Coming from dbt? Migrate in 5 steps
+      link: /guides/migrate-from-dbt/
+      icon: right-arrow
+      variant: secondary
     - text: View on GitHub
       link: https://github.com/rocky-data/rocky
       icon: external
@@ -16,24 +20,30 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
+## The disasters Rocky prevents
+
+Rocky exists because the most expensive failures in modern data platforms aren't slow queries — they're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
+
+dbt is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler** — so the disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed replay artifacts.
+
 <CardGrid>
-  <Card title="Type-Safe Compiler" icon="approve-check">
-    Column-level type inference and data contracts catch errors before execution.
+  <Card title="Typed compiler, not a templating engine" icon="approve-check">
+    Column-level type inference across the full DAG. 35+ diagnostic codes with actionable suggestions. `E013` blocks the PR before a row is written.
   </Card>
-  <Card title="Pure SQL or DSL" icon="document">
-    Write standard SQL with TOML config, or use the Rocky DSL for NULL-safe operators, windows, and pattern matching.
+  <Card title="Column-level lineage at compile time" icon="seti:graphql">
+    Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review.
   </Card>
-  <Card title="AI Intent Layer" icon="star">
-    Store intent as metadata. AI explains models, syncs them when upstream schemas change, and generates tests.
+  <Card title="Branches + deterministic replay" icon="random">
+    Named branches as isolated schemas. `rocky replay <run_id>` reconstructs a run bit-for-bit — inputs, code, and outputs as a content-addressed artifact.
   </Card>
-  <Card title="VS Code Extension" icon="laptop">
-    Full language server: completion, hover, go-to-definition, rename, code actions, and lineage visualization.
+  <Card title="Per-model cost attribution" icon="rocket">
+    Cost is a column on every run, not a dashboard. `[budget]` blocks fail the run on overspend. `rocky preview cost` projects spend at PR time.
   </Card>
-  <Card title="Quality Checks" icon="warning">
-    Inline pipeline checks (row count, freshness, null rate, anomaly) plus model-level assertions with severity and quarantine.
+  <Card title="AI gated through the compiler" icon="star">
+    Every AI suggestion type-checks before it lands. Generate → compile → auto-fix → ship — the closed-loop nobody else has.
   </Card>
-  <Card title="Dagster Integration" icon="puzzle">
-    Auto-discover assets, emit materializations, and translate check results — all via `dagster-rocky`.
+  <Card title="Dialect-divergence lint" icon="puzzle">
+    `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Cross-warehouse teams stop discovering portability bugs in prod.
   </Card>
 </CardGrid>
 
@@ -57,7 +67,13 @@ No credentials needed — the playground is DuckDB-backed.
 
 <video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 
+## Who Rocky is for
+
+Rocky is built first for **data platform engineers running production-critical, multi-tenant pipelines on Databricks** — the team where silent failures cost real money and dbt has hit a ceiling. The trust primitives are most battle-tested there.
+
+The next ring out: **Snowflake and BigQuery shops evaluating SQLMesh**, who want correctness moved to the compiler (not the planner) and prefer SQL by default. Adapters are Beta today — see the [introduction](/getting-started/introduction/#where-rocky-is-today) for the honest 2026 roadmap.
+
 <CardGrid>
-  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Import your dbt project, convert tests to contracts, and adopt Rocky incrementally." />
-  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="Auto-discovery, rich metadata, and check-result integration via dagster-rocky." />
+  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against your project, get a Rocky repo on disk, ship the gains incrementally — no rewrite." />
+  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky wraps the CLI as a ConfigurableResource. Auto-discovery, asset checks, Pipes — one subprocess hop." />
 </CardGrid>

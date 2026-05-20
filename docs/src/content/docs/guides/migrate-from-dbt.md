@@ -1,11 +1,21 @@
 ---
 title: Migrating from dbt
-description: Step-by-step guide to importing a dbt project into Rocky and adopting its compiler, type system, and contracts
+description: Run rocky import-dbt against your existing project and adopt Rocky's compiler, lineage, branches, and contracts incrementally — no rewrite.
 sidebar:
   order: 2
 ---
 
-Rocky includes a built-in importer that converts dbt SQL models to Rocky's sidecar format. This guide walks through the full migration: from importing models, to handling unsupported Jinja, to configuring your pipeline, to adopting Rocky's type system and contracts.
+**The migration is the conversion path.** Most teams adopting Rocky have a dbt project today; the day-one question is "how much rewriting?" The answer: little to none. Run `rocky import-dbt` against your existing repo, get a Rocky project on disk in seconds, and adopt the trust primitives — typed compile, contracts, column-level lineage, branches, cost — incrementally.
+
+The wedge in five steps:
+
+1. **Run `rocky import-dbt`.** Jinja `{{ ref() }}` and `{{ source() }}` resolve to bare references; configs become TOML sidecars; the importer writes `MIGRATION-NOTES.md` listing anything that didn't translate.
+2. **Run `rocky compile`.** First time through, expect real diagnostics — `E013` on type mismatches, `P002` on `SELECT *` blast radius, `P001` on dialect-portability issues. Each one is something dbt couldn't catch.
+3. **Add contracts on the boundary models.** `[contract] required_columns = […]`, `protected_columns = […]`. From here, the column rename that quietly breaks 47 downstream models becomes an `E010` in CI before it ships.
+4. **Adopt `rocky lineage-diff` in PR review.** Per-changed-column downstream blast radius. Drops into a PR comment. This is the moment your team stops reviewing changes blind.
+5. **Turn on `rocky preview cost`.** Per-PR cost projection — catch expensive plans before they ship instead of explaining them after.
+
+Everything below is the mechanics. The strategic point is above: you don't rewrite, you import and adopt.
 
 ## Prerequisites
 

@@ -7,6 +7,13 @@ sidebar:
 
 A factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features verified against official documentation and source code as of April 2026.
 
+Quick positioning before the tables:
+
+- **vs dbt.** dbt is the incumbent, not the competitor. Rocky's path is import-compatibility (`rocky import-dbt`) plus a step-change on the failure modes dbt structurally can't catch: silent schema drift, compile-time contracts, column-level lineage at PR time, per-model cost. dbt remains the right choice for moderate-scale, low-blast-radius pipelines where Jinja templating is enough.
+- **vs SQLMesh.** SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** SQLMesh's checks are runtime-ish; Rocky's are compile-time, expressed as diagnostic codes (`E001`–`E026`) you can grep in CI logs. SQLMesh is Python-first; Rocky keeps SQL as the default surface and reaches for a DSL only when SQL doesn't fit. SQLMesh's virtual environments are a genuinely good idea — Rocky's named branches express the same workflow with column-level lineage attached. SQLMesh is more mature in years and funding; Rocky is further along on Rust-native enforcement, LSP / IDE polish, compile-time column lineage, and cost as a first-class citizen.
+- **vs warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).** Those are warehouse-coupled and free with the platform. Rocky stays warehouse-neutral and ships a real compiler. If portability and serious tooling matter to you, Rocky wins; if they don't, the warehouse-native option may be "good enough."
+- **vs observability tools (Datafold, Monte Carlo, Anomalo).** Not competitors. Rocky prevents what these detect; they remain useful for the failure modes Rocky doesn't model. Integrate, don't replace.
+
 ## Architecture
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
@@ -171,9 +178,9 @@ See [benchmarks](/features/benchmarks/) for full cost analysis and methodology.
 
 | Tool | Best for |
 |---|---|
-| **Rocky** | High-scale (10k-50k+) Databricks/Snowflake/BigQuery pipelines. Teams needing compile-time safety, schema drift handling, governance automation, and sub-second iteration. |
-| **dbt-core** | Industry standard with the largest community and adapter ecosystem. Best for moderate scale (<5k models) with Jinja templating. |
+| **Rocky** | Production-critical, multi-tenant pipelines where silent failures cost real money. Databricks-first; Snowflake/BigQuery Beta. Compile-time contracts, column-level lineage at PR time, branches + replay, per-model cost attribution. |
+| **dbt-core** | Industry standard with the largest community and adapter ecosystem. Best for moderate scale (<5k models) with Jinja templating and where post-hoc lineage is acceptable. |
 | **dbt-fusion** | Teams on Snowflake wanting faster parse times while staying in the dbt ecosystem. Compile is slower than dbt-core; best adopted once GA. |
-| **SQLMesh** | SQL transpilation (write once, deploy anywhere), virtual environments, and column-level lineage without warehouse queries. |
-| **Coalesce** | Visual, low-code transformation for Snowflake-first organizations with less technical analysts. |
+| **SQLMesh** | Teams that want correctness checks at the planner level, Python-first ergonomics, and virtual environments. Closest competitor to Rocky on intent — Rocky differs by enforcing correctness at the compiler, defaulting to SQL, and attaching column-level lineage to the compile output. |
+| **Coalesce** | Visual, low-code transformation for Snowflake-first organizations with less technical analysts. Different buyer than Rocky. |
 | **Dataform** | BigQuery-only shops wanting tight GCP integration with minimal tooling. |
