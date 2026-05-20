@@ -919,12 +919,12 @@ impl FivetranClient {
                     // below; the guard is held across the HTTP
                     // call + cache write-back so followers can't
                     // observe the half-state.
-                    record_span_event(
-                        &PipelineEvent::new("fivetran.stampede_acquired")
-                            .with_metadata("key", cache_key.clone())
-                            .with_metadata("ttl_seconds", self.stampede_lock_ttl.as_secs())
-                            .with_metadata("backend", self.stampede.backend()),
-                    );
+                    let evt = PipelineEvent::new("fivetran.stampede_acquired")
+                        .with_metadata("key", cache_key.clone())
+                        .with_metadata("ttl_seconds", self.stampede_lock_ttl.as_secs())
+                        .with_metadata("backend", self.stampede.backend());
+                    record_span_event(&evt);
+                    global_event_bus().emit(evt);
                     let env = self
                         .fetch_envelope_from_api_with_circuit(destination_id, &cache_key, backend)
                         .await?;
@@ -942,16 +942,16 @@ impl FivetranClient {
                         .await
                     {
                         Some(env) => {
-                            record_span_event(
-                                &PipelineEvent::new("fivetran.stampede_polled")
-                                    .with_metadata("key", cache_key.clone())
-                                    .with_metadata(
-                                        "waited_ms",
-                                        started_at.elapsed().as_millis().min(u128::from(u64::MAX))
-                                            as u64,
-                                    )
-                                    .with_metadata("outcome", "cache_hit"),
-                            );
+                            let evt = PipelineEvent::new("fivetran.stampede_polled")
+                                .with_metadata("key", cache_key.clone())
+                                .with_metadata(
+                                    "waited_ms",
+                                    started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                                        as u64,
+                                )
+                                .with_metadata("outcome", "cache_hit");
+                            record_span_event(&evt);
+                            global_event_bus().emit(evt);
                             self.envelope_cache
                                 .lock()
                                 .await
@@ -959,16 +959,16 @@ impl FivetranClient {
                             return Ok(env);
                         }
                         None => {
-                            record_span_event(
-                                &PipelineEvent::new("fivetran.stampede_polled")
-                                    .with_metadata("key", cache_key.clone())
-                                    .with_metadata(
-                                        "waited_ms",
-                                        started_at.elapsed().as_millis().min(u128::from(u64::MAX))
-                                            as u64,
-                                    )
-                                    .with_metadata("outcome", "timeout_direct_fetch"),
-                            );
+                            let evt = PipelineEvent::new("fivetran.stampede_polled")
+                                .with_metadata("key", cache_key.clone())
+                                .with_metadata(
+                                    "waited_ms",
+                                    started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                                        as u64,
+                                )
+                                .with_metadata("outcome", "timeout_direct_fetch");
+                            record_span_event(&evt);
+                            global_event_bus().emit(evt);
                             // Follower timed out — fall through to
                             // a direct HTTP fetch (no protection).
                         }
@@ -980,11 +980,11 @@ impl FivetranClient {
                         backend = self.stampede.backend(),
                         "stampede lock unavailable; falling through to direct fetch"
                     );
-                    record_span_event(
-                        &PipelineEvent::new("fivetran.stampede_unavailable")
-                            .with_metadata("backend", self.stampede.backend())
-                            .with_error(e.to_string()),
-                    );
+                    let evt = PipelineEvent::new("fivetran.stampede_unavailable")
+                        .with_metadata("backend", self.stampede.backend())
+                        .with_error(e.to_string());
+                    record_span_event(&evt);
+                    global_event_bus().emit(evt);
                 }
             }
         }
@@ -1021,14 +1021,14 @@ impl FivetranClient {
             }
         };
         if circuit_state == CircuitState::Open {
-            record_span_event(
-                &PipelineEvent::new("fivetran.circuit_state_change")
-                    .with_metadata("account_id", self.account_id_hash.clone())
-                    .with_metadata("from_state", "open")
-                    .with_metadata("to_state", "open")
-                    .with_metadata("reason", "request_short_circuited")
-                    .with_metadata("backend", self.circuit.backend()),
-            );
+            let evt = PipelineEvent::new("fivetran.circuit_state_change")
+                .with_metadata("account_id", self.account_id_hash.clone())
+                .with_metadata("from_state", "open")
+                .with_metadata("to_state", "open")
+                .with_metadata("reason", "request_short_circuited")
+                .with_metadata("backend", self.circuit.backend());
+            record_span_event(&evt);
+            global_event_bus().emit(evt);
             return Err(FivetranError::CircuitOpen);
         }
 
@@ -1043,14 +1043,14 @@ impl FivetranClient {
                 if let Err(e) = self.circuit.record_success(&self.account_id_hash).await {
                     warn!(error = %e, "circuit record_success failed; fail-open");
                 } else if prev_state == CircuitState::HalfOpen {
-                    record_span_event(
-                        &PipelineEvent::new("fivetran.circuit_state_change")
-                            .with_metadata("account_id", self.account_id_hash.clone())
-                            .with_metadata("from_state", "half_open")
-                            .with_metadata("to_state", "closed")
-                            .with_metadata("reason", "probe_success")
-                            .with_metadata("backend", self.circuit.backend()),
-                    );
+                    let evt = PipelineEvent::new("fivetran.circuit_state_change")
+                        .with_metadata("account_id", self.account_id_hash.clone())
+                        .with_metadata("from_state", "half_open")
+                        .with_metadata("to_state", "closed")
+                        .with_metadata("reason", "probe_success")
+                        .with_metadata("backend", self.circuit.backend());
+                    record_span_event(&evt);
+                    global_event_bus().emit(evt);
                 }
             }
             Err(e) if is_remote_failure(e) => {
@@ -1072,14 +1072,14 @@ impl FivetranClient {
                         .await
                         .unwrap_or(circuit_state);
                     if new_state != circuit_state {
-                        record_span_event(
-                            &PipelineEvent::new("fivetran.circuit_state_change")
-                                .with_metadata("account_id", self.account_id_hash.clone())
-                                .with_metadata("from_state", circuit_state.as_str())
-                                .with_metadata("to_state", new_state.as_str())
-                                .with_metadata("reason", "remote_failure")
-                                .with_metadata("backend", self.circuit.backend()),
-                        );
+                        let evt = PipelineEvent::new("fivetran.circuit_state_change")
+                            .with_metadata("account_id", self.account_id_hash.clone())
+                            .with_metadata("from_state", circuit_state.as_str())
+                            .with_metadata("to_state", new_state.as_str())
+                            .with_metadata("reason", "remote_failure")
+                            .with_metadata("backend", self.circuit.backend());
+                        record_span_event(&evt);
+                        global_event_bus().emit(evt);
                     }
                 }
             }
