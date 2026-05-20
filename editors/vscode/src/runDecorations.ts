@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
 import { getOutputChannel } from "./output";
 import type { ModelHistoryOutput } from "./types/generated";
+import { hasRockyProject, onDidChangeRockyProject } from "./views/getStartedView";
 
 const SUPPORTED_EXTENSIONS = new Set([".rocky", ".sql"]);
 
@@ -96,6 +97,10 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
 
   const modelName = path.basename(document.fileName, ext);
   if (!modelName) return;
+
+  // Skip shelling out to `rocky history` in workspaces without a rocky.toml —
+  // the CLI would fail every time and we'd spam the output channel.
+  if (!hasRockyProject()) return;
 
   // Clear existing decorations before applying new ones
   for (const dt of ALL_DECORATION_TYPES) {
@@ -248,13 +253,34 @@ export function registerRunDecorations(
     }),
   );
 
+  // When project detection flips (e.g. user runs `rocky init`), re-decorate
+  // any already-visible editors; otherwise they'd show no decorations until
+  // the user clicks away and back.
+  context.subscriptions.push(
+    onDidChangeRockyProject((has) => {
+      if (!has) {
+        for (const editor of vscode.window.visibleTextEditors) {
+          for (const dt of ALL_DECORATION_TYPES) {
+            editor.setDecorations(dt, []);
+          }
+        }
+        return;
+      }
+      for (const editor of vscode.window.visibleTextEditors) {
+        applyRunDecoration(editor);
+      }
+    }),
+  );
+
   // Dispose decoration types on deactivation
   context.subscriptions.push(
     ...ALL_DECORATION_TYPES,
     refreshEmitter,
   );
 
-  // Apply immediately if there is already an active editor
+  // Apply immediately if there is already an active editor. The function
+  // itself bails when no Rocky project is detected, and the
+  // onDidChangeRockyProject hook above re-runs it once detection finishes.
   if (vscode.window.activeTextEditor) {
     applyRunDecoration(vscode.window.activeTextEditor);
   }

@@ -136,6 +136,15 @@ vi.mock("../output", () => ({
   }),
 }));
 
+// `views/getStartedView` exposes the hasRockyProject() / onDidChangeRockyProject
+// signal that gates CLI invocations. Tests assume a project is detected so
+// the open/save handlers actually shell out; onDidChangeRockyProject is a
+// no-op subscription here (the registration count assertion accounts for it).
+vi.mock("../views/getStartedView", () => ({
+  hasRockyProject: (): boolean => true,
+  onDidChangeRockyProject: () => ({ dispose: (): void => undefined }),
+}));
+
 import * as vscode from "vscode";
 import { runRockyJson } from "../rockyCli";
 import { registerDriftDiagnostics } from "../driftDiagnostics";
@@ -171,12 +180,13 @@ describe("registerDriftDiagnostics", () => {
     expect(vscode.workspace.onDidCloseTextDocument).toHaveBeenCalled();
   });
 
-  it("pushes collection + code action provider + acceptDrift command + 3 listeners + config listener into subscriptions", () => {
+  it("pushes collection + code action provider + acceptDrift command + 3 listeners + config + project listener into subscriptions", () => {
     const ctx = makeContext();
     registerDriftDiagnostics(ctx);
     // collection + codeActionsProvider + acceptDrift cmd +
-    // onDidOpen + onDidSave + onDidClose + onDidChangeConfiguration = 7
-    expect(ctx.subscriptions.length).toBe(7);
+    // onDidOpen + onDidSave + onDidClose + onDidChangeConfiguration +
+    // onDidChangeRockyProject = 8
+    expect(ctx.subscriptions.length).toBe(8);
   });
 
   it("registers a code actions provider for rocky diagnostics", () => {
