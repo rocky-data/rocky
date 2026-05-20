@@ -7,13 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.38.0] — 2026-05-20
+## [1.38.1] — 2026-05-20
 
-Two additions this cut. **`RockyResource.discover(emit_fivetran_state_to=...)`** — new optional kwarg that passes through to the engine's `rocky discover --emit-fivetran-state-to <PATH>` flag (shipped in engine `v1.38.0`). Designed for orchestrator hooks that ship Rocky's canonical Fivetran view to a downstream consumer (S3, Valkey, a sibling sensor) without re-fetching from the Fivetran API — the engine writes the envelope atomically (tmp + rename) and idempotently (blake3 sentinel; mtime stable on no-op rewrite), so a watcher can rely on the file path without coordinating with Rocky. The envelope is only delivered to the file; `DiscoverResult` is unchanged. And a **stderr mirroring fix** for Dagster step processes — engine binary stderr now reaches the step's own fd so the "View error" link surfaces engine-side errors instead of just an opaque exit code. Plus the codegen cascade from engine `v1.40.0` picks up the new `PlanOutput.budget_diagnostics` + `has_budget_errors` fields, so dagster consumers of `rocky plan --output json` can read per-model `[budget]` ceiling breaches as typed Pydantic data — a natural hook for a Dagster asset check to block downstream materialization when an `on_breach = "error"` model exceeds its ceiling.
-
-### Added
-
-- **`RockyResource.discover(emit_fivetran_state_to=...)`** ([#597](https://github.com/rocky-data/rocky/pull/597)). New optional kwarg. `str` and `pathlib.Path` inputs both work — `Path` is stringified at argv-build time. Composes cleanly with the existing `pipeline` kwarg (`--pipeline` first, `--emit-fivetran-state-to` second). Four new tests in `tests/test_resource.py` pin: omit-by-default, `str` pass-through, `Path` coercion, and composition with `pipeline`.
+Patch release picking up the dagster-side work that landed after `1.38.0` shipped earlier the same day. A **stderr mirroring fix** for Dagster step processes — engine binary stderr now reaches the step's own fd so the "View error" link surfaces engine-side errors instead of just an opaque exit code. Plus the codegen cascade from engine `v1.40.0` picks up the new `PlanOutput.budget_diagnostics` + `has_budget_errors` fields, so dagster consumers of `rocky plan --output json` can read per-model `[budget]` ceiling breaches as typed Pydantic data — a natural hook for a Dagster asset check to block downstream materialization when an `on_breach = "error"` model exceeds its ceiling.
 
 ### Fixed
 
@@ -22,6 +18,14 @@ Two additions this cut. **`RockyResource.discover(emit_fivetran_state_to=...)`**
 ### Changed
 
 - **Codegen pickup of `PlanOutput.budget_diagnostics` + `has_budget_errors`** (engine `v1.40.0` — [#606](https://github.com/rocky-data/rocky/pull/606)). Regenerated `dagster_rocky/types_generated/plan_schema.py` adds the per-model `[budget]` ceiling diagnostics surface. `has_budget_errors: bool` signals whether any Error-severity breach was emitted (i.e. an `on_breach = "error"` model exceeded its ceiling) — the natural hook for a Dagster asset check to block downstream materialization. Re-exported from `dagster_rocky.types`.
+
+## [1.38.0] — 2026-05-20
+
+One small addition this cut: `RockyResource.discover()` now accepts an optional `emit_fivetran_state_to: str | Path | None` kwarg that passes through to the engine's `rocky discover --emit-fivetran-state-to <PATH>` flag (shipped in engine `v1.38.0`). Designed for orchestrator hooks that ship Rocky's canonical Fivetran view to a downstream consumer (S3, Valkey, a sibling sensor) without re-fetching from the Fivetran API — the engine writes the envelope atomically (tmp + rename) and idempotently (blake3 sentinel; mtime stable on no-op rewrite), so a watcher can rely on the file path without coordinating with Rocky. The envelope is only delivered to the file; `DiscoverResult` is unchanged.
+
+### Added
+
+- **`RockyResource.discover(emit_fivetran_state_to=...)`** ([#597](https://github.com/rocky-data/rocky/pull/597)). New optional kwarg. `str` and `pathlib.Path` inputs both work — `Path` is stringified at argv-build time. Composes cleanly with the existing `pipeline` kwarg (`--pipeline` first, `--emit-fivetran-state-to` second). Four new tests in `tests/test_resource.py` pin: omit-by-default, `str` pass-through, `Path` coercion, and composition with `pipeline`.
 
 ### Added
 
