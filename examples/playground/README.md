@@ -36,7 +36,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**61 of 74 POCs run with no external credentials.** See each POC's README for prerequisites.
+**62 of 75 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -71,9 +71,9 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 
-### 02 — Performance (11 POCs · DuckDB)
+### 02 — Performance (12 POCs · DuckDB)
 
-Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets, side-by-side strategy showcase.
+Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets, side-by-side strategy showcase, per-table override rules.
 
 | POC | Feature |
 |---|---|
@@ -88,6 +88,7 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [09-adaptive-concurrency](pocs/02-performance/09-adaptive-concurrency) | AIMD throttling — dynamic parallelism with `concurrency`, `error_rate_abort_pct`, `table_retries` |
 | [10-cost-budgets](pocs/02-performance/10-cost-budgets) | **Trust arc 2** — per-run `cost_summary` + `[budget]` block + `budget_breach` record |
 | [11-strategy-showcase](pocs/02-performance/11-strategy-showcase) | Three strategies side-by-side on one source: `full_refresh` + `incremental` + `merge`, with a cheat-sheet README |
+| [12-replication-table-overrides](pocs/02-performance/12-replication-table-overrides) | `[[table_overrides]]` — per-table `strategy`/`merge_keys`/`timestamp_column`/`enabled` overrides with glob matching and most-specific-match-wins resolution |
 
 ### 03 — AI (5 POCs · `ANTHROPIC_API_KEY` required)
 
