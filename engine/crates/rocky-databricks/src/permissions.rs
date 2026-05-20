@@ -26,6 +26,18 @@ pub enum PermissionError {
 
     #[error("workspace binding error: {0}")]
     Workspace(#[from] WorkspaceError),
+
+    /// One or more GRANT/REVOKE statements failed mid-batch. Surfaces
+    /// from [`PermissionManager::apply_diff`] at call sites that want a
+    /// `Result<(), _>`-shaped error instead of inspecting the full
+    /// [`AppliedPermissionDiff`]. Carries a count + the per-grant error
+    /// list so the failure is greppable in logs.
+    #[error("{n_failed} grant statement(s) failed: {summary}")]
+    PartialApply {
+        n_failed: usize,
+        summary: String,
+        failures: Vec<FailedGrant>,
+    },
 }
 
 /// Permissions that Rocky manages. Others (OWNERSHIP, ALL PRIVILEGES, CREATE SCHEMA) are skipped.
@@ -69,10 +81,91 @@ impl WorkspaceBindingDiff {
 /// Combined reconcile result for a single catalog covering grants and
 /// workspace bindings. `rocky plan` / `rocky run` group these deltas
 /// together because both flow from the same governance block.
+///
+/// `applied` reports which grant changes actually landed and which
+/// failed mid-batch — added so callers can surface partial-apply
+/// outcomes without losing visibility into the underlying diff.
 #[derive(Debug, Clone, Default)]
 pub struct AccessDiff {
     pub permissions: PermissionDiff,
+    pub applied: AppliedPermissionDiff,
     pub bindings: WorkspaceBindingDiff,
+}
+
+/// A grant whose GRANT / REVOKE statement returned an error.
+///
+/// Surfaces alongside the successful grants in [`AppliedPermissionDiff`]
+/// so callers can re-reconcile the failed subset (e.g. on the next
+/// `rocky run`) without losing track of what already landed.
+#[derive(Debug, Clone)]
+pub struct FailedGrant {
+    pub grant: Grant,
+    /// Whether the grant was being applied (`true` = GRANT) or removed
+    /// (`false` = REVOKE). Captured so the next reconcile pass knows
+    /// which side it belongs to.
+    pub adding: bool,
+    /// The error message from the warehouse. Kept as `String` so the
+    /// struct stays `Clone` and the result can flow up through
+    /// `AccessDiff` into the run summary.
+    pub error: String,
+}
+
+/// Outcome of applying a [`PermissionDiff`]: a record of which GRANT /
+/// REVOKE statements actually landed, plus the ones that failed.
+///
+/// The previous [`PermissionManager::apply_diff`] returned
+/// `Result<(), PermissionError>` and aborted on the first failure — that
+/// left the catalog in a half-applied state with no record of which
+/// rows had landed, making safe retries impossible. Returning this
+/// structured result lets the caller surface the failed subset in the
+/// run summary and feed it back into the next reconcile pass (the
+/// diff is order-independent because [`compute_diff`] is idempotent).
+#[derive(Debug, Clone, Default)]
+pub struct AppliedPermissionDiff {
+    /// GRANT statements that succeeded.
+    pub granted: Vec<Grant>,
+    /// REVOKE statements that succeeded.
+    pub revoked: Vec<Grant>,
+    /// Grants whose GRANT or REVOKE statement failed.
+    pub failed: Vec<FailedGrant>,
+}
+
+impl AppliedPermissionDiff {
+    /// True when every desired GRANT and REVOKE landed cleanly.
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// True when no statements ran (either the diff was empty or every
+    /// one failed without any successes).
+    pub fn is_empty(&self) -> bool {
+        self.granted.is_empty() && self.revoked.is_empty() && self.failed.is_empty()
+    }
+
+    /// Converts this outcome into a `Result<(), PermissionError>` for
+    /// call sites that don't carry the structured diff up the stack
+    /// (the `apply_grants` / `revoke_grants` reconciler entry points).
+    /// Returns `Ok(())` if clean, otherwise [`PermissionError::PartialApply`].
+    pub fn into_result(self) -> Result<(), PermissionError> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let summary = self
+            .failed
+            .iter()
+            .take(3)
+            .map(|f| {
+                let verb = if f.adding { "GRANT" } else { "REVOKE" };
+                format!("{verb} {} to {}: {}", f.grant.permission, f.grant.principal, f.error)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(PermissionError::PartialApply {
+            n_failed: self.failed.len(),
+            summary,
+            failures: self.failed,
+        })
+    }
 }
 
 impl<'a> PermissionManager<'a> {
@@ -140,29 +233,91 @@ impl<'a> PermissionManager<'a> {
         }
     }
 
-    /// Applies a permission diff (GRANT + REVOKE statements).
-    pub async fn apply_diff(&self, diff: &PermissionDiff) -> Result<(), PermissionError> {
+    /// Applies a permission diff (GRANT + REVOKE statements) and
+    /// reports the outcome.
+    ///
+    /// Unlike the previous shape (`Result<(), PermissionError>`, abort
+    /// on first error), this method runs every GRANT and REVOKE
+    /// independently, collects the failures in
+    /// [`AppliedPermissionDiff::failed`], and only returns `Err` for
+    /// errors that surface *before* any warehouse statement runs
+    /// (e.g. a SQL identifier failing validation in `format_grant_sql`
+    /// / `format_revoke_sql`). Warehouse-side failures land in
+    /// `failed` so the caller can surface them in the run summary and
+    /// retry on the next reconcile.
+    ///
+    /// Atomicity rationale: Databricks does not expose a SQL-level
+    /// transaction for GRANT/REVOKE on Unity Catalog, and the
+    /// per-statement permissions PATCH endpoint
+    /// ([`crate::unity_catalog_client::UnityCatalogClient::patch_permissions`])
+    /// only covers the `table` securable today — catalog and schema
+    /// grants still flow through `execute_statement`. The next-best
+    /// guarantee is "no statement silently lost": run every change,
+    /// report what failed.
+    pub async fn apply_diff(
+        &self,
+        diff: &PermissionDiff,
+    ) -> Result<AppliedPermissionDiff, PermissionError> {
+        let mut applied = AppliedPermissionDiff::default();
+
         for grant in &diff.grants_to_add {
+            // Validation errors (bad identifier shape) surface *before*
+            // any statement reaches the warehouse — propagate them so
+            // the caller fails fast on misconfigured input.
             let sql = format_grant_sql(grant)?;
             debug!(principal = grant.principal, permission = %grant.permission, "granting");
-            self.connector.execute_statement(&sql).await?;
+            match self.connector.execute_statement(&sql).await {
+                Ok(_) => applied.granted.push(grant.clone()),
+                Err(e) => {
+                    debug!(
+                        principal = grant.principal,
+                        permission = %grant.permission,
+                        error = %e,
+                        "grant statement failed; continuing batch"
+                    );
+                    applied.failed.push(FailedGrant {
+                        grant: grant.clone(),
+                        adding: true,
+                        error: e.to_string(),
+                    });
+                }
+            }
         }
 
         for grant in &diff.grants_to_revoke {
             let sql = format_revoke_sql(grant)?;
             debug!(principal = grant.principal, permission = %grant.permission, "revoking");
-            self.connector.execute_statement(&sql).await?;
+            match self.connector.execute_statement(&sql).await {
+                Ok(_) => applied.revoked.push(grant.clone()),
+                Err(e) => {
+                    debug!(
+                        principal = grant.principal,
+                        permission = %grant.permission,
+                        error = %e,
+                        "revoke statement failed; continuing batch"
+                    );
+                    applied.failed.push(FailedGrant {
+                        grant: grant.clone(),
+                        adding: false,
+                        error: e.to_string(),
+                    });
+                }
+            }
         }
 
-        Ok(())
+        Ok(applied)
     }
 
     /// Full reconciliation: get current grants, compute diff, apply.
+    ///
+    /// Returns the desired-vs-current [`PermissionDiff`] together with
+    /// the [`AppliedPermissionDiff`] outcome so callers can tell which
+    /// changes landed and which need a retry on the next run.
     pub async fn reconcile(
         &self,
         desired: &[Grant],
         target: &GrantTarget,
-    ) -> Result<PermissionDiff, PermissionError> {
+    ) -> Result<(PermissionDiff, AppliedPermissionDiff), PermissionError> {
         let current = match target {
             GrantTarget::Catalog(cat) => self.get_catalog_grants(cat).await?,
             GrantTarget::Schema { catalog, schema } => {
@@ -171,8 +326,8 @@ impl<'a> PermissionManager<'a> {
         };
 
         let diff = Self::compute_diff(desired, &current);
-        self.apply_diff(&diff).await?;
-        Ok(diff)
+        let applied = self.apply_diff(&diff).await?;
+        Ok((diff, applied))
     }
 
     /// Computes the binding diff between desired and current workspace bindings.
@@ -273,7 +428,7 @@ impl<'a> PermissionManager<'a> {
         ws_mgr: Option<&WorkspaceManager>,
         desired_bindings: &[WorkspaceBindingDesired],
     ) -> Result<AccessDiff, PermissionError> {
-        let permissions = self.reconcile(desired_grants, target).await?;
+        let (permissions, applied) = self.reconcile(desired_grants, target).await?;
 
         let bindings = match (ws_mgr, target) {
             (Some(mgr), GrantTarget::Catalog(catalog)) => {
@@ -297,6 +452,7 @@ impl<'a> PermissionManager<'a> {
 
         Ok(AccessDiff {
             permissions,
+            applied,
             bindings,
         })
     }
@@ -384,6 +540,55 @@ fn format_target(target: &GrantTarget) -> Result<String, PermissionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_diff_into_result_clean_passes() {
+        let applied = AppliedPermissionDiff {
+            granted: vec![Grant {
+                principal: "u".into(),
+                permission: Permission::Select,
+                target: GrantTarget::Catalog("c".into()),
+            }],
+            revoked: vec![],
+            failed: vec![],
+        };
+        assert!(applied.is_clean());
+        applied.into_result().expect("clean diff must be Ok");
+    }
+
+    #[test]
+    fn applied_diff_into_result_failures_surface_as_partial_apply() {
+        let grant = Grant {
+            principal: "u@d.com".into(),
+            permission: Permission::Modify,
+            target: GrantTarget::Catalog("c".into()),
+        };
+        let applied = AppliedPermissionDiff {
+            granted: vec![],
+            revoked: vec![],
+            failed: vec![FailedGrant {
+                grant: grant.clone(),
+                adding: true,
+                error: "principal not found".into(),
+            }],
+        };
+        assert!(!applied.is_clean());
+        match applied.into_result().expect_err("failed diff must be Err") {
+            PermissionError::PartialApply {
+                n_failed,
+                summary,
+                failures,
+            } => {
+                assert_eq!(n_failed, 1);
+                assert!(summary.contains("GRANT"));
+                assert!(summary.contains("principal not found"));
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].grant.principal, "u@d.com");
+                assert!(failures[0].adding);
+            }
+            other => panic!("expected PartialApply, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_parse_managed_permissions() {

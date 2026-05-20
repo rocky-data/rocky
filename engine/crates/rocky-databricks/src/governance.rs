@@ -124,7 +124,16 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
             grants_to_add: grants.to_vec(),
             grants_to_revoke: vec![],
         };
-        perm_mgr.apply_diff(&diff).await.map_err(AdapterError::new)
+        // `apply_diff` no longer aborts on the first failed statement —
+        // it collects per-grant errors so this batch entry point still
+        // surfaces them as a single `AdapterError` while preserving the
+        // partial-apply visibility for diagnostic logs.
+        perm_mgr
+            .apply_diff(&diff)
+            .await
+            .map_err(AdapterError::new)?
+            .into_result()
+            .map_err(AdapterError::new)
     }
 
     async fn revoke_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
@@ -133,7 +142,12 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
             grants_to_add: vec![],
             grants_to_revoke: grants.to_vec(),
         };
-        perm_mgr.apply_diff(&diff).await.map_err(AdapterError::new)
+        perm_mgr
+            .apply_diff(&diff)
+            .await
+            .map_err(AdapterError::new)?
+            .into_result()
+            .map_err(AdapterError::new)
     }
 
     async fn bind_workspace(
