@@ -11,7 +11,7 @@ Extension (TypeScript)  ──stdio JSON-RPC──▶  rocky lsp (Rust binary)
 The extension is an LSP client. All language intelligence (diagnostics, completion, hover, go-to-definition, rename, etc.) comes from the Rocky CLI's built-in LSP server. The extension handles:
 - LSP client lifecycle (start/stop/restart) plus an `LspState` lifecycle emitter consumed by sidebar views
 - Status bar with server state + error count
-- 44 commands grouped by concern under `src/commands/` (AI, branch, compile, hooks, info, inspect, lineage, migration, ops, preview, run, storage, test, plus the `commandPalette` entry point)
+- 50 commands grouped by concern under `src/commands/` (AI, branch, compile, hooks, info, inspect, lineage, migration, ops, preview, run, storage, test, plus the `commandPalette` entry point and 2 inline code-lens commands)
 - Code lens (inline run/compile above models)
 - Activity bar sidebar with 6 views (Get Started, Extension Info, Models, Runs, Sources, Help) — empty-state copy is gated on the `rocky.hasProject` context flag so a workspace without a `rocky.toml` shows orientation instead of CLI errors
 - Lineage webview (DOT → SVG via viz.js)
@@ -116,7 +116,7 @@ code --install-extension rocky-*.vsix
 # Press F5 in VS Code → launches Extension Development Host
 ```
 
-## Extension Commands (44)
+## Extension Commands (50)
 
 | Command | What It Does |
 |---------|-------------|
@@ -152,13 +152,19 @@ code --install-extension rocky-*.vsix
 | `rocky.previewCreate` | Create a PR-preview branch with column-pruned re-run |
 | `rocky.previewDiff` | Sampled row diff between preview branch and base |
 | `rocky.previewCost` | Cost delta for the active preview |
+| `rocky.removePreview` | Remove a preview branch from the previews sidebar |
+| `rocky.refreshPreviews` | Refresh the previews sidebar view |
 | `rocky.branchApprove` | Sign and write a content-addressed branch approval |
 | `rocky.branchPromote` | Promote an approved branch to its target |
 | `rocky.codeLens.runModel` | Run model from inline code lens |
 | `rocky.codeLens.compileModel` | Compile model from inline code lens |
+| `rocky.copyColumnReference` | Copy a column reference (`model.column`) from the schema sidebar |
 | `rocky.refreshModels` | Refresh models sidebar view |
 | `rocky.refreshRuns` | Refresh runs sidebar view |
 | `rocky.refreshSources` | Refresh sources sidebar view |
+| `rocky.refreshSchema` | Refresh the schema sidebar (runs `rocky catalog`) |
+| `rocky.refreshCosts` | Refresh inline cost annotations |
+| `rocky.showCostDetail` | Show per-model cost breakdown |
 | `rocky.refreshInfo` | Refresh the Extension Info tree |
 | `rocky.openOutputChannel` | Show the Rocky output channel |
 | `rocky.openDocumentation` | Open the Rocky docs in the browser |
