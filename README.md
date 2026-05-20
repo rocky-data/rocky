@@ -145,9 +145,7 @@ Tag PII columns in the model sidecar; bind tags to mask strategies in `[mask]` /
 
 ## Where Rocky is today
 
-Rocky has run 927 production materializations across 14 customer pipelines on Databricks in its current line of development — alongside ~4,200 dbt runs it was deployed against. The trust primitives — compiler, branches, replay, lineage, contracts, cost attribution — are production-grade on Databricks.
-
-We're explicit about the rest:
+The trust primitives — compiler, branches, replay, lineage, contracts, cost attribution — are production-grade on Databricks. We're explicit about the rest:
 
 - **Databricks is the production target for 2026.** Snowflake, BigQuery, and Trino adapters are Beta — connection, execution, and the core run loop work, but conformance coverage is still growing. If your enterprise warehouse is Snowflake or BigQuery and you need it production-grade today, talk to us.
 - **AI is a growing surface, not a finished product.** The compile-validate loop (generate → type-check → auto-fix → land) is real and shipped; the broader story (mass refactor across the DAG, auto-migration from a column type change, schema-aware assertion generation) is on the roadmap, not the changelog.
