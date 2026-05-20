@@ -6,7 +6,7 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 ## Project Structure
 
-Cargo workspace with 21 crates (Rust edition 2024, MSRV 1.85):
+Cargo workspace with 22 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 24 members total. Rust edition 2024, MSRV 1.85:
 
 The `Plan` enum was deleted in the Phase 3 typed-IR migration; `ModelIr` is now the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
@@ -107,10 +107,14 @@ engine/                         # this directory, inside the rocky monorepo
 │   │       ├── adapter.rs      # Adapter trait implementation
 │   │       ├── dialect.rs      # BigQuery SQL dialect (backtick quoting, DML transactions)
 │   │       └── auth.rs         # GCP Service Account / ADC authentication
+│   ├── rocky-trino/            # Trino warehouse adapter (REST /v1/statement polling, Basic + JWT auth)
+│   │   └── src/                # Adapter trait impl + Docker-backed conformance harness behind `trino-conformance`
 │   ├── rocky-airbyte/          # Airbyte source adapter
 │   │   └── src/                # Airbyte protocol integration
 │   ├── rocky-iceberg/          # Apache Iceberg table format adapter
 │   │   └── src/                # Iceberg metadata + snapshot management
+│   ├── rocky-catalog-core/     # Shared catalog primitives across warehouse adapters
+│   │   └── src/                # Catalog/schema lifecycle, isolation policies, grant primitives
 │   ├── rocky-wasm/             # WebAssembly exports
 │   │   └── src/                # WASM-compatible entry points for browser/edge execution
 │   ├── rocky-observe/          # Observability
@@ -120,14 +124,14 @@ engine/                         # this directory, inside the rocky monorepo
 │   │       └── tracing_setup.rs # Structured JSON logging
 │   └── rocky-cli/              # CLI framework
 │       └── src/
-│           ├── commands/       # init, validate, discover, plan, run, state, doctor, + 20 more
+│           ├── commands/       # init, validate, discover, plan, run, state, doctor, + ~50 more (one .rs file per subcommand)
 │           │   └── doctor.rs   # Aggregate health checks (config, state, adapters, pipelines)
 │           ├── pipes.rs        # Dagster Pipes protocol emitter (T2) — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
 │           └── output.rs       # JSON / table formatters (incl. MaterializationMetadata + sql_fingerprint helper)
 ├── rocky/                      # Binary crate (the `rocky` CLI)
 │   └── src/
 │       └── main.rs
-└── examples/                   # 5 self-contained example projects (DuckDB, no credentials)
+└── examples/                   # 14 self-contained example projects (DuckDB, no credentials)
 ```
 
 ## Coding Standards
@@ -245,7 +249,7 @@ To change a CLI output:
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot covering the original 37 — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. For the current schema count, run `ls schemas/*.schema.json | wc -l`.
+Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Current count is 60 schemas; run `ls schemas/*.schema.json | wc -l` to verify.
 
 | Command | Output struct |
 |---|---|
