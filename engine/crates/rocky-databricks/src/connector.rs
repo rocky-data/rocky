@@ -163,6 +163,18 @@ pub struct QueryResult {
     pub total_row_count: Option<u64>,
 }
 
+/// Table-level byte statistics returned by `DESCRIBE DETAIL`.
+///
+/// `DESCRIBE DETAIL` always populates `sizeInBytes` for Delta tables;
+/// row count is omitted here because Databricks does not expose it without
+/// a prior `ANALYZE TABLE`.
+#[derive(Debug, Clone)]
+pub struct DescribeDetailStats {
+    /// Total size of all data files in the current Delta snapshot, in bytes.
+    /// `None` when the value was absent or NULL in the `DESCRIBE DETAIL` result.
+    pub size_bytes: Option<u64>,
+}
+
 impl DatabricksConnector {
     /// Creates a new connector with the given configuration and auth provider.
     pub fn new(config: ConnectorConfig, auth: Auth) -> Self {
@@ -454,6 +466,77 @@ impl DatabricksConnector {
                 return check_terminal_state(response);
             }
         }
+    }
+
+    /// Fetch table-level byte statistics using `DESCRIBE DETAIL`.
+    ///
+    /// Issues `DESCRIBE DETAIL <catalog>.<schema>.<table>` against the
+    /// Databricks SQL warehouse and parses the `sizeInBytes` column from
+    /// the response.  Row count is intentionally not populated here —
+    /// Databricks does not expose `numRows` without a prior `ANALYZE TABLE`
+    /// (which itself can be expensive).
+    ///
+    /// Returns `Ok(Some(...))` when the command succeeds and `sizeInBytes`
+    /// is present in the result.  Returns `Ok(None)` when the table is not
+    /// found or the column is absent.  Propagates [`ConnectorError`] on
+    /// network or API failures.
+    ///
+    /// # Architecture note
+    ///
+    /// `UnityCatalogClient::table_stats` is REST-only by design — placing
+    /// a SQL dependency inside that client would break the separation between
+    /// the catalog REST layer and the SQL execution layer.  This method
+    /// lives on `DatabricksConnector` (the SQL executor) instead, so callers
+    /// that want real stats for a Databricks-hosted table can call this
+    /// directly as a fallback when the REST path returns
+    /// [`rocky_catalog_core::CatalogError::UnsupportedOperation`].
+    pub async fn describe_detail_stats(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<DescribeDetailStats>, ConnectorError> {
+        let fqn = format!(
+            "`{catalog}`.`{schema}`.`{table}`",
+            catalog = catalog,
+            schema = schema,
+            table = table,
+        );
+        let sql = format!("DESCRIBE DETAIL {fqn}");
+
+        let result = match self.execute_sql(&sql).await {
+            Ok(r) => r,
+            Err(ConnectorError::StatementFailed { message, .. })
+                if message.to_uppercase().contains("TABLE_OR_VIEW_NOT_FOUND")
+                    || message.to_uppercase().contains("DELTA_TABLE_NOT_FOUND")
+                    || message.to_uppercase().contains("DOES NOT EXIST")
+                    || message.to_uppercase().contains("NOT FOUND") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Find the column index for `sizeInBytes` in the response schema.
+        let size_bytes_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("sizeInBytes"));
+
+        let size_bytes = match (size_bytes_idx, result.rows.first()) {
+            (Some(idx), Some(row)) => row.get(idx).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                }
+            }),
+            _ => None,
+        };
+
+        Ok(Some(DescribeDetailStats { size_bytes }))
     }
 
     /// Cancels a running statement.
@@ -901,5 +984,139 @@ mod tests {
         assert_eq!(manifest.total_byte_count, None);
         let stats = stats_from_response(&resp);
         assert_eq!(stats.bytes_scanned, None);
+    }
+
+    // ---- describe_detail_stats parsing helpers ----
+
+    /// Build a `QueryResult` that looks like a `DESCRIBE DETAIL` response
+    /// — one row, columns include `sizeInBytes`.
+    fn make_describe_detail_result(size_bytes_value: serde_json::Value) -> QueryResult {
+        QueryResult {
+            statement_id: "test".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "format".to_string(),
+                    type_name: "STRING".to_string(),
+                    position: 0,
+                },
+                ColumnSchema {
+                    name: "sizeInBytes".to_string(),
+                    type_name: "LONG".to_string(),
+                    position: 1,
+                },
+                ColumnSchema {
+                    name: "numFiles".to_string(),
+                    type_name: "LONG".to_string(),
+                    position: 2,
+                },
+            ],
+            rows: vec![vec![
+                serde_json::Value::String("delta".to_string()),
+                size_bytes_value,
+                serde_json::Value::Number(serde_json::Number::from(3u64)),
+            ]],
+            total_row_count: Some(1),
+        }
+    }
+
+    #[test]
+    fn describe_detail_parses_size_bytes_integer() {
+        let result = make_describe_detail_result(serde_json::Value::Number(
+            serde_json::Number::from(12_345_678u64),
+        ));
+        let size_bytes_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("sizeInBytes"));
+        let size = match (size_bytes_idx, result.rows.first()) {
+            (Some(idx), Some(row)) => row.get(idx).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                }
+            }),
+            _ => None,
+        };
+        assert_eq!(size, Some(12_345_678u64));
+    }
+
+    #[test]
+    fn describe_detail_parses_size_bytes_string() {
+        // Some Databricks response variants encode numbers as strings.
+        let result = make_describe_detail_result(serde_json::Value::String("98765".to_string()));
+        let size_bytes_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("sizeInBytes"));
+        let size = match (size_bytes_idx, result.rows.first()) {
+            (Some(idx), Some(row)) => row.get(idx).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                }
+            }),
+            _ => None,
+        };
+        assert_eq!(size, Some(98_765u64));
+    }
+
+    #[test]
+    fn describe_detail_returns_none_for_null_size() {
+        let result = make_describe_detail_result(serde_json::Value::Null);
+        let size_bytes_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("sizeInBytes"));
+        let size = match (size_bytes_idx, result.rows.first()) {
+            (Some(idx), Some(row)) => row.get(idx).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                }
+            }),
+            _ => None,
+        };
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn describe_detail_no_size_bytes_column_returns_none() {
+        let result = QueryResult {
+            statement_id: "test".to_string(),
+            columns: vec![ColumnSchema {
+                name: "format".to_string(),
+                type_name: "STRING".to_string(),
+                position: 0,
+            }],
+            rows: vec![vec![serde_json::Value::String("delta".to_string())]],
+            total_row_count: Some(1),
+        };
+        let size_bytes_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("sizeInBytes"));
+        assert!(size_bytes_idx.is_none());
+        let size = match (size_bytes_idx, result.rows.first()) {
+            (Some(idx), Some(row)) => row.get(idx).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    v.as_str().and_then(|s| s.parse::<u64>().ok())
+                }
+            }),
+            _ => None,
+        };
+        assert_eq!(size, None);
     }
 }

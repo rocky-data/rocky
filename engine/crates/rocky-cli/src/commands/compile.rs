@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
+use rocky_compiler::cost_check;
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::incrementality;
 use rocky_compiler::types::TypedColumn;
@@ -153,10 +154,37 @@ pub fn run_compile(
         HashMap::new()
     };
 
-    // Filter diagnostics by model if requested. We clone here so that the
-    // typed CompileOutput owns the diagnostics; this matches the previous
-    // serde_json::json!() behavior (which serialized references) but lets
-    // us hand the data to schemars-driven codegen consumers.
+    // Compute DAG-propagated cost estimates for all models.
+    // Uses hardcoded stub statistics for leaf nodes — real catalog stats
+    // (per-adapter `DESCRIBE DETAIL` / Iceberg snapshot summary) will replace
+    // these stubs in a follow-up that wires the adapter registry here.
+    let cost_estimates = {
+        use rocky_core::cost::{TableStats, WarehouseType, propagate_costs};
+        let dag_nodes = &result.project.dag_nodes;
+        let mut base_stats = std::collections::HashMap::new();
+        for node in dag_nodes {
+            if node.depends_on.is_empty() {
+                base_stats.insert(
+                    node.name.clone(),
+                    TableStats {
+                        row_count: 10_000,
+                        avg_row_bytes: 256,
+                    },
+                );
+            }
+        }
+        propagate_costs(dag_nodes, &base_stats, WarehouseType::Databricks).unwrap_or_default()
+    };
+
+    // Check per-model cost ceilings and emit E027 diagnostics for breaches.
+    let ceiling_diagnostics =
+        cost_check::check_cost_ceilings(&result.project.models, &cost_estimates);
+    if !ceiling_diagnostics.is_empty() {
+        result.diagnostics.extend(ceiling_diagnostics);
+        result.has_errors = true;
+    }
+
+    // Re-apply model filter to diagnostics (may now include E027).
     let diagnostics: Vec<_> = if let Some(filter) = model_filter {
         result
             .diagnostics
@@ -169,25 +197,6 @@ pub fn run_compile(
     };
 
     if output_json {
-        // Compute DAG-propagated cost estimates for all models.
-        let cost_estimates = {
-            use rocky_core::cost::{TableStats, WarehouseType, propagate_costs};
-            let dag_nodes = &result.project.dag_nodes;
-            let mut base_stats = std::collections::HashMap::new();
-            for node in dag_nodes {
-                if node.depends_on.is_empty() {
-                    base_stats.insert(
-                        node.name.clone(),
-                        TableStats {
-                            row_count: 10_000,
-                            avg_row_bytes: 256,
-                        },
-                    );
-                }
-            }
-            propagate_costs(dag_nodes, &base_stats, WarehouseType::Databricks).unwrap_or_default()
-        };
-
         let models_detail: Vec<ModelDetail> = result
             .project
             .models
@@ -990,6 +999,156 @@ schema_template = "s"
             rocky_compiler::types::RockyType::Int64,
         ));
         assert!(!cols[0].nullable);
+    }
+
+    /// Write a model sidecar with an optional `[budget]` block.
+    fn write_model_with_budget(
+        dir: &Path,
+        name: &str,
+        sql: &str,
+        max_usd: Option<f64>,
+        max_bytes_scanned: Option<u64>,
+    ) {
+        let sql_path = dir.join(format!("{name}.sql"));
+        fs::write(&sql_path, sql).unwrap();
+
+        let mut toml_body = format!(
+            "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+        );
+        let has_budget = max_usd.is_some() || max_bytes_scanned.is_some();
+        if has_budget {
+            toml_body.push_str("\n[budget]\n");
+            if let Some(usd) = max_usd {
+                toml_body.push_str(&format!("max_usd = {usd}\n"));
+            }
+            if let Some(bytes) = max_bytes_scanned {
+                toml_body.push_str(&format!("max_bytes_scanned = {bytes}\n"));
+            }
+        }
+        let toml_path = dir.join(format!("{name}.toml"));
+        fs::write(&toml_path, toml_body).unwrap();
+    }
+
+    /// A model whose `[budget] max_usd` is tighter than the stub estimate
+    /// must cause `rocky compile` to emit E027 and exit with an error.
+    ///
+    /// Stub leaf stats: 10_000 rows × 256 bytes → estimated_compute_cost_usd
+    /// ≈ $0.0000228 (Databricks pricing constants).  A ceiling of $0.000001
+    /// is well below that, so the breach is guaranteed deterministically.
+    #[test]
+    fn compile_emits_e027_when_usd_ceiling_exceeded() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // max_usd is far below the stub estimate (~$0.0000228).
+        write_model_with_budget(
+            &models_dir,
+            "expensive_model",
+            "SELECT 1 AS x",
+            Some(0.000001),
+            None,
+        );
+
+        let err = run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true, // output_json: true so we can inspect the JSON
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("compilation failed"),
+            "E027 should cause compilation failure, got: {err}",
+        );
+    }
+
+    /// A model without a `[budget]` block must compile successfully even
+    /// when cost estimates are non-zero.
+    #[test]
+    fn compile_no_budget_no_e027() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT 1 AS x");
+
+        run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("model without budget should compile cleanly");
+    }
+
+    /// A model with a `[budget] max_bytes_scanned` below the stub estimate
+    /// must emit E027.  Stub leaf: 10_000 rows × 256 bytes = 2_560_000
+    /// estimated_bytes; ceiling of 100_000 < 2_560_000.
+    #[test]
+    fn compile_emits_e027_when_bytes_ceiling_exceeded() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model_with_budget(
+            &models_dir,
+            "big_scan",
+            "SELECT 1 AS x",
+            None,
+            Some(100_000), // 100 KB — below the 2.56 MB stub estimate
+        );
+
+        let err = run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("compilation failed"),
+            "E027 bytes breach should cause compilation failure, got: {err}",
+        );
+    }
+
+    /// A model with a `[budget]` ceiling above the stub estimate must compile cleanly.
+    #[test]
+    fn compile_generous_budget_passes() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // max_usd = $1.00 >> stub estimate (~$0.000023); should pass.
+        write_model_with_budget(&models_dir, "cheap_model", "SELECT 1 AS x", Some(1.0), None);
+
+        run_compile(
+            None,
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("generous budget should not trigger E027");
     }
 
     /// Compile without a state file must not silently fail or create a
