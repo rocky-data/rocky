@@ -235,6 +235,25 @@ Returns a complete summary of the pipeline execution.
 | `job_ids` | array of strings | Warehouse-side job IDs for the statements this materialization issued, accumulated alongside `bytes_scanned` / `bytes_written`. Lets orchestrators cross-check rocky-reported figures against the warehouse console (`bq show -j`, Snowflake query history, Databricks SQL warehouse history). Empty `[]` for adapters that don't surface a job id. Available since engine `1.21.0`. |
 | `partition` | object or absent | Partition window info for `time_interval` materializations. |
 
+#### Cross-checking BigQuery cost against `bq show -j`
+
+`job_ids` lets operators reconcile rocky's reported `bytes_scanned` against the figure BigQuery's own job statistics return — useful for confirming the cost numbers `rocky run` reports match the GCP console before they show up on the bill.
+
+```sh
+# Capture the first job id from a run.
+rocky run --config rocky.toml --output json \
+  | jq -r '.materializations[].job_ids[]' \
+  | head -1
+# → bquxjob_5f3c4e2a_19a1b6d3e21
+
+# Fetch the same job via the BigQuery REST API and read the billed bytes.
+bq show -j --location=EU --format=prettyjson bquxjob_5f3c4e2a_19a1b6d3e21 \
+  | jq '.statistics.query.totalBytesBilled'
+# → "10485760"
+```
+
+The number returned by `bq show -j` is the same value the BigQuery console displays under "Bytes billed" and matches `materializations[].bytes_scanned` in rocky's JSON output. `--location` must match the dataset's region (`EU`, `US`, `us-east1`, …) — BigQuery jobs are region-scoped and `bq show -j` returns `Not found: Job` if the location is wrong.
+
 **`check_results[]`:**
 
 | Field | Type | Description |

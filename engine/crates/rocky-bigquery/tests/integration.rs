@@ -258,3 +258,120 @@ async fn test_execute_statement_with_stats_reports_billed_bytes() {
          likely fell back to totalBytesProcessed from jobs.query"
     );
 }
+
+/// Cross-checks `ExecutionStats.bytes_scanned` against an independently
+/// fetched `statistics.query.totalBytesBilled` from a fresh `jobs.get`
+/// REST call.
+///
+/// Rationale: `test_execute_statement_with_stats_reports_billed_bytes`
+/// confirms the figure clears the 10 MB floor, but it can't catch a
+/// regression where the adapter mis-parses `totalBytesBilled` to a value
+/// that's still > 10 MB but wrong by a factor of (say) 8. This test
+/// independently re-fetches the job via a vanilla `reqwest::get` against
+/// the BigQuery `jobs.get` endpoint and asserts the numbers agree within
+/// ±1% — exactly the cross-check operators run as `rocky run --output
+/// json | jq '.materializations[].job_ids[]'` piped into `bq show -j`.
+///
+/// The independent fetch deliberately bypasses
+/// `BigQueryAdapter::fetch_job_statistics`: if both sides went through
+/// the same code path, the test would be circular.
+///
+/// `bytes_scanned` is captured against `ExecutionStats::job_id` from the
+/// same call — this is the field surfaced into
+/// `MaterializationOutput.job_ids` in `rocky run --output json`.
+#[tokio::test]
+#[ignore]
+async fn test_bytes_scanned_matches_independent_jobs_get_total_bytes_billed() {
+    use rocky_bigquery::auth::BigQueryAuth;
+    use rocky_core::traits::WarehouseAdapter;
+    use serde::Deserialize;
+
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+    let location = std::env::var("BIGQUERY_TEST_LOCATION").unwrap_or_else(|_| "EU".to_string());
+
+    let adapter = adapter_from_env().expect("BigQuery env vars not set");
+    // `INFORMATION_SCHEMA.SCHEMATA` scans real metadata — keeps the
+    // billed figure well above the 10 MB floor so the ±1% tolerance
+    // isn't dominated by floor rounding.
+    let region = format!("region-{}", location.to_lowercase());
+    let sql = format!("SELECT COUNT(*) AS n FROM `{project}.{region}.INFORMATION_SCHEMA.SCHEMATA`");
+
+    let stats = adapter
+        .execute_statement_with_stats(&sql)
+        .await
+        .expect("execute_statement_with_stats");
+
+    let rocky_bytes = stats
+        .bytes_scanned
+        .expect("bytes_scanned should be populated");
+    let job_id = stats.job_id.expect("job_id should be populated");
+
+    // Independent `jobs.get` REST call — fresh client + fresh auth so
+    // we're not exercising the same path that produced `stats`.
+    let auth = BigQueryAuth::from_env().expect("BigQueryAuth::from_env");
+    let client = reqwest::Client::new();
+    let token = auth.get_token(&client).await.expect("acquire bearer token");
+    let url =
+        format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs/{job_id}");
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .query(&[("location", location.as_str())])
+        .send()
+        .await
+        .expect("jobs.get send");
+    assert!(
+        resp.status().is_success(),
+        "jobs.get returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Minimal local response shape — keeps the deserializer tolerant of
+    // fields we don't read (camelCase per BigQuery's REST API).
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JobGet {
+        statistics: Stats,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Stats {
+        query: Query,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Query {
+        total_bytes_billed: String,
+    }
+
+    let job: JobGet = resp.json().await.expect("parse jobs.get JSON");
+    let bq_bytes: u64 = job
+        .statistics
+        .query
+        .total_bytes_billed
+        .parse()
+        .expect("totalBytesBilled parses as u64");
+
+    // ±1% tolerance: in practice these should match exactly because
+    // `totalBytesBilled` is an integer the adapter passes through
+    // unchanged. The slack covers any future rounding pass added on
+    // either side.
+    let tolerance = (bq_bytes / 100).max(1);
+    let diff = rocky_bytes.abs_diff(bq_bytes);
+    assert!(
+        diff <= tolerance,
+        "bytes_scanned cross-check failed: rocky={rocky_bytes} bq_jobs_get={bq_bytes} \
+         diff={diff} tolerance={tolerance} (±1%) job_id={job_id} location={location}",
+    );
+
+    // Receipt the test prints when run with `-- --nocapture`. Captured
+    // by the operator and pasted into the PR description as the live
+    // cross-check evidence.
+    println!(
+        "bq-crosscheck OK | job_id={job_id} location={location} \
+         rocky.bytes_scanned={rocky_bytes} bq.totalBytesBilled={bq_bytes} \
+         diff={diff} tolerance={tolerance}"
+    );
+}
