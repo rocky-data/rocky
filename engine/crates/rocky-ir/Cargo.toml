@@ -1,6 +1,6 @@
 [package]
 name = "rocky-ir"
-version = "1.39.0"
+version = "1.39.1"
 description = "Typed intermediate representation (IR) for Rocky transformation pipelines"
 edition.workspace = true
 license.workspace = true
