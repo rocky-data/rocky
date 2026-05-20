@@ -25,7 +25,7 @@ Never do this in a leaf crate:
 reqwest = "0.12"
 ```
 
-Why: the workspace is 20 crates. Per-crate version pins drift, cause duplicate dep compilations, and break the MSRV contract.
+Why: the workspace is 22 crates. Per-crate version pins drift, cause duplicate dep compilations, and break the MSRV contract.
 
 ### Adding a new workspace dependency
 
