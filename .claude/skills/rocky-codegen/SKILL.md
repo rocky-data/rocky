@@ -22,7 +22,7 @@ If you edit a Rust output struct and forget to regenerate, the `codegen-drift` w
 engine/crates/rocky-cli/src/output.rs       (Rust source of truth)
         │
         ▼  cargo run -- export-schemas schemas/
-schemas/*.schema.json                        (55 JSON Schemas, committed)
+schemas/*.schema.json                        (60 JSON Schemas, committed)
         │
         ├──▶  integrations/dagster/src/dagster_rocky/types_generated/   (Pydantic v2)
         └──▶  editors/vscode/src/types/generated/                       (TypeScript)
@@ -59,7 +59,7 @@ Three recipes in `justfile`, runnable individually:
 
 | Recipe | What it does |
 |---|---|
-| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes 55 schemas to `schemas/`. |
+| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (currently 60; run `ls schemas/*.schema.json | wc -l` to verify). |
 | `just codegen-dagster` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `integrations/dagster/src/dagster_rocky/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
 | `just codegen-vscode` | Runs `json2ts` per schema into `editors/vscode/src/types/generated/`. Self-heals the curated `index.ts` barrel via `git checkout`. |
 
@@ -79,11 +79,11 @@ Both `codegen-dagster` and `codegen-vscode` intentionally overwrite the output d
 
 ## Fixture drift (related but distinct)
 
-`scripts/regen_fixtures.sh` (aka `just regen-fixtures`) captures live `rocky --output json` output against the `00-playground-default` POC into `integrations/dagster/tests/fixtures_generated/`. This is a **parallel corpus** used for drift detection — not the committed test source of truth, which lives at `integrations/dagster/tests/fixtures/`.
+`scripts/regen_fixtures.sh` (aka `just regen-fixtures`) captures live `rocky --output json` output against the playground POCs into `integrations/dagster/tests/fixtures_generated/`. This is a **drift-detection corpus** — `test_generated_fixtures.py` re-validates the captured JSON against the current Pydantic models. The dagster parsing tests themselves load hand-crafted Python dicts from `integrations/dagster/tests/scenarios.py`, exposed as `*_json` pytest fixtures via `conftest.py`.
 
 When to regen fixtures:
 - After a schema change that affects the shape of an output (new fields, renamed fields, changed types).
-- Before committing, run `just regen-fixtures` and eyeball the diff in `fixtures_generated/`. If intentional, promote with `./scripts/regen_fixtures.sh --in-place` (destructive — overwrites `fixtures/`).
+- Before committing, run `just regen-fixtures` and check that `test_generated_fixtures.py` still passes. If it doesn't, the captured shape no longer matches the Pydantic models — usually means the codegen step was skipped.
 
 Prerequisite: the release binary at `engine/target/release/rocky` must exist (`just codegen` already builds it).
 
