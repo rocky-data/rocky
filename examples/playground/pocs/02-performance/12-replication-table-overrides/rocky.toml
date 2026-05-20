@@ -1,0 +1,83 @@
+# 12-replication-table-overrides — per-table most-specific-match-wins overrides
+#
+# Two source schemas, one replication pipeline, five [[table_overrides]] rules:
+#
+#   raw__orders   → tables: orders, order_items, _diagnostics_sync
+#   raw__events   → tables: events, user_01, user_02
+#
+# Pipeline defaults: strategy = "full_refresh", merge_keys = ["id"]
+#
+# Rules (ordered broad → narrow):
+#   Rule 1  match.connector = "raw__orders"
+#             merge_keys = ["order_id"]
+#             (connector-level; overrides merge_keys for every table in raw__orders)
+#
+#   Rule 2  match.connector = "raw__orders", match.table = "orders"
+#             strategy = "incremental"
+#             timestamp_column = "ordered_at"
+#             (most-specific; inherits merge_keys = ["order_id"] from Rule 1 via
+#              per-field most-specific-match-wins — Rule 2 only overrides the
+#              strategy and timestamp_column fields; merge_keys comes from Rule 1)
+#
+#   Rule 3  match.table = "_diagnostics_*"
+#             enabled = false
+#             (glob `*`: disables _diagnostics_sync in raw__orders and any other schema)
+#
+#   Rule 4  match.connector = "raw__events", match.table = "user_??"
+#             enabled = false
+#             (glob `?`: disables user_01 and user_02; `??` = exactly two characters)
+#
+#   Rule 5  match.connector = "raw__events", match.table = "events"
+#             strategy = "incremental"
+#             timestamp_column = "occurred_at"
+#             (both connector + table axes; independent of Rule 2)
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.raw]
+strategy   = "full_refresh"  # pipeline default for all unmatched tables
+merge_keys = ["id"]          # pipeline default merge_keys (Rule 1 overrides to ["order_id"] for raw__orders)
+
+[pipeline.raw.source.schema_pattern]
+prefix     = "raw__"
+separator  = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+catalog_template = "poc"
+schema_template  = "staging__{source}"
+
+[pipeline.raw.target.governance]
+auto_create_schemas = true
+
+# Rule 1 — broad connector rule: every table in raw__orders gets merge_keys = ["order_id"]
+[[pipeline.raw.table_overrides]]
+match.connector = "raw__orders"
+merge_keys      = ["order_id"]
+
+# Rule 2 — narrower: orders table uses incremental; inherits merge_keys from Rule 1
+[[pipeline.raw.table_overrides]]
+match.connector  = "raw__orders"
+match.table      = "orders"
+strategy         = "incremental"
+timestamp_column = "ordered_at"
+
+# Rule 3 — glob `*`: disable all _diagnostics_* tables across every connector
+[[pipeline.raw.table_overrides]]
+match.table = "_diagnostics_*"
+enabled     = false
+
+# Rule 4 — glob `?`: disable user_01 and user_02 (two-char suffix) in raw__events
+[[pipeline.raw.table_overrides]]
+match.connector = "raw__events"
+match.table     = "user_??"
+enabled         = false
+
+# Rule 5 — both axes: events table uses incremental with a named watermark column
+[[pipeline.raw.table_overrides]]
+match.connector  = "raw__events"
+match.table      = "events"
+strategy         = "incremental"
+timestamp_column = "occurred_at"
