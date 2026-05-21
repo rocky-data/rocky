@@ -168,6 +168,17 @@ pub trait FivetranCircuitBreaker: Send + Sync + std::fmt::Debug {
 
     /// Stable backend tag for OTLP span attributes.
     fn backend(&self) -> &'static str;
+
+    /// Initial cooldown (in whole seconds) the breaker uses when
+    /// tripping from `Closed → Open`. Surfaced on
+    /// [`FivetranError::CircuitOpen`](crate::client::FivetranError::CircuitOpen)
+    /// so callers downstream of the adapter can derive a `retry_after`
+    /// hint without re-parsing config. Implementations back this with
+    /// [`CircuitConfig::cooldown`]; the default returns 300 (matching
+    /// [`CircuitConfig::default`]) so out-of-tree backends don't break.
+    fn cooldown_seconds(&self) -> u64 {
+        CircuitConfig::default().cooldown.as_secs()
+    }
 }
 
 /// No-op breaker — always reports `Closed`, ignores record_*. Default
@@ -463,6 +474,10 @@ pub mod test_support {
         fn backend(&self) -> &'static str {
             "in_memory"
         }
+
+        fn cooldown_seconds(&self) -> u64 {
+            self.config.cooldown.as_secs()
+        }
     }
 }
 
@@ -686,6 +701,10 @@ pub mod valkey {
 
         fn backend(&self) -> &'static str {
             "valkey"
+        }
+
+        fn cooldown_seconds(&self) -> u64 {
+            self.config.cooldown.as_secs()
         }
     }
 

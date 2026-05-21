@@ -92,8 +92,19 @@ pub enum FivetranError {
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
 
-    #[error("Fivetran circuit breaker open for account; no HTTP attempted")]
-    CircuitOpen,
+    #[error(
+        "Fivetran circuit breaker open for account; no HTTP attempted (retry after {cooldown_seconds}s)"
+    )]
+    CircuitOpen {
+        /// Initial cooldown for the configured breaker, in whole
+        /// seconds. Surfaces on `FailedSourceOutput.cooldown_seconds` so
+        /// callers (Dagster) can derive a `retry_after` hint. This is
+        /// the *initial* cooldown from
+        /// [`CircuitConfig::cooldown`](crate::circuit_breaker::CircuitConfig::cooldown),
+        /// not the dynamically-extended one — good enough for a
+        /// `retry_after` signal and keeps the error self-describing.
+        cooldown_seconds: u64,
+    },
 
     #[error(
         "emit-fivetran-state: all {total} connector(s) returned missing schema_config; no healthy connectors found"
@@ -1021,15 +1032,17 @@ impl FivetranClient {
             }
         };
         if circuit_state == CircuitState::Open {
+            let cooldown_seconds = self.circuit.cooldown_seconds();
             let evt = PipelineEvent::new("fivetran.circuit_state_change")
                 .with_metadata("account_id", self.account_id_hash.clone())
                 .with_metadata("from_state", "open")
                 .with_metadata("to_state", "open")
                 .with_metadata("reason", "request_short_circuited")
-                .with_metadata("backend", self.circuit.backend());
+                .with_metadata("backend", self.circuit.backend())
+                .with_metadata("cooldown_seconds", cooldown_seconds.to_string());
             record_span_event(&evt);
             global_event_bus().emit(evt);
-            return Err(FivetranError::CircuitOpen);
+            return Err(FivetranError::CircuitOpen { cooldown_seconds });
         }
 
         let api_outcome = self
@@ -1243,12 +1256,17 @@ impl FivetranClient {
 /// Only remote failures trip the circuit breaker; local errors
 /// (parsing, serialization) do not.
 ///
-/// 429 errors are intentionally *not* counted as remote failures —
-/// rate limiting is a soft signal that Fivetran is responsive but
-/// busy, and `RateLimited` only surfaces from [`Self::get`] when the
-/// retry budget is exhausted. The shared [`RatelimitBudget`] (L3) is
-/// the right tool for 429 propagation; tripping the breaker on every
-/// 429-storm would refuse traffic for an unrelated reason.
+/// `RateLimited` counts as remote. A single 429 is absorbed by the
+/// per-call retry loop in [`FivetranClient::get`] /
+/// [`FivetranClient::get_single_page`], so `RateLimited` only surfaces
+/// to this classifier *after* `retry.max_retries` consecutive 429s on
+/// one envelope-fetch — that is already the post-retry storm signal
+/// the shared circuit breaker should act on. The shared
+/// [`RatelimitBudget`] still propagates the `wake_at` window for fleet
+/// coordination on transient bursts; the breaker is the second layer
+/// that fast-fails sustained storms so callers stop hammering Fivetran
+/// (and so orchestrators learn the failure quickly enough to schedule
+/// a delayed retry instead of paging the operator).
 fn is_remote_failure(err: &FivetranError) -> bool {
     match err {
         FivetranError::Http(e) => {
@@ -1262,9 +1280,9 @@ fn is_remote_failure(err: &FivetranError) -> bool {
             code.starts_with('5')
         }
         FivetranError::RetryBudgetExhausted { .. } => true,
-        FivetranError::RateLimited => false, // see doc comment above
+        FivetranError::RateLimited => true,
         FivetranError::UnexpectedResponse(_) => false, // local decode error
-        FivetranError::CircuitOpen => false,
+        FivetranError::CircuitOpen { .. } => false,
         // Per-account upstream state, not a transport failure — don't
         // trip the breaker. A retry on the next discover cycle won't
         // help unless the operator fixes the connectors upstream.

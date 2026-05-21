@@ -593,6 +593,14 @@ pub struct FailedSourceOutput {
     /// Human-readable error from the adapter — for logs / debugging only.
     /// Don't pattern-match on this; use `error_class` for branching.
     pub message: String,
+    /// Backoff hint in whole seconds. Populated by adapters whose
+    /// failure mode carries a known cooldown — currently only the
+    /// Fivetran adapter when its shared circuit breaker trips.
+    /// Orchestrators use it as a `retry_after` hint when scheduling a
+    /// delayed re-discover. Absent for failure classes without an
+    /// engine-supplied hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
 }
 
 impl FailedSourceOutput {
@@ -604,6 +612,7 @@ impl FailedSourceOutput {
             source_type: failed.source_type,
             error_class: failed.error_class.to_string(),
             message: failed.message,
+            cooldown_seconds: failed.cooldown_seconds,
         }
     }
 }

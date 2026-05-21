@@ -52,6 +52,15 @@ pub struct FailedSource {
     pub source_type: String,
     pub error_class: FailedSourceErrorClass,
     pub message: String,
+    /// Backoff hint in whole seconds. Populated by adapters whose
+    /// failure mode carries a known cooldown — currently only the
+    /// Fivetran adapter when its shared circuit breaker trips, where
+    /// this is the initial `CircuitConfig::cooldown` for the
+    /// configured breaker. Orchestrators (Dagster, etc.) use it as a
+    /// `retry_after` hint when scheduling a delayed re-discover.
+    /// `None` for all other failure classes (no engine-supplied hint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
 }
 
 /// Coarse classification of why a discovery fetch failed.
