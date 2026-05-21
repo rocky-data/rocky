@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.39.0] — 2026-05-21
+
+Codegen-companion release to engine `v1.41.0`. Regenerated `dagster_rocky/types_generated/state_retention_sweep_schema.py` picks up the engine's new `SweepReport.traces_deleted` field from PR [#616](https://github.com/rocky-data/rocky/pull/616) (Arc 4 span retention). No new resource methods, sensors, or schedules — pure codegen cascade.
+
+### Changed
+
+- **Codegen pickup of `SweepReport.traces_deleted`** (engine `v1.41.0` — [#616](https://github.com/rocky-data/rocky/pull/616)). Regenerated `dagster_rocky/types_generated/state_retention_sweep_schema.py` adds the new `traces_deleted: int` field on `SweepReport`. Surfaces alongside the existing `runs_deleted` / `lineage_deleted` / `audit_deleted` counters from the engine's `auto_sweep_retention_at_end_of_run` path; dagster consumers of `rocky run --output json` reading the per-run state-retention surface now see how many JSONL trace files the engine swept on the latest run. Re-exported from `dagster_rocky.types`.
+
 ## [1.38.1] — 2026-05-20
 
 Patch release picking up the dagster-side work that landed after `1.38.0` shipped earlier the same day. A **stderr mirroring fix** for Dagster step processes — engine binary stderr now reaches the step's own fd so the "View error" link surfaces engine-side errors instead of just an opaque exit code. Plus the codegen cascade from engine `v1.40.0` picks up the new `PlanOutput.budget_diagnostics` + `has_budget_errors` fields, so dagster consumers of `rocky plan --output json` can read per-model `[budget]` ceiling breaches as typed Pydantic data — a natural hook for a Dagster asset check to block downstream materialization when an `on_breach = "error"` model exceeds its ceiling.

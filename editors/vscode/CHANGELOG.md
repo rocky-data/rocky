@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.0] — 2026-05-21
+
+Codegen-companion release to engine `v1.41.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's new `SweepReport.traces_deleted` field from PR [#616](https://github.com/rocky-data/rocky/pull/616) (Arc 4 span retention). The engine also shipped two new LSP AI code-action arms (W004 unresolved classification + new E028 DSL parse errors) in PR [#620](https://github.com/rocky-data/rocky/pull/620); no extension-side dispatch change is required because `vscode-languageclient` already passes `CodeAction.data` through verbatim — the new arms work end-to-end once a 1.41 engine is on `$PATH` against this extension.
+
+### Changed
+
+- **Codegen pickup of `SweepReport.traces_deleted`** (engine `v1.41.0` — [#616](https://github.com/rocky-data/rocky/pull/616)). Regenerated `src/types/generated/state_retention_sweep.ts` adds the new `traces_deleted: number` field on `SweepReport`. Surfaces alongside the existing `runs_deleted` / `lineage_deleted` / `audit_deleted` counters; extension code consuming the state-retention sweep result via `rockyJson.ts` now type-checks against the new field without further hand-edits.
+
 ## [1.24.0] — 2026-05-20
 
 Codegen-companion release to engine `v1.40.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's per-model cost-ceiling surface from PR [#606](https://github.com/rocky-data/rocky/pull/606). No new extension commands, UI, or settings — pure codegen cascade.
