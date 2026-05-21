@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.40.0] — 2026-05-21
+
+Companion to engine `v1.42.0`. Ships the dagster-side half of the Fivetran 429 self-healing fix ([#624](https://github.com/rocky-data/rocky/pull/624)): when the engine surfaces a `quota-exceeded` `TableError` (sustained 429s tripping the shared Fivetran circuit breaker), the component now yields partial materializations from succeeded filters and raises a retriable `dg.Failure` with a `retry_after_seconds` metadata hint so user-configured `RetryPolicy` schedules the next attempt past the breaker cooldown. Picks up the regenerated `discover_schema.py` for the new `FailedSourceOutput.cooldown_seconds` field.
+
+### Changed
+
+- **`_run_filters`: surface Fivetran storm signal as retriable `dg.Failure`** ([#624](https://github.com/rocky-data/rocky/pull/624)). When any `RunResult.errors[*].failure_kind == "quota-exceeded"` (the engine-side post-fix signal that sustained 429s tripped the shared circuit breaker, or the per-run retry budget was exhausted), the per-filter loop now (a) accumulates partial `RunResult`s, (b) yields `MaterializeResult` / `AssetCheckResult` events for the succeeded filters via the existing `_emit_results` path, then (c) raises `dg.Failure(allow_retries=True, description=..., metadata={"retry_after_seconds": MetadataValue.int(300), "failure_kind": "quota-exceeded"})`. The 300s default mirrors `CircuitConfig::default().cooldown` on the engine side; per-error cooldown threading through `TableErrorOutput` is a follow-up. Dagster's run-retry policy honours the `retry_after_seconds` hint when configured. New test `test_quota_exceeded_failure_kind_raises_retriable_failure` covers the partial-yield + retriable-metadata path.
+- **`types_generated/discover_schema.py`** regenerated to surface the new optional `FailedSourceOutput.cooldown_seconds` field shipped in engine `v1.42.0`.
+
 ## [1.39.0] — 2026-05-21
 
 Codegen-companion release to engine `v1.41.0`. Regenerated `dagster_rocky/types_generated/state_retention_sweep_schema.py` picks up the engine's new `SweepReport.traces_deleted` field from PR [#616](https://github.com/rocky-data/rocky/pull/616) (Arc 4 span retention). No new resource methods, sensors, or schedules — pure codegen cascade.

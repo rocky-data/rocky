@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-05-21
+
+Codegen-companion release to engine `v1.42.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's new optional `FailedSourceOutput.cooldown_seconds` field from PR [#624](https://github.com/rocky-data/rocky/pull/624) (Fivetran 429 self-healing). The `rocky-project` JSON schema surfaced via `jsonValidation` also picks up the improved `max_retries` doc-comment recommending `≤ 4` when the Fivetran shared circuit breaker is enabled — visible on hover in `rocky.toml` editing. No new commands, settings, or LSP features.
+
+### Changed
+
+- **`src/types/generated/discover.ts`** picks up the new optional `cooldown_seconds: number | null` field on `FailedSourceOutput`.
+- **`src/types/generated/{adapter_config,rocky_project}.ts`** + **`schemas/rocky-project.schema.json`** pick up the refreshed `max_retries` doc-comment text.
+
 ## [1.25.0] — 2026-05-21
 
 Codegen-companion release to engine `v1.41.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's new `SweepReport.traces_deleted` field from PR [#616](https://github.com/rocky-data/rocky/pull/616) (Arc 4 span retention). The engine also shipped two new LSP AI code-action arms (W004 unresolved classification + new E028 DSL parse errors) in PR [#620](https://github.com/rocky-data/rocky/pull/620); no extension-side dispatch change is required because `vscode-languageclient` already passes `CodeAction.data` through verbatim — the new arms work end-to-end once a 1.41 engine is on `$PATH` against this extension.
