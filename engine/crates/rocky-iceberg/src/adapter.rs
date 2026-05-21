@@ -91,6 +91,7 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
                         source_type: "iceberg".to_string(),
                         error_class,
                         message: e.to_string(),
+                        cooldown_seconds: None,
                     });
                 }
             }

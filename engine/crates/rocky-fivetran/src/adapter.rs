@@ -84,6 +84,10 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                 }
                 Err(e) => {
                     let error_class = classify_fivetran_error(&e);
+                    let cooldown_seconds = match &e {
+                        FivetranError::CircuitOpen { cooldown_seconds } => Some(*cooldown_seconds),
+                        _ => None,
+                    };
                     warn!(
                         connector = conn.id.as_str(),
                         error = %e,
@@ -96,6 +100,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                         source_type: conn.service,
                         error_class,
                         message: e.to_string(),
+                        cooldown_seconds,
                     });
                 }
             }
@@ -119,7 +124,7 @@ fn classify_fivetran_error(err: &FivetranError) -> FailedSourceErrorClass {
         // cause is "Fivetran (or our perception of it) is unhealthy"
         // — surface as Transient so downstream retries know to back
         // off and re-attempt on the next discover cycle.
-        FivetranError::CircuitOpen => FailedSourceErrorClass::Transient,
+        FivetranError::CircuitOpen { .. } => FailedSourceErrorClass::Transient,
         FivetranError::UnexpectedResponse(_) => FailedSourceErrorClass::Unknown,
         // Per-account upstream state ("every connector 404s on
         // schema_config"); not a transient transport thing.

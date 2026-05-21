@@ -482,8 +482,138 @@ async fn circuit_open_short_circuits_http() {
         .await
         .expect_err("CircuitOpen must short-circuit");
     assert!(
-        matches!(err, FivetranError::CircuitOpen),
-        "expected CircuitOpen, got {err:?}"
+        matches!(
+            err,
+            FivetranError::CircuitOpen {
+                cooldown_seconds: 60
+            }
+        ),
+        "expected CircuitOpen with 60s cooldown, got {err:?}"
+    );
+    drop(server);
+}
+
+// =============================================================================
+// Sustained 429-storm trips the shared breaker (FR rate-limit-self-healing)
+// =============================================================================
+
+/// A sustained 429 storm must trip the shared circuit breaker. Each
+/// envelope-fetch hits 429 and surfaces `RateLimited`; under the
+/// post-FR classification `is_remote_failure(RateLimited) == true`, so
+/// each call votes `Remote` to the breaker. After `failure_threshold`
+/// consecutive votes the breaker transitions `Closed → Open`, and the
+/// next call short-circuits with [`FivetranError::CircuitOpen`]
+/// carrying the configured cooldown.
+#[tokio::test]
+async fn rate_limit_storm_trips_breaker() {
+    let server = MockServer::start().await;
+    // Every endpoint returns 429 — fetch_envelope's first internal
+    // call surfaces RateLimited on attempt 0 (max_retries=0).
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(".*"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let cb = Arc::new(InMemoryCircuit::new(CircuitConfig {
+        failure_threshold: 5,
+        window: Duration::from_secs(60),
+        cooldown: Duration::from_secs(300),
+        cooldown_max: Duration::from_secs(3600),
+    }));
+    let api_key = "storm_test_key";
+    let account_hash = rocky_fivetran::ratelimit::hash_account_id(api_key);
+
+    let retry = rocky_core::config::RetryConfig {
+        max_retries: 0,
+        ..rocky_core::config::RetryConfig::default()
+    };
+    let client =
+        FivetranClient::with_base_url_and_retry(api_key.into(), "s".into(), server.uri(), retry)
+            .with_circuit_breaker(cb.clone());
+
+    // Five envelope-fetches against a 429-only wiremock — each
+    // surfaces RateLimited and votes Remote.
+    for i in 0..5u32 {
+        let err = client
+            .fetch_envelope("dest_storm", false)
+            .await
+            .expect_err("429 storm should surface RateLimited");
+        assert!(
+            matches!(err, FivetranError::RateLimited),
+            "call {i}: expected RateLimited, got {err:?}"
+        );
+    }
+    assert_eq!(
+        cb.state(&account_hash).await.unwrap(),
+        CircuitState::Open,
+        "breaker must be Open after {} consecutive 429-storm votes",
+        5
+    );
+
+    // Sixth call short-circuits with CircuitOpen + the configured cooldown.
+    let err = client
+        .fetch_envelope("dest_storm", false)
+        .await
+        .expect_err("CircuitOpen must short-circuit after trip");
+    assert!(
+        matches!(
+            err,
+            FivetranError::CircuitOpen {
+                cooldown_seconds: 300
+            }
+        ),
+        "expected CircuitOpen {{ cooldown_seconds: 300 }}, got {err:?}"
+    );
+    drop(server);
+}
+
+/// A 429 burst below the breaker's `failure_threshold` must NOT trip
+/// it. Regression for the FR's "single 429 isn't a service failure"
+/// property — the post-retry classification only acts on *sustained*
+/// storms (≥ `failure_threshold` votes within `window`).
+#[tokio::test]
+async fn rate_limit_below_threshold_does_not_trip_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(".*"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let cb = Arc::new(InMemoryCircuit::new(CircuitConfig {
+        failure_threshold: 5,
+        window: Duration::from_secs(60),
+        cooldown: Duration::from_secs(300),
+        cooldown_max: Duration::from_secs(3600),
+    }));
+    let api_key = "below_threshold_key";
+    let account_hash = rocky_fivetran::ratelimit::hash_account_id(api_key);
+
+    let retry = rocky_core::config::RetryConfig {
+        max_retries: 0,
+        ..rocky_core::config::RetryConfig::default()
+    };
+    let client =
+        FivetranClient::with_base_url_and_retry(api_key.into(), "s".into(), server.uri(), retry)
+            .with_circuit_breaker(cb.clone());
+
+    // Four 429-surfacing calls (one below threshold=5). The breaker
+    // counts them but does not trip.
+    for i in 0..4u32 {
+        let err = client
+            .fetch_envelope("dest_below", false)
+            .await
+            .expect_err("429 should surface RateLimited");
+        assert!(
+            matches!(err, FivetranError::RateLimited),
+            "call {i}: expected RateLimited, got {err:?}"
+        );
+    }
+    assert_eq!(
+        cb.state(&account_hash).await.unwrap(),
+        CircuitState::Closed,
+        "breaker must stay Closed below failure_threshold"
     );
     drop(server);
 }

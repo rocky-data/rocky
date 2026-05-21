@@ -101,6 +101,21 @@ _VALIDATION_ERROR_PREVIEW_BYTES: int = 1500
 #: code-server pod on large model trees.
 _COLUMN_LINEAGE_MAX_WORKERS: int = 8
 
+#: Default cooldown surfaced as the ``retry_after_seconds`` metadata
+#: hint when a run terminates with a ``quota-exceeded`` failure_kind.
+#: Matches ``rocky_fivetran::circuit_breaker::CircuitConfig::default().cooldown``
+#: on the engine side — i.e. the initial cooldown a tripped Fivetran
+#: shared breaker honours before transitioning ``Open → HalfOpen``.
+#: Used because ``TableError`` does not currently carry the per-error
+#: cooldown; threading the exact value through is a follow-up.
+_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS: int = 300
+
+#: Wire-form failure_kind for the Fivetran-storm signal — emitted by
+#: ``rocky_fivetran::client::is_remote_failure`` when sustained 429s
+#: trip the shared circuit breaker or exhaust the per-run retry budget.
+#: Matches the codegen'd ``FailureKind5.quota_exceeded`` value.
+_QUOTA_EXCEEDED_FAILURE_KIND: str = "quota-exceeded"
+
 
 def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Failure:
     """Build a ``dg.Failure`` for a Pydantic schema-mismatch on ``rocky <command>``.
@@ -1642,7 +1657,7 @@ def _make_rocky_asset(
             # governance events so the surfaces are wired in both modes.
             yield from governance_events
         else:
-            results = _run_filters(context, rocky, filters)
+            results, quota_breach_cooldown = _run_filters(context, rocky, filters)
 
             if len(filters) > 1:
                 context.log.info(
@@ -1663,6 +1678,14 @@ def _make_rocky_asset(
                 rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
                 extra_yielded_checks=compliance_yielded,
             )
+
+            # If a filter surfaced the Fivetran-storm signal, raise the
+            # retriable failure AFTER yielding materializations from
+            # the successful filters so partial progress is preserved
+            # in the asset graph and the operator's retry only re-runs
+            # what was lost.
+            if quota_breach_cooldown is not None:
+                raise _quota_breach_failure(quota_breach_cooldown)
 
         # Contract check results — sourced from compile diagnostics, not
         # from the run. Each declared contract spec gets exactly one
@@ -1850,7 +1873,7 @@ def _run_filters(
     filters: list[str],
     *,
     streaming: bool = True,
-) -> list[RunResult]:
+) -> tuple[list[RunResult], int | None]:
     """Execute ``rocky run`` for each filter and emit per-run log lines.
 
     By default uses :meth:`RockyResource.run_streaming` so the engine's
@@ -1859,8 +1882,16 @@ def _run_filters(
     of buffering until the subprocess exits. Set ``streaming=False`` to
     fall back to the buffered :meth:`run` path (mostly useful for
     tests that don't want to mock ``subprocess.Popen``).
+
+    Returns ``(results, cooldown_seconds)``. ``cooldown_seconds`` is
+    non-``None`` when at least one filter surfaced a ``quota-exceeded``
+    ``TableError`` — the post-FR Fivetran shared-breaker storm signal.
+    On the breach the loop stops after the offending filter, succeeded
+    results are still returned so the caller can yield their
+    materializations before raising a retriable :class:`dg.Failure`.
     """
     results: list[RunResult] = []
+    cooldown_seconds: int | None = None
     for f in filters:
         context.log.info(f"Executing: rocky run --filter {f}")
         result = rocky.run_streaming(context, filter=f) if streaming else rocky.run(filter=f)
@@ -1870,7 +1901,46 @@ def _run_filters(
         )
         _log_run_diagnostics(context, result)
         results.append(result)
-    return results
+        if _has_quota_breach(result):
+            cooldown_seconds = _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS
+            context.log.warning(
+                f"Fivetran shared circuit breaker tripped during filter '{f}' "
+                f"(`failure_kind == quota-exceeded`); skipping remaining filters "
+                f"and surfacing a retriable failure with retry_after_seconds={cooldown_seconds}."
+            )
+            break
+    return results, cooldown_seconds
+
+
+def _has_quota_breach(result: RunResult) -> bool:
+    """True when ``result.errors`` contains a quota-exceeded entry.
+
+    Single source of truth for the Fivetran-storm signal so callers
+    don't drift on the wire string. See
+    :data:`_QUOTA_EXCEEDED_FAILURE_KIND`.
+    """
+    return any(err.failure_kind == _QUOTA_EXCEEDED_FAILURE_KIND for err in result.errors)
+
+
+def _quota_breach_failure(cooldown_seconds: int) -> dg.Failure:
+    """Build the retriable :class:`dg.Failure` raised on a quota-exceeded breach.
+
+    ``allow_retries=True`` lets Dagster's :class:`RetryPolicy` reschedule the
+    run; ``retry_after_seconds`` is a metadata hint orchestrators can read to
+    delay the next attempt past the breaker cooldown.
+    """
+    return dg.Failure(
+        description=(
+            "Fivetran shared circuit breaker tripped (sustained 429s exhausted "
+            f"the per-call retry budget); backing off {cooldown_seconds}s before "
+            "the next attempt."
+        ),
+        allow_retries=True,
+        metadata={
+            "retry_after_seconds": dg.MetadataValue.int(cooldown_seconds),
+            "failure_kind": dg.MetadataValue.text(_QUOTA_EXCEEDED_FAILURE_KIND),
+        },
+    )
 
 
 def _log_run_diagnostics(

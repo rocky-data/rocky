@@ -268,6 +268,8 @@ export interface RetryConfig {
   max_backoff_ms?: number;
   /**
    * Maximum number of retry attempts. Set to 0 to disable retries (e.g. for CI).
+   *
+   * When the Fivetran shared circuit breaker is enabled (`[adapter.fivetran.circuit_breaker]` with a non-default backend), keep `max_retries` ≤ 4 so a single 429-storm bursts at most ~5 attempts (`max_retries + 1`) per envelope-fetch before voting `Remote` to the breaker. Higher values lengthen the storm without changing the outcome — the breaker still trips after `failure_threshold` envelope-fetches exhaust their retry budget, and the orchestrator only sees the result after that.
    */
   max_retries?: number;
   /**
