@@ -633,3 +633,80 @@ def test_governance_compliance_failure_does_not_fail_materialization(
     assert len(compliance_checks) == 1
     eval_data = compliance_checks[0].event_specific_data
     assert eval_data.passed is True
+
+
+# ---------------------------------------------------------------------------
+# Fivetran storm signal — quota-exceeded TableError surfaces as retriable
+# ---------------------------------------------------------------------------
+
+
+def test_quota_exceeded_failure_kind_raises_retriable_failure(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """When ``RunResult.errors`` carries a ``quota-exceeded`` entry, the
+    component must (a) still yield ``MaterializeResult`` events for the
+    tables that completed in that run, and then (b) raise a retriable
+    :class:`dg.Failure` whose metadata exposes ``retry_after_seconds``
+    so Dagster's :class:`RetryPolicy` can honour the breaker cooldown.
+
+    Mirrors the engine-side storm signal: when sustained 429s trip the
+    Fivetran shared circuit breaker (or exhaust the per-run retry
+    budget), ``is_remote_failure(RateLimited) == true`` votes the
+    failure to the breaker, and the resulting ``TableError`` carries
+    ``failure_kind == "quota-exceeded"``. dagster-rocky must translate
+    that into a retriable Dagster failure.
+    """
+    defs = _build_defs(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+
+    # Inject a quota-exceeded TableError without removing the
+    # materializations the run did manage to land. The fixture has one
+    # materialization for the orders asset (under selection); the
+    # storm-signal error references the payments asset that the run
+    # didn't complete because the breaker tripped mid-run.
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="rate limited — retry after backoff",
+            failure_kind="quota-exceeded",
+        )
+    ]
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    exec_result = _materialize_subset(defs, run_result, [orders_key])
+
+    # The step is marked failed but partial progress is preserved.
+    assert not exec_result.success, "quota-exceeded must surface as a failure"
+    mat_events = list(exec_result.get_asset_materialization_events())
+    mat_keys = {ev.asset_key for ev in mat_events}
+    assert orders_key in mat_keys, (
+        "materialization for the successful (orders) table must be yielded "
+        "before the retriable failure raises"
+    )
+
+    # The dg.Failure carries allow_retries + retry_after_seconds metadata.
+    failure_events = [
+        e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"
+    ]
+    assert failure_events, "exactly one STEP_FAILURE expected for the breached step"
+    failure_data = failure_events[0].event_specific_data
+    # Dagster wraps the dg.Failure metadata under
+    # ``failure_data.error_source`` (USER_CODE_ERROR) — the actionable
+    # signal is the structured failure metadata propagated via
+    # ``MetadataValue.int``.
+    metadata = (
+        failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
+    )
+    assert "retry_after_seconds" in metadata, (
+        "retry_after_seconds metadata must be present on the dg.Failure"
+    )
+    assert metadata["retry_after_seconds"].value == 300, (
+        "retry_after_seconds must match _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS (300)"
+    )
+    assert failure_data.user_failure_data.label == "quota-exceeded" or any(
+        v.value == "quota-exceeded"
+        for v in metadata.values()
+        if hasattr(v, "value")
+    ), "failure_kind tag must be carried on the dg.Failure metadata"
