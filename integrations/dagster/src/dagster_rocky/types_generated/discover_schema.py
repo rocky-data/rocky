@@ -38,6 +38,10 @@ class FailedSourceOutput(BaseModel):
     Surfaced on `DiscoverOutput.failed_sources` so downstream consumers can distinguish a transient fetch failure from a deletion when diffing successive discover snapshots (FR-014).
     """
 
+    cooldown_seconds: conint(ge=0) | None = None
+    """
+    Backoff hint in whole seconds. Populated by adapters whose failure mode carries a known cooldown — currently only the Fivetran adapter when its shared circuit breaker trips. Orchestrators use it as a `retry_after` hint when scheduling a delayed re-discover. Absent for failure classes without an engine-supplied hint.
+    """
     error_class: str
     """
     Coarse error class so consumers can branch without parsing the `message`. One of `"transient"` / `"timeout"` / `"rate_limit"` / `"auth"` / `"unknown"`.
