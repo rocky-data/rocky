@@ -687,18 +687,14 @@ def test_quota_exceeded_failure_kind_raises_retriable_failure(
     )
 
     # The dg.Failure carries allow_retries + retry_after_seconds metadata.
-    failure_events = [
-        e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"
-    ]
+    failure_events = [e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"]
     assert failure_events, "exactly one STEP_FAILURE expected for the breached step"
     failure_data = failure_events[0].event_specific_data
     # Dagster wraps the dg.Failure metadata under
     # ``failure_data.error_source`` (USER_CODE_ERROR) — the actionable
     # signal is the structured failure metadata propagated via
     # ``MetadataValue.int``.
-    metadata = (
-        failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
-    )
+    metadata = failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
     assert "retry_after_seconds" in metadata, (
         "retry_after_seconds metadata must be present on the dg.Failure"
     )
@@ -706,7 +702,5 @@ def test_quota_exceeded_failure_kind_raises_retriable_failure(
         "retry_after_seconds must match _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS (300)"
     )
     assert failure_data.user_failure_data.label == "quota-exceeded" or any(
-        v.value == "quota-exceeded"
-        for v in metadata.values()
-        if hasattr(v, "value")
+        v.value == "quota-exceeded" for v in metadata.values() if hasattr(v, "value")
     ), "failure_kind tag must be carried on the dg.Failure metadata"
