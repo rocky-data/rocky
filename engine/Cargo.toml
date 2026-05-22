@@ -145,6 +145,13 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Lexer
 logos = "0.16"
 
+# Incremental computation framework (rust-analyzer's salsa). Used by the
+# `rocky-lang::incremental` spike module to prove the framework's value
+# for Rocky's parse pipeline. Not yet wired into the main compile flow —
+# follow-up PRs migrate call sites once the framework's API surface is
+# pinned for Rocky's needs.
+salsa = "0.26"
+
 # Web server
 axum = "0.8"
 tower = "0.5"

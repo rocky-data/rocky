@@ -11,6 +11,10 @@ logos = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
+# Salsa spike (`incremental` module): parallel, opt-in tracked-query API
+# wrapping `parse()`. Kept off the main parse path so the existing parser
+# entry point stays untouched.
+salsa = { workspace = true }
 
 [lints]
 workspace = true
