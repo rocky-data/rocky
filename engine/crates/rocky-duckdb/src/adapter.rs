@@ -10,6 +10,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
 use rocky_core::traits::{
@@ -78,6 +80,34 @@ impl DuckDbWarehouseAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Arrow PoC — IPC bridge between duckdb (arrow 56) and workspace arrow 58.
+// ---------------------------------------------------------------------------
+
+/// Decode Arrow IPC stream bytes (written by [`DuckDbConnector::query_arrow_ipc_bytes`]
+/// against arrow 56) into a single workspace arrow-58 `RecordBatch`.
+fn decode_ipc_stream(bytes: &[u8]) -> AdapterResult<RecordBatch> {
+    let reader = StreamReader::try_new(bytes, None)
+        .map_err(|e| AdapterError::msg(format!("arrow IPC stream decode failed: {e}")))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| AdapterError::msg(format!("arrow IPC batch read failed: {e}")))?;
+    match batches.len() {
+        0 => Err(AdapterError::msg(
+            "fetch_arrow_batch: IPC stream contained no batches",
+        )),
+        1 => Ok(batches.into_iter().next().unwrap()),
+        _ => {
+            // Defensive — we always write exactly one batch above, but a
+            // future codepath could write more. Concat into one so the
+            // contract holds.
+            let schema = batches[0].schema();
+            arrow::compute::concat_batches(&schema, batches.iter())
+                .map_err(|e| AdapterError::msg(format!("arrow concat_batches failed: {e}")))
+        }
+    }
+}
+
 #[async_trait]
 impl WarehouseAdapter for DuckDbWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -102,6 +132,20 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             columns: result.columns,
             rows: result.rows,
         })
+    }
+
+    async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
+        // DuckDB's `query_arrow` returns batches built against arrow 56
+        // (whatever major `duckdb 1.4.4` pins). The trait method must
+        // return the workspace arrow 58 `RecordBatch`. The two are wire-
+        // compatible but not type-compatible, so we round-trip through
+        // the stable Arrow IPC stream format.
+        let conn = self
+            .connector
+            .lock()
+            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+        let raw = conn.query_arrow_ipc_bytes(sql).map_err(AdapterError::new)?;
+        decode_ipc_stream(&raw)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -305,5 +349,51 @@ mod tests {
                 .is_err(),
             "branch_schema must be validated as a SQL identifier"
         );
+    }
+
+    /// Live conformance test for the Arrow inter-adapter PoC.
+    ///
+    /// Marked `#[ignore]` because it links the bundled DuckDB C++ binary
+    /// (already in the dev dependency graph, but the explicit gate keeps
+    /// the default `cargo test` profile lean) and exercises the
+    /// arrow-56 → workspace-arrow-58 IPC bridge end-to-end. Run with:
+    ///
+    /// ```bash
+    /// cargo test -p rocky-duckdb -- --ignored fetch_arrow_batch
+    /// ```
+    #[ignore]
+    #[tokio::test]
+    async fn fetch_arrow_batch_round_trips_through_ipc_bridge() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::DataType;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let batch = adapter
+            .fetch_arrow_batch("SELECT 1 AS n, 'foo' AS s")
+            .await
+            .expect("fetch_arrow_batch should succeed on rocky-duckdb");
+
+        // Schema — 2 columns, named + typed as expected.
+        let schema = batch.schema();
+        assert_eq!(schema.fields().len(), 2, "expected 2 columns");
+        assert_eq!(schema.field(0).name(), "n");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).name(), "s");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+        // Rows + values.
+        assert_eq!(batch.num_rows(), 1);
+        let n = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("column 0 must downcast to Int32Array");
+        assert_eq!(n.value(0), 1);
+        let s = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column 1 must downcast to StringArray");
+        assert_eq!(s.value(0), "foo");
     }
 }

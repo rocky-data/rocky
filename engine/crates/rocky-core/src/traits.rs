@@ -304,6 +304,33 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Execute a SQL query and return rows.
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult>;
 
+    /// Execute a SQL query and return the result as a single Apache Arrow
+    /// [`RecordBatch`](arrow::record_batch::RecordBatch).
+    ///
+    /// **Proof-of-concept method.** Only `rocky-duckdb` implements this today.
+    /// The default impl returns an `AdapterError`, so existing adapters keep
+    /// working unchanged. The goal is to establish Arrow as the canonical
+    /// inter-adapter wire format ahead of a per-adapter rollout (Databricks,
+    /// Snowflake, BigQuery, Trino, Iceberg, Airbyte, Fivetran).
+    ///
+    /// Implementations that produce multiple batches MUST concatenate them
+    /// into a single `RecordBatch` so callers can treat the result as one
+    /// contiguous columnar slice. Streaming variants will land as a separate
+    /// trait method in a follow-up PR.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` if the adapter does not implement this method
+    /// or if the underlying warehouse query fails.
+    async fn fetch_arrow_batch(
+        &self,
+        _sql: &str,
+    ) -> AdapterResult<arrow::record_batch::RecordBatch> {
+        Err(AdapterError::msg(
+            "fetch_arrow_batch not supported by this adapter",
+        ))
+    }
+
     /// Describe a table's columns (name, type, nullable).
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>>;
 

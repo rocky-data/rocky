@@ -209,6 +209,7 @@ dependencies = [
  "arrow-buffer 56.2.1",
  "arrow-cast 56.2.1",
  "arrow-data 56.2.1",
+ "arrow-ipc 56.2.1",
  "arrow-ord 56.2.1",
  "arrow-row 56.2.1",
  "arrow-schema 56.2.1",
@@ -228,7 +229,7 @@ dependencies = [
  "arrow-cast 58.3.0",
  "arrow-csv",
  "arrow-data 58.3.0",
- "arrow-ipc",
+ "arrow-ipc 58.3.0",
  "arrow-json",
  "arrow-ord 58.3.0",
  "arrow-row 58.3.0",
@@ -402,6 +403,20 @@ dependencies = [
  "half",
  "num-integer",
  "num-traits",
+]
+
+[[package]]
+name = "arrow-ipc"
+version = "56.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f88b0fbb33af28089ccd3e4dcd0ff09de46842168d00220b920f7231feddf5"
+dependencies = [
+ "arrow-array 56.2.1",
+ "arrow-buffer 56.2.1",
+ "arrow-data 56.2.1",
+ "arrow-schema 56.2.1",
+ "arrow-select 56.2.1",
+ "flatbuffers",
 ]
 
 [[package]]
@@ -3071,7 +3086,7 @@ dependencies = [
  "arrow-array 58.3.0",
  "arrow-buffer 58.3.0",
  "arrow-data 58.3.0",
- "arrow-ipc",
+ "arrow-ipc 58.3.0",
  "arrow-schema 58.3.0",
  "arrow-select 58.3.0",
  "base64",
@@ -3934,6 +3949,7 @@ dependencies = [
 name = "rocky-core"
 version = "1.42.0"
 dependencies = [
+ "arrow 58.3.0",
  "async-trait",
  "blake3",
  "bytes",
@@ -3995,6 +4011,8 @@ dependencies = [
 name = "rocky-duckdb"
 version = "1.42.0"
 dependencies = [
+ "arrow 56.2.1",
+ "arrow 58.3.0",
  "async-trait",
  "chrono",
  "duckdb",
