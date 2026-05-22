@@ -241,6 +241,14 @@ class TableError(BaseModel):
     #: Defaults to ``"unknown"`` for older engine binaries that omit the
     #: field.
     failure_kind: str = "unknown"
+    #: Engine-supplied retry-after hint in whole seconds. Populated when a
+    #: warehouse circuit breaker tripped on a half-open-recovery config —
+    #: the warehouse-side mirror of ``FailedSource.cooldown_seconds``.
+    #: ``None`` for failures without an engine-supplied hint, and for
+    #: older engine binaries that don't yet emit the field. Read by
+    #: ``_run_filters`` to project the engine's cooldown onto the
+    #: retriable :class:`dg.Failure` instead of the hard-coded fallback.
+    cooldown_seconds: int | None = None
 
 
 class ExcludedTable(BaseModel):

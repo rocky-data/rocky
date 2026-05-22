@@ -704,3 +704,132 @@ def test_quota_exceeded_failure_kind_raises_retriable_failure(
     assert failure_data.user_failure_data.label == "quota-exceeded" or any(
         v.value == "quota-exceeded" for v in metadata.values() if hasattr(v, "value")
     ), "failure_kind tag must be carried on the dg.Failure metadata"
+
+
+def test_quota_exceeded_with_engine_cooldown_honours_engine_value(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """Run-side warehouse-breaker parity: when the engine supplies a
+    per-error ``TableError.cooldown_seconds`` (the warehouse breaker
+    was configured with ``circuit_breaker_recovery_timeout_secs``), the
+    component must surface that exact value on
+    ``retry_after_seconds`` instead of falling back to
+    :data:`_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS`.
+
+    Mirrors the warehouse-side mirror of PR #624: a Databricks /
+    Snowflake breaker trip lands a ``quota-exceeded`` ``TableError``
+    with the warehouse's configured cooldown, and the dagster handler
+    threads it through to ``dg.Failure.metadata.retry_after_seconds`` so
+    Dagster's :class:`RetryPolicy` honours the warehouse's view instead
+    of the Fivetran-default.
+    """
+    defs = _build_defs(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    # Engine reports a 90s cooldown on the breach — that wins over the
+    # 300s _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS fallback.
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="databricks circuit breaker tripped",
+            failure_kind="quota-exceeded",
+            cooldown_seconds=90,
+        )
+    ]
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    exec_result = _materialize_subset(defs, run_result, [orders_key])
+
+    assert not exec_result.success
+    failure_events = [e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"]
+    assert failure_events
+    failure_data = failure_events[0].event_specific_data
+    metadata = failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
+    assert metadata["retry_after_seconds"].value == 90, (
+        "engine-supplied TableError.cooldown_seconds must win over the "
+        "_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS fallback"
+    )
+
+
+def test_quota_exceeded_with_largest_cooldown_when_multiple_breaches(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """When more than one ``quota-exceeded`` error is present, the
+    component picks the largest engine-supplied cooldown so we honour
+    the most conservative backoff.
+
+    This is a defensive case — the engine breaks out of the run on the
+    first breaker trip — but the contract is "the longest reported
+    cooldown wins" and is worth pinning so a future engine change that
+    surfaces multiple breaches doesn't silently under-back-off.
+    """
+    defs = _build_defs(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="databricks breaker tripped (60s cooldown)",
+            failure_kind="quota-exceeded",
+            cooldown_seconds=60,
+        ),
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "refunds"],
+            error="snowflake breaker tripped (180s cooldown)",
+            failure_kind="quota-exceeded",
+            cooldown_seconds=180,
+        ),
+    ]
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    exec_result = _materialize_subset(defs, run_result, [orders_key])
+
+    assert not exec_result.success
+    failure_events = [e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"]
+    failure_data = failure_events[0].event_specific_data
+    metadata = failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
+    assert metadata["retry_after_seconds"].value == 180, (
+        "largest engine-supplied cooldown must win when multiple breaches are present"
+    )
+
+
+def test_quota_exceeded_with_none_cooldown_falls_back_to_default(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """A breach where every error carries ``cooldown_seconds=None``
+    (manual-reset-only breaker, or an older engine binary) must fall
+    back to :data:`_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS`.
+
+    Back-compat: prior to this PR every quota-exceeded error landed
+    without a cooldown field, and the dagster handler used the 300s
+    default. That behaviour must persist for ``None``-cooldown errors.
+    """
+    defs = _build_defs(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="breaker tripped without recovery_timeout configured",
+            failure_kind="quota-exceeded",
+            cooldown_seconds=None,
+        )
+    ]
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+
+    exec_result = _materialize_subset(defs, run_result, [orders_key])
+
+    assert not exec_result.success
+    failure_events = [e for e in exec_result.all_events if e.event_type_value == "STEP_FAILURE"]
+    failure_data = failure_events[0].event_specific_data
+    metadata = failure_data.user_failure_data.metadata if failure_data.user_failure_data else {}
+    assert metadata["retry_after_seconds"].value == 300, (
+        "None engine-supplied cooldown must fall back to "
+        "_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS (300)"
+    )

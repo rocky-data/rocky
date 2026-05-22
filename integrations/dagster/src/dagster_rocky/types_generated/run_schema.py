@@ -375,6 +375,10 @@ class TableErrorOutput(BaseModel):
     """
 
     asset_key: list[str]
+    cooldown_seconds: conint(ge=0) | None = None
+    """
+    Backoff hint in whole seconds. Populated by adapters whose failure mode carries a known cooldown — currently only the Databricks and Snowflake warehouse adapters when their shared circuit breaker trips (and the breaker was configured with `retry.circuit_breaker_recovery_timeout_secs`). Orchestrators (Dagster, etc.) use it as a `retry_after` hint when scheduling a delayed re-run. Mirrors the source-side shape on [`FailedSourceOutput::cooldown_seconds`]. Absent for failure classes without an engine-supplied hint.
+    """
     error: str
     failure_kind: (
         FailureKind1

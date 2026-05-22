@@ -244,6 +244,10 @@ export interface DriftActionOutput {
  */
 export interface TableErrorOutput {
   asset_key: string[];
+  /**
+   * Backoff hint in whole seconds. Populated by adapters whose failure mode carries a known cooldown — currently only the Databricks and Snowflake warehouse adapters when their shared circuit breaker trips (and the breaker was configured with `retry.circuit_breaker_recovery_timeout_secs`). Orchestrators (Dagster, etc.) use it as a `retry_after` hint when scheduling a delayed re-run. Mirrors the source-side shape on [`FailedSourceOutput::cooldown_seconds`]. Absent for failure classes without an engine-supplied hint.
+   */
+  cooldown_seconds?: number | null;
   error: string;
   /**
    * Coarse classification of the failure so orchestrators can branch on kind (retry, page, surface) without parsing `error`. Defaults to [`FailureKind::Unknown`] for errors that reached the output layer type-erased.

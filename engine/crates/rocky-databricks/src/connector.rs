@@ -38,7 +38,19 @@ pub enum ConnectorError {
     ApiError { status: u16, body: String },
 
     #[error("circuit breaker tripped after {consecutive_failures} consecutive transient failures")]
-    CircuitBreakerOpen { consecutive_failures: u32 },
+    CircuitBreakerOpen {
+        consecutive_failures: u32,
+        /// Initial half-open recovery timeout the underlying
+        /// [`CircuitBreaker`] honours before letting a trial request
+        /// through, in whole seconds. Populated from
+        /// [`CircuitBreaker::recovery_timeout`] when configured (i.e.
+        /// `retry.circuit_breaker_recovery_timeout_secs` is `Some`);
+        /// `None` for manual-reset-only breakers. Surfaces on
+        /// `TableErrorOutput.cooldown_seconds` so orchestrators can
+        /// derive a `retry_after` hint without re-parsing config —
+        /// mirrors the Fivetran source-adapter shape.
+        cooldown_seconds: Option<u64>,
+    },
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
@@ -283,6 +295,7 @@ impl DatabricksConnector {
         if let Err(e) = self.circuit_breaker.check() {
             return Err(ConnectorError::CircuitBreakerOpen {
                 consecutive_failures: e.consecutive_failures,
+                cooldown_seconds: self.circuit_breaker.recovery_timeout().map(|d| d.as_secs()),
             });
         }
 
@@ -899,6 +912,7 @@ mod tests {
     fn test_circuit_breaker_not_transient() {
         let err = ConnectorError::CircuitBreakerOpen {
             consecutive_failures: 5,
+            cooldown_seconds: None,
         };
         assert!(!is_transient(&err));
     }

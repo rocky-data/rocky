@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky-cli`: warehouse-side circuit-breaker cooldown parity** — `TableErrorOutput.cooldown_seconds: Option<u64>` added to the `rocky run` JSON output, mirroring the Fivetran-side `FailedSourceOutput.cooldown_seconds` shipped in v1.42.0. Populated when a Databricks or Snowflake circuit breaker trips on a config with `retry.circuit_breaker_recovery_timeout_secs` set. Sourced from a new `pub fn recovery_timeout(&self) -> Option<Duration>` accessor on `rocky_core::circuit_breaker::CircuitBreaker`; the warehouse `ConnectorError::CircuitBreakerOpen` variants now carry `cooldown_seconds: Option<u64>` and a unified `classify_anyhow_error_with_cooldown` walker projects them onto `TableError`. **Behaviour change:** the warehouse `CircuitBreakerOpen → FailureKind` mapping flips from `Transient` → `QuotaExceeded` to match the enum's documented semantics ("Rate limit hit or a configured budget cap (retry budget, circuit breaker, account-level quota)") and the existing dagster handler keyed on `failure_kind == quota-exceeded`. Orchestrators that previously treated a tripped warehouse breaker as a fail-fast transient now get a retriable `dg.Failure` with the warehouse's configured `retry_after_seconds` instead.
+- **`rocky-core`: `CircuitBreaker::recovery_timeout()` accessor** exposes the previously-private field so warehouse adapters can mirror it onto `ConnectorError::CircuitBreakerOpen.cooldown_seconds` without re-parsing config. `None` for manual-reset-only breakers preserves the original behaviour.
+
 ## [1.42.0] — 2026-05-21
 
 Headline: **Fivetran 429-storms now trip the shared circuit breaker** instead of stalling each pod in a 6-minute in-pod backoff loop. Pairs with a structured retriable signal on the Dagster side so orchestrators learn the failure within seconds and reschedule the run past the breaker cooldown. Single-PR cut ([#624](https://github.com/rocky-data/rocky/pull/624)) — small, targeted, high-impact for downstream consumers running Fivetran replication on a shared Valkey-backed breaker.
