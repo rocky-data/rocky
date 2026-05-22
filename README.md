@@ -10,11 +10,13 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Rocky is the trust plane for your warehouse.** A typed compiler, named branches, deterministic replay, column-level lineage, contracts, and per-model cost — all running over your existing Databricks / Snowflake / BigQuery / DuckDB. Apache 2.0.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.**
+
+Not a warehouse. Not a table format. Not a query engine. The trust plane for your data — a typed compiler, named branches, deterministic replay, column-level lineage, compile-time contracts, and per-model cost — running over your existing Databricks / Snowflake / BigQuery / DuckDB. Apache 2.0.
 
 Rocky exists because the disasters that cost data teams real money — silent schema drift wrecking a revenue dashboard, a column rename quietly poisoning 47 downstream models, an auditor asking who touched `fct_revenue.amount` and when, a cost spike that no one can attribute to a model — all share a common shape. They're problems the warehouse can't see and the templating engine on top of it was never asked to. Rocky owns the graph between your code and the warehouse so those problems become compile errors, blocked PRs, and signed artifacts instead of pages and post-mortems.
 
-It's built for the team running production-critical multi-tenant pipelines on Databricks today, on Snowflake or BigQuery tomorrow, who can't tolerate another silent failure. Storage and compute stay where they are.
+It's built for the team running production-critical multi-tenant pipelines on Databricks today, on Snowflake or BigQuery tomorrow, who can't tolerate another silent failure. Storage and compute stay where they are. **Rocky works on the SQL you already have** — the `.rocky` DSL is an acceleration when you want it, not a gate.
 
 <p align="center">
   <img src="docs/public/demo-quickstart.gif" alt="Rocky quickstart — create a project, compile, and run 3 models in under 15s" width="900" />
@@ -26,7 +28,7 @@ It's built for the team running production-critical multi-tenant pipelines on Da
 |---|---|---|
 | Upstream changes a column type | Silent — fails downstream, hours later | `E013` at compile, blocks the PR |
 | Required column dropped from a contract | No contract concept | `E010` at compile, blocks the PR |
-| Column rename with unknown blast radius | `dbt docs` post-hoc, table-level | `rocky lineage-diff` at PR time, column-level, downstream consumers listed |
+| Column rename with unknown blast radius | `dbt docs` post-hoc, table-level (dbt Cloud Enterprise has column lineage in their UI, also post-hoc, not PR-blocking) | `rocky lineage-diff` at PR time, column-level, downstream consumers listed, blocks the merge |
 | `SELECT *` pulls a new column you didn't expect | Silent | `P002` warning, downstream consumers named |
 | Snowflake-only function written for a Databricks project | Runs in dev, fails in prod | `P001` dialect-portability lint at compile |
 | Run cost doubles, no one knows which model | Manual warehouse spelunking | `RunOutput.cost_summary` per model, every run |
@@ -34,6 +36,8 @@ It's built for the team running production-critical multi-tenant pipelines on Da
 | Sev-2 at 3 AM, half the pipeline already ran | Re-run everything | `rocky run --resume-latest` — checkpoint, three-state circuit breaker, skip what succeeded |
 
 Each row is a real failure mode, with a Rocky command that turns it into a non-event. The same primitives — typed compiler, content-addressed state, column-level lineage, per-model cost — back every row.
+
+**Already on dbt?** `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. The "What dbt does" column above is dbt Core's behavior. **dbt Fusion** — dbt Labs' Rust rewrite of dbt Core (public beta) — catches some compile-time issues that dbt Core misses, but doesn't ship named branches, content-addressed deterministic replay, per-model cost attribution as a first-class column, dialect-portability lint across warehouses, or declarative governance + masking outside dbt platform's paid tiers. Those stay Rocky's surface, Apache 2.0.
 
 ## Try it in 60 seconds
 
@@ -149,7 +153,7 @@ The trust primitives — compiler, branches, replay, lineage, contracts, cost at
 
 - **Databricks is the production target for 2026.** Snowflake, BigQuery, and Trino adapters are Beta — connection, execution, and the core run loop work, but conformance coverage is still growing. If your enterprise warehouse is Snowflake or BigQuery and you need it production-grade today, talk to us.
 - **AI is a growing surface, not a finished product.** The compile-validate loop (generate → type-check → auto-fix → land) is real and shipped; the broader story (mass refactor across the DAG, auto-migration from a column type change, schema-aware assertion generation) is on the roadmap, not the changelog.
-- **Iceberg is supported as a source today.** First-class Iceberg-native writes — Rocky as the typed program over an open table format — is on the 2026 roadmap.
+- **Iceberg.** REST-catalog source discovery is Beta. Content-addressed writes round-trip as Iceberg through Delta UniForm — shipped end-to-end (Wave 2). First-class Iceberg-native writes without the Delta intermediate are on the 2026 roadmap.
 - **No built-in semantic layer.** Rocky's typed IR is the right home for one. Today, integrate with Cube, the dbt Semantic Layer, or your existing metric store.
 - **Orchestration: Dagster is first-class.** A `rocky serve` standalone path exists; native Airflow / Prefect integrations are not yet shipped — they're called from the CLI like any other binary.
 

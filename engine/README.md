@@ -1,8 +1,8 @@
 # Rocky
 
-**The trust plane for your warehouse.** Rocky is a typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data — named branches, deterministic replay, column-level lineage, compile-time contracts, per-model cost attribution. A single static Rust binary; storage and compute stay where they are.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data — named branches, deterministic replay, column-level lineage, compile-time contracts, per-model cost attribution. The trust plane for your data; a single static Rust binary; storage and compute stay where they are.
 
-**Rocky is not a warehouse, and not a templating layer.** It's a real compiler with type inference, diagnostic codes, and an IDE — so the failures that quietly cost data teams the most (silent schema drift, column rename blast radius, dialect divergence, cost spikes nobody can attribute) become compile errors and blocked PRs, not pages and post-mortems.
+**Rocky is not a warehouse, not a table format, not a query engine, not a templating layer.** It's a real compiler with type inference, diagnostic codes, and an IDE — so the failures that quietly cost data teams the most (silent schema drift, column rename blast radius, dialect divergence, cost spikes nobody can attribute) become compile errors and blocked PRs, not pages and post-mortems.
 
 No Jinja. No manifest. No parse step.
 
@@ -17,7 +17,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why — and the answer involves `git blame` and screenshots.
 
-dbt, by design, is a templating engine — it can't catch any of these at compile time. SQLMesh moved correctness to the planner. Rocky moved it to the compiler. Each failure above maps to a Rocky diagnostic code, a CI gate, or a content-addressed replay artifact.
+dbt Core, by design, is a templating engine — it can't catch any of these at compile time. dbt Fusion (dbt Labs' Rust rewrite of dbt Core, in public beta since 2025-05-28) catches some compile-time issues but still uses Jinja templating (`dbt-jinja` is a Rust port of mini-jinja), and doesn't ship named branches, content-addressed deterministic replay, per-model cost attribution, dialect-portability lint across warehouses, or declarative governance + masking outside dbt platform paid tiers. SQLMesh moved correctness to the planner. Rocky owns the trust dimensions all of them leave open — each failure above maps to a Rocky diagnostic code, a CI gate, or a content-addressed replay artifact.
 
 ## Scope on the ELT spectrum
 
