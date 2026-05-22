@@ -1792,3 +1792,192 @@ async fn test_read_retention_days_empty_rows_returns_none() {
     };
     assert_eq!(governance.read_retention_days(&table).await.unwrap(), None);
 }
+
+// =============================================================================
+// Warehouse-side breaker cooldown parity — mirrors the Fivetran shared-breaker
+// storm test in rocky-fivetran/tests/resilience_tests.rs. A sustained transient
+// storm must trip the per-connector circuit breaker and surface a
+// `ConnectorError::CircuitBreakerOpen { cooldown_seconds: Some(_) }` once the
+// breaker is configured with `circuit_breaker_recovery_timeout_secs`. The
+// cooldown flows through `classify_anyhow_error_with_cooldown` →
+// `TableErrorOutput.cooldown_seconds` so the dagster `_run_filters` handler
+// can emit a retriable `dg.Failure` with the right `retry_after_seconds`
+// hint without re-parsing config.
+// =============================================================================
+
+/// Builds a connector with the breaker armed at `threshold` and a configured
+/// half-open recovery timeout — the latter is what gives `CircuitBreakerOpen`
+/// a `cooldown_seconds: Some(_)` payload to mirror back to orchestrators.
+fn breaker_connector(
+    server: &MockServer,
+    threshold: u32,
+    cooldown_secs: u64,
+) -> DatabricksConnector {
+    let auth = Auth::from_config(AuthConfig {
+        host: "test.databricks.com".into(),
+        token: Some("test-token".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .unwrap();
+
+    let config = ConnectorConfig {
+        host: "test.databricks.com".into(),
+        warehouse_id: "test-warehouse".into(),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: threshold,
+            circuit_breaker_recovery_timeout_secs: Some(cooldown_secs),
+            ..Default::default()
+        },
+    };
+
+    DatabricksConnector::new(config, auth).with_base_url(server.uri())
+}
+
+/// A sustained 429 storm must trip the per-connector circuit breaker. Five
+/// 429-only calls (matching `circuit_breaker_threshold=5`, `max_retries=0`)
+/// each surface as `ApiError(429)` and vote the breaker towards `Open`. The
+/// sixth call short-circuits with `CircuitBreakerOpen` carrying the
+/// configured cooldown — that cooldown is the warehouse-side mirror of
+/// `FivetranError::CircuitOpen { cooldown_seconds }` and surfaces on
+/// `TableErrorOutput.cooldown_seconds` for dagster-rocky to honour.
+#[tokio::test]
+async fn rate_limit_storm_trips_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = breaker_connector(&server, 5, 180);
+
+    // Five 429-only calls vote `Remote` to the breaker; each surfaces as
+    // ApiError(429) with no retry (max_retries=0).
+    for i in 0..5u32 {
+        let err = connector
+            .execute_sql("SELECT 1")
+            .await
+            .expect_err("429 storm should error");
+        match err {
+            ConnectorError::ApiError { status: 429, .. } => {}
+            other => panic!("call {i}: expected ApiError(429), got: {other:?}"),
+        }
+    }
+
+    // Sixth call short-circuits — no HTTP, just the breaker projection.
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("CircuitBreakerOpen must short-circuit after trip");
+    match err {
+        ConnectorError::CircuitBreakerOpen {
+            consecutive_failures,
+            cooldown_seconds,
+        } => {
+            assert!(
+                consecutive_failures >= 5,
+                "expected ≥5 consecutive failures, got {consecutive_failures}"
+            );
+            assert_eq!(
+                cooldown_seconds,
+                Some(180),
+                "cooldown must mirror the configured recovery_timeout"
+            );
+        }
+        other => panic!("expected CircuitBreakerOpen, got: {other:?}"),
+    }
+}
+
+/// A burst below `circuit_breaker_threshold` must NOT trip the breaker.
+/// Regression for the inverse property of the storm test — single bursts
+/// stay absorbed by per-call retries / single-failure surfacing.
+#[tokio::test]
+async fn rate_limit_below_threshold_does_not_trip_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = breaker_connector(&server, 5, 180);
+
+    // Four 429s — below threshold=5 — must each surface as ApiError(429),
+    // never CircuitBreakerOpen.
+    for i in 0..4u32 {
+        let err = connector
+            .execute_sql("SELECT 1")
+            .await
+            .expect_err("429 should error");
+        match err {
+            ConnectorError::ApiError { status: 429, .. } => {}
+            ConnectorError::CircuitBreakerOpen { .. } => {
+                panic!("call {i}: breaker tripped below threshold=5")
+            }
+            other => panic!("call {i}: expected ApiError(429), got: {other:?}"),
+        }
+    }
+}
+
+/// Manual-reset-only breakers (no `circuit_breaker_recovery_timeout_secs`
+/// configured) still trip on a storm, but `CircuitBreakerOpen.cooldown_seconds`
+/// is `None` — dagster falls back to its `_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS`
+/// constant in that case.
+#[tokio::test]
+async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    // Same shape as `breaker_connector` but with `recovery_timeout_secs = None`.
+    let auth = Auth::from_config(AuthConfig {
+        host: "test.databricks.com".into(),
+        token: Some("test-token".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .unwrap();
+    let config = ConnectorConfig {
+        host: "test.databricks.com".into(),
+        warehouse_id: "test-warehouse".into(),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_timeout_secs: None,
+            ..Default::default()
+        },
+    };
+    let connector = DatabricksConnector::new(config, auth).with_base_url(server.uri());
+
+    for _ in 0..5u32 {
+        let _ = connector.execute_sql("SELECT 1").await;
+    }
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("CircuitBreakerOpen must short-circuit after trip");
+    match err {
+        ConnectorError::CircuitBreakerOpen {
+            cooldown_seconds: None,
+            ..
+        } => {}
+        other => {
+            panic!("expected CircuitBreakerOpen {{ cooldown_seconds: None, .. }}, got: {other:?}")
+        }
+    }
+}

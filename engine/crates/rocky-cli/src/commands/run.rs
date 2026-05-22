@@ -83,6 +83,14 @@ struct TableError {
     /// error is stringified; defaults to `Unknown` when no connector
     /// variant is in the chain (drift / governance / panic paths).
     failure_kind: crate::output::FailureKind,
+    /// Engine-supplied retry-after hint in whole seconds, populated
+    /// alongside `failure_kind` from the typed connector chain when a
+    /// warehouse circuit breaker tripped on a half-open-recovery
+    /// configuration. `None` when no cooldown is available (legacy
+    /// failures, non-breaker errors, breakers without a configured
+    /// `circuit_breaker_recovery_timeout_secs`). Mirrors the
+    /// source-side hint on `FailedSource.cooldown_seconds`.
+    cooldown_seconds: Option<u64>,
 }
 
 /// Sentinel error signalling that `rocky run` was cancelled by a shutdown
@@ -2182,8 +2190,10 @@ pub async fn run(
             }
             Ok((idx, Err(e))) => {
                 // Classify before stringification so the typed connector
-                // variant is preserved on `TableError.failure_kind`.
-                let failure_kind = classify_anyhow_error(&e);
+                // variant is preserved on `TableError.failure_kind` and
+                // the optional engine-supplied cooldown hint
+                // (warehouse-side breaker trip) is captured.
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 let msg = format!("{e:#}");
                 if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -2247,6 +2257,7 @@ pub async fn run(
                     error: msg,
                     task_index: Some(idx),
                     failure_kind,
+                    cooldown_seconds,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2281,6 +2292,7 @@ pub async fn run(
                     error: msg,
                     task_index: None,
                     failure_kind: FailureKind::Unknown,
+                    cooldown_seconds: None,
                 });
                 if fail_fast {
                     join_set.abort_all();
@@ -2499,7 +2511,8 @@ pub async fn run(
                         info!(table = task.table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
-                        let failure_kind = classify_anyhow_error(&e);
+                        let (failure_kind, cooldown_seconds) =
+                            classify_anyhow_error_with_cooldown(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.table_name.as_str(),
@@ -2511,6 +2524,7 @@ pub async fn run(
                             error: msg,
                             task_index: Some(idx),
                             failure_kind,
+                            cooldown_seconds,
                         });
                     }
                 }
@@ -3166,6 +3180,7 @@ pub async fn run(
             asset_key: e.asset_key.clone(),
             error: e.error.clone(),
             failure_kind: e.failure_kind,
+            cooldown_seconds: e.cooldown_seconds,
         })
         .collect();
 
@@ -5434,8 +5449,9 @@ async fn process_completed_result(
         }
         Ok((idx, Err(e))) => {
             // Classify before stringification so the typed connector
-            // variant is preserved on `TableError.failure_kind`.
-            let failure_kind = classify_anyhow_error(&e);
+            // variant is preserved on `TableError.failure_kind` (plus
+            // the optional warehouse-breaker cooldown hint).
+            let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
             let msg = format!("{e:#}");
             if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -5485,6 +5501,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: Some(idx),
                 failure_kind,
+                cooldown_seconds,
             });
         }
         Err(e) => {
@@ -5515,6 +5532,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: None,
                 failure_kind: FailureKind::Unknown,
+                cooldown_seconds: None,
             });
         }
     }

@@ -464,7 +464,17 @@ impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
                 500..=599 => FailureKind::Transient,
                 _ => FailureKind::QueryRejected,
             },
-            E::CircuitBreakerOpen { .. } => FailureKind::Transient,
+            // A tripped breaker is a *budget cap* — sustained transient
+            // pressure exhausted the retry budget — not a one-off
+            // transient blip. Match the [`FailureKind::QuotaExceeded`]
+            // doc-comment ("Rate limit hit or a configured budget cap
+            // (retry budget, circuit breaker, account-level quota)")
+            // and the Fivetran-side classification, so the dagster
+            // handler (which keys on `failure_kind == quota-exceeded`)
+            // can surface a retriable `dg.Failure` with the engine's
+            // cooldown hint instead of treating it as a fail-fast
+            // transient error.
+            E::CircuitBreakerOpen { .. } => FailureKind::QuotaExceeded,
             E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
         }
     }
@@ -493,9 +503,39 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
                 500..=599 => FailureKind::Transient,
                 _ => FailureKind::QueryRejected,
             },
-            E::CircuitBreakerOpen { .. } => FailureKind::Transient,
+            // See the databricks branch above — breaker trips are
+            // `QuotaExceeded` (budget cap), not `Transient`.
+            E::CircuitBreakerOpen { .. } => FailureKind::QuotaExceeded,
             E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
         }
+    }
+}
+
+/// Extract the warehouse-reported cooldown (in whole seconds) from a
+/// typed connector error, when the variant carries one. Populated only
+/// for `CircuitBreakerOpen` against breakers configured with timed
+/// half-open recovery (`retry.circuit_breaker_recovery_timeout_secs`);
+/// every other variant returns `None`. Surfaces on
+/// [`TableErrorOutput::cooldown_seconds`] so orchestrators can derive a
+/// `retry_after` hint without re-parsing config — warehouse-side mirror
+/// of the Fivetran `FailedSourceOutput.cooldown_seconds` path.
+fn cooldown_from_databricks(err: &rocky_databricks::connector::ConnectorError) -> Option<u64> {
+    use rocky_databricks::connector::ConnectorError as E;
+    match err {
+        E::CircuitBreakerOpen {
+            cooldown_seconds, ..
+        } => *cooldown_seconds,
+        _ => None,
+    }
+}
+
+fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> Option<u64> {
+    use rocky_snowflake::connector::ConnectorError as E;
+    match err {
+        E::CircuitBreakerOpen {
+            cooldown_seconds, ..
+        } => *cooldown_seconds,
+        _ => None,
     }
 }
 
@@ -527,6 +567,24 @@ fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKi
     None
 }
 
+/// Probe a single error link for a typed warehouse connector error and
+/// project it into both [`FailureKind`] and the optional cooldown hint.
+/// Returns `Some((kind, cooldown))` on a match, `None` otherwise — used
+/// by [`classify_anyhow_error_with_cooldown`] so a tripped warehouse
+/// breaker surfaces its `recovery_timeout` on
+/// [`TableErrorOutput::cooldown_seconds`] without re-walking the chain.
+fn classify_cause_with_cooldown(
+    cause: &(dyn std::error::Error + 'static),
+) -> Option<(FailureKind, Option<u64>)> {
+    if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
+        return Some((e.into(), cooldown_from_databricks(e)));
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some((e.into(), cooldown_from_snowflake(e)));
+    }
+    None
+}
+
 pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
     for cause in err.chain() {
         if let Some(kind) = classify_cause(cause) {
@@ -541,6 +599,29 @@ pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
     FailureKind::Unknown
 }
 
+/// Like [`classify_anyhow_error`], but also extracts the
+/// engine-supplied cooldown hint when the typed connector variant
+/// carries one (currently only warehouse `CircuitBreakerOpen` against a
+/// breaker configured with `circuit_breaker_recovery_timeout_secs`).
+/// Returns `(FailureKind, Option<u64>)`; the cooldown is the
+/// warehouse-side analogue of `FailedSourceOutput.cooldown_seconds` and
+/// feeds [`TableErrorOutput::cooldown_seconds`] so dagster-rocky can
+/// project it onto a retriable `dg.Failure` without re-parsing
+/// `rocky.toml`.
+pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind, Option<u64>) {
+    for cause in err.chain() {
+        if let Some(pair) = classify_cause_with_cooldown(cause) {
+            return pair;
+        }
+        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+            if let Some(pair) = classify_cause_with_cooldown(adapter_err.inner()) {
+                return pair;
+            }
+        }
+    }
+    (FailureKind::Unknown, None)
+}
+
 /// Error from a table that failed during parallel processing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TableErrorOutput {
@@ -552,6 +633,17 @@ pub struct TableErrorOutput {
     /// layer type-erased.
     #[serde(default)]
     pub failure_kind: FailureKind,
+    /// Backoff hint in whole seconds. Populated by adapters whose
+    /// failure mode carries a known cooldown — currently only the
+    /// Databricks and Snowflake warehouse adapters when their shared
+    /// circuit breaker trips (and the breaker was configured with
+    /// `retry.circuit_breaker_recovery_timeout_secs`). Orchestrators
+    /// (Dagster, etc.) use it as a `retry_after` hint when scheduling
+    /// a delayed re-run. Mirrors the source-side shape on
+    /// [`FailedSourceOutput::cooldown_seconds`]. Absent for failure
+    /// classes without an engine-supplied hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
 }
 
 /// A table that the discovery adapter reported but that is missing from
@@ -4126,6 +4218,7 @@ mod run_record_tests {
             asset_key: vec!["s".to_string(), "broken".to_string()],
             error: "connection refused".to_string(),
             failure_kind: FailureKind::Unknown,
+            cooldown_seconds: None,
         });
 
         let started = fixed_start();
@@ -5566,11 +5659,22 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn databricks_circuit_breaker_maps_to_transient() {
+    fn databricks_circuit_breaker_maps_to_quota_exceeded() {
+        // CircuitBreakerOpen is a budget-cap signal (sustained transient
+        // pressure exhausted the breaker) — see the doc-comment on
+        // `FailureKind::QuotaExceeded` and the dagster-side handler
+        // keyed on `failure_kind == "quota-exceeded"`.
         let e = DbE::CircuitBreakerOpen {
             consecutive_failures: 5,
+            cooldown_seconds: None,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+        let e = DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(120),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+        assert_eq!(cooldown_from_databricks(&e), Some(120));
     }
 
     #[test]
@@ -5639,11 +5743,20 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn snowflake_circuit_breaker_maps_to_transient() {
+    fn snowflake_circuit_breaker_maps_to_quota_exceeded() {
+        // See the databricks counterpart above — breaker trips are a
+        // budget-cap signal, not a one-off transient blip.
         let e = SnE::CircuitBreakerOpen {
             consecutive_failures: 5,
+            cooldown_seconds: None,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+        let e = SnE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(60),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::QuotaExceeded);
+        assert_eq!(cooldown_from_snowflake(&e), Some(60));
     }
 
     #[test]
@@ -5678,6 +5791,81 @@ mod failure_kind_tests {
     fn classify_anyhow_returns_unknown_when_no_connector_error_in_chain() {
         let err = anyhow::anyhow!("some non-connector failure");
         assert_eq!(classify_anyhow_error(&err), FailureKind::Unknown);
+    }
+
+    // ---- classify_anyhow_error_with_cooldown chain walk ------------------
+
+    #[test]
+    fn classify_anyhow_with_cooldown_extracts_databricks_breaker_cooldown() {
+        let conn_err = DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(180),
+        };
+        let err = anyhow::Error::new(conn_err).context("running materialization");
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, Some(180)),
+        );
+    }
+
+    #[test]
+    fn classify_anyhow_with_cooldown_extracts_snowflake_breaker_cooldown() {
+        let conn_err = SnE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(60),
+        };
+        let err = anyhow::Error::new(conn_err).context("running materialization");
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, Some(60)),
+        );
+    }
+
+    #[test]
+    fn classify_anyhow_with_cooldown_returns_none_when_breaker_has_no_recovery_timeout() {
+        // Manual-reset-only breakers (no `circuit_breaker_recovery_timeout_secs`
+        // configured) trip with `cooldown_seconds: None` — kind still flips
+        // to `QuotaExceeded` but the hint is absent.
+        let conn_err = DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: None,
+        };
+        let err = anyhow::Error::new(conn_err);
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, None),
+        );
+    }
+
+    #[test]
+    fn classify_anyhow_with_cooldown_returns_none_for_non_breaker_failure() {
+        let conn_err = DbE::Timeout {
+            id: "s".into(),
+            seconds: 60,
+        };
+        let err = anyhow::Error::new(conn_err);
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&err),
+            (FailureKind::Transient, None),
+        );
+    }
+
+    #[test]
+    fn classify_anyhow_with_cooldown_unwraps_adapter_error_wrapping_breaker() {
+        // Mirrors the production path: ConnectorError is wrapped in
+        // AdapterError (boxed) before crossing into anyhow — the
+        // cooldown walker must descend through the wrapper just like
+        // its FailureKind-only counterpart.
+        let conn_err = DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(300),
+        };
+        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let err = anyhow::Error::new(adapter_err);
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, Some(300)),
+        );
     }
 
     #[test]

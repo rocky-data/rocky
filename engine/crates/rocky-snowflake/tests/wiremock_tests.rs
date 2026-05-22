@@ -1092,3 +1092,182 @@ async fn test_statement_execute_span_emitted() {
         .expect("expected `statement.kind` attribute on statement.execute span");
     assert_eq!(kind.1, "query");
 }
+
+// =============================================================================
+// Warehouse-side breaker cooldown parity — mirrors the Fivetran shared-breaker
+// storm test in rocky-fivetran/tests/resilience_tests.rs. A sustained transient
+// storm must trip the per-connector circuit breaker and surface a
+// `ConnectorError::CircuitBreakerOpen { cooldown_seconds: Some(_) }` once the
+// breaker is configured with `circuit_breaker_recovery_timeout_secs`. The
+// cooldown flows through `classify_anyhow_error_with_cooldown` →
+// `TableErrorOutput.cooldown_seconds` so the dagster `_run_filters` handler
+// can emit a retriable `dg.Failure` with the right `retry_after_seconds`
+// hint without re-parsing config.
+// =============================================================================
+
+/// Builds a connector with the breaker armed at `threshold` and a configured
+/// half-open recovery timeout — the latter is what gives `CircuitBreakerOpen`
+/// a `cooldown_seconds: Some(_)` payload to mirror back to orchestrators.
+fn breaker_connector(
+    server: &MockServer,
+    threshold: u32,
+    cooldown_secs: u64,
+) -> SnowflakeConnector {
+    let auth = Auth::from_config(AuthConfig {
+        account: "test_account".into(),
+        username: None,
+        password: None,
+        oauth_token: Some("test-sf-token".into()),
+        private_key_path: None,
+        pat: None,
+    })
+    .unwrap();
+
+    let config = ConnectorConfig {
+        account: "test_account".into(),
+        warehouse: "COMPUTE_WH".into(),
+        database: Some("TEST_DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("SYSADMIN".into()),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: threshold,
+            circuit_breaker_recovery_timeout_secs: Some(cooldown_secs),
+            ..Default::default()
+        },
+    };
+
+    SnowflakeConnector::new(config, auth).with_base_url(server.uri())
+}
+
+#[tokio::test]
+async fn rate_limit_storm_trips_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = breaker_connector(&server, 5, 240);
+
+    for i in 0..5u32 {
+        let err = connector
+            .execute_sql("SELECT 1")
+            .await
+            .expect_err("429 storm should error");
+        match err {
+            ConnectorError::ApiError { status: 429, .. } => {}
+            other => panic!("call {i}: expected ApiError(429), got: {other:?}"),
+        }
+    }
+
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("CircuitBreakerOpen must short-circuit after trip");
+    match err {
+        ConnectorError::CircuitBreakerOpen {
+            consecutive_failures,
+            cooldown_seconds,
+        } => {
+            assert!(
+                consecutive_failures >= 5,
+                "expected ≥5 consecutive failures, got {consecutive_failures}"
+            );
+            assert_eq!(
+                cooldown_seconds,
+                Some(240),
+                "cooldown must mirror the configured recovery_timeout"
+            );
+        }
+        other => panic!("expected CircuitBreakerOpen, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_below_threshold_does_not_trip_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let connector = breaker_connector(&server, 5, 240);
+
+    for i in 0..4u32 {
+        let err = connector
+            .execute_sql("SELECT 1")
+            .await
+            .expect_err("429 should error");
+        match err {
+            ConnectorError::ApiError { status: 429, .. } => {}
+            ConnectorError::CircuitBreakerOpen { .. } => {
+                panic!("call {i}: breaker tripped below threshold=5")
+            }
+            other => panic!("call {i}: expected ApiError(429), got: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&server)
+        .await;
+
+    let auth = Auth::from_config(AuthConfig {
+        account: "test_account".into(),
+        username: None,
+        password: None,
+        oauth_token: Some("test-sf-token".into()),
+        private_key_path: None,
+        pat: None,
+    })
+    .unwrap();
+    let config = ConnectorConfig {
+        account: "test_account".into(),
+        warehouse: "COMPUTE_WH".into(),
+        database: Some("TEST_DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("SYSADMIN".into()),
+        timeout: Duration::from_secs(30),
+        retry: RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_timeout_secs: None,
+            ..Default::default()
+        },
+    };
+    let connector = SnowflakeConnector::new(config, auth).with_base_url(server.uri());
+
+    for _ in 0..5u32 {
+        let _ = connector.execute_sql("SELECT 1").await;
+    }
+    let err = connector
+        .execute_sql("SELECT 1")
+        .await
+        .expect_err("CircuitBreakerOpen must short-circuit after trip");
+    match err {
+        ConnectorError::CircuitBreakerOpen {
+            cooldown_seconds: None,
+            ..
+        } => {}
+        other => {
+            panic!("expected CircuitBreakerOpen {{ cooldown_seconds: None, .. }}, got: {other:?}")
+        }
+    }
+}

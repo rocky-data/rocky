@@ -101,13 +101,15 @@ _VALIDATION_ERROR_PREVIEW_BYTES: int = 1500
 #: code-server pod on large model trees.
 _COLUMN_LINEAGE_MAX_WORKERS: int = 8
 
-#: Default cooldown surfaced as the ``retry_after_seconds`` metadata
-#: hint when a run terminates with a ``quota-exceeded`` failure_kind.
-#: Matches ``rocky_fivetran::circuit_breaker::CircuitConfig::default().cooldown``
-#: on the engine side — i.e. the initial cooldown a tripped Fivetran
-#: shared breaker honours before transitioning ``Open → HalfOpen``.
-#: Used because ``TableError`` does not currently carry the per-error
-#: cooldown; threading the exact value through is a follow-up.
+#: Fallback cooldown for the ``retry_after_seconds`` metadata hint when
+#: a run terminates with a ``quota-exceeded`` ``failure_kind`` but the
+#: engine-side ``TableError.cooldown_seconds`` is absent — i.e. when
+#: the warehouse breaker that tripped wasn't configured with a
+#: ``circuit_breaker_recovery_timeout_secs``, or the engine binary is
+#: older than the warehouse-cooldown-parity cut. Matches
+#: ``rocky_fivetran::circuit_breaker::CircuitConfig::default().cooldown``
+#: (300s) on the engine side. When ``TableError.cooldown_seconds`` is
+#: populated, that value wins over this constant.
 _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS: int = 300
 
 #: Wire-form failure_kind for the Fivetran-storm signal — emitted by
@@ -1901,10 +1903,11 @@ def _run_filters(
         )
         _log_run_diagnostics(context, result)
         results.append(result)
-        if _has_quota_breach(result):
-            cooldown_seconds = _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS
+        breach_cooldown = _quota_breach_cooldown(result)
+        if breach_cooldown is not None:
+            cooldown_seconds = breach_cooldown
             context.log.warning(
-                f"Fivetran shared circuit breaker tripped during filter '{f}' "
+                f"Circuit breaker tripped during filter '{f}' "
                 f"(`failure_kind == quota-exceeded`); skipping remaining filters "
                 f"and surfacing a retriable failure with retry_after_seconds={cooldown_seconds}."
             )
@@ -1915,11 +1918,38 @@ def _run_filters(
 def _has_quota_breach(result: RunResult) -> bool:
     """True when ``result.errors`` contains a quota-exceeded entry.
 
-    Single source of truth for the Fivetran-storm signal so callers
-    don't drift on the wire string. See
-    :data:`_QUOTA_EXCEEDED_FAILURE_KIND`.
+    Single source of truth for the storm signal so callers don't drift on
+    the wire string. See :data:`_QUOTA_EXCEEDED_FAILURE_KIND`. Used by
+    tests; runtime callers should prefer :func:`_quota_breach_cooldown`
+    which also returns the engine-supplied cooldown hint.
     """
     return any(err.failure_kind == _QUOTA_EXCEEDED_FAILURE_KIND for err in result.errors)
+
+
+def _quota_breach_cooldown(result: RunResult) -> int | None:
+    """Return the cooldown to honour for a quota-exceeded breach, or
+    ``None`` if no breach occurred.
+
+    Prefers the engine-supplied ``TableError.cooldown_seconds`` (the
+    warehouse breaker's configured ``recovery_timeout``, or the Fivetran
+    breaker's ``CircuitConfig.cooldown``) over the
+    :data:`_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS` fallback. The
+    fallback covers two cases: (a) the breaker that tripped wasn't
+    configured with a recovery timeout, so the engine emits
+    ``cooldown_seconds: None``; (b) an older engine binary doesn't yet
+    emit the field. When multiple quota-exceeded errors are present
+    (rare — the engine breaks out of the run on first trip), the largest
+    populated cooldown wins so we honour the most conservative backoff.
+    """
+    breach_cooldowns = [
+        err.cooldown_seconds
+        for err in result.errors
+        if err.failure_kind == _QUOTA_EXCEEDED_FAILURE_KIND
+    ]
+    if not breach_cooldowns:
+        return None
+    populated = [c for c in breach_cooldowns if c is not None]
+    return max(populated) if populated else _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS
 
 
 def _quota_breach_failure(cooldown_seconds: int) -> dg.Failure:
@@ -1928,12 +1958,21 @@ def _quota_breach_failure(cooldown_seconds: int) -> dg.Failure:
     ``allow_retries=True`` lets Dagster's :class:`RetryPolicy` reschedule the
     run; ``retry_after_seconds`` is a metadata hint orchestrators can read to
     delay the next attempt past the breaker cooldown.
+
+    The breach signal originates from either the Fivetran shared circuit
+    breaker (sustained 429s on discover-time fetches) or a warehouse
+    circuit breaker (Databricks or Snowflake — sustained transient
+    pressure on a run-time SQL statement). The ``cooldown_seconds`` is
+    the engine's configured ``recovery_timeout`` for whichever breaker
+    tripped, or :data:`_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS` when
+    the engine didn't supply one (older binary, manual-reset-only
+    breaker).
     """
     return dg.Failure(
         description=(
-            "Fivetran shared circuit breaker tripped (sustained 429s exhausted "
-            f"the per-call retry budget); backing off {cooldown_seconds}s before "
-            "the next attempt."
+            "Circuit breaker tripped (sustained transient pressure exhausted "
+            f"the per-call retry budget); backing off {cooldown_seconds}s "
+            "before the next attempt."
         ),
         allow_retries=True,
         metadata={

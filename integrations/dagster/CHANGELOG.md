@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`_run_filters`: honour engine-supplied `TableError.cooldown_seconds`** for the `retry_after_seconds` hint on quota-exceeded breaches. Closes the warehouse-side parity gap PR #624 documented as a follow-up: when a Databricks or Snowflake circuit breaker trips on a config with `circuit_breaker_recovery_timeout_secs` set, the engine now stamps the warehouse's configured cooldown onto each breach error; the dagster handler reads it (preferring the largest reported cooldown when multiple are present) and projects it onto `dg.Failure.metadata.retry_after_seconds` instead of the hard-coded 300s constant. The constant is retained as a fallback for two cases: (a) manual-reset-only breakers (no `recovery_timeout` configured) emit `None`, (b) older engine binaries don't yet emit the field. Three new tests pin (a) engine-cooldown-wins, (b) largest-cooldown-wins when multiple breaches surface, (c) fallback for `None`.
+- **`TableError.cooldown_seconds: int | None = None`** added to the hand-written Pydantic model in `dagster_rocky/types.py`. Default-`None` preserves byte-stable parsing of fixtures captured before the warehouse-cooldown-parity cut.
+- **`types_generated/run_schema.py`** regenerated to surface the new optional `TableErrorOutput.cooldown_seconds` field shipped in the matching engine cut.
+
 ## [1.40.0] — 2026-05-21
 
 Companion to engine `v1.42.0`. Ships the dagster-side half of the Fivetran 429 self-healing fix ([#624](https://github.com/rocky-data/rocky/pull/624)): when the engine surfaces a `quota-exceeded` `TableError` (sustained 429s tripping the shared Fivetran circuit breaker), the component now yields partial materializations from succeeded filters and raises a retriable `dg.Failure` with a `retry_after_seconds` metadata hint so user-configured `RetryPolicy` schedules the next attempt past the breaker cooldown. Picks up the regenerated `discover_schema.py` for the new `FailedSourceOutput.cooldown_seconds` field.

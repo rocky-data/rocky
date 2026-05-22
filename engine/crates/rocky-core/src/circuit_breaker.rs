@@ -115,6 +115,21 @@ impl CircuitBreaker {
         }
     }
 
+    /// Initial half-open recovery timeout the breaker honours after
+    /// transitioning `Closed → Open`. `None` for manual-reset-only
+    /// breakers (constructed via [`Self::new`]).
+    ///
+    /// Surfaced on warehouse-adapter `ConnectorError::CircuitBreakerOpen`
+    /// so callers downstream of the adapter (e.g. the `rocky run` JSON
+    /// output, Dagster) can derive a `retry_after` hint without
+    /// re-parsing config — mirrors
+    /// [`FivetranCircuitBreaker::cooldown_seconds`](../../../rocky_fivetran/circuit_breaker/trait.FivetranCircuitBreaker.html)
+    /// on the source-adapter side.
+    #[must_use]
+    pub fn recovery_timeout(&self) -> Option<Duration> {
+        self.recovery_timeout
+    }
+
     fn now_ms(&self) -> u64 {
         // Saturating cast: breaks after ~584 million years of uptime.
         self.epoch.elapsed().as_millis() as u64
