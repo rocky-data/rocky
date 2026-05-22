@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-**Rocky is the trust plane for your warehouse.** A typed compiler that owns the graph between your code and your data — branches, deterministic replay, column-level lineage, compile-time contracts, dialect-portability lint, per-model cost attribution. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that owns the graph between your code and your data — branches, deterministic replay, column-level lineage, compile-time contracts, dialect-portability lint, per-model cost attribution. The trust plane for your data: storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
 
 ## Why Rocky exists
 
@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries — they're 
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why — and the answer involves `git blame` and screenshots.
 
-dbt, by design, is a templating engine — it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** Each failure above maps to a Rocky diagnostic code, a CI gate, or a content-addressed replay artifact.
+dbt Core, by design, is a templating engine — it can't catch any of these at compile time. dbt Fusion (dbt Labs' Rust rewrite of dbt Core, in public beta since 2025-05-28) catches some compile-time issues but still uses Jinja templating and doesn't ship named branches, content-addressed deterministic replay, per-model cost attribution, dialect-portability lint, or declarative governance + masking outside dbt platform paid tiers. SQLMesh moved correctness to the planner. **Rocky owns the trust dimensions all of them leave open** — each failure above maps to a Rocky diagnostic code, a CI gate, or a content-addressed replay artifact.
 
 ## Who Rocky is for
 
@@ -32,7 +32,7 @@ Rocky is **not** a fit for: greenfield analytics shops with no scale pain, singl
 
 A typed compiler that drives your warehouse. Storage and compute stay where they are. Rocky owns the graph — dependencies, compile-time types, drift handling, incremental logic, lineage, cost, contracts, governance.
 
-**Rocky is not a warehouse.** It's the trust plane in front of one.
+**Rocky is not a warehouse, not a table format, not a query engine.** It's the typed graph between your code and whichever of those you've chosen.
 
 ## Scope on the ELT spectrum
 
@@ -62,7 +62,7 @@ We are explicit about the difference between what Rocky ships and what's on the 
 - **Databricks is the production target for 2026.** SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, `SHALLOW CLONE` for branches — all production-grade.
 - **Snowflake, BigQuery, Trino are Beta.** Connection, execution, and the core run loop work; conformance coverage is still growing. We test against live warehouses; corner cases get reported and fixed quickly. If your enterprise warehouse is Snowflake or BigQuery and you need it production-grade today, [open a discussion](https://github.com/rocky-data/rocky/discussions) — we want the failure reports.
 - **AI is a growing surface.** The compile-validate loop is real and shipped. The killer demo (rename a column, regenerate 47 downstream models, regenerate assertions, run tests, ship) is the 2026 roadmap.
-- **Iceberg is a source today.** First-class Iceberg-native writes — Rocky as the typed program over an open table format — is on the 2026 roadmap.
+- **Iceberg.** REST-catalog source discovery is Beta. Content-addressed writes round-trip as Iceberg through Delta UniForm — shipped end-to-end (Wave 2). First-class Iceberg-native writes without the Delta intermediate are on the 2026 roadmap.
 - **No built-in semantic layer.** Rocky's typed IR is the right home for one; until then, integrate with Cube, the dbt Semantic Layer, or your existing metric store.
 - **Orchestration: Dagster is first-class.** `rocky serve` exists for small standalone teams. Native Airflow / Prefect integrations are not shipped — those orchestrators call Rocky like any other CLI.
 

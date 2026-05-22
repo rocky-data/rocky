@@ -15,7 +15,7 @@ Rocky organizes its capabilities around **seven trust dimensions** — the failu
 6. **Dialect-divergence lint** — `P001` portability lint
 7. **Declarative governance** — RBAC diff, masking, classification, `rocky compliance`
 
-The capability detail follows. For positioning vs other tools, see [Comparison](/features/comparison/). For honest scope (Databricks-first, Snowflake/BigQuery Beta, Iceberg-native on the roadmap), see [Where Rocky is today](/getting-started/introduction/#where-rocky-is-today).
+The capability detail follows. For positioning vs other tools, see [Comparison](/features/comparison/). For honest scope (Databricks-first, Snowflake/BigQuery Beta, Iceberg writes via Delta UniForm shipped, first-class Iceberg-native writes on the roadmap), see [Where Rocky is today](/getting-started/introduction/#where-rocky-is-today).
 
 ## Warehouse Support
 

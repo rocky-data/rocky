@@ -7,7 +7,7 @@
 
 # Rocky VS Code Extension
 
-Editor support for [Rocky](https://github.com/rocky-data/rocky) — the trust plane for your warehouse. Real LSP (not Jinja-aware text completion), interactive column-level lineage, compile-time diagnostics inline, and AI model generation gated through the compiler.
+Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed graph between your code and your warehouse. Real LSP (not Jinja-aware text completion), interactive column-level lineage, compile-time diagnostics inline, and AI model generation gated through the compiler.
 
 ## Features
 

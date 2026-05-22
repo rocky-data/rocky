@@ -1,6 +1,6 @@
 # dagster-rocky
 
-Dagster integration for [Rocky](https://github.com/rocky-data/rocky) — the trust plane for your warehouse.
+Dagster integration for [Rocky](https://github.com/rocky-data/rocky) — the typed graph between your code and your warehouse.
 
 `dagster-rocky` wraps the `rocky` CLI as a Dagster `ConfigurableResource` and exposes Rocky-managed
 tables as materializable Dagster assets. Compile-time contracts, column-level lineage, schema-drift
