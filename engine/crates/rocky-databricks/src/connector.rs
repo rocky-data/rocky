@@ -7,9 +7,10 @@ use rocky_core::retry::compute_backoff;
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
+use rocky_observe::span_attrs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{Instrument, Span, debug, field, info_span, warn};
 
 use crate::auth::Auth;
 
@@ -285,6 +286,33 @@ impl DatabricksConnector {
     }
 
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+        // Span attribute schema unification: every adapter wraps its
+        // retry-loop in a `statement.execute` span carrying the
+        // canonical `rocky.*` keys so OTel collectors see consistent
+        // attributes across Databricks / Snowflake / BigQuery. The
+        // bespoke `adapter` / `statement.kind` names emit alongside
+        // for one release so existing dashboards see no breakage.
+        // Follow-up PRs drop the aliases. See
+        // `rocky_observe::span_attrs`.
+        //
+        // `rocky.warehouse.query_id` / `bytes_scanned` /
+        // `retry.attempt` start empty; success path records them
+        // once the warehouse manifest lands.
+        let span = info_span!(
+            "statement.execute",
+            adapter = "databricks",
+            statement.kind = classify_statement_kind(sql),
+            "rocky.adapter.name" = "databricks",
+            "rocky.statement.kind" = classify_statement_kind(sql),
+            "rocky.warehouse.name" = %self.config.warehouse_id,
+            "rocky.warehouse.query_id" = field::Empty,
+            "rocky.warehouse.bytes_scanned" = field::Empty,
+            "rocky.retry.attempt" = field::Empty,
+        );
+        self.submit_and_wait_inner(sql).instrument(span).await
+    }
+
+    async fn submit_and_wait_inner(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
         let retry = &self.config.retry;
 
         // Circuit breaker: fail fast if Open. When timed half-open
@@ -311,6 +339,16 @@ impl DatabricksConnector {
                     if attempt > 0 {
                         rocky_observe::metrics::METRICS.inc_retries_succeeded();
                     }
+                    // Enrich the active `statement.execute` span with
+                    // the warehouse-side query ID + bytes manifest +
+                    // final attempt count now that Databricks has
+                    // returned them.
+                    let span = Span::current();
+                    span.record(span_attrs::WAREHOUSE_QUERY_ID, resp.statement_id.as_str());
+                    if let Some(bytes) = resp.manifest.as_ref().and_then(|m| m.total_byte_count) {
+                        span.record(span_attrs::WAREHOUSE_BYTES_SCANNED, bytes);
+                    }
+                    span.record(span_attrs::RETRY_ATTEMPT, u64::from(attempt + 1));
                     return Ok(resp);
                 }
                 Err(err) => {
@@ -719,6 +757,44 @@ fn stats_from_response(response: &StatementResponse) -> rocky_core::traits::Exec
 const POLL_DELAY_STEPS_MS: [u64; 5] = [100, 200, 500, 1000, 2000];
 /// Maximum polling delay after exponential growth.
 const MAX_POLL_DELAY_MS: u64 = 5000;
+
+/// Best-effort SQL-keyword classifier for the
+/// `rocky.statement.kind` span attribute (and its legacy
+/// `statement.kind` alias). Mirrors the matcher in the Snowflake
+/// connector so the span-attribute taxonomy is uniform across
+/// adapters — a dashboard filtering on
+/// `rocky.statement.kind = "ddl"` returns the same shape of work
+/// regardless of which warehouse executed it.
+///
+/// Returns one of `"query"`, `"dml"`, `"ddl"`, `"other"`.
+fn classify_statement_kind(sql: &str) -> &'static str {
+    let sql = strip_leading_sql_comments_and_whitespace(sql);
+    let keyword = sql
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+
+    match keyword.to_ascii_uppercase().as_str() {
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN" => "query",
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "TRUNCATE" => "dml",
+        "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE" => "ddl",
+        _ => "other",
+    }
+}
+
+fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        let Some(comment_body) = trimmed.strip_prefix("--") else {
+            return trimmed;
+        };
+
+        sql = match comment_body.find('\n') {
+            Some(line_end) => &comment_body[line_end + 1..],
+            None => "",
+        };
+    }
+}
 
 /// Computes the polling delay for statement status checks.
 ///

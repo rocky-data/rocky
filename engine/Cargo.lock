@@ -3766,6 +3766,7 @@ dependencies = [
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
+ "rocky-observe",
  "rocky-sql",
  "serde",
  "serde_json",

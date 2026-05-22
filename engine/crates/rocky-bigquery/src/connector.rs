@@ -6,13 +6,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::Instant;
-use tracing::{Instrument, debug, info_span};
+use tracing::{Instrument, Span, debug, field, info_span};
 
 use rocky_core::traits::{
     AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, PkRange, QueryResult, SqlDialect,
     WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
+use rocky_observe::span_attrs;
 use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::auth::BigQueryAuth;
@@ -153,10 +154,23 @@ impl BigQueryAdapter {
         // endpoint and the wire request doesn't surface the parsed
         // statement kind. TODO: classify via `rocky-sql` if downstream
         // consumers need to filter ddl/dml from query traffic.
+        //
+        // Span attribute schema unification: emit the canonical
+        // `rocky.*` keys alongside the bespoke `adapter` /
+        // `statement.kind` names for one release so existing
+        // dashboards see no breakage. Follow-up PRs drop the bespoke
+        // aliases. `rocky.warehouse.query_id` starts empty and is
+        // filled by `Span::record` once BigQuery returns the
+        // `JobReference.job_id`. See `rocky_observe::span_attrs`.
         let span = info_span!(
             "statement.execute",
             adapter = "bigquery",
             statement.kind = "query",
+            "rocky.adapter.name" = "bigquery",
+            "rocky.statement.kind" = "query",
+            "rocky.warehouse.name" = %self.project_id,
+            "rocky.warehouse.query_id" = field::Empty,
+            "rocky.warehouse.bytes_scanned" = field::Empty,
         );
         async move {
             let token = self.auth.get_token(&self.client).await?;
@@ -195,6 +209,7 @@ impl BigQueryAdapter {
             let response: BigQueryResponse = resp.json().await?;
 
             if response.job_complete {
+                record_warehouse_attrs_on_current_span(&response);
                 return Ok(response);
             }
 
@@ -275,6 +290,7 @@ impl BigQueryAdapter {
                     attempts = attempt + 1,
                     "BigQuery query completed"
                 );
+                record_warehouse_attrs_on_current_span(&response);
                 return Ok(response);
             }
         }
@@ -717,6 +733,37 @@ fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
         bytes_written: None,
         rows_affected: None,
         job_id,
+    }
+}
+
+/// Record the canonical warehouse-side attributes on the current
+/// `statement.execute` span once a `jobs.query` /
+/// `jobs.getQueryResults` response has resolved.
+///
+/// Mirrors the resolution order of [`stats_from_response`] so the
+/// span attribute and the [`ExecutionStats`] returned to the runner
+/// agree on which figure represents "bytes scanned" — under the OTel
+/// `rocky.warehouse.bytes_scanned` semantic this is the billed
+/// (cost-relevant) figure when available, otherwise the processed
+/// fallback.
+fn record_warehouse_attrs_on_current_span(response: &BigQueryResponse) {
+    let span = Span::current();
+    if let Some(job_ref) = &response.job_reference {
+        span.record(span_attrs::WAREHOUSE_QUERY_ID, job_ref.job_id.as_str());
+    }
+    if let Some(bytes) = response
+        .statistics
+        .as_ref()
+        .and_then(|s| s.query.as_ref())
+        .and_then(BigQueryQueryStatistics::total_bytes_billed_u64)
+        .or_else(|| {
+            response
+                .total_bytes_processed
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+    {
+        span.record(span_attrs::WAREHOUSE_BYTES_SCANNED, bytes);
     }
 }
 
