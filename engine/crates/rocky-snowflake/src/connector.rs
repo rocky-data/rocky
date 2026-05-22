@@ -17,9 +17,10 @@ use rocky_core::retry::compute_backoff;
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
+use rocky_observe::span_attrs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{Instrument, debug, info_span, warn};
+use tracing::{Instrument, Span, debug, field, info_span, warn};
 
 use crate::auth::Auth;
 
@@ -287,10 +288,27 @@ impl SnowflakeConnector {
     /// rather than spawning a new span per attempt. Mirrors the OTel
     /// `<verb>.<resource>` shape used by the `materialize.table` parent.
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+        // Span attribute schema unification: the canonical
+        // `rocky.adapter.name` / `rocky.statement.kind` keys live
+        // alongside the bespoke `adapter` / `statement.kind` names
+        // for one release so existing dashboards see no breakage.
+        // Follow-up PRs drop the bespoke aliases. See
+        // `rocky_observe::span_attrs`.
+        //
+        // `rocky.warehouse.name` carries the configured virtual
+        // warehouse so cross-environment dashboards can pivot cost
+        // by physical compute pool. `rocky.warehouse.query_id`
+        // starts empty and is filled by `Span::record` once
+        // Snowflake returns the `statement_handle`.
         let span = info_span!(
             "statement.execute",
             adapter = "snowflake",
             statement.kind = classify_statement_kind(sql),
+            "rocky.adapter.name" = "snowflake",
+            "rocky.statement.kind" = classify_statement_kind(sql),
+            "rocky.warehouse.name" = %self.config.warehouse,
+            "rocky.warehouse.query_id" = field::Empty,
+            "rocky.retry.attempt" = field::Empty,
         );
         self.submit_and_wait_inner(sql).instrument(span).await
     }
@@ -319,6 +337,15 @@ impl SnowflakeConnector {
                         record_span_event(&evt);
                         global_event_bus().emit(evt);
                     }
+                    // Enrich the active `statement.execute` span with
+                    // the warehouse-side query ID + final attempt count
+                    // now that Snowflake has returned them.
+                    let span = Span::current();
+                    span.record(
+                        span_attrs::WAREHOUSE_QUERY_ID,
+                        resp.statement_handle.as_str(),
+                    );
+                    span.record(span_attrs::RETRY_ATTEMPT, u64::from(attempt + 1));
                     return Ok(resp);
                 }
                 Err(err) => {
