@@ -121,6 +121,10 @@ sha2 = "0.11"
 # Content-addressed hashing (row-level dedup calibration)
 blake3 = "1"
 
+# Data parallelism — work-stealing par_iter for CPU-bound fan-out
+# (project loading, type-checking, SQL gen, multi-file parse).
+rayon = "1"
+
 # MD5 — used by the Fivetran object-store cache backend to compare
 # locally-computed digests against S3 ETags (single-part ETags = MD5)
 # for the hash-dedupe write path.
@@ -144,6 +148,13 @@ secrecy = { version = "0.10", features = ["serde"] }
 
 # Lexer
 logos = "0.16"
+
+# Incremental computation framework (rust-analyzer's salsa). Used by the
+# `rocky-lang` `incremental` spike module to prove the framework's value
+# for Rocky's parse pipeline. Not yet wired into the main compile flow —
+# follow-up PRs migrate call sites once the framework's API surface is
+# pinned for Rocky's needs.
+salsa = "0.26"
 
 # Web server
 axum = "0.8"

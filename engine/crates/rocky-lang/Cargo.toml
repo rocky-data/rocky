@@ -11,6 +11,15 @@ logos = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "parse_corpus"
+harness = false
 
 [lints]
 workspace = true

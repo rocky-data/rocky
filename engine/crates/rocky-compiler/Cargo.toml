@@ -25,7 +25,7 @@ indexmap = { workspace = true }
 regex = { workspace = true }
 sqlparser = { workspace = true }
 bumpalo = "3"
-rayon = "1"
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

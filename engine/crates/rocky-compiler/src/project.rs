@@ -135,7 +135,11 @@ impl Project {
 ///
 /// File discovery is sequential (single `read_dir` scan), but parsing and
 /// lowering are parallelized with rayon — each `.rocky` file is parsed,
-/// lowered to SQL, and resolved independently.
+/// lowered to SQL, and resolved independently. Read-only callers that only
+/// need parse results (without lowering / sidecar config) can use
+/// [`rocky_lang::parse_all`] directly — it owns the par-iter strategy
+/// (work-stealing pool, sequential fallback below a small threshold) so
+/// the optimization stays in one place.
 fn load_rocky_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
     if !dir.exists() {
         return Ok(Vec::new());

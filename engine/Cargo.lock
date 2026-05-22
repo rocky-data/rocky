@@ -4045,9 +4045,12 @@ dependencies = [
 name = "rocky-lang"
 version = "1.42.0"
 dependencies = [
+ "criterion",
  "logos",
  "miette",
+ "rayon",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
