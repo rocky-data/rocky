@@ -87,6 +87,18 @@ pub enum TrinoError {
         "Trino coordinator returned a nextUri pointing at a different origin: {next} (coordinator: {coordinator}). Refusing to follow — the Authorization header would otherwise be sent to an unrelated host."
     )]
     UntrustedNextUri { coordinator: String, next: String },
+
+    #[error(
+        "Trino coordinator did not honour the requested Arrow spooled-segment encoding. \
+         Apache Arrow IPC is a proposed extension to the spooling protocol \
+         (upstream PR trinodb/trino#26365) and is not yet supported by any shipping \
+         Trino release (current: 481). Fall back to the JSON polling path via \
+         `TrinoClient::execute` until Arrow encoding lands upstream."
+    )]
+    ArrowEncodingUnavailable,
+
+    #[error("Trino spooled Arrow decode error: {0}")]
+    ArrowDecode(String),
 }
 
 /// Returns `true` when `candidate` is on the same scheme + host + port as
@@ -235,6 +247,20 @@ impl TrinoClient {
     /// Read-only access to the active config (mostly for tests).
     pub fn config(&self) -> &TrinoClientConfig {
         &self.config
+    }
+
+    /// Crate-internal access to the underlying `reqwest::Client` so
+    /// sibling modules (e.g. `arrow_stream`) can drive the same
+    /// connection pool / timeout / TLS config without re-building one.
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Crate-internal handle on the shared header set
+    /// (`Authorization` + `X-Trino-User` + optional catalog/schema).
+    /// Sibling modules add encoding-negotiation headers on top.
+    pub(crate) fn base_headers(&self) -> Result<HeaderMap, TrinoError> {
+        self.build_headers()
     }
 
     /// Resolve the `X-Trino-User` value. Errors if neither config nor

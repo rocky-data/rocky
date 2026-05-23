@@ -115,6 +115,42 @@ async fn round_trip_select_one() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`. Apache Arrow IPC is not yet supported by shipping Trino (current: 481, May 2026) — see upstream trinodb/trino#26365. Until that lands the test asserts the version-gated `ArrowEncodingUnavailable` error rather than a successful round-trip."]
+async fn fetch_arrow_batch_against_live_trino_surfaces_version_gate() {
+    // Live conformance receipt for `WarehouseAdapter::fetch_arrow_batch`.
+    //
+    // Until Apache Arrow IPC ships as a spooled-protocol encoding the
+    // upstream coordinator falls back to inline-JSON `data` whenever
+    // the client requests `arrow` / `arrow+zstd`. The adapter MUST
+    // surface that gracefully — `ArrowEncodingUnavailable`, wrapped in
+    // `AdapterError` — rather than panic or quietly degrade. When
+    // Arrow encoding eventually lands upstream this test flips: drop
+    // the assertion and read the `RecordBatch` rows back.
+    let adapter = build_adapter();
+    let result = adapter.fetch_arrow_batch("SELECT 1 AS n").await;
+    match result {
+        Ok(batch) => {
+            // Forward-compat: when upstream Trino enables Arrow this
+            // branch becomes the receipt. Until then it shouldn't fire.
+            assert_eq!(
+                batch.num_rows(),
+                1,
+                "Trino coordinator unexpectedly accepted Arrow encoding — \
+                 update this assertion to verify the actual decoded row."
+            );
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Arrow"),
+                "expected ArrowEncodingUnavailable-style error against \
+                 a pre-Arrow Trino, got: {msg}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
 async fn round_trip_create_insert_select_drop() {
     // Exercises the full `WarehouseAdapter` surface against the writable

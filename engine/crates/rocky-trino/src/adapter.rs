@@ -6,6 +6,7 @@
 //! `checksum_chunks` errors via the `row_hash_expr` default, governance /
 //! batch / loader are absent.
 
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
 use rocky_ir::{ColumnInfo, TableRef};
@@ -65,6 +66,31 @@ impl WarehouseAdapter for TrinoAdapter {
             columns,
             rows: out.rows,
         })
+    }
+
+    /// Fetch `sql` results as a single Arrow `RecordBatch` via Trino's
+    /// spooled-protocol Arrow encoding.
+    ///
+    /// Drives [`TrinoClient::execute_arrow`], which negotiates Arrow IPC
+    /// segments through the `X-Trino-Client-Capabilities: SPOOLING` +
+    /// `X-Trino-Spooled-Segments-Accept-Encoding: arrow+zstd,arrow`
+    /// headers (the spec from upstream PR `trinodb/trino#26365`).
+    ///
+    /// # Version-gating
+    ///
+    /// Apache Arrow IPC is **not yet supported by any shipping Trino
+    /// release** (current: 481, May 2026) — the upstream PR is closed
+    /// stale and awaiting revival. When the coordinator falls back to
+    /// inline JSON rows the call surfaces
+    /// [`TrinoError::ArrowEncodingUnavailable`] (wrapped in
+    /// [`AdapterError`]) rather than silently degrading. Once Arrow
+    /// encoding lands upstream the negotiation wire is already in
+    /// place — no further adapter changes needed.
+    async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
+        self.client
+            .execute_arrow(sql)
+            .await
+            .map_err(AdapterError::new)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -131,6 +157,40 @@ mod tests {
             .format_table_ref("iceberg", "raw", "orders")
             .unwrap();
         assert_eq!(r, "\"iceberg\".\"raw\".\"orders\"");
+    }
+
+    #[tokio::test]
+    async fn fetch_arrow_batch_surfaces_version_gate_when_server_falls_back_to_inline_rows() {
+        // The shipping Trino release (481) doesn't advertise an Arrow
+        // spooled encoding, so the coordinator ignores the negotiation
+        // headers and ships inline-JSON rows. The adapter MUST surface
+        // this clearly rather than silently route around the gap.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "20260523_version_gate",
+                "data": [[1, "alice"]],
+                "stats": {"state": "FINISHED"}
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg =
+            TrinoClientConfig::new(server.uri()).with_timeout(std::time::Duration::from_secs(5));
+        let auth = crate::test_helpers::test_basic_auth();
+        let adapter = TrinoAdapter::new(cfg, auth);
+        let err = adapter
+            .fetch_arrow_batch("SELECT id, name FROM users")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Arrow"),
+            "expected Arrow-encoding-related error, got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -4097,8 +4097,10 @@ dependencies = [
 name = "rocky-trino"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "reqwest",
  "rocky-adapter-sdk",
