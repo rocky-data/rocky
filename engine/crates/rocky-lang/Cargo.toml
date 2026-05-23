@@ -16,5 +16,11 @@ serde = { workspace = true }
 # entry point stays untouched.
 salsa = { workspace = true }
 
+[dev-dependencies]
+# `read_source` tests write a fixture file under a temp dir and assert the
+# Salsa input picks up its contents. Per-crate dev-dep matches how the
+# other ~9 workspace crates use tempfile.
+tempfile = "3"
+
 [lints]
 workspace = true
