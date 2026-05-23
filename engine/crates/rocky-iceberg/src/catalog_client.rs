@@ -379,30 +379,34 @@ fn build_create_table_request(name: &str, schema: &TableSchema) -> CreateTableRe
 
 /// Build one `CommitTableRequest` from a catalog-agnostic [`TableCommit`].
 ///
-/// The v1 translation pins the convention `main` as the branch this
-/// commit advances. The trait's CAS contract maps to two Iceberg
+/// The translation maps the trait's CAS contract onto two Iceberg
 /// primitives:
 ///
 /// - [`TableCommit::expected_snapshot_id`] = `Some(id)` → an
-///   `assert-ref-snapshot-id` requirement on `main` pinning the base
-///   snapshot to `id`. A concurrent writer that landed against the same
-///   base fails this CAS and surfaces as
+///   `assert-ref-snapshot-id` requirement on the selected ref pinning
+///   the base snapshot to `id`. A concurrent writer that landed against
+///   the same base fails this CAS and surfaces as
 ///   [`CatalogError::CommitConflict`].
 /// - [`TableCommit::expected_snapshot_id`] = `None` → an `assert-create`
 ///   requirement, used when the commit creates the table.
 ///
-/// The update is a `set-snapshot-ref` advancing `main` to
-/// [`TableCommit::new_snapshot_id`]. This assumes the new snapshot
-/// already exists in the table's metadata (real callers write the
-/// snapshot row + manifest list first, then call commit). Richer
-/// commit shapes (schema updates, partition spec changes, multiple ref
-/// advances) belong on per-adapter extension surfaces rather than the
-/// converged trait.
+/// The synthesized update is a `set-snapshot-ref` advancing the same
+/// ref to [`TableCommit::new_snapshot_id`]. The ref defaults to `"main"`
+/// when [`TableCommit::branch`] is `None`, preserving the v1
+/// single-branch contract.
+///
+/// [`TableCommit::extra_requirements`] and [`TableCommit::extra_updates`]
+/// are appended *after* the synthesized pair. The order is load-bearing:
+/// the synthesized assert + advance always fire first so the CAS holds
+/// regardless of whatever schema / partition-spec entries the caller
+/// threaded through.
 fn build_commit_table_request(commit: &TableCommit) -> CommitTableRequest {
-    let requirement = match commit.expected_snapshot_id {
+    let ref_name = commit.branch.as_deref().unwrap_or("main");
+
+    let synth_requirement = match commit.expected_snapshot_id {
         Some(snapshot_id) => json!({
             "type": "assert-ref-snapshot-id",
-            "ref": "main",
+            "ref": ref_name,
             "snapshot-id": snapshot_id,
         }),
         None => json!({
@@ -410,20 +414,32 @@ fn build_commit_table_request(commit: &TableCommit) -> CommitTableRequest {
         }),
     };
 
-    let update = json!({
+    let synth_update = json!({
         "action": "set-snapshot-ref",
-        "ref-name": "main",
+        "ref-name": ref_name,
         "type": "branch",
         "snapshot-id": commit.new_snapshot_id,
     });
+
+    // Synthesised entries first, then caller-supplied passthrough
+    // payload. `Vec::with_capacity` lets the buffer grow without
+    // intermediate reallocations when callers thread schema /
+    // partition-spec updates through.
+    let mut requirements = Vec::with_capacity(1 + commit.extra_requirements.len());
+    requirements.push(synth_requirement);
+    requirements.extend(commit.extra_requirements.iter().cloned());
+
+    let mut updates = Vec::with_capacity(1 + commit.extra_updates.len());
+    updates.push(synth_update);
+    updates.extend(commit.extra_updates.iter().cloned());
 
     CommitTableRequest {
         identifier: CommitTableIdentifier {
             namespace: commit.table.namespace.clone(),
             name: commit.table.name.clone(),
         },
-        requirements: vec![requirement],
-        updates: vec![update],
+        requirements,
+        updates,
     }
 }
 
@@ -658,15 +674,15 @@ mod tests {
 
     #[test]
     fn build_commit_table_request_uses_assert_ref_when_base_pinned() {
-        let commit = TableCommit {
-            table: TableRef {
+        let commit = TableCommit::new(
+            TableRef {
                 catalog: None,
                 namespace: vec!["analytics".into()],
                 name: "orders".into(),
             },
-            expected_snapshot_id: Some(42),
-            new_snapshot_id: 43,
-        };
+            Some(42),
+            43,
+        );
         let req = build_commit_table_request(&commit);
         assert_eq!(req.identifier.namespace, vec!["analytics".to_string()]);
         assert_eq!(req.identifier.name, "orders");
@@ -684,17 +700,123 @@ mod tests {
 
     #[test]
     fn build_commit_table_request_uses_assert_create_when_no_base() {
-        let commit = TableCommit {
-            table: TableRef {
+        let commit = TableCommit::new(
+            TableRef {
                 catalog: None,
                 namespace: vec!["analytics".into()],
                 name: "orders".into(),
             },
-            expected_snapshot_id: None,
-            new_snapshot_id: 1,
-        };
+            None,
+            1,
+        );
         let req = build_commit_table_request(&commit);
         assert_eq!(req.requirements[0]["type"], "assert-create");
+    }
+
+    #[test]
+    fn build_commit_table_request_targets_named_branch() {
+        // Passing `branch = Some("dev_feature")` pins the assertion against
+        // that ref and points the `set-snapshot-ref` update at the same
+        // name. The v1 contract (None → "main") is checked above; this
+        // pins the new multi-ref path.
+        let commit = TableCommit::new(
+            TableRef {
+                catalog: None,
+                namespace: vec!["analytics".into()],
+                name: "orders".into(),
+            },
+            Some(42),
+            43,
+        )
+        .with_branch(Some("dev_feature".into()));
+
+        let req = build_commit_table_request(&commit);
+        assert_eq!(req.requirements[0]["type"], "assert-ref-snapshot-id");
+        assert_eq!(req.requirements[0]["ref"], "dev_feature");
+        assert_eq!(req.requirements[0]["snapshot-id"], 42);
+        assert_eq!(req.updates[0]["action"], "set-snapshot-ref");
+        assert_eq!(req.updates[0]["ref-name"], "dev_feature");
+        assert_eq!(req.updates[0]["type"], "branch");
+        assert_eq!(req.updates[0]["snapshot-id"], 43);
+    }
+
+    #[test]
+    fn build_commit_table_request_threads_extra_payload() {
+        // Schema + partition-spec mutations land as opaque JSON blobs
+        // appended after the synthesized assert + set-snapshot-ref pair.
+        // The order is load-bearing: the synthesized entries are always
+        // emitted first so the assertion / advance fires whether or not
+        // the caller adds extras.
+        let extra_requirement = serde_json::json!({
+            "type": "assert-last-assigned-field-id",
+            "last-assigned-field-id": 7,
+        });
+        let extra_update_add_schema = serde_json::json!({
+            "action": "add-schema",
+            "schema": {
+                "type": "struct",
+                "schema-id": 1,
+                "fields": [
+                    { "id": 1, "name": "id", "required": true, "type": "long" },
+                    { "id": 2, "name": "name", "required": false, "type": "string" }
+                ]
+            }
+        });
+        let extra_update_set_spec = serde_json::json!({
+            "action": "add-partition-spec",
+            "spec": {
+                "spec-id": 1,
+                "fields": [
+                    { "source-id": 1, "field-id": 1000, "name": "id_bucket",
+                      "transform": "bucket[16]" }
+                ]
+            }
+        });
+
+        let commit = TableCommit::new(
+            TableRef {
+                catalog: None,
+                namespace: vec!["analytics".into()],
+                name: "orders".into(),
+            },
+            Some(42),
+            43,
+        )
+        .with_extra_requirements(vec![extra_requirement.clone()])
+        .with_extra_updates(vec![
+            extra_update_add_schema.clone(),
+            extra_update_set_spec.clone(),
+        ]);
+
+        let req = build_commit_table_request(&commit);
+        // Synthesised entries are first; extras follow in order.
+        assert_eq!(req.requirements.len(), 2);
+        assert_eq!(req.requirements[0]["type"], "assert-ref-snapshot-id");
+        assert_eq!(req.requirements[1], extra_requirement);
+
+        assert_eq!(req.updates.len(), 3);
+        assert_eq!(req.updates[0]["action"], "set-snapshot-ref");
+        assert_eq!(req.updates[1], extra_update_add_schema);
+        assert_eq!(req.updates[2], extra_update_set_spec);
+    }
+
+    #[test]
+    fn table_commit_new_defaults_branch_to_main() {
+        // The constructor must leave `branch` as None so the existing
+        // call sites keep targeting `main`. Spec: None default IS the
+        // backward-compat behaviour.
+        let commit = TableCommit::new(
+            TableRef {
+                catalog: None,
+                namespace: vec!["analytics".into()],
+                name: "orders".into(),
+            },
+            None,
+            1,
+        );
+        assert!(commit.branch.is_none());
+        assert!(commit.extra_requirements.is_empty());
+        assert!(commit.extra_updates.is_empty());
     }
 
     #[test]

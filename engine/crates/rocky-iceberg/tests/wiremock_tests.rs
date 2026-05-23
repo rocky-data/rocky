@@ -592,11 +592,7 @@ async fn commit_transaction_happy_path_assert_ref_snapshot_id() {
     let client = IcebergCatalogClient::new(&server.uri(), None);
     let adapter = IcebergCatalogClientAdapter::new(client);
 
-    let commit = TableCommit {
-        table: sample_table(),
-        expected_snapshot_id: Some(42),
-        new_snapshot_id: 43,
-    };
+    let commit = TableCommit::new(sample_table(), Some(42), 43);
     adapter
         .commit_transaction(&[commit])
         .await
@@ -634,11 +630,7 @@ async fn commit_transaction_assert_create_when_no_base_snapshot() {
     let client = IcebergCatalogClient::new(&server.uri(), None);
     let adapter = IcebergCatalogClientAdapter::new(client);
 
-    let commit = TableCommit {
-        table: sample_table(),
-        expected_snapshot_id: None,
-        new_snapshot_id: 1,
-    };
+    let commit = TableCommit::new(sample_table(), None, 1);
     adapter
         .commit_transaction(&[commit])
         .await
@@ -663,11 +655,7 @@ async fn commit_transaction_409_maps_to_commit_conflict() {
     let client = IcebergCatalogClient::new(&server.uri(), None);
     let adapter = IcebergCatalogClientAdapter::new(client);
 
-    let commit = TableCommit {
-        table: sample_table(),
-        expected_snapshot_id: Some(42),
-        new_snapshot_id: 43,
-    };
+    let commit = TableCommit::new(sample_table(), Some(42), 43);
     let err = adapter
         .commit_transaction(&[commit])
         .await
@@ -692,6 +680,241 @@ async fn commit_transaction_empty_slice_is_a_noop() {
         .commit_transaction(&[])
         .await
         .expect("empty commit slice should be a no-op");
+}
+
+#[tokio::test]
+async fn commit_transaction_advances_named_branch() {
+    // Pins the multi-ref headline: `TableCommit::with_branch(Some("dev_feature"))`
+    // threads through to BOTH the assertion (`assert-ref-snapshot-id.ref`)
+    // and the update (`set-snapshot-ref.ref-name`) on the wire body.
+    // The `body_json` matcher fails the test if the adapter advanced
+    // the wrong ref.
+    let server = MockServer::start().await;
+
+    let expected_body = json!({
+        "table-changes": [{
+            "identifier": {
+                "namespace": ["analytics"],
+                "name": "orders"
+            },
+            "requirements": [{
+                "type": "assert-ref-snapshot-id",
+                "ref": "dev_feature",
+                "snapshot-id": 42
+            }],
+            "updates": [{
+                "action": "set-snapshot-ref",
+                "ref-name": "dev_feature",
+                "type": "branch",
+                "snapshot-id": 43
+            }]
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let commit =
+        TableCommit::new(sample_table(), Some(42), 43).with_branch(Some("dev_feature".into()));
+    adapter
+        .commit_transaction(&[commit])
+        .await
+        .expect("multi-ref commit should succeed");
+}
+
+#[tokio::test]
+async fn commit_transaction_threads_schema_and_partition_updates() {
+    // Pins the schema-update + partition-spec passthrough: opaque JSON
+    // blobs supplied via `with_extra_updates` land in the wire body's
+    // `updates` array *after* the synthesized `set-snapshot-ref` entry.
+    // Likewise `with_extra_requirements` appends after the synthesized
+    // assert. Order is load-bearing.
+    let server = MockServer::start().await;
+
+    let extra_requirement = json!({
+        "type": "assert-last-assigned-field-id",
+        "last-assigned-field-id": 7
+    });
+    let add_schema_update = json!({
+        "action": "add-schema",
+        "schema": {
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" },
+                { "id": 2, "name": "name", "required": false, "type": "string" }
+            ]
+        }
+    });
+    let add_partition_spec_update = json!({
+        "action": "add-partition-spec",
+        "spec": {
+            "spec-id": 1,
+            "fields": [
+                { "source-id": 1, "field-id": 1000, "name": "id_bucket",
+                  "transform": "bucket[16]" }
+            ]
+        }
+    });
+
+    let expected_body = json!({
+        "table-changes": [{
+            "identifier": {
+                "namespace": ["analytics"],
+                "name": "orders"
+            },
+            "requirements": [
+                {
+                    "type": "assert-ref-snapshot-id",
+                    "ref": "main",
+                    "snapshot-id": 42
+                },
+                extra_requirement
+            ],
+            "updates": [
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "type": "branch",
+                    "snapshot-id": 43
+                },
+                add_schema_update,
+                add_partition_spec_update
+            ]
+        }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let commit = TableCommit::new(sample_table(), Some(42), 43)
+        .with_extra_requirements(vec![json!({
+            "type": "assert-last-assigned-field-id",
+            "last-assigned-field-id": 7
+        })])
+        .with_extra_updates(vec![
+            json!({
+                "action": "add-schema",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 1,
+                    "fields": [
+                        { "id": 1, "name": "id", "required": true, "type": "long" },
+                        { "id": 2, "name": "name", "required": false, "type": "string" }
+                    ]
+                }
+            }),
+            json!({
+                "action": "add-partition-spec",
+                "spec": {
+                    "spec-id": 1,
+                    "fields": [
+                        { "source-id": 1, "field-id": 1000, "name": "id_bucket",
+                          "transform": "bucket[16]" }
+                    ]
+                }
+            }),
+        ]);
+
+    adapter
+        .commit_transaction(&[commit])
+        .await
+        .expect("commit with schema + partition updates should succeed");
+}
+
+#[tokio::test]
+async fn commit_transaction_multi_table_with_per_table_refs() {
+    // Multi-table commit where each table advances its own ref — pins
+    // that the ref-selection is per-`TableCommit`, not a single
+    // batch-wide default. A real consumer (the writer running a
+    // multi-table replication slice) needs this: dev-branch and
+    // main-branch tables in the same atomic batch.
+    let server = MockServer::start().await;
+
+    let expected_body = json!({
+        "table-changes": [
+            {
+                "identifier": { "namespace": ["analytics"], "name": "orders" },
+                "requirements": [{
+                    "type": "assert-ref-snapshot-id",
+                    "ref": "main",
+                    "snapshot-id": 100
+                }],
+                "updates": [{
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "type": "branch",
+                    "snapshot-id": 101
+                }]
+            },
+            {
+                "identifier": { "namespace": ["analytics"], "name": "customers" },
+                "requirements": [{
+                    "type": "assert-ref-snapshot-id",
+                    "ref": "dev_feature",
+                    "snapshot-id": 200
+                }],
+                "updates": [{
+                    "action": "set-snapshot-ref",
+                    "ref-name": "dev_feature",
+                    "type": "branch",
+                    "snapshot-id": 201
+                }]
+            }
+        ]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/transactions/commit"))
+        .and(body_json(&expected_body))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IcebergCatalogClient::new(&server.uri(), None);
+    let adapter = IcebergCatalogClientAdapter::new(client);
+
+    let main_commit = TableCommit::new(
+        TableRef {
+            catalog: None,
+            namespace: vec!["analytics".into()],
+            name: "orders".into(),
+        },
+        Some(100),
+        101,
+    );
+    let dev_commit = TableCommit::new(
+        TableRef {
+            catalog: None,
+            namespace: vec!["analytics".into()],
+            name: "customers".into(),
+        },
+        Some(200),
+        201,
+    )
+    .with_branch(Some("dev_feature".into()));
+
+    adapter
+        .commit_transaction(&[main_commit, dev_commit])
+        .await
+        .expect("multi-table multi-ref commit should succeed");
 }
 
 #[tokio::test]
