@@ -665,3 +665,290 @@ async fn fetch_arrow_batch_returns_workspace_arrow_batch() {
         .expect("column 1 is Utf8");
     assert_eq!(s_col.value(0), "foo");
 }
+
+/// BigQuery's 10 MB minimum-bill floor (Phase 2.3 of the BQ trial-window
+/// plan).
+///
+/// BigQuery's on-demand pricing applies a 10 MB (10 × 1024 × 1024 =
+/// 10_485_760 bytes) minimum per query — any query that reads less than
+/// 10 MB of raw columnar data is still billed as if it scanned 10 MB.
+/// Documented at <https://cloud.google.com/bigquery/pricing#on_demand_pricing>:
+/// "Each query you run will have a 10 MB minimum data processed."
+///
+/// **Query choice is load-bearing.** This test creates a tiny ephemeral
+/// table (`UNNEST([STRUCT(1 AS id, 'a' AS name), STRUCT(2, 'b')])` — the
+/// same shape as `test_clone_table_for_branch_copy`) rather than
+/// scanning an `INFORMATION_SCHEMA` view. Reason: against
+/// `INFORMATION_SCHEMA` views, BigQuery reports *both*
+/// `totalBytesProcessed` and `totalBytesBilled` as the 10 MB floor —
+/// the metadata path has no underlying columnar storage to report a
+/// smaller raw figure against. Querying a real (tiny) table makes
+/// `totalBytesProcessed` reflect the actual columnar bytes read (a few
+/// dozen bytes for a 2-row INT64+STRING table) while
+/// `totalBytesBilled` is rounded up to the floor. The two figures
+/// genuinely diverge, which is what lets the test discriminate
+/// "Rocky reads billed" from "Rocky reads processed". Constant-only
+/// queries like `SELECT 1` aren't useful here either — BQ exempts
+/// them from the floor entirely (they bill 0).
+///
+/// Rocky's cost path reads `totalBytesBilled` (floor-applied), not
+/// `totalBytesProcessed` (raw scan) — the enrichment lives in
+/// `connector.rs::execute_statement_with_stats` (lines 386-401), which
+/// calls `fetch_job_statistics` after the sync `jobs.query` response
+/// so the figure surfaced into `ExecutionStats::bytes_scanned` is the
+/// billed one. Cost calc downstream multiplies that by the per-TB
+/// rate. So for any sub-10 MB query, Rocky's reported cost should
+/// match the floor-based number, not the cheaper processed-bytes
+/// number.
+///
+/// This test makes that explicit:
+///
+/// 1. Issue a sub-10 MB query against an ephemeral 2-row table.
+/// 2. Independently fetch `jobs.get` and confirm
+///    `totalBytesProcessed < 10 MB` and `totalBytesBilled == 10 MB`
+///    exactly. This documents what the floor actually looks like at
+///    the BQ REST surface — future maintainers seeing a tiny query
+///    that reports a 10 MB cost can read the assertion and understand
+///    why.
+/// 3. Assert Rocky's `bytes_scanned` equals `totalBytesBilled` (the
+///    floor), not `totalBytesProcessed` (the raw scan).
+/// 4. Assert Rocky's computed cost matches the floor-based calc and
+///    *exceeds* the cheaper processed-based calc. The redundant
+///    inequality is the regression guard: if a future change swaps
+///    the connector back to reading `totalBytesProcessed` (the bug
+///    that PR #330 fixed), the equality stays true while the
+///    inequality flips, and the test trips loudly.
+///
+/// PR #617's `test_bytes_scanned_matches_independent_jobs_get_total_bytes_billed`
+/// cross-checks that Rocky reads `totalBytesBilled` rather than
+/// `totalBytesProcessed`, but it only asserts the byte figure clears
+/// the 10 MB floor — it can't catch a regression where the *floor
+/// itself* moves (BQ changes the minimum, or a future config knob
+/// makes it configurable). This test pins the floor value as an
+/// explicit assertion so the documented behavior stays load-bearing.
+///
+/// Dataset is dropped CASCADE on test exit regardless of outcome,
+/// mirroring `test_clone_table_for_branch_copy`'s cleanup pattern.
+#[tokio::test]
+#[ignore]
+async fn test_sub_10mb_query_bills_at_minimum_floor() {
+    use rocky_bigquery::auth::BigQueryAuth;
+    use rocky_core::cost::{BIGQUERY_USD_PER_TB_SCANNED, WarehouseType, compute_observed_cost_usd};
+    use rocky_core::traits::WarehouseAdapter;
+    use serde::Deserialize;
+
+    /// BigQuery's 10 MB minimum-bill floor in bytes (10 × 1024 × 1024).
+    /// Documented at <https://cloud.google.com/bigquery/pricing#on_demand_pricing>:
+    /// "Each query you run will have a 10 MB minimum data processed."
+    const BQ_MINIMUM_BILL_FLOOR_BYTES: u64 = 10 * 1024 * 1024;
+
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+    let location = std::env::var("BIGQUERY_TEST_LOCATION").unwrap_or_else(|_| "EU".to_string());
+
+    let adapter = adapter_from_env().expect("BigQuery env vars not set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let dataset = format!("hc_phase5_floor_{suffix}");
+    let table = "tiny";
+
+    // Setup: a tiny 2-row table. BigQuery's `jobs.get` reports
+    // `totalBytesProcessed` as the actual columnar bytes read (a few
+    // dozen for INT64+STRING × 2 rows) while `totalBytesBilled` gets
+    // rounded up to the 10 MB floor. Both figures coming from
+    // `INFORMATION_SCHEMA` views happen to be the floor (the metadata
+    // path has no smaller raw figure to report), so a real ephemeral
+    // table is what makes the processed-vs-billed comparison
+    // meaningful.
+    adapter
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS `{project}`.`{dataset}`"
+        ))
+        .await
+        .expect("create dataset");
+    adapter
+        .execute_statement(&format!(
+            "CREATE OR REPLACE TABLE `{project}`.`{dataset}`.`{table}` AS \
+             SELECT * FROM UNNEST([STRUCT(1 AS id, 'a' AS name), STRUCT(2, 'b')])"
+        ))
+        .await
+        .expect("create tiny table");
+
+    let sql = format!("SELECT id, name FROM `{project}`.`{dataset}`.`{table}`");
+
+    // Run unit under test, capture result; cleanup runs before any
+    // assertion-driven panic so a mid-test failure doesn't leak the
+    // dataset.
+    let probe_result = adapter.execute_statement_with_stats(&sql).await;
+
+    // Independent `jobs.get` REST call so the floor assertion isn't
+    // circular with the adapter path that produced `stats`. Same
+    // shape as PR #617's cross-check, extended to include
+    // `totalBytesProcessed` since this test compares processed vs
+    // billed. Only attempted when the adapter call succeeded; on
+    // failure the cleanup-then-assert pattern still rethrows the
+    // underlying error.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JobGet {
+        statistics: Stats,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Stats {
+        query: Query,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Query {
+        total_bytes_processed: String,
+        total_bytes_billed: String,
+    }
+
+    let job_get: Option<(String, u64, u64, u64)> = if let Ok(ref stats) = probe_result {
+        let rocky_bytes = stats.bytes_scanned.expect("bytes_scanned populated");
+        let job_id = stats.job_id.clone().expect("job_id populated");
+        let auth = BigQueryAuth::from_env().expect("BigQueryAuth::from_env");
+        let client = reqwest::Client::new();
+        let token = auth.get_token(&client).await.expect("acquire bearer token");
+        let url =
+            format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs/{job_id}");
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("location", location.as_str())])
+            .send()
+            .await
+            .expect("jobs.get send");
+        assert!(
+            resp.status().is_success(),
+            "jobs.get returned {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+        let job: JobGet = resp.json().await.expect("parse jobs.get JSON");
+        let bq_processed: u64 = job
+            .statistics
+            .query
+            .total_bytes_processed
+            .parse()
+            .expect("totalBytesProcessed parses as u64");
+        let bq_billed: u64 = job
+            .statistics
+            .query
+            .total_bytes_billed
+            .parse()
+            .expect("totalBytesBilled parses as u64");
+        Some((job_id, rocky_bytes, bq_processed, bq_billed))
+    } else {
+        None
+    };
+
+    // Unconditional cleanup. Best-effort — a leftover `hc_phase5_*`
+    // dataset is easy to mop up via `bq rm -r -f -d` but tearing down
+    // here keeps the sandbox clean on the happy path.
+    let _ = adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{dataset}` CASCADE"
+        ))
+        .await;
+
+    // Surface adapter failure (if any) after cleanup.
+    let _stats = probe_result.expect("execute_statement_with_stats should succeed");
+    let (job_id, rocky_bytes, bq_processed, bq_billed) =
+        job_get.expect("job_get populated when probe succeeded");
+
+    // Receipt printed before assertions so a `cargo test -- --ignored
+    // --nocapture` run shows the raw values even when an assertion
+    // later fails — easier to diagnose a real floor change vs a test
+    // bug.
+    let rocky_cost_usd =
+        compute_observed_cost_usd(WarehouseType::BigQuery, Some(rocky_bytes), 0, 0.0, 0.0)
+            .expect("compute_observed_cost_usd returned None for BigQuery bytes");
+    let floor_cost_usd =
+        (BQ_MINIMUM_BILL_FLOOR_BYTES as f64 / 1.0e12) * BIGQUERY_USD_PER_TB_SCANNED;
+    let processed_cost_usd = (bq_processed as f64 / 1.0e12) * BIGQUERY_USD_PER_TB_SCANNED;
+    println!(
+        "bq-floor-check | job_id={job_id} location={location} \
+         bq.totalBytesProcessed={bq_processed} (raw scan) \
+         bq.totalBytesBilled={bq_billed} (floor-applied) \
+         floor_bytes={BQ_MINIMUM_BILL_FLOOR_BYTES} \
+         rocky.bytes_scanned={rocky_bytes} \
+         rocky.cost_usd=${rocky_cost_usd:.9} \
+         floor.cost_usd=${floor_cost_usd:.9} \
+         processed.cost_usd=${processed_cost_usd:.9}"
+    );
+
+    // (1) Precondition: the raw-scan figure must be strictly under the
+    // floor — otherwise the query is too large to exercise the floor
+    // path. The 2-row UNNEST seed makes this trivially true; the
+    // assertion guards future test edits that swap in a larger probe.
+    assert!(
+        bq_processed < BQ_MINIMUM_BILL_FLOOR_BYTES,
+        "test precondition violated: totalBytesProcessed={bq_processed} is not under \
+         the 10 MB floor ({BQ_MINIMUM_BILL_FLOOR_BYTES}). The query needs to scan less \
+         than 10 MB of raw data to exercise the floor behavior."
+    );
+
+    // (2) The billed figure must equal the floor exactly. Pinning the
+    // exact value makes a future "BigQuery moved the floor" change
+    // surface here as a loud failure, with the doc-comment and the
+    // receipt available as the diagnostic context.
+    assert_eq!(
+        bq_billed, BQ_MINIMUM_BILL_FLOOR_BYTES,
+        "totalBytesBilled={bq_billed} does not match the documented 10 MB floor \
+         ({BQ_MINIMUM_BILL_FLOOR_BYTES}). Either BigQuery has changed its minimum-bill \
+         behavior or the query unexpectedly scans more than 10 MB. Inspect job_id={job_id} \
+         in the GCP console."
+    );
+
+    // (3) Rocky must read the billed figure (floor-applied), not the
+    // processed figure (raw scan). The connector enrichment path
+    // (`connector.rs::execute_statement_with_stats` →
+    // `fetch_job_statistics`) is what makes this true — this assertion
+    // is the canary if that enrichment ever regresses.
+    assert_eq!(
+        rocky_bytes, bq_billed,
+        "Rocky's bytes_scanned must equal BigQuery's totalBytesBilled (the floor-applied \
+         figure surfaced via jobs.get), not totalBytesProcessed. \
+         rocky.bytes_scanned={rocky_bytes} bq.totalBytesBilled={bq_billed} \
+         bq.totalBytesProcessed={bq_processed}. \
+         If they diverge, connector.rs::execute_statement_with_stats has likely lost the \
+         jobs.get enrichment fixed in PR #330."
+    );
+
+    // (4) Rocky's computed cost must match the floor-based dollar calc
+    // exactly. Uses the same `compute_observed_cost_usd` call the run
+    // finalizer makes (mirrors the cost path in `populate_cost_summary`).
+    let rel_diff = if floor_cost_usd == 0.0 {
+        0.0
+    } else {
+        ((rocky_cost_usd - floor_cost_usd) / floor_cost_usd).abs()
+    };
+    assert!(
+        rel_diff < 1e-9,
+        "Rocky's computed cost does not match the floor-based formula. \
+         rocky.cost_usd=${rocky_cost_usd:.9} floor.cost_usd=${floor_cost_usd:.9} \
+         rel_diff={rel_diff:e}. \
+         Expected `bytes_scanned * BIGQUERY_USD_PER_TB_SCANNED / 1e12` with \
+         bytes_scanned = floor ({BQ_MINIMUM_BILL_FLOOR_BYTES}).",
+    );
+
+    // (5) Redundant cross-check: the cost must strictly exceed what
+    // it would be if Rocky read `totalBytesProcessed` instead of
+    // `totalBytesBilled`. If a future change reverts the PR #330 fix
+    // (reading processed instead of billed), assertion (3) catches it
+    // via the byte equality, but this one fails too — and the failure
+    // message points directly at the cost-attribution implication
+    // rather than the byte-level cause.
+    assert!(
+        rocky_cost_usd > processed_cost_usd,
+        "Rocky's cost ({rocky_cost_usd:.9}) does not exceed the processed-based cost \
+         ({processed_cost_usd:.9}). For a sub-10 MB query the floor-based cost MUST be \
+         higher — if it isn't, Rocky is reading the raw scan figure rather than the \
+         billed figure, defeating the floor enrichment."
+    );
+}
