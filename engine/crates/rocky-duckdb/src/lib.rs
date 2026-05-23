@@ -28,8 +28,9 @@ pub enum DuckDbError {
     #[error("no rows returned")]
     NoRows,
 
-    /// Arrow IPC encode/decode failure on the `fetch_arrow_batch` bridge.
-    #[error("Arrow IPC error: {0}")]
+    /// Arrow compute failure on the `fetch_arrow_batch` path (e.g. multi-batch
+    /// `concat_batches` against a schema mismatch).
+    #[error("Arrow error: {0}")]
     Arrow(String),
 }
 
@@ -126,58 +127,40 @@ impl DuckDbConnector {
         Ok(())
     }
 
-    /// Execute `sql` via DuckDB's native `query_arrow` and return the
-    /// resulting batches concatenated and serialized as Arrow IPC stream
-    /// bytes.
+    /// Execute `sql` via DuckDB's native `query_arrow` and return a single
+    /// workspace `arrow::record_batch::RecordBatch`.
     ///
-    /// This is the producer half of the
-    /// [`crate::adapter::DuckDbWarehouseAdapter::fetch_arrow_batch`] PoC
-    /// bridge — keeping the arrow-56 types inside this function avoids
-    /// leaking the duckdb-pinned arrow major across the crate's public
-    /// surface. The consumer side (workspace arrow 58) decodes the bytes
-    /// back into a `RecordBatch` via `arrow::ipc::reader::StreamReader`.
+    /// Backs [`crate::adapter::DuckDbWarehouseAdapter::fetch_arrow_batch`].
+    /// Since `duckdb 1.10503` pins workspace `arrow 58`, the batches returned
+    /// by `query_arrow` are type-compatible with the workspace and no IPC
+    /// roundtrip is needed — multi-batch result sets are concatenated into
+    /// one via `arrow::compute::concat_batches`.
     ///
     /// # Errors
     ///
     /// Surfaces any underlying [`duckdb::Error`] from `prepare` /
-    /// `query_arrow`, plus arrow encode failures wrapped as
-    /// [`DuckDbError::Arrow`].
-    pub fn query_arrow_ipc_bytes(&self, sql: &str) -> Result<Vec<u8>, DuckDbError> {
-        use arrow56::ipc::writer::StreamWriter;
-        use arrow56::record_batch::RecordBatch as Arrow56RecordBatch;
+    /// `query_arrow`, and arrow concat failures wrapped as
+    /// [`DuckDbError::Arrow`]. Returns `DuckDbError::NoRows` when the
+    /// statement produces zero batches (e.g. DDL).
+    pub fn query_arrow_batch(
+        &self,
+        sql: &str,
+    ) -> Result<arrow::record_batch::RecordBatch, DuckDbError> {
+        use arrow::record_batch::RecordBatch;
 
         debug!(sql = sql, "executing DuckDB query_arrow");
         let mut stmt = self.conn.prepare(sql)?;
-        let batches: Vec<Arrow56RecordBatch> = stmt.query_arrow(params![])?.collect();
+        let batches: Vec<RecordBatch> = stmt.query_arrow(params![])?.collect();
 
-        // Empty result sets are legal. Fall back to an empty schema so the
-        // IPC stream still carries a valid schema header.
-        let schema = batches.first().map_or_else(
-            || std::sync::Arc::new(arrow56::datatypes::Schema::empty()),
-            Arrow56RecordBatch::schema,
-        );
-
-        let combined = if batches.len() <= 1 {
-            batches.into_iter().next()
-        } else {
-            Some(
-                arrow56::compute::concat_batches(&schema, batches.iter())
-                    .map_err(|e| DuckDbError::Arrow(e.to_string()))?,
-            )
-        };
-
-        let mut buf: Vec<u8> = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut buf, &schema)
-            .map_err(|e| DuckDbError::Arrow(e.to_string()))?;
-        if let Some(batch) = combined {
-            writer
-                .write(&batch)
-                .map_err(|e| DuckDbError::Arrow(e.to_string()))?;
+        match batches.len() {
+            0 => Err(DuckDbError::NoRows),
+            1 => Ok(batches.into_iter().next().expect("len==1")),
+            _ => {
+                let schema = batches[0].schema();
+                arrow::compute::concat_batches(&schema, batches.iter())
+                    .map_err(|e| DuckDbError::Arrow(e.to_string()))
+            }
         }
-        writer
-            .finish()
-            .map_err(|e| DuckDbError::Arrow(e.to_string()))?;
-        Ok(buf)
     }
 
     /// Creates a table from a schema definition (for test setup).

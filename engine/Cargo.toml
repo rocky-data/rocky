@@ -30,7 +30,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.85.1"
 homepage = "https://rocky-data.dev/"
 repository = "https://github.com/rocky-data/rocky"
 
@@ -106,7 +106,11 @@ url = "2"
 percent-encoding = "2"
 
 # DuckDB
-duckdb = { version = "1", features = ["bundled"] }
+# Pinned to the 1.10503 line (year/upstream-version-coded scheme) so it
+# ships against workspace `arrow 58` directly — earlier 1.4.x releases
+# tracked `arrow 56` and required an IPC-stream bridge inside the
+# rocky-duckdb adapter to reconcile with the workspace arrow major.
+duckdb = { version = "1.10503", features = ["bundled"] }
 
 # CSV parsing
 csv = "1"

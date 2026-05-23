@@ -13,13 +13,9 @@ rocky-sql = { path = "../rocky-sql" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 duckdb = { workspace = true }
 # Workspace arrow (58) is the type returned by `WarehouseAdapter::fetch_arrow_batch`.
+# `duckdb 1.10503` pins arrow 58 internally, so `query_arrow` returns workspace-
+# compatible `RecordBatch` directly — no IPC bridge needed.
 arrow = { workspace = true }
-# `arrow56` is the same arrow major that `duckdb 1.4.4` pins internally;
-# `query_arrow` returns batches built against arrow 56 types. We activate the
-# `ipc` feature here so we can round-trip those batches into the workspace's
-# arrow 58 via the stable Arrow IPC format. A follow-up that bumps `duckdb`
-# to a release on arrow 58 will delete this alias.
-arrow56 = { package = "arrow", version = "56", default-features = false, features = ["ipc"] }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
