@@ -3993,6 +3993,7 @@ dependencies = [
  "miette",
  "salsa",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
