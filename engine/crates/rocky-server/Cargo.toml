@@ -17,6 +17,10 @@ rocky-ir = { path = "../rocky-ir" }
 rocky-lang = { path = "../rocky-lang" }
 rocky-sql = { path = "../rocky-sql" }
 axum = { workspace = true }
+# LSP `didOpen` / `didChange` route into `rocky-lang::incremental::RockyDatabase`
+# so parse-level requests (DSL parse diagnostics, etc.) are memoized via the
+# `parse_file` tracked query instead of re-parsing on every keystroke.
+salsa = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tower-lsp = { workspace = true }
@@ -28,6 +32,8 @@ sqlparser = { workspace = true }
 strsim = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# `SeedSalsaError` (LSP↔salsa bridge) wraps `rocky_lang::incremental::ReadSourceError`.
+thiserror = { workspace = true }
 # Used by the contract-quickfix helper signature, which mirrors the
 # `typed_models: IndexMap<String, Vec<TypedColumn>>` shape from rocky-compiler.
 indexmap = { workspace = true }
