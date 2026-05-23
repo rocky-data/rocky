@@ -105,8 +105,41 @@ state machine rather than a one-shot REST call:
    the query keeps returning `nextUri` past the deadline the call
    returns `TrinoError::Timeout` with the last observed state.
 
-The aggregated rows surface as `Vec<Vec<serde_json::Value>>`. Arrow
-record-batch construction is a follow-up.
+The aggregated rows surface as `Vec<Vec<serde_json::Value>>`.
+
+### Arrow result fetch (`fetch_arrow_batch`)
+
+`TrinoAdapter` implements `WarehouseAdapter::fetch_arrow_batch` via the
+spooled-protocol Arrow encoding path in `src/arrow_stream.rs`. The
+client negotiates Arrow IPC segments by sending:
+
+- `X-Trino-Client-Capabilities: SPOOLING` — opts the response shape
+  into the segmented `data` envelope rather than the inline-JSON row
+  matrix.
+- `X-Trino-Spooled-Segments-Accept-Encoding: arrow+zstd,arrow` —
+  encoding preference list. The coordinator picks the first it
+  supports and holds that choice for the duration of the query.
+
+Each spooled segment carries either an inline base64-encoded Arrow IPC
+stream (small payloads) or a `uri` to fetch raw IPC bytes from
+(typically a presigned object-store URL). The adapter decodes each
+segment via `arrow::ipc::reader::StreamReader`, concatenates the per-
+segment batches with `arrow::compute::concat_batches`, and best-effort
+acks each segment via its `ackUri` so the coordinator can release it.
+
+**Version gate.** Apache Arrow IPC is a **proposed** spooled-protocol
+encoding — see upstream PR
+[`trinodb/trino#26365`](https://github.com/trinodb/trino/pull/26365)
+(closed stale Nov 2025, revival discussion ongoing). The shipping Trino
+release (481 as of May 2026) advertises only `json`, `json+lz4`, and
+`json+zstd` spooling encodings. Until Arrow encoding lands upstream
+the coordinator falls back to the inline-JSON row shape when the
+client requests `arrow` / `arrow+zstd`. The adapter detects that
+fallback and surfaces a clear `TrinoError::ArrowEncodingUnavailable`
+(wrapped in `AdapterError`) rather than silently emitting a synthetic
+batch. The negotiation wire is in place so the adapter is ready the
+day upstream merges; no further changes are required when that
+happens.
 
 ## Dialect summary
 
@@ -163,8 +196,13 @@ DropAndRecreate.
 - **True `INSERT OVERWRITE`.** Iceberg-backed catalogs support it
   natively; v0 falls back to `DELETE` + `INSERT`.
 - **`information_schema`-backed nullability** in `describe_table`.
-- **Arrow record batches** from the connector (today: `serde_json::Value`
-  rows).
+- **Arrow record batches** from the connector — `fetch_arrow_batch` is
+  implemented via the spooled-protocol Arrow path (see [Wire protocol](#wire-protocol)
+  above), but the path is version-gated on upstream Trino merging
+  Arrow IPC as a supported spooling encoding (PR
+  [`trinodb/trino#26365`](https://github.com/trinodb/trino/pull/26365)).
+  Today the call surfaces `ArrowEncodingUnavailable` against any
+  shipping coordinator.
 
 ## Testing
 

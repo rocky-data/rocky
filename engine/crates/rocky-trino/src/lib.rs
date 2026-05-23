@@ -24,6 +24,7 @@
 //! `tests/conformance.rs` and the README for invocation.
 
 pub mod adapter;
+pub mod arrow_stream;
 pub mod auth;
 pub mod connector;
 pub mod dialect;

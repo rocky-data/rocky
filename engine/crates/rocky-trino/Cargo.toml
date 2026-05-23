@@ -11,7 +11,9 @@ rocky-core = { path = "../rocky-core" }
 rocky-ir = { path = "../rocky-ir" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
+arrow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
