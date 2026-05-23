@@ -3807,6 +3807,7 @@ dependencies = [
  "rocky-ir",
  "rocky-lang",
  "rocky-sql",
+ "salsa",
  "schemars",
  "serde",
  "serde_json",

@@ -117,13 +117,42 @@ pub enum CompileError {
 
 /// Compile a project from a models directory.
 ///
-/// This is the main entry point for `rocky compile`.
+/// This is the main entry point for `rocky compile`. Constructs a
+/// transient salsa database internally — repeated calls to this
+/// function do not share cache state. For LSP / watch-mode call sites
+/// that want the per-file parse + lower cache to persist across
+/// compiles, use [`compile_with_db`] with a long-lived database.
 pub fn compile(config: &CompilerConfig) -> Result<CompileResult, CompileError> {
+    let mut db = crate::salsa_compile::RockyDatabase::default();
+    compile_with_db(&mut db, config)
+}
+
+/// Compile a project using the caller's salsa database for the
+/// per-file parse + lower pipeline.
+///
+/// The first call against a given database loads + parses + lowers
+/// every `.rocky` file from disk. Subsequent calls with no input
+/// changes return the cached lowered SQL without re-invoking the
+/// parser or lowerer — the salsa per-file invocation counter (visible
+/// in the `salsa_compile` unit tests) stays flat. Edits propagated to
+/// the database via `SourceFile::set_text` invalidate only the
+/// affected file's per-file cache entry; the remainder of the project
+/// reuses the previous parse + lower output.
+///
+/// Cross-model passes (semantic graph, type checking across model
+/// boundaries, contract validation, blast-radius lint, classification
+/// completeness) still run end-to-end on every call — the salsa
+/// migration starts at the file level and grows outward in
+/// follow-ups.
+pub fn compile_with_db(
+    db: &mut crate::salsa_compile::RockyDatabase,
+    config: &CompilerConfig,
+) -> Result<CompileResult, CompileError> {
     let total_start = Instant::now();
 
-    // 1. Load and resolve project
+    // 1. Load and resolve project (salsa-driven for .rocky files).
     let load_start = Instant::now();
-    let project = Project::load(&config.models_dir)?;
+    let project = Project::load_with_db(&config.models_dir, db)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let mut result = compile_project(project, config)?;

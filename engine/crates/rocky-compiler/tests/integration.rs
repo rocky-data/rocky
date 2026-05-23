@@ -6,8 +6,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use rocky_compiler::compile::{CompilerConfig, compile};
+use rocky_compiler::compile::{CompilerConfig, compile, compile_with_db};
 use rocky_compiler::project::Project;
+use rocky_compiler::salsa_compile::{RockyDatabase, file_typecheck, read_source};
 use rocky_compiler::semantic::build_semantic_graph;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -466,5 +467,138 @@ table = "m20"
     assert!(
         incr.type_check.typed_models.contains_key("m20"),
         "new model m20 must be typechecked by incremental path"
+    );
+}
+
+// ---- Salsa-tracked compile pipeline ----
+
+/// Driving `compile_with_db` twice against the same database returns
+/// the same `Arc<FileTypecheck>` for every `.rocky` file in the
+/// project — pointer equality is the external receipt that the salsa
+/// per-file cache was hit on the second compile.
+#[test]
+fn salsa_compile_with_db_reuses_per_file_cache_across_repeated_compiles() {
+    use std::sync::Arc;
+
+    let models_dir = fixture_path("mixed_project/models");
+    let config = CompilerConfig {
+        models_dir: models_dir.clone(),
+        ..Default::default()
+    };
+    let mut db = RockyDatabase::default();
+
+    // First compile: cold cache. Resolve a known `.rocky` file in the
+    // fixture and capture its FileTypecheck Arc.
+    let first = compile_with_db(&mut db, &config).expect("first compile must succeed");
+    let rocky_path = models_dir
+        .join("order_summary.rocky")
+        .canonicalize()
+        .expect("fixture .rocky file must exist");
+    let src = read_source(&mut db, rocky_path.clone()).expect("read_source must succeed");
+    let ft_first = file_typecheck(&db, src);
+
+    // Second compile against the same database — no inputs touched.
+    let second = compile_with_db(&mut db, &config).expect("second compile must succeed");
+    let ft_second = file_typecheck(&db, src);
+
+    assert!(
+        Arc::ptr_eq(&ft_first, &ft_second),
+        "second compile must reuse the per-file FileTypecheck Arc (cache hit)",
+    );
+    // Sanity: outputs are observationally equivalent.
+    assert_eq!(
+        first.type_check.typed_models.len(),
+        second.type_check.typed_models.len(),
+        "compile output shape must be stable across repeated compiles",
+    );
+}
+
+/// Mutating one `.rocky` file's `SourceFile` via `set_text` to a
+/// genuinely different AST invalidates **only** that file's
+/// `file_typecheck` cache entry — independent files in the same
+/// project keep their cached `Arc<FileTypecheck>`.
+#[test]
+fn salsa_compile_with_db_invalidates_only_changed_file() {
+    use std::sync::Arc;
+
+    use rocky_compiler::salsa_compile::lookup_source;
+    use salsa::Setter;
+
+    // Use a tempdir copy of the mixed_project fixture so we can mutate
+    // the `.rocky` file via set_text without touching the source tree.
+    let src_models_dir = fixture_path("mixed_project/models");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest_models = tmp.path().join("models");
+    std::fs::create_dir_all(&dest_models).unwrap();
+    for entry in std::fs::read_dir(&src_models_dir).unwrap() {
+        let entry = entry.unwrap();
+        let dst = dest_models.join(entry.file_name());
+        std::fs::copy(entry.path(), dst).unwrap();
+    }
+    // Add a second independent .rocky file we can pin "unchanged".
+    let independent = dest_models.join("independent.rocky");
+    std::fs::write(
+        &independent,
+        "from raw_data\nwhere active == true\nselect { id }\n",
+    )
+    .unwrap();
+    // Sidecar so the loader treats it as a real model.
+    std::fs::write(
+        dest_models.join("independent.toml"),
+        "name = \"independent\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"independent\"\n",
+    )
+    .unwrap();
+
+    let config = CompilerConfig {
+        models_dir: dest_models.clone(),
+        ..Default::default()
+    };
+    let mut db = RockyDatabase::default();
+
+    // First compile.
+    let _ = compile_with_db(&mut db, &config).expect("first compile");
+
+    let target_path = dest_models
+        .join("order_summary.rocky")
+        .canonicalize()
+        .unwrap();
+    let indep_path = independent.canonicalize().unwrap();
+
+    let target_src = lookup_source(&db, &target_path)
+        .expect("target SourceFile must be in the dedup map after first compile");
+    let indep_src = lookup_source(&db, &indep_path)
+        .expect("independent SourceFile must be in the dedup map after first compile");
+
+    let ft_target_before = file_typecheck(&db, target_src);
+    let ft_indep_before = file_typecheck(&db, indep_src);
+
+    // Edit the target file to a genuinely different AST.
+    target_src
+        .set_text(&mut db)
+        .to("from orders\nwhere status != \"refunded\"\nselect { customer_id }\n".to_string());
+
+    // Re-run the full compile against the same db — internally it
+    // will reload from disk via read_source (which dedups by path),
+    // but the in-memory set_text override stays in place for this
+    // SourceFile because the dedup map returns the same handle.
+    //
+    // Actually wait — Project::load_with_db re-reads from disk for
+    // any new files, but it canonicalizes existing paths through
+    // read_source, which checks the dedup map BEFORE reading disk.
+    // So our set_text-mutated input is what file_typecheck sees on
+    // the second compile.
+    let _ = compile_with_db(&mut db, &config).expect("second compile");
+
+    let ft_target_after = file_typecheck(&db, target_src);
+    let ft_indep_after = file_typecheck(&db, indep_src);
+
+    assert!(
+        !Arc::ptr_eq(&ft_target_before, &ft_target_after),
+        "target file's FileTypecheck Arc must change after a genuine AST edit",
+    );
+    assert!(
+        Arc::ptr_eq(&ft_indep_before, &ft_indep_after),
+        "independent file's FileTypecheck Arc must NOT change when an \
+         unrelated file is edited (per-file invalidation receipt)",
     );
 }

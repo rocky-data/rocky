@@ -68,11 +68,36 @@ impl Project {
     ///
     /// Supports both `.sql` (with sidecar `.toml`) and `.rocky` files.
     /// Both formats produce `Model` structs and are unified from this point.
+    ///
+    /// This is the legacy entry point — it constructs a transient salsa
+    /// database internally for the `.rocky` parse pipeline, so repeated
+    /// calls re-parse from disk. Use [`Project::load_with_db`] when the
+    /// caller already owns a `RockyDatabase` and wants the per-file
+    /// parse cache to persist across compiles (LSP, watch-mode, tests).
     pub fn load(models_dir: &Path) -> Result<Self, ProjectError> {
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        Self::load_with_db(models_dir, &mut db)
+    }
+
+    /// Load a project from a models directory, reusing the caller's
+    /// salsa database for the `.rocky` parse + lower pipeline.
+    ///
+    /// `.rocky` files are loaded through
+    /// [`crate::salsa_compile::read_source`] +
+    /// [`crate::salsa_compile::file_typecheck`], so a second call against
+    /// an unchanged file returns the cached lowered SQL without
+    /// re-invoking the parser or lowerer. `.sql` files still load
+    /// through the existing non-tracked path —
+    /// `models::load_models_from_dir` reads them directly from disk —
+    /// because they have no entry on the salsa side yet.
+    pub fn load_with_db(
+        models_dir: &Path,
+        db: &mut crate::salsa_compile::RockyDatabase,
+    ) -> Result<Self, ProjectError> {
         let mut models = models::load_models_from_dir(models_dir)?;
 
-        // Also load .rocky files
-        let rocky_models = load_rocky_models(models_dir)?;
+        // Also load .rocky files via the salsa pipeline
+        let rocky_models = load_rocky_models_with_db(models_dir, db)?;
         if !rocky_models.is_empty() {
             info!(count = rocky_models.len(), "loaded .rocky models");
             models.extend(rocky_models);
@@ -128,14 +153,171 @@ impl Project {
     }
 }
 
-/// Load `.rocky` files from a directory and lower them to `Model` structs.
+/// Load `.rocky` files from a directory through the salsa database.
 ///
-/// Respects `_defaults.toml` and sidecar inference, same as
-/// [`models::load_models_from_dir`] does for `.sql` files.
+/// Sequential rather than rayon-parallel: salsa's `RockyDatabase` is
+/// `&mut`-bounded for input loading (`read_source` mutates the dedup
+/// map), so per-file parses run on the calling thread. The expected
+/// payoff is the *second* compile, which hits the salsa cache for
+/// every unchanged file and serves the lowered SQL without touching
+/// the parser at all.
+fn load_rocky_models_with_db(
+    dir: &Path,
+    db: &mut crate::salsa_compile::RockyDatabase,
+) -> Result<Vec<Model>, ProjectError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let defaults_path = dir.join("_defaults.toml");
+    let defaults = if defaults_path.exists() {
+        Some(models::load_dir_defaults(&defaults_path)?)
+    } else {
+        None
+    };
+
+    let rocky_paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(models::ModelError::ReadFile)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().is_some_and(|ext| ext == "rocky") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if rocky_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut models: Vec<Model> = Vec::with_capacity(rocky_paths.len());
+    for path in &rocky_paths {
+        models.push(load_single_rocky_model_with_db(
+            path,
+            defaults.as_ref(),
+            db,
+        )?);
+    }
+
+    models.sort_by(|a, b| a.config.name.cmp(&b.config.name));
+    Ok(models)
+}
+
+/// Salsa-driven sibling of [`load_single_rocky_model`]. Uses
+/// [`crate::salsa_compile::read_source`] +
+/// [`crate::salsa_compile::file_typecheck`] to get the lowered SQL
+/// through the database cache; the surrounding sidecar / defaults
+/// logic is identical.
+fn load_single_rocky_model_with_db(
+    path: &Path,
+    defaults: Option<&models::DirDefaults>,
+    db: &mut crate::salsa_compile::RockyDatabase,
+) -> Result<Model, ProjectError> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Tracked-query route: read_source loads the file via the salsa
+    // dedup map; file_typecheck parses + lowers (or returns the cached
+    // result if neither input nor AST has changed).
+    let src = crate::salsa_compile::read_source(db, path.to_path_buf()).map_err(|e| {
+        ProjectError::RockyParse {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    let ft = crate::salsa_compile::file_typecheck(db, src);
+
+    if let Some(first) = ft.diagnostics.first() {
+        // Treat the leading parse / lower diagnostic as the
+        // ProjectError. Distinguishing parse vs lower errors by
+        // string-prefix matches the historical structure.
+        if first.starts_with("lower error: ") {
+            return Err(ProjectError::RockyLower {
+                path: path.display().to_string(),
+                reason: first.trim_start_matches("lower error: ").to_string(),
+            });
+        }
+        return Err(ProjectError::RockyParse {
+            path: path.display().to_string(),
+            reason: first.trim_start_matches("parse error: ").to_string(),
+        });
+    }
+
+    let sql = ft.sql.clone();
+
+    // Sidecar config + contract resolution — unchanged from the
+    // non-salsa path.
+    let toml_path = path.with_extension("toml");
+    let config = if toml_path.exists() {
+        models::load_model_pair(path, &toml_path, defaults)?.config
+    } else {
+        let catalog = defaults
+            .as_ref()
+            .and_then(|d| d.target.as_ref())
+            .and_then(|t| t.catalog.clone())
+            .unwrap_or_else(|| "warehouse".to_string());
+        let schema = defaults
+            .as_ref()
+            .and_then(|d| d.target.as_ref())
+            .and_then(|t| t.schema.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let strategy = defaults
+            .as_ref()
+            .and_then(|d| d.strategy.clone())
+            .unwrap_or_default();
+
+        ModelConfig {
+            name: name.clone(),
+            depends_on: vec![],
+            strategy,
+            target: TargetConfig {
+                catalog,
+                schema,
+                table: name.clone(),
+            },
+            sources: vec![],
+            adapter: None,
+            intent: defaults.as_ref().and_then(|d| d.intent.clone()),
+            freshness: defaults.as_ref().and_then(|d| d.freshness.clone()),
+            tests: vec![],
+            format: None,
+            format_options: None,
+            classification: Default::default(),
+            retention: None,
+            budget: None,
+            name_declared: String::new(),
+            target_table_declared: String::new(),
+        }
+    };
+
+    let contract_file = path.with_extension("contract.toml");
+    let contract_path = if contract_file.exists() {
+        Some(contract_file)
+    } else {
+        None
+    };
+
+    Ok(Model {
+        config,
+        sql,
+        file_path: path.display().to_string(),
+        contract_path,
+    })
+}
+
+/// Legacy non-salsa loader for `.rocky` files.
 ///
-/// File discovery is sequential (single `read_dir` scan), but parsing and
-/// lowering are parallelized with rayon — each `.rocky` file is parsed,
-/// lowered to SQL, and resolved independently.
+/// Kept for back-compat with call sites that construct projects
+/// without a salsa database — internally, [`Project::load`] now spins
+/// up a transient db and routes through [`load_rocky_models_with_db`].
+/// This function remains as a fallback used by tests that exercise
+/// the no-database path directly.
+#[allow(dead_code)]
 fn load_rocky_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
     if !dir.exists() {
         return Ok(Vec::new());
