@@ -2015,6 +2015,43 @@ impl StateStore {
         Ok(count)
     }
 
+    /// Count the number of ledger rows pointing at a given `blake3_hash`.
+    ///
+    /// This is the VACUUM refcount primitive. A content-addressed parquet
+    /// file is safe to physically delete only when its hash refcount is
+    /// zero — every recorded reference (a run+model pair that materialised
+    /// the same bytes) must be retired first. A refcount above one means
+    /// the bytes are shared (e.g. across branches or replayed runs) and
+    /// deleting them would corrupt every other referer.
+    ///
+    /// O(N) full table scan today; if the ledger grows past the
+    /// comfortable single-digit-millisecond range a secondary
+    /// `ARTIFACTS_BY_HASH` index can back this method without changing
+    /// the signature. The wider value here is **honest counting**, not
+    /// raw speed: VACUUM consumers only need the boolean refcount==0
+    /// answer, but exposing the integer lets callers log "kept N
+    /// references" for ops debugging.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::Db`] when the redb transaction fails to
+    /// open the table or iterate, and [`StateError::Serialize`] when a
+    /// ledger row fails to deserialize. Callers in a VACUUM path
+    /// should treat both as "do not delete" — fail closed.
+    pub fn refcount_for_hash(&self, blake3_hash: &str) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut count: u64 = 0;
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            if record.blake3_hash == blake3_hash {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     // -----------------------------------------------------------------------
     // Branches (schema-prefix virtual branches)
     // -----------------------------------------------------------------------
@@ -2233,6 +2270,111 @@ pub struct ArtifactRecord {
     /// same as the write's Delta `modification_time_millis` (that's in
     /// the log); close enough for retention sweep windows.
     pub written_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of splitting a batch of candidate artifacts by refcount.
+///
+/// Produced by [`partition_vacuum_candidates`] from a batch of
+/// candidate [`ArtifactRecord`]s (rows the caller has decided are
+/// eligible by some other policy — e.g. age, Delta-log staleness,
+/// retention window) and a refcount lookup. The split is purely
+/// arithmetic: rows whose `blake3_hash` is referenced more than once
+/// in the ledger land in `still_referenced`; rows referenced exactly
+/// once land in `safe_to_delete` (the input row *is* the last
+/// reference, and physically deleting the bytes will drop the
+/// refcount to zero once the ledger row is retired).
+///
+/// The split intentionally never raises errors: a lookup failure on
+/// any candidate moves it to `still_referenced` (fail-closed — we
+/// would rather keep an orphan byte for one more sweep than delete
+/// something that's still live), and the lookup error is captured in
+/// `lookup_errors` so the caller can surface it. This is the
+/// "graceful degradation" the Phase 6 spec calls out: a ledger
+/// hiccup must not catastrophically nuke a VACUUM run, and it must
+/// definitely never delete a byte we cannot prove is unreferenced.
+#[derive(Debug, Clone)]
+pub struct VacuumPartition {
+    /// Candidates whose hash had a refcount of exactly 1 — i.e. the
+    /// candidate row itself was the only reference and the bytes are
+    /// now orphan-eligible. Safe to physically delete *after* the
+    /// ledger row is retired in the same transaction.
+    pub safe_to_delete: Vec<ArtifactRecord>,
+    /// Candidates whose hash had a refcount above 1, *or* whose
+    /// refcount lookup failed. Either way the bytes must be kept.
+    pub still_referenced: Vec<ArtifactRecord>,
+    /// Hashes whose refcount lookup failed. The corresponding records
+    /// are in `still_referenced` (fail-closed). Present so callers can
+    /// log a warning and decide whether to abort the sweep.
+    pub lookup_errors: Vec<String>,
+}
+
+/// Partition a batch of VACUUM candidates by ledger refcount.
+///
+/// `refcount` is invoked once per unique candidate hash; on success
+/// the integer it returns is interpreted as the total number of
+/// ledger references for that hash (including the row the caller
+/// has already decided to retire). A return of `Ok(0)` is treated
+/// as "ledger has no record at all" → kept in `still_referenced`,
+/// because absence of evidence is not evidence of absence (the
+/// row may have been written by an older Rocky version that
+/// pre-dates the ledger, or by a writer that crashed before the
+/// `record_artifact` call).
+///
+/// Refcount semantics: a hash with refcount exactly 1 is safe to
+/// delete because the single reference is the candidate itself
+/// (the caller has, by definition, decided to retire it). Refcount
+/// above 1 means at least one *other* run/model also wrote bytes
+/// with the same content hash — physical deletion would corrupt
+/// those references.
+///
+/// Designed to be transport-agnostic: `refcount` can be backed by
+/// [`StateStore::refcount_for_hash`], a remote service, or a
+/// pre-computed `HashMap` for batch sweeps.
+pub fn partition_vacuum_candidates<F>(
+    candidates: Vec<ArtifactRecord>,
+    mut refcount: F,
+) -> VacuumPartition
+where
+    F: FnMut(&str) -> Result<u64, StateError>,
+{
+    let mut safe_to_delete = Vec::new();
+    let mut still_referenced = Vec::new();
+    let mut lookup_errors: Vec<String> = Vec::new();
+    // Per-batch memoisation: a partitioned commit can record many
+    // rows under the same blake3_hash, and rerunning the lookup for
+    // each duplicate is pure waste.
+    let mut seen: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+
+    for record in candidates {
+        let count = match seen.get(&record.blake3_hash) {
+            Some(cached) => *cached,
+            None => {
+                let result = refcount(&record.blake3_hash);
+                let cached = match result {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        if !lookup_errors.contains(&record.blake3_hash) {
+                            lookup_errors.push(record.blake3_hash.clone());
+                        }
+                        None
+                    }
+                };
+                seen.insert(record.blake3_hash.clone(), cached);
+                cached
+            }
+        };
+
+        match count {
+            Some(1) => safe_to_delete.push(record),
+            _ => still_referenced.push(record),
+        }
+    }
+
+    VacuumPartition {
+        safe_to_delete,
+        still_referenced,
+        lookup_errors,
+    }
 }
 
 /// Record of a successfully loaded file, stored in the state database.
@@ -4698,5 +4840,157 @@ mod tests {
             .map(|g| g.value().to_string())
             .unwrap();
         assert_eq!(stored, "7");
+    }
+
+    // -----------------------------------------------------------------------
+    // VACUUM refcount (Phase 6) — refcount_for_hash + partition_vacuum_candidates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn refcount_for_hash_counts_ledger_rows() {
+        // Sanity: refcount_for_hash matches list_artifacts_by_hash().len(),
+        // and isolated hashes don't bleed into one another's counts.
+        let (store, _dir) = temp_store();
+        store
+            .record_artifact(&make_artifact(
+                "run-a",
+                "m",
+                "shared",
+                "s3://b/p1/shared.parquet",
+                1,
+            ))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact(
+                "run-b",
+                "m",
+                "shared",
+                "s3://b/p2/shared.parquet",
+                1,
+            ))
+            .unwrap();
+        store
+            .record_artifact(&make_artifact(
+                "run-c",
+                "m",
+                "solo",
+                "s3://b/p3/solo.parquet",
+                1,
+            ))
+            .unwrap();
+
+        assert_eq!(store.refcount_for_hash("shared").unwrap(), 2);
+        assert_eq!(store.refcount_for_hash("solo").unwrap(), 1);
+        assert_eq!(store.refcount_for_hash("never-written").unwrap(), 0);
+    }
+
+    #[test]
+    fn vacuum_partition_single_reference_is_safe_to_delete() {
+        // Baseline regression: when the candidate is the *only* recorded
+        // reference, the partition routes it into safe_to_delete. This is
+        // the path today's (pre-Phase-6, implicit-refcount=1) VACUUM
+        // effectively walks — proving it still works confirms backward
+        // compat is preserved.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "m", "h-solo", "s3://b/p/solo.parquet", 1);
+        store.record_artifact(&art).unwrap();
+
+        let partition =
+            partition_vacuum_candidates(vec![art.clone()], |h| store.refcount_for_hash(h));
+
+        assert_eq!(partition.safe_to_delete.len(), 1);
+        assert_eq!(partition.safe_to_delete[0].blake3_hash, "h-solo");
+        assert!(partition.still_referenced.is_empty());
+        assert!(partition.lookup_errors.is_empty());
+    }
+
+    #[test]
+    fn vacuum_partition_multi_reference_is_preserved() {
+        // The cleanup invariant: two runs reference the same hash; even
+        // though only run-a's artifact is in the candidate batch, the
+        // bytes must not be deleted because run-b's row still points at
+        // them.
+        let (store, _dir) = temp_store();
+        let art_a = make_artifact("run-a", "m", "h-shared", "s3://b/p1/shared.parquet", 1);
+        let art_b = make_artifact("run-b", "m", "h-shared", "s3://b/p2/shared.parquet", 1);
+        store.record_artifact(&art_a).unwrap();
+        store.record_artifact(&art_b).unwrap();
+
+        let partition =
+            partition_vacuum_candidates(vec![art_a.clone()], |h| store.refcount_for_hash(h));
+
+        assert!(partition.safe_to_delete.is_empty());
+        assert_eq!(partition.still_referenced.len(), 1);
+        assert_eq!(partition.still_referenced[0].run_id, "run-a");
+        assert!(partition.lookup_errors.is_empty());
+    }
+
+    #[test]
+    fn vacuum_partition_refcount_zero_is_preserved_fail_closed() {
+        // A refcount of 0 means the ledger has *no* record of this hash —
+        // either pre-ledger bytes or a writer that crashed before
+        // recording. We don't pretend that's evidence of absence; the
+        // row stays in still_referenced so an operator can investigate
+        // before the byte is physically removed. This is "fail closed".
+        let art = make_artifact("run-x", "m", "h-orphan", "s3://b/p/orphan.parquet", 1);
+
+        let partition = partition_vacuum_candidates(vec![art.clone()], |_| Ok(0));
+
+        assert!(partition.safe_to_delete.is_empty());
+        assert_eq!(partition.still_referenced.len(), 1);
+        assert_eq!(partition.still_referenced[0].blake3_hash, "h-orphan");
+        assert!(partition.lookup_errors.is_empty());
+    }
+
+    #[test]
+    fn vacuum_partition_lookup_error_does_not_catastrophically_fail() {
+        // Graceful degradation: when refcount lookup errors for a hash,
+        // the partition routes the candidate to still_referenced (fail
+        // closed — never delete what we can't prove unreferenced) and
+        // records the hash in lookup_errors so the caller can log it.
+        // The function itself still returns Ok-equivalent (a populated
+        // VacuumPartition), not a panic / bubble-up, so a single bad
+        // row cannot nuke a sweep over thousands of healthy rows.
+        let art_bad = make_artifact("run-x", "m", "h-bad", "s3://b/p/bad.parquet", 1);
+        let art_good = make_artifact("run-y", "m", "h-good", "s3://b/p/good.parquet", 1);
+
+        let partition = partition_vacuum_candidates(vec![art_bad.clone(), art_good.clone()], |h| {
+            if h == "h-bad" {
+                // Any StateError variant works for the test; Busy is
+                // a realistic "ledger is locked" surface.
+                Err(StateError::Busy {
+                    path: "/tmp/state.redb".to_string(),
+                })
+            } else {
+                Ok(1)
+            }
+        });
+
+        assert_eq!(partition.safe_to_delete.len(), 1);
+        assert_eq!(partition.safe_to_delete[0].blake3_hash, "h-good");
+        assert_eq!(partition.still_referenced.len(), 1);
+        assert_eq!(partition.still_referenced[0].blake3_hash, "h-bad");
+        assert_eq!(partition.lookup_errors, vec!["h-bad".to_string()]);
+    }
+
+    #[test]
+    fn vacuum_partition_memoises_lookup_per_hash() {
+        // A partitioned commit can record many rows under the same hash.
+        // We don't want to fire one ledger scan per row when one scan
+        // per unique hash suffices. Wire a counter into the closure and
+        // assert it fires exactly once per unique hash.
+        let art1 = make_artifact("r", "m", "h-dup", "s3://b/p/a.parquet", 1);
+        let art2 = make_artifact("r", "m", "h-dup", "s3://b/p/b.parquet", 1);
+        let art3 = make_artifact("r", "m", "h-other", "s3://b/p/c.parquet", 1);
+
+        let mut hits = 0u32;
+        let partition = partition_vacuum_candidates(vec![art1, art2, art3], |_| {
+            hits += 1;
+            Ok(1)
+        });
+
+        // Two unique hashes ("h-dup", "h-other") → exactly two lookups.
+        assert_eq!(hits, 2);
+        assert_eq!(partition.safe_to_delete.len(), 3);
     }
 }
