@@ -232,19 +232,28 @@ fn load_single_rocky_model_with_db(
     })?;
     let ft = crate::salsa_compile::file_typecheck(db, src);
 
-    if let Some(first) = ft.diagnostics.first() {
+    // Diagnostics are accumulated by `file_typecheck` via the
+    // [`CompileDiagnostic`] salsa accumulator — on a cache hit they're
+    // returned straight from the cache without re-running the body, on
+    // a token-equivalent re-parse they backdate, and on a real AST
+    // change they re-emit fresh.
+    let diagnostics = crate::salsa_compile::file_typecheck::accumulated::<
+        crate::salsa_compile::CompileDiagnostic,
+    >(db, src);
+    if let Some(first) = diagnostics.first() {
         // Treat the leading parse / lower diagnostic as the
         // ProjectError. Distinguishing parse vs lower errors by
         // string-prefix matches the historical structure.
-        if first.starts_with("lower error: ") {
+        let msg = &first.0;
+        if msg.starts_with("lower error: ") {
             return Err(ProjectError::RockyLower {
                 path: path.display().to_string(),
-                reason: first.trim_start_matches("lower error: ").to_string(),
+                reason: msg.trim_start_matches("lower error: ").to_string(),
             });
         }
         return Err(ProjectError::RockyParse {
             path: path.display().to_string(),
-            reason: first.trim_start_matches("parse error: ").to_string(),
+            reason: msg.trim_start_matches("parse error: ").to_string(),
         });
     }
 
