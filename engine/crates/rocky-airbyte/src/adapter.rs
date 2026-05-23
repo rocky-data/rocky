@@ -2,6 +2,17 @@
 //!
 //! Calls the Airbyte REST API to discover connections and their configured
 //! streams in a workspace. This is a metadata-only operation.
+//!
+//! # Not a `WarehouseAdapter`
+//!
+//! Airbyte is a source-side integration, not a warehouse, so this crate does
+//! **not** implement [`rocky_core::traits::WarehouseAdapter`] — including the
+//! `fetch_arrow_batch` PoC method added in [PR #631]. Sync output lands in a
+//! downstream warehouse (Databricks, Snowflake, BigQuery, Trino, Iceberg,
+//! DuckDB); Arrow reads of that data go through the warehouse adapter for
+//! that destination. See the crate-level docstring for the full rationale.
+//!
+//! [PR #631]: https://github.com/rocky-data/rocky/pull/631
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
