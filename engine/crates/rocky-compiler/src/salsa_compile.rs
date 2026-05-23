@@ -49,27 +49,69 @@
 //!   `.rocky` files (the surface the parser-side migration wired up).
 //!   Extending to `.sql` requires routing the SQL parser through a
 //!   tracked query too.
-//! - Diagnostics still flow through the `Vec<Diagnostic>` shape on
-//!   `CompileResult`. The salsa Accumulator-driven path is the next
-//!   migration step.
+//!
+//! # Diagnostics
+//!
+//! Parse and lower errors emitted from inside [`file_typecheck`] are
+//! routed through [`CompileDiagnostic`], a [`salsa::accumulator`]. The
+//! consequence is that diagnostics get the same memoization + backdating
+//! treatment as the rest of the tracked output:
+//!
+//! - **Memoization**: a second `file_typecheck` call against unchanged
+//!   inputs returns the cached accumulated diagnostics without
+//!   re-entering the body — no duplicate emission.
+//! - **Backdating**: if `set_text` produces a token-equivalent AST
+//!   (whitespace-only edits, for example), salsa inherits the previous
+//!   run's accumulated diagnostics instead of re-running the body.
+//! - **Composition**: a child tracked query's accumulated diagnostics
+//!   roll up into the parent's accumulator pool automatically.
+//!
+//! Callers retrieve the diagnostics via
+//! `file_typecheck::accumulated::<CompileDiagnostic>(db, src)` *after*
+//! invoking `file_typecheck`. Today these diagnostics carry the same
+//! `"parse error: …"` / `"lower error: …"` string prefixes that the
+//! pre-accumulator `Vec<String>` shape used, so [`crate::project`]'s
+//! existing prefix-discriminating branch keeps working untouched.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use salsa::Accumulator;
+
 use rocky_lang::ast::RockyFile;
 use rocky_lang::incremental::{SourceFile, parse_file};
 
 pub use rocky_lang::incremental::{ReadSourceError, RockyDatabase, lookup_source, read_source};
 
+/// Salsa accumulator carrying compile-time diagnostics for `.rocky` files.
+///
+/// Parse and lower errors emitted from inside [`file_typecheck`] (and
+/// future per-file tracked queries) push a `CompileDiagnostic` instead
+/// of stashing the message on the returned tracked value. Retrieve via
+/// `file_typecheck::accumulated::<CompileDiagnostic>(db, src)`.
+///
+/// The wire shape today is a plain string prefixed with
+/// `"parse error: "` or `"lower error: "` — same as the pre-accumulator
+/// `Vec<String>` field so callers don't need to discriminate by code
+/// (yet). Migrating these to structured [`crate::diagnostic::Diagnostic`]
+/// values is a separate follow-up.
+#[salsa::accumulator]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileDiagnostic(pub String);
+
 /// Per-file typecheck output, salsa-tracked.
 ///
-/// Carries the lowered SQL string, the parsed AST handle, and the
-/// extracted output column names. Cross-model type propagation
-/// happens in the orchestrator — this struct is intentionally local
-/// (no upstream-dependent fields) so its identity is determined solely
-/// by the input file's AST.
+/// Carries the lowered SQL string and the extracted output column
+/// names. Cross-model type propagation happens in the orchestrator —
+/// this struct is intentionally local (no upstream-dependent fields)
+/// so its identity is determined solely by the input file's AST.
+///
+/// Diagnostics produced by parse + lower do **not** live on this
+/// struct — they flow through the [`CompileDiagnostic`] accumulator so
+/// they participate in salsa's memoization + backdating. Retrieve via
+/// `file_typecheck::accumulated::<CompileDiagnostic>(db, src)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTypecheck {
     /// Lowered SQL string (for `.rocky`) or the original SQL (for `.sql`).
@@ -78,9 +120,6 @@ pub struct FileTypecheck {
     /// orchestrator stitches these into typed columns once upstream
     /// types are known.
     pub output_columns: Vec<String>,
-    /// Diagnostics produced by parse + lower. Cross-model diagnostics
-    /// are appended later by the orchestrator.
-    pub diagnostics: Vec<String>,
 }
 
 /// Parse + lower a `.rocky` source file into a [`FileTypecheck`].
@@ -103,7 +142,9 @@ pub struct FileTypecheck {
 /// downstream tracked-value comparison short-circuits the
 /// dependent-query re-run. Callers observing `file_typecheck` results
 /// across an identical-AST edit see the same `Arc<FileTypecheck>`
-/// returned (pointer-equal in practice).
+/// returned (pointer-equal in practice). Accumulated
+/// [`CompileDiagnostic`] entries inherit the same backdating — a
+/// re-parse that produces an identical AST does NOT re-emit them.
 #[salsa::tracked]
 pub fn file_typecheck(db: &dyn salsa::Database, src: SourceFile) -> Arc<FileTypecheck> {
     // Test-only invocation counter — gives integration tests a way to
@@ -123,20 +164,23 @@ pub fn file_typecheck(db: &dyn salsa::Database, src: SourceFile) -> Arc<FileType
                 Arc::new(FileTypecheck {
                     sql,
                     output_columns,
-                    diagnostics: Vec::new(),
                 })
             }
-            Err(err) => Arc::new(FileTypecheck {
+            Err(err) => {
+                CompileDiagnostic(format!("lower error: {err}")).accumulate(db);
+                Arc::new(FileTypecheck {
+                    sql: String::new(),
+                    output_columns: Vec::new(),
+                })
+            }
+        },
+        Err(err) => {
+            CompileDiagnostic(format!("parse error: {err}")).accumulate(db);
+            Arc::new(FileTypecheck {
                 sql: String::new(),
                 output_columns: Vec::new(),
-                diagnostics: vec![format!("lower error: {err}")],
-            }),
-        },
-        Err(err) => Arc::new(FileTypecheck {
-            sql: String::new(),
-            output_columns: Vec::new(),
-            diagnostics: vec![format!("parse error: {err}")],
-        }),
+            })
+        }
     }
 }
 
@@ -235,7 +279,10 @@ pub(crate) mod tests {
     use salsa::Setter;
     use tempfile::TempDir;
 
-    use super::{FileTypecheck, RockyDatabase, file_typecheck, read_source, source_signature};
+    use super::{
+        CompileDiagnostic, FileTypecheck, RockyDatabase, file_typecheck, read_source,
+        source_signature,
+    };
     use rocky_lang::incremental::SourceFile;
 
     fn write_model(dir: &TempDir, name: &str, body: &str) -> PathBuf {
@@ -468,9 +515,196 @@ pub(crate) mod tests {
             vec!["id".to_string(), "total".to_string()],
             "output_columns must match the trailing `select {{ }}` step",
         );
+
+        // Valid input must not push anything onto the accumulator.
+        let diags = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
         assert!(
-            ft.diagnostics.is_empty(),
-            "valid input must not produce diagnostics",
+            diags.is_empty(),
+            "valid input must not produce accumulated diagnostics, got {diags:?}",
+        );
+    }
+
+    /// Headline accumulator receipt: a lower-error file emits exactly
+    /// one `CompileDiagnostic` with the expected `"lower error: …"`
+    /// prefix. Guards both the wire shape `project.rs` discriminates
+    /// against and the basic accumulate-then-retrieve contract.
+    #[test]
+    fn lower_error_emits_one_accumulated_diagnostic() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_counter();
+
+        let tmp = TempDir::new().expect("tempdir");
+        // `select` without a leading `from` parses fine but fails to
+        // lower with the stable `"pipeline must start with 'from'"`
+        // error.
+        let a = write_model(&tmp, "no_from.rocky", "select { id }");
+
+        let mut db = RockyDatabase::default();
+        let src = read_source(&mut db, a).expect("read");
+
+        let ft = file_typecheck(&db, src);
+        assert!(ft.sql.is_empty(), "lower-error files yield no lowered SQL",);
+
+        let diags = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly one accumulated diagnostic for a single lower-error file, got {diags:?}",
+        );
+        assert!(
+            diags[0].0.starts_with("lower error: "),
+            "diagnostic must carry the `lower error: ` prefix (project.rs \
+             discriminates against this prefix), got {:?}",
+            diags[0].0,
+        );
+    }
+
+    /// Memoization receipt: a second `file_typecheck` call against
+    /// unchanged inputs returns the same accumulated diagnostics
+    /// without re-entering the body. This is the load-bearing salsa
+    /// invariant — without it the accumulator pool would grow on every
+    /// re-read of a stable broken file.
+    #[test]
+    fn accumulated_diagnostics_memoize_on_cache_hit() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_counter();
+
+        let tmp = TempDir::new().expect("tempdir");
+        let a = write_model(&tmp, "no_from.rocky", "select { id }");
+
+        let mut db = RockyDatabase::default();
+        let src = read_source(&mut db, a).expect("read");
+
+        let _ = file_typecheck(&db, src);
+        let first = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+        assert_eq!(invocation_count(), 1, "cold-cache baseline: body ran once",);
+        assert_eq!(first.len(), 1, "one diagnostic on first call");
+
+        let _ = file_typecheck(&db, src);
+        let second = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+        assert_eq!(
+            invocation_count(),
+            1,
+            "second call must hit the cache — body must NOT re-run",
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "cache hit returns the same single accumulated diagnostic — \
+             never doubled, never empty",
+        );
+        assert_eq!(
+            second[0].0, first[0].0,
+            "accumulated diagnostic identity stable across cache hits",
+        );
+    }
+
+    /// Backdating receipt: `set_text` that produces a token-equivalent
+    /// AST (here, a trailing newline appended to a lower-error file)
+    /// inherits the previous run's accumulated diagnostics instead of
+    /// re-emitting. This is the headline win of routing diagnostics
+    /// through the accumulator — string-input revision bumps, but the
+    /// downstream AST is `PartialEq`-equal so salsa backdates.
+    #[test]
+    fn accumulated_diagnostics_backdate_on_token_equivalent_ast() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_counter();
+
+        let tmp = TempDir::new().expect("tempdir");
+        let a = write_model(&tmp, "no_from.rocky", "select { id }");
+
+        let mut db = RockyDatabase::default();
+        let src = read_source(&mut db, a).expect("read");
+
+        let _ = file_typecheck(&db, src);
+        let first_msg = {
+            let first = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+            assert_eq!(first.len(), 1, "cold-cache baseline: one diagnostic");
+            assert_eq!(invocation_count(), 1, "body ran once cold");
+            first[0].0.clone()
+        };
+
+        // Append a trailing newline — the input String changes (so the
+        // salsa input revision bumps and `parse_file`'s body re-runs),
+        // but the parsed AST is identical, so `file_typecheck`'s body
+        // should backdate.
+        src.set_text(&mut db).to("select { id }\n".to_string());
+
+        let _ = file_typecheck(&db, src);
+        let second = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+
+        assert_eq!(
+            invocation_count(),
+            1,
+            "token-equivalent AST: file_typecheck body must NOT re-run \
+             (backdating receipt — without the accumulator migration this \
+             test cannot exist because diagnostics on the struct would \
+             never have been observable to backdating in the first place)",
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "accumulated diagnostics are inherited from the cached run, \
+             not re-emitted — count stays at 1",
+        );
+        assert_eq!(
+            second[0].0, first_msg,
+            "diagnostic identity preserved across the backdated re-parse",
+        );
+    }
+
+    /// Invalidation receipt: a `set_text` that produces a structurally
+    /// different AST DOES re-emit fresh diagnostics, and stale
+    /// diagnostics from the previous AST do not leak through. Pairs
+    /// with the backdating test above: backdating must not be so
+    /// aggressive that genuine edits get hidden.
+    #[test]
+    fn accumulated_diagnostics_invalidate_on_real_ast_change() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_counter();
+
+        let tmp = TempDir::new().expect("tempdir");
+        // Start with a lower-error file (no `from`).
+        let a = write_model(&tmp, "evolving.rocky", "select { id }");
+
+        let mut db = RockyDatabase::default();
+        let src = read_source(&mut db, a).expect("read");
+
+        let _ = file_typecheck(&db, src);
+        {
+            let first = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+            assert_eq!(
+                first.len(),
+                1,
+                "cold-cache baseline: one lower-error diagnostic"
+            );
+            assert!(first[0].0.starts_with("lower error: "));
+        }
+
+        // Edit to a structurally different, valid file.
+        src.set_text(&mut db)
+            .to("from orders\nselect { id }".to_string());
+
+        let _ = file_typecheck(&db, src);
+        let second = file_typecheck::accumulated::<CompileDiagnostic>(&db, src);
+
+        assert_eq!(
+            invocation_count(),
+            2,
+            "genuine AST change: body re-runs (no spurious backdating)",
+        );
+        assert!(
+            second.is_empty(),
+            "valid post-edit AST emits no diagnostics; stale lower-error \
+             diagnostic from the prior AST does not leak through, got {second:?}",
         );
     }
 
