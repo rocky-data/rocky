@@ -21,17 +21,6 @@
 //! let parsed = parse_file(&db, src);
 //! assert!(parsed.is_ok());
 //! ```
-//!
-//! # Safety
-//!
-//! [`ParsedAst`] carries an `unsafe impl salsa::Update` because
-//! [`crate::ast::RockyFile`] doesn't itself implement
-//! [`salsa::Update`] — and the spike scope explicitly excludes editing
-//! `ast.rs`. The impl is sound (`maybe_update` overwrites in place and
-//! returns "changed"; salsa only calls it after deciding to re-run the
-//! query) and isolated to the spike module; production migration will
-//! eventually derive `salsa::Update` on the AST types directly. See the
-//! site-level `SAFETY:` comment on the impl below.
 
 use std::sync::Arc;
 
@@ -55,64 +44,16 @@ pub struct SourceFile {
     pub text: String,
 }
 
-/// Memoizable handle to a parsed Rocky DSL AST.
-///
-/// Wraps `Arc<RockyFile>` so we can implement [`salsa::Update`] without
-/// touching [`crate::ast::RockyFile`] itself (out-of-scope for the
-/// spike). The `Arc` makes the value cheap to clone out of the salsa
-/// cache and means `Arc::ptr_eq` is a robust way to assert memoization
-/// returned the same instance.
-#[derive(Clone)]
-pub struct ParsedAst(pub Arc<RockyFile>);
-
-impl PartialEq for ParsedAst {
-    /// Compare by `Arc` pointer identity — two `ParsedAst`s are equal
-    /// iff they point at the same allocation. This is the conservative
-    /// choice given [`RockyFile`] doesn't implement structural
-    /// `PartialEq`: distinct allocations are reported "not equal",
-    /// which over-invalidates downstream salsa queries but is never
-    /// incorrect. Deriving structural equality on `RockyFile` is a
-    /// follow-up.
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for ParsedAst {}
-
-// SAFETY: salsa::Update requires that `maybe_update(old, new)`:
-//   (1) writes `new` through `old` (the pointer is valid + aligned for
-//       a `Self` because salsa allocates the storage), and
-//   (2) returns whether the value changed.
-// We unconditionally write and return `true`. Returning `true`
-// over-approximates: it tells salsa "assume the AST changed", so
-// downstream tracked queries that depend on this output may invalidate
-// when they could have short-circuited. That is a *performance* loss,
-// never a soundness one — and `maybe_update` is only invoked after salsa
-// has already decided to re-execute the query, so the over-approximation
-// matters only for transitively-dependent queries (of which the spike
-// has none). `RockyFile` has no `PartialEq`, so a content equality
-// check isn't cheaply available; deriving it is a follow-up.
-unsafe impl salsa::Update for ParsedAst {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        // SAFETY: salsa guarantees `old_pointer` points at valid,
-        // properly-aligned storage of size `Self` owned by the cache.
-        unsafe {
-            std::ptr::write(old_pointer, new_value);
-        }
-        true
-    }
-}
-
-/// Parse a [`SourceFile`] into a [`ParsedAst`].
+/// Parse a [`SourceFile`] into an [`Arc<RockyFile>`].
 ///
 /// # Memoization
 ///
 /// Calling `parse_file` twice with the same `SourceFile` and an
-/// unchanged `text` returns the cached [`ParsedAst`] from the second
-/// call onward; the underlying [`parser::parse`] is invoked exactly
-/// once per revision. Mutating the input via [`salsa::Setter::set_text`]
-/// bumps the revision and forces a re-parse on the next call.
+/// unchanged `text` returns the cached [`Arc<RockyFile>`] from the
+/// second call onward; the underlying [`parser::parse`] is invoked
+/// exactly once per revision. Mutating the input via
+/// [`salsa::Setter::set_text`] bumps the revision and forces a re-parse
+/// on the next call.
 ///
 /// # Errors
 ///
@@ -124,7 +65,10 @@ unsafe impl salsa::Update for ParsedAst {
 /// accumulator — both are follow-up work; this spike keeps the error
 /// path simple.
 #[salsa::tracked]
-pub fn parse_file(db: &dyn salsa::Database, src: SourceFile) -> Result<ParsedAst, Arc<String>> {
+pub fn parse_file(
+    db: &dyn salsa::Database,
+    src: SourceFile,
+) -> Result<Arc<RockyFile>, Arc<String>> {
     // Counter wrapped in a Mutex (per spike spec) so the unit test can
     // assert the parser body was invoked exactly the expected number of
     // times. Lives behind cfg(test) to keep the production path free of
@@ -137,7 +81,7 @@ pub fn parse_file(db: &dyn salsa::Database, src: SourceFile) -> Result<ParsedAst
 
     let text = src.text(db);
     parser::parse(text)
-        .map(|ast| ParsedAst(Arc::new(ast)))
+        .map(Arc::new)
         .map_err(|e: ParseError| Arc::new(e.to_string()))
 }
 
@@ -217,7 +161,7 @@ mod tests {
         // value across the two calls.
         let (a, b) = (first.unwrap(), second.unwrap());
         assert!(
-            Arc::ptr_eq(&a.0, &b.0),
+            Arc::ptr_eq(&a, &b),
             "memoized Arc should be shared across calls",
         );
 
