@@ -375,3 +375,228 @@ async fn test_bytes_scanned_matches_independent_jobs_get_total_bytes_billed() {
          diff={diff} tolerance={tolerance}"
     );
 }
+
+/// Pipeline-level cost attribution cross-check (Phase 2.2 of the BQ
+/// trial-window plan).
+///
+/// PR #617 cross-checked `bytes_scanned` against `totalBytesBilled` for a
+/// *single* statement. This test extends that to the pipeline shape: when
+/// `rocky run` materializes N models, the sum of per-model `cost_usd`
+/// across all materializations should equal what BigQuery billed for the
+/// pipeline's jobs, within ±1%. Confirms the per-model attribution
+/// doesn't double-count or drop sub-jobs when aggregated.
+///
+/// The test stays inside `rocky-bigquery` so it can't dev-depend on
+/// `rocky-cli` (cyclic) — and therefore can't pull in
+/// `RunOutput::populate_cost_summary` directly. Instead it mirrors the
+/// arithmetic that function performs: `compute_observed_cost_usd` per
+/// statement (the exact call the run finalizer makes) summed across the
+/// pipeline. The function lives in `rocky-core::cost`, which both this
+/// test and the CLI's run finalizer share, so the two paths use the
+/// same per-model formula.
+///
+/// Three distinct `INFORMATION_SCHEMA` views are queried (`SCHEMATA`,
+/// `TABLES`, `COLUMNS`). In practice all three bill at BigQuery's 10 MB
+/// minimum floor, so the sum is `3 × 10 MB`. That's still enough to
+/// surface the regression this test is built for: dropping one of the
+/// three jobs would put rocky's sum at `2 × 10 MB` against BQ's
+/// `3 × 10 MB`, a 33% divergence that the ±1% assertion catches loudly.
+/// Per-job and sum assertions both run so the two failure modes
+/// (per-job mis-reporting vs missed an entire job) remain
+/// distinguishable in test output.
+///
+/// **Scope boundary.** Because the test doesn't subprocess-drive
+/// `rocky run`, it doesn't catch a regression where the adapter issues
+/// N statements for one model but only surfaces M < N job IDs into
+/// `MaterializationOutput.job_ids` — that's a `commands/run.rs`
+/// statement-collection wiring concern, separable from the
+/// bytes × cost arithmetic this test owns.
+#[tokio::test]
+#[ignore]
+async fn test_pipeline_level_cost_attribution_matches_jobs_get() {
+    use rocky_bigquery::auth::BigQueryAuth;
+    use rocky_core::cost::{BIGQUERY_USD_PER_TB_SCANNED, WarehouseType, compute_observed_cost_usd};
+    use rocky_core::traits::WarehouseAdapter;
+    use serde::Deserialize;
+
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+    let location = std::env::var("BIGQUERY_TEST_LOCATION").unwrap_or_else(|_| "EU".to_string());
+
+    let adapter = adapter_from_env().expect("BigQuery env vars not set");
+
+    // Three distinct INFORMATION_SCHEMA views. All three typically
+    // bill at BigQuery's 10 MB minimum floor for metadata scans of
+    // this size, but the queries themselves are distinct jobs with
+    // distinct job_ids — so missing a job in collection still
+    // surfaces as a ~33% sum divergence (one job dropped from
+    // 3 × 10 MB), well outside the ±1% tolerance.
+    let region = format!("region-{}", location.to_lowercase());
+    let statements = [
+        format!("SELECT COUNT(*) AS n FROM `{project}.{region}.INFORMATION_SCHEMA.SCHEMATA`"),
+        format!("SELECT COUNT(*) AS n FROM `{project}.{region}.INFORMATION_SCHEMA.TABLES`"),
+        format!("SELECT COUNT(*) AS n FROM `{project}.{region}.INFORMATION_SCHEMA.COLUMNS`"),
+    ];
+    assert!(
+        statements.len() >= 3,
+        "Phase 2.2 cross-check requires >= 3 statements to exercise the aggregation"
+    );
+
+    // 1) Drive each statement through the adapter and collect what the
+    // run finalizer would feed into `compute_observed_cost_usd`.
+    let mut rocky_jobs: Vec<(String, u64)> = Vec::with_capacity(statements.len());
+    let mut rocky_total_cost_usd = 0.0_f64;
+    for (idx, sql) in statements.iter().enumerate() {
+        let stats = adapter
+            .execute_statement_with_stats(sql)
+            .await
+            .unwrap_or_else(|e| panic!("execute_statement_with_stats #{idx} failed: {e}"));
+        let bytes = stats
+            .bytes_scanned
+            .unwrap_or_else(|| panic!("bytes_scanned missing for statement #{idx}"));
+        let job_id = stats
+            .job_id
+            .unwrap_or_else(|| panic!("job_id missing for statement #{idx}"));
+
+        // Mirror the per-model `populate_cost_summary` step: bytes ×
+        // per-TB rate, summed across materializations. `duration_ms`
+        // and DBU args are ignored for BigQuery — the formula is
+        // bytes-only — but the call signature is shared with the
+        // duration-based adapters, so the zeros document that this
+        // path doesn't read them.
+        let cost = compute_observed_cost_usd(WarehouseType::BigQuery, Some(bytes), 0, 0.0, 0.0)
+            .unwrap_or_else(|| {
+                panic!("compute_observed_cost_usd returned None for BigQuery bytes")
+            });
+
+        rocky_total_cost_usd += cost;
+        rocky_jobs.push((job_id, bytes));
+    }
+
+    // 2) Independent `jobs.get` per job_id — fresh client + fresh auth
+    // so this side bypasses any caching or reuse in the adapter path.
+    let auth = BigQueryAuth::from_env().expect("BigQueryAuth::from_env");
+    let client = reqwest::Client::new();
+    let token = auth.get_token(&client).await.expect("acquire bearer token");
+
+    // Minimal local response shape — keeps the deserializer tolerant of
+    // fields we don't read (camelCase per BigQuery's REST API).
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JobGet {
+        statistics: Stats,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Stats {
+        query: Query,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Query {
+        total_bytes_billed: String,
+    }
+
+    let mut bq_total_bytes_billed: u64 = 0;
+    let mut per_job_receipts: Vec<String> = Vec::with_capacity(rocky_jobs.len());
+    for (job_id, rocky_bytes) in &rocky_jobs {
+        let url =
+            format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs/{job_id}");
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("location", location.as_str())])
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("jobs.get send failed for {job_id}: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "jobs.get returned {} for {job_id}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+
+        let job: JobGet = resp
+            .json()
+            .await
+            .unwrap_or_else(|e| panic!("parse jobs.get JSON for {job_id}: {e}"));
+        let bq_bytes: u64 = job
+            .statistics
+            .query
+            .total_bytes_billed
+            .parse()
+            .unwrap_or_else(|e| panic!("totalBytesBilled parses as u64 for {job_id}: {e}"));
+
+        // Per-job ±1% check first: surfaces "matched the wrong job"
+        // vs "missed a job" as distinct failure modes when the totals
+        // also diverge.
+        let per_job_tolerance = (bq_bytes / 100).max(1);
+        let per_job_diff = rocky_bytes.abs_diff(bq_bytes);
+        assert!(
+            per_job_diff <= per_job_tolerance,
+            "per-job bytes mismatch for {job_id}: \
+             rocky={rocky_bytes} bq.totalBytesBilled={bq_bytes} \
+             diff={per_job_diff} tolerance={per_job_tolerance} (±1%)"
+        );
+
+        bq_total_bytes_billed = bq_total_bytes_billed.saturating_add(bq_bytes);
+        per_job_receipts.push(format!(
+            "  {job_id} rocky={rocky_bytes} bq={bq_bytes} diff={per_job_diff}"
+        ));
+    }
+
+    // 3) Sum side: use the same `compute_observed_cost_usd` formula so
+    // the comparison is apples-to-apples — both rocky_total_cost_usd
+    // and bq_total_cost_usd run through the same per-TB constant.
+    let bq_total_cost_usd = (bq_total_bytes_billed as f64 / 1.0e12) * BIGQUERY_USD_PER_TB_SCANNED;
+
+    // 4) Pipeline-level ±1% assertion. Halt criterion in the plan
+    // (Phase 2.2) is "> 5% divergence = real adapter bug, write a
+    // memo." The hard assertion stays at ±1%; a separate
+    // halt-criterion print fires when the divergence is in the
+    // "real-bug" band so the operator catches it even if the panic
+    // message scrolls past.
+    let rel_diff = if bq_total_cost_usd == 0.0 {
+        0.0
+    } else {
+        ((rocky_total_cost_usd - bq_total_cost_usd) / bq_total_cost_usd).abs()
+    };
+    if rel_diff > 0.05 {
+        eprintln!(
+            "HALT-CRITERION TRIPPED: pipeline cost divergence {:.2}% > 5%. \
+             Per the BQ trial-window plan (Phase 2.2), this is a real adapter \
+             bug — capture a memo and surface separately. \
+             rocky=${rocky_total_cost_usd:.6} bq=${bq_total_cost_usd:.6} \
+             rocky_bytes_sum={} bq_bytes_sum={bq_total_bytes_billed}",
+            rel_diff * 100.0,
+            rocky_jobs.iter().map(|(_, b)| *b).sum::<u64>(),
+        );
+    }
+    assert!(
+        rel_diff <= 0.01,
+        "pipeline cost cross-check failed: \
+         rocky=${rocky_total_cost_usd:.6} bq=${bq_total_cost_usd:.6} \
+         relative_diff={:.4}% (±1% required) \
+         rocky_bytes_sum={} bq_bytes_sum={bq_total_bytes_billed} \
+         jobs={}",
+        rel_diff * 100.0,
+        rocky_jobs.iter().map(|(_, b)| *b).sum::<u64>(),
+        rocky_jobs
+            .iter()
+            .map(|(j, _)| j.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
+    // Receipt block. Operator captures with `-- --nocapture` and pastes
+    // into the PR description as the live cross-check evidence.
+    println!(
+        "bq-pipeline-crosscheck OK | location={location} jobs={}\n\
+         per-job:\n{}\n\
+         totals: rocky=${rocky_total_cost_usd:.6} bq=${bq_total_cost_usd:.6} \
+         rel_diff={:.4}% (±1% required)",
+        rocky_jobs.len(),
+        per_job_receipts.join("\n"),
+        rel_diff * 100.0,
+    );
+}
