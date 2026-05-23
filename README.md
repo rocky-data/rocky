@@ -14,7 +14,7 @@
 
 Not a warehouse. Not a table format. Not a query engine. The trust plane for your data — a typed compiler, named branches, deterministic replay, column-level lineage, compile-time contracts, and per-model cost — running over your existing Databricks / Snowflake / BigQuery / DuckDB. Apache 2.0.
 
-Rocky exists because the disasters that cost data teams real money — silent schema drift wrecking a revenue dashboard, a column rename quietly poisoning 47 downstream models, an auditor asking who touched `fct_revenue.amount` and when, a cost spike that no one can attribute to a model — all share a common shape. They're problems the warehouse can't see and the templating engine on top of it was never asked to. Rocky owns the graph between your code and the warehouse so those problems become compile errors, blocked PRs, and signed artifacts instead of pages and post-mortems.
+Rocky exists because the disasters that cost data teams real money — silent schema drift wrecking a revenue dashboard, a column rename quietly poisoning 47 downstream models, an auditor asking who touched `fct_revenue.amount` and when, a cost spike that no one can attribute to a model — all share a common shape. They're problems the warehouse can't see and the templating engine on top of it was never asked to. Rocky owns the graph between your code and the warehouse so those problems become compile errors, blocked PRs, and verifiable artifacts instead of pages and post-mortems.
 
 It's built for the team running production-critical multi-tenant pipelines on Databricks today, on Snowflake or BigQuery tomorrow, who can't tolerate another silent failure. Storage and compute stay where they are. **Rocky works on the SQL you already have** — the `.rocky` DSL is an acceleration when you want it, not a gate.
 
@@ -32,7 +32,7 @@ It's built for the team running production-critical multi-tenant pipelines on Da
 | `SELECT *` pulls a new column you didn't expect | Silent | `P002` warning, downstream consumers named |
 | Snowflake-only function written for a Databricks project | Runs in dev, fails in prod | `P001` dialect-portability lint at compile |
 | Run cost doubles, no one knows which model | Manual warehouse spelunking | `RunOutput.cost_summary` per model, every run |
-| Auditor asks: who changed `fct_revenue.amount`, when, and why? | Git blame + screenshots | `rocky replay <run_id>` — signed, content-addressed artifact of the exact code + inputs + outputs |
+| Auditor asks: who changed `fct_revenue.amount`, when, and why? | Git blame + screenshots | `rocky replay <run_id>` — content-addressed record of the exact code and the output it produced |
 | Sev-2 at 3 AM, half the pipeline already ran | Re-run everything | `rocky run --resume-latest` — checkpoint, three-state circuit breaker, skip what succeeded |
 
 Each row is a real failure mode, with a Rocky command that turns it into a non-event. The same primitives — typed compiler, content-addressed state, column-level lineage, per-model cost — back every row.
