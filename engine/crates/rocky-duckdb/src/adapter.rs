@@ -10,7 +10,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
@@ -80,34 +79,6 @@ impl DuckDbWarehouseAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Arrow PoC — IPC bridge between duckdb (arrow 56) and workspace arrow 58.
-// ---------------------------------------------------------------------------
-
-/// Decode Arrow IPC stream bytes (written by [`DuckDbConnector::query_arrow_ipc_bytes`]
-/// against arrow 56) into a single workspace arrow-58 `RecordBatch`.
-fn decode_ipc_stream(bytes: &[u8]) -> AdapterResult<RecordBatch> {
-    let reader = StreamReader::try_new(bytes, None)
-        .map_err(|e| AdapterError::msg(format!("arrow IPC stream decode failed: {e}")))?;
-    let batches: Vec<RecordBatch> = reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| AdapterError::msg(format!("arrow IPC batch read failed: {e}")))?;
-    match batches.len() {
-        0 => Err(AdapterError::msg(
-            "fetch_arrow_batch: IPC stream contained no batches",
-        )),
-        1 => Ok(batches.into_iter().next().unwrap()),
-        _ => {
-            // Defensive — we always write exactly one batch above, but a
-            // future codepath could write more. Concat into one so the
-            // contract holds.
-            let schema = batches[0].schema();
-            arrow::compute::concat_batches(&schema, batches.iter())
-                .map_err(|e| AdapterError::msg(format!("arrow concat_batches failed: {e}")))
-        }
-    }
-}
-
 #[async_trait]
 impl WarehouseAdapter for DuckDbWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -135,17 +106,15 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     }
 
     async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
-        // DuckDB's `query_arrow` returns batches built against arrow 56
-        // (whatever major `duckdb 1.4.4` pins). The trait method must
-        // return the workspace arrow 58 `RecordBatch`. The two are wire-
-        // compatible but not type-compatible, so we round-trip through
-        // the stable Arrow IPC stream format.
+        // `duckdb 1.10503` pins workspace `arrow 58`, so `query_arrow`
+        // returns batches directly type-compatible with the trait's
+        // `arrow::record_batch::RecordBatch`. No IPC bridge required —
+        // the connector concatenates multi-batch result sets in place.
         let conn = self
             .connector
             .lock()
             .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        let raw = conn.query_arrow_ipc_bytes(sql).map_err(AdapterError::new)?;
-        decode_ipc_stream(&raw)
+        conn.query_arrow_batch(sql).map_err(AdapterError::new)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -351,19 +320,19 @@ mod tests {
         );
     }
 
-    /// Live conformance test for the Arrow inter-adapter PoC.
+    /// Live conformance test for the Arrow inter-adapter path.
     ///
     /// Marked `#[ignore]` because it links the bundled DuckDB C++ binary
     /// (already in the dev dependency graph, but the explicit gate keeps
     /// the default `cargo test` profile lean) and exercises the
-    /// arrow-56 → workspace-arrow-58 IPC bridge end-to-end. Run with:
+    /// `query_arrow` → workspace-arrow-58 path end-to-end. Run with:
     ///
     /// ```bash
     /// cargo test -p rocky-duckdb -- --ignored fetch_arrow_batch
     /// ```
     #[ignore]
     #[tokio::test]
-    async fn fetch_arrow_batch_round_trips_through_ipc_bridge() {
+    async fn fetch_arrow_batch_returns_workspace_arrow_batch() {
         use arrow::array::{Int32Array, StringArray};
         use arrow::datatypes::DataType;
 
