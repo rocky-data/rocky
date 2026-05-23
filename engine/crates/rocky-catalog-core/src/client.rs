@@ -86,6 +86,18 @@ pub trait CatalogClient: Send + Sync {
     /// compare-and-swap rejects the commit (a concurrent writer landed
     /// against the same base snapshot); the caller is then expected to
     /// re-read state and retry.
+    ///
+    /// Each [`TableCommit`] carries three optional widening fields on
+    /// top of the headline snapshot-advance pair:
+    /// [`TableCommit::branch`] selects a non-default ref (defaults to
+    /// `"main"`); [`TableCommit::extra_requirements`] and
+    /// [`TableCommit::extra_updates`] append Iceberg-spec
+    /// `commit-table-update` JSON entries (e.g. `add-schema`,
+    /// `add-partition-spec`, `set-default-spec`) onto the wire payload.
+    /// Adapters that do not natively speak the Iceberg update set MAY
+    /// surface `commit_transaction` as
+    /// [`crate::CatalogError::UnsupportedOperation`] regardless of
+    /// whether the extra payload is populated.
     async fn commit_transaction(&self, commits: &[TableCommit]) -> CatalogResult<()>;
 
     // ---------------------------------------------------------------------
