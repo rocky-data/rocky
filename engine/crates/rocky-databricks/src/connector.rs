@@ -1,6 +1,8 @@
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
@@ -55,6 +57,20 @@ pub enum ConnectorError {
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+
+    /// The statement returned no Arrow chunks. Surfaces from
+    /// [`DatabricksConnector::execute_sql_arrow`] when the warehouse
+    /// produced no result payload (e.g. DDL routed through the Arrow
+    /// path) — the trait method `fetch_arrow_batch` is documented as
+    /// returning a `RecordBatch`, so we surface this as an error
+    /// rather than synthesizing an empty schema.
+    #[error("statement {id} returned no Arrow chunks")]
+    NoArrowChunks { id: String },
+
+    /// Arrow IPC stream decode failure on a chunk. Wraps the
+    /// underlying `arrow::error::ArrowError` message.
+    #[error("Arrow IPC decode error: {0}")]
+    Arrow(String),
 }
 
 /// Configuration for the Databricks SQL connector.
@@ -109,6 +125,54 @@ struct SubmitRequest {
     format: String,
 }
 
+/// Result-payload shape requested from the Statement Execution API.
+///
+/// Databricks pairs `disposition` × `format` rigidly: `INLINE` only
+/// supports `JSON_ARRAY`, and `ARROW_STREAM` is only accepted with
+/// `EXTERNAL_LINKS`. We expose the two paths the connector uses.
+#[derive(Debug, Clone, Copy)]
+enum ResultFormat {
+    /// `disposition=INLINE, format=JSON_ARRAY` — the legacy path used by
+    /// every non-Arrow connector entry point. Result rows arrive in the
+    /// initial response body as a `data_array` of JSON cells.
+    InlineJson,
+    /// `disposition=EXTERNAL_LINKS, format=ARROW_STREAM` — used by
+    /// [`DatabricksConnector::execute_sql_arrow`]. The response carries
+    /// pre-signed URLs to chunked Arrow IPC stream files in cloud
+    /// storage (S3 / ADLS / GCS, depending on the workspace cloud).
+    ExternalArrow,
+}
+
+impl ResultFormat {
+    fn disposition(self) -> &'static str {
+        match self {
+            Self::InlineJson => "INLINE",
+            Self::ExternalArrow => "EXTERNAL_LINKS",
+        }
+    }
+
+    fn format(self) -> &'static str {
+        match self {
+            Self::InlineJson => "JSON_ARRAY",
+            Self::ExternalArrow => "ARROW_STREAM",
+        }
+    }
+}
+
+/// A pre-signed external link to one Arrow IPC stream chunk.
+///
+/// Databricks returns these on `disposition=EXTERNAL_LINKS` responses;
+/// the URL is a cloud-storage pre-signed GET that must NOT carry the
+/// Databricks Bearer token (the storage layer rejects it).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExternalLink {
+    pub chunk_index: u64,
+    pub row_offset: Option<u64>,
+    pub row_count: Option<u64>,
+    pub byte_count: Option<u64>,
+    pub external_link: String,
+}
+
 /// Response from the Databricks SQL Statement Execution API.
 #[derive(Debug, Deserialize)]
 pub struct StatementResponse {
@@ -144,6 +208,11 @@ pub struct Manifest {
     /// [`rocky_core::traits::ExecutionStats::bytes_scanned`] — see
     /// [`stats_from_response`] for the semantic-impurity note.
     pub total_byte_count: Option<u64>,
+    /// Total chunk count across the result set. Populated on
+    /// `disposition=EXTERNAL_LINKS` responses; `None` on the inline
+    /// JSON path where chunking does not apply.
+    #[serde(default)]
+    pub total_chunk_count: Option<u64>,
 }
 
 /// Column schema from a statement result manifest.
@@ -161,10 +230,29 @@ pub struct ColumnSchema {
     pub position: u32,
 }
 
-/// Inline result data from a SQL statement (JSON_ARRAY format).
+/// Inline result data from a SQL statement (JSON_ARRAY format) or the
+/// initial batch of pre-signed external-link descriptors
+/// (`ARROW_STREAM` / `EXTERNAL_LINKS`). Databricks populates exactly
+/// one of the two fields per response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResultData {
     pub data_array: Option<Vec<Vec<serde_json::Value>>>,
+    /// Initial batch of pre-signed URLs returned alongside the response
+    /// when `disposition=EXTERNAL_LINKS`. Holds at most the chunks
+    /// Databricks chose to inline in the submit/poll reply; remaining
+    /// chunks are pulled via `GET /api/2.0/sql/statements/{id}/result/chunks/{i}`.
+    #[serde(default)]
+    pub external_links: Option<Vec<ExternalLink>>,
+}
+
+/// Response from `GET /api/2.0/sql/statements/{id}/result/chunks/{chunk_index}`.
+///
+/// Used to walk the chunk listing forward when the initial submit/poll
+/// reply only returned a subset of `manifest.total_chunk_count` links.
+#[derive(Debug, Deserialize)]
+struct ChunkResponse {
+    #[serde(default)]
+    external_links: Vec<ExternalLink>,
 }
 
 /// The result of executing a SQL statement.
@@ -285,7 +373,149 @@ impl DatabricksConnector {
         Ok(stats_from_response(&response))
     }
 
+    /// Execute `sql` and return a single workspace
+    /// [`arrow::record_batch::RecordBatch`] for the full result set.
+    ///
+    /// Submits via `disposition=EXTERNAL_LINKS, format=ARROW_STREAM` —
+    /// Databricks rejects `disposition=INLINE` paired with
+    /// `format=ARROW_STREAM`, so EXTERNAL_LINKS is the only Arrow path.
+    /// The connector:
+    ///
+    /// 1. Submits the statement through the existing breaker + retry +
+    ///    span-attribute path (`submit_and_wait_with_format`).
+    /// 2. Walks `manifest.total_chunk_count` forward, paging through
+    ///    `GET /api/2.0/sql/statements/{id}/result/chunks/{i}` whenever
+    ///    Databricks did not inline every link in the initial reply.
+    /// 3. Fetches every chunk URL concurrently (cap: 4) — the URLs are
+    ///    pre-signed cloud-storage GETs that must NOT carry the
+    ///    Databricks Bearer token (the storage layer rejects it), so
+    ///    each chunk is fetched on the bare `reqwest::Client` without
+    ///    `.bearer_auth(...)`.
+    /// 4. Decodes each chunk via `arrow::ipc::reader::StreamReader` and
+    ///    concatenates the per-chunk `RecordBatch` slices into a single
+    ///    `RecordBatch` via `arrow::compute::concat_batches`.
+    ///
+    /// Backs [`crate::adapter::DatabricksWarehouseAdapter::fetch_arrow_batch`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectorError::NoArrowChunks`] when the statement succeeds
+    ///   but the warehouse returns no chunks (e.g. DDL accidentally
+    ///   routed through the Arrow path).
+    /// - [`ConnectorError::Arrow`] for IPC stream decode / concat
+    ///   failures.
+    /// - All transport / API / auth / retry-budget errors that the
+    ///   underlying submit-and-wait path can surface.
+    pub async fn execute_sql_arrow(&self, sql: &str) -> Result<RecordBatch, ConnectorError> {
+        let query_start = std::time::Instant::now();
+        let response = self
+            .submit_and_wait_with_format(sql, ResultFormat::ExternalArrow)
+            .await?;
+        rocky_observe::metrics::METRICS
+            .record_query_duration_ms(query_start.elapsed().as_millis() as u64);
+        rocky_observe::metrics::METRICS.inc_statements_executed();
+
+        let statement_id = response.statement_id.clone();
+        let total_chunk_count = response
+            .manifest
+            .as_ref()
+            .and_then(|m| m.total_chunk_count)
+            .unwrap_or(0);
+
+        // Gather every pre-signed URL. The submit/poll reply inlines the
+        // first batch on `result.external_links`; the rest, if any, are
+        // pulled via `GET .../result/chunks/{index}` until we've covered
+        // `manifest.total_chunk_count`.
+        let mut links: Vec<ExternalLink> = response
+            .result
+            .and_then(|r| r.external_links)
+            .unwrap_or_default();
+
+        if total_chunk_count == 0 || links.is_empty() {
+            return Err(ConnectorError::NoArrowChunks { id: statement_id });
+        }
+
+        let known_max = links.iter().map(|l| l.chunk_index).max().unwrap_or(0);
+        let mut next_chunk = known_max + 1;
+        while (links.len() as u64) < total_chunk_count {
+            let extra = self
+                .fetch_result_chunk_links(&statement_id, next_chunk)
+                .await?;
+            if extra.is_empty() {
+                // Server gave us no forward progress; bail to avoid
+                // looping. Mirrors the manifest-vs-links sanity check
+                // the Databricks SDK applies on this path.
+                return Err(ConnectorError::Arrow(format!(
+                    "statement {statement_id}: expected {total_chunk_count} chunks, \
+                     got {got} and the chunks endpoint returned no further links",
+                    got = links.len(),
+                )));
+            }
+            next_chunk = extra
+                .iter()
+                .map(|l| l.chunk_index)
+                .max()
+                .unwrap_or(next_chunk)
+                + 1;
+            links.extend(extra);
+        }
+
+        // Fetch every chunk in parallel (cap concurrency at 4 to avoid
+        // hammering the storage layer or the local socket pool).
+        let client = self.client.clone();
+        let chunk_bytes: Vec<bytes::Bytes> = stream::iter(links)
+            .map(|link| {
+                let client = client.clone();
+                async move { fetch_external_chunk(&client, &link).await }
+            })
+            .buffered(4)
+            .try_collect()
+            .await?;
+
+        decode_arrow_chunks(&statement_id, chunk_bytes)
+    }
+
+    /// Page through `GET /api/2.0/sql/statements/{id}/result/chunks/{chunk_index}`
+    /// to retrieve pre-signed URLs that Databricks did not inline on the
+    /// initial submit/poll reply. This call IS authenticated against
+    /// Databricks (unlike the chunk URLs themselves, which hit cloud
+    /// storage). No retry wrapping here — the parent `submit_and_wait`
+    /// already protected the submit/poll cycle.
+    async fn fetch_result_chunk_links(
+        &self,
+        statement_id: &str,
+        chunk_index: u64,
+    ) -> Result<Vec<ExternalLink>, ConnectorError> {
+        let token = self.auth.get_token().await?;
+        let url = format!(
+            "{}/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}",
+            self.api_base_url(),
+        );
+        let resp = self.client.get(&url).bearer_auth(&token).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ConnectorError::ApiError { status, body });
+        }
+        let body: ChunkResponse = resp.json().await?;
+        Ok(body.external_links)
+    }
+
     async fn submit_and_wait(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+        self.submit_and_wait_with_format(sql, ResultFormat::InlineJson)
+            .await
+    }
+
+    /// Run the submit/poll/retry path with a caller-chosen disposition × format.
+    ///
+    /// All existing JSON-row callers stay on `ResultFormat::InlineJson`
+    /// via [`Self::submit_and_wait`]; the Arrow path uses
+    /// `ResultFormat::ExternalArrow` to request pre-signed chunk URLs.
+    async fn submit_and_wait_with_format(
+        &self,
+        sql: &str,
+        result_format: ResultFormat,
+    ) -> Result<StatementResponse, ConnectorError> {
         // Span attribute schema unification: every adapter wraps its
         // retry-loop in a `statement.execute` span carrying the
         // canonical `rocky.*` keys so OTel collectors see consistent
@@ -309,10 +539,16 @@ impl DatabricksConnector {
             "rocky.warehouse.bytes_scanned" = field::Empty,
             "rocky.retry.attempt" = field::Empty,
         );
-        self.submit_and_wait_inner(sql).instrument(span).await
+        self.submit_and_wait_inner(sql, result_format)
+            .instrument(span)
+            .await
     }
 
-    async fn submit_and_wait_inner(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+    async fn submit_and_wait_inner(
+        &self,
+        sql: &str,
+        result_format: ResultFormat,
+    ) -> Result<StatementResponse, ConnectorError> {
         let retry = &self.config.retry;
 
         // Circuit breaker: fail fast if Open. When timed half-open
@@ -328,7 +564,7 @@ impl DatabricksConnector {
         }
 
         for attempt in 0..=retry.max_retries {
-            match self.submit_and_wait_once(sql).await {
+            match self.submit_and_wait_once(sql, result_format).await {
                 Ok(resp) => {
                     if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
                         let evt = PipelineEvent::new("circuit_breaker_recovered")
@@ -435,7 +671,11 @@ impl DatabricksConnector {
         unreachable!("retry loop should always return")
     }
 
-    async fn submit_and_wait_once(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+    async fn submit_and_wait_once(
+        &self,
+        sql: &str,
+        result_format: ResultFormat,
+    ) -> Result<StatementResponse, ConnectorError> {
         let token = self.auth.get_token().await?;
         let url = format!("{}/api/2.0/sql/statements", self.api_base_url());
 
@@ -445,8 +685,8 @@ impl DatabricksConnector {
             warehouse_id: self.config.warehouse_id.clone(),
             statement: sql.to_string(),
             wait_timeout: "30s".to_string(),
-            disposition: "INLINE".to_string(),
-            format: "JSON_ARRAY".to_string(),
+            disposition: result_format.disposition().to_string(),
+            format: result_format.format().to_string(),
         };
 
         let resp = self
@@ -610,6 +850,84 @@ impl DatabricksConnector {
     }
 }
 
+/// Fetch one chunk's Arrow IPC stream bytes from its pre-signed
+/// external URL. The URL is a cloud-storage pre-signed GET (S3 /
+/// Azure-blob / GCS, per the workspace cloud); it must NOT carry the
+/// Databricks Bearer token — the storage layer either ignores it
+/// (S3) or rejects the signature (Azure / GCS).
+async fn fetch_external_chunk(
+    client: &Client,
+    link: &ExternalLink,
+) -> Result<bytes::Bytes, ConnectorError> {
+    let resp = client.get(&link.external_link).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ConnectorError::ApiError { status, body });
+    }
+    Ok(resp.bytes().await?)
+}
+
+/// Decode a vector of Arrow IPC stream chunks (each one is a full
+/// self-describing stream starting with its own schema message) into a
+/// single concatenated [`RecordBatch`].
+///
+/// Each Databricks chunk is independently `StreamReader`-decodable —
+/// the schema is repeated at the head of every chunk, so we don't need
+/// to stitch chunk bodies together at the byte level. We collect every
+/// chunk's batches, then `concat_batches` against the first chunk's
+/// schema. An empty input is treated as `NoArrowChunks` (defensive —
+/// the caller already enforced this on the link list).
+fn decode_arrow_chunks(
+    statement_id: &str,
+    chunks: Vec<bytes::Bytes>,
+) -> Result<RecordBatch, ConnectorError> {
+    use arrow::ipc::reader::StreamReader;
+
+    if chunks.is_empty() {
+        return Err(ConnectorError::NoArrowChunks {
+            id: statement_id.to_string(),
+        });
+    }
+
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    let mut schema: Option<arrow::datatypes::SchemaRef> = None;
+
+    for (i, buf) in chunks.into_iter().enumerate() {
+        let cursor = std::io::Cursor::new(buf);
+        let reader = StreamReader::try_new(cursor, None).map_err(|e| {
+            ConnectorError::Arrow(format!(
+                "statement {statement_id}: chunk {i}: StreamReader::try_new: {e}"
+            ))
+        })?;
+        if schema.is_none() {
+            schema = Some(reader.schema());
+        }
+        for batch in reader {
+            let batch = batch.map_err(|e| {
+                ConnectorError::Arrow(format!(
+                    "statement {statement_id}: chunk {i}: stream batch: {e}"
+                ))
+            })?;
+            all_batches.push(batch);
+        }
+    }
+
+    let schema = schema.expect("schema set on first chunk");
+    if all_batches.is_empty() {
+        // Arrow-stream-with-zero-batches happens for 0-row results;
+        // synthesize an empty batch with the schema we read off the
+        // stream header rather than erroring (`SELECT * FROM t WHERE
+        // false` should round-trip with the right schema and 0 rows).
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    if all_batches.len() == 1 {
+        return Ok(all_batches.into_iter().next().expect("len==1"));
+    }
+    arrow::compute::concat_batches(&schema, all_batches.iter())
+        .map_err(|e| ConnectorError::Arrow(format!("statement {statement_id}: concat: {e}")))
+}
+
 fn is_terminal(state: &str) -> bool {
     matches!(state, "SUCCEEDED" | "FAILED" | "CANCELED" | "CLOSED")
 }
@@ -680,7 +998,9 @@ fn is_transient(err: &ConnectorError) -> bool {
         | ConnectorError::Canceled { .. }
         | ConnectorError::UnexpectedState { .. }
         | ConnectorError::CircuitBreakerOpen { .. }
-        | ConnectorError::RetryBudgetExhausted { .. } => false,
+        | ConnectorError::RetryBudgetExhausted { .. }
+        | ConnectorError::NoArrowChunks { .. }
+        | ConnectorError::Arrow(_) => false,
     }
 }
 
@@ -711,9 +1031,10 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
                 ErrorClass::Permanent
             }
         }
-        ConnectorError::Canceled { .. } | ConnectorError::UnexpectedState { .. } => {
-            ErrorClass::Permanent
-        }
+        ConnectorError::Canceled { .. }
+        | ConnectorError::UnexpectedState { .. }
+        | ConnectorError::NoArrowChunks { .. }
+        | ConnectorError::Arrow(_) => ErrorClass::Permanent,
     }
 }
 
@@ -1208,5 +1529,159 @@ mod tests {
             _ => None,
         };
         assert_eq!(size, None);
+    }
+
+    // ---- Arrow IPC stream decode + result-format wiring ----
+
+    #[test]
+    fn result_format_disposition_and_format_pairs() {
+        // Encode the disposition × format mapping the Databricks Statement
+        // Execution API enforces: `INLINE`+`JSON_ARRAY` and `EXTERNAL_LINKS`+
+        // `ARROW_STREAM`. Any drift here flips a request to a server-side
+        // `INVALID_PARAMETER_VALUE` we'd only see on the live test.
+        assert_eq!(ResultFormat::InlineJson.disposition(), "INLINE");
+        assert_eq!(ResultFormat::InlineJson.format(), "JSON_ARRAY");
+        assert_eq!(ResultFormat::ExternalArrow.disposition(), "EXTERNAL_LINKS");
+        assert_eq!(ResultFormat::ExternalArrow.format(), "ARROW_STREAM");
+    }
+
+    #[test]
+    fn manifest_with_external_links_deserializes_chunks() {
+        // Shape captured from the live sandbox — confirms we walk the
+        // initial reply's `result.external_links` + `manifest.chunks`
+        // without serde drift.
+        let json = r#"{
+            "statement_id": "id-arrow",
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "total_row_count": 1,
+                "total_byte_count": 456,
+                "total_chunk_count": 1
+            },
+            "result": {
+                "external_links": [
+                    {
+                        "chunk_index": 0,
+                        "row_offset": 0,
+                        "row_count": 1,
+                        "byte_count": 456,
+                        "external_link": "https://example.test/chunk0"
+                    }
+                ]
+            }
+        }"#;
+        let resp: StatementResponse = serde_json::from_str(json).unwrap();
+        let manifest = resp.manifest.unwrap();
+        assert_eq!(manifest.total_chunk_count, Some(1));
+        let links = resp.result.unwrap().external_links.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].chunk_index, 0);
+        assert_eq!(links[0].external_link, "https://example.test/chunk0");
+    }
+
+    /// Round-trip a known Arrow batch through the IPC stream writer and
+    /// back through `decode_arrow_chunks`. Single-chunk fast path —
+    /// the multi-chunk `concat_batches` path is exercised by the
+    /// next test.
+    #[test]
+    fn decode_arrow_chunks_round_trip_single_chunk() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["foo"])),
+            ],
+        )
+        .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+
+        let decoded = decode_arrow_chunks("test", vec![bytes::Bytes::from(buf)]).unwrap();
+        assert_eq!(decoded.num_rows(), 1);
+        assert_eq!(decoded.schema().fields().len(), 2);
+        assert_eq!(decoded.schema().field(0).name(), "n");
+        assert_eq!(decoded.schema().field(1).name(), "s");
+    }
+
+    #[test]
+    fn decode_arrow_chunks_concatenates_multiple_chunks() {
+        // Two chunks, each a self-describing IPC stream (schema is
+        // repeated at the head) — `decode_arrow_chunks` should
+        // concatenate them into a single `RecordBatch`. Mirrors the
+        // Databricks `EXTERNAL_LINKS` shape where every chunk URL
+        // resolves to an independently-decodable stream.
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let make_chunk = |vals: Vec<i32>| -> bytes::Bytes {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vals)) as _])
+                    .unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            }
+            bytes::Bytes::from(buf)
+        };
+
+        let chunks = vec![make_chunk(vec![1, 2]), make_chunk(vec![3, 4, 5])];
+        let decoded = decode_arrow_chunks("test", chunks).unwrap();
+        assert_eq!(decoded.num_rows(), 5);
+        let n = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..n.len()).map(|i| n.value(i)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn decode_arrow_chunks_empty_input_returns_no_arrow_chunks() {
+        let err = decode_arrow_chunks("id-empty", vec![]).unwrap_err();
+        assert!(
+            matches!(err, ConnectorError::NoArrowChunks { ref id } if id == "id-empty"),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn arrow_and_no_arrow_chunks_errors_are_not_transient() {
+        // Both Arrow-path-specific errors are terminal — the retry
+        // loop must not loop on them.
+        let arrow_err = ConnectorError::Arrow("schema mismatch".into());
+        assert!(!is_transient(&arrow_err));
+        assert!(matches!(classify_error(&arrow_err), ErrorClass::Permanent));
+
+        let no_chunks_err = ConnectorError::NoArrowChunks { id: "id-x".into() };
+        assert!(!is_transient(&no_chunks_err));
+        assert!(matches!(
+            classify_error(&no_chunks_err),
+            ErrorClass::Permanent
+        ));
     }
 }

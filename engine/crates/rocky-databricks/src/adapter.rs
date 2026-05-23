@@ -168,6 +168,23 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         })
     }
 
+    /// Override the default `Err(...)` impl from
+    /// [`WarehouseAdapter::fetch_arrow_batch`] with the real
+    /// `disposition=EXTERNAL_LINKS, format=ARROW_STREAM` path through
+    /// [`DatabricksConnector::execute_sql_arrow`]. Databricks rejects
+    /// `disposition=INLINE` paired with `format=ARROW_STREAM`, so
+    /// EXTERNAL_LINKS is the only path — the connector handles the
+    /// chunk-pagination + concurrent fetch + IPC decode internally.
+    async fn fetch_arrow_batch(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<arrow::record_batch::RecordBatch> {
+        self.connector
+            .execute_sql_arrow(sql)
+            .await
+            .map_err(AdapterError::new)
+    }
+
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
         // Try the Unity REST path first when a catalog client is wired —
         // `GET /api/2.1/unity-catalog/tables/{full_name}` returns the column

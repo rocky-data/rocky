@@ -3863,8 +3863,11 @@ dependencies = [
 name = "rocky-databricks"
 version = "1.42.0"
 dependencies = [
+ "arrow",
  "async-trait",
+ "bytes",
  "chrono",
+ "futures",
  "percent-encoding",
  "reqwest",
  "rocky-adapter-sdk",

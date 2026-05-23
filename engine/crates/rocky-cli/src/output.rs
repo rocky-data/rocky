@@ -476,6 +476,14 @@ impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
             // transient error.
             E::CircuitBreakerOpen { .. } => FailureKind::QuotaExceeded,
             E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
+            // Arrow-disposition path failures from `execute_sql_arrow`.
+            // The statement landed but the result payload was either
+            // empty (no chunks where we expected some) or undecodable
+            // (IPC parse / `concat_batches` mismatch). Both are
+            // adapter-side defects we can't retry past, so classify
+            // as `QueryRejected` (the closest "warehouse handed back
+            // something we can't use" bucket).
+            E::NoArrowChunks { .. } | E::Arrow(_) => FailureKind::QueryRejected,
         }
     }
 }
