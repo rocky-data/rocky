@@ -18,6 +18,7 @@ use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::auth::BigQueryAuth;
 use crate::dialect::BigQueryDialect;
+use crate::storage_read::{StorageReadError, StorageTableRef, fetch_arrow_record_batch};
 
 #[derive(Debug, Error)]
 pub enum BigQueryError {
@@ -32,6 +33,9 @@ pub enum BigQueryError {
 
     #[error("query timed out after {timeout_secs}s")]
     Timeout { timeout_secs: u64 },
+
+    #[error("Storage Read API error: {0}")]
+    StorageRead(#[from] StorageReadError),
 }
 
 /// BigQuery warehouse adapter.
@@ -301,6 +305,116 @@ impl BigQueryAdapter {
     }
 
     /// Fetch the full `Job` resource for a completed job ID and return
+    /// its `configuration.query.destinationTable` reference.
+    ///
+    /// Every non-DDL `jobs.query` job lands its result rows in an
+    /// anonymous temporary table BigQuery creates under
+    /// `<project>:_<hash>.<table>`. The reference comes back on
+    /// `jobs.get` under `configuration.query.destinationTable`; we use
+    /// it as the input to the Storage Read API's `CreateReadSession`
+    /// call for the Arrow path.
+    ///
+    /// Anonymous result tables auto-expire after ~24h, so there's no
+    /// cleanup tax on the caller.
+    async fn fetch_destination_table(
+        &self,
+        job_ref: &JobReference,
+    ) -> Result<JobDestinationTable, BigQueryError> {
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/jobs/{}",
+            self.project_id, job_ref.job_id
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("location", self.location.as_str())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().to_string();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BigQueryError::ApiError {
+                status,
+                message: body,
+            });
+        }
+
+        #[derive(Deserialize)]
+        struct JobGetResponse {
+            configuration: Option<JobConfiguration>,
+        }
+        #[derive(Deserialize)]
+        struct JobConfiguration {
+            query: Option<JobQueryConfig>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct JobQueryConfig {
+            destination_table: Option<JobDestinationTable>,
+        }
+
+        let job: JobGetResponse = resp.json().await?;
+        job.configuration
+            .and_then(|c| c.query)
+            .and_then(|q| q.destination_table)
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing destinationTable".into(),
+                message: format!(
+                    "jobs.get response for job '{}' had no configuration.query.destinationTable; \
+                     the query may be DDL-only or the job may not be a query job",
+                    job_ref.job_id
+                ),
+            })
+    }
+
+    /// Execute `sql` and return its result as a single workspace
+    /// `arrow 58` `RecordBatch` via the BigQuery Storage Read API.
+    ///
+    /// Two-step:
+    ///   1. `jobs.query` runs the SQL synchronously / async (existing
+    ///      polling-loop path). The response carries the `jobReference`
+    ///      we need to look up the anonymous destination table.
+    ///   2. `jobs.get` resolves
+    ///      `configuration.query.destinationTable` → `(project,
+    ///      dataset, table)`. We pass that handle to
+    ///      `storage_read::fetch_arrow_record_batch`, which opens a
+    ///      one-stream Arrow read session and streams Arrow IPC bytes
+    ///      back over gRPC.
+    ///
+    /// The Storage Read API uses the same OAuth scope as the REST API
+    /// (`https://www.googleapis.com/auth/bigquery`), so the existing
+    /// `BigQueryAuth` cache covers both transports.
+    async fn fetch_arrow_via_storage_read(
+        &self,
+        sql: &str,
+    ) -> Result<arrow::record_batch::RecordBatch, BigQueryError> {
+        let response = self.run_query(sql).await?;
+        let job_ref = response
+            .job_reference
+            .as_ref()
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message:
+                    "jobs.query response had no jobReference; cannot resolve destination table"
+                        .into(),
+            })?;
+        let dest = self.fetch_destination_table(job_ref).await?;
+        let table_ref = StorageTableRef {
+            project: &dest.project_id,
+            dataset: &dest.dataset_id,
+            table: &dest.table_id,
+        };
+        let batch =
+            fetch_arrow_record_batch(&self.auth, &self.client, &self.project_id, &table_ref, &[])
+                .await?;
+        Ok(batch)
+    }
+
+    /// Fetch the full `Job` resource for a completed job ID and return
     /// just its `statistics` block.
     ///
     /// The synchronous `jobs.query` and `jobs.getQueryResults` endpoints
@@ -428,6 +542,20 @@ impl WarehouseAdapter for BigQueryAdapter {
             .collect();
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Arrow path via the BigQuery Storage Read API (gRPC). Overrides
+    /// the default `Err(...)` impl on `WarehouseAdapter`. See
+    /// [`BigQueryAdapter::fetch_arrow_via_storage_read`] for the
+    /// two-hop flow (`jobs.query` → `jobs.get` for destination table →
+    /// `CreateReadSession` + `ReadRows` over gRPC).
+    async fn fetch_arrow_batch(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<arrow::record_batch::RecordBatch> {
+        self.fetch_arrow_via_storage_read(sql)
+            .await
+            .map_err(AdapterError::new)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -863,6 +991,22 @@ struct JobReference {
     #[allow(dead_code)]
     project_id: String,
     job_id: String,
+}
+
+/// `configuration.query.destinationTable` shape from `jobs.get`.
+///
+/// For a non-DDL `jobs.query` job, BigQuery silently materializes the
+/// result rows in an anonymous table named under `<project>:_<hash>`
+/// and returns that table reference here. The Storage Read API's
+/// `CreateReadSession.read_session.table` accepts the same
+/// `projects/<project>/datasets/<dataset>/tables/<table>` form built
+/// from these three fields.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobDestinationTable {
+    project_id: String,
+    dataset_id: String,
+    table_id: String,
 }
 
 #[derive(Debug, Deserialize)]

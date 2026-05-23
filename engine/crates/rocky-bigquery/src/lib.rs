@@ -12,8 +12,10 @@ pub mod dialect;
 pub mod discovery;
 pub mod governance;
 pub mod loader;
+pub mod storage_read;
 
 pub use connector::BigQueryAdapter;
 pub use dialect::BigQueryDialect;
 pub use discovery::BigQueryDiscoveryAdapter;
 pub use loader::BigQueryLoaderAdapter;
+pub use storage_read::{StorageReadError, StorageTableRef};
