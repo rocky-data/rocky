@@ -17,9 +17,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use salsa::Setter;
 use sqlparser::ast::{self, SetExpr, Statement};
 use sqlparser::parser::Parser;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -27,6 +28,7 @@ use tracing::info;
 
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
 use rocky_compiler::typecheck::RefLocation;
+use rocky_lang::incremental::{RockyDatabase, SourceFile, read_source};
 
 use crate::schema_cache_throttle::SchemaCacheThrottle;
 
@@ -362,6 +364,24 @@ pub struct RockyLsp {
     /// session per `models_dir` rather than per keystroke. See
     /// `schema_cache_throttle.rs`.
     schema_cache_throttle: SchemaCacheThrottle,
+    /// Salsa database for incremental DSL parsing — backs `didOpen` /
+    /// `didChange` so a parsed `RockyFile` is memoized across keystrokes
+    /// and only re-runs when the buffer text actually changes.
+    ///
+    /// Wrapped in [`tokio::sync::Mutex`] (not `RwLock`) because every
+    /// touch point on the salsa side — `read_source`, `SourceFile::set_text`,
+    /// even the `db.files` dedup map — needs `&mut RockyDatabase`. The
+    /// `parse_file` tracked query only needs `&dyn salsa::Database`,
+    /// which the `&mut` guard satisfies, so we don't lose any concurrency
+    /// vs. an `RwLock` we'd never read-lock anyway.
+    salsa_db: Arc<Mutex<RockyDatabase>>,
+    /// LSP-side URI → `SourceFile` map. The salsa db keeps its own
+    /// canonical-path dedup map, but it's private to `rocky-lang`; the
+    /// LSP also needs to bridge `tower_lsp::Url` to the salsa input
+    /// handle on every `didChange`, which this side-map makes O(1).
+    /// Populated in `did_open` (after `read_source` succeeds) and
+    /// `did_change`; survives `did_close` (cached for re-open).
+    salsa_sources: Arc<RwLock<HashMap<Url, SourceFile>>>,
 }
 
 impl RockyLsp {
@@ -442,6 +462,18 @@ impl RockyLsp {
     /// only on a compile-pipeline failure — the compiler's own diagnostic
     /// stream is empty in that case because the project loader bails on
     /// the first parse error before any `Diagnostic` is produced.
+    ///
+    /// If the file already has a `SourceFile` in the salsa db (i.e. the
+    /// editor has opened it and we've been receiving `didChange`
+    /// notifications), the parse runs through the memoized
+    /// [`parse_file`](rocky_lang::incremental::parse_file) tracked query
+    /// against the live editor buffer — no disk read, and the result
+    /// stays cached for the next compile-pipeline failure that re-enters
+    /// this function. Files that have never been opened in the editor
+    /// fall back to the original `read_to_string` + `rocky_lang::parse`
+    /// path so cold-start projects (compile triggered before any
+    /// `didOpen`) still surface E028 for syntactically-broken `.rocky`
+    /// files.
     async fn publish_dsl_parse_diagnostics(&self, models_dir: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(models_dir) else {
             return;
@@ -451,17 +483,60 @@ impl RockyLsp {
             if path.extension().and_then(|s| s.to_str()) != Some("rocky") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(uri) = Url::from_file_path(&path) else {
                 continue;
             };
+
+            // Salsa fast path: editor-opened file → use the buffer that
+            // backs the IDE's current view (not stale disk content) and
+            // memoize the parse so a series of compile failures during
+            // an active edit doesn't re-parse the same broken file on
+            // every keystroke.
+            let salsa_source = self.salsa_sources.read().await.get(&uri).copied();
+            let (content, parse_outcome) = if let Some(source) = salsa_source {
+                let db = self.salsa_db.lock().await;
+                let text = source.text(&*db).clone();
+                let outcome = rocky_lang::incremental::parse_file(&*db, source);
+                drop(db);
+                (
+                    text,
+                    outcome.map(|_| ()).map_err(|err_arc| (*err_arc).clone()),
+                )
+            } else {
+                // Cold-start fallback: file not in salsa db yet (no
+                // `didOpen` seen). Match the legacy behaviour and re-read
+                // from disk; the parse runs through the original
+                // `rocky_lang::parse` because we don't have a salsa
+                // input to hang the memoization off.
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let outcome = match rocky_lang::parse(&content) {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err.to_string()),
+                };
+                (content, outcome)
+            };
+
+            // No parse failure → no synthetic diagnostic to emit. The
+            // compile pipeline that called us is the source of truth
+            // for non-parse diagnostics.
+            if parse_outcome.is_ok() {
+                continue;
+            }
+
+            // Re-parse just for span info — the salsa cache hit above
+            // returns a stringified error (incremental.rs maps the
+            // `ParseError` through `to_string` because `salsa::Update`
+            // values need `Clone`). The structured `ParseError` is what
+            // `lsp_range_from_parse_error` needs to compute a real
+            // squiggle range. Parsing the same content a second time
+            // here only fires on the error path (rare; bounded by the
+            // number of broken .rocky files in the project).
             let Err(parse_err) = rocky_lang::parse(&content) else {
                 continue;
             };
             let (range, message) = lsp_range_from_parse_error(&parse_err, &content);
-
-            let Ok(uri) = Url::from_file_path(&path) else {
-                continue;
-            };
             let diag = Diagnostic {
                 range,
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -823,6 +898,68 @@ fn delta_encode_semantic_tokens(tokens: &[(u32, u32, u32, u32)]) -> Vec<Semantic
     data
 }
 
+/// Failure modes for [`seed_salsa_source`] — surfaced to the LSP handler
+/// so it can choose between "drop silently" (non-file URI) and "surface
+/// as a diagnostic" (disk read failure).
+#[derive(Debug, thiserror::Error)]
+enum SeedSalsaError {
+    /// The URI doesn't use the `file:` scheme — `to_file_path()`
+    /// returned `Err`. The LSP spec permits `untitled:`, `vscode-remote:`,
+    /// and other schemes; salsa wiring is only meaningful for on-disk
+    /// files because [`read_source`] dedupes by canonical path.
+    #[error("non-file URI; salsa wiring skipped")]
+    NonFileUri,
+    /// [`read_source`] failed (file missing, unreadable, etc.). The
+    /// salsa db is **not** mutated on this path.
+    #[error("read_source failed: {0}")]
+    ReadSource(#[from] rocky_lang::incremental::ReadSourceError),
+}
+
+/// Bridge an LSP buffer (`uri` + `text`) into the salsa `RockyDatabase`.
+///
+/// Used by both `did_open` (cold-start: never seen this URI) and
+/// `did_change` (warm path: URI already mapped). On the first call for
+/// a given URI the helper looks up an existing [`SourceFile`] in
+/// `sources`; if absent, it calls [`read_source`] to seed disk content
+/// and inserts the resulting handle into `sources`. On every call it
+/// then calls [`SourceFile::set_text`] with the editor buffer to bump
+/// the salsa revision — except when the existing text already matches
+/// (e.g. `did_open` immediately after `read_source` on a clean buffer
+/// that matches disk), in which case the `set_text` is skipped so
+/// salsa's backdating optimization sees an unchanged revision.
+///
+/// `&self` LSP handlers thread the two Arc fields in directly; the
+/// signature here is structured so the tests can drive the same code
+/// path without constructing a `tower_lsp::Client`.
+async fn seed_salsa_source(
+    salsa_db: &Arc<Mutex<RockyDatabase>>,
+    salsa_sources: &Arc<RwLock<HashMap<Url, SourceFile>>>,
+    uri: &Url,
+    text: &str,
+) -> std::result::Result<SourceFile, SeedSalsaError> {
+    let path = uri
+        .to_file_path()
+        .map_err(|()| SeedSalsaError::NonFileUri)?;
+
+    let existing = salsa_sources.read().await.get(uri).copied();
+    let source = match existing {
+        Some(s) => s,
+        None => {
+            let mut db = salsa_db.lock().await;
+            let s = read_source(&mut db, path)?;
+            drop(db);
+            salsa_sources.write().await.insert(uri.clone(), s);
+            s
+        }
+    };
+
+    let mut db = salsa_db.lock().await;
+    if source.text(&*db) != text {
+        source.set_text(&mut *db).to(text.to_string());
+    }
+    Ok(source)
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for RockyLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -915,14 +1052,93 @@ impl LanguageServer for RockyLsp {
         self.recompile().await;
     }
 
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        let text = params.text_document.text;
+        let uri_string = uri.to_string();
+
+        // Same defensive size cap as `did_change` — a malicious or buggy
+        // client could otherwise OOM the LSP with a single notification.
+        if text.len() > MAX_DOCUMENT_BYTES {
+            tracing::warn!(
+                uri = %uri_string,
+                bytes = text.len(),
+                limit = MAX_DOCUMENT_BYTES,
+                "did_open text exceeds size limit; dropping update",
+            );
+            return;
+        }
+
+        // Mirror the existing document store so completion / hover /
+        // formatting handlers (which key off `self.documents`) see the
+        // buffer immediately, regardless of whether the salsa wiring
+        // below succeeds.
+        self.documents
+            .write()
+            .await
+            .insert(uri_string.clone(), text.clone());
+
+        if let Err(err) = seed_salsa_source(&self.salsa_db, &self.salsa_sources, &uri, &text).await
+        {
+            // Surface as an LSP diagnostic — silently dropping would
+            // leave the editor with no signal that the file
+            // couldn't be loaded (e.g. permissions, broken
+            // canonicalize). Salsa wiring is best-effort, so the
+            // rest of the LSP keeps working off `self.documents`.
+            match err {
+                SeedSalsaError::NonFileUri => {
+                    tracing::debug!(
+                        uri = %uri_string,
+                        "did_open: skipping salsa wiring for non-file URI",
+                    );
+                }
+                SeedSalsaError::ReadSource(read_err) => {
+                    let diag = Diagnostic {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        code: Some(NumberOrString::String("rocky::read_source".to_string())),
+                        source: Some("rocky".to_string()),
+                        message: format!(
+                            "failed to load source into incremental cache: {read_err}; \
+                             falling back to non-memoized parse",
+                        ),
+                        ..Default::default()
+                    };
+                    self.client
+                        .publish_diagnostics(uri.clone(), vec![diag], None)
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn did_close(&self, _params: DidCloseTextDocumentParams) {
+        // Intentionally do NOT evict the salsa `SourceFile` or the
+        // `self.documents` cache. Re-opening the same file is the
+        // common case for a re-launched editor session, and keeping
+        // the entry means `parse_file` stays warm across the close /
+        // re-open round-trip. The salsa storage cost is one
+        // memoized `Arc<RockyFile>` per file — bounded by the
+        // workspace size, not by editing churn.
+    }
+
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri_string = params.text_document.uri.to_string();
-        let changed_file = params.text_document.uri.to_file_path().ok();
+        let uri = params.text_document.uri.clone();
+        let uri_string = uri.to_string();
+        let changed_file = uri.to_file_path().ok();
         // P3.2 buffer-hash short-circuit: if the incoming text is identical
         // to what's already cached for this URI, skip the document update
         // *and* the debounced recompile scheduling. Catches cursor-only
         // edits and undo→redo sequences where the editor replays
         // `didChange` with unchanged content.
+        //
+        // `rocky-server` only advertises `TextDocumentSyncKind::FULL`,
+        // so every `params.content_changes` entry carries the entire
+        // buffer text — no range-patching required. If the sync kind
+        // is ever flipped to `INCREMENTAL`, this branch and the salsa
+        // `set_text` below would need to fold patches into a buffer
+        // first; that's a separate PR.
+        let mut new_text: Option<String> = None;
         if let Some(change) = params.content_changes.into_iter().last() {
             // Refuse to cache pathologically large documents. tower-lsp
             // does not bound JSON-RPC payload size, so a buggy or
@@ -946,7 +1162,8 @@ impl LanguageServer for RockyLsp {
             if unchanged {
                 return;
             }
-            docs.insert(uri_string.clone(), change.text);
+            docs.insert(uri_string.clone(), change.text.clone());
+            new_text = Some(change.text);
         }
 
         // §P3.4: drop the stale semantic-token cache entry for this URI
@@ -954,6 +1171,24 @@ impl LanguageServer for RockyLsp {
         // updated SQL. (The content-hash gate would catch stale entries
         // anyway, but evicting now keeps the cache tight.)
         self.semantic_tokens_cache.write().await.remove(&uri_string);
+
+        // Bump the salsa input revision so the next `parse_file` for
+        // this URI re-parses. Sits AFTER the buffer-hash short-circuit
+        // so cursor-only "edits" (where the editor replays `didChange`
+        // with unchanged text) don't churn the cache. If `did_open`
+        // was never received for this URI (e.g. tests that drive
+        // `did_change` directly), the helper falls back to
+        // `read_source` so the input still gets seeded.
+        if let Some(text) = new_text {
+            if let Err(err) =
+                seed_salsa_source(&self.salsa_db, &self.salsa_sources, &uri, &text).await
+            {
+                tracing::debug!(
+                    uri = %uri_string,
+                    "did_change: salsa update skipped ({err})",
+                );
+            }
+        }
 
         if !self.recompile_pending.swap(true, Ordering::SeqCst) {
             let client = self.client.clone();
@@ -3914,6 +4149,8 @@ pub async fn run_lsp() {
         init_notify: Arc::new(Notify::new()),
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
         schema_cache_throttle: SchemaCacheThrottle::new(),
+        salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+        salsa_sources: Arc::new(RwLock::new(HashMap::new())),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -5236,5 +5473,179 @@ mod tests {
             "expected non-zero span for a broken token on line 1, got {range:?}"
         );
         assert!(!message.is_empty(), "diagnostic message must be non-empty");
+    }
+
+    // ── Salsa LSP bridge ───────────────────────────────────────────────────
+    //
+    // These tests drive `seed_salsa_source` directly — the same helper
+    // both `did_open` and `did_change` route into. We don't construct a
+    // `tower_lsp::Client` (it requires a live JSON-RPC socket), so the
+    // test surface is the helper plus `parse_file`, exactly the path
+    // the LSP handler exercises. The invariants pinned mirror the
+    // memoization receipts in `rocky-lang/src/incremental.rs`, but
+    // anchored on the LSP-side wiring.
+
+    /// `did_open → parse_file → parse_file` (no `did_change` in
+    /// between): the second `parse_file` must return the same
+    /// `Arc<RockyFile>` instance — salsa serves from cache because the
+    /// input revision is unchanged.
+    #[tokio::test]
+    async fn lsp_did_open_then_parse_memoizes() {
+        use std::fs;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("model.rocky");
+        // The disk file is what `read_source` initially canonicalizes
+        // and reads; `seed_salsa_source` then immediately overwrites it
+        // with the editor buffer below.
+        fs::write(&path, "from orders").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+
+        let salsa_db = Arc::new(Mutex::new(RockyDatabase::default()));
+        let salsa_sources = Arc::new(RwLock::new(HashMap::new()));
+
+        // `did_open` shape: editor buffer matches disk, so `set_text`
+        // is a no-op (helper compares text first). Either way, the
+        // salsa input is populated.
+        seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from orders")
+            .await
+            .expect("did_open seed must succeed");
+
+        // Two consecutive `parse_file` calls with no intervening
+        // mutation: the second is a salsa cache hit, so the returned
+        // `Arc<RockyFile>` is identical to the first.
+        let source = *salsa_sources.read().await.get(&uri).unwrap();
+        let first = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).expect("first parse must succeed")
+        };
+        let second = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).expect("second parse must succeed")
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second parse must return the cached Arc — memoization receipt for did_open path",
+        );
+    }
+
+    /// `did_open → parse_file → did_change(new text) → parse_file`:
+    /// the post-change parse must produce a *different* `Arc` because
+    /// `set_text` bumped the input revision and salsa re-ran the
+    /// `parse_file` tracked query.
+    #[tokio::test]
+    async fn lsp_did_change_invalidates_salsa_cache() {
+        use std::fs;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("model.rocky");
+        fs::write(&path, "from orders").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+
+        let salsa_db = Arc::new(Mutex::new(RockyDatabase::default()));
+        let salsa_sources = Arc::new(RwLock::new(HashMap::new()));
+
+        // did_open
+        seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from orders")
+            .await
+            .unwrap();
+        let source = *salsa_sources.read().await.get(&uri).unwrap();
+        let before = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).unwrap()
+        };
+
+        // did_change with new text
+        seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from users")
+            .await
+            .unwrap();
+
+        let after = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).unwrap()
+        };
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "did_change must invalidate the cache; expected a fresh Arc<RockyFile> from parse_file \
+             after `set_text` bumped the salsa revision",
+        );
+    }
+
+    /// `seed_salsa_source` replayed with identical text must NOT bump
+    /// the salsa revision — the helper's `source.text(&db) != text`
+    /// gate skips the `set_text` call when the buffer matches. The
+    /// `did_change` handler also short-circuits earlier via its own
+    /// buffer-hash check, but this test pins the helper's backstop so
+    /// any future caller (range-sync path, file-watcher, etc.) that
+    /// bypasses the LSP-level gate still doesn't churn the salsa cache.
+    #[tokio::test]
+    async fn lsp_seed_salsa_source_identical_text_is_idempotent() {
+        use std::fs;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("model.rocky");
+        fs::write(&path, "from orders").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+
+        let salsa_db = Arc::new(Mutex::new(RockyDatabase::default()));
+        let salsa_sources = Arc::new(RwLock::new(HashMap::new()));
+
+        // did_open
+        seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from orders")
+            .await
+            .unwrap();
+        let source = *salsa_sources.read().await.get(&uri).unwrap();
+        let before = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).unwrap()
+        };
+
+        // Simulate a replayed `did_change` with the same text — the
+        // LSP handler hits its buffer-hash short-circuit *and*
+        // `seed_salsa_source` skips `set_text` because the salsa input
+        // already matches.
+        seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from orders")
+            .await
+            .unwrap();
+
+        let after = {
+            let db = salsa_db.lock().await;
+            rocky_lang::incremental::parse_file(&*db, source).unwrap()
+        };
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "identical-text replay must NOT bump the salsa revision",
+        );
+    }
+
+    /// Non-`file:` URI (e.g. `untitled:` for an unsaved buffer) must
+    /// surface `SeedSalsaError::NonFileUri` — the LSP handler turns
+    /// this into a debug log, not a diagnostic, because such buffers
+    /// don't have an on-disk dedup key.
+    #[tokio::test]
+    async fn lsp_seed_salsa_skips_non_file_uri() {
+        use tokio::sync::Mutex;
+
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let salsa_db = Arc::new(Mutex::new(RockyDatabase::default()));
+        let salsa_sources = Arc::new(RwLock::new(HashMap::new()));
+
+        let err = seed_salsa_source(&salsa_db, &salsa_sources, &uri, "from orders")
+            .await
+            .expect_err("non-file URI must error");
+        assert!(
+            matches!(err, SeedSalsaError::NonFileUri),
+            "expected NonFileUri, got {err:?}",
+        );
+        assert!(
+            salsa_sources.read().await.is_empty(),
+            "failed seed must not populate the URI → SourceFile map",
+        );
     }
 }
