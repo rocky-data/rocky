@@ -193,6 +193,20 @@ opentelemetry_sdk = "0.31"
 opentelemetry-otlp = "0.31"
 tracing-opentelemetry = "0.32"
 
+# gRPC stack — used by `rocky-bigquery`'s Storage Read API impl of
+# `WarehouseAdapter::fetch_arrow_batch`. `tonic` 0.14 + `prost` 0.14
+# already appear transitively in the lock graph via opentelemetry-otlp;
+# declaring them at workspace scope lets future adapters reuse the
+# exact pinned majors instead of accidentally pulling a second copy.
+# `tls-aws-lc` + `tls-webpki-roots` align with the reqwest `rustls-tls`
+# + jsonwebtoken `aws_lc_rs` stack already in the workspace.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "transport", "tls-aws-lc", "tls-webpki-roots"] }
+prost = "0.14"
+# Auto-generated tonic client for the BigQuery Storage Read API
+# (`google.cloud.bigquery.storage.v1`). Tracks the workspace tonic +
+# prost majors exactly.
+googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.33"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

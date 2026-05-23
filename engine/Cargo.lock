@@ -1711,6 +1711,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "googleapis-tonic-google-api"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4411485f14b532ed4a23fa143a355e9ff148def1727c18d262eceb0ceccea90"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "googleapis-tonic-google-cloud-bigquery-storage-v1"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee577ff55e3d3ca1bbb4720ea0036ca2b4d1cc9b3d0cf76264d6979305743b48"
+dependencies = [
+ "googleapis-tonic-google-api",
+ "googleapis-tonic-google-rpc",
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "googleapis-tonic-google-rpc"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f48f43a381f9a1b6dab85d87635a255602a516a2d691fa372c5bb340a3659d6"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3176,6 +3214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-types"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "psm"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3699,10 +3746,15 @@ dependencies = [
 name = "rocky-bigquery"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
+ "futures",
+ "googleapis-tonic-google-cloud-bigquery-storage-v1",
  "jsonwebtoken",
+ "prost",
  "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
@@ -3713,6 +3765,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
 ]
 
@@ -4219,6 +4272,8 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4264,6 +4319,7 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted 0.9.0",
@@ -5116,6 +5172,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -5124,13 +5181,16 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

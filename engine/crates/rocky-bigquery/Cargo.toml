@@ -23,6 +23,18 @@ tracing = { workspace = true }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 
+# Arrow path — `WarehouseAdapter::fetch_arrow_batch` returns workspace
+# `arrow 58` `RecordBatch`. The BigQuery Storage Read API hands back
+# Arrow IPC schema + record-batch messages over gRPC; we splice the
+# schema bytes onto each batch and feed them through
+# `arrow::ipc::reader::StreamReader` to land back on workspace types.
+arrow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+googleapis-tonic-google-cloud-bigquery-storage-v1 = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 

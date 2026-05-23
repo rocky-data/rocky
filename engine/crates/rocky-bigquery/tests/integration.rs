@@ -600,3 +600,68 @@ async fn test_pipeline_level_cost_attribution_matches_jobs_get() {
         rel_diff * 100.0,
     );
 }
+
+/// Verifies the Arrow Storage Read path on `WarehouseAdapter::fetch_arrow_batch`.
+///
+/// Mirrors the rocky-duckdb conformance test (PR #631): runs
+/// `SELECT 1 AS n, 'foo' AS s`, asserts a 1-row / 2-column workspace
+/// `arrow 58` `RecordBatch` with column types `Int64` (BigQuery's
+/// canonical signed integer width) and `Utf8`. The two-hop flow under
+/// test:
+///   1. `jobs.query` runs the SELECT.
+///   2. `jobs.get` resolves the anonymous destination table.
+///   3. Storage Read API `CreateReadSession` + `ReadRows` over gRPC
+///      streams Arrow IPC bytes back.
+///
+/// Caller IAM requires `bigquery.readSessions.create` on
+/// `BIGQUERY_TEST_PROJECT` in addition to the usual `dataEditor` +
+/// `jobUser` grants (the bundled `BigQuery Read Session User` role
+/// supplies it).
+///
+/// Run with:
+///   `cargo test -p rocky-bigquery --test integration -- --ignored \
+///    fetch_arrow_batch_returns_workspace_arrow_batch`
+#[tokio::test]
+#[ignore]
+async fn fetch_arrow_batch_returns_workspace_arrow_batch() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    let adapter = adapter_from_env().expect("BigQuery env vars not set");
+
+    let batch = adapter
+        .fetch_arrow_batch("SELECT 1 AS n, 'foo' AS s")
+        .await
+        .expect("fetch_arrow_batch should succeed on BigQuery sandbox");
+
+    assert_eq!(
+        batch.num_rows(),
+        1,
+        "expected 1 row, got {}",
+        batch.num_rows()
+    );
+    assert_eq!(batch.num_columns(), 2, "expected 2 columns");
+
+    // Schema check — `INT64` / `STRING` is the BigQuery canonical
+    // surface for the literal types `1` and `'foo'`. Both map onto
+    // workspace arrow's `Int64` / `Utf8`.
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(field_names, vec!["n", "s"]);
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+    let n_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("column 0 is Int64");
+    assert_eq!(n_col.value(0), 1);
+
+    let s_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("column 1 is Utf8");
+    assert_eq!(s_col.value(0), "foo");
+}
