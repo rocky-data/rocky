@@ -421,10 +421,10 @@ fn collect_model_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>
         let path = entry.path();
         if file_type.is_dir() {
             collect_model_files(root, &path, out);
-        } else if file_type.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push((rel.to_string_lossy().replace('\\', "/"), path));
-            }
+        } else if file_type.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push((rel.to_string_lossy().replace('\\', "/"), path));
         }
     }
 }
@@ -1025,10 +1025,10 @@ async fn discover_replication_branch_targets(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Some((ref filter_key, ref filter_value)) = parsed_filter {
-            if !matches_filter(conn, &parsed, filter_key, filter_value) {
-                continue;
-            }
+        if let Some((ref filter_key, ref filter_value)) = parsed_filter
+            && !matches_filter(conn, &parsed, filter_key, filter_value)
+        {
+            continue;
         }
         let target_sep = pipeline
             .target
@@ -1130,10 +1130,10 @@ fn discover_transformation_branch_targets(
     ))?;
     if let Ok(entries) = std::fs::read_dir(&models_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path()) {
-                    all_models.extend(sub);
-                }
+            if entry.path().is_dir()
+                && let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path())
+            {
+                all_models.extend(sub);
             }
         }
     }
@@ -1652,14 +1652,14 @@ pub async fn run_branch_promote_from_plan(
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
 
-    if let Some(n) = name {
-        if n != promote_plan.branch_name {
-            anyhow::bail!(
-                "branch name '{n}' does not match plan's branch name '{}'. \
+    if let Some(n) = name
+        && n != promote_plan.branch_name
+    {
+        anyhow::bail!(
+            "branch name '{n}' does not match plan's branch name '{}'. \
                  Omit the positional arg or pass the correct name.",
-                promote_plan.branch_name
-            );
-        }
+            promote_plan.branch_name
+        );
     }
 
     let actor = approver_identity().unwrap_or_else(|_| crate::output::ApproverIdentity {

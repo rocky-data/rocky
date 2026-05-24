@@ -77,29 +77,29 @@ fn extract_adapter_blocks(
 
     // Unnamed `[adapter]` with a `type` key is the canonical shape —
     // auto-wraps as `adapter.default`.
-    if let Some(v) = table.get("adapter") {
-        if let Some(t) = v.as_table() {
-            if t.contains_key("type") {
-                // Flat shape: promote to adapter.default.
-                out.push(("adapter.default".to_owned(), serialize_toml(v)?));
-            } else {
-                // Nested shape: every sub-table is a named adapter.
-                for (name, inner) in t {
-                    if inner.is_table() {
-                        out.push((format!("adapter.{name}"), serialize_toml(inner)?));
-                    }
+    if let Some(v) = table.get("adapter")
+        && let Some(t) = v.as_table()
+    {
+        if t.contains_key("type") {
+            // Flat shape: promote to adapter.default.
+            out.push(("adapter.default".to_owned(), serialize_toml(v)?));
+        } else {
+            // Nested shape: every sub-table is a named adapter.
+            for (name, inner) in t {
+                if inner.is_table() {
+                    out.push((format!("adapter.{name}"), serialize_toml(inner)?));
                 }
             }
         }
     }
 
     // The `adapters` alias lives only as a nested table.
-    if let Some(v) = table.get("adapters") {
-        if let Some(t) = v.as_table() {
-            for (name, inner) in t {
-                if inner.is_table() {
-                    out.push((format!("adapters.{name}"), serialize_toml(inner)?));
-                }
+    if let Some(v) = table.get("adapters")
+        && let Some(t) = v.as_table()
+    {
+        for (name, inner) in t {
+            if inner.is_table() {
+                out.push((format!("adapters.{name}"), serialize_toml(inner)?));
             }
         }
     }

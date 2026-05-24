@@ -67,7 +67,7 @@ impl AdaptiveThrottle {
     /// - Above half of max concurrency: increase by 1 (congestion avoidance, careful probing)
     pub fn on_success(&self) {
         let count = self.inner.success_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % self.inner.increase_interval == 0 {
+        if count.is_multiple_of(self.inner.increase_interval) {
             let _ = self
                 .inner
                 .current

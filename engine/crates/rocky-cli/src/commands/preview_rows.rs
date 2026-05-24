@@ -212,10 +212,10 @@ pub async fn run_preview_rows(
     let masks = rocky_cfg.resolve_mask_for_env(None);
     let mut masked: BTreeMap<String, MaskStrategy> = BTreeMap::new();
     for (col, tag) in &m.config.classification {
-        if let Some(&strat) = masks.get(tag) {
-            if strat != MaskStrategy::None {
-                masked.insert(col.clone(), strat);
-            }
+        if let Some(&strat) = masks.get(tag)
+            && strat != MaskStrategy::None
+        {
+            masked.insert(col.clone(), strat);
         }
     }
 

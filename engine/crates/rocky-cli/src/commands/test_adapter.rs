@@ -102,11 +102,10 @@ pub async fn run_test_adapter_builtin(
     // process-adapter conformance path. This makes `--adapter` the single
     // user-facing surface for both shipped adapters and installed process
     // adapters — same flag, same convention as `cargo` subcommands.
-    if !BUILTIN_ADAPTERS.contains(&adapter_name) {
-        if let Some(command) = resolve_adapter_command(adapter_name) {
-            return run_test_adapter(&command.display().to_string(), config_path, json_output)
-                .await;
-        }
+    if !BUILTIN_ADAPTERS.contains(&adapter_name)
+        && let Some(command) = resolve_adapter_command(adapter_name)
+    {
+        return run_test_adapter(&command.display().to_string(), config_path, json_output).await;
     }
 
     // For built-in adapters, we construct a manifest from the adapter name

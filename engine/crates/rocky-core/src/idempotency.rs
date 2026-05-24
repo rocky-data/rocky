@@ -810,10 +810,10 @@ async fn object_store_sweep_expired(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if parsed.expires_at < now {
-            if let Ok(()) = provider.delete(&rel_path).await {
-                removed += 1;
-            }
+        if parsed.expires_at < now
+            && let Ok(()) = provider.delete(&rel_path).await
+        {
+            removed += 1;
         }
     }
     Ok(removed)

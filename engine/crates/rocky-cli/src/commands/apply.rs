@@ -660,14 +660,14 @@ fn summarize_source_state_drift(
         ));
     }
     for (id, p_conn) in &persisted_map {
-        if let Some(l_conn) = live_map.get(id) {
-            if p_conn != l_conn {
-                lines.push(format!(
-                    "  connector '{id}' changed (tables: {} -> {}; schema/type may also differ)",
-                    p_conn.tables.len(),
-                    l_conn.tables.len(),
-                ));
-            }
+        if let Some(l_conn) = live_map.get(id)
+            && p_conn != l_conn
+        {
+            lines.push(format!(
+                "  connector '{id}' changed (tables: {} -> {}; schema/type may also differ)",
+                p_conn.tables.len(),
+                l_conn.tables.len(),
+            ));
         }
     }
     lines.join("\n")

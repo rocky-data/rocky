@@ -598,10 +598,10 @@ pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
         if let Some(kind) = classify_cause(cause) {
             return kind;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
-            if let Some(kind) = classify_cause(adapter_err.inner()) {
-                return kind;
-            }
+        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
+            && let Some(kind) = classify_cause(adapter_err.inner())
+        {
+            return kind;
         }
     }
     FailureKind::Unknown
@@ -621,10 +621,10 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         if let Some(pair) = classify_cause_with_cooldown(cause) {
             return pair;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
-            if let Some(pair) = classify_cause_with_cooldown(adapter_err.inner()) {
-                return pair;
-            }
+        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
+            && let Some(pair) = classify_cause_with_cooldown(adapter_err.inner())
+        {
+            return pair;
         }
     }
     (FailureKind::Unknown, None)

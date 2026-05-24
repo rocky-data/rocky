@@ -55,10 +55,10 @@ impl CompileCache {
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                if let Ok(cache) = serde_json::from_str::<CompileCache>(&content) {
-                    if cache.version == Self::VERSION {
-                        return cache;
-                    }
+                if let Ok(cache) = serde_json::from_str::<CompileCache>(&content)
+                    && cache.version == Self::VERSION
+                {
+                    return cache;
                 }
                 // Version mismatch or corrupt — start fresh
                 Self::new()

@@ -870,16 +870,15 @@ pub fn validate(dag: &UnifiedDag) -> Vec<UnifiedDagError> {
         }
 
         // 4. Test nodes must not have outgoing DataDependency edges.
-        if edge.edge_type == EdgeType::DataDependency {
-            if let Some(from_node) = node_map.get(edge.from.0.as_str()) {
-                if from_node.kind == NodeKind::Test {
-                    errors.push(UnifiedDagError::InvalidEdge {
-                        from: edge.from.0.clone(),
-                        to: edge.to.0.clone(),
-                        reason: "test nodes cannot have outgoing data dependencies".into(),
-                    });
-                }
-            }
+        if edge.edge_type == EdgeType::DataDependency
+            && let Some(from_node) = node_map.get(edge.from.0.as_str())
+            && from_node.kind == NodeKind::Test
+        {
+            errors.push(UnifiedDagError::InvalidEdge {
+                from: edge.from.0.clone(),
+                to: edge.to.0.clone(),
+                reason: "test nodes cannot have outgoing data dependencies".into(),
+            });
         }
     }
 

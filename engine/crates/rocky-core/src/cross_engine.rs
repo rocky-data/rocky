@@ -253,22 +253,22 @@ pub fn validate_cross_engine_config(
 ) -> Result<(), CrossEngineError> {
     // 1. Validate per-model adapter overrides reference existing adapters.
     for model in models {
-        if let Some(ref adapter_name) = model.config.adapter {
-            if !config.adapters.contains_key(adapter_name) {
-                // Find which pipeline this model belongs to (best effort).
-                let pipeline_name = model
-                    .file_path
-                    .split('/')
-                    .find(|seg| config.pipelines.contains_key(*seg))
-                    .unwrap_or("unknown")
-                    .to_owned();
+        if let Some(ref adapter_name) = model.config.adapter
+            && !config.adapters.contains_key(adapter_name)
+        {
+            // Find which pipeline this model belongs to (best effort).
+            let pipeline_name = model
+                .file_path
+                .split('/')
+                .find(|seg| config.pipelines.contains_key(*seg))
+                .unwrap_or("unknown")
+                .to_owned();
 
-                return Err(CrossEngineError::UnknownModelAdapter {
-                    model: model.config.name.clone(),
-                    pipeline: pipeline_name,
-                    adapter: adapter_name.clone(),
-                });
-            }
+            return Err(CrossEngineError::UnknownModelAdapter {
+                model: model.config.name.clone(),
+                pipeline: pipeline_name,
+                adapter: adapter_name.clone(),
+            });
         }
     }
 
@@ -446,15 +446,15 @@ fn find_cross_warehouse_edges(config: &RockyConfig) -> Vec<CrossWarehouseEdge> {
                 .get(downstream_source_name)
                 .map(|a| a.adapter_type.as_str());
 
-            if let (Some(up), Some(down)) = (upstream_type, downstream_type) {
-                if up != down {
-                    edges.push(CrossWarehouseEdge {
-                        source_pipeline: dep_name.clone(),
-                        target_pipeline: name.clone(),
-                        upstream_adapter_type: up.to_owned(),
-                        downstream_adapter_type: down.to_owned(),
-                    });
-                }
+            if let (Some(up), Some(down)) = (upstream_type, downstream_type)
+                && up != down
+            {
+                edges.push(CrossWarehouseEdge {
+                    source_pipeline: dep_name.clone(),
+                    target_pipeline: name.clone(),
+                    upstream_adapter_type: up.to_owned(),
+                    downstream_adapter_type: down.to_owned(),
+                });
             }
         }
     }

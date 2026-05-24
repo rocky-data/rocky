@@ -360,10 +360,10 @@ impl TrinoClient {
 
         let mut attempt = 0_usize;
         loop {
-            if let Some(cols) = current.columns.take() {
-                if columns.is_empty() {
-                    columns = cols.into_iter().map(TrinoColumnMeta::from_wire).collect();
-                }
+            if let Some(cols) = current.columns.take()
+                && columns.is_empty()
+            {
+                columns = cols.into_iter().map(TrinoColumnMeta::from_wire).collect();
             }
             if let Some(data) = current.data.take() {
                 rows.extend(data);

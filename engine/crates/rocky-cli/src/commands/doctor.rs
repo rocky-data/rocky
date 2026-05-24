@@ -199,10 +199,10 @@ pub async fn doctor(
                     ));
                 }
                 // Check schema pattern is parseable (replication pipelines only)
-                if let Some(repl) = pipeline.as_replication() {
-                    if let Err(e) = repl.schema_pattern() {
-                        issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
-                    }
+                if let Some(repl) = pipeline.as_replication()
+                    && let Err(e) = repl.schema_pattern()
+                {
+                    issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
                 }
             }
             let pipeline_count = cfg.pipelines.len();

@@ -276,24 +276,24 @@ pub fn generate_transformation_sql_with_warehouse(
     // `generate_transformation_initial_ddl` when missing (Merge today;
     // Incremental / DeleteInsert / Microbatch wired in as their live smoke
     // tests land). Here we handle FullRefresh which always does CTAS.
-    if let Some(ref format) = model_ir.format {
-        if matches!(
+    if let Some(ref format) = model_ir.format
+        && matches!(
             model_ir.materialization,
             MaterializationStrategy::FullRefresh
-        ) {
-            let opts = model_ir
-                .format_options
-                .as_ref()
-                .cloned()
-                .unwrap_or_default();
-            return Ok(lakehouse::generate_lakehouse_ddl(
-                format,
-                &target,
-                &model_ir.sql,
-                &opts,
-                dialect,
-            )?);
-        }
+        )
+    {
+        let opts = model_ir
+            .format_options
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        return Ok(lakehouse::generate_lakehouse_ddl(
+            format,
+            &target,
+            &model_ir.sql,
+            &opts,
+            dialect,
+        )?);
     }
 
     match &model_ir.materialization {

@@ -84,10 +84,10 @@ pub fn run_replay(
         .map(to_model)
         .collect();
 
-    if let Some(name) = model_filter {
-        if models.is_empty() {
-            anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
-        }
+    if let Some(name) = model_filter
+        && models.is_empty()
+    {
+        anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
     }
 
     if json {

@@ -136,10 +136,10 @@ impl<K: Eq + Hash + Clone + Send, V: Clone + Send> TieredCache<K, V> {
         let value = fetch().await?;
 
         // 4. Populate Valkey
-        if let Some(ref valkey) = self.valkey {
-            if let Err(e) = valkey.set(valkey_key, &value, None).await {
-                tracing::warn!("tiered cache: valkey set failed: {e}");
-            }
+        if let Some(ref valkey) = self.valkey
+            && let Err(e) = valkey.set(valkey_key, &value, None).await
+        {
+            tracing::warn!("tiered cache: valkey set failed: {e}");
         }
 
         // 5. Populate memory
@@ -160,10 +160,10 @@ impl<K: Eq + Hash + Clone + Send, V: Clone + Send> TieredCache<K, V> {
             mem.remove(key);
         }
 
-        if let Some(ref valkey) = self.valkey {
-            if let Err(e) = valkey.delete(valkey_key).await {
-                tracing::warn!("tiered cache: valkey delete failed during invalidate: {e}");
-            }
+        if let Some(ref valkey) = self.valkey
+            && let Err(e) = valkey.delete(valkey_key).await
+        {
+            tracing::warn!("tiered cache: valkey delete failed during invalidate: {e}");
         }
     }
 

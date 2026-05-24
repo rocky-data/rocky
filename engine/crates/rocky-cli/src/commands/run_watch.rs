@@ -309,19 +309,20 @@ fn event_path_is_relevant(
 ) -> bool {
     // rocky.toml exact match (+ its temporary editor backups don't match
     // the filename, so are ignored automatically).
-    if let Some(name) = path.file_name() {
-        if path.parent() == Some(config_dir) && name == config_filename {
-            return true;
-        }
+    if let Some(name) = path.file_name()
+        && path.parent() == Some(config_dir)
+        && name == config_filename
+    {
+        return true;
     }
 
     // Skip dotfiles (vim swap files like `.foo.swp`, `.DS_Store`, etc.)
     // and the embedded redb state store, which lives next to models on
     // some layouts.
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.starts_with('.') || name.ends_with(".redb") || name.ends_with(".redb-lock") {
-            return false;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && (name.starts_with('.') || name.ends_with(".redb") || name.ends_with(".redb-lock"))
+    {
+        return false;
     }
 
     // Match transformation-relevant suffixes. `.toml` is included so

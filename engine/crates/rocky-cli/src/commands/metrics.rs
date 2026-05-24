@@ -167,10 +167,10 @@ pub fn run_metrics(
                 let mut rates: Vec<_> = latest.metrics.null_rates.iter().collect();
                 rates.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (col, rate) in &rates {
-                    if let Some(filter_col) = column {
-                        if col.as_str() != filter_col {
-                            continue;
-                        }
+                    if let Some(filter_col) = column
+                        && col.as_str() != filter_col
+                    {
+                        continue;
                     }
                     println!("    {col}: {:.2}%", *rate * 100.0);
                 }

@@ -150,19 +150,19 @@ fn parse_sqlparser_location(
         if let Some(comma) = tail.find(", Column ") {
             let line_str = &tail[..comma];
             let col_str = tail[comma + 9..].trim_end_matches(|c: char| !c.is_ascii_digit());
-            if let (Ok(line), Ok(col)) = (line_str.parse::<usize>(), col_str.parse::<usize>()) {
-                if let Some(offset) = line_col_to_offset(source, line, col) {
-                    // Span length: highlight up to end of the token or line.
-                    let rest = &source[offset..];
-                    let len = rest
-                        .find(|c: char| c.is_whitespace())
-                        .unwrap_or(rest.len())
-                        .max(1);
-                    return (
-                        Some(miette::SourceSpan::new(offset.into(), len)),
-                        Some("Check SQL syntax near this position".to_string()),
-                    );
-                }
+            if let (Ok(line), Ok(col)) = (line_str.parse::<usize>(), col_str.parse::<usize>())
+                && let Some(offset) = line_col_to_offset(source, line, col)
+            {
+                // Span length: highlight up to end of the token or line.
+                let rest = &source[offset..];
+                let len = rest
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(rest.len())
+                    .max(1);
+                return (
+                    Some(miette::SourceSpan::new(offset.into(), len)),
+                    Some("Check SQL syntax near this position".to_string()),
+                );
             }
         }
     }

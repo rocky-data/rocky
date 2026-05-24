@@ -1274,11 +1274,10 @@ pub async fn run(
                 Err(_) => continue,
             };
 
-            if let Some((ref filter_key, ref filter_value)) = parsed_filter {
-                if !matches_filter(conn, &parsed, filter_key, filter_value) {
+            if let Some((ref filter_key, ref filter_value)) = parsed_filter
+                && !matches_filter(conn, &parsed, filter_key, filter_value) {
                     continue;
                 }
-            }
 
             let components = parsed_to_json_map(&parsed);
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
@@ -1345,13 +1344,12 @@ pub async fn run(
                 // explicit desired state that replaces any overlap by
                 // id. The FR-009 validator above has already rejected
                 // the dangerous shape (`Some(empty)` without opt-in).
-                if let Some(ov) = governance_override {
-                    if let Some(ids) = ov.workspace_ids.as_ref() {
+                if let Some(ov) = governance_override
+                    && let Some(ids) = ov.workspace_ids.as_ref() {
                         for b in ids {
                             binding_map.insert(b.id, b.clone());
                         }
                     }
-                }
                 let all_bindings: Vec<rocky_core::config::WorkspaceBindingConfig> = {
                     let mut v: Vec<_> = binding_map.into_values().collect();
                     v.sort_by_key(|b| b.id);
@@ -1404,8 +1402,8 @@ pub async fn run(
                         current_ids.get(&binding.id),
                         Some(current_kind) if current_kind == desired_kind
                     );
-                    if needs_apply {
-                        if let Err(e) = governance_adapter
+                    if needs_apply
+                        && let Err(e) = governance_adapter
                             .bind_workspace(&target_catalog, binding.id, desired_kind)
                             .await
                         {
@@ -1417,13 +1415,12 @@ pub async fn run(
                                 "workspace binding failed"
                             );
                         }
-                    }
                 }
 
                 // Remove bindings that exist on the catalog but aren't desired.
                 for &cur_id in current_ids.keys() {
-                    if !desired_ids.contains(&cur_id) {
-                        if let Err(e) = governance_adapter
+                    if !desired_ids.contains(&cur_id)
+                        && let Err(e) = governance_adapter
                             .remove_workspace_binding(&target_catalog, cur_id)
                             .await
                         {
@@ -1434,18 +1431,16 @@ pub async fn run(
                                 "remove workspace binding failed"
                             );
                         }
-                    }
                 }
 
                 let should_isolate = governance.isolation.as_ref().is_some_and(|i| i.enabled);
-                if should_isolate {
-                    if let Err(e) = governance_adapter
+                if should_isolate
+                    && let Err(e) = governance_adapter
                         .set_isolation(&target_catalog, true)
                         .await
                     {
                         warn!(catalog = target_catalog, error = %e, "catalog isolation failed");
                     }
-                }
 
                 // Merge catalog grants: config defaults + per-run override
                 let mut all_grants = governance.grants.clone();
@@ -2304,12 +2299,11 @@ pub async fn run(
                 // Signal the adaptive throttle: rate limits reduce concurrency,
                 // other errors are treated as successes (they're permanent
                 // failures, not a signal to slow down).
-                if let Some(t) = &throttle {
-                    if is_rate_limit_error(&msg) {
+                if let Some(t) = &throttle
+                    && is_rate_limit_error(&msg) {
                         t.on_rate_limit();
                         adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
                     }
-                }
 
                 warn!(error = msg, "table processing failed");
                 rocky_observe::metrics::METRICS.inc_tables_failed();
@@ -2920,8 +2914,8 @@ pub async fn run(
     }
 
     // Anomaly detection
-    if row_count_enabled {
-        if let Some(ref store) = state_store {
+    if row_count_enabled
+        && let Some(ref store) = state_store {
             for (target_key, _) in &batch_asset_keys {
                 let tgt_count = target_counts
                     .iter()
@@ -2967,7 +2961,6 @@ pub async fn run(
                 }
             }
         }
-    }
 
     // Process freshness results
     if let Some(ref freshness_cfg) = pipeline.checks.freshness {
@@ -3174,8 +3167,8 @@ pub async fn run(
                     // governance adapter; best-effort — failure warns
                     // but does not abort the run, matching the
                     // classification/masking contract above.
-                    if let Some(retention) = model.config.retention {
-                        if let Err(e) = governance_adapter
+                    if let Some(retention) = model.config.retention
+                        && let Err(e) = governance_adapter
                             .apply_retention_policy(&table_ref, &retention)
                             .await
                         {
@@ -3186,7 +3179,6 @@ pub async fn run(
                                 "apply retention policy failed"
                             );
                         }
-                    }
                 }
             }
 
@@ -3853,10 +3845,10 @@ pub(crate) async fn execute_models(
     for layer in &compile_result.project.layers {
         for model_name in layer {
             // When a model name filter is active, skip models that don't match.
-            if let Some(target) = model_name_filter {
-                if model_name != target {
-                    continue;
-                }
+            if let Some(target) = model_name_filter
+                && model_name != target
+            {
+                continue;
             }
 
             let Some(model) = compile_result.project.model(model_name) else {
@@ -4015,17 +4007,17 @@ pub(crate) async fn execute_models(
                 )
                 .await
                 .with_context(|| format!("model '{model_name}' failed"));
-                if let Err(ref e) = time_interval_res {
-                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
-                        let _ = reg
-                            .fire(&HookContext::model_error(
-                                run_id,
-                                pipe,
-                                model_name,
-                                &format!("{e:#}"),
-                            ))
-                            .await;
-                    }
+                if let Err(ref e) = time_interval_res
+                    && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
+                {
+                    let _ = reg
+                        .fire(&HookContext::model_error(
+                            run_id,
+                            pipe,
+                            model_name,
+                            &format!("{e:#}"),
+                        ))
+                        .await;
                 }
                 time_interval_res?;
                 if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
@@ -5561,11 +5553,11 @@ async fn process_completed_result(
             }
 
             // Signal the adaptive throttle
-            if let Some(t) = &throttle {
-                if is_rate_limit_error(&msg) {
-                    t.on_rate_limit();
-                    adjust_semaphore(t, semaphore, semaphore_capacity);
-                }
+            if let Some(t) = &throttle
+                && is_rate_limit_error(&msg)
+            {
+                t.on_rate_limit();
+                adjust_semaphore(t, semaphore, semaphore_capacity);
             }
 
             warn!(error = msg, "table processing failed");

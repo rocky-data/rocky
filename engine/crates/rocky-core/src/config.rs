@@ -2066,11 +2066,11 @@ impl RockyConfig {
         }
 
         // Pass 2: if env matches a nested override table, overlay.
-        if let Some(env_name) = env {
-            if let Some(MaskEntry::EnvOverride(overrides)) = self.mask.get(env_name) {
-                for (k, v) in overrides {
-                    out.insert(k.clone(), *v);
-                }
+        if let Some(env_name) = env
+            && let Some(MaskEntry::EnvOverride(overrides)) = self.mask.get(env_name)
+        {
+            for (k, v) in overrides {
+                out.insert(k.clone(), *v);
             }
         }
 
@@ -4124,28 +4124,25 @@ pub fn validate_adapter_kinds(config: &RockyConfig) -> Vec<ConfigError> {
 
         // Skip missing / unknown-type references — those are reported by
         // `rocky validate` (V022 / V017) or by the registry at runtime.
-        if let Some(source_cfg) = config.adapters.get(&replication.source.adapter) {
-            if capability_for(&source_cfg.adapter_type).is_some()
-                && !adapter_role_active(source_cfg, AdapterKind::Data)
-            {
-                errors.push(ConfigError::PipelineSourceAdapterNotData {
-                    pipeline: pipeline_name.clone(),
-                    adapter: replication.source.adapter.clone(),
-                });
-            }
+        if let Some(source_cfg) = config.adapters.get(&replication.source.adapter)
+            && capability_for(&source_cfg.adapter_type).is_some()
+            && !adapter_role_active(source_cfg, AdapterKind::Data)
+        {
+            errors.push(ConfigError::PipelineSourceAdapterNotData {
+                pipeline: pipeline_name.clone(),
+                adapter: replication.source.adapter.clone(),
+            });
         }
 
-        if let Some(discovery) = &replication.source.discovery {
-            if let Some(disc_cfg) = config.adapters.get(&discovery.adapter) {
-                if capability_for(&disc_cfg.adapter_type).is_some()
-                    && !adapter_role_active(disc_cfg, AdapterKind::Discovery)
-                {
-                    errors.push(ConfigError::PipelineDiscoveryAdapterNotDiscovery {
-                        pipeline: pipeline_name.clone(),
-                        adapter: discovery.adapter.clone(),
-                    });
-                }
-            }
+        if let Some(discovery) = &replication.source.discovery
+            && let Some(disc_cfg) = config.adapters.get(&discovery.adapter)
+            && capability_for(&disc_cfg.adapter_type).is_some()
+            && !adapter_role_active(disc_cfg, AdapterKind::Discovery)
+        {
+            errors.push(ConfigError::PipelineDiscoveryAdapterNotDiscovery {
+                pipeline: pipeline_name.clone(),
+                adapter: discovery.adapter.clone(),
+            });
         }
     }
 
@@ -4539,23 +4536,23 @@ pub fn check_config_deprecations(toml_str: &str) -> Result<Vec<DeprecationWarnin
 fn normalize_toml_shorthands(value: &mut toml::Value) {
     if let Some(table) = value.as_table_mut() {
         // Handle bare [adapter] → [adapter.default]
-        if let Some(adapter_val) = table.get("adapter") {
-            if is_bare_adapter(adapter_val) {
-                let adapter = table.remove("adapter").expect("key was just found above");
-                let mut wrapper = toml::map::Map::new();
-                wrapper.insert("default".to_string(), adapter);
-                table.insert("adapter".to_string(), toml::Value::Table(wrapper));
-            }
+        if let Some(adapter_val) = table.get("adapter")
+            && is_bare_adapter(adapter_val)
+        {
+            let adapter = table.remove("adapter").expect("key was just found above");
+            let mut wrapper = toml::map::Map::new();
+            wrapper.insert("default".to_string(), adapter);
+            table.insert("adapter".to_string(), toml::Value::Table(wrapper));
         }
 
         // Handle bare [pipeline] → [pipeline.default]
-        if let Some(pipeline_val) = table.get("pipeline") {
-            if is_bare_pipeline(pipeline_val) {
-                let pipeline = table.remove("pipeline").expect("key was just found above");
-                let mut wrapper = toml::map::Map::new();
-                wrapper.insert("default".to_string(), pipeline);
-                table.insert("pipeline".to_string(), toml::Value::Table(wrapper));
-            }
+        if let Some(pipeline_val) = table.get("pipeline")
+            && is_bare_pipeline(pipeline_val)
+        {
+            let pipeline = table.remove("pipeline").expect("key was just found above");
+            let mut wrapper = toml::map::Map::new();
+            wrapper.insert("default".to_string(), pipeline);
+            table.insert("pipeline".to_string(), toml::Value::Table(wrapper));
         }
     }
 }

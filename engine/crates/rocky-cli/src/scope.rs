@@ -163,15 +163,15 @@ pub(crate) fn resolve_transformation_managed_tables(
         "project root '{}' could not be resolved",
         project_root.display()
     ))?;
-    if let Ok(canonical_models) = models_dir.canonicalize() {
-        if !canonical_models.starts_with(&canonical_root) {
-            bail!(
-                "models directory '{}' resolves outside the project root '{}'. \
+    if let Ok(canonical_models) = models_dir.canonicalize()
+        && !canonical_models.starts_with(&canonical_root)
+    {
+        bail!(
+            "models directory '{}' resolves outside the project root '{}'. \
                  Refusing to load — adjust `models = \"...\"` in rocky.toml.",
-                canonical_models.display(),
-                canonical_root.display(),
-            );
-        }
+            canonical_models.display(),
+            canonical_root.display(),
+        );
     }
 
     // Load models the same way `rocky list models` does: top-level +
@@ -183,10 +183,10 @@ pub(crate) fn resolve_transformation_managed_tables(
 
     if let Ok(entries) = std::fs::read_dir(&models_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path()) {
-                    all_models.extend(sub);
-                }
+            if entry.path().is_dir()
+                && let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path())
+            {
+                all_models.extend(sub);
             }
         }
     }
@@ -218,10 +218,10 @@ pub(crate) fn managed_catalog_set(managed: &HashSet<String>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for full in managed {
-        if let Some((catalog, _rest)) = full.split_once('.') {
-            if seen.insert(catalog.to_string()) {
-                out.push(catalog.to_string());
-            }
+        if let Some((catalog, _rest)) = full.split_once('.')
+            && seen.insert(catalog.to_string())
+        {
+            out.push(catalog.to_string());
         }
     }
     out.sort();

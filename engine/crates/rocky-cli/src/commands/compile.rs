@@ -195,10 +195,10 @@ fn compile_inner(
 
         let mut expanded = HashMap::new();
         for model in &result.project.models {
-            if let Some(filter) = model_filter {
-                if model.config.name != filter {
-                    continue;
-                }
+            if let Some(filter) = model_filter
+                && model.config.name != filter
+            {
+                continue;
             }
             let sql = expand_macros(&model.sql, &macro_defs)?;
             expanded.insert(model.config.name.clone(), sql);

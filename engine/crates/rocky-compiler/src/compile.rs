@@ -368,10 +368,10 @@ pub fn compile_incremental(
     // set differs from the previous graph's must be re-typechecked —
     // the scope it reads from has changed.
     for (name, schema) in &semantic_graph.models {
-        if let Some(prev_schema) = previous.semantic_graph.models.get(name) {
-            if schema.upstream != prev_schema.upstream {
-                affected.insert(name.clone());
-            }
+        if let Some(prev_schema) = previous.semantic_graph.models.get(name)
+            && schema.upstream != prev_schema.upstream
+        {
+            affected.insert(name.clone());
         }
     }
 
@@ -555,13 +555,13 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
                 .and_then(|s| s.strip_suffix(')'))
             {
                 let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2 {
-                    if let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
-                        return RockyType::Decimal {
-                            precision: p,
-                            scale: s,
-                        };
-                    }
+                if parts.len() == 2
+                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
+                {
+                    return RockyType::Decimal {
+                        precision: p,
+                        scale: s,
+                    };
                 }
             }
             RockyType::Decimal {
