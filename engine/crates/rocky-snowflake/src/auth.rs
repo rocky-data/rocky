@@ -220,7 +220,9 @@ impl Auth {
             });
         }
 
-        // Key-pair auth (stub — will error when get_token is called)
+        // Key-pair auth: this branch only constructs the AuthInner; JWT
+        // minting + fingerprint computation + 59-minute token caching all
+        // happen in `get_token` (see lines 277-354).
         if let Some(key_path) = config.private_key_path.filter(|p| !p.is_empty()) {
             if let Some(ref username) = config.username {
                 if !username.is_empty() {
