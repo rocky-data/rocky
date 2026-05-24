@@ -51,6 +51,8 @@ Substitution happens in `rocky-core/src/config.rs` before serde sees the value.
 
 An unnamed `[adapter]` with a `type` key auto-wraps as `adapter.default`. Pipeline adapter refs default to `"default"` — so you can omit `adapter = "default"` lines everywhere.
 
+Top-level adapter fields are strict (`deny_unknown_fields` — typos are parse errors). Adapter-specific keys Rocky doesn't model go under a nested `[adapter.<name>.extra]` table, which passes through untouched for a custom or process adapter to read.
+
 ### The `kind` field
 
 `kind` declares the role an `[adapter.*]` block plays. Two valid values: `"data"` (warehouse read/write) and `"discovery"` (metadata enumeration).

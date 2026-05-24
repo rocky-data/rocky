@@ -492,7 +492,9 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 | `--message <text>` | `string` | (none) | Optional free-form note persisted in the approval artifact. |
 | `--out <path>` | `PathBuf` | `./.rocky/approvals/<branch>/<approval_id>.json` | Override the artifact destination path. |
 
-Writes a content-addressed approval artifact that binds the approver's git identity to the branch's current state hash. `rocky branch promote` later refuses to run unless the on-disk approvals satisfy the [`[branch.approval]`](/reference/configuration/#branchapproval) policy.
+Writes a content-addressed approval artifact that binds the approver's git identity to the exact bytes of the branch's models and project config. Editing, adding, or renaming any model after approval voids that approval, so `rocky branch promote` refuses to run unless the on-disk approvals still match the current state and satisfy the [`[branch.approval]`](/reference/configuration/#branchapproval) policy.
+
+> **Upgrade note (engine v1.43):** approvals created before v1.43 bound to the project config only, not the model bytes. They no longer satisfy the gate after upgrading. Run `rocky branch approve <name>` once to re-sign each branch against its current model contents.
 
 ### `branch promote` flags
 
@@ -504,9 +506,10 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 | `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
 | `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
 | `--skip-approval` | flag | off | Bypass the approval gate. Always emits an `approval_skipped` audit event so the bypass leaves a paper trail. |
-| `--filter <key=value>` | `string` | (none) | Filter sources by component value (e.g. `--filter client=acme`). |
+| `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline. |
+| `--filter <key=value>` | `string` | (none) | Filter the promote targets. Replication pipelines filter sources by schema-pattern component (e.g. `--filter client=acme`); transformation pipelines filter models by `table`, `model`, `catalog`, or `schema`. |
 
-Enumerates the configured replication pipeline's production targets, runs the optional `[branch.approval]` gate, runs the semantic breaking-change gate against `--base-ref`, then dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>` per target.
+Enumerates the pipeline's production targets and promotes each one. A replication pipeline discovers the source connector's tables through the schema-pattern templates; a transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. It then runs the optional `[branch.approval]` gate, runs the semantic breaking-change gate against `--base-ref`, and dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>` per target. Quality and snapshot pipelines are not supported and return a clear error.
 
 The breaking-change gate vetoes the promote (exit nonzero) when any finding has `severity == "breaking"` unless `--allow-breaking` is passed. Every gate decision — block, allow-via-override, or fail-open when the gate couldn't run — is recorded in the audit trail. See [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) to surface the same findings informationally on every PR.
 

@@ -118,8 +118,20 @@ Each `[adapter.NAME]` block defines one adapter instance. The `name` is arbitrar
 |-------|------|----------|-------------|
 | `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"fivetran"`, `"manual"`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
+| `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
 The remaining fields depend on the adapter type.
+
+The top-level adapter fields are strictly validated — an unrecognized key (a typo like `tooken`) is rejected rather than silently ignored. Keys that a custom or process adapter consumes but Rocky doesn't model go under a nested `[adapter.NAME.extra]` table, which passes through untouched:
+
+```toml
+[adapter.my_warehouse]
+type = "process"
+
+[adapter.my_warehouse.extra]
+default_schema = "analytics"
+x_custom_header = "service-account"
+```
 
 ### `type = "duckdb"`
 

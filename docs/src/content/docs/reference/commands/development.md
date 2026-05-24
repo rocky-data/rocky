@@ -436,6 +436,35 @@ Validating 12 models...
 
 ---
 
+## `rocky adapter`
+
+Discover and inspect the adapters available on your system. Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` whose name starts with `rocky-` is treated as a process adapter named after the suffix, so a `rocky-snowplow` binary registers as the adapter `snowplow`.
+
+### `rocky adapter list`
+
+Walks `PATH`, runs each `rocky-*` candidate, and prints one row per discovered adapter.
+
+```bash
+rocky adapter list [--output json]
+```
+
+The table shows `NAME`, `VERSION`, `DIALECT`, and `PATH`. An adapter that fails to initialize still appears in the listing with its error, so a broken install is visible rather than silently skipped. The bundled `rocky-lsp` language server is filtered out. Passing `--output json` returns each adapter's full manifest.
+
+### `rocky adapter info <name>`
+
+Resolves `rocky-<name>` on `PATH`, runs it, and prints its manifest (name, version, SQL dialect, and the path it resolved to).
+
+```bash
+rocky adapter info snowplow
+```
+
+### Related Commands
+
+- [`rocky test-adapter`](#rocky-test-adapter) -- run the conformance suite against a discovered adapter
+- [`rocky init-adapter`](#rocky-init-adapter) -- scaffold a new adapter crate
+
+---
+
 ## `rocky test-adapter`
 
 Run conformance tests against a warehouse adapter.
@@ -448,7 +477,7 @@ rocky test-adapter [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--adapter` | string | — | Built-in adapter name (databricks, snowflake, duckdb) |
+| `--adapter` | string | — | Adapter name. Resolves a built-in adapter (`databricks`, `snowflake`, `duckdb`) first, then falls back to an installed `rocky-<name>` executable on your `PATH`. |
 | `--command` | string | — | Path to a process adapter binary |
 | `--adapter-config` | string | — | JSON config to pass to the adapter |
 
