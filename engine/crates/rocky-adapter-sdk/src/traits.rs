@@ -10,6 +10,36 @@
 //! - [`GovernanceAdapter`] — manage catalog/schema lifecycle, tags, permissions
 //! - [`BatchCheckAdapter`] — execute batched data quality checks
 //! - [`TypeMapper`] — normalize warehouse type strings
+//! - [`AuthProvider`] — render auth + mandatory headers for HTTP-based adapters
+//!
+//! # Method-surface parity with `rocky-core`
+//!
+//! The in-tree `rocky-core::traits::WarehouseAdapter` accumulates capabilities
+//! that out-of-tree adapters also need (`ping`, `explain`, `list_tables`,
+//! `execute_statement_with_stats`, etc.). This crate mirrors the additive
+//! subset so SDK-only implementors have the same method surface available.
+//! All mirrored methods have default impls — adapters opt in by overriding.
+//!
+//! Known non-additive divergences (defer to a follow-up — they require
+//! cross-crate type or signature changes that this PR deliberately doesn't
+//! land):
+//!
+//! - `clone_table_for_branch` (depends on `rocky-sql::validation` — pulling
+//!   it into the SDK would expand the dep graph beyond the "thin contract"
+//!   the SDK promises).
+//! - `fetch_arrow_batch` (workspace `arrow` dep + active sibling rollout
+//!   across in-tree adapters; the SDK trait will absorb it once that
+//!   stabilizes).
+//! - `SqlDialect::merge_into` signature mismatch (`&[Arc<str>]` +
+//!   `ColumnSelection` in `rocky-core` vs `&[String]` + `Option<&[String]>`
+//!   here). Aligning means changing one side; deferred so the sibling
+//!   adapter rollout doesn't collide.
+//! - `TableRef` / `ColumnInfo` / `Grant` / `MetadataColumn` are duplicated
+//!   between the SDK and `rocky-ir`; the registry holds adapters as
+//!   `Arc<dyn rocky_core::traits::WarehouseAdapter>` which is keyed off
+//!   the `rocky-ir` types, so SDK-only adapter trait objects can't yet
+//!   slot in. Unifying these types is the prerequisite for true
+//!   process-adapter pluggability.
 
 use std::collections::BTreeMap;
 
@@ -90,6 +120,46 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for AdapterError {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// Result of an EXPLAIN or dry-run cost estimate for a SQL statement.
+///
+/// Returned by [`WarehouseAdapter::explain`]. Every field is optional
+/// because not every warehouse reports every number — adapters populate
+/// the slots their native EXPLAIN / dry-run path exposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainResult {
+    /// Estimated bytes that would be scanned.
+    pub estimated_bytes_scanned: Option<u64>,
+    /// Estimated number of rows processed.
+    pub estimated_rows: Option<u64>,
+    /// Estimated compute cost in the warehouse's native unit
+    /// (e.g., DBU-seconds).
+    pub estimated_compute_units: Option<f64>,
+    /// Raw EXPLAIN output from the warehouse (for human inspection).
+    pub raw_explain: String,
+}
+
+/// Statistics the warehouse reported for a single executed statement.
+///
+/// Returned by [`WarehouseAdapter::execute_statement_with_stats`]. Every
+/// field is `Option<u64>` because not every adapter reports every number.
+/// The host runtime threads populated fields up into
+/// `MaterializationOutput.bytes_scanned` / `.bytes_written` so cost-aware
+/// commands (`rocky cost`) can compute dollar figures without re-querying
+/// the warehouse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionStats {
+    /// Adapter-reported bytes figure used for cost accounting.
+    pub bytes_scanned: Option<u64>,
+    /// Adapter-reported bytes-written figure (only populated by adapters
+    /// that expose it natively).
+    pub bytes_written: Option<u64>,
+    /// Rows affected by the statement (inserts + updates + deletes).
+    pub rows_affected: Option<u64>,
+    /// Warehouse-specific job identifier for this statement, when one
+    /// exists.
+    pub job_id: Option<String>,
 }
 
 /// Three-part table reference.
@@ -356,6 +426,73 @@ pub trait WarehouseAdapter: Send + Sync {
 
     /// Release any resources held by this adapter.
     async fn close(&self) -> AdapterResult<()>;
+
+    /// Execute a SQL statement and return the warehouse-reported
+    /// [`ExecutionStats`] (bytes scanned, bytes written, rows affected,
+    /// job id).
+    ///
+    /// Default: delegates to [`Self::execute_statement`] and returns
+    /// [`ExecutionStats::default`] (all `None`). Adapters with access to
+    /// statement-level stats (BigQuery's `statistics.query.totalBytesBilled`,
+    /// Databricks's `result.manifest.total_byte_count`, etc.) should
+    /// override to populate the fields.
+    async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
+        self.execute_statement(sql)
+            .await
+            .map(|()| ExecutionStats::default())
+    }
+
+    /// Cheap connectivity check. Exercises the auth path and verifies
+    /// the warehouse is reachable without doing real work.
+    ///
+    /// Used by `rocky doctor --check auth`. Default: `SELECT 1`.
+    /// Adapters with cheaper ping paths can override.
+    async fn ping(&self) -> AdapterResult<()> {
+        self.execute_statement("SELECT 1").await
+    }
+
+    /// Run EXPLAIN or a dry-run cost estimate for a SQL statement.
+    ///
+    /// Returns cost metadata (bytes scanned, rows, compute units) and
+    /// the raw EXPLAIN output. Not all warehouses support this — the
+    /// default returns an error.
+    async fn explain(&self, _sql: &str) -> AdapterResult<ExplainResult> {
+        Err(AdapterError::not_supported("explain"))
+    }
+
+    /// Whether this adapter is experimental.
+    ///
+    /// Experimental adapters may have incomplete feature coverage or
+    /// behavioral differences compared to production-ready adapters.
+    /// The runtime logs a warning at startup when an experimental
+    /// adapter is selected.
+    fn is_experimental(&self) -> bool {
+        false
+    }
+
+    /// Compute warehouse name, if this adapter has one.
+    ///
+    /// Used by SQL generators that emit `WAREHOUSE = …` clauses
+    /// (currently only Snowflake's `CREATE DYNAMIC TABLE`). Returns
+    /// `None` for adapters without a compute-warehouse concept
+    /// (Databricks routes to a configured SQL endpoint, BigQuery is
+    /// serverless, DuckDB is in-process).
+    fn warehouse_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// List table names in a given catalog + schema.
+    ///
+    /// Used by `rocky discover` to verify which tables actually exist
+    /// in the source warehouse. Table names should be returned lowercase
+    /// for case-insensitive matching.
+    ///
+    /// Default: returns an error indicating the adapter doesn't support
+    /// listing. Callers should handle the error gracefully (include all
+    /// discovered tables without filtering and log a warning).
+    async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+        Err(AdapterError::not_supported("list_tables"))
+    }
 
     /// Compute checksums for a batch of chunks defined by primary-key
     /// ranges. Used by Rocky's checksum-bisection diff to compare two
@@ -788,6 +925,180 @@ mod tests {
     fn _assert_batch_check_object_safe(_: &dyn BatchCheckAdapter) {}
     fn _assert_dialect_object_safe(_: &dyn SqlDialect) {}
     fn _assert_loader_object_safe(_: &dyn LoaderAdapter) {}
+
+    // ---------------------------------------------------------------
+    // WarehouseAdapter additive-method defaults — these tests pin the
+    // "out-of-tree adapters get rocky-core method parity for free"
+    // contract. Each method has a sensible default so an adapter that
+    // only implements the four required methods (dialect /
+    // execute_statement / execute_query / describe_table / table_exists
+    // / close) still composes with code that calls the additive set.
+    // ---------------------------------------------------------------
+
+    struct MinimalAdapter;
+    struct StubDialect;
+
+    impl SqlDialect for StubDialect {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn format_table_ref(&self, _c: &str, _s: &str, _t: &str) -> AdapterResult<String> {
+            Ok("stub".into())
+        }
+        fn create_table_as(&self, _t: &str, _s: &str) -> String {
+            String::new()
+        }
+        fn insert_into(&self, _t: &str, _s: &str) -> String {
+            String::new()
+        }
+        fn merge_into(
+            &self,
+            _t: &str,
+            _s: &str,
+            _k: &[String],
+            _u: Option<&[String]>,
+        ) -> AdapterResult<String> {
+            Ok(String::new())
+        }
+        fn describe_table_sql(&self, _t: &str) -> String {
+            String::new()
+        }
+        fn drop_table_sql(&self, _t: &str) -> String {
+            String::new()
+        }
+        fn create_catalog_sql(&self, _n: &str) -> Option<AdapterResult<String>> {
+            None
+        }
+        fn create_schema_sql(&self, _c: &str, _s: &str) -> Option<AdapterResult<String>> {
+            None
+        }
+        fn row_hash_expr(&self, _c: &[String]) -> String {
+            String::new()
+        }
+        fn tablesample_clause(&self, _p: u32) -> Option<String> {
+            None
+        }
+        fn select_clause(
+            &self,
+            _c: &ColumnSelection,
+            _m: &[MetadataColumn],
+        ) -> AdapterResult<String> {
+            Ok(String::new())
+        }
+        fn watermark_where(&self, _c: &str, _l: Option<&DateTime<Utc>>) -> AdapterResult<String> {
+            Ok(String::new())
+        }
+        fn insert_overwrite_partition(
+            &self,
+            _t: &str,
+            _f: &str,
+            _s: &str,
+        ) -> AdapterResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait]
+    impl WarehouseAdapter for MinimalAdapter {
+        fn dialect(&self) -> &dyn SqlDialect {
+            &StubDialect
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            Ok(())
+        }
+        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            })
+        }
+        async fn describe_table(&self, _t: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Ok(vec![])
+        }
+        async fn table_exists(&self, _t: &TableRef) -> AdapterResult<bool> {
+            Ok(false)
+        }
+        async fn close(&self) -> AdapterResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn trait_default_execute_statement_with_stats_returns_default() {
+        // Minimal adapters that don't override get an all-None stats
+        // record — adapters opt in to populating fields by overriding.
+        let stats = MinimalAdapter
+            .execute_statement_with_stats("SELECT 1")
+            .await
+            .unwrap();
+        assert!(stats.bytes_scanned.is_none());
+        assert!(stats.bytes_written.is_none());
+        assert!(stats.rows_affected.is_none());
+        assert!(stats.job_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn trait_default_ping_delegates_to_select_one() {
+        // The contract: `ping` exists with a sensible default so
+        // `rocky doctor --check auth` works against every adapter
+        // without per-adapter wiring.
+        MinimalAdapter
+            .ping()
+            .await
+            .expect("default ping is SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn trait_default_explain_errors() {
+        // EXPLAIN is opt-in — adapters that don't override surface a
+        // clear "not supported" rather than emitting bogus cost data.
+        let err = MinimalAdapter.explain("SELECT 1").await.unwrap_err();
+        assert!(err.to_string().contains("explain"));
+    }
+
+    #[tokio::test]
+    async fn trait_default_list_tables_errors() {
+        let err = MinimalAdapter.list_tables("c", "s").await.unwrap_err();
+        assert!(err.to_string().contains("list_tables"));
+    }
+
+    #[test]
+    fn trait_default_is_experimental_returns_false() {
+        // Production-ready adapters get the right default automatically.
+        assert!(!MinimalAdapter.is_experimental());
+    }
+
+    #[test]
+    fn trait_default_warehouse_name_returns_none() {
+        // Snowflake-style warehouses opt in by overriding; everything
+        // else gets None — used by the dialect's `CREATE DYNAMIC TABLE`.
+        assert!(MinimalAdapter.warehouse_name().is_none());
+    }
+
+    #[test]
+    fn execution_stats_default_is_all_none() {
+        let s = ExecutionStats::default();
+        assert!(s.bytes_scanned.is_none());
+        assert!(s.bytes_written.is_none());
+        assert!(s.rows_affected.is_none());
+        assert!(s.job_id.is_none());
+    }
+
+    #[test]
+    fn explain_result_serializes_with_optional_fields() {
+        // Mirrors the rocky-core shape so adapters porting an in-tree
+        // EXPLAIN impl to an out-of-tree adapter don't need to reshape
+        // the result type.
+        let r = ExplainResult {
+            estimated_bytes_scanned: Some(1024),
+            estimated_rows: None,
+            estimated_compute_units: Some(1.5),
+            raw_explain: "PLAN".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"estimated_bytes_scanned\":1024"));
+        assert!(json.contains("\"raw_explain\":\"PLAN\""));
+    }
 
     #[test]
     fn test_table_ref_display() {

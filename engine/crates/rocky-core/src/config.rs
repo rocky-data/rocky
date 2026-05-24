@@ -2361,6 +2361,41 @@ pub struct AdapterConfig {
     /// adapters; absent block defaults to `AlwaysClosed` (no breaker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<FivetranCircuitBreakerConfig>,
+
+    /// Escape hatch for adapter-specific keys this struct doesn't model.
+    ///
+    /// `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the
+    /// top level (`tooken` for `token`) surface as parse errors rather
+    /// than silent ignores. That guard, however, also blocks legitimate
+    /// adapter-specific settings — an out-of-tree Trino adapter wanting
+    /// a `default_schema` slot, a Postgres adapter wanting a non-standard
+    /// `application_name`, etc. — from ever reaching the adapter.
+    ///
+    /// Authors of such adapters declare the keys under a nested `[extra]`
+    /// table:
+    ///
+    /// ```toml
+    /// [adapter.my_trino]
+    /// type = "trino"
+    /// host = "https://trino.example.com"
+    /// token = "${TRINO_JWT}"
+    ///
+    /// [adapter.my_trino.extra]
+    /// default_schema = "analytics"
+    /// x_trino_user = "service-account"
+    /// ```
+    ///
+    /// Top-level typos still error (`tooken = "..."` is still rejected);
+    /// only keys nested under `[adapter.<name>.extra]` flow through to the
+    /// adapter unchanged. Adapters read these via `.extra.get("...")` and
+    /// validate them themselves — Rocky doesn't schema-check the contents.
+    ///
+    /// Values are `serde_json::Value` so the field survives `just codegen`
+    /// (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables /
+    /// arrays still round-trip through serde because they all map to the
+    /// JSON shape.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -2393,6 +2428,7 @@ impl std::fmt::Debug for AdapterConfig {
             .field("ratelimit", &self.ratelimit)
             .field("stampede", &self.stampede)
             .field("circuit_breaker", &self.circuit_breaker)
+            .field("extra", &self.extra)
             .finish()
     }
 }
@@ -6593,6 +6629,7 @@ table = "customers_history"
             ratelimit: None,
             stampede: None,
             circuit_breaker: None,
+            extra: std::collections::BTreeMap::new(),
         };
 
         let debug = format!("{cfg:?}");
@@ -6632,6 +6669,147 @@ table = "customers_history"
             "host missing: {debug}"
         );
         assert!(debug.contains("client_123"), "client_id missing: {debug}");
+    }
+
+    // ---------------------------------------------------------------
+    // AdapterConfig.extra — escape hatch for adapter-specific TOML keys
+    // ---------------------------------------------------------------
+    //
+    // The `extra` field exists so out-of-tree adapters (e.g. rocky-trino
+    // wanting `default_schema`, an arbitrary adapter wanting an
+    // `x_trino_user`-style mandatory header value) can carry adapter-
+    // specific config without the `deny_unknown_fields` guard rejecting
+    // every such file. The tests below pin the contract:
+    //
+    // 1. Known top-level fields parse alongside `[extra]` content.
+    // 2. Top-level typos are still rejected (deny_unknown_fields kept).
+    // 3. `[extra]` accepts string / int / bool / table values
+    //    (TOML scalars round-trip through serde_json::Value).
+    // 4. Missing `[extra]` parses as an empty map (`#[serde(default)]`).
+    // 5. Empty `extra` round-trips without leaking an empty TOML table.
+
+    #[test]
+    fn adapter_extra_carries_through_unknown_keys() {
+        let toml_str = r#"
+type = "trino"
+host = "https://trino.example.com"
+token = "jwt-token-here"
+
+[extra]
+default_schema = "analytics"
+x_trino_user = "service-account"
+"#;
+        let cfg: AdapterConfig = toml::from_str(toml_str).expect("extra keys should parse");
+        assert_eq!(cfg.adapter_type, "trino");
+        assert_eq!(
+            cfg.extra
+                .get("default_schema")
+                .and_then(serde_json::Value::as_str),
+            Some("analytics"),
+        );
+        assert_eq!(
+            cfg.extra
+                .get("x_trino_user")
+                .and_then(serde_json::Value::as_str),
+            Some("service-account"),
+        );
+    }
+
+    #[test]
+    fn adapter_extra_does_not_disable_top_level_typo_detection() {
+        // A typo at the top level must still be rejected — `extra` is the
+        // *only* escape hatch, not a global pass-through.
+        let toml_str = r#"
+type = "trino"
+host = "https://trino.example.com"
+tooken = "this-is-a-typo"
+"#;
+        let result: Result<AdapterConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "top-level typos must still fail with deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn adapter_extra_accepts_mixed_value_types() {
+        let toml_str = r#"
+type = "custom"
+
+[extra]
+str_key = "hello"
+int_key = 42
+bool_key = true
+"#;
+        let cfg: AdapterConfig = toml::from_str(toml_str).expect("mixed-type extra should parse");
+        assert_eq!(
+            cfg.extra.get("str_key").and_then(serde_json::Value::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            cfg.extra.get("int_key").and_then(serde_json::Value::as_i64),
+            Some(42)
+        );
+        assert_eq!(
+            cfg.extra
+                .get("bool_key")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn adapter_extra_accepts_nested_table() {
+        // Nested tables under [extra] flow through as JSON objects, so
+        // adapters can carry structured config (auth profiles, region
+        // maps, etc.) without inventing a top-level key per shape.
+        let toml_str = r#"
+type = "custom"
+
+[extra.auth]
+mode = "jwt"
+issuer = "https://idp.example.com"
+"#;
+        let cfg: AdapterConfig = toml::from_str(toml_str).expect("nested table should parse");
+        let auth = cfg.extra.get("auth").expect("auth sub-table present");
+        assert_eq!(
+            auth.get("mode").and_then(serde_json::Value::as_str),
+            Some("jwt")
+        );
+        assert_eq!(
+            auth.get("issuer").and_then(serde_json::Value::as_str),
+            Some("https://idp.example.com")
+        );
+    }
+
+    #[test]
+    fn adapter_extra_defaults_to_empty_when_absent() {
+        let toml_str = r#"
+type = "duckdb"
+path = ":memory:"
+"#;
+        let cfg: AdapterConfig =
+            toml::from_str(toml_str).expect("config without extra should parse");
+        assert!(cfg.extra.is_empty());
+    }
+
+    #[test]
+    fn adapter_extra_skips_serializing_when_empty() {
+        // skip_serializing_if must hold: an empty `extra` should not appear
+        // in JSON-serialized output, so plan/config snapshots stay tight
+        // and existing fixtures aren't perturbed.
+        let cfg: AdapterConfig = toml::from_str(
+            r#"
+type = "duckdb"
+path = ":memory:"
+"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("\"extra\""),
+            "empty extra leaked into JSON: {json}"
+        );
     }
 
     /// Integration guard for the `ReplicationPlan.config_snapshot` leak

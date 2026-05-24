@@ -689,6 +689,7 @@ mod tests {
             ratelimit: None,
             stampede: None,
             circuit_breaker: None,
+            extra: std::collections::BTreeMap::new(),
         }
     }
 

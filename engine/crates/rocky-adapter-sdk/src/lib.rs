@@ -15,6 +15,7 @@
 //! Adapters declare which SDK version they target via [`AdapterManifest::sdk_version`].
 //! Breaking changes to traits require a minor version bump with a migration guide.
 
+pub mod auth;
 pub mod conformance;
 pub mod manifest;
 pub mod process;
@@ -26,11 +27,13 @@ pub mod traits;
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-export core types that adapters need.
+pub use auth::{AuthProvider, StaticAuthProvider};
 pub use manifest::{AdapterCapabilities, AdapterManifest};
 pub use traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, ColumnInfo, ColumnSelection,
-    DiscoveredConnector, DiscoveredTable, DiscoveryAdapter, DiscoveryResult, FailedSource,
-    FailedSourceErrorClass, FileFormat, FreshnessResult, GovernanceAdapter, Grant, GrantTarget,
-    LoadOptions, LoadResult, LoadSource, LoaderAdapter, MetadataColumn, Permission, QueryResult,
-    RowCountResult, SqlDialect, TableRef, TagTarget, TypeMapper, WarehouseAdapter, is_cloud_uri,
+    DiscoveredConnector, DiscoveredTable, DiscoveryAdapter, DiscoveryResult, ExecutionStats,
+    ExplainResult, FailedSource, FailedSourceErrorClass, FileFormat, FreshnessResult,
+    GovernanceAdapter, Grant, GrantTarget, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
+    MetadataColumn, Permission, QueryResult, RowCountResult, SqlDialect, TableRef, TagTarget,
+    TypeMapper, WarehouseAdapter, is_cloud_uri,
 };
