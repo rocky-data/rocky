@@ -4,10 +4,23 @@
 
 use std::path::{Path, PathBuf};
 
+use rmcp::ErrorData as McpError;
+use rmcp::RoleServer;
+use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
-use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
+// `GetPromptRequestParams`, `PaginatedRequestParams`, and `ListPromptsResult`
+// are referenced unqualified in the code the `#[prompt_handler]` macro emits,
+// so they must be in scope here even though this module names none of them.
+use rmcp::model::{
+    GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
+    PaginatedRequestParams, PromptMessage, PromptMessageRole, ProtocolVersion, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{
+    Json, ServerHandler, prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+};
 
 use rocky_cli::commands;
 use rocky_compiler::compile::{self, CompileResult as CompilerResult, CompilerConfig};
@@ -29,6 +42,7 @@ pub struct RockyMcpServer {
     models_dir: PathBuf,
     root: PathBuf,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +110,20 @@ pub struct ProposeArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
+// MCP prompt arguments are string-typed on the wire; `Serialize` is part of
+// the prompt-macro contract (mirrors rmcp's own examples).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct BuildModelArgs {
+    /// What the user wants to build — the model's purpose in their own words
+    /// (e.g. "daily completed-orders revenue by region"). The prompt threads
+    /// this intent through Rocky's authoring loop.
+    pub intent: String,
+}
+
+// ---------------------------------------------------------------------------
 // Caps for the data-grounding tools.
 // ---------------------------------------------------------------------------
 
@@ -118,6 +146,7 @@ impl RockyMcpServer {
             models_dir,
             root,
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
     }
 
@@ -631,13 +660,93 @@ impl RockyMcpServer {
     }
 }
 
+// `prompt_router`'s `router` arg takes a string ident (unlike `tool_router`);
+// the default generated fn is already named `prompt_router`, so no arg needed.
+#[prompt_router]
+impl RockyMcpServer {
+    /// The actionable, intent-parameterized form of the server `instructions`
+    /// (the `rocky-ai-workflow` skill). Walks a connected agent through
+    /// Rocky's authoring loop for one concrete model, ending at *propose* —
+    /// the human runs `rocky review --approve` + `rocky apply`.
+    #[prompt(
+        name = "build_model",
+        description = "Guide the authoring of one Rocky model from a plain-language intent: \
+         inspect schema -> sample rows -> profile columns -> write SQL -> compile-loop -> \
+         plan preview -> propose. Stops at the human approval gate."
+    )]
+    async fn build_model(
+        &self,
+        Parameters(args): Parameters<BuildModelArgs>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let intent = args.intent.trim();
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "I'll author this Rocky model SQL-first, grounding every decision in the \
+                 real data, and stop at a proposed plan for you to review and apply. \
+                 The substrate trusts my edits because the compiler checked them and you \
+                 sign off the invariants — never because they merely compiled.",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Build a Rocky model for this intent:\n\n  {intent}\n\n\
+                     Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
+                     1. inspect_schema — read every existing model and source table with its \
+                     typed columns. Never guess column names; select only what's actually there.\n\
+                     2. sample_rows — look at real rows before writing any filter or cast. The \
+                     schema tells you a column exists; it does not tell you its literal values, \
+                     its units, or its null rate.\n\
+                     3. profile_column — for any column you filter, cast, or aggregate on, \
+                     check distinct values, null rate, and domain.\n\
+                     4. Write the model as raw SQL (models/<name>.sql + a <name>.toml sidecar \
+                     for strategy + target). SQL is first-class in Rocky — do NOT reach for the \
+                     .rocky DSL unless the user explicitly asks. Keep it minimal and readable.\n\
+                     5. compile — type-check and read the diagnostics. Each carries a code, a \
+                     span, and often a suggestion. Fix against the diagnostic and recompile; \
+                     loop until clean. The compiler is your fast feedback loop — lean on it \
+                     instead of reasoning about correctness in your head.\n\
+                     6. plan_preview — read the exact SQL Rocky would execute and confirm it \
+                     matches the intent before proposing.\n\
+                     7. Encode what you learned while sampling as a contract (required/protected \
+                     columns) or a check (assertion), not just a WHERE clause — that moves the \
+                     invariant into the typed substrate so the compiler enforces it on every \
+                     future run.\n\
+                     8. propose — generate the materialization plan. It is recorded as an \
+                     AI-authored plan with a plan_id.\n\n\
+                     RECONCILE DISCIPLINE (the step that separates a model that compiles from a \
+                     model that is correct): check literal values and units against the sampled \
+                     data, not just the schema. A `WHERE status = 'completed'` that returns zero \
+                     rows because the data actually holds 'COMPLETE' compiles perfectly and is \
+                     wrong. Confirm dollars-vs-cents and UTC-vs-local from real rows.\n\n\
+                     STOP at propose. Never apply an AI-authored change directly — a bare apply \
+                     is refused by design. Surface the plan_id and the review report clearly, \
+                     then the human runs `rocky review <plan-id> --approve` to sign off the \
+                     invariants and `rocky apply <plan-id>` to execute. Do not approve on the \
+                     user's behalf unless they explicitly tell you to."
+                ),
+            ),
+        ];
+
+        Ok(GetPromptResult::new(messages)
+            .with_description(format!("Rocky model-authoring loop for: {intent}")))
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RockyMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(INSTRUCTIONS.to_string())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(INSTRUCTIONS.to_string())
     }
 }
 

@@ -88,7 +88,7 @@ just --list      # All recipes
 ## Coding Standards
 
 ### Rust
-- **Edition**: 2024 (MSRV 1.85)
+- **Edition**: 2024 (MSRV 1.88)
 - **Error handling**: `thiserror` for library errors, `anyhow` for binary/CLI errors
 - **Logging**: `tracing` crate (not `println!`)
 - **SQL safety**: All identifiers validated via `rocky-sql/validation.rs` before interpolation

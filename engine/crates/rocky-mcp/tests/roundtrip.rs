@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, GetPromptRequestParams};
 use rocky_mcp::RockyMcpServer;
 use tempfile::TempDir;
 
@@ -299,6 +299,98 @@ async fn sample_rows_returns_capped_rows_on_duckdb() {
     let rows = sc["rows"].as_array().unwrap();
     assert!(!rows.is_empty(), "sampled at least one row");
     assert!(rows.len() <= 50, "capped at 50 rows");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn prompts_list_includes_build_model() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    let names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
+    assert!(
+        names.iter().any(|n| n == "build_model"),
+        "prompts/list must include build_model, got {names:?}"
+    );
+
+    // The build_model prompt declares its single `intent` argument.
+    let build_model = prompts
+        .iter()
+        .find(|p| p.name == "build_model")
+        .expect("build_model prompt present");
+    let args = build_model
+        .arguments
+        .as_ref()
+        .expect("build_model declares arguments");
+    assert!(
+        args.iter().any(|a| a.name == "intent"),
+        "build_model must declare an `intent` argument"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn prompt_get_build_model_returns_authoring_loop() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let intent = "daily completed-orders revenue by region";
+    let args = serde_json::json!({ "intent": intent })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .get_prompt(GetPromptRequestParams::new("build_model").with_arguments(args))
+        .await
+        .expect("get_prompt build_model");
+
+    assert!(
+        !result.messages.is_empty(),
+        "build_model must return prompt messages"
+    );
+
+    // Flatten every text message into one haystack and assert on the key
+    // workflow steps + the reconcile discipline + the user's intent — wording
+    // is free to drift, but these anchors must survive copy edits.
+    use rmcp::model::PromptMessageContent;
+    let haystack: String = result
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            PromptMessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for anchor in [
+        intent,
+        "inspect_schema",
+        "sample_rows",
+        "profile_column",
+        "compile",
+        "plan_preview",
+        "propose",
+        "review",
+        "apply",
+    ] {
+        assert!(
+            haystack.contains(anchor),
+            "build_model prompt should mention `{anchor}`; full text:\n{haystack}"
+        );
+    }
+    // The reconcile discipline is the load-bearing instruction.
+    assert!(
+        haystack.to_lowercase().contains("reconcile"),
+        "build_model must emphasize the reconcile discipline"
+    );
 
     client.cancel().await.unwrap();
 }
