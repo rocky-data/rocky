@@ -2733,6 +2733,30 @@ adapter = "default"
         let models_dir = dir.join("models");
         std::fs::create_dir(&models_dir).unwrap();
 
+        // `run_branch_promote` resolves the approver identity via
+        // `git config --get user.email`, which is cwd-sensitive (repo-local →
+        // global → system). The promote runs with the cwd set to `dir` below,
+        // so make `dir` a self-contained git repo with a local identity.
+        // Without this the promote fails with "`git config --get user.email`
+        // exited with status 1" on any host whose ambient/global git identity
+        // is unset (e.g. CI runners) — a latent flake that only passed locally
+        // because dev machines usually have a global `user.email` configured.
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup for test repo identity");
+            assert!(
+                status.success(),
+                "git {git_args:?} failed during test setup"
+            );
+        }
+
         // Two transformation models targeting `warehouse.marts.<table>`.
         write_transformation_model(
             &models_dir,
