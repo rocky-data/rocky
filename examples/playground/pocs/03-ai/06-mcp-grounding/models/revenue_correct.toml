@@ -1,0 +1,15 @@
+[strategy]
+type = "full_refresh"
+
+# The invariant learned from sampling, encoded as a typed assertion. Completed
+# revenue is exactly $1000.00 — five completed orders summing to 100000 cents.
+# `rocky test --declarative` runs SUM(revenue_usd) against the materialized
+# target table; the equality holds only for the data-grounded model. The naive
+# model carries no such assertion because its author never looked at the data.
+[[tests]]
+type = "aggregate"
+op = "sum"
+column = "revenue_usd"
+cmp = "eq"
+value = "1000"
+severity = "error"

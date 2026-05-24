@@ -1,0 +1,21 @@
+# 06-mcp-grounding — schema-only authoring vs data-grounded authoring.
+#
+# Persistent DuckDB file: `rocky test --declarative` runs the [[tests]] in a
+# model sidecar against the materialized target table, so the table must
+# already exist in this file (run.sh materializes it first).
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "demo"
