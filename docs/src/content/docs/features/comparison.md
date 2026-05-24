@@ -108,7 +108,7 @@ Quick positioning before the tables:
 | Dagster | **Native** | Yes | Via dbt | No |
 | Airflow | Via CLI | Yes | Via dbt | Yes |
 | Dagster Pipes protocol | **Yes** | No | No | No |
-| Typed output models | **Yes** (28 schemas) | No | No | No |
+| Typed output models | **Yes** (63 schemas) | No | No | No |
 
 ## Data Quality
 

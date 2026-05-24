@@ -76,7 +76,7 @@ if [[ "${OS}" == "Linux" ]]; then
     if ldd /bin/sh 2>/dev/null | grep -q musl || \
        [[ -f /lib/libc.musl-x86_64.so.1 || -f /lib/libc.musl-aarch64.so.1 ]]; then
         echo "Error: Pre-built binaries are not available for musl/Alpine Linux." >&2
-        echo "  Build from source (requires Rust 1.85+):" >&2
+        echo "  Build from source (requires Rust 1.88+):" >&2
         echo "    git clone https://github.com/rocky-data/rocky.git" >&2
         echo "    cd rocky/engine && cargo build --release" >&2
         exit 1

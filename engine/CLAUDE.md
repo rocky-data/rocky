@@ -6,7 +6,7 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 ## Project Structure
 
-Cargo workspace with 22 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 24 members total. Rust edition 2024, MSRV 1.88:
+Cargo workspace with 23 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 25 members total. Rust edition 2024, MSRV 1.88:
 
 The `Plan` enum was deleted in the Phase 3 typed-IR migration; `ModelIr` is now the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
@@ -131,7 +131,7 @@ engine/                         # this directory, inside the rocky monorepo
 ├── rocky/                      # Binary crate (the `rocky` CLI)
 │   └── src/
 │       └── main.rs
-└── examples/                   # 14 self-contained example projects (DuckDB, no credentials)
+└── examples/                   # 15 self-contained example projects (DuckDB, no credentials)
 ```
 
 ## Coding Standards
@@ -249,7 +249,7 @@ To change a CLI output:
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Current count is 60 schemas; run `ls schemas/*.schema.json | wc -l` to verify.
+Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Current count is 63 schemas; run `ls schemas/*.schema.json | wc -l` to verify.
 
 | Command | Output struct |
 |---|---|
