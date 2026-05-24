@@ -14,13 +14,25 @@ import {
 const BRANCH_NAME_PLACEHOLDER = "e.g., fix-price";
 const FILTER_PLACEHOLDER = "e.g., client=acme";
 
-export async function branchApprove(): Promise<void> {
+/** Branch name from a Branches-view tree item (or a string), else undefined. */
+function resolveBranchName(arg: unknown): string | undefined {
+  if (typeof arg === "string" && arg.length > 0) return arg;
+  if (arg && typeof arg === "object" && "branchName" in arg) {
+    const name = (arg as { branchName?: unknown }).branchName;
+    if (typeof name === "string" && name.length > 0) return name;
+  }
+  return undefined;
+}
+
+export async function branchApprove(arg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
-  const name = await promptForInput("Branch name to approve", {
-    placeHolder: BRANCH_NAME_PLACEHOLDER,
-    required: true,
-  });
+  const name =
+    resolveBranchName(arg) ??
+    (await promptForInput("Branch name to approve", {
+      placeHolder: BRANCH_NAME_PLACEHOLDER,
+      required: true,
+    }));
   if (!name) return;
 
   const message = await promptForInput("Approval message (optional)", {
@@ -46,13 +58,15 @@ export async function branchApprove(): Promise<void> {
   }
 }
 
-export async function branchPromote(): Promise<void> {
+export async function branchPromote(arg?: unknown): Promise<void> {
   if (!ensureWorkspace()) return;
 
-  const name = await promptForInput("Branch name to promote", {
-    placeHolder: BRANCH_NAME_PLACEHOLDER,
-    required: true,
-  });
+  const name =
+    resolveBranchName(arg) ??
+    (await promptForInput("Branch name to promote", {
+      placeHolder: BRANCH_NAME_PLACEHOLDER,
+      required: true,
+    }));
   if (!name) return;
 
   const filter = await promptForInput("Filter (optional, key=value)", {

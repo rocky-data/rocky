@@ -345,6 +345,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "rocky.refreshBranches",
+        "title": "Refresh Branches",
+        "category": "Rocky",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "rocky.refreshSources",
         "title": "Refresh Sources",
         "category": "Rocky",
@@ -551,6 +557,14 @@
           "visibility": "collapsed"
         },
         {
+          "id": "rocky.branches",
+          "name": "Branches",
+          "type": "tree",
+          "icon": "$(git-branch)",
+          "contextualTitle": "Rocky Branches",
+          "visibility": "collapsed"
+        },
+        {
           "id": "rocky.help",
           "name": "Help",
           "type": "tree",
@@ -658,9 +672,24 @@
           "command": "rocky.refreshPreviews",
           "when": "view == rocky.previews",
           "group": "navigation"
+        },
+        {
+          "command": "rocky.refreshBranches",
+          "when": "view == rocky.branches",
+          "group": "navigation"
         }
       ],
       "view/item/context": [
+        {
+          "command": "rocky.branchApprove",
+          "when": "view == rocky.branches && viewItem == rockyBranch",
+          "group": "1_promote@1"
+        },
+        {
+          "command": "rocky.branchPromote",
+          "when": "view == rocky.branches && viewItem == rockyBranch",
+          "group": "1_promote@2"
+        },
         {
           "command": "rocky.compile",
           "when": "view == rocky.models && viewItem == rockyModel",
