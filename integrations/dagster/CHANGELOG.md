@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.42.0] — 2026-05-25
+
+Companion to engine `v1.44.0`. Codegen-driven — regenerated Pydantic bindings for the engine's new AI surface (`rocky ai-contract`, `rocky preview rows`, and the `rocky review` AI-authored-plan gate). No new resource wiring or behaviour.
+
+### Changed
+
+- **`types_generated/{ai_contract,preview_rows,review}_schema.py`** generated for the engine's new `rocky ai-contract`, `rocky preview rows`, and `rocky review` output schemas. The new models are additive, so parsing of fixtures captured before this cut stays byte-stable.
+
 ## [1.41.0] — 2026-05-24
 
 Companion to engine `v1.43.0`. The dagster side picks up the warehouse-cooldown parity work plus the regenerated Pydantic bindings for the engine's new config and compile-output surface (the `[freshness]` block and the W005 freshness-coverage diagnostic, the `AdapterConfig.extra` escape hatch). Codegen-driven — no new resource wiring or behaviour beyond the cooldown handler below.

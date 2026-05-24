@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.44.0] — 2026-05-25
+
+The AI-drivable surface lands end-to-end. `rocky mcp` exposes the engine's read-only tools over the Model Context Protocol so an agent can drive Rocky directly, a `build_model` prompt scripts the authoring loop, and AI-authored plans are gated behind `rocky review` before any `rocky apply`. Also ships `rocky ai-contract`, `rocky preview rows`, and a governance-safe ad-hoc SQL preview.
+
+### Added
+
+- **`rocky mcp`: read-only MCP server** — exposes the engine over the Model Context Protocol so an AI agent can drive Rocky through read-only tools (`compile`, `plan_preview`, `lineage`, `test`, `list`, `inspect_schema`, `sample_rows`, `profile_column`, `propose`, plus `breaking_change` and `dependents` for impact analysis). No tool mutates the warehouse or engine state: `sample_rows` / `profile_column` issue DuckDB-only `SELECT`s and return `{unavailable: true}` on any non-DuckDB adapter, and `propose` writes an `ai_authored` plan to `.rocky/plans/` that still requires `rocky review <plan-id> --approve` + `rocky apply <plan-id>` to materialize. Identifiers are validated through `rocky_sql::validation` before composing refs — no raw-input SQL injection.
+- **`build_model` MCP prompt** — a server prompt that scripts the model-authoring loop (inspect → sample → profile → write SQL → compile → plan_preview → propose), stopping at the human review gate and carrying the reconcile discipline (check the data, not just the schema). Bumps the workspace MSRV to 1.88 (the rmcp 1.7 tree requires it).
+- **`rocky ai-contract`: AI-drafted data contracts from observed data** — samples a model and infers a starter data contract (column types, nullability, observed ranges) the author can refine, rather than hand-writing one from scratch. Codegen cascade propagated to the dagster + VS Code bindings.
+- **`rocky preview rows`: inline model / CTE row preview** — previews the output rows of a model or a named CTE, governance-aware (declared masks applied). Backs the VS Code inline-preview panel.
+- **AI-authored-plan review gate (`rocky review`)** — adds a `PlanKind::AiAuthored` discriminator; a bare `rocky apply` refuses to execute an AI-authored plan until a human runs `rocky review <plan-id> --approve`, which records a sign-off marker after reporting the semantic breaking-change delta against a base ref so the approval is informed.
+- **Ad-hoc SQL selection preview (governance-safe)** — previews the result of an ad-hoc SQL selection with governance masks applied, without registering a model.
+
+### Changed
+
+- **`rocky-cli`: typed-output cores extracted from command handlers** — JSON-output construction for `compile` / `plan_preview` / `lineage` / `test` / `list*` is factored into reusable `*_output` core functions so the MCP server and the CLI share one code path. No output-schema change.
+
 ### Fixed
+
+- **`rocky-cli`: clippy `--all-targets` failures surfaced by clippy 1.95** — the MSRV→1.88 bump moved CI to clippy 1.95, which newly flags `collapsible_if` / `manual_is_multiple_of`. Resolved across the workspace so `cargo clippy --all-targets -- -D warnings` stays green.
 
 - **`rocky-cli`: `branch promote` approvals no longer self-invalidate under the canonical state layout** — `models_fingerprint` (folded into `branch_state_hash` by the v1.43.0 model-byte approval binding) walked the `<config_dir>/models` tree but only skipped `.git` / `target` / `.DS_Store`. The canonical state path is `<models>/.rocky-state.redb` (+ its `.lock`), so the state DB lives *inside* the models tree — its mutable bytes were feeding the content hash. The result: the first state-writing command after `branch approve` (including `branch promote` itself) drifted `branch_state_hash`, so a freshly-signed approval failed its own `state_hash_mismatch` check before it could be honoured. `collect_model_files` now also skips any entry whose name starts with `.rocky-state.redb`, so state churn no longer voids approvals; a genuine model-source edit still drifts the hash (approval soundness preserved). Regression test `models_fingerprint_ignores_state_db_but_tracks_model_edits` pins both halves.
 
