@@ -2714,7 +2714,13 @@ adapter = "default"
     /// The approval gate stays disabled (default `[branch.approval]`) and
     /// `--allow-breaking` is passed so the base-ref-missing skip path on the
     /// breaking-change gate doesn't block the promote.
+    ///
+    /// `cwd_lock` is deliberately held across the run's awaits to serialize
+    /// against other cwd-mutating tests in this binary (see the comment at
+    /// the `_cwd_guard` site below); allow the await-holding-lock lint at
+    /// the test level for that reason.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn run_branch_promote_transformation_e2e_succeeds() {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;

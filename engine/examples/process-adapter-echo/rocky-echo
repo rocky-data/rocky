@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Minimal Rocky process adapter — exercises the JSON-RPC wire protocol.
+
+Drop this file on `$PATH` as an executable named `rocky-echo` and Rocky's
+adapter machinery will pick it up via the `cargo`-subcommand convention.
+Once visible, `rocky adapter list` shows it and `rocky test-adapter
+--adapter echo` runs the conformance suite against it.
+
+The adapter is intentionally minimal: it returns a hard-coded table set
+from `describe_table` and confirms every `execute_statement` call without
+talking to a real warehouse. It exists to demonstrate the wire protocol
+and act as a smoke-test target.
+
+Wire protocol (see PROTOCOL.md for the full reference):
+
+    * One JSON object per line on stdin (Rocky -> adapter) and stdout
+      (adapter -> Rocky).
+    * Stderr is for free-form logging.
+    * The first message Rocky sends is `initialize` — the adapter must
+      respond with its manifest.
+    * Subsequent calls mirror the `WarehouseAdapter` trait
+      (`execute_statement`, `execute_query`, `describe_table`,
+      `table_exists`, `shutdown`).
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any
+
+# The set of (catalog, schema, table) the echo adapter pretends exists.
+# Used by `describe_table` and `table_exists` so the conformance suite has
+# something to look at without a real warehouse.
+FAKE_TABLES: dict[tuple[str, str, str], list[dict[str, Any]]] = {
+    ("main", "demo", "events"): [
+        {"name": "id", "data_type": "BIGINT", "nullable": False},
+        {"name": "name", "data_type": "VARCHAR", "nullable": True},
+        {"name": "ts", "data_type": "TIMESTAMP", "nullable": False},
+    ],
+}
+
+MANIFEST: dict[str, Any] = {
+    "name": "echo",
+    "version": "0.1.0",
+    "sdk_version": "0.1.0",
+    "dialect": "echo",
+    "capabilities": {
+        "warehouse": True,
+        "discovery": False,
+        "governance": False,
+        "batch_checks": False,
+        "create_catalog": False,
+        "create_schema": True,
+        "merge": False,
+        "tablesample": False,
+        "file_load": False,
+    },
+    "auth_methods": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
+    },
+}
+
+
+def emit(obj: dict[str, Any]) -> None:
+    """Write a single JSON-RPC message followed by a newline and flush."""
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def ok(req_id: int, result: dict[str, Any]) -> None:
+    emit({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def err(req_id: int, code: str, message: str) -> None:
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": code, "message": message},
+        }
+    )
+
+
+def handle(req: dict[str, Any]) -> bool:
+    """Dispatch one JSON-RPC request. Returns False when the loop should stop."""
+    method = req.get("method", "")
+    rid = req.get("id", 0)
+    params = req.get("params", {}) or {}
+
+    if method == "initialize":
+        ok(rid, {"manifest": MANIFEST})
+        return True
+
+    if method == "execute_statement":
+        sys.stderr.write(f"[rocky-echo] execute_statement: {params.get('sql', '')[:80]}\n")
+        ok(rid, {"ok": True})
+        return True
+
+    if method == "execute_query":
+        # Return an empty result set; the conformance harness only checks
+        # the response shape here.
+        ok(rid, {"columns": [], "rows": []})
+        return True
+
+    if method == "describe_table":
+        key = (params.get("catalog", ""), params.get("schema", ""), params.get("table", ""))
+        columns = FAKE_TABLES.get(key)
+        if columns is None:
+            err(rid, "TABLE_NOT_FOUND", f"unknown table: {'.'.join(key)}")
+        else:
+            ok(rid, {"columns": columns})
+        return True
+
+    if method == "table_exists":
+        key = (params.get("catalog", ""), params.get("schema", ""), params.get("table", ""))
+        ok(rid, {"exists": key in FAKE_TABLES})
+        return True
+
+    if method == "shutdown":
+        ok(rid, {})
+        return False
+
+    err(rid, "UNKNOWN_METHOD", f"method '{method}' not supported by rocky-echo")
+    return True
+
+
+def main() -> int:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # No id available — emit a protocol error with id=0 and keep going.
+            err(0, "PARSE_ERROR", f"invalid JSON: {exc}")
+            continue
+        try:
+            keep_going = handle(req)
+        except Exception as exc:  # noqa: BLE001 — surface any handler bug as an RPC error.
+            err(req.get("id", 0), "INTERNAL", f"{type(exc).__name__}: {exc}")
+            continue
+        if not keep_going:
+            break
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,3 +1,4 @@
+mod adapter;
 mod ai;
 pub mod apply;
 mod archive;
@@ -59,6 +60,9 @@ mod validate;
 mod validate_migration;
 mod watch;
 
+pub use adapter::{
+    discover_adapters_on_path, resolve_adapter_command, run_adapter_info, run_adapter_list,
+};
 pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
 pub use apply::{run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
