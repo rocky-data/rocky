@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.41.0] — 2026-05-24
+
+Companion to engine `v1.43.0`. The dagster side picks up the warehouse-cooldown parity work plus the regenerated Pydantic bindings for the engine's new config and compile-output surface (the `[freshness]` block and the W005 freshness-coverage diagnostic, the `AdapterConfig.extra` escape hatch). Codegen-driven — no new resource wiring or behaviour beyond the cooldown handler below.
+
 ### Changed
 
 - **`_run_filters`: honour engine-supplied `TableError.cooldown_seconds`** for the `retry_after_seconds` hint on quota-exceeded breaches. Closes the warehouse-side parity gap PR #624 documented as a follow-up: when a Databricks or Snowflake circuit breaker trips on a config with `circuit_breaker_recovery_timeout_secs` set, the engine now stamps the warehouse's configured cooldown onto each breach error; the dagster handler reads it (preferring the largest reported cooldown when multiple are present) and projects it onto `dg.Failure.metadata.retry_after_seconds` instead of the hard-coded 300s constant. The constant is retained as a fallback for two cases: (a) manual-reset-only breakers (no `recovery_timeout` configured) emit `None`, (b) older engine binaries don't yet emit the field. Three new tests pin (a) engine-cooldown-wins, (b) largest-cooldown-wins when multiple breaches surface, (c) fallback for `None`.
 - **`TableError.cooldown_seconds: int | None = None`** added to the hand-written Pydantic model in `dagster_rocky/types.py`. Default-`None` preserves byte-stable parsing of fixtures captured before the warehouse-cooldown-parity cut.
 - **`types_generated/run_schema.py`** regenerated to surface the new optional `TableErrorOutput.cooldown_seconds` field shipped in the matching engine cut.
+- **`types_generated/{compile,dag,rocky_project,adapter_config}_schema.py`** regenerated for the engine's `[freshness]` config (project default + per-model `expected_lag_seconds`), the W005 freshness-coverage diagnostic now surfaced in compile/dag output, and the `[adapter.<name>.extra]` escape hatch on `AdapterConfig`. Parsing of fixtures captured before this cut stays byte-stable — the new fields are all optional.
 
 ## [1.40.0] — 2026-05-21
 
