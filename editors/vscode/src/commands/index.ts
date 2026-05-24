@@ -13,6 +13,7 @@ import {
   reportBug,
   viewMarketplace,
 } from "./info";
+import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
 import { registerLineageSerializer, showLineage } from "./lineage";
 import { importDbt, validateMigration } from "./migration";
@@ -82,6 +83,9 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     // Health & analysis
     vscode.commands.registerCommand("rocky.doctor", doctor),
     vscode.commands.registerCommand("rocky.optimize", optimize),
+
+    // Governance
+    vscode.commands.registerCommand("rocky.compliance", compliance),
 
     // Preview (PR-bundle)
     vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
