@@ -65,7 +65,9 @@ mod watch;
 pub use adapter::{
     discover_adapters_on_path, resolve_adapter_command, run_adapter_info, run_adapter_list,
 };
-pub use ai::{run_ai, run_ai_explain, run_ai_sync, run_ai_test};
+pub use ai::{
+    SchemaBuckets, build_schema_context, run_ai, run_ai_explain, run_ai_sync, run_ai_test,
+};
 pub use apply::{run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 #[cfg(feature = "duckdb")]
@@ -80,7 +82,7 @@ pub use ci::run_ci;
 pub use ci_diff::run_ci_diff;
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
-pub use compile::run_compile;
+pub use compile::{compile_output, run_compile};
 pub use completions::run_completions;
 pub use compliance::run_compliance;
 pub use cost::run_cost;
@@ -96,16 +98,17 @@ pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use init::init;
 pub use init_adapter::run_init_adapter;
-pub use lineage::run_lineage;
+pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
 pub use list::{
-    list_adapters, list_consumers, list_deps, list_models, list_pipelines, list_sources,
+    list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
+    list_models_output, list_pipelines, list_pipelines_output, list_sources, list_sources_output,
 };
 pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::run_metrics;
 pub use optimize::run_optimize;
-pub use plan::{PlanRunOptions, plan, plan_promote};
+pub use plan::{PlanRunOptions, plan, plan_preview_output, plan_promote};
 pub use playground::{run_playground, run_playground_with_template};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
@@ -129,7 +132,7 @@ pub use state::{state_clear_schema_cache, state_retention_sweep, state_show};
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]
-pub use test::run_test;
+pub use test::{run_test, test_output};
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
 pub use trace::run_trace;
 pub use validate::validate;

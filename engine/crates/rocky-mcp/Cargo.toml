@@ -1,0 +1,38 @@
+[package]
+name = "rocky-mcp"
+version = "1.43.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Model Context Protocol (MCP) server exposing Rocky's read-only verification and data-grounding tools over stdio."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+rocky-cli = { path = "../rocky-cli" }
+rocky-core = { path = "../rocky-core" }
+rocky-sql = { path = "../rocky-sql" }
+rocky-compiler = { path = "../rocky-compiler" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# rmcp's `#[tool]` macro generates code that references `schemars` (1.x) by
+# path, so the param structs need it as a direct dependency. This is the
+# 1.x major; the rest of the workspace pins 0.8 via [workspace.dependencies].
+schemars = "1"
+
+[dev-dependencies]
+rocky-duckdb = { path = "../rocky-duckdb" }
+tempfile = "3"
+serde_json = { workspace = true }
+# The scripted round-trip test drives the stdio server in-process with an rmcp
+# client over a duplex pipe, so it needs the client side of rmcp too.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "client"] }

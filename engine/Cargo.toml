@@ -21,6 +21,7 @@ members = [
     "crates/rocky-duckdb",
     "crates/rocky-observe",
     "crates/rocky-cli",
+    "crates/rocky-mcp",
     "crates/rocky-wasm",
     "rocky",
     "rocky-lsp",
@@ -85,6 +86,12 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 tokio = { version = "1", features = ["full"] }
+
+# MCP server (Model Context Protocol) — stdio transport only.
+# Transitively pulls schemars 1.x; the rest of the workspace uses schemars
+# 0.8. The dual-major is disjoint (rmcp's `#[tool]` param structs derive
+# schemars 1.x; Rocky's `*Output` structs derive 0.8) and compiles cleanly.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }

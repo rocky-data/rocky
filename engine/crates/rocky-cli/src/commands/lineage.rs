@@ -194,13 +194,9 @@ pub fn run_lineage(
 ///
 /// `result` is a completed compile; `model_name` is the focal model. Errors
 /// when the model is absent from the semantic graph.
-// Reusable typed-output core for a future in-process caller. No internal call
-// site beyond `run_lineage`'s JSON branch yet.
-#[allow(dead_code)]
-pub(crate) fn lineage_output(
-    result: &compile::CompileResult,
-    model_name: &str,
-) -> Result<LineageOutput> {
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`),
+// alongside `run_lineage`'s JSON branch.
+pub fn lineage_output(result: &compile::CompileResult, model_name: &str) -> Result<LineageOutput> {
     let schema = result
         .semantic_graph
         .model_schema(model_name)
@@ -293,10 +289,9 @@ pub(crate) fn lineage_output(
 ///
 /// `downstream` selects the trace direction: `true` traces consumers, `false`
 /// traces sources.
-// Reusable typed-output core for a future in-process caller. No internal call
-// site beyond `run_lineage`'s JSON branch yet.
-#[allow(dead_code)]
-pub(crate) fn column_lineage_output(
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`),
+// alongside `run_lineage`'s JSON branch.
+pub fn column_lineage_output(
     result: &compile::CompileResult,
     model_name: &str,
     column: &str,

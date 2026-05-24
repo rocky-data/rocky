@@ -1412,6 +1412,20 @@ enum Command {
         /// Target shell: bash, elvish, fish, powershell, or zsh
         shell: clap_complete::Shell,
     },
+
+    /// Run the Model Context Protocol (MCP) server over stdio.
+    ///
+    /// Exposes Rocky's read-only verification and data-grounding tools
+    /// (compile, plan_preview, lineage, test, list, inspect_schema,
+    /// sample_rows, profile_column, propose) so any MCP-capable agent harness
+    /// can drive Rocky. Long-running: serves until the client disconnects.
+    /// Materialization stays human-gated — the `propose` tool only writes an
+    /// AI-authored plan; a human runs `rocky review --approve` + `rocky apply`.
+    Mcp {
+        /// Pipeline config file the server resolves the project from.
+        #[arg(long, default_value = "rocky.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2921,6 +2935,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
+        Command::Mcp { config } => rocky_mcp::serve_stdio(config).await,
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit

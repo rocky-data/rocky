@@ -6,10 +6,9 @@ use crate::output::*;
 
 /// Side-effect-free core of `rocky list pipelines`: load the config and
 /// assemble the typed [`ListPipelinesOutput`] without printing.
-// Reusable typed-output core for a future in-process caller. No internal call
-// site yet beyond `list_pipelines`' JSON branch.
-#[allow(dead_code)]
-pub(crate) fn list_pipelines_output(config_path: &Path) -> Result<ListPipelinesOutput> {
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`),
+// alongside `list_pipelines`' JSON branch.
+pub fn list_pipelines_output(config_path: &Path) -> Result<ListPipelinesOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     Ok(ListPipelinesOutput::new(build_pipeline_entries(&cfg)))
 }
@@ -75,9 +74,8 @@ pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
 
 /// Side-effect-free core of `rocky list adapters`: load the config and
 /// assemble the typed [`ListAdaptersOutput`] without printing.
-// Reusable typed-output core for a future in-process caller.
-#[allow(dead_code)]
-pub(crate) fn list_adapters_output(config_path: &Path) -> Result<ListAdaptersOutput> {
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`).
+pub fn list_adapters_output(config_path: &Path) -> Result<ListAdaptersOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     Ok(ListAdaptersOutput::new(build_adapter_entries(&cfg)))
 }
@@ -122,9 +120,8 @@ pub fn list_adapters(config_path: &Path, json: bool) -> Result<()> {
 
 /// Side-effect-free core of `rocky list models`: load the models directory
 /// and assemble the typed [`ListModelsOutput`] without printing.
-// Reusable typed-output core for a future in-process caller.
-#[allow(dead_code)]
-pub(crate) fn list_models_output(models_dir: &Path) -> Result<ListModelsOutput> {
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`).
+pub fn list_models_output(models_dir: &Path) -> Result<ListModelsOutput> {
     Ok(ListModelsOutput::new(build_model_entries(models_dir)?))
 }
 
@@ -205,9 +202,8 @@ pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
 
 /// Side-effect-free core of `rocky list sources`: load the config and
 /// assemble the typed [`ListSourcesOutput`] without printing.
-// Reusable typed-output core for a future in-process caller.
-#[allow(dead_code)]
-pub(crate) fn list_sources_output(config_path: &Path) -> Result<ListSourcesOutput> {
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`).
+pub fn list_sources_output(config_path: &Path) -> Result<ListSourcesOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     Ok(ListSourcesOutput::new(build_source_entries(&cfg)))
 }
