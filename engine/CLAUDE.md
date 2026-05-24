@@ -6,7 +6,7 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 ## Project Structure
 
-Cargo workspace with 22 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 24 members total. Rust edition 2024, MSRV 1.85:
+Cargo workspace with 22 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 24 members total. Rust edition 2024, MSRV 1.88:
 
 The `Plan` enum was deleted in the Phase 3 typed-IR migration; `ModelIr` is now the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 

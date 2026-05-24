@@ -1,6 +1,6 @@
 ---
 name: rust-dep-hygiene
-description: Dependency hygiene for the Rocky engine workspace — how to add/update deps via [workspace.dependencies], MSRV 1.85 policy, cargo-audit / cargo-deny / cargo-machete usage, and how the weekly security audit surfaces advisories.
+description: Dependency hygiene for the Rocky engine workspace — how to add/update deps via [workspace.dependencies], MSRV 1.88 policy, cargo-audit / cargo-deny / cargo-machete usage, and how the weekly security audit surfaces advisories.
 ---
 
 # Dependency hygiene for the Rocky engine
@@ -45,20 +45,22 @@ cargo update                            # Everything — use with care, always r
 
 Major version bumps require editing `engine/Cargo.toml` directly and checking the changelog for breaking changes. Pin the version in `[workspace.dependencies]`, not in individual crates.
 
-## MSRV (1.85, Rust 2024 edition)
+## MSRV (1.88, Rust 2024 edition)
 
 `engine/Cargo.toml` declares:
 
 ```toml
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 ```
+
+> Bumped 1.85.1 → 1.88 on 2026-05-24: the `rocky-mcp` crate's `rmcp 1.7` tree (`rmcp-macros` → `darling 0.23`, plus `time 0.3.47`) requires rustc 1.88, so the effective workspace MSRV was already 1.88.
 
 **Rules:**
 
-1. **Don't use features newer than 1.85** in any engine crate. If a stable feature lands in 1.86+, either wait for the next MSRV bump or gate your usage behind something that compiles on 1.85.
-2. **Dependencies can have their own MSRV.** If a dep requires Rust 1.87 and Rocky is on 1.85, you have two choices: pin an older version of the dep (check `cargo tree` and the dep's changelog) or propose an MSRV bump.
+1. **Don't use features newer than 1.88** in any engine crate. If a stable feature lands in 1.89+, either wait for the next MSRV bump or gate your usage behind something that compiles on 1.88.
+2. **Dependencies can have their own MSRV.** If a dep requires Rust 1.90 and Rocky is on 1.88, you have two choices: pin an older version of the dep (check `cargo tree` and the dep's changelog) or propose an MSRV bump.
 3. **Bumping MSRV is a policy change.** Don't do it unilaterally. Propose to Hugo, note the reason (typically: a dep dropped support for the old MSRV), and bump both the `[workspace.package]` line **and** the CI toolchain installer in `.github/workflows/engine-ci.yml` in the same PR.
 4. **Edition bumps** (2024 → 2027 when that exists) are separate from MSRV bumps and even rarer. Don't conflate them.
 

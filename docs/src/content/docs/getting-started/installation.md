@@ -50,7 +50,7 @@ Direct downloads from the [releases page](https://github.com/rocky-data/rocky/re
 
 ## Build from source
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.88+ (edition 2024).
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git

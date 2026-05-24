@@ -121,7 +121,7 @@ curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/instal
 irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
 ```
 
-**Build from source** (requires Rust 1.85+):
+**Build from source** (requires Rust 1.88+):
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git

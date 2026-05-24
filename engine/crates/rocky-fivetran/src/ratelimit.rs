@@ -170,7 +170,7 @@ fn write_wake_at(path: &Path, wake_at: SystemTime) {
     };
     // Use explicit-trait form so we resolve to fs4 1.x's `FileExt::lock`
     // rather than the std `File::lock` that was stabilised in Rust
-    // 1.89 — the workspace MSRV is 1.85, so we can't rely on the std
+    // 1.89 — the workspace MSRV is 1.88, so we can't rely on the std
     // method existing on every build host.
     if let Err(e) = FileExt::lock(&tmp) {
         warn!(tmp_path = %tmp_path.display(), error = %e, "ratelimit tmp lock failed; skipping write");
