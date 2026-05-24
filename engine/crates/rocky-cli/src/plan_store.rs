@@ -76,6 +76,14 @@ pub enum PlanKind {
     /// recomputed and checked against the persisted value so stale plans are
     /// rejected before any SQL is executed.
     Promote,
+    /// An AI-authored run plan. The payload is a `RunPlan` struct — the same
+    /// shape as [`PlanKind::Run`] — but the kind discriminator marks it as
+    /// machine-authored, so a bare `rocky apply` refuses to execute it until a
+    /// human signs off via `rocky review <plan-id> --approve`. The review step
+    /// writes a marker file alongside the plan; `apply` requires that marker
+    /// before dispatching the same execution path as a `Run` plan.
+    #[serde(rename = "ai_authored")]
+    AiAuthored,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -86,6 +94,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Run => write!(f, "run"),
             PlanKind::Replication => write!(f, "replication"),
             PlanKind::Promote => write!(f, "promote"),
+            PlanKind::AiAuthored => write!(f, "ai_authored"),
         }
     }
 }
@@ -326,6 +335,7 @@ mod tests {
         let id_run = write_plan(dir.path(), PlanKind::Run, &payload)?;
         let id_replication = write_plan(dir.path(), PlanKind::Replication, &payload)?;
         let id_promote = write_plan(dir.path(), PlanKind::Promote, &payload)?;
+        let id_ai = write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
         assert_ne!(
             id_compact, id_archive,
             "different kinds must produce different plan_ids"
@@ -354,7 +364,52 @@ mod tests {
             id_run, id_promote,
             "run and promote must produce different plan_ids"
         );
+        // An AI-authored plan and a plain run plan share the same RunPlan
+        // payload shape, so the *kind* discriminator is the only thing that
+        // makes their digests differ — that's the whole point of the gate.
+        assert_ne!(
+            id_run, id_ai,
+            "run and ai_authored must produce different plan_ids"
+        );
+        assert_ne!(
+            id_compact, id_ai,
+            "compact and ai_authored must produce different plan_ids"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn ai_authored_kind_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.ai_tbl",
+            statement_count: 9,
+        };
+
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        assert_eq!(plan_id.len(), 64);
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::AiAuthored);
+        // AI-authored plans persist via the v1 writer (RunPlan payload), so
+        // the on-disk format_version stays 1 like the other run-shaped kinds.
+        assert_eq!(plan.format_version, 1);
+        assert_eq!(plan.payload["model"], serde_json::json!("cat.sc.ai_tbl"));
+        assert_eq!(plan.payload["statement_count"], serde_json::json!(9));
+        Ok(())
+    }
+
+    /// `PlanKind::AiAuthored` serializes to the multi-word wire name
+    /// `"ai_authored"` (the variant overrides the enum's `lowercase`
+    /// rename with an explicit `serde(rename)`). The apply dispatcher
+    /// relies on this for round-trip dispatch.
+    #[test]
+    fn ai_authored_kind_wire_name() {
+        let kind = PlanKind::AiAuthored;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, r#""ai_authored""#);
+        let parsed: PlanKind = serde_json::from_str(r#""ai_authored""#).unwrap();
+        assert_eq!(parsed, PlanKind::AiAuthored);
     }
 
     #[test]
@@ -436,6 +491,7 @@ mod tests {
         assert_eq!(PlanKind::Run.to_string(), "run");
         assert_eq!(PlanKind::Replication.to_string(), "replication");
         assert_eq!(PlanKind::Promote.to_string(), "promote");
+        assert_eq!(PlanKind::AiAuthored.to_string(), "ai_authored");
     }
 
     #[test]

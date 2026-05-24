@@ -213,6 +213,25 @@ enum Command {
         plan_id: String,
     },
 
+    /// Review an AI-authored plan before it can be applied.
+    ///
+    /// AI agents can author plans, but a bare `rocky apply` refuses to execute
+    /// an AI-authored plan until a human has reviewed it. `rocky review`
+    /// compiles the working-tree models, diffs them against `--base`, and
+    /// reports the breaking-change findings. With `--approve` it records a
+    /// sign-off marker that unblocks `rocky apply <plan-id>`.
+    Review {
+        /// AI-authored plan identifier (64-char blake3 hex) to review.
+        plan_id: String,
+        /// Git ref to diff the working-tree models against.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Record the human sign-off, writing the review marker that
+        /// unblocks `rocky apply`. Without this flag the review is a dry run.
+        #[arg(long)]
+        approve: bool,
+    },
+
     /// Validate config without connecting to any APIs
     Validate,
 
@@ -1857,6 +1876,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Apply { plan_id } => {
             rocky_cli::commands::run_apply(&cli.config, &plan_id, json).await
         }
+        Command::Review {
+            plan_id,
+            base,
+            approve,
+        } => rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await,
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {
             pipeline,
