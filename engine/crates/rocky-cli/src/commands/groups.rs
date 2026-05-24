@@ -20,7 +20,7 @@ pub enum CommandGroup {
     Infra,
     /// Development and tooling: init, playground, serve, lsp, list, shell, validate, bench, export-schemas
     Dev,
-    /// Migration tooling: import-dbt, validate-migration, init-adapter, test-adapter
+    /// Migration tooling: import-dbt, validate-migration, init-adapter, test-adapter, adapter
     Migrate,
     /// Data operations: seed, snapshot, docs
     Data,
@@ -92,7 +92,7 @@ pub fn classify_command(name: &str) -> Option<CommandGroup> {
         "init" | "playground" | "serve" | "lsp" | "list" | "shell" | "validate" | "bench"
         | "export-schemas" | "fmt" => Some(CommandGroup::Dev),
         // Migrate
-        "import-dbt" | "validate-migration" | "init-adapter" | "test-adapter" => {
+        "import-dbt" | "validate-migration" | "init-adapter" | "test-adapter" | "adapter" => {
             Some(CommandGroup::Migrate)
         }
         // Data
@@ -154,6 +154,7 @@ fn commands_for_group(group: CommandGroup) -> &'static [(&'static str, &'static 
             ("validate-migration", "Validate a dbt-to-Rocky migration"),
             ("init-adapter", "Scaffold a new warehouse adapter crate"),
             ("test-adapter", "Run conformance tests against an adapter"),
+            ("adapter", "Discover and inspect process adapters on $PATH"),
         ],
         CommandGroup::Data => &[
             ("seed", "Load CSV seed files into the warehouse"),
@@ -266,6 +267,7 @@ mod tests {
             classify_command("test-adapter"),
             Some(CommandGroup::Migrate)
         );
+        assert_eq!(classify_command("adapter"), Some(CommandGroup::Migrate));
     }
 
     #[test]

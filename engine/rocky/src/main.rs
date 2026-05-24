@@ -1022,6 +1022,17 @@ enum Command {
         name: String,
     },
 
+    /// Discover and inspect process adapters installed on `$PATH`.
+    ///
+    /// Rocky follows the `cargo`-subcommand convention: any `rocky-<name>`
+    /// executable on `$PATH` is treated as a process adapter named `<name>`.
+    /// See `engine/examples/process-adapter-echo/PROTOCOL.md` for the wire
+    /// protocol.
+    Adapter {
+        #[command(subcommand)]
+        subcommand: AdapterAction,
+    },
+
     /// Run conformance tests against an adapter
     TestAdapter {
         /// Built-in adapter name (databricks, snowflake, duckdb)
@@ -1410,6 +1421,21 @@ enum HooksAction {
     Test {
         /// Event name (e.g., on_pipeline_start, on_materialize_error)
         event: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdapterAction {
+    /// List `rocky-<name>` process adapters discovered on `$PATH`.
+    ///
+    /// Each entry is spawned long enough to read its manifest; adapters that
+    /// fail to initialize still appear with an error message so broken
+    /// installs are visible rather than silently skipped.
+    List,
+    /// Print the manifest for an installed process adapter.
+    Info {
+        /// Adapter name (resolved to `rocky-<name>` on `$PATH`).
+        name: String,
     },
 }
 
@@ -2442,13 +2468,28 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             adapter_config,
         } => match (adapter, command) {
             (Some(name), _) => {
-                rocky_cli::commands::run_test_adapter_builtin(&name, None, json).await
+                // `run_test_adapter_builtin` now falls back to PATH-based
+                // `rocky-<name>` resolution when `name` isn't a known
+                // compiled-in adapter, so the config string needs to flow
+                // through for process adapters too.
+                rocky_cli::commands::run_test_adapter_builtin(
+                    &name,
+                    adapter_config.as_deref(),
+                    json,
+                )
+                .await
             }
             (_, Some(cmd)) => {
                 rocky_cli::commands::run_test_adapter(&cmd, adapter_config.as_deref(), json).await
             }
             (None, None) => {
                 anyhow::bail!("either --adapter or --command is required for test-adapter")
+            }
+        },
+        Command::Adapter { subcommand } => match subcommand {
+            AdapterAction::List => rocky_cli::commands::run_adapter_list(json).await,
+            AdapterAction::Info { name } => {
+                rocky_cli::commands::run_adapter_info(&name, json).await
             }
         },
         Command::History {

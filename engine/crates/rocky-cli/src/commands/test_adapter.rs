@@ -10,7 +10,15 @@ use rocky_adapter_sdk::conformance::{self, ConformanceResult};
 use rocky_adapter_sdk::manifest::{AdapterCapabilities, AdapterManifest};
 use rocky_adapter_sdk::process::ProcessAdapter;
 
+use crate::commands::adapter::resolve_adapter_command;
 use crate::output::{TestAdapterOutput, TestAdapterTestResult};
+
+/// Names recognised by the compiled-in / static dispatch arm in
+/// [`run_test_adapter_builtin`]. Anything outside this list falls through to
+/// the PATH-based `rocky-<name>` process-adapter resolution so the same
+/// `--adapter <name>` flag works for both shipped adapters and installed
+/// process adapters.
+const BUILTIN_ADAPTERS: &[&str] = &["databricks", "snowflake", "duckdb"];
 
 /// Run the conformance test suite against a process adapter.
 ///
@@ -86,9 +94,21 @@ pub async fn run_test_adapter(
 /// This validates a compiled-in adapter without spawning a process.
 pub async fn run_test_adapter_builtin(
     adapter_name: &str,
-    _config_path: Option<&str>,
+    config_path: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
+    // PATH-based fallback: an `--adapter foo` that isn't a known builtin is
+    // resolved to a `rocky-foo` binary on `$PATH` and dispatched through the
+    // process-adapter conformance path. This makes `--adapter` the single
+    // user-facing surface for both shipped adapters and installed process
+    // adapters — same flag, same convention as `cargo` subcommands.
+    if !BUILTIN_ADAPTERS.contains(&adapter_name) {
+        if let Some(command) = resolve_adapter_command(adapter_name) {
+            return run_test_adapter(&command.display().to_string(), config_path, json_output)
+                .await;
+        }
+    }
+
     // For built-in adapters, we construct a manifest from the adapter name
     // and run the conformance suite. Actual execution requires a live warehouse,
     // so this mode validates the test plan and capability matching.
@@ -123,7 +143,10 @@ pub async fn run_test_adapter_builtin(
         },
         _ => {
             anyhow::bail!(
-                "unknown built-in adapter '{adapter_name}'. Known adapters: databricks, snowflake, duckdb"
+                "unknown adapter '{adapter_name}'. Known built-in adapters: {builtins}. \
+                 To use a process adapter, install a `rocky-{adapter_name}` binary on $PATH \
+                 (see `rocky adapter list`).",
+                builtins = BUILTIN_ADAPTERS.join(", "),
             );
         }
     };
