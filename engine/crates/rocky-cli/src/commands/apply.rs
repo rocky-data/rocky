@@ -85,6 +85,9 @@ pub(crate) async fn run_apply_in(
             run_apply_replication_plan(root, config_path, plan_id, output_json).await
         }
         PlanKind::Promote => run_apply_promote_plan(root, config_path, plan_id, output_json).await,
+        PlanKind::AiAuthored => {
+            run_apply_ai_authored_plan(root, config_path, plan_id, output_json).await
+        }
     }
 }
 
@@ -118,6 +121,25 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
+    execute_run_plan(config_path, plan_id, run_plan, output_json).await
+}
+
+/// Execute a deserialized [`RunPlan`] against the warehouse.
+///
+/// Shared by [`run_apply_run_plan`] (plain `PlanKind::Run`) and
+/// [`run_apply_ai_authored_plan`] (`PlanKind::AiAuthored`, post-review): the
+/// payload shape is identical, so once the AI-authored gate has cleared, the
+/// execution path is byte-for-byte the same as a plain run plan.
+///
+/// The full flag surface of `rocky run` is replayed from the `RunPlan` —
+/// partitioning, shadow / branch routing, governance override, resume,
+/// idempotency key, and the `--dag` mode.
+async fn execute_run_plan(
+    config_path: &Path,
+    plan_id: &str,
+    run_plan: RunPlan,
+    output_json: bool,
+) -> Result<()> {
     // Build partition options from the persisted flags.
     let partition_opts = crate::commands::run::PartitionRunOptions {
         partition: run_plan.partition.clone(),
@@ -211,6 +233,66 @@ async fn run_apply_run_plan(
     // The `run` command has already emitted its own JSON (or text) output.
     // Nothing more to emit in the inline/non-envelope path.
     Ok(())
+}
+
+/// Path to the review marker for an AI-authored plan:
+/// `<root>/.rocky/plans/<plan_id>.reviewed.json`.
+///
+/// The marker is written by `rocky review <plan-id> --approve` and is the
+/// human sign-off that unblocks `rocky apply` for an AI-authored plan. Its
+/// presence (not its contents) is what the apply gate checks.
+pub(crate) fn review_marker_path(root: &Path, plan_id: &str) -> std::path::PathBuf {
+    root.join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.reviewed.json"))
+}
+
+/// True when an approved review marker exists for `plan_id` under `root`.
+pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
+    review_marker_path(root, plan_id).exists()
+}
+
+/// Apply a `PlanKind::AiAuthored` plan.
+///
+/// AI-authored plans carry a `RunPlan` payload identical in shape to a plain
+/// `PlanKind::Run` plan, but a bare `rocky apply` must NOT execute them — an
+/// AI agent could have authored a change that drops a column or rewrites a
+/// model. Execution is gated on a review marker written by
+/// `rocky review <plan-id> --approve`:
+///
+/// - marker ABSENT → `bail!` instructing the operator to review first.
+/// - marker PRESENT → the human has signed off; dispatch the identical
+///   execution path as [`run_apply_run_plan`] via [`execute_run_plan`].
+async fn run_apply_ai_authored_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    output_json: bool,
+) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read AI-authored plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::AiAuthored {
+        bail!(
+            "plan '{plan_id}' is a {} plan, not an ai_authored plan. \
+             Use `rocky apply {plan_id}` and let the dispatcher route it.",
+            plan.kind,
+        );
+    }
+
+    if !ai_plan_is_reviewed(root, plan_id) {
+        bail!(
+            "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+             An AI agent authored this change, so it cannot be applied directly. \
+             Review the breaking-change report and approve it first with \
+             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+        );
+    }
+
+    let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize ai_authored plan payload")?;
+
+    execute_run_plan(config_path, plan_id, run_plan, output_json).await
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
@@ -803,6 +885,101 @@ mod tests {
             plan.kind,
             PlanKind::Run,
             "compact plan kind must differ from Run"
+        );
+        Ok(())
+    }
+
+    /// `review_marker_path` resolves to
+    /// `<root>/.rocky/plans/<plan_id>.reviewed.json`.
+    #[test]
+    fn review_marker_path_layout() {
+        let root = std::path::Path::new("/tmp/proj");
+        let plan_id = "abc123";
+        let p = super::review_marker_path(root, plan_id);
+        assert_eq!(
+            p,
+            std::path::Path::new("/tmp/proj/.rocky/plans/abc123.reviewed.json")
+        );
+    }
+
+    /// An AI-authored plan with no review marker is reported as not reviewed,
+    /// and the apply gate refuses it. Writing the marker flips the detection.
+    /// (The full execution path needs a warehouse adapter; here we assert the
+    /// guard helper, which is what `run_apply_ai_authored_plan` branches on.)
+    #[test]
+    fn ai_authored_plan_review_gate_detects_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_run_plan();
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+
+        // Sanity: the plan really is AiAuthored, so the dispatcher routes it
+        // to the gated path rather than the bare run path.
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::AiAuthored);
+
+        // No marker yet → not reviewed → apply must refuse.
+        assert!(
+            !super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "fresh AI-authored plan must not count as reviewed"
+        );
+
+        // Write the marker (what `rocky review --approve` does) → reviewed.
+        let marker = super::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap())?;
+        std::fs::write(&marker, b"{}")?;
+        assert!(
+            super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "AI-authored plan with a marker present must count as reviewed"
+        );
+        Ok(())
+    }
+
+    /// The apply-time guard refuses to execute an AI-authored plan that has
+    /// no review marker, with a message pointing at `rocky review`.
+    #[tokio::test]
+    async fn ai_authored_apply_without_marker_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_run_plan();
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+
+        // No marker → the gate bails before any warehouse work. The config
+        // path is never read because the marker check short-circuits first.
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            std::path::Path::new("rocky.toml"),
+            &plan_id,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rocky review"),
+            "refusal must point at `rocky review`, got: {msg}"
+        );
+        assert!(
+            msg.contains("not been reviewed"),
+            "refusal must explain the plan is unreviewed, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Dispatching an AI-authored plan id through a wrong-kind guard reports
+    /// the actual kind rather than silently treating it as a run plan.
+    #[test]
+    fn wrong_kind_for_ai_authored_apply_returns_clear_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id = write_plan(
+            dir.path(),
+            crate::plan_store::PlanKind::Compact,
+            &serde_json::json!({"dummy": true}),
+        )?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, crate::plan_store::PlanKind::Compact);
+        assert_ne!(
+            plan.kind,
+            PlanKind::AiAuthored,
+            "compact plan kind must differ from AiAuthored"
         );
         Ok(())
     }

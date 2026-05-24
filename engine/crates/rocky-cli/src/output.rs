@@ -4694,6 +4694,44 @@ pub struct PromotePlan {
     pub created_at: DateTime<Utc>,
 }
 
+/// JSON output for `rocky review <plan-id>`.
+///
+/// `rocky review` is the human sign-off gate for an AI-authored plan. It
+/// compares the working-tree models against `base_ref`, classifies the
+/// semantic delta, and either reports the findings (dry run) or — with
+/// `--approve` — writes a review marker that unblocks `rocky apply`.
+///
+/// The marker is written even when breaking changes exist, on the premise
+/// that the human approving has seen this report and is signing off on them
+/// explicitly. `breaking_changes` therefore always lists the full classified
+/// delta so the approval is informed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewOutput {
+    pub version: String,
+    pub command: String,
+    /// The AI-authored plan being reviewed (64-char blake3 hex).
+    pub plan_id: String,
+    /// Git ref the working tree was compared against (default `HEAD`).
+    pub base_ref: String,
+    /// True when this invocation wrote the approval marker (i.e. `--approve`
+    /// was set). When false, the review was a dry run and `rocky apply` stays
+    /// blocked.
+    pub approved: bool,
+    /// True when the approval marker is now present on disk as a result of
+    /// this invocation. Mirrors `approved` today; kept distinct so callers
+    /// reading the JSON do not have to infer marker state from the flag.
+    pub marker_written: bool,
+    /// Semantic breaking-change findings between `base_ref` and the working
+    /// tree. Empty when the classifier ran and found no breaking changes;
+    /// absent when the gate was skipped (compile failure on either side, or
+    /// the models directory was unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+    /// Human-readable summary of the review outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// JSON output for `rocky replay <run_id|latest>`.
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every

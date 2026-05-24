@@ -41,6 +41,7 @@ mod preview;
 mod profile_storage;
 mod replay;
 mod retention_status;
+mod review;
 mod run;
 mod run_audit;
 mod run_content_addressed;
@@ -111,6 +112,7 @@ pub use preview::{
 pub use profile_storage::run_profile_storage;
 pub use replay::run_replay;
 pub use retention_status::run_retention_status;
+pub use review::run_review;
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;

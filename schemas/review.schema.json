@@ -1,0 +1,574 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BreakingChange": {
+      "description": "A single typed semantic change between two `ProjectIr` snapshots.\n\nEach variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.",
+      "oneOf": [
+        {
+          "description": "A model present on the base side is absent on the head side.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "model_removed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A model present on the head side is absent on the base side.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "model_added"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column present on the base side is absent on the head side.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "data_type": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_dropped"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "column",
+            "data_type",
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column was added.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "data_type": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_added"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "nullable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "column",
+            "data_type",
+            "kind",
+            "model",
+            "nullable"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's data type changed.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_type_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "narrowing": {
+              "description": "`true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).",
+              "type": "boolean"
+            },
+            "new_type": {
+              "type": "string"
+            },
+            "old_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "narrowing",
+            "new_type",
+            "old_type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's nullability flipped.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_nullability_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_nullable": {
+              "type": "boolean"
+            },
+            "old_nullable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "new_nullable",
+            "old_nullable"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's position in the output schema changed. `SELECT *` downstream consumers see different positional projection.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_reordered"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_index": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "old_index": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "new_index",
+            "old_index"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "materialization_strategy_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_strategy": {
+              "type": "string"
+            },
+            "old_strategy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new_strategy",
+            "old_strategy"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Materialization-specific key columns changed without the top-level variant changing (e.g. `Merge` `unique_key` rewritten, `Incremental` `timestamp_column` swapped).",
+          "properties": {
+            "key_kind": {
+              "description": "Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "materialization_key_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "key_kind",
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "replication_columns_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "partition_by_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Target table reference renamed (catalog, schema, or table component).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "target_renamed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "type": "string"
+            },
+            "old": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Source reference rebound to a different table.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "source_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column mask was added, removed, or its strategy changed.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_mask_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_strategy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "old_strategy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "lakehouse_format_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "type": "string"
+            },
+            "old": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "sql_body_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BreakingFinding": {
+      "description": "A classified finding produced by [`diff_project_ir`].",
+      "properties": {
+        "change": {
+          "$ref": "#/definitions/BreakingChange"
+        },
+        "severity": {
+          "$ref": "#/definitions/BreakingSeverity"
+        }
+      },
+      "required": [
+        "change",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "BreakingSeverity": {
+      "description": "Severity classification for a single semantic change.",
+      "oneOf": [
+        {
+          "description": "Will break a downstream consumer that reads the model's prior shape.",
+          "enum": [
+            "breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "May break consumers depending on usage; e.g. nullable → NOT NULL, column reordered.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Informational only — purely additive or backwards-compatible.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky review <plan-id>`.\n\n`rocky review` is the human sign-off gate for an AI-authored plan. It compares the working-tree models against `base_ref`, classifies the semantic delta, and either reports the findings (dry run) or — with `--approve` — writes a review marker that unblocks `rocky apply`.\n\nThe marker is written even when breaking changes exist, on the premise that the human approving has seen this report and is signing off on them explicitly. `breaking_changes` therefore always lists the full classified delta so the approval is informed.",
+  "properties": {
+    "approved": {
+      "description": "True when this invocation wrote the approval marker (i.e. `--approve` was set). When false, the review was a dry run and `rocky apply` stays blocked.",
+      "type": "boolean"
+    },
+    "base_ref": {
+      "description": "Git ref the working tree was compared against (default `HEAD`).",
+      "type": "string"
+    },
+    "breaking_changes": {
+      "description": "Semantic breaking-change findings between `base_ref` and the working tree. Empty when the classifier ran and found no breaking changes; absent when the gate was skipped (compile failure on either side, or the models directory was unavailable).",
+      "items": {
+        "$ref": "#/definitions/BreakingFinding"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "command": {
+      "type": "string"
+    },
+    "marker_written": {
+      "description": "True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.",
+      "type": "boolean"
+    },
+    "message": {
+      "description": "Human-readable summary of the review outcome.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "plan_id": {
+      "description": "The AI-authored plan being reviewed (64-char blake3 hex).",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "approved",
+    "base_ref",
+    "command",
+    "marker_written",
+    "plan_id",
+    "version"
+  ],
+  "title": "ReviewOutput",
+  "type": "object"
+}
