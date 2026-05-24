@@ -1,3 +1,5 @@
+import { unlink, writeFile } from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig, resolveProjectRoot } from "../config";
@@ -61,19 +63,51 @@ function findCteContaining(
   return undefined;
 }
 
+/** The active editor's non-empty selection text, trimmed. */
+function selectedSql(): string | undefined {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.selection.isEmpty) return undefined;
+  const text = editor.document.getText(editor.selection).trim();
+  return text.length > 0 ? text : undefined;
+}
+
 /**
  * `rocky.previewModel` — preview output rows. When invoked without an explicit
- * model (the Cmd/Ctrl+Enter keybinding or the command palette) it's
- * cursor-aware: if the cursor sits inside a CTE of a `.sql` model, that CTE is
- * previewed instead of the whole model. The model-level "Preview" CodeLens
- * passes the model name explicitly and always previews the full model.
+ * model (the Cmd/Ctrl+Enter keybinding or the command palette) it previews, in
+ * order of preference: a non-empty editor **selection** (ad-hoc), the **CTE**
+ * under the cursor (`.sql` models), else the whole **model**. The model-level
+ * "Preview" CodeLens passes the model name explicitly and always previews the
+ * full model.
  */
 export async function previewModel(arg?: unknown): Promise<void> {
   const explicit = explicitModel(arg);
   const model = explicit ?? activeEditorModel();
   if (!model) return;
-  const cte = explicit ? undefined : await cteUnderCursor();
-  await runPreview(model, cte);
+  if (explicit) {
+    await runPreview(model, undefined);
+    return;
+  }
+  const selection = selectedSql();
+  if (selection) {
+    await runAdhoc(model, selection);
+    return;
+  }
+  await runPreview(model, await cteUnderCursor());
+}
+
+/**
+ * Preview an ad-hoc SQL selection. Writes it to a temp file and runs `preview
+ * rows --sql-file` against the enclosing `model` — the engine refuses when that
+ * model has masked columns, so a selection can't leak pre-mask values.
+ */
+async function runAdhoc(model: string, sql: string): Promise<void> {
+  const tmp = path.join(os.tmpdir(), `rocky-preview-${process.pid}-${Date.now()}.sql`);
+  await writeFile(tmp, sql, "utf8");
+  try {
+    await runPreview(model, undefined, tmp);
+  } finally {
+    await unlink(tmp).catch(() => undefined);
+  }
 }
 
 /** `rocky.previewCte` — preview a single CTE's rows (from the CodeLens). */
@@ -84,14 +118,22 @@ export async function previewCte(arg?: {
   if (arg?.model && arg?.cte) await runPreview(arg.model, arg.cte);
 }
 
-async function runPreview(model: string, cte: string | undefined): Promise<void> {
+async function runPreview(
+  model: string,
+  cte: string | undefined,
+  sqlFile?: string,
+): Promise<void> {
   if (!ensureWorkspace()) return;
   const provider = getQueryResultsProvider();
   if (!provider) return;
 
   const { previewRowLimit, previewAllowWarehouse } = getConfig();
   const cwd = resolveProjectRoot();
-  const title = cte ? `${model} · ${cte}` : model;
+  const title = sqlFile
+    ? `${model} · selection`
+    : cte
+      ? `${model} · ${cte}`
+      : model;
 
   // Reveal the Query Results panel, then show a placeholder while we run.
   await vscode.commands.executeCommand("rocky.queryResults.focus");
@@ -100,7 +142,7 @@ async function runPreview(model: string, cte: string | undefined): Promise<void>
   const run = (allowWarehouse: boolean): Promise<PreviewRowsOutput> =>
     runRockyJsonWithProgress<PreviewRowsOutput>(
       `Previewing ${title}…`,
-      buildPreviewArgs(model, cte, previewRowLimit, allowWarehouse),
+      buildPreviewArgs(model, cte, previewRowLimit, allowWarehouse, sqlFile),
       { cwd },
     );
 

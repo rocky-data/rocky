@@ -1558,6 +1558,13 @@ enum PreviewAction {
         /// Models directory.
         #[arg(long, default_value = "models")]
         models: PathBuf,
+        /// Preview an ad-hoc SQL snippet read from this file instead of the
+        /// model's compiled SQL (used by the editor's "Preview Selection").
+        /// `--model` still names the enclosing model: if it has masked columns,
+        /// ad-hoc preview is refused to avoid leaking pre-mask values.
+        /// Mutually exclusive with `--cte`.
+        #[arg(long)]
+        sql_file: Option<PathBuf>,
     },
 }
 
@@ -2817,6 +2824,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 allow_warehouse,
                 pipeline,
                 models,
+                sql_file,
             } => {
                 rocky_cli::commands::run_preview_rows(
                     &cli.config,
@@ -2827,6 +2835,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     allow_warehouse,
                     pipeline.as_deref(),
                     &models,
+                    sql_file.as_deref(),
                     json,
                 )
                 .await

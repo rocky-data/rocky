@@ -44,6 +44,12 @@ describe("buildPreviewArgs", () => {
     expect(args[args.indexOf("--cte") + 1]).toBe("my_cte");
   });
 
+  it("includes --sql-file for ad-hoc selection preview", () => {
+    const args = buildPreviewArgs("m", undefined, 100, false, "/tmp/sel.sql");
+    expect(args).toContain("--sql-file");
+    expect(args[args.indexOf("--sql-file") + 1]).toBe("/tmp/sel.sql");
+  });
+
   it("appends --allow-warehouse only when allowed", () => {
     expect(buildPreviewArgs("m", undefined, 100, false)).not.toContain(
       "--allow-warehouse",
