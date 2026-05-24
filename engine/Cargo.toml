@@ -209,7 +209,12 @@ googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.33"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# LTO disabled: rustc 1.95 emits LLVM-22 bitcode (e.g. via the
+# `googleapis-tonic-...-bigquery-storage` crate) that the release
+# linkers can't parse — Apple `ld` (libLTO ~15) and zigbuild's
+# `ld.lld` (LLVM 19) both fail with "Unknown attribute kind". Disabling
+# LTO drops the bitcode hand-off entirely. Revisit if the toolchains catch up.
+lto = false
 codegen-units = 1
 panic = "abort"
 strip = true
