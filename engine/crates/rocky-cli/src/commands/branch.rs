@@ -402,7 +402,17 @@ fn collect_model_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == ".git" || name == "target" || name == ".DS_Store" {
+        // Skip VCS/build/OS cruft and Rocky's own state DB. The canonical state
+        // path is `<models>/.rocky-state.redb` (+ its `.lock`), so it lives
+        // *inside* the models tree — folding its mutable bytes into the
+        // fingerprint would drift `branch_state_hash` on every state write and
+        // invalidate a still-valid approval the moment `promote` runs. State is
+        // not model source, so it must not contribute to the content hash.
+        if name == ".git"
+            || name == "target"
+            || name == ".DS_Store"
+            || name.starts_with(".rocky-state.redb")
+        {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
@@ -2038,6 +2048,48 @@ mod tests {
 
         artifact.signature.digest = "0".repeat(64);
         assert!(verify_signature(&artifact).is_err());
+    }
+
+    /// Regression: `models_fingerprint` must ignore Rocky's own state DB.
+    /// The canonical state path is `<models>/.rocky-state.redb`, so it lives
+    /// inside the models tree. If its mutable bytes fed the fingerprint, every
+    /// state write after `branch approve` would drift `branch_state_hash` and
+    /// invalidate the approval before `promote` could honour it. A genuine
+    /// model-source edit must still change the digest.
+    #[test]
+    fn models_fingerprint_ignores_state_db_but_tracks_model_edits() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, "[adapter]\ntype = \"duckdb\"\n").unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id").unwrap();
+
+        let baseline = models_fingerprint(&config_path);
+
+        // Writing (and later mutating) the state DB + its lock inside models/
+        // must NOT change the fingerprint.
+        std::fs::write(models.join(".rocky-state.redb"), b"redb-bytes-v1").unwrap();
+        std::fs::write(models.join(".rocky-state.redb.lock"), b"lock").unwrap();
+        assert_eq!(
+            models_fingerprint(&config_path),
+            baseline,
+            "creating the state DB must not change the models fingerprint"
+        );
+        std::fs::write(models.join(".rocky-state.redb"), b"redb-bytes-v2-mutated").unwrap();
+        assert_eq!(
+            models_fingerprint(&config_path),
+            baseline,
+            "mutating the state DB must not change the models fingerprint"
+        );
+
+        // A real model-source edit must change it (positive control).
+        std::fs::write(models.join("m.sql"), "SELECT 2 AS id").unwrap();
+        assert_ne!(
+            models_fingerprint(&config_path),
+            baseline,
+            "editing a model file must change the fingerprint"
+        );
     }
 
     /// State-hash mismatch is the load-bearing rejection: an approval signed

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky-cli`: `branch promote` approvals no longer self-invalidate under the canonical state layout** — `models_fingerprint` (folded into `branch_state_hash` by the v1.43.0 model-byte approval binding) walked the `<config_dir>/models` tree but only skipped `.git` / `target` / `.DS_Store`. The canonical state path is `<models>/.rocky-state.redb` (+ its `.lock`), so the state DB lives *inside* the models tree — its mutable bytes were feeding the content hash. The result: the first state-writing command after `branch approve` (including `branch promote` itself) drifted `branch_state_hash`, so a freshly-signed approval failed its own `state_hash_mismatch` check before it could be honoured. `collect_model_files` now also skips any entry whose name starts with `.rocky-state.redb`, so state churn no longer voids approvals; a genuine model-source edit still drifts the hash (approval soundness preserved). Regression test `models_fingerprint_ignores_state_db_but_tracks_model_edits` pins both halves.
+
 ## [1.43.0] — 2026-05-24
 
 ### Added
