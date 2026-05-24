@@ -233,6 +233,67 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One classified breaking-change finding, projected from
+/// `rocky_core::breaking_change::BreakingFinding`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BreakingFindingLite {
+    /// The change kind discriminant, e.g. `"column_dropped"`,
+    /// `"column_type_changed"`, `"model_removed"`.
+    pub change: String,
+    /// `"breaking"`, `"warning"`, or `"info"`.
+    pub severity: String,
+    /// Externally-visible target name of the affected model
+    /// (`catalog.schema.table`).
+    pub model: String,
+    /// Affected column, for column-scoped changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// Human-readable description of the change.
+    pub message: String,
+}
+
+/// `breaking_change` result — the semantic delta between the working-tree
+/// models and the models at a base git ref.
+///
+/// When the gate could not run (the base ref or HEAD failed to compile, or the
+/// models directory is missing — typically because the project is not a git
+/// repo), `skipped_reason` is set, `has_breaking` is `false`, `breaking_count`
+/// is `0`, and `findings` is empty. A clean diff and a skipped gate are
+/// therefore distinguishable: check `skipped_reason`.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct BreakingChangeResult {
+    /// `true` when at least one finding is `breaking`-severity.
+    pub has_breaking: bool,
+    /// Count of `breaking`-severity findings.
+    pub breaking_count: usize,
+    /// All classified findings (breaking + warning + info).
+    pub findings: Vec<BreakingFindingLite>,
+    /// Why the breaking-change gate was skipped, when it could not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+}
+
+/// One downstream consumer of a model in a `dependents` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DependentEntry {
+    /// The downstream model that depends on the focal model.
+    pub model: String,
+    /// Columns of the focal model that this dependent reads. Empty when the
+    /// dependency is model-level only (no column-resolved edges).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub via_columns: Vec<String>,
+}
+
+/// `dependents` result — the reverse of `lineage`: downstream models that
+/// consume the focal model, with the focal columns each reads.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DependentsResult {
+    /// The focal model whose consumers were resolved.
+    pub model: String,
+    /// Downstream consumers, sorted by model name.
+    pub dependents: Vec<DependentEntry>,
+}
+
 /// `propose` result — the AI-authored plan id awaiting human review.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProposeResult {

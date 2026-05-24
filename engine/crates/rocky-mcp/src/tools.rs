@@ -109,6 +109,23 @@ pub struct ProposeArgs {
     pub model: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BreakingChangeArgs {
+    /// Git ref to compare the working tree against. Defaults to `"HEAD"`.
+    #[serde(default = "default_base_ref")]
+    pub base: String,
+}
+
+fn default_base_ref() -> String {
+    "HEAD".to_string()
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DependentsArgs {
+    /// The focal model whose downstream consumers to resolve.
+    pub model: String,
+}
+
 // ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
@@ -204,6 +221,61 @@ impl RockyMcpServer {
         };
         load_source_schemas_from_cache(&store, chrono::Utc::now(), cfg.cache.schemas.ttl())
             .unwrap_or_default()
+    }
+
+    /// Classify the semantic breaking changes between the working tree (HEAD
+    /// of the on-disk files) and the models at `base_ref`. Reuses the exact
+    /// compile + classify path `rocky review` runs: compile HEAD with the warm
+    /// source-schema cache, `extract_base_compile` the base ref, lower both to
+    /// `ProjectIr`, and `diff_project_ir`.
+    ///
+    /// On any step that prevents the gate from running (HEAD or base fails to
+    /// compile — typically because the project isn't a git repo), returns a
+    /// result with `skipped_reason` set and zeroed counts so the caller can
+    /// distinguish "clean diff" from "gate didn't run".
+    fn compute_breaking_change(&self, base_ref: &str) -> BreakingChangeResult {
+        let source_schemas = self.load_source_schemas();
+
+        let config = CompilerConfig {
+            models_dir: self.models_dir.clone(),
+            contracts_dir: None,
+            source_schemas: source_schemas.clone(),
+            source_column_info: std::collections::HashMap::new(),
+            ..Default::default()
+        };
+        let head_compile = match compile::compile(&config) {
+            Ok(r) => r,
+            Err(e) => {
+                return BreakingChangeResult {
+                    skipped_reason: Some(format!("HEAD compile failed: {e}")),
+                    ..Default::default()
+                };
+            }
+        };
+
+        let base_compile =
+            match commands::extract_base_compile(base_ref, &self.models_dir, source_schemas) {
+                Ok(r) => r,
+                Err(reason) => {
+                    return BreakingChangeResult {
+                        skipped_reason: Some(format!("base ref '{base_ref}': {reason}")),
+                        ..Default::default()
+                    };
+                }
+            };
+
+        let base_ir = commands::project_ir_from_compile(&base_compile);
+        let head_ir = commands::project_ir_from_compile(&head_compile);
+        let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+
+        let breaking_count = findings.iter().filter(|f| f.is_breaking()).count();
+        let lite = findings.iter().map(breaking_finding_lite).collect();
+        BreakingChangeResult {
+            has_breaking: breaking_count > 0,
+            breaking_count,
+            findings: lite,
+            skipped_reason: None,
+        }
     }
 
     // -------------------------- MUST tools ---------------------------------
@@ -426,6 +498,69 @@ impl RockyMcpServer {
             models: to_entries(model_schemas),
             sources: to_entries(source_tables),
         }))
+    }
+
+    #[tool(
+        description = "Classify the semantic breaking changes between the working-tree models \
+         and the models at a base git ref (default HEAD). Reuses the exact compile + typed-IR \
+         classifier that `rocky review` and the branch-promote gate run. Self-check blast radius \
+         BEFORE propose. Returns {has_breaking, breaking_count, findings:[{change, severity, \
+         model, column?, message}]}. When the gate can't run (non-git project, or either side \
+         fails to compile), `skipped_reason` is set and the counts are zero."
+    )]
+    async fn breaking_change(
+        &self,
+        params: Parameters<BreakingChangeArgs>,
+    ) -> Result<Json<BreakingChangeResult>, String> {
+        let base = params.0.base;
+        Ok(Json(self.compute_breaking_change(&base)))
+    }
+
+    #[tool(
+        description = "List the downstream models that depend on a given model (the reverse of \
+         `lineage`). For each dependent, returns the focal model's columns it reads via \
+         `via_columns`. Use to gauge the blast radius of changing a model before editing it."
+    )]
+    async fn dependents(
+        &self,
+        params: Parameters<DependentsArgs>,
+    ) -> Result<Json<DependentsResult>, String> {
+        let model = params.0.model;
+        let result = self.compile_full().map_err(|e| format!("{e:#}"))?;
+
+        // Assert the focal model exists in the semantic graph — same
+        // not-found contract as `lineage_output`.
+        let schema = result
+            .semantic_graph
+            .model_schema(&model)
+            .ok_or_else(|| format!("model '{model}' not found"))?;
+
+        // Downstream model names come straight from the model schema; the
+        // per-dependent `via_columns` are the focal model's columns that feed
+        // each dependent, collected from the column-level edge set (the
+        // reverse direction of the `lineage` edge filter).
+        let mut dependents: Vec<DependentEntry> = schema
+            .downstream
+            .iter()
+            .map(|dep| {
+                let mut via_columns: Vec<String> = result
+                    .semantic_graph
+                    .edges
+                    .iter()
+                    .filter(|e| *e.source.model == *model && *e.target.model == **dep)
+                    .map(|e| e.source.column.to_string())
+                    .collect();
+                via_columns.sort();
+                via_columns.dedup();
+                DependentEntry {
+                    model: dep.clone(),
+                    via_columns,
+                }
+            })
+            .collect();
+        dependents.sort_by(|a, b| a.model.cmp(&b.model));
+
+        Ok(Json(DependentsResult { model, dependents }))
     }
 
     // ------------------------- SHOULD tools --------------------------------
@@ -829,6 +964,50 @@ fn edge_lite(e: &rocky_cli::output::LineageEdgeRecord) -> LineageEdgeLite {
     }
 }
 
+/// Project a `BreakingFinding` into the lite, schemars-1.x shape.
+///
+/// `change` is the snake_case `kind` discriminant of the tagged
+/// [`rocky_core::breaking_change::BreakingChange`] enum (e.g.
+/// `"column_dropped"`); `model` and the optional `column` are pulled from the
+/// variant; `message` is the debug rendering of the change, matching the
+/// human-readable line `rocky review` emits.
+fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> BreakingFindingLite {
+    use rocky_core::breaking_change::BreakingSeverity;
+    let severity = match f.severity {
+        BreakingSeverity::Breaking => "breaking",
+        BreakingSeverity::Warning => "warning",
+        BreakingSeverity::Info => "info",
+    }
+    .to_string();
+
+    // The enum is `#[serde(tag = "kind", rename_all = "snake_case")]`, so the
+    // serialized object carries the discriminant under `kind` and the variant
+    // fields (incl. `model` and, where present, `column`) at the top level.
+    let value = serde_json::to_value(&f.change).unwrap_or_default();
+    let change = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let column = value
+        .get("column")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    BreakingFindingLite {
+        change,
+        severity,
+        model,
+        column,
+        message: format!("{:?}", f.change),
+    }
+}
+
 /// Render one query cell as a display string, truncating long values.
 fn render_cell(v: serde_json::Value) -> String {
     let s = match v {
@@ -921,5 +1100,39 @@ mod tests {
         let server = RockyMcpServer::new(PathBuf::from("/tmp/proj/rocky.toml"));
         assert_eq!(server.models_dir, PathBuf::from("/tmp/proj/models"));
         assert_eq!(server.root, PathBuf::from("/tmp/proj"));
+    }
+
+    #[test]
+    fn breaking_finding_lite_projects_column_scoped_change() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let finding = BreakingFinding {
+            change: BreakingChange::ColumnDropped {
+                model: "c.s.orders".to_string(),
+                column: "legacy_flag".to_string(),
+                data_type: "String".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        };
+        let lite = breaking_finding_lite(&finding);
+        assert_eq!(lite.change, "column_dropped");
+        assert_eq!(lite.severity, "breaking");
+        assert_eq!(lite.model, "c.s.orders");
+        assert_eq!(lite.column.as_deref(), Some("legacy_flag"));
+        assert!(lite.message.contains("ColumnDropped"));
+    }
+
+    #[test]
+    fn breaking_finding_lite_omits_column_for_model_scoped_change() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let finding = BreakingFinding {
+            change: BreakingChange::ModelRemoved {
+                model: "c.s.orders".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        };
+        let lite = breaking_finding_lite(&finding);
+        assert_eq!(lite.change, "model_removed");
+        assert_eq!(lite.model, "c.s.orders");
+        assert_eq!(lite.column, None);
     }
 }
