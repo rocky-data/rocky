@@ -322,20 +322,101 @@ fn generate_approval_id(now: DateTime<Utc>) -> String {
 
 /// Compute the content-addressed `branch_state_hash` for a branch.
 ///
-/// The hash inputs are intentionally minimal in v1 (Option B in the design
-/// memo): the branch name, its `schema_prefix`, and the rocky.toml content
-/// fingerprint. A change to either the branch metadata or the project
-/// config voids every existing approval. Adding `latest_run_id` and a
-/// `models_hash` are forward-compatible follow-ups — they extend the hashed
-/// payload without breaking the artifact format.
+/// The hash binds an approval to the exact reviewed state: the branch name,
+/// its `schema_prefix`, the `rocky.toml` content fingerprint, and a
+/// fingerprint over the project's model source tree (see
+/// [`models_fingerprint`]). A change to the branch metadata, the project
+/// config, *or any model file* voids every existing approval. (`latest_run_id`
+/// remains a forward-compatible follow-up — it extends the payload without
+/// breaking the artifact format.)
 fn compute_branch_state_hash(record: &BranchRecord, config_path: &Path) -> Result<String> {
     let payload = serde_json::json!({
         "branch": record.name,
         "schema_prefix": record.schema_prefix,
         "config_hash": config_fingerprint(config_path),
+        "models_hash": models_fingerprint(config_path),
     });
     let canonical = canonical_json(&payload)?;
     Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
+}
+
+/// Content fingerprint over the project's model source tree.
+///
+/// Walks `<config_dir>/models` recursively and folds every file's path
+/// (relative to the models root) and bytes into one blake3 digest. The
+/// relative path is hashed alongside the bytes — with `\0` field separators —
+/// so renames and moves register, and entries are sorted by relative path so
+/// the digest is independent of the OS directory-iteration order. `.git`,
+/// `target`, and `.DS_Store` entries are skipped. Returns `"none"` when the
+/// models directory is absent (e.g. replication-only projects); an unreadable
+/// file folds in an `<unreadable>` marker instead of panicking — so the result
+/// is always deterministic, mirroring [`config_fingerprint`]'s graceful
+/// contract.
+///
+/// Scope: this covers the conventional `<config_dir>/models` tree. A project
+/// that points its `models` glob at a non-default directory still has that
+/// glob *declaration* covered by `config_fingerprint` (editing the glob voids
+/// approvals); broadening this walk to arbitrary glob roots is a follow-up if
+/// a non-default layout surfaces.
+fn models_fingerprint(config_path: &Path) -> String {
+    let models_root = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("models");
+    if !models_root.is_dir() {
+        return "none".to_string();
+    }
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_model_files(&models_root, &models_root, &mut files);
+    // Bytewise sort on the relative path so the digest is independent of the
+    // platform's directory-iteration order.
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let mut hasher = blake3::Hasher::new();
+    for (rel, abs) in &files {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        match std::fs::read(abs) {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+            }
+            Err(_) => {
+                hasher.update(b"<unreadable>");
+            }
+        }
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Recursively collect `(relative_path, absolute_path)` for every file under
+/// `dir`, relative to `root`, skipping VCS / build / OS-cruft entries.
+/// Relative paths use `/` separators so the digest is stable across platforms.
+/// Traversal IO errors are swallowed best-effort — an unreadable directory
+/// contributes nothing rather than aborting the whole fingerprint.
+fn collect_model_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == "target" || name == ".DS_Store" {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_model_files(root, &path, out);
+        } else if file_type.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push((rel.to_string_lossy().replace('\\', "/"), path));
+            }
+        }
+    }
 }
 
 /// Produce the canonical-JSON byte payload that an [`ApprovalSignature`]
@@ -1761,6 +1842,13 @@ mod tests {
         path
     }
 
+    /// Write a model source file at `<dir>/models/<rel>`, creating parents.
+    fn write_model(dir: &Path, rel: &str, body: &str) {
+        let path = dir.join("models").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
     /// `branch_state_hash` is byte-identical for the same `(record, config)`
     /// pair — the load-bearing determinism contract that `branch promote`
     /// relies on for its "approval is bound to the exact reviewed state"
@@ -1808,6 +1896,73 @@ mod tests {
         let after = compute_branch_state_hash(&record, &cfg).unwrap();
 
         assert_ne!(before, after);
+    }
+
+    /// An unchanged model tree hashes identically across calls — the
+    /// determinism contract still holds once `models_hash` is folded in.
+    #[test]
+    fn branch_state_hash_stable_with_models_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = write_minimal_config(tmp.path(), "# cfg\n");
+        write_model(tmp.path(), "fct_orders.sql", "SELECT 1 AS id");
+        write_model(tmp.path(), "sub/dim_customers.rocky", "from raw_customers");
+        let record = sample_record("fix-price");
+
+        let h1 = compute_branch_state_hash(&record, &cfg).unwrap();
+        let h2 = compute_branch_state_hash(&record, &cfg).unwrap();
+        assert_eq!(h1, h2, "unchanged model tree must hash identically");
+    }
+
+    /// Editing a model file's bytes must flip the hash — otherwise an
+    /// approval signed against model SQL X would still validate after the SQL
+    /// changed underneath it. This is the soundness hole #13b closes.
+    #[test]
+    fn branch_state_hash_changes_on_model_edit() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = write_minimal_config(tmp.path(), "# cfg\n");
+        write_model(tmp.path(), "fct_orders.sql", "SELECT 1 AS id");
+        let record = sample_record("fix-price");
+        let before = compute_branch_state_hash(&record, &cfg).unwrap();
+
+        write_model(tmp.path(), "fct_orders.sql", "SELECT 2 AS id");
+        let after = compute_branch_state_hash(&record, &cfg).unwrap();
+        assert_ne!(
+            before, after,
+            "a model byte edit must invalidate every existing approval"
+        );
+    }
+
+    /// Adding a new model file must flip the hash.
+    #[test]
+    fn branch_state_hash_changes_on_model_file_add() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = write_minimal_config(tmp.path(), "# cfg\n");
+        write_model(tmp.path(), "a.sql", "SELECT 1");
+        let record = sample_record("fix-price");
+        let before = compute_branch_state_hash(&record, &cfg).unwrap();
+
+        write_model(tmp.path(), "b.sql", "SELECT 2");
+        let after = compute_branch_state_hash(&record, &cfg).unwrap();
+        assert_ne!(before, after, "adding a model must invalidate approvals");
+    }
+
+    /// Renaming a model file (identical bytes, new path) must flip the hash —
+    /// the relative path is part of the hashed payload, not just the sort key.
+    #[test]
+    fn branch_state_hash_changes_on_model_rename() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = write_minimal_config(tmp.path(), "# cfg\n");
+        write_model(tmp.path(), "a.sql", "SELECT 1");
+        let record = sample_record("fix-price");
+        let before = compute_branch_state_hash(&record, &cfg).unwrap();
+
+        std::fs::remove_file(tmp.path().join("models/a.sql")).unwrap();
+        write_model(tmp.path(), "b.sql", "SELECT 1"); // same bytes, new name
+        let after = compute_branch_state_hash(&record, &cfg).unwrap();
+        assert_ne!(
+            before, after,
+            "a rename (identical bytes, new path) must flip the hash"
+        );
     }
 
     /// The signature digest depends on every field in the canonical-JSON
