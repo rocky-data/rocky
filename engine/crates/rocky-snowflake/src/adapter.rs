@@ -1,4 +1,24 @@
 //! Snowflake warehouse adapter implementing [`WarehouseAdapter`].
+//!
+//! ## Arrow (`fetch_arrow_batch`) is intentionally not implemented
+//!
+//! Unlike the Databricks, BigQuery, and Trino adapters, `SnowflakeWarehouseAdapter`
+//! does **not** override [`WarehouseAdapter::fetch_arrow_batch`]; it inherits the
+//! default "not supported" `Err`, and that is permanent for this REST-based adapter.
+//!
+//! Snowflake's public SQL REST API v2 (`/api/v2/statements`, the API this adapter
+//! speaks) only ever returns JSON. Requesting `resultSetMetaData.format = "arrowv1"`
+//! on submit is silently downgraded to `"jsonv2"`, and fetching a partition of a
+//! large result (`GET .../statements/{handle}?partition=N` with
+//! `Accept: application/vnd.apache.arrow.stream`) still comes back as
+//! gzip-compressed JSON with `Content-Type: application/json` — confirmed live
+//! against a 14-partition result, where the Arrow `Accept` header was ignored
+//! outright. Arrow over Snowflake exists only in the native driver protocol
+//! (the Python / JDBC / Go / ADBC connectors), which this adapter does not use.
+//!
+//! Do not add a stub that decodes the JSON rows and rebuilds an Arrow `RecordBatch`
+//! in-process: it would satisfy the trait signature while hiding a full JSON
+//! round-trip behind a columnar API, defeating the point of `fetch_arrow_batch`.
 
 use async_trait::async_trait;
 
