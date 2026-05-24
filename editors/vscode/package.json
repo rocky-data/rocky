@@ -296,6 +296,12 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.compliance",
+        "title": "Check Governance Compliance",
+        "category": "Rocky",
+        "icon": "$(shield)"
+      },
+      {
         "command": "rocky.previewCreate",
         "title": "Rocky: Preview Create (PR diff)",
         "category": "Rocky"
@@ -715,6 +721,11 @@
           "command": "rocky.showCompiledSql",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
           "group": "rocky@5"
+        },
+        {
+          "command": "rocky.compliance",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@6"
         }
       ]
     },
