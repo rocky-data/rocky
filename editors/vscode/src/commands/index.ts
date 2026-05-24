@@ -18,6 +18,7 @@ import { registerLineageSerializer, showLineage } from "./lineage";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
 import { previewCost, previewCreate, previewDiff } from "./preview";
+import { previewCte, previewModel } from "./previewRows";
 import { compare, discover, plan, run } from "./run";
 import { archive, compact, profileStorage } from "./storage";
 import { test } from "./test";
@@ -86,6 +87,10 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
     vscode.commands.registerCommand("rocky.previewDiff", previewDiff),
     vscode.commands.registerCommand("rocky.previewCost", previewCost),
+
+    // Inline row preview → Query Results panel
+    vscode.commands.registerCommand("rocky.previewModel", previewModel),
+    vscode.commands.registerCommand("rocky.previewCte", previewCte),
 
     // Branch approval / promote — gated production writes from a branch
     vscode.commands.registerCommand("rocky.branchApprove", branchApprove),

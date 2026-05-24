@@ -6,6 +6,8 @@ export interface RockyConfig {
   serverPath: string;
   extraArgs: string[];
   inlayHintsEnabled: boolean;
+  previewRowLimit: number;
+  previewAllowWarehouse: boolean;
 }
 
 /** Reads the current Rocky settings. Always re-read; do not cache. */
@@ -15,6 +17,8 @@ export function getConfig(): RockyConfig {
     serverPath: cfg.get<string>("server.path", "rocky"),
     extraArgs: cfg.get<string[]>("server.extraArgs", []),
     inlayHintsEnabled: cfg.get<boolean>("inlayHints.enabled", true),
+    previewRowLimit: cfg.get<number>("preview.rowLimit", 100),
+    previewAllowWarehouse: cfg.get<boolean>("preview.allowWarehouse", false),
   };
 }
 
