@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { registerBranchesView } from "./branchesView";
 import { registerExtensionInfoView } from "./extensionInfoView";
 import type { ExtensionInfoTreeProvider } from "./extensionInfoView";
 import { registerGetStartedView } from "./getStartedView";
@@ -31,6 +32,7 @@ export function registerViews(context: vscode.ExtensionContext): void {
   registerSourcesView(context);
   registerSchemaView(context);
   previewProvider = registerPreviewView(context);
+  registerBranchesView(context);
   registerHelpView(context);
   queryResultsProvider = registerQueryResultsView(context);
 }

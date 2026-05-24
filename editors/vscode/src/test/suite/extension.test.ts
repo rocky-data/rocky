@@ -102,6 +102,7 @@ suite("Rocky Extension", () => {
       "rocky.refreshModels",
       "rocky.refreshRuns",
       "rocky.refreshSources",
+      "rocky.refreshBranches",
     ]) {
       assert.ok(
         commands.includes(expected),
