@@ -141,7 +141,7 @@ Methods worth thinking carefully about:
 
 ## Auth and connection management
 
-The SDK does not prescribe an auth trait — each adapter wires its own. The two patterns worth copying are in-tree:
+The SDK ships an optional `AuthProvider` trait that composes the `Authorization` header with any extra mandatory headers your warehouse requires, such as a user-identity header alongside a bearer token. A `StaticAuthProvider` covers the fixed-credential case. Adapters with bespoke needs can still wire their own; the two patterns worth copying are in-tree:
 
 - **`engine/crates/rocky-databricks/src/auth.rs`** — PAT-first, OAuth M2M fallback. Reads `${DATABRICKS_TOKEN}`; if absent, falls through to the `client_credentials` flow with `${DATABRICKS_CLIENT_ID}` / `${DATABRICKS_CLIENT_SECRET}`. The auto-detection logic is roughly twenty lines.
 - **`engine/crates/rocky-snowflake/src/auth.rs`** — multi-method priority: pre-supplied OAuth bearer wins, then RS256 key-pair JWT, then password. Each method reads from a distinct `${SNOWFLAKE_*}` variable so config files never carry secrets.
@@ -207,7 +207,7 @@ A dynamic registration path (declarative config + crates.io discovery) is on the
 
 These are real and surface during implementation — flagging them up front so you don't lose half a day debugging.
 
-- **Two trait surfaces exist today.** `rocky-adapter-sdk/src/traits.rs` is the public, marketed contract. `rocky-core/src/traits.rs` is a richer superset that the in-tree adapters currently use (it adds methods like `execute_statement_with_stats`, `ExplainResult`, retention APIs). For new out-of-tree adapters, target the SDK — it's the contract that will stay stable. The in-tree richer surface is migrating toward the SDK over time.
+- **The SDK trait surface now mirrors most of the in-tree one.** `rocky-adapter-sdk/src/traits.rs` is the public, marketed contract; `rocky-core/src/traits.rs` is what the in-tree adapters use. The SDK gained default-impl methods for `execute_statement_with_stats` (and `ExecutionStats`), `ping`, `explain` (and `ExplainResult`), `is_experimental`, `warehouse_name`, and `list_tables`, so out-of-tree adapters get the same shape in-tree adapters use. A few methods still differ pending cross-crate type unification — `fetch_arrow_batch`, `clone_table_for_branch`, and the `merge_into` signature, plus a handful of duplicated types (`TableRef`, `ColumnInfo`, `Grant`, `MetadataColumn`). Target the SDK surface and treat those as not-yet-stable.
 - **Identifier validation is not optional.** Anything you splice into SQL must pass `[A-Za-z0-9_]+` (or your warehouse's equivalent). The skeleton's `validate_ident` shows the pattern. SQL-injection-bearing string literals were the subject of [a real CVE-class fix](https://github.com/rocky-data/rocky/pull/293) — don't reinvent that hole.
 - **The `catalog` field in `TableRef` is always present.** Warehouses without catalogs (ClickHouse, Postgres, MySQL) get an empty string. Your dialect's `format_table_ref` is responsible for dropping it.
 - **`AdapterError` is intentionally type-erased.** Use `AdapterError::msg(...)` for ad-hoc errors, `AdapterError::new(my_err)` to wrap an `std::error::Error`, and `AdapterError::not_supported("method_name")` for capabilities your warehouse doesn't have. Don't reach for `thiserror` inside the trait impl — the SDK boxes everything.

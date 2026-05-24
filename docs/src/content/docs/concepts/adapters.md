@@ -120,6 +120,10 @@ Rocky ──stdin──► Adapter Process
 Rocky ◄─stdout── Adapter Process
 ```
 
+### Discovering installed adapters
+
+Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` named `rocky-<name>` registers as the process adapter `<name>` (the bundled `rocky-lsp` is filtered out). Use [`rocky adapter list`](/reference/commands/development/#rocky-adapter) to enumerate the adapters Rocky can see, and `rocky adapter info <name>` to inspect one adapter's manifest.
+
 ### Protocol flow
 
 1. Rocky sends `initialize` with config → adapter responds with `AdapterManifest`

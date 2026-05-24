@@ -11,7 +11,7 @@ Rocky provides a single binary with subcommands for the full pipeline lifecycle.
 - **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
-- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `hooks`, `validate-migration`, `test-adapter`
+- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`
 - **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
 - **Diagnostics**: `doctor`, `compare`
 

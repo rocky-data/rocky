@@ -217,10 +217,10 @@ During `rocky apply`, for each managed catalog and schema:
 1. **Read** desired permissions from `[pipeline.<name>.target.governance.grants]` and `[pipeline.<name>.target.governance.schema_grants]`
 2. **Query** current state with `SHOW GRANTS ON CATALOG` and `SHOW GRANTS ON SCHEMA`
 3. **Compute diff**: Determine which grants to add and which to revoke
-4. **Execute** the necessary `GRANT` and `REVOKE` statements
+4. **Apply** the diff. On Databricks, Rocky reconciles catalog- and schema-level grants through the Unity Catalog permissions API as a single batched request per securable, grouped by principal. On warehouses without a REST permissions API, it emits the equivalent `GRANT` and `REVOKE` SQL. The privilege effect is identical either way; only the transport differs (you will see PATCH requests in Databricks audit logs rather than `GRANT` statements).
 
 ```sql
--- Example generated SQL
+-- Equivalent SQL (the form emitted on SQL-only warehouses)
 GRANT SELECT ON CATALOG `acme_warehouse` TO `group:analysts`;
 GRANT USE SCHEMA ON SCHEMA `acme_warehouse`.`staging__us_west__shopify` TO `group:analysts`;
 REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `group:temp_access`;
