@@ -1501,8 +1501,14 @@ enum PlanSubcommand {
         #[arg(long)]
         allow_breaking: bool,
         /// Filter sources by component value (e.g., --filter client=acme).
+        /// On transformation pipelines, supported keys are
+        /// `table`, `model`, `catalog`, `schema`.
         #[arg(long)]
         filter: Option<String>,
+        /// Pipeline name to plan against — required when `rocky.toml`
+        /// defines more than one pipeline. Omit when there is exactly one.
+        #[arg(long)]
+        pipeline: Option<String>,
         /// Models directory used by the breaking-change gate.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -1564,11 +1570,13 @@ enum BranchAction {
     },
     /// Promote a branch's tables to their production targets.
     ///
-    /// Enumerates the configured replication pipeline's production
-    /// targets, runs the optional `[branch.approval]` gate, runs the
-    /// semantic breaking-change gate against `--base-ref`, and dispatches
+    /// Enumerates the configured pipeline's production targets, runs the
+    /// optional `[branch.approval]` gate, runs the semantic
+    /// breaking-change gate against `--base-ref`, and dispatches
     /// `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM
-    /// branch__<name>.<x>` per target.
+    /// branch__<name>.<x>` per target. Both replication and transformation
+    /// pipelines are supported — replication walks the discovery surface,
+    /// transformation walks the `models` glob.
     ///
     /// When `--plan <plan-id>` is given, the gates are skipped and the
     /// pre-built promote plan is applied directly. The positional `<name>`
@@ -1582,9 +1590,15 @@ enum BranchAction {
         /// Pass the 64-char plan_id returned by `rocky plan promote`.
         #[arg(long)]
         plan: Option<String>,
-        /// Filter sources by component value (e.g., --filter client=acme)
+        /// Filter sources by component value (e.g., --filter client=acme).
+        /// On transformation pipelines, supported keys are
+        /// `table`, `model`, `catalog`, `schema`.
         #[arg(long)]
         filter: Option<String>,
+        /// Pipeline name to promote — required when `rocky.toml` defines
+        /// more than one pipeline. Omit when there is exactly one.
+        #[arg(long)]
+        pipeline: Option<String>,
         /// Bypass the approval gate. Always emits an `ApprovalSkipped`
         /// audit event so the bypass leaves a paper trail.
         #[arg(long)]
@@ -1920,6 +1934,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 base,
                 allow_breaking,
                 filter: promote_filter,
+                pipeline: promote_pipeline,
                 models,
             }) => {
                 let cwd =
@@ -1931,6 +1946,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &base,
                     &name,
                     promote_filter.as_deref(),
+                    promote_pipeline.as_deref(),
                     allow_breaking,
                     json,
                 )
@@ -2584,6 +2600,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 name,
                 plan,
                 filter,
+                pipeline,
                 skip_approval,
                 allow_breaking,
                 base_ref,
@@ -2622,6 +2639,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &base_ref,
                         &branch_name,
                         filter.as_deref(),
+                        pipeline.as_deref(),
                         skip_approval,
                         allow_breaking,
                         json,

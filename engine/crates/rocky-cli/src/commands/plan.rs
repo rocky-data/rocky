@@ -1004,6 +1004,7 @@ pub async fn plan_promote(
     base_ref: &str,
     branch_name: &str,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
     allow_breaking: bool,
     output_json: bool,
 ) -> Result<()> {
@@ -1014,6 +1015,7 @@ pub async fn plan_promote(
         base_ref,
         branch_name,
         filter,
+        pipeline_name,
         allow_breaking,
     )
     .await?;
@@ -1070,6 +1072,7 @@ pub(crate) async fn build_promote_plan_inner(
     base_ref: &str,
     branch_name: &str,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
     allow_breaking: bool,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
@@ -1170,7 +1173,8 @@ pub(crate) async fn build_promote_plan_inner(
     }
 
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
-    let planned_targets = discover_branch_targets_for_plan(config_path, &record, filter).await?;
+    let planned_targets =
+        discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
     let head_ref = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
