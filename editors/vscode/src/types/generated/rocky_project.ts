@@ -47,6 +47,10 @@ export type FivetranStampedeBackend = "none" | "valkey";
  */
 export type BudgetBreachAction = "warn" | "error";
 /**
+ * Severity of a test failure.
+ */
+export type TestSeverity = "error" | "warning";
+/**
  * Supports both single-webhook and multi-webhook syntax per event.
  *
  * Single: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`
@@ -137,10 +141,6 @@ export type QualityAssertion = {
   table: string;
   [k: string]: unknown;
 } & QualityAssertion1;
-/**
- * Severity of a test failure.
- */
-export type TestSeverity = "error" | "warning";
 export type QualityAssertion1 =
   | {
       type: "not_null";
@@ -357,6 +357,14 @@ export interface RockyConfig {
    * Cost estimation configuration.
    */
   cost?: CostSection;
+  /**
+   * Project-level freshness defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit individual fields. See [`ProjectFreshnessConfig`] for the TOML shape:
+   *
+   * ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
+   *
+   * Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
+   */
+  freshness?: ProjectFreshnessConfig;
   /**
    * Shell hooks configuration.
    */
@@ -821,6 +829,27 @@ export interface CostSection {
    * Warehouse size for cost estimation (e.g., "Small", "Medium", "Large").
    */
   warehouse_size?: string;
+}
+/**
+ * Project-level freshness defaults.
+ *
+ * Top-level `[freshness]` block on `rocky.toml`. Provides defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit one or more fields. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).
+ *
+ * All fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` is treated as "no project default" for the W005 soft-warn — the suppression still requires a concrete TTL.
+ */
+export interface ProjectFreshnessConfig {
+  /**
+   * Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value (plus the other fields). When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata.
+   */
+  expected_lag_seconds?: number | null;
+  /**
+   * Default severity reported when the freshness check trips.
+   */
+  severity?: TestSeverity | null;
+  /**
+   * Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
+   */
+  time_column?: string | null;
 }
 /**
  * The `[hook]` section from rocky.toml.

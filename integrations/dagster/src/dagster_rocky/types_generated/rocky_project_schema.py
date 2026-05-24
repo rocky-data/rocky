@@ -1223,7 +1223,7 @@ class TableRef(BaseModel):
     """
 
 
-class TestSeverity1(StrEnum):
+class TestSeverity5(StrEnum):
     """
     Test failure is a hard error — pipeline fails.
     """
@@ -1231,7 +1231,7 @@ class TestSeverity1(StrEnum):
     error = "error"
 
 
-class TestSeverity2(StrEnum):
+class TestSeverity6(StrEnum):
     """
     Test failure is a warning — pipeline continues.
     """
@@ -1430,7 +1430,7 @@ class AggregateCheckToggle1(BaseModel):
     """
 
     enabled: bool | None = False
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of a test failure.
     """
@@ -1464,7 +1464,7 @@ class CustomCheckConfig(BaseModel):
         extra="forbid",
     )
     name: str
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity reported when this check fails.
     """
@@ -1484,7 +1484,7 @@ class FreshnessConfig(BaseModel):
     """
     Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"), value overrides threshold_seconds for matching schemas.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity reported when freshness lag exceeds the threshold.
     """
@@ -1538,7 +1538,7 @@ class NullRateConfig(BaseModel):
     )
     columns: list[str]
     sample_percent: conint(ge=0) | None = 10
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity reported when a column's null rate exceeds the threshold.
     """
@@ -1571,6 +1571,32 @@ class PipelineSourceConfig(BaseModel):
     """
 
 
+class ProjectFreshnessConfig(BaseModel):
+    """
+    Project-level freshness defaults.
+
+    Top-level `[freshness]` block on `rocky.toml`. Provides defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit one or more fields. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).
+
+    All fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` is treated as "no project default" for the W005 soft-warn — the suppression still requires a concrete TTL.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    expected_lag_seconds: conint(ge=0) | None = None
+    """
+    Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value (plus the other fields). When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata.
+    """
+    severity: TestSeverity5 | TestSeverity6 | None = None
+    """
+    Default severity reported when the freshness check trips.
+    """
+    time_column: str | None = None
+    """
+    Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
+    """
+
+
 class QualityAssertion1(BaseModel):
     """
     Assert that a column contains no NULL values.
@@ -1592,7 +1618,7 @@ class QualityAssertion1(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1624,7 +1650,7 @@ class QualityAssertion2(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1656,7 +1682,7 @@ class QualityAssertion3(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1692,7 +1718,7 @@ class QualityAssertion4(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1732,7 +1758,7 @@ class QualityAssertion5(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1768,7 +1794,7 @@ class QualityAssertion6(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1810,7 +1836,7 @@ class QualityAssertion7(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1854,7 +1880,7 @@ class QualityAssertion8(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1892,7 +1918,7 @@ class QualityAssertion9(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1938,7 +1964,7 @@ class QualityAssertion10(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -1978,7 +2004,7 @@ class QualityAssertion11(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -2010,7 +2036,7 @@ class QualityAssertion12(BaseModel):
     """
     Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
     """
-    severity: TestSeverity1 | TestSeverity2 | None = "error"
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity of failure. Defaults to `error`.
     """
@@ -2873,6 +2899,14 @@ class RockyConfig(BaseModel):
     )
     """
     Cost estimation configuration.
+    """
+    freshness: ProjectFreshnessConfig | None = Field({}, validate_default=True)
+    """
+    Project-level freshness defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit individual fields. See [`ProjectFreshnessConfig`] for the TOML shape:
+
+    ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
+
+    Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
     """
     hook: HooksConfig | None = Field({"webhooks": {}}, validate_default=True)
     """

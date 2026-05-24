@@ -67,13 +67,21 @@ pub fn run_compile(
     // Load `[mask]` + `[classifications.allow_unmasked]` for the W004
     // classification-tag completeness check. No rocky.toml (standalone
     // `rocky compile --models models/`) means both come through empty —
-    // W004 never fires, matching the pre-check behaviour.
-    let (mask, allow_unmasked) = match config_path {
+    // W004 never fires, matching the pre-check behaviour. The same
+    // resolved `RockyConfig` also supplies the W005 freshness-coverage
+    // suppression bit — when the top-level `[freshness]` block declares
+    // an `expected_lag_seconds`, every model inherits the default and
+    // W005 stays silent.
+    let (mask, allow_unmasked, project_freshness_default) = match config_path {
         Some(path) => match rocky_config::load_rocky_config(path) {
-            Ok(cfg) => (cfg.mask.clone(), cfg.classifications.allow_unmasked.clone()),
-            Err(_) => (std::collections::BTreeMap::new(), Vec::new()),
+            Ok(cfg) => (
+                cfg.mask.clone(),
+                cfg.classifications.allow_unmasked.clone(),
+                cfg.freshness.has_default(),
+            ),
+            Err(_) => (std::collections::BTreeMap::new(), Vec::new(), false),
         },
-        None => (std::collections::BTreeMap::new(), Vec::new()),
+        None => (std::collections::BTreeMap::new(), Vec::new(), false),
     };
 
     let config = CompilerConfig {
@@ -83,6 +91,7 @@ pub fn run_compile(
         source_column_info: HashMap::new(),
         mask,
         allow_unmasked,
+        project_freshness_default,
     };
 
     let mut result = compile::compile(&config)?;

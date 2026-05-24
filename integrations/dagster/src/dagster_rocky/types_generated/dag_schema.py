@@ -43,19 +43,6 @@ class LineageQualifiedColumn(BaseModel):
     model: str
 
 
-class ModelFreshnessConfig(BaseModel):
-    """
-    Per-model freshness configuration.
-
-    Declares the maximum allowed lag between successive materializations of the model. The compiler does not validate this — it's a metadata field consumed by downstream observability tools.
-    """
-
-    max_lag_seconds: conint(ge=0)
-    """
-    Maximum lag in seconds before the model is considered stale.
-    """
-
-
 class PartitionShapeOutput(BaseModel):
     """
     Partition shape metadata for time-interval nodes.
@@ -216,6 +203,22 @@ class TargetConfig(BaseModel):
     table: str
 
 
+class TestSeverity3(StrEnum):
+    """
+    Test failure is a hard error — pipeline fails.
+    """
+
+    error = "error"
+
+
+class TestSeverity4(StrEnum):
+    """
+    Test failure is a warning — pipeline continues.
+    """
+
+    warning = "warning"
+
+
 class TimeGrain(StrEnum):
     """
     Partition granularity for `time_interval` materialization.
@@ -235,6 +238,31 @@ class LineageEdgeRecord(BaseModel):
     transform: str
     """
     Transform kind: "direct", "cast", "expression", etc. Stringified from `rocky_sql::lineage::TransformKind` to avoid pulling schemars into rocky-sql.
+    """
+
+
+class ModelFreshnessConfig(BaseModel):
+    """
+    Per-model freshness configuration.
+
+    Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
+
+    The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+    """
+
+    max_lag_seconds: conint(ge=0)
+    """
+    Maximum lag in seconds before the model is considered stale.
+
+    Accepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.
+    """
+    severity: TestSeverity3 | TestSeverity4 | None = None
+    """
+    Severity reported when the freshness check trips. Default `warning` keeps the runtime check non-blocking — switch to `error` to fail the pipeline on stale data.
+    """
+    time_column: str | None = None
+    """
+    Optional timestamp column used to evaluate freshness at runtime (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When unset the runtime falls back to the model's last-materialization timestamp from the state store.
     """
 
 

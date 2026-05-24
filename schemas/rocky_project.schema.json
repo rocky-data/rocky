@@ -1863,6 +1863,40 @@
       },
       "type": "object"
     },
+    "ProjectFreshnessConfig": {
+      "additionalProperties": false,
+      "description": "Project-level freshness defaults.\n\nTop-level `[freshness]` block on `rocky.toml`. Provides defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit one or more fields. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).\n\nAll fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` is treated as \"no project default\" for the W005 soft-warn — the suppression still requires a concrete TTL.",
+      "properties": {
+        "expected_lag_seconds": {
+          "description": "Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value (plus the other fields). When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default severity reported when the freshness check trips."
+        },
+        "time_column": {
+          "description": "Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "QualityAssertion": {
       "description": "A single row-level assertion attached to a quality pipeline, scoped to one table in the pipeline's `tables` list.\n\n```toml [[pipeline.nightly_dq.checks.assertions]] name     = \"orders_customer_id_not_null\"  # optional table    = \"orders\" type     = \"not_null\" column   = \"customer_id\" severity = \"error\" ```\n\nThe `type`-specific fields (and `column`, `severity`) are flattened from `TestDecl` — the same surface used by declarative model tests.",
       "oneOf": [
@@ -3452,6 +3486,15 @@
         "warehouse_size": "Medium"
       },
       "description": "Cost estimation configuration."
+    },
+    "freshness": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProjectFreshnessConfig"
+        }
+      ],
+      "default": {},
+      "description": "Project-level freshness defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit individual fields. See [`ProjectFreshnessConfig`] for the TOML shape:\n\n```toml [freshness] expected_lag_seconds = 3600 time_column = \"updated_at\" severity = \"warning\" ```\n\nInheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field)."
     },
     "hook": {
       "allOf": [

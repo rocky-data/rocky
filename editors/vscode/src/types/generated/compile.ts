@@ -12,6 +12,10 @@
  */
 export type Severity = "Error" | "Warning" | "Info";
 /**
+ * Severity of a test failure.
+ */
+export type TestSeverity = "error" | "warning";
+/**
  * Confidence level for an incrementality recommendation.
  */
 export type Confidence = "high" | "medium" | "low";
@@ -262,13 +266,25 @@ export interface CostHint {
 /**
  * Per-model freshness configuration.
  *
- * Declares the maximum allowed lag between successive materializations of the model. The compiler does not validate this — it's a metadata field consumed by downstream observability tools.
+ * Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
+ *
+ * The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
  */
 export interface ModelFreshnessConfig {
   /**
    * Maximum lag in seconds before the model is considered stale.
+   *
+   * Accepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.
    */
   max_lag_seconds: number;
+  /**
+   * Severity reported when the freshness check trips. Default `warning` keeps the runtime check non-blocking — switch to `error` to fail the pipeline on stale data.
+   */
+  severity?: TestSeverity | null;
+  /**
+   * Optional timestamp column used to evaluate freshness at runtime (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When unset the runtime falls back to the model's last-materialization timestamp from the state store.
+   */
+  time_column?: string | null;
   [k: string]: unknown;
 }
 /**

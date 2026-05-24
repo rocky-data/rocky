@@ -1002,6 +1002,48 @@ fn default_suffix_quarantine() -> String {
     "__quarantine".to_string()
 }
 
+/// Project-level freshness defaults.
+///
+/// Top-level `[freshness]` block on `rocky.toml`. Provides defaults
+/// inherited by per-model
+/// [`crate::models::ModelFreshnessConfig`] declarations that omit one
+/// or more fields. Independent of the
+/// [`ChecksConfig::freshness`](FreshnessConfig) check (which lives
+/// under `[checks.freshness]` and feeds the data-quality test pipeline).
+///
+/// All fields are optional. A project-level `[freshness]` with no
+/// `expected_lag_seconds` is treated as "no project default" for the
+/// W005 soft-warn — the suppression still requires a concrete TTL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectFreshnessConfig {
+    /// Default maximum lag in seconds before models are considered
+    /// stale. When set, every model without its own `freshness` block
+    /// inherits this value (plus the other fields). When `None`, no
+    /// project-level default applies — per-model declarations are the
+    /// only source of freshness metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_lag_seconds: Option<u64>,
+    /// Default timestamp column used to evaluate freshness at runtime.
+    /// Inherited by per-model freshness blocks that don't specify their
+    /// own `time_column`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+    /// Default severity reported when the freshness check trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::tests::TestSeverity>,
+}
+
+impl ProjectFreshnessConfig {
+    /// True when the project carries an actionable freshness default
+    /// (an `expected_lag_seconds` value). The W005 compile-time soft
+    /// warn treats a model as covered if either the model itself or
+    /// the project supplies a TTL.
+    pub fn has_default(&self) -> bool {
+        self.expected_lag_seconds.is_some()
+    }
+}
+
 /// Freshness check configuration with optional per-schema overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1975,6 +2017,26 @@ pub struct RockyConfig {
     /// gate consumed by `rocky branch promote`. See [`BranchSection`].
     #[serde(default)]
     pub branch: BranchSection,
+
+    /// Project-level freshness defaults inherited by per-model
+    /// [`crate::models::ModelFreshnessConfig`] declarations that omit
+    /// individual fields. See [`ProjectFreshnessConfig`] for the TOML
+    /// shape:
+    ///
+    /// ```toml
+    /// [freshness]
+    /// expected_lag_seconds = 3600
+    /// time_column = "updated_at"
+    /// severity = "warning"
+    /// ```
+    ///
+    /// Inheritance is field-by-field: a per-model `[freshness]` table
+    /// always wins for the fields it sets; absent fields fall through to
+    /// the project-level default. Models with no per-model `[freshness]`
+    /// at all inherit the project default when it carries an
+    /// `expected_lag_seconds` value (the required field).
+    #[serde(default)]
+    pub freshness: ProjectFreshnessConfig,
 }
 
 impl RockyConfig {

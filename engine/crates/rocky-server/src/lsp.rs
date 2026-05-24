@@ -417,17 +417,26 @@ impl RockyLsp {
         )
         .await;
 
-        // Load `rocky.toml` so the W004 classification-tag check fires in
-        // the LSP. Without `mask` + `allow_unmasked` populated, the
-        // compiler's `check_classification_tags` is a no-op and the IDE
-        // never sees the warning. Project root = `models_dir.parent()`
+        // Load `rocky.toml` so the W004 classification-tag check + W005
+        // freshness coverage check fire in the LSP. Without `mask` +
+        // `allow_unmasked` populated, the compiler's
+        // `check_classification_tags` is a no-op and the IDE never sees
+        // the warning. Without `project_freshness_default`, W005 fires
+        // on every model with a temporal column regardless of the
+        // project-level default. Project root = `models_dir.parent()`
         // (the same assumption the schema-cache loader makes above).
         // Missing or unreadable `rocky.toml` falls back to empty defaults.
-        let (mask, allow_unmasked) = dir_path
+        let (mask, allow_unmasked, project_freshness_default) = dir_path
             .parent()
             .map(|root| root.join("rocky.toml"))
             .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
-            .map(|c| (c.mask, c.classifications.allow_unmasked))
+            .map(|c| {
+                (
+                    c.mask,
+                    c.classifications.allow_unmasked,
+                    c.freshness.has_default(),
+                )
+            })
             .unwrap_or_default();
 
         let config = CompilerConfig {
@@ -437,6 +446,7 @@ impl RockyLsp {
             source_column_info: HashMap::new(),
             mask,
             allow_unmasked,
+            project_freshness_default,
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -559,6 +569,22 @@ impl RockyLsp {
         let toml_path = std::path::PathBuf::from(dir).parent()?.join("rocky.toml");
         let text = std::fs::read_to_string(&toml_path).ok()?;
         let uri = Url::from_file_path(&toml_path).ok()?;
+        Some((uri, text))
+    }
+
+    /// Read a model's sidecar `.toml` and return its URI + raw contents.
+    /// `model_file_path` is the model's `.sql` (or `.rocky`) source path;
+    /// the sidecar is the same path with a `.toml` extension. Returns
+    /// `None` when the sidecar is missing or unreadable — the W005 AI arm
+    /// then skips itself rather than fabricating an edit target. A missing
+    /// sidecar is fine: the AI edit creates the `[freshness]` block in a
+    /// fresh file via [`end_of_document_position`] on the empty text.
+    async fn load_model_sidecar(
+        model_file_path: &str,
+    ) -> Option<(tower_lsp::lsp_types::Url, String)> {
+        let sidecar_path = std::path::Path::new(model_file_path).with_extension("toml");
+        let text = std::fs::read_to_string(&sidecar_path).unwrap_or_default();
+        let uri = Url::from_file_path(&sidecar_path).ok()?;
         Some((uri, text))
     }
 
@@ -2215,6 +2241,42 @@ impl LanguageServer for RockyLsp {
                         actions.push(CodeActionOrCommand::CodeAction(action));
                     }
                 }
+                Some("W005") => {
+                    // W005 — model has temporal output column(s) but no
+                    // `[freshness]` block declared. AI fallback proposes
+                    // a `[freshness]` block appended to the model's
+                    // sidecar `.toml`. The deterministic suggestion (from
+                    // `Diagnostic::with_suggestion`) is also surfaced by
+                    // the catch-all arm below; the AI action is the
+                    // executable fix that actually edits the file.
+                    let Some(model) = self.model_for_uri(result, uri) else {
+                        continue;
+                    };
+
+                    let Some((sidecar_uri, sidecar_text)) =
+                        Self::load_model_sidecar(&model.file_path).await
+                    else {
+                        continue;
+                    };
+
+                    let typed_cols = result
+                        .type_check
+                        .typed_models
+                        .get(&model.config.name)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if let Some(action) = build_ai_freshness_action(
+                        &diag.message,
+                        &model.config.name,
+                        &sidecar_uri,
+                        &sidecar_text,
+                        &typed_cols,
+                        diag,
+                    ) {
+                        actions.push(CodeActionOrCommand::CodeAction(action));
+                    }
+                }
                 _ => {
                     // For any diagnostic with a suggestion, offer it
                     if let Some(compiler_diag) = find_compiler_diagnostic(result, diag) {
@@ -2317,6 +2379,20 @@ impl LanguageServer for RockyLsp {
                 };
                 let outcome = resolve_ai_dsl_action(&resolved_data).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
+            }
+            AI_FRESHNESS_FIX_KIND => {
+                let resolved_data: AiFreshnessActionData = match serde_json::from_value(
+                    data.clone(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, raw = ?data, "code_action_resolve: freshness payload parse failed");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+                let outcome = resolve_ai_freshness_action(&resolved_data).await;
+                apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
             }
             _ => {
                 tracing::warn!(raw = ?data, "code_action_resolve received unknown payload kind");
@@ -2974,6 +3050,10 @@ const AI_CLASSIFICATION_FIX_KIND: &str = "rocky.ai-classification-fix.v1";
 /// DSL pipeline for the affected file.
 const AI_DSL_FIX_KIND: &str = "rocky.ai-dsl-fix.v1";
 
+/// Marker for the W005 freshness-coverage arm. Suggests a `[freshness]`
+/// block appended to the model's sidecar `.toml`.
+const AI_FRESHNESS_FIX_KIND: &str = "rocky.ai-freshness-fix.v1";
+
 /// Diagnostic code for a `.rocky` DSL parse failure. The compile-result
 /// diagnostic stream short-circuits on a `ProjectError::RockyParse`, so
 /// the LSP re-parses each `.rocky` file in the project on recompile
@@ -3445,6 +3525,172 @@ fn end_of_document_position(text: &str) -> Position {
     } else {
         Position::new(line_count.saturating_sub(1), last_line_len)
     }
+}
+
+// ── AI fallback for W005 missing freshness coverage ────────────────────────
+
+/// Serializable payload threaded from [`code_action`] into
+/// [`code_action_resolve`] for the W005 arm. The suggested fix is a
+/// `[freshness]` block appended to the model's sidecar `.toml`, so the
+/// sidecar URI is carried inline alongside the candidate temporal
+/// columns the LLM picks `time_column` from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AiFreshnessActionData {
+    /// Marker matching [`AI_FRESHNESS_FIX_KIND`].
+    kind: String,
+    /// Model the missing-freshness diagnostic fired on.
+    model_name: String,
+    /// LSP URI of the model's sidecar `.toml` — the file the
+    /// `WorkspaceEdit` appends the `[freshness]` block to.
+    sidecar_uri: tower_lsp::lsp_types::Url,
+    /// Current contents of the sidecar captured at code-action time.
+    /// Used both to compute the append range and to ground the LLM so it
+    /// doesn't emit a `[freshness]` block that collides with one already
+    /// present.
+    sidecar_text: String,
+    /// Temporal output columns (DATE / TIMESTAMP / TIMESTAMP_NTZ) of the
+    /// model. The LLM chooses one as the `time_column`. Carried as plain
+    /// names rather than full `TypedColumn`s — the type is implied by the
+    /// W005 condition.
+    temporal_columns: Vec<String>,
+}
+
+/// Build the deferred AI code-action for a W005 missing-freshness
+/// diagnostic. Returns `None` when the model has no temporal columns —
+/// which shouldn't happen for a W005 (the compiler only emits it when at
+/// least one temporal column exists), so divergence here is a compiler
+/// regression rather than untrusted input.
+pub(crate) fn build_ai_freshness_action(
+    _message: &str,
+    model_name: &str,
+    sidecar_uri: &tower_lsp::lsp_types::Url,
+    sidecar_text: &str,
+    typed_cols: &[rocky_compiler::types::TypedColumn],
+    diag: &Diagnostic,
+) -> Option<CodeAction> {
+    let temporal_columns: Vec<String> = typed_cols
+        .iter()
+        .filter(|c| c.data_type.is_temporal())
+        .map(|c| c.name.clone())
+        .collect();
+    if temporal_columns.is_empty() {
+        return None;
+    }
+
+    let title = format!("AI fix: add `[freshness]` block to {model_name}.toml");
+
+    let data = AiFreshnessActionData {
+        kind: AI_FRESHNESS_FIX_KIND.to_string(),
+        model_name: model_name.to_string(),
+        sidecar_uri: sidecar_uri.clone(),
+        sidecar_text: sidecar_text.to_string(),
+        temporal_columns,
+    };
+
+    Some(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: None,
+        data: Some(serde_json::to_value(data).ok()?),
+        ..Default::default()
+    })
+}
+
+/// Resolve a W005 AI action — call the LLM, extract a `[freshness]`
+/// TOML snippet, and emit a `TextEdit` that appends it to the end of the
+/// model's sidecar `.toml`. Appending (rather than splicing into an
+/// existing block) keeps the edit logic predictable when the sidecar has
+/// no `[freshness]` section at all — including the empty-file case where
+/// the sidecar didn't previously exist.
+async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveOutcome {
+    let api_key = match std::env::var(AI_API_KEY_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return AiResolveOutcome::Disabled(format!(
+                "{AI_API_KEY_ENV} not set in the LSP environment"
+            ));
+        }
+    };
+
+    let (system_prompt, user_prompt) =
+        build_freshness_fix_prompt(&data.model_name, &data.temporal_columns, &data.sidecar_text);
+
+    let ai_config = rocky_ai::client::AiConfig {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        api_key: rocky_core::redacted::RedactedString::new(api_key),
+        default_format: "toml".to_string(),
+        max_attempts: 1,
+        max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+    };
+
+    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+        Ok(c) => c,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+
+    let response = match client.generate(&system_prompt, &user_prompt, None).await {
+        Ok(r) => r,
+        Err(e) => return AiResolveOutcome::Disabled(format!("AI request failed: {e}")),
+    };
+
+    let extracted = rocky_ai::generate::extract_code(&response.content);
+    let snippet = extracted.trim();
+    if snippet.is_empty() {
+        return AiResolveOutcome::Disabled(
+            "AI response did not contain a TOML code block".to_string(),
+        );
+    }
+
+    let append_position = end_of_document_position(&data.sidecar_text);
+    let prefix = if data.sidecar_text.is_empty() || data.sidecar_text.ends_with("\n\n") {
+        ""
+    } else if data.sidecar_text.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let new_text = format!("{prefix}{snippet}\n");
+
+    AiResolveOutcome::Edit(TextEdit {
+        range: Range::new(append_position, append_position),
+        new_text,
+    })
+}
+
+/// Build the LLM prompt for a W005 freshness-coverage fix. The system
+/// half encodes the role + output-format constraint; the user half
+/// supplies the per-call context (model name, candidate temporal
+/// columns, current sidecar). Splitting this way keeps the system
+/// portion stable across resolves for prompt caching.
+fn build_freshness_fix_prompt(
+    model_name: &str,
+    temporal_columns: &[String],
+    sidecar_text: &str,
+) -> (String, String) {
+    let system = "You are an expert Rocky data-pipeline reviewer. Your task is to \
+                 propose a TOML `[freshness]` block for a model's sidecar `.toml` so \
+                 the model declares a time-to-live after which it is considered \
+                 stale. Set `expected_lag_seconds` to a sensible TTL for the model \
+                 (e.g. 3600 for hourly data, 86400 for daily). Set `time_column` to \
+                 the most appropriate timestamp/date column from the supplied \
+                 candidates. Output ONLY the new TOML block inside a single ```toml \
+                 fenced block — no commentary, no explanation, no diff. The block \
+                 must start with `[freshness]` on its own line."
+        .to_string();
+
+    let candidates = temporal_columns.join(", ");
+    let user = format!(
+        "Model: `{model_name}`\n\
+         Candidate temporal columns: {candidates}\n\n\
+         Current sidecar `.toml`:\n```toml\n{sidecar_text}\n```\n\n\
+         Emit a `[freshness]` block with `expected_lag_seconds` and a \
+         `time_column` chosen from the candidates. Do not duplicate or modify \
+         any existing block."
+    );
+
+    (system, user)
 }
 
 // ── AI fallback for `.rocky` DSL parse errors (E028) ───────────────────────
@@ -5430,6 +5676,7 @@ mod tests {
 
         // Mirror `recompile()`'s mask/allow_unmasked threading.
         let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
+        let project_freshness_default = cfg.freshness.has_default();
         let compile_config = rocky_compiler::compile::CompilerConfig {
             models_dir: models_dir.clone(),
             contracts_dir: None,
@@ -5437,6 +5684,7 @@ mod tests {
             source_column_info: HashMap::new(),
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,
+            project_freshness_default,
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

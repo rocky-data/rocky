@@ -176,13 +176,31 @@
       "type": "object"
     },
     "ModelFreshnessConfig": {
-      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model. The compiler does not validate this — it's a metadata field consumed by downstream observability tools.",
+      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\nThe compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
       "properties": {
         "max_lag_seconds": {
-          "description": "Maximum lag in seconds before the model is considered stale.",
+          "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Severity reported when the freshness check trips. Default `warning` keeps the runtime check non-blocking — switch to `error` to fail the pipeline on stale data."
+        },
+        "time_column": {
+          "description": "Optional timestamp column used to evaluate freshness at runtime (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When unset the runtime falls back to the model's last-materialization timestamp from the state store.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -493,6 +511,25 @@
         "table"
       ],
       "type": "object"
+    },
+    "TestSeverity": {
+      "description": "Severity of a test failure.",
+      "oneOf": [
+        {
+          "description": "Test failure is a hard error — pipeline fails.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Test failure is a warning — pipeline continues.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "TimeGrain": {
       "description": "Partition granularity for `time_interval` materialization.\n\nThe granularity determines: - The canonical partition key format (see [`TimeGrain::format_str`]). - How `@start_date` / `@end_date` placeholders are computed per partition. - What column types are valid (`hour` requires TIMESTAMP; others accept DATE).",
