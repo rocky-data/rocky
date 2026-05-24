@@ -67,6 +67,14 @@ suite("Rocky Extension", () => {
     );
   });
 
+  test("rocky.dag command is registered", async () => {
+    const commands = await vscode.commands.getCommands(true);
+    assert.ok(
+      commands.includes("rocky.dag"),
+      "rocky.dag command should be registered",
+    );
+  });
+
   test("rocky.doctor command exists", async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(

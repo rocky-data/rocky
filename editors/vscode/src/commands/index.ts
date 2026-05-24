@@ -4,6 +4,7 @@ import { aiExplain, aiGenerate, aiSync, aiTest } from "./ai";
 import { branchApprove, branchPromote } from "./branch";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
+import { showDag } from "./dag";
 import { hooksList, hooksTest } from "./hooks";
 import {
   init,
@@ -86,6 +87,9 @@ export function registerCommands(context: vscode.ExtensionContext): void {
 
     // Governance
     vscode.commands.registerCommand("rocky.compliance", compliance),
+
+    // Execution plan (topological run schedule)
+    vscode.commands.registerCommand("rocky.dag", showDag),
 
     // Preview (PR-bundle)
     vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
