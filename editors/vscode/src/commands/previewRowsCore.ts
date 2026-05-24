@@ -26,9 +26,11 @@ export function buildPreviewArgs(
   cte: string | undefined,
   limit: number,
   allowWarehouse: boolean,
+  sqlFile?: string,
 ): string[] {
   const args = ["preview", "rows", "--model", model];
   if (cte) args.push("--cte", cte);
+  if (sqlFile) args.push("--sql-file", sqlFile);
   args.push("--limit", String(limit), "--output", "json");
   if (allowWarehouse) args.push("--allow-warehouse");
   return args;

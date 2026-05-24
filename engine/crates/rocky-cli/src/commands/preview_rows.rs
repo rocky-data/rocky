@@ -48,9 +48,21 @@ pub async fn run_preview_rows(
     allow_warehouse: bool,
     pipeline_name: Option<&str>,
     models_dir: &Path,
+    sql_file: Option<&Path>,
     output_json: bool,
 ) -> Result<()> {
     let start = Instant::now();
+
+    // `--sql-file` (ad-hoc selection preview) and `--cte` are mutually
+    // exclusive: ad-hoc runs the file's SQL, not a model CTE.
+    if sql_file.is_some() && cte.is_some() {
+        return Err(err(
+            output_json,
+            "invalid_arguments",
+            "--sql-file and --cte cannot be combined",
+            None,
+        ));
+    }
 
     // Validate identifiers up-front — never interpolate unvalidated input.
     rocky_sql::validation::validate_identifier(model).map_err(|_| {
@@ -221,7 +233,50 @@ pub async fn run_preview_rows(
     }
 
     let inner = expanded.trim().trim_end_matches(';').trim();
-    let final_sql = if let Some(cte_name) = cte {
+    let final_sql = if let Some(path) = sql_file {
+        // Ad-hoc selection preview. The snippet has no model-output
+        // classification to mask against, so refuse if the enclosing model has
+        // ANY masked column rather than risk leaking a pre-mask value (the same
+        // fail-safe as CTE preview).
+        if !masked.is_empty() {
+            let cols: Vec<&String> = masked.keys().collect();
+            return Err(err(
+                output_json,
+                "adhoc_masking_blocked",
+                &format!(
+                    "model '{model}' has masked columns; ad-hoc selection preview is disabled to avoid leaking pre-mask values"
+                ),
+                Some(serde_json::json!({ "columns": cols })),
+            ));
+        }
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            err(
+                output_json,
+                "adhoc_read_error",
+                &format!("failed to read selection from {}: {e}", path.display()),
+                None,
+            )
+        })?;
+        // Expand macros in the selection too (it may reference Rocky macros).
+        let ad_expanded = rocky_core::macros::expand_macros(&raw, &macro_defs).map_err(|e| {
+            err(
+                output_json,
+                "compile_error",
+                &format!("macro expansion failed: {e}"),
+                None,
+            )
+        })?;
+        let ad_trimmed = ad_expanded.trim().trim_end_matches(';').trim();
+        if !rocky_sql::parser::is_single_select(ad_trimmed) {
+            return Err(err(
+                output_json,
+                "unsupported_model_kind",
+                "selection is not a single SELECT statement",
+                None,
+            ));
+        }
+        wrap_with_limit(ad_trimmed, limit)
+    } else if let Some(cte_name) = cte {
         let isolated = rocky_sql::parser::isolate_cte(&expanded, cte_name)
             .map_err(|e| err(output_json, "cte_error", &format!("{e}"), None))?;
         wrap_with_limit(isolated.trim().trim_end_matches(';').trim(), limit)
