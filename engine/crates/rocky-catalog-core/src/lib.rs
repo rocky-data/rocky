@@ -23,11 +23,19 @@
 //! catalogs that lack a REST surface for the operation. Callers are
 //! expected to treat that variant as a soft signal — typically by falling
 //! back to a SQL-driven path — rather than as a hard failure.
+//!
+//! Multi-securable governance (catalog / schema / table grants in a batch)
+//! lives on a parallel opt-in trait, [`GovernanceCatalogClient`]. Adapters
+//! that don't expose RBAC mutation over REST simply don't implement it;
+//! callers detect the absence at the binding site rather than pattern-
+//! matching on [`CatalogError::UnsupportedOperation`]. See
+//! [`governance`] for the trait shape.
 
 #![forbid(unsafe_code)]
 
 pub mod client;
 pub mod error;
+pub mod governance;
 pub mod types;
 
 #[cfg(any(test, feature = "testing"))]
@@ -35,6 +43,7 @@ pub mod testing;
 
 pub use client::CatalogClient;
 pub use error::{CatalogError, CatalogResult};
+pub use governance::{GovernanceCatalogClient, Securable};
 pub use types::{
     BranchKind, BranchRef, ColumnSchema, Grant, TableCommit, TableRef, TableSchema, TableStats,
 };
