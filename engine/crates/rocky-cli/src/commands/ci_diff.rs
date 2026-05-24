@@ -222,7 +222,7 @@ fn compile_head(
 /// historical models with today's leaf types still detects the model-level
 /// schema drift that ci-diff is looking for, and there's no per-ref cache
 /// to restore from.
-pub(crate) fn extract_base_compile(
+pub fn extract_base_compile(
     base_ref: &str,
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
@@ -587,7 +587,7 @@ pub(crate) fn compute_ci_diff(
 /// `dag` and `lineage_edges` are left empty: the classifier ignores both
 /// (they are implementation-detail fields per the
 /// `rocky_core::breaking_change` module docs).
-pub(crate) fn project_ir_from_compile(
+pub fn project_ir_from_compile(
     result: &rocky_compiler::compile::CompileResult,
 ) -> rocky_ir::ProjectIr {
     let typed = &result.type_check.typed_models;

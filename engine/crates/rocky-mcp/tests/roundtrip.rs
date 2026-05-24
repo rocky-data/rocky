@@ -78,7 +78,9 @@ async fn tools_list_returns_expected_set() {
     assert_eq!(
         names,
         vec![
+            "breaking_change",
             "compile",
+            "dependents",
             "inspect_schema",
             "lineage",
             "list",
@@ -299,6 +301,70 @@ async fn sample_rows_returns_capped_rows_on_duckdb() {
     let rows = sc["rows"].as_array().unwrap();
     assert!(!rows.is_empty(), "sampled at least one row");
     assert!(rows.len() <= 50, "capped at 50 rows");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn breaking_change_skips_gate_outside_git_repo() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // No `git init` — `extract_base_compile` cannot resolve the base ref, so
+    // the gate is skipped and the wire contract reports why.
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("breaking_change"))
+        .await
+        .expect("breaking_change call");
+
+    let sc = result.structured_content.expect("structured content");
+    let obj = sc.as_object().unwrap();
+    assert_eq!(obj["has_breaking"], serde_json::json!(false));
+    assert_eq!(obj["breaking_count"], serde_json::json!(0));
+    assert!(
+        obj.get("skipped_reason").and_then(|v| v.as_str()).is_some(),
+        "non-git project must surface a skipped_reason, got: {obj:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn dependents_returns_downstream_consumers() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // Add a second model that selects from `orders`, making it a dependent.
+    std::fs::write(
+        dir.path().join("models").join("order_ids.sql"),
+        "SELECT id FROM orders\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("models").join("order_ids.toml"),
+        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"main\"\nschema = \"out\"\ntable = \"order_ids\"\n",
+    )
+    .unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("dependents").with_arguments(args))
+        .await
+        .expect("dependents call");
+
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    let deps = sc["dependents"].as_array().unwrap();
+    assert!(
+        deps.iter()
+            .any(|d| d["model"] == serde_json::json!("order_ids")),
+        "order_ids depends on orders; got {deps:?}"
+    );
 
     client.cancel().await.unwrap();
 }
