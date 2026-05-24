@@ -952,3 +952,121 @@ async fn test_sub_10mb_query_bills_at_minimum_floor() {
          billed figure, defeating the floor enrichment."
     );
 }
+
+/// Verifies the wired `BigQueryGovernanceAdapter::set_tags` path applies
+/// labels to a dataset and a table via `ALTER SCHEMA ... SET OPTIONS` /
+/// `ALTER TABLE ... SET OPTIONS` and that BigQuery exposes the applied
+/// labels via `INFORMATION_SCHEMA.SCHEMATA_OPTIONS` /
+/// `INFORMATION_SCHEMA.TABLE_OPTIONS`.
+///
+/// Until the registry wiring for `BigQueryGovernanceAdapter` landed, this
+/// adapter was instantiable in code but never reached production callers.
+/// The test exercises the dataset/table targets (the two that execute
+/// real SQL); `TagTarget::Catalog` stays a warn-and-return because BQ
+/// projects do not support labels via SQL.
+#[tokio::test]
+#[ignore]
+async fn test_governance_set_tags_applies_labels() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use rocky_bigquery::governance::BigQueryGovernanceAdapter;
+    use rocky_core::traits::{GovernanceAdapter, TagTarget};
+
+    let warehouse = Arc::new(adapter_from_env().expect("BigQuery env vars not set"));
+    let project =
+        std::env::var("BIGQUERY_TEST_PROJECT").expect("BIGQUERY_TEST_PROJECT must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let dataset = format!("hc_phase6_gov_{suffix}");
+    let table = "labels_target";
+
+    // Setup. Arc auto-derefs through &self method calls.
+    warehouse
+        .execute_statement(&format!("CREATE SCHEMA `{project}`.`{dataset}`"))
+        .await
+        .expect("create dataset");
+    warehouse
+        .execute_statement(&format!(
+            "CREATE TABLE `{project}`.`{dataset}`.`{table}` AS \
+             SELECT * FROM UNNEST([STRUCT(1 AS id, 'a' AS name)])"
+        ))
+        .await
+        .expect("create table");
+
+    // Run the unit under test via the wired adapter (Arc-shaped).
+    let gov = BigQueryGovernanceAdapter::new(Arc::clone(&warehouse));
+
+    let mut labels = BTreeMap::new();
+    labels.insert("env".to_string(), "test".to_string());
+    labels.insert("owner".to_string(), "rocky".to_string());
+
+    let schema_target = TagTarget::Schema {
+        catalog: project.clone(),
+        schema: dataset.clone(),
+    };
+    let schema_result = gov.set_tags(&schema_target, &labels).await;
+
+    let table_target = TagTarget::Table {
+        catalog: project.clone(),
+        schema: dataset.clone(),
+        table: table.to_string(),
+    };
+    let table_result = gov.set_tags(&table_target, &labels).await;
+
+    // Read the labels back via INFORMATION_SCHEMA *_OPTIONS so the
+    // assertion goes through BigQuery's own metadata surface rather
+    // than trusting the SQL we emitted to match what BigQuery stored.
+    let schema_labels_q = format!(
+        "SELECT option_name, option_value FROM `{project}`.`region-EU`.INFORMATION_SCHEMA.SCHEMATA_OPTIONS \
+         WHERE schema_name = '{dataset}' AND option_name = 'labels'"
+    );
+    let schema_labels_result = warehouse.execute_query(&schema_labels_q).await.ok();
+
+    let table_labels_q = format!(
+        "SELECT option_name, option_value FROM `{project}`.`{dataset}`.INFORMATION_SCHEMA.TABLE_OPTIONS \
+         WHERE table_name = '{table}' AND option_name = 'labels'"
+    );
+    let table_labels_result = warehouse.execute_query(&table_labels_q).await.ok();
+
+    // Cleanup before assertions.
+    let _ = warehouse
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{dataset}` CASCADE"
+        ))
+        .await;
+
+    schema_result.expect("set_tags(Schema) should succeed");
+    table_result.expect("set_tags(Table) should succeed");
+
+    let schema_rows = schema_labels_result.expect("schema labels queryable");
+    assert!(
+        !schema_rows.rows.is_empty(),
+        "expected at least one labels row for the dataset"
+    );
+    let schema_label_value = schema_rows.rows[0]
+        .last()
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        schema_label_value.contains("env") && schema_label_value.contains("owner"),
+        "dataset labels should contain env + owner; got {schema_label_value}"
+    );
+
+    let table_rows = table_labels_result.expect("table labels queryable");
+    assert!(
+        !table_rows.rows.is_empty(),
+        "expected at least one labels row for the table"
+    );
+    let table_label_value = table_rows.rows[0]
+        .last()
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        table_label_value.contains("env") && table_label_value.contains("owner"),
+        "table labels should contain env + owner; got {table_label_value}"
+    );
+}
