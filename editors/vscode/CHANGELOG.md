@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-05-25
+
+A wave of new panels and views surfacing the engine's trust + AI features directly in the editor — eight new commands (50 → 58).
+
+### Added
+
+- **Plan review / apply gate UI** (`rocky.reviewPlan`) — review an AI-authored plan's breaking-change report in a panel, then approve + apply from the editor.
+- **Inline row preview + live compiled-SQL panel** (`rocky.previewModel`, `rocky.showCompiledSql`) — preview a model's or CTE's output rows inline and open the live compiled SQL for the active model, with cursor-aware preview and result-grid polish.
+- **Ad-hoc SQL selection preview** — preview a highlighted SQL selection, governance-safe (masks applied).
+- **Governance compliance panel** (`rocky.compliance`) — per-model mask / grant verdicts.
+- **Execution-plan panel** (`rocky.dag`) — renders `rocky dag`.
+- **Branches view** (`rocky.refreshBranches`) — sidebar listing virtual branches.
+- **Run-trace timeline panel** (`rocky.trace`) — timeline of the latest run.
+- **Lineage-diff panel** (`rocky.lineageDiff`) — per-changed-column downstream blast radius vs a base ref.
+
+### Changed
+
+- **`src/types/generated/{ai_contract,preview_rows,review}.ts`** regenerated for the engine's new `rocky ai-contract`, `rocky preview rows`, and `rocky review` output surface.
+- Documentation counts and the VS Code API-minimum string refreshed to match the current extension surface.
+
 ## [1.27.0] — 2026-05-24
 
 Codegen-companion release to engine `v1.43.0`. The regenerated TypeScript bindings under `src/types/generated/` and the `rocky-project` JSON schema surfaced via `jsonValidation` pick up the engine's new config and output surface. No new commands, settings, or LSP features.
