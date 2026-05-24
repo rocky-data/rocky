@@ -312,6 +312,7 @@ mod tests {
             roles: Default::default(),
             ai: Default::default(),
             branch: Default::default(),
+            freshness: Default::default(),
         }
     }
 

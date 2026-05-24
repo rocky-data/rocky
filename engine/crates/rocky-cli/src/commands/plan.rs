@@ -450,6 +450,7 @@ fn build_and_persist_run_plan(
         source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
+        project_freshness_default: false,
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -613,6 +614,7 @@ fn populate_governance_actions(
         source_column_info: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
+        project_freshness_default: cfg.freshness.has_default(),
     })
     .context("failed to compile project for governance preview")?;
 
@@ -713,6 +715,7 @@ async fn check_plan_budget(
         source_column_info: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
+        project_freshness_default: false,
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,

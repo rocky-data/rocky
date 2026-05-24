@@ -78,6 +78,13 @@ pub struct CompilerConfig {
     /// matching `[mask]` strategy — the escape hatch documented on
     /// `[classifications.allow_unmasked]`. Suppresses W004 for listed tags.
     pub allow_unmasked: Vec<String>,
+    /// Whether `rocky.toml`'s top-level `[freshness]` block declares a
+    /// project-wide `expected_lag_seconds`. When `true`, the W005
+    /// freshness-coverage check skips every model — they all inherit
+    /// the project default. Callers that don't load a `RockyConfig`
+    /// keep the default (`false`) and continue to see W005 per
+    /// uncovered model.
+    pub project_freshness_default: bool,
 }
 
 /// Result of compilation.
@@ -257,11 +264,23 @@ pub fn compile_project(
     let classification_diagnostics =
         typecheck::check_classification_tags(&project.models, &config.mask, &config.allow_unmasked);
 
-    // 8. Merge all diagnostics.
+    // 8. Freshness coverage (W005). Soft-warn on any model with at
+    //    least one temporal output column but no `freshness` block in
+    //    scope (per-model or project-level default). Cheap (O(models *
+    //    temporal_cols)) and runs against the already-built
+    //    `typed_models` map.
+    let freshness_diagnostics = typecheck::check_freshness_coverage(
+        &project.models,
+        &type_check.typed_models,
+        config.project_freshness_default,
+    );
+
+    // 9. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
+    diagnostics.extend(freshness_diagnostics);
 
     let has_errors = diagnostics
         .iter()
@@ -444,10 +463,18 @@ pub fn compile_incremental(
     let classification_diagnostics =
         typecheck::check_classification_tags(&project.models, &config.mask, &config.allow_unmasked);
 
+    // W005: whole-project freshness coverage, same rationale as W004.
+    let freshness_diagnostics = typecheck::check_freshness_coverage(
+        &project.models,
+        &type_check.typed_models,
+        config.project_freshness_default,
+    );
+
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
+    diagnostics.extend(freshness_diagnostics);
 
     let has_errors = diagnostics
         .iter()

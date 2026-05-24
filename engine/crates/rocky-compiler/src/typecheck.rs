@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, I001, I002, SourceSpan, W001, W002,
-    W003, W004,
+    W003, W004, W005,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -875,6 +875,72 @@ pub fn check_classification_tags(
                 Diagnostic::warning(W004, &model.config.name, message).with_suggestion(suggestion),
             );
         }
+    }
+    diagnostics
+}
+
+/// W005 — emit one warning per model that has at least one temporal
+/// output column (DATE / TIMESTAMP / TIMESTAMP_NTZ) but no `freshness`
+/// declaration in scope.
+///
+/// "In scope" means either:
+/// - the model's sidecar `[freshness]` is set, or
+/// - the project-level `[freshness]` carries an `expected_lag_seconds`.
+///
+/// The latter is supplied via `project_freshness_default` — a `true`
+/// value suppresses W005 globally because every model inherits the
+/// project-level TTL.
+///
+/// This is a soft hint, not a structural error. Pure-metadata checks
+/// like "model has a date column you might want to assert freshness on"
+/// belong in the warning channel.
+///
+/// The diagnostic's first suggested column (used by the LSP arm to
+/// pre-fill an AI prompt) is the first temporal column in `typed`'s
+/// natural order. The compiler does not need to pick the "best" one —
+/// the AI arm asks the LLM to choose against the full model context.
+pub fn check_freshness_coverage(
+    models: &[rocky_core::models::Model],
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    project_freshness_default: bool,
+) -> Vec<Diagnostic> {
+    if project_freshness_default {
+        // Project-level default covers every model — no W005s.
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+    for model in models {
+        if model.config.freshness.is_some() {
+            continue;
+        }
+        let Some(cols) = typed_models.get(&model.config.name) else {
+            continue;
+        };
+        let temporal_columns: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.data_type.is_temporal())
+            .map(|c| c.name.as_str())
+            .collect();
+        if temporal_columns.is_empty() {
+            continue;
+        }
+
+        // Stable, single message — the LSP AI arm parses out the column
+        // list from the message text, so keep the shape pinned.
+        let columns_joined = temporal_columns.join(", ");
+        let message = format!(
+            "model '{}' has temporal column(s) ({}) but no `freshness` block declared",
+            model.config.name, columns_joined,
+        );
+        let suggestion = format!(
+            "add a `[freshness]` block to the model sidecar, e.g. \
+             `[freshness] expected_lag_seconds = 3600, time_column = \"{}\"`",
+            temporal_columns[0],
+        );
+        diagnostics.push(
+            Diagnostic::warning(W005, &model.config.name, message).with_suggestion(suggestion),
+        );
     }
     diagnostics
 }
@@ -2988,5 +3054,99 @@ mod tests {
         for d in &diags {
             assert_eq!(&*d.code, "W004");
         }
+    }
+
+    // ----- W005: freshness-coverage soft-warn -----
+
+    /// Build a `typed_models` map with a single entry. `check_freshness_coverage`
+    /// keys columns by model name, mirroring `TypeCheckResult::typed_models`.
+    fn typed_models_for(
+        name: &str,
+        cols: &[(&str, RockyType)],
+    ) -> IndexMap<String, Vec<TypedColumn>> {
+        let mut out = IndexMap::new();
+        out.insert(
+            name.to_string(),
+            cols.iter()
+                .map(|(c, ty)| typed_col(c, ty.clone(), false))
+                .collect(),
+        );
+        out
+    }
+
+    #[test]
+    fn w005_temporal_column_without_freshness_emits_diagnostic() {
+        let models = vec![make_model("events", "SELECT 1")];
+        let typed = typed_models_for(
+            "events",
+            &[("id", RockyType::Int64), ("event_ts", RockyType::Timestamp)],
+        );
+
+        let diags = check_freshness_coverage(&models, &typed, false);
+
+        assert_eq!(diags.len(), 1, "expected exactly one W005, got: {diags:?}");
+        let d = &diags[0];
+        assert_eq!(&*d.code, "W005");
+        assert_eq!(d.severity, crate::diagnostic::Severity::Warning);
+        assert_eq!(d.model, "events");
+        let msg = d.message.as_ref();
+        assert!(msg.contains("event_ts"), "message missing column: {msg}");
+        // The suggestion must name the public-facing field + a candidate column.
+        let help = d.suggestion.as_deref().unwrap_or("");
+        assert!(
+            help.contains("expected_lag_seconds"),
+            "suggestion missing TTL hint: {help}"
+        );
+        assert!(
+            help.contains("event_ts"),
+            "suggestion missing candidate time_column: {help}"
+        );
+    }
+
+    #[test]
+    fn w005_no_temporal_column_emits_nothing() {
+        let models = vec![make_model("dims", "SELECT 1")];
+        let typed = typed_models_for(
+            "dims",
+            &[("id", RockyType::Int64), ("label", RockyType::String)],
+        );
+
+        let diags = check_freshness_coverage(&models, &typed, false);
+        assert!(
+            diags.is_empty(),
+            "a model with no temporal column should emit no W005, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn w005_model_freshness_block_suppresses_diagnostic() {
+        let mut model = make_model("events", "SELECT 1");
+        model.config.freshness = Some(rocky_core::models::ModelFreshnessConfig {
+            max_lag_seconds: 3600,
+            time_column: Some("event_ts".to_string()),
+            severity: None,
+        });
+        let models = vec![model];
+        let typed = typed_models_for("events", &[("event_ts", RockyType::Timestamp)]);
+
+        let diags = check_freshness_coverage(&models, &typed, false);
+        assert!(
+            diags.is_empty(),
+            "a per-model [freshness] block should suppress W005, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn w005_project_default_suppresses_diagnostic_globally() {
+        let models = vec![make_model("events", "SELECT 1")];
+        let typed = typed_models_for("events", &[("event_ts", RockyType::Timestamp)]);
+
+        // `project_freshness_default = true` => every model inherits the
+        // project-level TTL, so W005 stays silent.
+        let diags = check_freshness_coverage(&models, &typed, true);
+        assert!(
+            diags.is_empty(),
+            "a project-level [freshness] default should suppress all W005s, got: {diags:?}"
+        );
     }
 }

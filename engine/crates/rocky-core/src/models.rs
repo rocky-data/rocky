@@ -191,12 +191,53 @@ pub struct ModelConfig {
 /// Per-model freshness configuration.
 ///
 /// Declares the maximum allowed lag between successive materializations of
-/// the model. The compiler does not validate this — it's a metadata field
-/// consumed by downstream observability tools.
+/// the model plus the optional timestamp column used by the runtime
+/// freshness check.
+///
+/// The compiler does not enforce the TTL — it's metadata consumed by
+/// downstream observability tooling (`dagster-rocky` `FreshnessPolicy`,
+/// `rocky doctor --freshness`, etc.). The compiler does however soft-warn
+/// (W005) when a model has at least one temporal output column but no
+/// `freshness` declaration anywhere in scope (per-model or project-level
+/// default).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelFreshnessConfig {
     /// Maximum lag in seconds before the model is considered stale.
+    ///
+    /// Accepts both `max_lag_seconds` (legacy field name, preserved for
+    /// existing sidecar fixtures + dagster Pydantic + VS Code bindings)
+    /// and `expected_lag_seconds` (the documented public-facing name
+    /// matching dbt freshness + SQLMesh defaults). Both deserialize to
+    /// the same field; the serialized name stays `max_lag_seconds` so
+    /// existing JSON/codegen consumers keep working unchanged.
+    #[serde(alias = "expected_lag_seconds")]
     pub max_lag_seconds: u64,
+    /// Optional timestamp column used to evaluate freshness at runtime
+    /// (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When
+    /// unset the runtime falls back to the model's last-materialization
+    /// timestamp from the state store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+    /// Severity reported when the freshness check trips. Default
+    /// `warning` keeps the runtime check non-blocking — switch to
+    /// `error` to fail the pipeline on stale data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::tests::TestSeverity>,
+}
+
+impl ModelFreshnessConfig {
+    /// Construct from a project-level default (see
+    /// [`crate::config::ProjectFreshnessConfig`]). Used when a model
+    /// declares no `[freshness]` block of its own but the project has a
+    /// `[freshness]` section that should inherit.
+    pub fn from_project_default(default: &crate::config::ProjectFreshnessConfig) -> Option<Self> {
+        let max_lag_seconds = default.expected_lag_seconds?;
+        Some(Self {
+            max_lag_seconds,
+            time_column: default.time_column.clone(),
+            severity: default.severity,
+        })
+    }
 }
 
 /// Target table coordinates for a model.

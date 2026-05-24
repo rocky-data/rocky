@@ -67,6 +67,12 @@ pub const W003: &str = "W003";
 /// `[mask.<env>]` strategy and isn't listed in `[classifications.allow_unmasked]`.
 /// One diagnostic per unresolved `(model, column, tag)` triple.
 pub const W004: &str = "W004";
+/// Model has at least one temporal output column (DATE / TIMESTAMP /
+/// TIMESTAMP_NTZ) but no `freshness` declaration in scope — neither a
+/// per-model sidecar block nor a project-level `[freshness]` default.
+/// Soft hint that the model would benefit from a freshness expectation.
+/// Suppressed by adding a `[freshness]` block (per-model or project).
+pub const W005: &str = "W005";
 /// Contract defines a column not in model output (but not required).
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.

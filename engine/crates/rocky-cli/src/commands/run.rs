@@ -3113,6 +3113,7 @@ pub async fn run(
                     // keeps parity with `rocky compile`'s diagnostic set.
                     mask: rocky_cfg.mask.clone(),
                     allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
+                    project_freshness_default: rocky_cfg.freshness.has_default(),
                 },
             );
             if let Ok(gov_compile) = governance_compile {
