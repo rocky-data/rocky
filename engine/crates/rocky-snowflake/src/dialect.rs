@@ -339,6 +339,94 @@ impl SqlDialect for SnowflakeSqlDialect {
             .join(", ");
         Ok(format!("COALESCE(HASH({arg_list}), 0)"))
     }
+
+    /// Snowflake's `DESCRIBE TABLE` returns native type names
+    /// (`NUMBER(p,s)`, `VARCHAR(n)`, `TIMESTAMP_NTZ`), not the
+    /// Databricks-flavored names the default allowlist matches.
+    /// Override so drift evolution doesn't fall through to
+    /// `DropAndRecreate` on safe widenings.
+    ///
+    /// Snowflake's `ALTER COLUMN ... SET DATA TYPE` accepts:
+    /// - `NUMBER(p1,s) -> NUMBER(p2,s)` where `p2 >= p1` (precision
+    ///   widening, scale preserved).
+    /// - `VARCHAR(n) -> VARCHAR(m)` where `m >= n` (length widening).
+    ///
+    /// Family changes (`NUMBER -> VARCHAR`, `TIMESTAMP_NTZ ->
+    /// TIMESTAMP_TZ`) and scale changes on `NUMBER` are not allowed
+    /// by `ALTER COLUMN`, so treating them as unsafe avoids a
+    /// partial-execution failure.
+    fn is_safe_type_widening(&self, source_type: &str, target_type: &str) -> bool {
+        is_safe_number_widening(target_type, source_type)
+            || is_safe_snowflake_varchar_widening(target_type, source_type)
+    }
+
+    /// Snowflake folds unquoted identifiers to UPPERCASE at parse time.
+    /// The default `alter_column_type_sql` interpolates `column` without
+    /// quotes, which silently breaks against any column created with
+    /// quoted lowercase names. `format_table_ref` already quotes the
+    /// table parts; this override does the same for the column.
+    fn alter_column_type_sql(
+        &self,
+        table_ref: &str,
+        column: &str,
+        new_type: &str,
+    ) -> AdapterResult<String> {
+        validation::validate_identifier(column).map_err(AdapterError::new)?;
+        rocky_core::sql_gen::validate_sql_type(new_type).map_err(AdapterError::new)?;
+        let col_q = self.quote_identifier(column);
+        Ok(format!(
+            "ALTER TABLE {table_ref} ALTER COLUMN {col_q} TYPE {new_type}"
+        ))
+    }
+}
+
+/// `NUMBER(p1,s) -> NUMBER(p2,s)` where `p2 >= p1` (precision widens,
+/// scale must match). Snowflake's `DESCRIBE TABLE` returns `NUMBER` as
+/// the canonical name even when the column was declared as `DECIMAL`,
+/// `NUMERIC`, `INT`, or `BIGINT`, so this is the surface to match.
+fn is_safe_number_widening(target: &str, source: &str) -> bool {
+    fn parse_number(t: &str) -> Option<(u32, u32)> {
+        let t = t.trim();
+        if !t.starts_with("NUMBER(") || !t.ends_with(')') {
+            return None;
+        }
+        let inner = &t[7..t.len() - 1];
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let p = parts[0].trim().parse::<u32>().ok()?;
+        let s = parts[1].trim().parse::<u32>().ok()?;
+        Some((p, s))
+    }
+
+    if let (Some((tp, ts)), Some((sp, ss))) = (parse_number(target), parse_number(source)) {
+        sp >= tp && ss == ts
+    } else {
+        false
+    }
+}
+
+/// `VARCHAR(n) -> VARCHAR(m)` where `m >= n`.
+///
+/// Snowflake aliases `STRING`, `TEXT`, `CHAR`, `CHARACTER` to `VARCHAR`,
+/// and `DESCRIBE TABLE` returns the canonical `VARCHAR(n)` regardless
+/// of which alias was used at create time. Parsing only `VARCHAR(`
+/// covers every text-column case.
+fn is_safe_snowflake_varchar_widening(target: &str, source: &str) -> bool {
+    fn parse_varchar(t: &str) -> Option<u32> {
+        let t = t.trim();
+        if !t.starts_with("VARCHAR(") || !t.ends_with(')') {
+            return None;
+        }
+        t[8..t.len() - 1].trim().parse::<u32>().ok()
+    }
+
+    if let (Some(tn), Some(sn)) = (parse_varchar(target), parse_varchar(source)) {
+        sn >= tn
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -646,5 +734,95 @@ mod tests {
         ));
         assert!(script.contains("INSERT INTO warehouse.marts.fct_daily_orders"));
         assert!(script.ends_with("COMMIT"));
+    }
+
+    // Trait signature: `is_safe_type_widening(source_type, target_type)`
+    // where `source_type` is the NEW desired type and `target_type` is
+    // the CURRENT warehouse type. Widening means current -> new, so
+    // call sites read `(new, current)`.
+
+    #[test]
+    fn is_safe_type_widening_number_precision_widens() {
+        let d = dialect();
+        // Warehouse currently NUMBER(10,0); want NUMBER(38,0).
+        assert!(d.is_safe_type_widening("NUMBER(38,0)", "NUMBER(10,0)"));
+        assert!(d.is_safe_type_widening("NUMBER(20,2)", "NUMBER(10,2)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_number_narrowing_rejected() {
+        let d = dialect();
+        // Narrowing loses data.
+        assert!(!d.is_safe_type_widening("NUMBER(10,0)", "NUMBER(38,0)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_number_scale_change_rejected() {
+        let d = dialect();
+        // Snowflake's ALTER COLUMN refuses scale changes even if precision
+        // widens. Reject so drift skips ALTER and uses DropAndRecreate.
+        assert!(!d.is_safe_type_widening("NUMBER(10,4)", "NUMBER(10,2)"));
+        assert!(!d.is_safe_type_widening("NUMBER(20,4)", "NUMBER(10,2)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_varchar_length_widens() {
+        let d = dialect();
+        // Warehouse currently VARCHAR(100); want VARCHAR(1000).
+        assert!(d.is_safe_type_widening("VARCHAR(1000)", "VARCHAR(100)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_varchar_narrowing_rejected() {
+        let d = dialect();
+        assert!(!d.is_safe_type_widening("VARCHAR(100)", "VARCHAR(1000)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_family_change_rejected() {
+        let d = dialect();
+        // Snowflake's ALTER COLUMN can't change type families.
+        assert!(!d.is_safe_type_widening("VARCHAR(100)", "NUMBER(10,0)"));
+        assert!(!d.is_safe_type_widening("NUMBER(10,0)", "VARCHAR(100)"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_databricks_names_rejected() {
+        let d = dialect();
+        // Default Databricks-flavored allowlist would accept these. On
+        // Snowflake, DESCRIBE never returns these names; if they show up
+        // they're from a wrong-dialect source, not a safe Snowflake widening.
+        assert!(!d.is_safe_type_widening("STRING", "BIGINT"));
+        assert!(!d.is_safe_type_widening("BIGINT", "INT"));
+    }
+
+    #[test]
+    fn alter_column_type_sql_quotes_column() {
+        let d = dialect();
+        let sql = d
+            .alter_column_type_sql("\"db\".\"sch\".\"tbl\"", "id", "NUMBER(38,0)")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "ALTER TABLE \"db\".\"sch\".\"tbl\" ALTER COLUMN \"id\" TYPE NUMBER(38,0)"
+        );
+    }
+
+    #[test]
+    fn alter_column_type_sql_rejects_bad_identifier() {
+        let d = dialect();
+        let err = d
+            .alter_column_type_sql("\"db\".\"sch\".\"tbl\"", "bad; DROP", "NUMBER(38,0)")
+            .unwrap_err();
+        assert!(err.to_string().contains("identifier"));
+    }
+
+    #[test]
+    fn is_safe_type_widening_malformed_input_rejected() {
+        let d = dialect();
+        // Garbage in, false out (not a panic).
+        assert!(!d.is_safe_type_widening("NUMBER(38,0)", "NUMBER("));
+        assert!(!d.is_safe_type_widening("NUMBER(38,0)", "NUMBER(abc,0)"));
+        assert!(!d.is_safe_type_widening("VARCHAR(100)", "VARCHAR()"));
     }
 }
