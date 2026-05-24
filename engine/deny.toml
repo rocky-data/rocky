@@ -1,0 +1,18 @@
+# cargo-deny configuration — minimal, scoped to the schemars dual-major.
+#
+# There is no `cargo deny check` in the engine CI today: the weekly security
+# audit (`.github/workflows/engine-weekly.yml`) runs `cargo audit` against the
+# advisory DB, which does not flag duplicate dependency versions. This file
+# exists so a future `cargo deny check` (or a manual audit) passes cleanly with
+# the one duplicate the MCP server introduces.
+
+[bans]
+multiple-versions = "deny"
+# rmcp 1.7 transitively pulls schemars 1.x (its `#[tool]` param-struct macros
+# derive schemars 1.x `JsonSchema`); the rest of the Rocky workspace pins
+# schemars 0.8 for the `*Output` JSON-schema cascade (dagster + vscode codegen).
+# The two majors are disjoint trait worlds and compile together cleanly, so the
+# duplicate is intentional and accepted.
+skip = [
+    { crate = "schemars", reason = "rmcp 1.7 (schemars 1.x) vs Rocky's *Output cascade (schemars 0.8) — disjoint majors, compiles cleanly" },
+]

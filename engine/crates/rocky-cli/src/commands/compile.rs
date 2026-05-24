@@ -347,11 +347,11 @@ struct CompileTextData {
 ///
 /// `cache_ttl_override`: optional CLI `--cache-ttl <seconds>` value that
 /// replaces `[cache.schemas] ttl_seconds` for this invocation only.
-// Reusable typed-output core for a future in-process caller (MCP server). No
-// internal call site yet — the `run_compile` wrapper uses `compile_inner`
-// directly so it can also render text mode.
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn compile_output(
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`). The
+// `run_compile` wrapper uses `compile_inner` directly so it can also render
+// text mode.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_output(
     config_path: Option<&Path>,
     state_path: &Path,
     models_dir: &Path,

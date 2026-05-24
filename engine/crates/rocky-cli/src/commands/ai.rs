@@ -81,7 +81,10 @@ fn compile_project(
 }
 
 /// Typed schemas bucketed by origin for prompt rendering.
-type SchemaBuckets = (
+///
+/// `(existing-models, source-tables)`. Public so the in-process MCP server
+/// (`rocky-mcp`) can consume the same bucketing via [`build_schema_context`].
+pub type SchemaBuckets = (
     Vec<(String, Vec<TypedColumn>)>,
     Vec<(String, Vec<TypedColumn>)>,
 );
@@ -91,7 +94,10 @@ type SchemaBuckets = (
 /// dotted schema.table naming convention used in Rocky sources; anything
 /// else is treated as an existing model. This is best-effort classification
 /// — the prompt tolerates either bucket without losing correctness.
-fn build_schema_context(result: &CompileResult) -> SchemaBuckets {
+///
+/// Exposed for the in-process MCP server (`rocky-mcp`), whose `inspect_schema`
+/// tool reuses the same (models, sources) bucketing the `rocky ai` prompt uses.
+pub fn build_schema_context(result: &CompileResult) -> SchemaBuckets {
     let mut model_schemas = Vec::new();
     let mut source_tables = Vec::new();
 

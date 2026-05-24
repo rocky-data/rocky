@@ -492,10 +492,9 @@ fn strategy_purpose(strategy: &MaterializationStrategy) -> &'static str {
 /// no compiled models (replication-only, or `models/` holds only stubs), the
 /// returned `PlanOutput` has empty `statements` and a `tracing::info!` note —
 /// the live `rocky plan` discovery path is the surface for replication SQL.
-// Reusable typed-output core for a future in-process caller. No internal call
-// site yet — `rocky plan` uses the full live `plan()` path.
-#[allow(dead_code)]
-pub(crate) fn plan_preview_output(
+// Reusable typed-output core for the in-process MCP server (`rocky-mcp`).
+// `rocky plan` uses the full live `plan()` path.
+pub fn plan_preview_output(
     config_path: Option<&Path>,
     models_dir: &Path,
     filter: Option<&str>,

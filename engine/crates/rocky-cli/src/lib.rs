@@ -4,7 +4,7 @@ pub mod error_reporter;
 pub mod otel_guard;
 pub mod output;
 pub mod pipes;
-pub(crate) mod plan_store;
+pub mod plan_store;
 pub mod registry;
 pub(crate) mod schema_cache_writer;
 pub(crate) mod scope;
