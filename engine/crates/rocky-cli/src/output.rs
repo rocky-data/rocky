@@ -1776,6 +1776,49 @@ pub struct AiTestAssertion {
     pub sql: Option<String>,
 }
 
+/// JSON output for `rocky ai-contract <model>`.
+///
+/// Reports the AI-drafted data contract for a model, grounded in the observed
+/// per-column profile of its target table. The drafted contract is
+/// compile-verified against the model before it's reported, so a successful
+/// response is a contract that `rocky compile` accepts.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AiContractOutput {
+    pub version: String,
+    pub command: String,
+    /// The model the contract was drafted for.
+    pub model: String,
+    /// Number of LLM attempts taken to reach a compile-verified contract.
+    pub attempts: usize,
+    /// The drafted contract serialized as `.contract.toml`.
+    pub contract_toml: String,
+    /// Path the contract was written to, when `--save` was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+    /// The observed per-column profile that grounded the draft.
+    pub profile: Vec<AiContractColumnProfile>,
+}
+
+/// Observed profile of one column, as reported by `rocky ai-contract`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AiContractColumnProfile {
+    pub name: String,
+    /// Inferred Rocky type name.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub rows: u64,
+    pub nulls: u64,
+    pub null_rate: f64,
+    pub distinct: u64,
+    /// Observed low-cardinality domain. Empty above the cardinality cap. This
+    /// is reported as evidence; it is not encoded into the contract file.
+    pub observed_values: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<String>,
+}
+
 /// JSON output for `rocky lineage-diff <base_ref>`.
 ///
 /// Combines the structural per-column diff produced by `rocky ci-diff`

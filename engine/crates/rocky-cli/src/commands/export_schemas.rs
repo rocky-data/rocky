@@ -18,17 +18,17 @@ use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
-    AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput, ApproveOutput,
-    ArchiveApplyOutput, ArchiveOutput, BranchDeleteOutput, BranchListOutput, BranchOutput,
-    BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput, ClearSchemaCacheOutput,
-    ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput, CompactOutput, CompareOutput,
-    CompileOutput, ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput,
-    DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput,
-    LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput, ModelHistoryOutput,
-    OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
-    PreviewRowsOutput, ProfileStorageOutput, PromotePlan, ReplayOutput, RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
-    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    AiContractOutput, AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput,
+    ApproveOutput, ArchiveApplyOutput, ArchiveOutput, BranchDeleteOutput, BranchListOutput,
+    BranchOutput, BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput,
+    ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
+    CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
+    DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
+    HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
+    ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
+    PreviewDiffOutput, PreviewRowsOutput, ProfileStorageOutput, PromotePlan, ReplayOutput,
+    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput,
+    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -69,6 +69,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<AiSyncOutput>("ai_sync"),
         entry::<AiExplainOutput>("ai_explain"),
         entry::<AiTestOutput>("ai_test"),
+        entry::<AiContractOutput>("ai_contract"),
         entry::<LineageOutput>("lineage"),
         entry::<ColumnLineageOutput>("column_lineage"),
         entry::<LineageDiffOutput>("lineage_diff"),

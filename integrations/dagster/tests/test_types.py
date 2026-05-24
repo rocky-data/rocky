@@ -7,6 +7,7 @@ import json
 import pytest
 
 from dagster_rocky.types import (
+    AiContractOutput,
     ApplyOutput,
     CatalogOutput,
     CiResult,
@@ -519,6 +520,28 @@ def test_parse_catalog(catalog_json: str):
     assert result.stats.asset_count == 2
     assert result.stats.column_count == 5
     assert result.stats.assets_with_star == 0
+
+
+def test_parse_ai_contract(ai_contract_json: str):
+    result = AiContractOutput.model_validate_json(ai_contract_json)
+    assert result.command == "ai_contract"
+    assert result.model == "customer_orders"
+    assert result.attempts == 1
+    assert result.saved_path == "models/customer_orders.contract.toml"
+    assert "[[columns]]" in result.contract_toml
+    assert "customer_id" in result.contract_toml
+
+    assert len(result.profile) == 2
+    customer_id = next(c for c in result.profile if c.name == "customer_id")
+    assert customer_id.type == "Int64"
+    assert customer_id.null_rate == 0.0
+    assert customer_id.observed_values == []
+
+    status = next(c for c in result.profile if c.name == "status")
+    assert status.distinct == 3
+    assert status.observed_values == ["cancelled", "completed", "pending"]
+    # The auto-detect dispatch routes "ai_contract" to AiContractOutput.
+    assert isinstance(parse_rocky_output(ai_contract_json), AiContractOutput)
 
 
 def test_parse_test_result(test_result_json: str):

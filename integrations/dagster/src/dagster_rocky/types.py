@@ -995,6 +995,8 @@ class DriftDetectResult(BaseModel):
 # Both remain importable. The hand-written classes are the public API.
 
 from .types_generated import (  # noqa: E402, F401
+    AiContractColumnProfile,
+    AiContractOutput,
     AiExplainOutput,
     AiGenerateOutput,
     AiSyncOutput,
@@ -1118,6 +1120,11 @@ DagEdge = DagEdgeOutput
 HistoryResult = HistoryOutput
 ModelHistoryResult = ModelHistoryOutput
 
+# ``rocky ai-contract`` has no hand-written legacy class; the generated model
+# is the source of truth. Expose a Python-flavored alias for symmetry with the
+# other AI commands.
+AiContractResult = AiContractOutput
+
 # ---------------------------------------------------------------------------
 # Fivetran state envelope (FR-C)
 # ---------------------------------------------------------------------------
@@ -1160,6 +1167,7 @@ RockyOutput = (
     | AiSyncResult
     | AiExplainResult
     | AiTestResult
+    | AiContractOutput
     | ValidateMigrationResult
     | ConformanceResult
     | DoctorResult
@@ -1198,6 +1206,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "ai_sync": AiSyncResult,
     "ai_explain": AiExplainResult,
     "ai_test": AiTestResult,
+    "ai_contract": AiContractOutput,
     "validate-migration": ValidateMigrationResult,
     "test-adapter": ConformanceResult,
     "doctor": DoctorResult,

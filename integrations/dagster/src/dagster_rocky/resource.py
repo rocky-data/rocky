@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 from .types import (
+    AiContractOutput,
     AiExplainResult,
     AiResult,
     AiSyncResult,
@@ -2618,6 +2619,18 @@ class RockyResource(dg.ConfigurableResource):
         if save:
             args.append("--save")
         return _parse_rocky_json(self._run_rocky(args), AiTestResult, command="ai test")
+
+    def ai_contract(
+        self,
+        model: str,
+        *,
+        save: bool = False,
+    ) -> AiContractOutput:
+        """AI-draft a data contract from a model's observed data (DuckDB only)."""
+        args: list[str] = ["ai-contract", model, "--models", self.models_dir]
+        if save:
+            args.append("--save")
+        return _parse_rocky_json(self._run_rocky(args), AiContractOutput, command="ai contract")
 
     # ------------------------------------------------------------------ #
     # Hook commands                                                      #

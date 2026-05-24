@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AiContractColumnProfile": {
+      "description": "Observed profile of one column, as reported by `rocky ai-contract`.",
+      "properties": {
+        "distinct": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "null_rate": {
+          "format": "double",
+          "type": "number"
+        },
+        "nulls": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "observed_values": {
+          "description": "Observed low-cardinality domain. Empty above the cardinality cap. This is reported as evidence; it is not encoded into the contract file.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "type": {
+          "description": "Inferred Rocky type name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "distinct",
+        "name",
+        "null_rate",
+        "nulls",
+        "observed_values",
+        "rows",
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky ai-contract <model>`.\n\nReports the AI-drafted data contract for a model, grounded in the observed per-column profile of its target table. The drafted contract is compile-verified against the model before it's reported, so a successful response is a contract that `rocky compile` accepts.",
+  "properties": {
+    "attempts": {
+      "description": "Number of LLM attempts taken to reach a compile-verified contract.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "contract_toml": {
+      "description": "The drafted contract serialized as `.contract.toml`.",
+      "type": "string"
+    },
+    "model": {
+      "description": "The model the contract was drafted for.",
+      "type": "string"
+    },
+    "profile": {
+      "description": "The observed per-column profile that grounded the draft.",
+      "items": {
+        "$ref": "#/definitions/AiContractColumnProfile"
+      },
+      "type": "array"
+    },
+    "saved_path": {
+      "description": "Path the contract was written to, when `--save` was passed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attempts",
+    "command",
+    "contract_toml",
+    "model",
+    "profile",
+    "version"
+  ],
+  "title": "AiContractOutput",
+  "type": "object"
+}

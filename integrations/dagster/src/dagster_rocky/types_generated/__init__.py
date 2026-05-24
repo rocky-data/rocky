@@ -45,6 +45,7 @@ top-level package re-exports each shared type from one canonical module.
 """
 
 # AI commands
+from .ai_contract_schema import AiContractColumnProfile, AiContractOutput
 from .ai_explain_schema import AiExplainOutput, AiExplanation
 from .ai_schema import AiGenerateOutput
 from .ai_sync_schema import AiSyncOutput, AiSyncProposal
@@ -292,6 +293,8 @@ __all__ = [
     "AiTestOutput",
     "AiTestModelResult",
     "AiTestAssertion",
+    "AiContractOutput",
+    "AiContractColumnProfile",
     # ci
     "CiOutput",
     # ci-diff
