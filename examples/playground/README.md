@@ -58,9 +58,9 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 | [09-files-to-duckdb](pocs/00-foundations/09-files-to-duckdb) | `rocky load` ingests Parquet + CSV + JSONL from one `data/` directory into DuckDB — format auto-detected by extension |
 | [10-route-by-tenant](pocs/00-foundations/10-route-by-tenant) | One Parquet file with mixed-account rows is loaded then fanned out to per-tenant schemas (`account_acme.events`, `account_beta.events`, …) via per-model `target.schema` overrides |
 
-### 01 — Quality (6 POCs · DuckDB)
+### 01 — Quality (7 POCs · DuckDB)
 
-Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline.
+Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs.
 
 | POC | Feature |
 |---|---|
@@ -70,6 +70,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` with both passing and intentionally failing assertions |
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
+| [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Declarative per-model + project `[freshness]` SLA metadata surfacing in `rocky compile` output (`expected_lag_seconds` alias); W005 coverage diagnostic documented as the editor/LSP nudge |
 
 ### 02 — Performance (12 POCs · DuckDB)
 
@@ -168,7 +169,7 @@ Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native a
 | [01-snowflake-dynamic-table](pocs/07-adapters/01-snowflake-dynamic-table) | `MaterializationStrategy::DynamicTable { target_lag }` | Snowflake |
 | [02-databricks-materialized-view](pocs/07-adapters/02-databricks-materialized-view) | `MaterializationStrategy::MaterializedView` on Databricks | Databricks |
 | [03-fivetran-discover](pocs/07-adapters/03-fivetran-discover) | `rocky discover` against Fivetran REST API; metadata only | `FIVETRAN_API_KEY` |
-| [04-custom-process-adapter](pocs/07-adapters/04-custom-process-adapter) | ~80-line Python adapter speaking JSON-RPC over stdio, registered via `[adapter] type = "process"` | none |
+| [04-custom-process-adapter](pocs/07-adapters/04-custom-process-adapter) | Python adapter speaking JSON-RPC over stdio, discovered through the engine as `rocky adapter list`/`info` via the `rocky-<name>` PATH convention | none |
 | [05-bigquery-native-queries](pocs/07-adapters/05-bigquery-native-queries) | BigQuery adapter — backtick quoting, time-interval partitions, DML transactions | GCP SA / ADC |
 | [06-rust-native-adapter-skeleton](pocs/07-adapters/06-rust-native-adapter-skeleton) | Out-of-tree warehouse adapter starter — `rocky-adapter-sdk` traits against an in-memory mock, ClickHouse-shaped (backtick quoting, no `MERGE`, partition replace) | none (Rust toolchain) |
 | [07-trino-docker](pocs/07-adapters/07-trino-docker) | `rocky-trino` v0 adapter against a single-node `trinodb/trino` container — full_refresh CTAS from `tpch.tiny.nation` into the `memory` catalog | none (Docker) |

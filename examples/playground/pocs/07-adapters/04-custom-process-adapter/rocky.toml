@@ -1,11 +1,7 @@
-# Process adapter (planned in rocky-adapter-sdk):
-# [adapter.sqlite_custom]
-# type = "process"
-# command = "python3 adapter.py"
-#
-# Until process adapters are wired through the registry, this rocky.toml
-# uses DuckDB so `rocky validate` is happy. The Python adapter is
-# exercised directly via run.sh.
+# Process adapters are discovered from $PATH by filename (`rocky-<name>`), so
+# they don't need to be declared here — `run.sh` installs adapter.py as
+# `rocky-sqlite` and the engine finds it via `rocky adapter list`. This rocky.toml
+# just gives `rocky validate` a valid DuckDB pipeline to chew on.
 
 [adapter]
 type = "duckdb"
