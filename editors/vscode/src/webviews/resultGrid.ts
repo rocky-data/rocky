@@ -49,6 +49,19 @@ export function coerceCell(value: unknown): string {
 }
 
 /**
+ * Serialize a grid (already coerced to display strings) as RFC-4180 CSV.
+ * Cells containing a comma, quote, or newline are double-quoted with embedded
+ * quotes doubled. Pure — unit-tested.
+ */
+export function toCsv(columns: string[], rows: string[][]): string {
+  const esc = (v: string): string =>
+    /[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  const header = columns.map(esc).join(",");
+  const body = rows.map((r) => r.map(esc).join(",")).join("\r\n");
+  return body ? `${header}\r\n${body}` : header;
+}
+
+/**
  * Panel-area "Query Results" view (docks next to Problems/Terminal, matching
  * dbt's preview panel). A {@link vscode.WebviewView} isn't instantiated until
  * the view is first revealed, so the provider buffers the latest payload and
@@ -85,6 +98,8 @@ export class ResultGridViewProvider implements vscode.WebviewViewProvider {
         }
       } else if (msg.type === "copyTsv") {
         void this.copyTsv();
+      } else if (msg.type === "saveCsv") {
+        void this.saveCsv();
       } else if (msg.type === "showSql") {
         void this.showSql();
       }
@@ -137,6 +152,20 @@ export class ResultGridViewProvider implements vscode.WebviewViewProvider {
     void vscode.window.showInformationMessage("Query results copied (TSV).");
   }
 
+  private async saveCsv(): Promise<void> {
+    if (!this.lastData) return;
+    const name = this.lastMeta?.cte ?? this.lastMeta?.model ?? "query-results";
+    const uri = await vscode.window.showSaveDialog({
+      filters: { CSV: ["csv"] },
+      saveLabel: "Save query results",
+      defaultUri: vscode.Uri.file(`${name}.csv`),
+    });
+    if (!uri) return;
+    const csv = toCsv(this.lastData.columns, this.lastData.rows);
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(csv, "utf8"));
+    void vscode.window.showInformationMessage(`Saved ${this.lastData.rows.length} rows to CSV.`);
+  }
+
   private async showSql(): Promise<void> {
     const sql = this.lastMeta?.executedSql;
     if (!sql) return;
@@ -160,6 +189,7 @@ export class ResultGridViewProvider implements vscode.WebviewViewProvider {
       table.grid th { cursor: pointer; user-select: none; position: sticky; top: 0; }
       table.grid th .arrow { color: var(--vscode-descriptionForeground); margin-left:4px; }
       table.grid td, table.grid th { white-space: pre; max-width: 480px; overflow: hidden; text-overflow: ellipsis; }
+      table.grid td.num, table.grid th.num { text-align: right; font-variant-numeric: tabular-nums; }
       .empty { color: var(--vscode-descriptionForeground); padding: 12px 0; }
       .err { color: var(--vscode-errorForeground); padding: 12px 0; white-space: pre-wrap; }
     `;
@@ -172,6 +202,7 @@ ${buildHead(webview, nonce, "Query Results", extraStyles)}
     <span id="meta"></span>
     <span style="flex:1"></span>
     <button id="copy" hidden>Copy TSV</button>
+    <button id="csv" hidden>Save CSV</button>
     <button id="sql" hidden>Show SQL</button>
   </div>
   <div id="status" class="empty">Run <strong>Preview</strong> on a model to see rows here.</div>
@@ -179,13 +210,27 @@ ${buildHead(webview, nonce, "Query Results", extraStyles)}
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
-    let state = { columns: [], rows: [], sortCol: -1, sortDir: 1 };
+    let state = { columns: [], rows: [], sortCol: -1, sortDir: 1, numeric: [] };
 
     function cmp(a, b) {
       const na = Number(a), nb = Number(b);
       const numeric = a !== "" && b !== "" && !Number.isNaN(na) && !Number.isNaN(nb);
       if (numeric) return na - nb;
       return a < b ? -1 : a > b ? 1 : 0;
+    }
+
+    // A column is numeric when every non-empty cell parses as a number.
+    function computeNumericCols(columns, rows) {
+      return columns.map((_, i) => {
+        let seen = false;
+        for (const r of rows) {
+          const v = r[i];
+          if (v === "" || v == null) continue;
+          seen = true;
+          if (Number.isNaN(Number(v))) return false;
+        }
+        return seen;
+      });
     }
 
     function render() {
@@ -195,12 +240,13 @@ ${buildHead(webview, nonce, "Query Results", extraStyles)}
       if (state.sortCol >= 0) {
         rows = rows.slice().sort((r1, r2) => state.sortDir * cmp(r1[state.sortCol], r2[state.sortCol]));
       }
+      const cls = (i) => state.numeric[i] ? " class='num'" : "";
       const thead = "<thead><tr>" + state.columns.map((c, i) => {
         const arrow = i === state.sortCol ? (state.sortDir > 0 ? "▲" : "▼") : "";
-        return "<th data-col='" + i + "'>" + escapeHtml(c) + "<span class='arrow'>" + arrow + "</span></th>";
+        return "<th data-col='" + i + "'" + cls(i) + ">" + escapeHtml(c) + "<span class='arrow'>" + arrow + "</span></th>";
       }).join("") + "</tr></thead>";
       const tbody = "<tbody>" + rows.map((r) =>
-        "<tr>" + r.map((cell) => "<td>" + escapeHtml(cell) + "</td>").join("") + "</tr>"
+        "<tr>" + r.map((cell, i) => "<td" + cls(i) + ">" + escapeHtml(cell) + "</td>").join("") + "</tr>"
       ).join("") + "</tbody>";
       wrap.innerHTML = "<table class='grid'>" + thead + tbody + "</table>";
       for (const th of wrap.querySelectorAll("th")) {
@@ -218,35 +264,48 @@ ${buildHead(webview, nonce, "Query Results", extraStyles)}
         .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
 
+    function applyData(m) {
+      state = { columns: m.columns, rows: m.rows, sortCol: -1, sortDir: 1, numeric: computeNumericCols(m.columns, m.rows) };
+      $("title").textContent = m.title;
+      const bits = [];
+      if (typeof m.meta.rowCount === "number") bits.push(m.meta.rowCount + (m.meta.truncated ? "+ rows (truncated)" : " rows"));
+      if (m.meta.adapterKind) bits.push(m.meta.adapterKind);
+      if (m.meta.cte) bits.push("CTE: " + m.meta.cte);
+      $("meta").textContent = bits.join(" · ");
+      const status = $("status");
+      status.hidden = state.rows.length > 0;
+      if (!state.rows.length) { status.className = "empty"; status.textContent = "(0 rows)"; }
+      $("copy").hidden = false;
+      $("csv").hidden = false;
+      $("sql").hidden = !m.meta.executedSql;
+      render();
+    }
+
     window.addEventListener("message", (ev) => {
       const m = ev.data;
-      const status = $("status"), copy = $("copy"), sql = $("sql"), meta = $("meta"), title = $("title");
+      const status = $("status"), copy = $("copy"), csv = $("csv"), sql = $("sql"), meta = $("meta"), title = $("title");
       if (m.type === "loading") {
         title.textContent = m.title; meta.textContent = "";
         status.className = "empty"; status.textContent = "Running…"; status.hidden = false;
-        copy.hidden = true; sql.hidden = true; $("grid-wrap").innerHTML = "";
+        copy.hidden = true; csv.hidden = true; sql.hidden = true; $("grid-wrap").innerHTML = "";
       } else if (m.type === "error") {
         title.textContent = ""; meta.textContent = "";
         status.className = "err"; status.textContent = m.message; status.hidden = false;
-        copy.hidden = true; sql.hidden = true; $("grid-wrap").innerHTML = "";
+        copy.hidden = true; csv.hidden = true; sql.hidden = true; $("grid-wrap").innerHTML = "";
       } else if (m.type === "data") {
-        state = { columns: m.columns, rows: m.rows, sortCol: -1, sortDir: 1 };
-        title.textContent = m.title;
-        const bits = [];
-        if (typeof m.meta.rowCount === "number") bits.push(m.meta.rowCount + (m.meta.truncated ? "+ rows (truncated)" : " rows"));
-        if (m.meta.adapterKind) bits.push(m.meta.adapterKind);
-        if (m.meta.cte) bits.push("CTE: " + m.meta.cte);
-        meta.textContent = bits.join(" · ");
-        status.hidden = state.rows.length > 0;
-        if (!state.rows.length) { status.className = "empty"; status.textContent = "(0 rows)"; }
-        copy.hidden = false;
-        sql.hidden = !m.meta.executedSql;
-        render();
+        applyData(m);
+        vscode.setState(m); // survive webview reloads (window reload, panel re-open)
       }
     });
 
     $("copy").addEventListener("click", () => vscode.postMessage({ type: "copyTsv" }));
+    $("csv").addEventListener("click", () => vscode.postMessage({ type: "saveCsv" }));
     $("sql").addEventListener("click", () => vscode.postMessage({ type: "showSql" }));
+
+    // Restore the last results from persisted state before announcing readiness.
+    const saved = vscode.getState();
+    if (saved && saved.type === "data") applyData(saved);
+
     vscode.postMessage({ type: "ready" });
   </script>
 </body>

@@ -11,10 +11,13 @@ import {
 } from "./previewRowsCore";
 import { confirmAction, ensureWorkspace, resolveModelName } from "./ui";
 
-/** Resolve a model name from a command arg or the active editor. */
-function resolveModelToPreview(arg: unknown): string | undefined {
-  const fromArg = resolveModelName(arg);
-  if (fromArg) return fromArg;
+/** Model name from an explicit command arg (CodeLens / tree item), if any. */
+function explicitModel(arg: unknown): string | undefined {
+  return resolveModelName(arg);
+}
+
+/** Model name derived from the active editor's file name. */
+function activeEditorModel(): string | undefined {
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     vscode.window.showWarningMessage("Open a Rocky model file first.");
@@ -24,10 +27,53 @@ function resolveModelToPreview(arg: unknown): string | undefined {
   return base.length > 0 ? base : undefined;
 }
 
-/** `rocky.previewModel` — preview a model's output rows. */
+/**
+ * Find the CTE whose range contains the active editor's cursor, for `.sql`
+ * models, via the LSP's document symbols. Returns undefined for `.rocky` files
+ * (which surface pipeline steps, not CTEs) or when the cursor isn't in a CTE.
+ */
+async function cteUnderCursor(): Promise<string | undefined> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || !editor.document.fileName.endsWith(".sql")) return undefined;
+  const pos = editor.selection.active;
+  try {
+    const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+      "vscode.executeDocumentSymbolProvider",
+      editor.document.uri,
+    );
+    return findCteContaining(symbols ?? [], pos);
+  } catch {
+    return undefined;
+  }
+}
+
+function findCteContaining(
+  symbols: vscode.DocumentSymbol[],
+  pos: vscode.Position,
+): string | undefined {
+  for (const s of symbols) {
+    if (s.detail === "CTE" && s.range.contains(pos)) return s.name;
+    if (s.children && s.children.length > 0) {
+      const nested = findCteContaining(s.children, pos);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `rocky.previewModel` — preview output rows. When invoked without an explicit
+ * model (the Cmd/Ctrl+Enter keybinding or the command palette) it's
+ * cursor-aware: if the cursor sits inside a CTE of a `.sql` model, that CTE is
+ * previewed instead of the whole model. The model-level "Preview" CodeLens
+ * passes the model name explicitly and always previews the full model.
+ */
 export async function previewModel(arg?: unknown): Promise<void> {
-  const model = resolveModelToPreview(arg);
-  if (model) await runPreview(model, undefined);
+  const explicit = explicitModel(arg);
+  const model = explicit ?? activeEditorModel();
+  if (!model) return;
+  const cte = explicit ? undefined : await cteUnderCursor();
+  await runPreview(model, cte);
 }
 
 /** `rocky.previewCte` — preview a single CTE's rows (from the CodeLens). */
