@@ -9,9 +9,12 @@ import type { PreviewTreeProvider } from "./previewView";
 import { registerRunsView } from "./runsView";
 import { registerSchemaView } from "./schemaView";
 import { registerSourcesView } from "./sourcesView";
+import { registerQueryResultsView } from "../webviews/resultGrid";
+import type { ResultGridViewProvider } from "../webviews/resultGrid";
 
 let infoProvider: ExtensionInfoTreeProvider | undefined;
 let previewProvider: PreviewTreeProvider | undefined;
+let queryResultsProvider: ResultGridViewProvider | undefined;
 
 /**
  * Registers all eight Rocky tree views on the activity bar:
@@ -29,10 +32,15 @@ export function registerViews(context: vscode.ExtensionContext): void {
   registerSchemaView(context);
   previewProvider = registerPreviewView(context);
   registerHelpView(context);
+  queryResultsProvider = registerQueryResultsView(context);
 }
 
 export function getPreviewProvider(): PreviewTreeProvider | undefined {
   return previewProvider;
+}
+
+export function getQueryResultsProvider(): ResultGridViewProvider | undefined {
+  return queryResultsProvider;
 }
 
 export function getInfoProvider(): ExtensionInfoTreeProvider | undefined {

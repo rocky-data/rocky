@@ -45,7 +45,9 @@ export class RockyCodeLensProvider implements vscode.CodeLensProvider {
     this.emitter.fire();
   }
 
-  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+  async provideCodeLenses(
+    document: vscode.TextDocument,
+  ): Promise<vscode.CodeLens[]> {
     const ext = path.extname(document.fileName);
     if (!SUPPORTED_EXTENSIONS.has(ext)) return [];
     if (!isModelFile(document.fileName)) return [];
@@ -56,17 +58,62 @@ export class RockyCodeLensProvider implements vscode.CodeLensProvider {
     const line = findModelCommentLine(document);
     const range = new vscode.Range(line, 0, line, 0);
 
-    return [
-      makeLens(range, "$(play) Run Model", "rocky.codeLens.runModel", [
+    const lenses = [
+      makeLens(range, "$(play) Run Model", "rocky.codeLens.runModel", [modelName]),
+      makeLens(range, "$(table) Preview", "rocky.previewModel", [modelName]),
+      makeLens(range, "$(file-code) Compile Model", "rocky.codeLens.compileModel", [
         modelName,
       ]),
-      makeLens(range, "$(file-code) Compile Model", "rocky.codeLens.compileModel", [
+      makeLens(range, "$(open-preview) Compiled SQL", "rocky.showCompiledSql", [
         modelName,
       ]),
       makeLens(range, "$(beaker) Test", "rocky.test", [modelName]),
       makeLens(range, "$(graph) Lineage", "rocky.showLineage", [modelName]),
     ];
+
+    // Per-CTE preview lenses. CTE symbols are emitted by the LSP only for
+    // `.sql` models (`.rocky` files surface pipeline steps instead). If the
+    // LSP isn't ready or returns nothing, the base lenses still apply.
+    if (ext === ".sql") {
+      try {
+        const symbols = await vscode.commands.executeCommand<
+          vscode.DocumentSymbol[]
+        >("vscode.executeDocumentSymbolProvider", document.uri);
+        for (const cte of collectCteSymbols(symbols ?? [])) {
+          const cteRange = new vscode.Range(cte.line, 0, cte.line, 0);
+          lenses.push(
+            makeLens(cteRange, `$(table) Preview CTE: ${cte.name}`, "rocky.previewCte", [
+              { model: modelName, cte: cte.name },
+            ]),
+          );
+        }
+      } catch {
+        // Symbol provider unavailable — keep the base lenses.
+      }
+    }
+
+    return lenses;
   }
+}
+
+/**
+ * Recursively collect CTE symbols from a document-symbol tree. The Rocky LSP
+ * tags each CTE with `detail: "CTE"` nested under the model symbol.
+ */
+function collectCteSymbols(
+  symbols: vscode.DocumentSymbol[],
+): { name: string; line: number }[] {
+  const out: { name: string; line: number }[] = [];
+  const walk = (syms: vscode.DocumentSymbol[]): void => {
+    for (const s of syms) {
+      if (s.detail === "CTE") {
+        out.push({ name: s.name, line: s.range.start.line });
+      }
+      if (s.children && s.children.length > 0) walk(s.children);
+    }
+  };
+  walk(symbols);
+  return out;
 }
 
 function makeLens(

@@ -124,6 +124,16 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show inline cost annotations (CodeLens) above model files. Data is fetched from `rocky optimize` on activation and refreshed via the **Rocky: Refresh Cost Annotations** command."
+        },
+        "rocky.preview.rowLimit": {
+          "type": "number",
+          "default": 100,
+          "markdownDescription": "Maximum rows returned by **Rocky: Preview** (`rocky preview rows --limit`)."
+        },
+        "rocky.preview.allowWarehouse": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow row previews to execute against a non-DuckDB warehouse (Databricks/Snowflake/BigQuery/Trino). May incur query cost — you're still asked to confirm each run. DuckDB previews run locally and ignore this setting."
         }
       }
     },
@@ -132,6 +142,18 @@
         "command": "rocky.commandPalette",
         "title": "Rocky Command Palette",
         "category": "Rocky"
+      },
+      {
+        "command": "rocky.previewModel",
+        "title": "Preview Model Rows",
+        "category": "Rocky",
+        "icon": "$(table)"
+      },
+      {
+        "command": "rocky.showCompiledSql",
+        "title": "Open Compiled SQL",
+        "category": "Rocky",
+        "icon": "$(open-preview)"
       },
       {
         "command": "rocky.codeLens.runModel",
@@ -447,9 +469,24 @@
           "title": "Rocky",
           "icon": "icons/rocky-activity-bar.svg"
         }
+      ],
+      "panel": [
+        {
+          "id": "rockyPanel",
+          "title": "Rocky",
+          "icon": "icons/rocky-activity-bar.svg"
+        }
       ]
     },
     "views": {
+      "rockyPanel": [
+        {
+          "id": "rocky.queryResults",
+          "name": "Query Results",
+          "type": "webview",
+          "contextualTitle": "Rocky Query Results"
+        }
+      ],
       "rocky": [
         {
           "id": "rocky.getStarted",
@@ -668,6 +705,16 @@
           "command": "rocky.optimize",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
           "group": "rocky@3"
+        },
+        {
+          "command": "rocky.previewModel",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@4"
+        },
+        {
+          "command": "rocky.showCompiledSql",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@5"
         }
       ]
     },
@@ -703,6 +750,12 @@
         "command": "rocky.commandPalette",
         "key": "ctrl+shift+r",
         "mac": "cmd+shift+r"
+      },
+      {
+        "command": "rocky.previewModel",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && (resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//))"
       }
     ],
     "walkthroughs": [

@@ -48,6 +48,17 @@ suite("Rocky Extension", () => {
     assert.deepStrictEqual(missing, [], `Missing commands: ${missing.join(", ")}`);
   });
 
+  test("Inline-preview commands are registered", async () => {
+    const commands = await vscode.commands.getCommands(true);
+    const expected = [
+      "rocky.previewModel",
+      "rocky.previewCte",
+      "rocky.showCompiledSql",
+    ];
+    const missing = expected.filter((c) => !commands.includes(c));
+    assert.deepStrictEqual(missing, [], `Missing commands: ${missing.join(", ")}`);
+  });
+
   test("rocky.doctor command exists", async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { registerChatParticipant } from "./chatParticipant";
 import { registerCodeLensProvider } from "./codeLens";
 import { registerCommands } from "./commands";
+import { registerCompiledSqlProvider } from "./compiledSqlProvider";
 import { registerCostCodeLensProvider } from "./costCodeLens";
 import { registerDriftDiagnostics } from "./driftDiagnostics";
 import { setExtensionUri } from "./extensionState";
@@ -29,6 +30,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerRunDecorations(context);
   registerDriftDiagnostics(context);
   registerTaskProvider(context);
+  registerCompiledSqlProvider(context);
   registerViews(context);
 }
 
