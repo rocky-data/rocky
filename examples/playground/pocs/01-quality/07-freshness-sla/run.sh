@@ -2,7 +2,7 @@
 # 07-freshness-sla — model-level freshness SLAs + the W005 coverage diagnostic.
 # Compile-time only; `--with-seed` types the leaf models from data/seed.sql so
 # the temporal columns that drive W005 are concrete (not Unknown).
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"

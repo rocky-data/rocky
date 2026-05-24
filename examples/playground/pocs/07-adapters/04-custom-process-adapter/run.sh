@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 04-custom-process-adapter — a Python warehouse adapter, exercised raw and
 # then discovered through the engine via the `rocky-` PATH convention.
-set -uo pipefail
+set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 mkdir -p expected
