@@ -1071,26 +1071,33 @@ async fn test_statement_execute_span_emitted() {
         .await
         .unwrap();
 
-    let captured = captured_spans().lock().unwrap();
-    let stmt_span = captured
-        .iter()
-        .find(|(name, _)| name == "statement.execute")
-        .unwrap_or_else(|| {
-            let names: Vec<&str> = captured.iter().map(|(n, _)| n.as_str()).collect();
-            panic!("expected a statement.execute span, got: {names:?}")
-        });
-    let adapter = stmt_span
-        .1
-        .iter()
-        .find(|(k, _)| k == "adapter")
-        .expect("expected `adapter` attribute on statement.execute span");
-    assert_eq!(adapter.1, "snowflake");
-    let kind = stmt_span
-        .1
-        .iter()
-        .find(|(k, _)| k == "statement.kind")
-        .expect("expected `statement.kind` attribute on statement.execute span");
-    assert_eq!(kind.1, "query");
+    // `CREATE TABLE` classifies as `ddl` (see `classify_statement_kind`), so the
+    // canary's span carries `statement.kind = "ddl"`.
+    //
+    // `captured_spans()` is a process-wide static shared by every test in this
+    // binary, so other `#[tokio::test]` cases running in parallel can interleave
+    // their own `statement.execute` spans into the buffer. Assert that the
+    // canary's span *exists* (adapter + `ddl` kind on a single span) rather than
+    // indexing the first `statement.execute` entry, which might belong to a
+    // sibling test. Compute the result and drop the lock guard *before* the
+    // assertion, so a failure can never poison the shared mutex and cascade into
+    // sibling tests.
+    let found_canary_span = {
+        let captured = captured_spans().lock().unwrap();
+        captured.iter().any(|(name, fields)| {
+            name == "statement.execute"
+                && fields
+                    .iter()
+                    .any(|(k, v)| k == "adapter" && v == "snowflake")
+                && fields
+                    .iter()
+                    .any(|(k, v)| k == "statement.kind" && v == "ddl")
+        })
+    };
+    assert!(
+        found_canary_span,
+        "expected a `statement.execute` span with adapter=snowflake and statement.kind=ddl"
+    );
 }
 
 // =============================================================================
