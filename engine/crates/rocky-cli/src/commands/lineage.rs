@@ -82,8 +82,6 @@ pub fn run_lineage(
         .model_schema(model_name)
         .context(format!("model '{model_name}' not found"))?;
 
-    let direction = if downstream { "downstream" } else { "upstream" };
-
     // `--format dot` is lineage-specific and only produces DOT, so it wins
     // over the global `--output json` (which defaults to `json`). Without
     // this, `rocky lineage <m> --format dot` silently emits JSON.
@@ -91,106 +89,10 @@ pub fn run_lineage(
 
     if output_json && !emit_dot {
         if let Some(col) = col_name {
-            let trace_edges = if downstream {
-                result
-                    .semantic_graph
-                    .trace_column_downstream(model_name, col)
-            } else {
-                result.semantic_graph.trace_column(model_name, col)
-            };
-            let trace: Vec<LineageEdgeRecord> =
-                trace_edges.iter().map(|e| to_edge_record(e)).collect();
-            let output = ColumnLineageOutput {
-                version: VERSION.to_string(),
-                command: "lineage".to_string(),
-                model: model_name.to_string(),
-                column: col.to_string(),
-                direction: direction.to_string(),
-                trace,
-            };
+            let output = column_lineage_output(&result, model_name, col, downstream)?;
             print_json(&output)?;
         } else {
-            let edges: Vec<LineageEdgeRecord> = result
-                .semantic_graph
-                .edges
-                .iter()
-                .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
-                .map(to_edge_record)
-                .collect();
-            // Look up typed columns for this model from the typecheck
-            // pass so each `LineageColumnDef` can carry its inferred
-            // `data_type`. The typed schema may be absent (e.g. on a
-            // model that failed typecheck) or report `RockyType::Unknown`
-            // for columns it couldn't resolve — both map to `None`.
-            let typed_cols = result.type_check.typed_models.get(model_name);
-            let columns: Vec<LineageColumnDef> = schema
-                .columns
-                .iter()
-                .map(|c| {
-                    let data_type = typed_cols
-                        .and_then(|cols| cols.iter().find(|t| t.name == c.name))
-                        .filter(|t| !matches!(t.data_type, rocky_ir::types::RockyType::Unknown))
-                        .map(|t| t.data_type.to_string());
-                    LineageColumnDef {
-                        name: c.name.clone(),
-                        data_type,
-                    }
-                })
-                .collect();
-            // Per-node metadata for the focal model + every distinct
-            // endpoint of `edges`. Project models contribute a
-            // `target_schema` from their declared target config; nodes
-            // not present in `project.models` are treated as external
-            // sources and carry their qualified reference string as
-            // `source_id` so the VS Code lineage subgraph drill-in can
-            // cluster them without parsing the qualified name.
-            let mut node_ids: Vec<String> = Vec::new();
-            let mut seen_nodes: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            if seen_nodes.insert(model_name.to_string()) {
-                node_ids.push(model_name.to_string());
-            }
-            for edge in result
-                .semantic_graph
-                .edges
-                .iter()
-                .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
-            {
-                for endpoint in [&edge.source.model, &edge.target.model] {
-                    let name = endpoint.to_string();
-                    if seen_nodes.insert(name.clone()) {
-                        node_ids.push(name);
-                    }
-                }
-            }
-            let nodes: Vec<LineageNodeDef> = node_ids
-                .into_iter()
-                .map(|id| {
-                    if let Some(model) = result.project.model(&id) {
-                        LineageNodeDef {
-                            model: id,
-                            target_schema: Some(model.config.target.schema.clone()),
-                            source_id: None,
-                        }
-                    } else {
-                        LineageNodeDef {
-                            model: id.clone(),
-                            target_schema: None,
-                            source_id: Some(id),
-                        }
-                    }
-                })
-                .collect();
-            let output = LineageOutput {
-                version: VERSION.to_string(),
-                command: "lineage".to_string(),
-                model: model_name.to_string(),
-                columns,
-                upstream: schema.upstream.clone(),
-                downstream: schema.downstream.clone(),
-                edges,
-                nodes,
-            };
+            let output = lineage_output(&result, model_name)?;
             print_json(&output)?;
         }
     } else if emit_dot {
@@ -284,4 +186,146 @@ pub fn run_lineage(
     }
 
     Ok(())
+}
+
+/// Side-effect-free core producing the model-level [`LineageOutput`] (the
+/// no-`--column` case). Mirrors the JSON-branch assembly in [`run_lineage`]
+/// without printing.
+///
+/// `result` is a completed compile; `model_name` is the focal model. Errors
+/// when the model is absent from the semantic graph.
+// Reusable typed-output core for a future in-process caller. No internal call
+// site beyond `run_lineage`'s JSON branch yet.
+#[allow(dead_code)]
+pub(crate) fn lineage_output(
+    result: &compile::CompileResult,
+    model_name: &str,
+) -> Result<LineageOutput> {
+    let schema = result
+        .semantic_graph
+        .model_schema(model_name)
+        .context(format!("model '{model_name}' not found"))?;
+
+    let edges: Vec<LineageEdgeRecord> = result
+        .semantic_graph
+        .edges
+        .iter()
+        .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
+        .map(to_edge_record)
+        .collect();
+    // Look up typed columns for this model from the typecheck pass so each
+    // `LineageColumnDef` can carry its inferred `data_type`. The typed schema
+    // may be absent (e.g. on a model that failed typecheck) or report
+    // `RockyType::Unknown` for columns it couldn't resolve — both map to `None`.
+    let typed_cols = result.type_check.typed_models.get(model_name);
+    let columns: Vec<LineageColumnDef> = schema
+        .columns
+        .iter()
+        .map(|c| {
+            let data_type = typed_cols
+                .and_then(|cols| cols.iter().find(|t| t.name == c.name))
+                .filter(|t| !matches!(t.data_type, rocky_ir::types::RockyType::Unknown))
+                .map(|t| t.data_type.to_string());
+            LineageColumnDef {
+                name: c.name.clone(),
+                data_type,
+            }
+        })
+        .collect();
+    // Per-node metadata for the focal model + every distinct endpoint of
+    // `edges`. Project models contribute a `target_schema` from their declared
+    // target config; nodes not present in `project.models` are treated as
+    // external sources and carry their qualified reference string as
+    // `source_id` so the VS Code lineage subgraph drill-in can cluster them
+    // without parsing the qualified name.
+    let mut node_ids: Vec<String> = Vec::new();
+    let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if seen_nodes.insert(model_name.to_string()) {
+        node_ids.push(model_name.to_string());
+    }
+    for edge in result
+        .semantic_graph
+        .edges
+        .iter()
+        .filter(|e| &*e.target.model == model_name || &*e.source.model == model_name)
+    {
+        for endpoint in [&edge.source.model, &edge.target.model] {
+            let name = endpoint.to_string();
+            if seen_nodes.insert(name.clone()) {
+                node_ids.push(name);
+            }
+        }
+    }
+    let nodes: Vec<LineageNodeDef> = node_ids
+        .into_iter()
+        .map(|id| {
+            if let Some(model) = result.project.model(&id) {
+                LineageNodeDef {
+                    model: id,
+                    target_schema: Some(model.config.target.schema.clone()),
+                    source_id: None,
+                }
+            } else {
+                LineageNodeDef {
+                    model: id.clone(),
+                    target_schema: None,
+                    source_id: Some(id),
+                }
+            }
+        })
+        .collect();
+
+    Ok(LineageOutput {
+        version: VERSION.to_string(),
+        command: "lineage".to_string(),
+        model: model_name.to_string(),
+        columns,
+        upstream: schema.upstream.clone(),
+        downstream: schema.downstream.clone(),
+        edges,
+        nodes,
+    })
+}
+
+/// Side-effect-free core producing the column-level [`ColumnLineageOutput`]
+/// (the `--column` / `model.column` case). Mirrors the JSON-branch assembly in
+/// [`run_lineage`] without printing.
+///
+/// `downstream` selects the trace direction: `true` traces consumers, `false`
+/// traces sources.
+// Reusable typed-output core for a future in-process caller. No internal call
+// site beyond `run_lineage`'s JSON branch yet.
+#[allow(dead_code)]
+pub(crate) fn column_lineage_output(
+    result: &compile::CompileResult,
+    model_name: &str,
+    column: &str,
+    downstream: bool,
+) -> Result<ColumnLineageOutput> {
+    // Assert the model exists so the column core matches `run_lineage`'s
+    // model-not-found behaviour (the wrapper resolves `schema` before
+    // dispatch).
+    result
+        .semantic_graph
+        .model_schema(model_name)
+        .context(format!("model '{model_name}' not found"))?;
+
+    let direction = if downstream { "downstream" } else { "upstream" };
+    let trace_edges = if downstream {
+        result
+            .semantic_graph
+            .trace_column_downstream(model_name, column)
+    } else {
+        result.semantic_graph.trace_column(model_name, column)
+    };
+    let trace: Vec<LineageEdgeRecord> = trace_edges.iter().map(|e| to_edge_record(e)).collect();
+
+    Ok(ColumnLineageOutput {
+        version: VERSION.to_string(),
+        command: "lineage".to_string(),
+        model: model_name.to_string(),
+        column: column.to_string(),
+        direction: direction.to_string(),
+        trace,
+    })
 }

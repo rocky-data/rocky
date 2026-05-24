@@ -424,6 +424,201 @@ pub async fn plan(
     Ok(())
 }
 
+/// Resolve a standalone [`SqlDialect`](rocky_core::traits::SqlDialect) for the
+/// SQL preview, keyed by an adapter-type string (`"databricks"`, `"snowflake"`,
+/// `"bigquery"`, `"trino"`, `"duckdb"`).
+///
+/// These dialects are pure formatters — they need no live connection — so the
+/// preview can render warehouse-accurate SQL offline. DuckDB is only available
+/// when the `duckdb` feature is enabled (the default); without it, and for any
+/// unknown / missing adapter type, we fall back to the Databricks dialect and
+/// log a `tracing::warn!` so the preview still produces SQL.
+fn dialect_for_adapter_type(adapter_type: &str) -> Box<dyn rocky_core::traits::SqlDialect> {
+    match adapter_type {
+        "databricks" => Box::new(rocky_databricks::dialect::DatabricksSqlDialect),
+        "snowflake" => Box::new(rocky_snowflake::dialect::SnowflakeSqlDialect),
+        "bigquery" => Box::new(rocky_bigquery::dialect::BigQueryDialect),
+        "trino" => Box::new(rocky_trino::dialect::TrinoDialect),
+        #[cfg(feature = "duckdb")]
+        "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
+        other => {
+            tracing::warn!(
+                adapter_type = other,
+                "plan_preview: no standalone dialect for this adapter type — \
+                 falling back to the Databricks dialect for the SQL preview"
+            );
+            Box::new(rocky_databricks::dialect::DatabricksSqlDialect)
+        }
+    }
+}
+
+/// Map a transformation [`MaterializationStrategy`] to the `purpose` label used
+/// on a [`PlannedStatement`] in the SQL preview.
+fn strategy_purpose(strategy: &MaterializationStrategy) -> &'static str {
+    match strategy {
+        MaterializationStrategy::FullRefresh => "full_refresh",
+        MaterializationStrategy::Incremental { .. } => "incremental",
+        MaterializationStrategy::Merge { .. } => "merge",
+        MaterializationStrategy::View => "view",
+        MaterializationStrategy::MaterializedView => "materialized_view",
+        MaterializationStrategy::DynamicTable { .. } => "dynamic_table",
+        MaterializationStrategy::TimeInterval { .. } => "time_interval",
+        MaterializationStrategy::Ephemeral => "ephemeral",
+        MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
+        MaterializationStrategy::Microbatch { .. } => "microbatch",
+        MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+    }
+}
+
+/// Side-effect-free SQL preview core: compile the project in-process and render
+/// the SQL each compiled transformation model **would** emit, returning a
+/// [`PlanOutput`] whose only populated field is `statements`.
+///
+/// This is the offline, adapter-free analogue of [`plan`] for an in-process
+/// caller (MCP server): no warehouse connection, no discovery, no governance
+/// preview, no plan persistence. Discovery/governance/`plan_id`/
+/// `execution_layers` stay empty/`None`/default.
+///
+/// ## Dialect
+///
+/// The dialect is sourced from the project's configured target adapter type
+/// (via `config_path`) when available; otherwise it defaults to DuckDB (or the
+/// Databricks fallback when the `duckdb` feature is off). See
+/// [`dialect_for_adapter_type`].
+///
+/// ## Replication-only projects
+///
+/// This core covers compiled (transformation) models only. If the project has
+/// no compiled models (replication-only, or `models/` holds only stubs), the
+/// returned `PlanOutput` has empty `statements` and a `tracing::info!` note —
+/// the live `rocky plan` discovery path is the surface for replication SQL.
+// Reusable typed-output core for a future in-process caller. No internal call
+// site yet — `rocky plan` uses the full live `plan()` path.
+#[allow(dead_code)]
+pub(crate) fn plan_preview_output(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    filter: Option<&str>,
+    env: Option<&str>,
+) -> Result<PlanOutput> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
+    output.env = env.map(str::to_string);
+
+    // Resolve the preview dialect from the configured target adapter type.
+    // No config / unresolvable target → DuckDB (or the Databricks fallback
+    // when the `duckdb` feature is off).
+    let adapter_type = config_path
+        .and_then(|p| rocky_core::config::load_rocky_config(p).ok())
+        .and_then(|cfg| {
+            // Prefer the default replication pipeline's target adapter; fall
+            // back to the first adapter declared in the config.
+            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
+                .ok()
+                .map(|(_, pipeline)| pipeline.target.adapter.clone());
+            target_adapter_name
+                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
+                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
+        })
+        .unwrap_or_else(|| "duckdb".to_string());
+    let dialect = dialect_for_adapter_type(&adapter_type);
+
+    // Compile the project in-process (offline — no source schemas, no cache).
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        source_schemas: std::collections::HashMap::new(),
+        source_column_info: std::collections::HashMap::new(),
+        mask: std::collections::BTreeMap::new(),
+        allow_unmasked: vec![],
+        project_freshness_default: false,
+    };
+    let result = match compile::compile(&config) {
+        Ok(r) => r,
+        // `NoModels` is the replication-only signal: the models directory holds
+        // no compiled models. That is not an error for the preview — return
+        // empty statements with a note. Every other compile failure (parse,
+        // semantic-graph, contract-load) propagates so an in-process caller
+        // sees the real problem.
+        Err(rocky_compiler::compile::CompileError::Project(
+            rocky_compiler::project::ProjectError::NoModels { .. },
+        )) => {
+            tracing::info!(
+                models_dir = %models_dir.display(),
+                "plan_preview: project has no compiled models — replication SQL preview \
+                 requires the live `rocky plan` discovery path; returning empty statements"
+            );
+            return Ok(output);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("failed to compile models for plan preview"));
+        }
+    };
+
+    if result.project.models.is_empty() {
+        tracing::info!(
+            models_dir = %models_dir.display(),
+            "plan_preview: project has no compiled models — returning empty statements"
+        );
+        return Ok(output);
+    }
+
+    // Project the compile result to typed IR, reusing the shared
+    // `project_ir_from_compile` helper so we don't re-derive IR by hand.
+    let project_ir = super::ci_diff::project_ir_from_compile(&result);
+
+    for model_ir in &project_ir.models {
+        let model_name = model_ir.name.as_ref();
+        if let Some(f) = filter {
+            if model_name != f {
+                continue;
+            }
+        }
+
+        let target_label = if model_ir.target.catalog.is_empty() {
+            format!("{}.{}", model_ir.target.schema, model_ir.target.table)
+        } else {
+            format!(
+                "{}.{}.{}",
+                model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+            )
+        };
+        let purpose = strategy_purpose(&model_ir.materialization);
+
+        // `warehouse = None`: the offline preview has no live adapter, so
+        // Snowflake DynamicTable models cannot resolve a compute warehouse and
+        // ContentAddressed models route through the iceberg writer rather than
+        // SQL gen. Both surface as `SqlGenError::InvalidRequest` — skip them
+        // with a note rather than failing the whole preview.
+        match sql_gen::generate_transformation_sql_with_warehouse(model_ir, dialect.as_ref(), None)
+        {
+            Ok(stmts) => {
+                // Ephemeral models return `Ok(vec![])` (inlined as CTEs) — no
+                // statement to preview. Multi-statement strategies
+                // (DeleteInsert, lakehouse DDL) emit one row each.
+                for sql in stmts {
+                    output.statements.push(PlannedStatement {
+                        purpose: purpose.to_string(),
+                        target: target_label.clone(),
+                        sql,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    model = model_name,
+                    strategy = purpose,
+                    error = %e,
+                    "plan_preview: skipping model whose SQL cannot be rendered offline"
+                );
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return
 /// `Some((payload, plan_id, persisted_at))`.
@@ -1430,6 +1625,152 @@ ssn = "confidential"
         assert_eq!(MaskStrategy::Redact.as_str(), "redact");
         assert_eq!(MaskStrategy::Partial.as_str(), "partial");
         assert_eq!(MaskStrategy::None.as_str(), "none");
+    }
+
+    // ------------------------------------------------------------------
+    // plan_preview_output — offline, adapter-free SQL preview core.
+    // ------------------------------------------------------------------
+
+    /// A project with one full-refresh transformation model yields exactly one
+    /// CTAS statement, and only `statements` is populated (governance /
+    /// plan_id / execution_layers stay empty).
+    #[test]
+    fn plan_preview_renders_full_refresh_ctas() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "users",
+                r#"name = "users"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "users"
+"#,
+            )],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        assert_eq!(out.statements.len(), 1, "one model → one statement");
+        assert_eq!(out.statements[0].purpose, "full_refresh");
+        assert_eq!(out.statements[0].target, "c.s.users");
+        let sql = out.statements[0].sql.to_uppercase();
+        assert!(
+            sql.contains("CREATE") && sql.contains("TABLE"),
+            "full_refresh should render CTAS, got: {}",
+            out.statements[0].sql
+        );
+        // Preview core touches statements only.
+        assert!(out.classification_actions.is_empty());
+        assert!(out.mask_actions.is_empty());
+        assert!(out.retention_actions.is_empty());
+        assert!(out.plan_id.is_none());
+        assert!(out.execution_layers.is_empty());
+    }
+
+    /// The `filter` arg narrows the preview to a single model by name and is
+    /// copied onto `PlanOutput.filter`.
+    #[test]
+    fn plan_preview_filter_narrows_to_one_model() {
+        let tmp = TempDir::new().unwrap();
+        let model_a = r#"name = "a"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "a"
+"#;
+        let model_b = r#"name = "b"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "b"
+"#;
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[("a", model_a), ("b", model_b)],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, Some("a"), None).unwrap();
+        assert_eq!(out.filter, "a");
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.a");
+    }
+
+    /// A `models/` directory with no compiled models (replication-only)
+    /// returns empty statements rather than erroring.
+    #[test]
+    fn plan_preview_replication_only_returns_empty_statements() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("rocky.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+        )
+        .unwrap();
+        // models_dir exists but holds no model sidecars.
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        assert!(
+            out.statements.is_empty(),
+            "no compiled models → empty statements"
+        );
+        assert!(out.plan_id.is_none());
+    }
+
+    /// With no config, the preview still renders SQL using the default
+    /// dialect (DuckDB under the default feature set).
+    #[test]
+    fn plan_preview_without_config_uses_default_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("m.sql"), "-- model: m\nSELECT 1 AS id").unwrap();
+        fs::write(
+            models_dir.join("m.toml"),
+            r#"name = "m"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "m"
+"#,
+        )
+        .unwrap();
+
+        let out = plan_preview_output(None, &models_dir, None, None).unwrap();
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.m");
     }
 
     // ------------------------------------------------------------------

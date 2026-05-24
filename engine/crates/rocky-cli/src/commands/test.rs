@@ -15,6 +15,27 @@ use crate::output::{
 };
 use crate::registry::{self, AdapterRegistry};
 
+/// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
+/// tests and assemble the typed [`TestOutput`] without printing.
+///
+/// The `run_test` wrapper calls this and prints; an in-process caller (MCP
+/// server) can obtain the struct directly.
+// Reusable typed-output core for a future in-process caller. No internal call
+// site yet — `run_test` re-runs the test runner so it can also render text.
+#[allow(dead_code)]
+pub(crate) fn test_output(models_dir: &Path, contracts_dir: Option<&Path>) -> Result<TestOutput> {
+    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir)?;
+    let failures: Vec<TestFailure> = result
+        .failures
+        .iter()
+        .map(|(name, error)| TestFailure {
+            name: name.clone(),
+            error: error.clone(),
+        })
+        .collect();
+    Ok(TestOutput::new(result.total, result.passed, failures))
+}
+
 /// Execute `rocky test` (DuckDB-based local tests).
 pub fn run_test(
     models_dir: &Path,
