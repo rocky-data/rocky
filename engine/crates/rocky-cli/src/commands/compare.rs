@@ -73,10 +73,10 @@ pub async fn compare(
             Err(_) => continue,
         };
 
-        if let Some((ref filter_key, ref filter_value)) = parsed_filter {
-            if !matches_filter(conn, &parsed, filter_key, filter_value) {
-                continue;
-            }
+        if let Some((ref filter_key, ref filter_value)) = parsed_filter
+            && !matches_filter(conn, &parsed, filter_key, filter_value)
+        {
+            continue;
         }
 
         let target_sep = pipeline

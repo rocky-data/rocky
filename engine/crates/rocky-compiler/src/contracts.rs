@@ -70,14 +70,14 @@ pub fn load_contracts(dir: &Path) -> Result<HashMap<String, CompilerContract>, S
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
 
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(model_name) = name.strip_suffix(".contract.toml") {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-                let contract: CompilerContract = toml::from_str(&content)
-                    .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-                contracts.insert(model_name.to_string(), contract);
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && let Some(model_name) = name.strip_suffix(".contract.toml")
+        {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            let contract: CompilerContract = toml::from_str(&content)
+                .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+            contracts.insert(model_name.to_string(), contract);
         }
     }
 
@@ -149,17 +149,18 @@ pub fn validate_contract(
                 }
 
                 // Nullability check
-                if let Some(nullable) = contract_col.nullable {
-                    if !nullable && col.nullable {
-                        diagnostics.push(Diagnostic::error(
-                            E012,
-                            model_name,
-                            format!(
-                                "column '{}' must be non-nullable per contract, but is nullable",
-                                contract_col.name
-                            ),
-                        ));
-                    }
+                if let Some(nullable) = contract_col.nullable
+                    && !nullable
+                    && col.nullable
+                {
+                    diagnostics.push(Diagnostic::error(
+                        E012,
+                        model_name,
+                        format!(
+                            "column '{}' must be non-nullable per contract, but is nullable",
+                            contract_col.name
+                        ),
+                    ));
                 }
             }
             None => {

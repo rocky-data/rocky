@@ -506,20 +506,20 @@ fn validate_replication_pipeline(
             field: Some(format!("pipeline.{name}.target.adapter")),
         });
     }
-    if let Some(ref disc) = pipeline.source.discovery {
-        if !cfg.adapters.contains_key(&disc.adapter) {
-            ok = false;
-            msgs.push(ValidateMessage {
-                severity: "error".into(),
-                code: "V024".into(),
-                message: format!(
-                    "pipeline.{name}: discovery adapter '{}' not found in [adapter]",
-                    disc.adapter
-                ),
-                file: None,
-                field: Some(format!("pipeline.{name}.source.discovery.adapter")),
-            });
-        }
+    if let Some(ref disc) = pipeline.source.discovery
+        && !cfg.adapters.contains_key(&disc.adapter)
+    {
+        ok = false;
+        msgs.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V024".into(),
+            message: format!(
+                "pipeline.{name}: discovery adapter '{}' not found in [adapter]",
+                disc.adapter
+            ),
+            file: None,
+            field: Some(format!("pipeline.{name}.source.discovery.adapter")),
+        });
     }
 
     msgs.push(ValidateMessage {
@@ -868,10 +868,10 @@ fn lint_config(
                 if pipeline.source.adapter == *adapter_name {
                     ref_count += 1;
                 }
-                if let Some(ref disc) = pipeline.source.discovery {
-                    if disc.adapter == *adapter_name {
-                        ref_count += 1;
-                    }
+                if let Some(ref disc) = pipeline.source.discovery
+                    && disc.adapter == *adapter_name
+                {
+                    ref_count += 1;
                 }
             }
         }

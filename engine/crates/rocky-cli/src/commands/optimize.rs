@@ -167,10 +167,10 @@ fn load_dag_from_models(models_dir: Option<&Path>) -> Vec<DagNode> {
     // Also check one level of subdirectories (same pattern as estimate.rs).
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Ok(sub) = models::load_models_from_dir(&entry.path()) {
-                    all_models.extend(sub);
-                }
+            if entry.path().is_dir()
+                && let Ok(sub) = models::load_models_from_dir(&entry.path())
+            {
+                all_models.extend(sub);
             }
         }
     }

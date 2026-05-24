@@ -498,21 +498,21 @@ impl WarehouseAdapter for BigQueryAdapter {
         // sync path, so the `is_none()` check is currently always true
         // when a job ran — but keeping it defensive against future
         // codepaths that might pre-populate the field.
-        if response.statistics.is_none() {
-            if let Some(ref job_ref) = response.job_reference {
-                match self.fetch_job_statistics(job_ref).await {
-                    Ok(stats) => response.statistics = Some(stats),
-                    Err(e) => {
-                        // Best-effort: fall back to top-level
-                        // `total_bytes_processed`. Logged so a future
-                        // "cost numbers look low" debug session has the
-                        // failure reason recorded.
-                        debug!(
-                            job_id = %job_ref.job_id,
-                            error = %e,
-                            "jobs.get failed; falling back to totalBytesProcessed",
-                        );
-                    }
+        if response.statistics.is_none()
+            && let Some(ref job_ref) = response.job_reference
+        {
+            match self.fetch_job_statistics(job_ref).await {
+                Ok(stats) => response.statistics = Some(stats),
+                Err(e) => {
+                    // Best-effort: fall back to top-level
+                    // `total_bytes_processed`. Logged so a future
+                    // "cost numbers look low" debug session has the
+                    // failure reason recorded.
+                    debug!(
+                        job_id = %job_ref.job_id,
+                        error = %e,
+                        "jobs.get failed; falling back to totalBytesProcessed",
+                    );
                 }
             }
         }

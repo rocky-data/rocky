@@ -97,12 +97,12 @@ fn validate_options(options: &LakehouseOptions) -> Result<(), LakehouseError> {
             )));
         }
     }
-    if let Some(comment) = &options.comment {
-        if comment.contains('\'') || comment.contains("--") || comment.contains(';') {
-            return Err(LakehouseError::InvalidOption(format!(
-                "comment contains unsafe characters: '{comment}'"
-            )));
-        }
+    if let Some(comment) = &options.comment
+        && (comment.contains('\'') || comment.contains("--") || comment.contains(';'))
+    {
+        return Err(LakehouseError::InvalidOption(format!(
+            "comment contains unsafe characters: '{comment}'"
+        )));
     }
     Ok(())
 }

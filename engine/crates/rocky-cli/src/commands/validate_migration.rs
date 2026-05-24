@@ -232,10 +232,10 @@ fn collect_rocky_model_names(dir: &Path) -> std::collections::HashSet<String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "sql") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.insert(stem.to_string());
-                }
+            if path.extension().is_some_and(|ext| ext == "sql")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                names.insert(stem.to_string());
             }
             // Recurse into subdirectories
             if path.is_dir() {

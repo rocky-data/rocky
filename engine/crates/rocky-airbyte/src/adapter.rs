@@ -88,10 +88,10 @@ fn matches_prefix(conn: &Connection, prefix: &str) -> bool {
         return true;
     }
 
-    if let Some(ns) = &conn.namespace_format {
-        if ns.starts_with(prefix) {
-            return true;
-        }
+    if let Some(ns) = &conn.namespace_format
+        && ns.starts_with(prefix)
+    {
+        return true;
     }
 
     // Fall back to connection name for connections without namespace_format.

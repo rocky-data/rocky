@@ -72,12 +72,12 @@ fn resolve_shell_adapter(
     pipeline_name: Option<&str>,
 ) -> Result<(String, Arc<dyn WarehouseAdapter>)> {
     // Try pipeline-based resolution first
-    if pipeline_name.is_some() || config.pipelines.len() == 1 {
-        if let Ok((_, pipeline)) = registry::resolve_pipeline(config, pipeline_name) {
-            let adapter_ref = pipeline_target_adapter(pipeline);
-            let adapter = registry.warehouse_adapter(&adapter_ref)?;
-            return Ok((adapter_ref, adapter));
-        }
+    if (pipeline_name.is_some() || config.pipelines.len() == 1)
+        && let Ok((_, pipeline)) = registry::resolve_pipeline(config, pipeline_name)
+    {
+        let adapter_ref = pipeline_target_adapter(pipeline);
+        let adapter = registry.warehouse_adapter(&adapter_ref)?;
+        return Ok((adapter_ref, adapter));
     }
 
     // Fallback: use the only warehouse adapter

@@ -140,24 +140,23 @@ pub fn detect_schema_changes(
 
         // Detect type changes
         for col in current_cols {
-            if let Some(prev_col) = prev_cols.iter().find(|p| p.name == col.name) {
-                if prev_col.data_type != col.data_type
-                    && col.data_type != rocky_compiler::types::RockyType::Unknown
-                    && prev_col.data_type != rocky_compiler::types::RockyType::Unknown
-                {
-                    changes.push(SchemaChange {
-                        model: model_name.clone(),
-                        change_type: SchemaChangeType::ColumnTypeChanged {
-                            name: col.name.clone(),
-                            old_type: format!("{:?}", prev_col.data_type),
-                            new_type: format!("{:?}", col.data_type),
-                        },
-                        details: format!(
-                            "Column '{}' type changed from {:?} to {:?} in '{}'",
-                            col.name, prev_col.data_type, col.data_type, model_name
-                        ),
-                    });
-                }
+            if let Some(prev_col) = prev_cols.iter().find(|p| p.name == col.name)
+                && prev_col.data_type != col.data_type
+                && col.data_type != rocky_compiler::types::RockyType::Unknown
+                && prev_col.data_type != rocky_compiler::types::RockyType::Unknown
+            {
+                changes.push(SchemaChange {
+                    model: model_name.clone(),
+                    change_type: SchemaChangeType::ColumnTypeChanged {
+                        name: col.name.clone(),
+                        old_type: format!("{:?}", prev_col.data_type),
+                        new_type: format!("{:?}", col.data_type),
+                    },
+                    details: format!(
+                        "Column '{}' type changed from {:?} to {:?} in '{}'",
+                        col.name, prev_col.data_type, col.data_type, model_name
+                    ),
+                });
             }
         }
     }

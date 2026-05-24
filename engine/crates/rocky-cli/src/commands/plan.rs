@@ -99,10 +99,10 @@ pub async fn plan(
             Err(_) => continue,
         };
 
-        if let Some((ref filter_key, ref filter_value)) = parsed_filter {
-            if !matches_filter(conn, &parsed, filter_key, filter_value) {
-                continue;
-            }
+        if let Some((ref filter_key, ref filter_value)) = parsed_filter
+            && !matches_filter(conn, &parsed, filter_key, filter_value)
+        {
+            continue;
         }
 
         let target_sep = pipeline
@@ -122,34 +122,33 @@ pub async fn plan(
         };
 
         // Catalog creation — only when governance enables it and the dialect supports catalogs.
-        if pipeline.target.governance.auto_create_catalogs {
-            if let Some(create_cat) = dialect.create_catalog_sql(&target_catalog) {
-                let sql = create_cat.map_err(|e| anyhow::anyhow!("create_catalog: {e}"))?;
-                output.statements.push(PlannedStatement {
-                    purpose: "create_catalog".into(),
-                    target: target_catalog.clone(),
-                    sql,
-                });
-            }
+        if pipeline.target.governance.auto_create_catalogs
+            && let Some(create_cat) = dialect.create_catalog_sql(&target_catalog)
+        {
+            let sql = create_cat.map_err(|e| anyhow::anyhow!("create_catalog: {e}"))?;
+            output.statements.push(PlannedStatement {
+                purpose: "create_catalog".into(),
+                target: target_catalog.clone(),
+                sql,
+            });
         }
 
         // Schema creation — only when governance enables it.
-        if pipeline.target.governance.auto_create_schemas {
-            if let Some(create_sch) =
+        if pipeline.target.governance.auto_create_schemas
+            && let Some(create_sch) =
                 dialect.create_schema_sql(&effective_target_catalog, &target_schema)
-            {
-                let sql = create_sch.map_err(|e| anyhow::anyhow!("create_schema: {e}"))?;
-                let target_label = if effective_target_catalog.is_empty() {
-                    target_schema.clone()
-                } else {
-                    format!("{effective_target_catalog}.{target_schema}")
-                };
-                output.statements.push(PlannedStatement {
-                    purpose: "create_schema".into(),
-                    target: target_label,
-                    sql,
-                });
-            }
+        {
+            let sql = create_sch.map_err(|e| anyhow::anyhow!("create_schema: {e}"))?;
+            let target_label = if effective_target_catalog.is_empty() {
+                target_schema.clone()
+            } else {
+                format!("{effective_target_catalog}.{target_schema}")
+            };
+            output.statements.push(PlannedStatement {
+                purpose: "create_schema".into(),
+                target: target_label,
+                sql,
+            });
         }
 
         // Per-table copy SQL
@@ -569,10 +568,10 @@ pub fn plan_preview_output(
 
     for model_ir in &project_ir.models {
         let model_name = model_ir.name.as_ref();
-        if let Some(f) = filter {
-            if model_name != f {
-                continue;
-            }
+        if let Some(f) = filter
+            && model_name != f
+        {
+            continue;
         }
 
         let target_label = if model_ir.target.catalog.is_empty() {

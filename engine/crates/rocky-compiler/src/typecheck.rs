@@ -1057,11 +1057,11 @@ fn collect_refs_from_query(
         }
 
         // Collect from ORDER BY
-        if let Some(ref order_by) = query.order_by {
-            if let ast::OrderByKind::Expressions(ref exprs) = order_by.kind {
-                for order in exprs {
-                    collect_refs_from_expr(&order.expr, file_path, ref_map);
-                }
+        if let Some(ref order_by) = query.order_by
+            && let ast::OrderByKind::Expressions(ref exprs) = order_by.kind
+        {
+            for order in exprs {
+                collect_refs_from_expr(&order.expr, file_path, ref_map);
             }
         }
     }
@@ -2683,14 +2683,14 @@ mod tests {
         let sql = format!("SELECT {expr_str}");
         let dialect = rocky_sql::dialect::DatabricksDialect;
         let stmts = Parser::parse_sql(&dialect, &sql).unwrap();
-        if let Statement::Query(q) = &stmts[0] {
-            if let SetExpr::Select(s) = q.body.as_ref() {
-                if let SelectItem::UnnamedExpr(e) = &s.projection[0] {
-                    return e.clone();
-                }
-                if let SelectItem::ExprWithAlias { expr, .. } = &s.projection[0] {
-                    return expr.clone();
-                }
+        if let Statement::Query(q) = &stmts[0]
+            && let SetExpr::Select(s) = q.body.as_ref()
+        {
+            if let SelectItem::UnnamedExpr(e) = &s.projection[0] {
+                return e.clone();
+            }
+            if let SelectItem::ExprWithAlias { expr, .. } = &s.projection[0] {
+                return expr.clone();
             }
         }
         panic!("failed to parse expression: {expr_str}");

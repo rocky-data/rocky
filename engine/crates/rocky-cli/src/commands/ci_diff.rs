@@ -273,10 +273,11 @@ pub(crate) fn extract_base_compile(
         let show_output = Command::new("git")
             .args(["show", &format!("{base_ref}:{file_path}")])
             .output();
-        if let Ok(o) = show_output {
-            if o.status.success() && std::fs::write(&dest, &o.stdout).is_ok() {
-                wrote_any = true;
-            }
+        if let Ok(o) = show_output
+            && o.status.success()
+            && std::fs::write(&dest, &o.stdout).is_ok()
+        {
+            wrote_any = true;
         }
     }
     if !wrote_any {

@@ -170,10 +170,10 @@ fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
 
     if let Ok(entries) = std::fs::read_dir(models_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Ok(sub) = models::load_models_from_dir(&entry.path()) {
-                    all.extend(sub);
-                }
+            if entry.path().is_dir()
+                && let Ok(sub) = models::load_models_from_dir(&entry.path())
+            {
+                all.extend(sub);
             }
         }
     }

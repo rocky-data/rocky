@@ -271,12 +271,12 @@ impl Parser {
             "cross" => Some(JoinType::Cross),
             _ => None,
         };
-        if let Some(jt) = modifier {
-            if self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::Join) {
-                self.advance(); // consume the modifier ident
-                self.advance(); // consume the `join` keyword
-                return Some(jt);
-            }
+        if let Some(jt) = modifier
+            && self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::Join)
+        {
+            self.advance(); // consume the modifier ident
+            self.advance(); // consume the `join` keyword
+            return Some(jt);
         }
 
         None

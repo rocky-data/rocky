@@ -258,13 +258,11 @@ fn extract_expr_lineage(
                         if let sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(inner_expr),
                         ) = arg
-                        {
-                            if let Some(mut lineage) =
+                            && let Some(mut lineage) =
                                 extract_expr_lineage(inner_expr, alias_map, source_tables)
-                            {
-                                lineage.transform = TransformKind::Aggregation(func_name.clone());
-                                return Some(lineage);
-                            }
+                        {
+                            lineage.transform = TransformKind::Aggregation(func_name.clone());
+                            return Some(lineage);
                         }
                     }
                     None

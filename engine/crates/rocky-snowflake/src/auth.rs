@@ -223,19 +223,18 @@ impl Auth {
         // Key-pair auth: this branch only constructs the AuthInner; JWT
         // minting + fingerprint computation + 59-minute token caching all
         // happen in `get_token` (see lines 277-354).
-        if let Some(key_path) = config.private_key_path.filter(|p| !p.is_empty()) {
-            if let Some(ref username) = config.username {
-                if !username.is_empty() {
-                    return Ok(Auth {
-                        inner: AuthInner::KeyPair {
-                            account: config.account,
-                            username: username.clone(),
-                            private_key_path: key_path,
-                            cached_token: Arc::new(RwLock::new(None)),
-                        },
-                    });
-                }
-            }
+        if let Some(key_path) = config.private_key_path.filter(|p| !p.is_empty())
+            && let Some(ref username) = config.username
+            && !username.is_empty()
+        {
+            return Ok(Auth {
+                inner: AuthInner::KeyPair {
+                    account: config.account,
+                    username: username.clone(),
+                    private_key_path: key_path,
+                    cached_token: Arc::new(RwLock::new(None)),
+                },
+            });
         }
 
         // Password auth

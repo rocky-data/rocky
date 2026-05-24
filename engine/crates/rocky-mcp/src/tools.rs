@@ -597,10 +597,10 @@ impl RockyMcpServer {
 
         // If a model filter was given, assert it exists so we don't write a
         // plan that applies to nothing.
-        if let Some(model) = params.0.model.as_deref() {
-            if !models.iter().any(|m| m == model) {
-                return Err(format!("model '{model}' not found in project"));
-            }
+        if let Some(model) = params.0.model.as_deref()
+            && !models.iter().any(|m| m == model)
+        {
+            return Err(format!("model '{model}' not found in project"));
         }
 
         let run_plan = build_ai_run_plan(params.0.model.clone(), &result);

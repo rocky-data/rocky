@@ -2950,13 +2950,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // SIGINT: map `commands::Interrupted` to the conventional shell exit
     // code (128 + SIGINT). Only `rocky run` currently emits this; other
     // commands fall through to the default exit-1-on-error below.
-    if let Err(ref err) = result {
-        if err
+    if let Err(ref err) = result
+        && err
             .downcast_ref::<rocky_cli::commands::Interrupted>()
             .is_some()
-        {
-            std::process::exit(130);
-        }
+    {
+        std::process::exit(130);
     }
 
     // Partial-success: map `commands::PartialFailure` to exit code 2.
@@ -2966,27 +2965,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // results rather than treating the whole run as a hard failure.
     // Total failure (no tables copied) keeps exit code 1 — that branch
     // doesn't produce the partial-success sentinel.
-    if let Err(ref err) = result {
-        if err
+    if let Err(ref err) = result
+        && err
             .downcast_ref::<rocky_cli::commands::PartialFailure>()
             .is_some()
-        {
-            std::process::exit(2);
-        }
+    {
+        std::process::exit(2);
     }
 
     // In text mode, try to upgrade config errors to rich miette diagnostics
     // with source spans and suggestions. JSON mode returns structured errors
     // unchanged for orchestrators (e.g., Dagster).
-    if let Err(ref err) = result {
-        if !json {
-            if let Some(diagnostic) =
-                rocky_cli::error_reporter::try_upgrade_config_error(err, &config_path)
-            {
-                eprintln!("{:?}", miette::Report::new(diagnostic));
-                std::process::exit(1);
-            }
-        }
+    if let Err(ref err) = result
+        && !json
+        && let Some(diagnostic) =
+            rocky_cli::error_reporter::try_upgrade_config_error(err, &config_path)
+    {
+        eprintln!("{:?}", miette::Report::new(diagnostic));
+        std::process::exit(1);
     }
 
     result

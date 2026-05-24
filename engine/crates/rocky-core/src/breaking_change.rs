@@ -366,18 +366,18 @@ fn diff_columns(
 
     // Reorder detection — only on columns that exist on both sides.
     for (name, (old_idx, _)) in &old_by_name {
-        if let Some((new_idx, _)) = new_by_name.get(name) {
-            if old_idx != new_idx {
-                findings.push(BreakingFinding {
-                    change: BreakingChange::ColumnReordered {
-                        model: model.to_string(),
-                        column: (*name).to_string(),
-                        old_index: *old_idx,
-                        new_index: *new_idx,
-                    },
-                    severity: BreakingSeverity::Warning,
-                });
-            }
+        if let Some((new_idx, _)) = new_by_name.get(name)
+            && old_idx != new_idx
+        {
+            findings.push(BreakingFinding {
+                change: BreakingChange::ColumnReordered {
+                    model: model.to_string(),
+                    column: (*name).to_string(),
+                    old_index: *old_idx,
+                    new_index: *new_idx,
+                },
+                severity: BreakingSeverity::Warning,
+            });
         }
     }
 }

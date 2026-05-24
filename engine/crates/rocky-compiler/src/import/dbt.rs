@@ -352,9 +352,10 @@ pub fn apply_dbt_unit_tests(manifest: &DbtManifest, result: &mut ImportResult) {
     for ut in manifest.unit_tests.values() {
         result.unit_tests_found += 1;
 
-        if let Some(format) = ut.expect.format.as_deref() {
-            if !is_dict_format(format) {
-                result.warnings.push(ImportWarning {
+        if let Some(format) = ut.expect.format.as_deref()
+            && !is_dict_format(format)
+        {
+            result.warnings.push(ImportWarning {
                     model: ut.model.clone(),
                     category: WarningCategory::UnsupportedUnitTestFormat,
                     message: format!(
@@ -365,9 +366,8 @@ pub fn apply_dbt_unit_tests(manifest: &DbtManifest, result: &mut ImportResult) {
                         "convert the expected rows to inline `format: dict` in the dbt unit_test, or hand-port to a Rocky [[test]] block".to_string(),
                     ),
                 });
-                result.unit_tests_skipped += 1;
-                continue;
-            }
+            result.unit_tests_skipped += 1;
+            continue;
         }
 
         // dbt's per-given format defaults to `dict` (inline rows). Skip
@@ -456,10 +456,10 @@ pub(crate) fn strip_ref_wrapper(input: &str) -> String {
             return bare;
         }
     }
-    if let Some(inner) = strip_call(trimmed, "source") {
-        if let Some((src, tbl)) = split_source_args(inner) {
-            return format!("{src}.{tbl}");
-        }
+    if let Some(inner) = strip_call(trimmed, "source")
+        && let Some((src, tbl)) = split_source_args(inner)
+    {
+        return format!("{src}.{tbl}");
     }
     trimmed
         .trim_matches(|c: char| c == '\'' || c == '"')
@@ -500,10 +500,10 @@ fn attach_intent(result: &mut ImportResult, model_name: &str, description: Optio
     let Some(desc) = description else {
         return;
     };
-    if let Some(imported) = result.imported.iter_mut().find(|m| m.name == model_name) {
-        if imported.config.intent.is_none() {
-            imported.config.intent = Some(desc.to_string());
-        }
+    if let Some(imported) = result.imported.iter_mut().find(|m| m.name == model_name)
+        && imported.config.intent.is_none()
+    {
+        imported.config.intent = Some(desc.to_string());
     }
 }
 
@@ -1218,12 +1218,12 @@ fn import_single_model(
 
     // If is_incremental() was detected and config didn't already set incremental,
     // override the strategy
-    if let Some(ref incr) = incr_result {
-        if matches!(strategy, StrategyConfig::FullRefresh) {
-            strategy = StrategyConfig::Incremental {
-                timestamp_column: incr.timestamp_column.clone(),
-            };
-        }
+    if let Some(ref incr) = incr_result
+        && matches!(strategy, StrategyConfig::FullRefresh)
+    {
+        strategy = StrategyConfig::Incremental {
+            timestamp_column: incr.timestamp_column.clone(),
+        };
     }
 
     // Apply project config inheritance

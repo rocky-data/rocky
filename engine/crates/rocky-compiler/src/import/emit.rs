@@ -111,13 +111,10 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
     // warnings (Wave 2) so we don't false-flag models that hit warnings
     // for unrelated reasons (dropped tags, hooks, on_schema_change).
     for w in &inputs.import.structured_warnings {
-        if let super::dbt::ImportDbtStructuredWarning::UnsupportedMaterialization {
-            model, ..
-        } = w
+        if let super::dbt::ImportDbtStructuredWarning::UnsupportedMaterialization { model, .. } = w
+            && !unknown_materializations.contains(model)
         {
-            if !unknown_materializations.contains(model) {
-                unknown_materializations.push(model.clone());
-            }
+            unknown_materializations.push(model.clone());
         }
     }
 

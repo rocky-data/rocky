@@ -25,10 +25,10 @@ const PIPELINE_KEYWORDS: &[&str] = &[
 /// word boundary (whitespace, `{`, end-of-string, etc.).
 fn is_pipeline_keyword(trimmed: &str) -> bool {
     for &kw in PIPELINE_KEYWORDS {
-        if let Some(rest) = trimmed.strip_prefix(kw) {
-            if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
-                return true;
-            }
+        if let Some(rest) = trimmed.strip_prefix(kw)
+            && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric())
+        {
+            return true;
         }
     }
     false

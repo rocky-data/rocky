@@ -395,10 +395,10 @@ fn parse_snowflake_retention_rows(rows: &[Vec<serde_json::Value>]) -> Option<u32
         // Accept both string and numeric JSON forms: Snowflake's SQL REST
         // API has historically sent parameter values as strings, but the
         // type is not guaranteed across versions / mock shapes.
-        if let Some(s) = raw.as_str() {
-            if let Ok(days) = s.trim().parse::<u32>() {
-                return Some(days);
-            }
+        if let Some(s) = raw.as_str()
+            && let Ok(days) = s.trim().parse::<u32>()
+        {
+            return Some(days);
         }
         if let Some(n) = raw.as_u64() {
             return u32::try_from(n).ok();

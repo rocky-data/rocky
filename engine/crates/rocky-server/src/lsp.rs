@@ -835,10 +835,9 @@ impl RockyLsp {
         };
         if let Some((cached_hash, cached_tokens)) =
             self.semantic_tokens_cache.read().await.get(uri_str)
+            && *cached_hash == sql_hash
         {
-            if *cached_hash == sql_hash {
-                return cached_tokens.clone();
-            }
+            return cached_tokens.clone();
         }
 
         let model_names: std::collections::HashSet<&str> = result
@@ -989,13 +988,13 @@ async fn seed_salsa_source(
 #[tower_lsp::async_trait]
 impl LanguageServer for RockyLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        if let Some(root) = params.root_uri {
-            if let Ok(path) = root.to_file_path() {
-                let models_path = path.join("models");
-                if models_path.exists() {
-                    *self.models_dir.write().await = Some(models_path.display().to_string());
-                    info!(path = %models_path.display(), "LSP found models directory");
-                }
+        if let Some(root) = params.root_uri
+            && let Ok(path) = root.to_file_path()
+        {
+            let models_path = path.join("models");
+            if models_path.exists() {
+                *self.models_dir.write().await = Some(models_path.display().to_string());
+                info!(path = %models_path.display(), "LSP found models directory");
             }
         }
 
@@ -1205,15 +1204,14 @@ impl LanguageServer for RockyLsp {
         // was never received for this URI (e.g. tests that drive
         // `did_change` directly), the helper falls back to
         // `read_source` so the input still gets seeded.
-        if let Some(text) = new_text {
-            if let Err(err) =
+        if let Some(text) = new_text
+            && let Err(err) =
                 seed_salsa_source(&self.salsa_db, &self.salsa_sources, &uri, &text).await
-            {
-                tracing::debug!(
-                    uri = %uri_string,
-                    "did_change: salsa update skipped ({err})",
-                );
-            }
+        {
+            tracing::debug!(
+                uri = %uri_string,
+                "did_change: salsa update skipped ({err})",
+            );
         }
 
         if !self.recompile_pending.swap(true, Ordering::SeqCst) {
@@ -1376,16 +1374,16 @@ impl LanguageServer for RockyLsp {
             }
             CompletionContext::ColumnReference(ref model_name) => {
                 let mut items = Vec::new();
-                if let Some(result) = compile_result {
-                    if let Some(schema) = result.semantic_graph.model_schema(model_name) {
-                        for col in &schema.columns {
-                            items.push(CompletionItem {
-                                label: col.name.clone(),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some(format!("column from {model_name}")),
-                                ..Default::default()
-                            });
-                        }
+                if let Some(result) = compile_result
+                    && let Some(schema) = result.semantic_graph.model_schema(model_name)
+                {
+                    for col in &schema.columns {
+                        items.push(CompletionItem {
+                            label: col.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(format!("column from {model_name}")),
+                            ..Default::default()
+                        });
                     }
                 }
                 items
@@ -1461,101 +1459,99 @@ impl LanguageServer for RockyLsp {
             let models_dir = self.models_dir.read().await;
             if let Some(ref dir) = *models_dir {
                 let macros_dir = std::path::PathBuf::from(dir).join("../macros");
-                if macros_dir.is_dir() {
-                    if let Ok(macro_defs) = rocky_core::macros::load_macros_from_dir(&macros_dir) {
-                        if let Some(m) = macro_defs.iter().find(|m| m.name == macro_name) {
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: m.hover_markdown(),
-                                }),
-                                range: None,
-                            }));
-                        }
-                    }
+                if macros_dir.is_dir()
+                    && let Ok(macro_defs) = rocky_core::macros::load_macros_from_dir(&macros_dir)
+                    && let Some(m) = macro_defs.iter().find(|m| m.name == macro_name)
+                {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: m.hover_markdown(),
+                        }),
+                        range: None,
+                    }));
                 }
             }
         }
 
         // Check if hovering on a model name (could be a referenced model, not the current file's model)
-        if let Some(ref w) = word {
-            if let Some(hover_model) = result.project.model(w) {
-                let hover_name = &hover_model.config.name;
-                let schema = result.semantic_graph.model_schema(hover_name);
-                let typed_cols = result.type_check.typed_models.get(hover_name);
+        if let Some(ref w) = word
+            && let Some(hover_model) = result.project.model(w)
+        {
+            let hover_name = &hover_model.config.name;
+            let schema = result.semantic_graph.model_schema(hover_name);
+            let typed_cols = result.type_check.typed_models.get(hover_name);
 
-                let mut info_lines = vec![format!("**Model:** `{hover_name}`")];
+            let mut info_lines = vec![format!("**Model:** `{hover_name}`")];
 
-                // Show intent if available
-                if let Some(schema) = schema {
-                    if let Some(ref intent) = schema.intent {
-                        info_lines.push(String::new());
-                        info_lines.push(format!("> {intent}"));
-                    }
-
-                    info_lines.push(format!(
-                        "\n**Upstream:** {}",
-                        if schema.upstream.is_empty() {
-                            "none (leaf)".to_string()
-                        } else {
-                            schema.upstream.join(", ")
-                        }
-                    ));
-                    if !schema.downstream.is_empty() {
-                        info_lines
-                            .push(format!("**Downstream:** {}", schema.downstream.join(", ")));
-                    }
+            // Show intent if available
+            if let Some(schema) = schema {
+                if let Some(ref intent) = schema.intent {
+                    info_lines.push(String::new());
+                    info_lines.push(format!("> {intent}"));
                 }
 
-                // Show DAG-propagated cost hint if available.
-                if let Some(cost_est) = compute_model_cost_hint(result, hover_name) {
-                    info_lines.push(String::new());
-                    if cost_est.estimated_compute_cost_usd > 0.0 {
-                        info_lines.push(format!(
-                            "**Est. cost:** ${:.6} ({} rows, {} bytes) — confidence: {}",
-                            cost_est.estimated_compute_cost_usd,
-                            format_number(cost_est.estimated_rows),
-                            format_bytes(cost_est.estimated_bytes),
-                            match cost_est.confidence {
-                                rocky_core::cost::Confidence::High => "high",
-                                rocky_core::cost::Confidence::Medium => "medium",
-                                rocky_core::cost::Confidence::Low => "low",
-                            },
-                        ));
+                info_lines.push(format!(
+                    "\n**Upstream:** {}",
+                    if schema.upstream.is_empty() {
+                        "none (leaf)".to_string()
                     } else {
-                        info_lines.push(format!(
-                            "**Est. rows:** {} ({} bytes) — confidence: {}",
-                            format_number(cost_est.estimated_rows),
-                            format_bytes(cost_est.estimated_bytes),
-                            match cost_est.confidence {
-                                rocky_core::cost::Confidence::High => "high",
-                                rocky_core::cost::Confidence::Medium => "medium",
-                                rocky_core::cost::Confidence::Low => "low",
-                            },
-                        ));
+                        schema.upstream.join(", ")
                     }
+                ));
+                if !schema.downstream.is_empty() {
+                    info_lines.push(format!("**Downstream:** {}", schema.downstream.join(", ")));
                 }
-
-                if let Some(cols) = typed_cols {
-                    info_lines.push(String::new());
-                    info_lines.push("**Columns:**".to_string());
-                    for col in cols {
-                        let nullable = if col.nullable { "?" } else { "" };
-                        info_lines.push(format!(
-                            "- `{}`: `{:?}{}`",
-                            col.name, col.data_type, nullable
-                        ));
-                    }
-                }
-
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: info_lines.join("\n"),
-                    }),
-                    range: None,
-                }));
             }
+
+            // Show DAG-propagated cost hint if available.
+            if let Some(cost_est) = compute_model_cost_hint(result, hover_name) {
+                info_lines.push(String::new());
+                if cost_est.estimated_compute_cost_usd > 0.0 {
+                    info_lines.push(format!(
+                        "**Est. cost:** ${:.6} ({} rows, {} bytes) — confidence: {}",
+                        cost_est.estimated_compute_cost_usd,
+                        format_number(cost_est.estimated_rows),
+                        format_bytes(cost_est.estimated_bytes),
+                        match cost_est.confidence {
+                            rocky_core::cost::Confidence::High => "high",
+                            rocky_core::cost::Confidence::Medium => "medium",
+                            rocky_core::cost::Confidence::Low => "low",
+                        },
+                    ));
+                } else {
+                    info_lines.push(format!(
+                        "**Est. rows:** {} ({} bytes) — confidence: {}",
+                        format_number(cost_est.estimated_rows),
+                        format_bytes(cost_est.estimated_bytes),
+                        match cost_est.confidence {
+                            rocky_core::cost::Confidence::High => "high",
+                            rocky_core::cost::Confidence::Medium => "medium",
+                            rocky_core::cost::Confidence::Low => "low",
+                        },
+                    ));
+                }
+            }
+
+            if let Some(cols) = typed_cols {
+                info_lines.push(String::new());
+                info_lines.push("**Columns:**".to_string());
+                for col in cols {
+                    let nullable = if col.nullable { "?" } else { "" };
+                    info_lines.push(format!(
+                        "- `{}`: `{:?}{}`",
+                        col.name, col.data_type, nullable
+                    ));
+                }
+            }
+
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: info_lines.join("\n"),
+                }),
+                range: None,
+            }));
         }
 
         // Check if hovering on a column name
@@ -1565,40 +1561,40 @@ impl LanguageServer for RockyLsp {
                 let model_name = &model.config.name;
 
                 // Look for the column in the current model's typed columns
-                if let Some(typed_cols) = result.type_check.typed_models.get(model_name) {
-                    if let Some(col) = typed_cols.iter().find(|c| c.name == *w) {
-                        let value =
-                            build_column_hover_markdown(col, model_name, &result.semantic_graph);
+                if let Some(typed_cols) = result.type_check.typed_models.get(model_name)
+                    && let Some(col) = typed_cols.iter().find(|c| c.name == *w)
+                {
+                    let value =
+                        build_column_hover_markdown(col, model_name, &result.semantic_graph);
 
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value,
-                            }),
-                            range: None,
-                        }));
-                    }
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
                 }
 
                 // Also check upstream model columns (for qualified refs like model.col)
                 if let Some(schema) = result.semantic_graph.model_schema(model_name) {
                     for upstream_name in &schema.upstream {
-                        if let Some(up_cols) = result.type_check.typed_models.get(upstream_name) {
-                            if let Some(col) = up_cols.iter().find(|c| c.name == *w) {
-                                let value = build_column_hover_markdown(
-                                    col,
-                                    upstream_name,
-                                    &result.semantic_graph,
-                                );
+                        if let Some(up_cols) = result.type_check.typed_models.get(upstream_name)
+                            && let Some(col) = up_cols.iter().find(|c| c.name == *w)
+                        {
+                            let value = build_column_hover_markdown(
+                                col,
+                                upstream_name,
+                                &result.semantic_graph,
+                            );
 
-                                return Ok(Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value,
-                                    }),
-                                    range: None,
-                                }));
-                            }
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value,
+                                }),
+                                range: None,
+                            }));
                         }
                     }
                 }
@@ -1689,22 +1685,20 @@ impl LanguageServer for RockyLsp {
             // 3. Fallback: if the column exists in an upstream model, go there
             if let Some(schema) = result.semantic_graph.model_schema(model_name) {
                 for upstream_name in &schema.upstream {
-                    if let Some(up_cols) = result.type_check.typed_models.get(upstream_name) {
-                        if up_cols.iter().any(|c| c.name == word) {
-                            if let Some(upstream_model) = result.project.model(upstream_name) {
-                                let target_path = std::path::Path::new(&upstream_model.file_path);
-                                if let Ok(target_uri) = Url::from_file_path(target_path) {
-                                    let col_line =
-                                        find_column_line_in_sql(&upstream_model.sql, &word);
-                                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                                        uri: target_uri,
-                                        range: Range::new(
-                                            Position::new(col_line, 0),
-                                            Position::new(col_line, 0),
-                                        ),
-                                    })));
-                                }
-                            }
+                    if let Some(up_cols) = result.type_check.typed_models.get(upstream_name)
+                        && up_cols.iter().any(|c| c.name == word)
+                        && let Some(upstream_model) = result.project.model(upstream_name)
+                    {
+                        let target_path = std::path::Path::new(&upstream_model.file_path);
+                        if let Ok(target_uri) = Url::from_file_path(target_path) {
+                            let col_line = find_column_line_in_sql(&upstream_model.sql, &word);
+                            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: target_uri,
+                                range: Range::new(
+                                    Position::new(col_line, 0),
+                                    Position::new(col_line, 0),
+                                ),
+                            })));
                         }
                     }
                 }
@@ -1885,25 +1879,25 @@ impl LanguageServer for RockyLsp {
         let mut children = Vec::new();
 
         // Add intent as first child if present
-        if let Some(schema) = result.semantic_graph.model_schema(model_name) {
-            if let Some(ref intent) = schema.intent {
-                let display = if intent.len() > 80 {
-                    format!("{}...", &intent[..77])
-                } else {
-                    intent.clone()
-                };
-                #[allow(deprecated)]
-                children.push(DocumentSymbol {
-                    name: "intent".to_string(),
-                    detail: Some(display),
-                    kind: SymbolKind::STRING,
-                    tags: None,
-                    deprecated: None,
-                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                    selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                    children: None,
-                });
-            }
+        if let Some(schema) = result.semantic_graph.model_schema(model_name)
+            && let Some(ref intent) = schema.intent
+        {
+            let display = if intent.len() > 80 {
+                format!("{}...", &intent[..77])
+            } else {
+                intent.clone()
+            };
+            #[allow(deprecated)]
+            children.push(DocumentSymbol {
+                name: "intent".to_string(),
+                detail: Some(display),
+                kind: SymbolKind::STRING,
+                tags: None,
+                deprecated: None,
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                children: None,
+            });
         }
 
         // Add column symbols
@@ -2279,15 +2273,15 @@ impl LanguageServer for RockyLsp {
                 }
                 _ => {
                     // For any diagnostic with a suggestion, offer it
-                    if let Some(compiler_diag) = find_compiler_diagnostic(result, diag) {
-                        if let Some(suggestion) = &compiler_diag.suggestion {
-                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                                title: suggestion.clone(),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                diagnostics: Some(vec![diag.clone()]),
-                                ..Default::default()
-                            }));
-                        }
+                    if let Some(compiler_diag) = find_compiler_diagnostic(result, diag)
+                        && let Some(suggestion) = &compiler_diag.suggestion
+                    {
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: suggestion.clone(),
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![diag.clone()]),
+                            ..Default::default()
+                        }));
                     }
                 }
             }
@@ -2602,13 +2596,13 @@ fn get_completion_context(text: &str, line: usize, col: usize) -> CompletionCont
     let upper = text_before.to_uppercase();
     let tokens: Vec<&str> = upper.split_whitespace().collect();
 
-    if let Some(last) = tokens.last() {
-        if matches!(
+    if let Some(last) = tokens.last()
+        && matches!(
             *last,
             "FROM" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "CROSS" | "FULL"
-        ) {
-            return CompletionContext::ModelReference;
-        }
+        )
+    {
+        return CompletionContext::ModelReference;
     }
 
     if tokens.len() >= 2 {
@@ -2646,16 +2640,16 @@ fn extract_cte_info(sql: &str) -> Vec<CteInfo> {
     };
     let mut ctes = Vec::new();
     for stmt in &stmts {
-        if let Statement::Query(query) = stmt {
-            if let Some(with) = &query.with {
-                for cte in &with.cte_tables {
-                    let ident = &cte.alias.name;
-                    ctes.push(CteInfo {
-                        name: ident.value.clone(),
-                        line: ident.span.start.line as usize,
-                        col: ident.span.start.column as usize,
-                    });
-                }
+        if let Statement::Query(query) = stmt
+            && let Some(with) = &query.with
+        {
+            for cte in &with.cte_tables {
+                let ident = &cte.alias.name;
+                ctes.push(CteInfo {
+                    name: ident.value.clone(),
+                    line: ident.span.start.line as usize,
+                    col: ident.span.start.column as usize,
+                });
             }
         }
     }
@@ -3928,18 +3922,17 @@ fn collect_tokens_from_table_factor(
 ) {
     if let ast::TableFactor::Table { name, .. } = factor {
         let table_name = name.to_string();
-        if model_names.contains(table_name.as_str()) {
-            if let Some(first_part) = name.0.first() {
-                if let Some(first_ident) = first_part.as_ident() {
-                    let line = first_ident.span.start.line as u32;
-                    let col = first_ident.span.start.column as u32;
-                    // sqlparser uses 1-indexed line/column; LSP expects 0-indexed.
-                    // Only emit a token for the leading identifier so the range
-                    // can't extend past the line if the qualified name wraps.
-                    let len = first_ident.value.len() as u32;
-                    tokens.push((line.saturating_sub(1), col.saturating_sub(1), len, 0)); // NAMESPACE
-                }
-            }
+        if model_names.contains(table_name.as_str())
+            && let Some(first_part) = name.0.first()
+            && let Some(first_ident) = first_part.as_ident()
+        {
+            let line = first_ident.span.start.line as u32;
+            let col = first_ident.span.start.column as u32;
+            // sqlparser uses 1-indexed line/column; LSP expects 0-indexed.
+            // Only emit a token for the leading identifier so the range
+            // can't extend past the line if the qualified name wraps.
+            let len = first_ident.value.len() as u32;
+            tokens.push((line.saturating_sub(1), col.saturating_sub(1), len, 0)); // NAMESPACE
         }
     }
 }
@@ -3969,18 +3962,17 @@ fn collect_tokens_from_expr(
         }
         ast::Expr::Function(f) => {
             let func_name = f.name.to_string().to_uppercase();
-            if func_names.contains(func_name.as_str()) {
-                if let Some(first_part) = f.name.0.first() {
-                    if let Some(first_ident) = first_part.as_ident() {
-                        let line = first_ident.span.start.line as u32;
-                        let col = first_ident.span.start.column as u32;
-                        // Emit only the first ident's length to keep the range
-                        // single-line and within the line bounds.
-                        let len = first_ident.value.len() as u32;
-                        if line > 0 && col > 0 {
-                            tokens.push((line - 1, col - 1, len, 2)); // FUNCTION
-                        }
-                    }
+            if func_names.contains(func_name.as_str())
+                && let Some(first_part) = f.name.0.first()
+                && let Some(first_ident) = first_part.as_ident()
+            {
+                let line = first_ident.span.start.line as u32;
+                let col = first_ident.span.start.column as u32;
+                // Emit only the first ident's length to keep the range
+                // single-line and within the line bounds.
+                let len = first_ident.value.len() as u32;
+                if line > 0 && col > 0 {
+                    tokens.push((line - 1, col - 1, len, 2)); // FUNCTION
                 }
             }
             if let ast::FunctionArguments::List(arg_list) = &f.args {
@@ -4063,28 +4055,28 @@ fn extract_rocky_pipeline_steps(text: &str) -> Vec<RockyPipelineStep> {
             continue;
         }
         for &kw in ROCKY_STEP_KEYWORDS {
-            if let Some(rest) = trimmed.strip_prefix(kw) {
-                if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
-                    // Capture the rest of the line (after keyword) as detail
-                    let detail = rest.trim();
-                    let detail = if detail.is_empty() {
-                        None
+            if let Some(rest) = trimmed.strip_prefix(kw)
+                && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric())
+            {
+                // Capture the rest of the line (after keyword) as detail
+                let detail = rest.trim();
+                let detail = if detail.is_empty() {
+                    None
+                } else {
+                    // Truncate long details
+                    let d = detail.trim_end_matches('{').trim();
+                    if d.len() > 60 {
+                        Some(format!("{}...", &d[..57]))
                     } else {
-                        // Truncate long details
-                        let d = detail.trim_end_matches('{').trim();
-                        if d.len() > 60 {
-                            Some(format!("{}...", &d[..57]))
-                        } else {
-                            Some(d.to_string())
-                        }
-                    };
-                    steps.push(RockyPipelineStep {
-                        keyword: kw.to_string(),
-                        detail,
-                        line: i,
-                    });
-                    break;
-                }
+                        Some(d.to_string())
+                    }
+                };
+                steps.push(RockyPipelineStep {
+                    keyword: kw.to_string(),
+                    detail,
+                    line: i,
+                });
+                break;
             }
         }
     }
@@ -4117,17 +4109,17 @@ fn compute_rocky_folding_ranges(text: &str) -> Vec<FoldingRange> {
             match ch {
                 '{' => brace_stack.push(i as u32),
                 '}' => {
-                    if let Some(start) = brace_stack.pop() {
-                        if (i as u32) > start {
-                            ranges.push(FoldingRange {
-                                start_line: start,
-                                start_character: None,
-                                end_line: i as u32,
-                                end_character: None,
-                                kind: Some(FoldingRangeKind::Region),
-                                collapsed_text: None,
-                            });
-                        }
+                    if let Some(start) = brace_stack.pop()
+                        && (i as u32) > start
+                    {
+                        ranges.push(FoldingRange {
+                            start_line: start,
+                            start_character: None,
+                            end_line: i as u32,
+                            end_character: None,
+                            kind: Some(FoldingRangeKind::Region),
+                            collapsed_text: None,
+                        });
                     }
                 }
                 _ => {}
@@ -4155,19 +4147,18 @@ fn compute_sql_folding_ranges(text: &str) -> Vec<FoldingRange> {
         for token in upper.split_whitespace() {
             if token == "CASE" || token.starts_with("CASE,") || token.ends_with(",CASE") {
                 case_stack.push(i as u32);
-            } else if token == "END" || token == "END," || token == "END)" {
-                if let Some(start) = case_stack.pop() {
-                    if (i as u32) > start {
-                        ranges.push(FoldingRange {
-                            start_line: start,
-                            start_character: None,
-                            end_line: i as u32,
-                            end_character: None,
-                            kind: Some(FoldingRangeKind::Region),
-                            collapsed_text: None,
-                        });
-                    }
-                }
+            } else if (token == "END" || token == "END," || token == "END)")
+                && let Some(start) = case_stack.pop()
+                && (i as u32) > start
+            {
+                ranges.push(FoldingRange {
+                    start_line: start,
+                    start_character: None,
+                    end_line: i as u32,
+                    end_character: None,
+                    kind: Some(FoldingRangeKind::Region),
+                    collapsed_text: None,
+                });
             }
         }
     }
@@ -4196,17 +4187,17 @@ fn compute_sql_folding_ranges(text: &str) -> Vec<FoldingRange> {
                     ')' => {
                         paren_depth -= 1;
                         if paren_depth == 0 {
-                            if let Some(start) = cte_start.take() {
-                                if (i as u32) > start {
-                                    ranges.push(FoldingRange {
-                                        start_line: start,
-                                        start_character: None,
-                                        end_line: i as u32,
-                                        end_character: None,
-                                        kind: Some(FoldingRangeKind::Region),
-                                        collapsed_text: None,
-                                    });
-                                }
+                            if let Some(start) = cte_start.take()
+                                && (i as u32) > start
+                            {
+                                ranges.push(FoldingRange {
+                                    start_line: start,
+                                    start_character: None,
+                                    end_line: i as u32,
+                                    end_character: None,
+                                    kind: Some(FoldingRangeKind::Region),
+                                    collapsed_text: None,
+                                });
                             }
                             // Check if the next non-blank line starts a new CTE
                             // (has comma + name + AS pattern).
@@ -4240,19 +4231,19 @@ fn compute_sql_folding_ranges(text: &str) -> Vec<FoldingRange> {
         if block_start.is_none() && line.contains("/*") {
             block_start = Some(i as u32);
         }
-        if block_start.is_some() && line.contains("*/") {
-            if let Some(start) = block_start.take() {
-                if (i as u32) > start {
-                    ranges.push(FoldingRange {
-                        start_line: start,
-                        start_character: None,
-                        end_line: i as u32,
-                        end_character: None,
-                        kind: Some(FoldingRangeKind::Comment),
-                        collapsed_text: None,
-                    });
-                }
-            }
+        if block_start.is_some()
+            && line.contains("*/")
+            && let Some(start) = block_start.take()
+            && (i as u32) > start
+        {
+            ranges.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: i as u32,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Comment),
+                collapsed_text: None,
+            });
         }
     }
 
