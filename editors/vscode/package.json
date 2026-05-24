@@ -302,6 +302,12 @@
         "icon": "$(shield)"
       },
       {
+        "command": "rocky.dag",
+        "title": "Show Execution Plan",
+        "category": "Rocky",
+        "icon": "$(list-tree)"
+      },
+      {
         "command": "rocky.previewCreate",
         "title": "Rocky: Preview Create (PR diff)",
         "category": "Rocky"
@@ -726,6 +732,11 @@
           "command": "rocky.compliance",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
           "group": "rocky@6"
+        },
+        {
+          "command": "rocky.dag",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@7"
         }
       ]
     },
