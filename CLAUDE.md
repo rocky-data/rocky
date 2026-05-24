@@ -6,7 +6,7 @@ Single repository for the Rocky data platform — a typed-program layer above th
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 22-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 23-crate Cargo workspace. |
 | `integrations/dagster/` | Python | Dagster integration — wraps the `rocky` binary as a `ConfigurableResource`, parses JSON output into Pydantic models. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
 | `examples/playground/` | Config only | Self-contained DuckDB sample pipeline. Used as a smoke test and a benchmark fixture. No credentials needed. |
@@ -38,6 +38,7 @@ This repo ships a set of task-specific skills in `.claude/skills/` that should b
 | [`rocky-new-adapter`](.claude/skills/rocky-new-adapter/SKILL.md) | Adding a warehouse or source adapter crate |
 | [`rocky-dsl-change`](.claude/skills/rocky-dsl-change/SKILL.md) | Changing `.rocky` DSL syntax — the 4-file lockstep cascade |
 | [`rocky-test-fixtures`](.claude/skills/rocky-test-fixtures/SKILL.md) | Regenerating dagster JSON test fixtures via `just regen-fixtures` |
+| [`rocky-ai-workflow`](.claude/skills/rocky-ai-workflow/SKILL.md) | Authoring or modifying a Rocky model on behalf of a user — inspect → sample → SQL → compile-loop → plan → propose → review → apply |
 | [`rocky-poc`](.claude/skills/rocky-poc/SKILL.md) | Scaffolding a new POC under `examples/playground/` |
 | [`rocky-release`](.claude/skills/rocky-release/SKILL.md) | Cutting a tag-namespaced release (`engine-v*`, `dagster-v*`, `vscode-v*`) |
 
@@ -60,7 +61,7 @@ Every Rocky CLI command that emits `--output json` is backed by a typed Rust out
 
 The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
 
-**Status:** The codegen migration is complete — all 60 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen`, enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The dagster `types.py` re-exports generated Pydantic models — see [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
+**Status:** The codegen migration is complete — all 63 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen`, enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The dagster `types.py` re-exports generated Pydantic models — see [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)

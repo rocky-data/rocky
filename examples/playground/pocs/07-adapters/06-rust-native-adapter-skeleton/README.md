@@ -1,7 +1,7 @@
 # 06-rust-native-adapter-skeleton — Rust-native warehouse adapter starter
 
 > **Category:** 07-adapters
-> **Credentials:** none (Rust toolchain only — `cargo` 1.85+)
+> **Credentials:** none (Rust toolchain only — `cargo` 1.88+)
 > **Runtime:** ~10s on a warm cache
 > **Rocky features:** `rocky-adapter-sdk` traits (`WarehouseAdapter`, `SqlDialect`), in-process testing
 

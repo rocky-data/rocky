@@ -11,7 +11,7 @@ Extension (TypeScript)  ──stdio JSON-RPC──▶  rocky lsp (Rust binary)
 The extension is an LSP client. All language intelligence (diagnostics, completion, hover, go-to-definition, rename, etc.) comes from the Rocky CLI's built-in LSP server. The extension handles:
 - LSP client lifecycle (start/stop/restart) plus an `LspState` lifecycle emitter consumed by sidebar views
 - Status bar with server state + error count
-- 50 commands grouped by concern under `src/commands/` (AI, branch, compile, hooks, info, inspect, lineage, migration, ops, preview, run, storage, test, plus the `commandPalette` entry point and 2 inline code-lens commands)
+- 58 commands grouped by concern under `src/commands/` (AI, branch, compile, hooks, info, inspect, lineage, migration, ops, preview, run, storage, test, plus the `commandPalette` entry point and 2 inline code-lens commands)
 - Code lens (inline run/compile above models)
 - Activity bar sidebar with 6 views (Get Started, Extension Info, Models, Runs, Sources, Help) — empty-state copy is gated on the `rocky.hasProject` context flag so a workspace without a `rocky.toml` shows orientation instead of CLI errors
 - Lineage webview (DOT → SVG via viz.js)
@@ -69,7 +69,7 @@ src/
 syntaxes/
 └── rocky.tmLanguage.json # TextMate grammar for .rocky files
 snippets/
-└── rocky.json            # 23 code snippets
+└── rocky.json            # 28 code snippets
 schemas/
 ├── rocky-config.schema.json  # JSON Schema for *.rocky.toml validation
 └── rocky-project.schema.json # JSON Schema for rocky project structure
@@ -116,7 +116,7 @@ code --install-extension rocky-*.vsix
 # Press F5 in VS Code → launches Extension Development Host
 ```
 
-## Extension Commands (50)
+## Extension Commands (58)
 
 | Command | What It Does |
 |---------|-------------|
@@ -170,6 +170,14 @@ code --install-extension rocky-*.vsix
 | `rocky.openDocumentation` | Open the Rocky docs in the browser |
 | `rocky.viewMarketplace` | Open the extension's Marketplace listing |
 | `rocky.reportBug` | File a bug report on GitHub |
+| `rocky.previewModel` | Preview a model's output rows in a panel |
+| `rocky.showCompiledSql` | Open the live compiled SQL for the active model |
+| `rocky.compliance` | Governance compliance panel (mask + grant verdicts) |
+| `rocky.dag` | Execution-plan panel (`rocky dag`) |
+| `rocky.trace` | Run-trace timeline panel for the latest run |
+| `rocky.lineageDiff` | Per-column downstream blast radius vs the base ref |
+| `rocky.reviewPlan` | Review an AI-authored plan's breaking changes, then approve + apply |
+| `rocky.refreshBranches` | Refresh the branches sidebar view |
 
 ## Configuration Settings
 

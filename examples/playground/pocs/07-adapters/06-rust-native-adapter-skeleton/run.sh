@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE/adapter"
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "cargo not found — install Rust 1.85+ from https://rustup.rs to run this POC" >&2
+    echo "cargo not found — install Rust 1.88+ from https://rustup.rs to run this POC" >&2
     exit 1
 fi
 

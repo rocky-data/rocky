@@ -112,7 +112,7 @@ table = "fct_orders"
 
 ## Crate Architecture
 
-22-crate Cargo workspace (24 members incl. `rocky` + `rocky-lsp` binaries). Rust edition 2024, MSRV 1.88:
+23-crate Cargo workspace (25 members incl. `rocky` + `rocky-lsp` binaries). Rust edition 2024, MSRV 1.88:
 
 ```
 rocky-core         — Warehouse-agnostic engine: adapter traits, DAG executor, models, checks, contracts, config, state

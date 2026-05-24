@@ -39,7 +39,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The engine is a Cargo workspace with 23 members — 21 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
+The engine is a Cargo workspace with 25 members — 23 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
 
 ### Dagster integration (`integrations/dagster/`)
 

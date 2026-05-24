@@ -48,7 +48,7 @@ The extension spawns `rocky lsp` on startup and attaches it as the language serv
 
 ## Commands
 
-A subset of the most common commands; see `Rocky: Open Command Palette` for the full list (50 commands across compile, run, AI, lineage, branch, preview, and ops).
+A subset of the most common commands; see `Rocky: Open Command Palette` for the full list (58 commands across compile, run, AI, lineage, branch, preview, and ops).
 
 | Command | Description |
 |---------|-------------|
