@@ -129,3 +129,9 @@ def plan_with_run_spine_json() -> str:
 def apply_json() -> str:
     """ApplyOutput envelope wrapping a run result."""
     return json.dumps(scenarios.APPLY)
+
+
+@pytest.fixture
+def ai_contract_json() -> str:
+    """AiContractOutput — AI-drafted contract from an observed column profile."""
+    return json.dumps(scenarios.AI_CONTRACT)

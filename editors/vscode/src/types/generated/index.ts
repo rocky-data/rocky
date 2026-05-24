@@ -24,6 +24,7 @@
  */
 
 // AI commands
+export type { AiContractColumnProfile, AiContractOutput } from "./ai_contract";
 export type { AiExplainOutput, AiExplanation } from "./ai_explain";
 export type { AiGenerateOutput } from "./ai";
 export type { AiSyncOutput, AiSyncProposal } from "./ai_sync";

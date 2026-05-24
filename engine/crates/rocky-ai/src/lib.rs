@@ -5,6 +5,7 @@
 //! The compiler is the safety net — LLM output gets type-checked before execution.
 
 pub mod client;
+pub mod contract;
 pub mod explain;
 pub mod generate;
 pub mod prompt;

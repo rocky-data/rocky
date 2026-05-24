@@ -869,6 +869,20 @@ enum Command {
         models: String,
     },
 
+    /// AI-draft a data contract from a model's observed data (DuckDB only)
+    AiContract {
+        /// Model whose target table to profile and draft a contract for
+        model: String,
+        /// Save the drafted contract to `<model>.contract.toml` in the models
+        /// directory (default: print to stdout)
+        #[arg(long)]
+        save: bool,
+        /// Models directory (compiled to obtain the model's inferred schema,
+        /// and the destination directory when `--save` is passed)
+        #[arg(long, default_value = "models")]
+        models: String,
+    },
+
     /// Create a sample project with DuckDB (no credentials needed)
     Playground {
         /// Directory name for the playground project
@@ -2420,6 +2434,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 model.as_deref(),
                 all,
+                save,
+                json,
+                cli.cache_ttl,
+            )
+            .await
+        }
+        Command::AiContract {
+            model,
+            save,
+            models,
+        } => {
+            rocky_cli::commands::run_ai_contract(
+                &cli.config,
+                &state_path,
+                &models,
+                &model,
                 save,
                 json,
                 cli.cache_ttl,

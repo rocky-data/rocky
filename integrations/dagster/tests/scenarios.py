@@ -839,3 +839,46 @@ CATALOG: dict[str, Any] = {
         "duration_ms": 7,
     },
 }
+
+# ---------------------------------------------------------------------------
+# ai-contract — AI-drafted data contract from an observed column profile
+# ---------------------------------------------------------------------------
+
+AI_CONTRACT: dict[str, Any] = {
+    "version": "1.43.0",
+    "command": "ai_contract",
+    "model": "customer_orders",
+    "attempts": 1,
+    "contract_toml": (
+        "[[columns]]\n"
+        'name = "customer_id"\n'
+        'type = "Int64"\n'
+        "nullable = false\n\n"
+        "[rules]\n"
+        'required = ["customer_id"]\n'
+        'protected = ["customer_id"]\n'
+    ),
+    "saved_path": "models/customer_orders.contract.toml",
+    "profile": [
+        {
+            "name": "customer_id",
+            "type": "Int64",
+            "rows": 1000,
+            "nulls": 0,
+            "null_rate": 0.0,
+            "distinct": 1000,
+            "observed_values": [],
+            "min": "1",
+            "max": "1000",
+        },
+        {
+            "name": "status",
+            "type": "String",
+            "rows": 1000,
+            "nulls": 0,
+            "null_rate": 0.0,
+            "distinct": 3,
+            "observed_values": ["cancelled", "completed", "pending"],
+        },
+    ],
+}
