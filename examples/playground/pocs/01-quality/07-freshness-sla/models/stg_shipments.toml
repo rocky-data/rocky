@@ -1,0 +1,13 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+schema = "staging"
+
+# Per-model freshness SLA. `expected_lag_seconds` is the public-facing field name
+# (aliases the legacy `max_lag_seconds`). Declaring it here satisfies the W005
+# coverage check for this model, independent of any project-level default.
+[freshness]
+expected_lag_seconds = 3600
+time_column = "shipped_at"
+severity = "warning"
