@@ -5680,7 +5680,10 @@ mod tests {
                 name: "hcv2_cat".into()
             }
         );
-        let privileges: Vec<&str> = catalog_grants.iter().map(|g| g.privilege.as_str()).collect();
+        let privileges: Vec<&str> = catalog_grants
+            .iter()
+            .map(|g| g.privilege.as_str())
+            .collect();
         assert!(
             privileges.contains(&"USE_CATALOG"),
             "multi-word privilege must reach REST as USE_CATALOG, got {privileges:?}"
