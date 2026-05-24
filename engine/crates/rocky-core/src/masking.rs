@@ -136,17 +136,68 @@ pub fn generate_drop_mask_sql(
     ))
 }
 
-/// SQL expression implementing the [`MaskStrategy::Partial`] strategy.
+/// SQL expression implementing the [`MaskStrategy::Partial`] strategy over an
+/// arbitrary operand `col`.
 ///
 /// Keeps the first two and last two characters, replaces the middle with
 /// `***`. Values shorter than 5 chars fall through to full redaction so
-/// short strings aren't effectively unmasked.
+/// short strings aren't effectively unmasked. `col` must be either the UDF
+/// parameter name (`v`) or a pre-validated column identifier.
+fn partial_mask_expr_for(col: &str) -> String {
+    format!(
+        "CASE WHEN {col} IS NULL THEN NULL \
+           WHEN length({col}) < 5 THEN '***' \
+           ELSE concat(substring({col}, 1, 2), '***', substring({col}, length({col}) - 1, 2)) \
+         END"
+    )
+}
+
+/// Partial-mask body for the Unity Catalog UDF, whose parameter is `v`.
 fn partial_mask_expr() -> String {
-    "CASE WHEN v IS NULL THEN NULL \
-       WHEN length(v) < 5 THEN '***' \
-       ELSE concat(substring(v, 1, 2), '***', substring(v, length(v) - 1, 2)) \
-     END"
-    .to_string()
+    partial_mask_expr_for("v")
+}
+
+/// Renders an **inline** masking expression for previewing a single column,
+/// substituting `column` directly into the per-strategy expression.
+///
+/// Unlike [`generate_set_mask_sql`] (which binds a warehouse-side masking
+/// *policy* to a materialized column), this returns a plain SQL scalar
+/// expression suitable for an ad-hoc `SELECT` — used by `rocky preview rows`
+/// so a previewed model's classified columns are masked the same way they
+/// would be in the materialized target. The result is aliased back to the
+/// original column name by the caller.
+///
+/// `column` **must** be a pre-validated SQL identifier (see
+/// [`validation::validate_identifier`]); it is interpolated unquoted.
+///
+/// Returns `None` when masking can't be expressed for `adapter_type` — the
+/// caller treats that as a fail-safe refusal (`unmaskable_column`) rather than
+/// leaking an unmasked value. The Databricks/Snowflake forms reuse the exact
+/// expressions Rocky already ships in its masking policies; DuckDB is covered
+/// for local preview; BigQuery and Trino are intentionally `None` until their
+/// forms are live-verified (they don't implement column-mask policies yet).
+pub fn inline_mask_expr(
+    strategy: MaskStrategy,
+    column: &str,
+    adapter_type: &str,
+) -> Option<String> {
+    match strategy {
+        // Explicit identity — the column is allowed unmasked.
+        MaskStrategy::None => None,
+        // Constant; valid in every dialect.
+        MaskStrategy::Redact => Some("'***'".to_string()),
+        MaskStrategy::Hash => match adapter_type {
+            // Same `sha2(v, 256)` form Rocky's masking policies use.
+            "databricks" | "snowflake" => Some(format!("sha2({column}, 256)")),
+            // DuckDB's hex-returning sha256 over a cast-to-text operand.
+            "duckdb" => Some(format!("sha256(CAST({column} AS VARCHAR))")),
+            _ => None,
+        },
+        MaskStrategy::Partial => match adapter_type {
+            "databricks" | "snowflake" | "duckdb" => Some(partial_mask_expr_for(column)),
+            _ => None,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -254,5 +305,61 @@ mod tests {
                 .is_err()
         );
         assert!(generate_drop_mask_sql("cat", "sch", "users", "bad col").is_err());
+    }
+
+    #[test]
+    fn test_inline_mask_redact_all_dialects() {
+        for dialect in ["databricks", "snowflake", "duckdb", "bigquery", "trino"] {
+            assert_eq!(
+                inline_mask_expr(MaskStrategy::Redact, "email", dialect).as_deref(),
+                Some("'***'")
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_mask_hash_per_dialect() {
+        assert_eq!(
+            inline_mask_expr(MaskStrategy::Hash, "email", "databricks").as_deref(),
+            Some("sha2(email, 256)")
+        );
+        assert_eq!(
+            inline_mask_expr(MaskStrategy::Hash, "email", "snowflake").as_deref(),
+            Some("sha2(email, 256)")
+        );
+        assert_eq!(
+            inline_mask_expr(MaskStrategy::Hash, "email", "duckdb").as_deref(),
+            Some("sha256(CAST(email AS VARCHAR))")
+        );
+    }
+
+    #[test]
+    fn test_inline_mask_partial_duckdb() {
+        let expr = inline_mask_expr(MaskStrategy::Partial, "email", "duckdb").unwrap();
+        assert!(expr.starts_with("CASE WHEN email IS NULL THEN NULL"));
+        assert!(expr.contains("length(email) < 5"));
+        assert!(expr.contains("substring(email, 1, 2)"));
+    }
+
+    #[test]
+    fn test_inline_mask_fail_safe_unsupported_dialects() {
+        // BigQuery / Trino mask forms aren't live-verified yet → None, which the
+        // caller turns into a fail-safe `unmaskable_column` refusal (never a leak).
+        assert!(inline_mask_expr(MaskStrategy::Hash, "email", "bigquery").is_none());
+        assert!(inline_mask_expr(MaskStrategy::Partial, "email", "trino").is_none());
+    }
+
+    #[test]
+    fn test_inline_mask_none_is_identity() {
+        assert!(inline_mask_expr(MaskStrategy::None, "email", "duckdb").is_none());
+    }
+
+    #[test]
+    fn test_inline_partial_matches_udf_body_shape() {
+        // The inline partial expression and the UDF body share one builder, so
+        // they can't drift.
+        let udf = partial_mask_expr();
+        let inline = partial_mask_expr_for("v");
+        assert_eq!(udf, inline);
     }
 }

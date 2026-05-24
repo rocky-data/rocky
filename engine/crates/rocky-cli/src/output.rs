@@ -5126,6 +5126,41 @@ impl RetentionStatusOutput {
 // `just codegen` (see `engine/CLAUDE.md`).
 // ---------------------------------------------------------------------------
 
+/// JSON output for `rocky preview rows`.
+///
+/// A sample of result rows for a single transformation model (or one of its
+/// CTEs), executed against the pipeline's configured adapter. Classified
+/// columns are masked inline before execution, so the rows match what the
+/// materialized target would expose. `truncated` is `true` when the model
+/// produced at least `limit_applied` rows.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PreviewRowsOutput {
+    pub version: String,
+    pub command: String,
+    /// Model whose output was sampled.
+    pub model: String,
+    /// CTE within the model that was isolated, if `--cte` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cte: Option<String>,
+    /// Output column names, in order.
+    pub columns: Vec<String>,
+    /// Sampled rows; each row is a list of JSON-encoded cell values aligned
+    /// to `columns`.
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Number of rows returned (≤ `limit_applied`).
+    pub row_count: usize,
+    /// The `LIMIT` applied to the preview query.
+    pub limit_applied: u32,
+    /// `true` when `row_count` reached `limit_applied` — more rows may exist.
+    pub truncated: bool,
+    /// The exact SQL executed (carries no credentials). Useful for debugging
+    /// the masking projection and CTE isolation.
+    pub executed_sql: String,
+    /// Adapter the preview ran against (e.g. `"duckdb"`, `"databricks"`).
+    pub adapter_kind: String,
+    pub duration_ms: u64,
+}
+
 /// JSON output for `rocky preview create`.
 ///
 /// Records the prune-and-copy decision plus the run summary for the branch

@@ -71,6 +71,68 @@ impl ParseError {
     }
 }
 
+/// Errors from [`isolate_cte`].
+#[derive(Debug, Error)]
+pub enum CteError {
+    /// The SQL didn't parse as a single query statement.
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+
+    /// `cte_name` was not a valid SQL identifier.
+    #[error("invalid CTE name: {0}")]
+    InvalidName(String),
+
+    /// The query has no `WITH` clause.
+    #[error("query has no CTEs (no WITH clause)")]
+    NoCtes,
+
+    /// No CTE in the query matched `cte_name`.
+    #[error("no CTE named '{0}' in query")]
+    NotFound(String),
+}
+
+/// Rewrite a query so a single named CTE can be executed in isolation.
+///
+/// Given `WITH a AS (...), b AS (...) SELECT ...`, returns
+/// `WITH a AS (...), b AS (...)\nSELECT * FROM <cte_name>` — the full `WITH`
+/// clause is preserved (unreferenced sibling CTEs are harmless) and only the
+/// trailing query is replaced. Used by `rocky preview rows --cte` to sample a
+/// single CTE's output.
+///
+/// The CTE reference is emitted **unquoted**, which is safe because
+/// `cte_name` is validated against `^[A-Za-z0-9_]+$` first. Quoted /
+/// case-sensitive CTE names are matched on their bare value and are not yet
+/// re-quoted on output (a known limitation).
+///
+/// # Errors
+///
+/// Returns [`CteError::InvalidName`] when `cte_name` isn't a valid identifier,
+/// [`CteError::Parse`] when `sql` isn't a single query, [`CteError::NoCtes`]
+/// when there's no `WITH` clause, and [`CteError::NotFound`] when no CTE
+/// matches `cte_name`.
+pub fn isolate_cte(sql: &str, cte_name: &str) -> Result<String, CteError> {
+    crate::validation::validate_identifier(cte_name)
+        .map_err(|_| CteError::InvalidName(cte_name.to_string()))?;
+
+    let Statement::Query(query) = parse_single_statement(sql)? else {
+        return Err(CteError::NoCtes);
+    };
+
+    let Some(with) = &query.with else {
+        return Err(CteError::NoCtes);
+    };
+
+    if !with
+        .cte_tables
+        .iter()
+        .any(|cte| cte.alias.name.value == cte_name)
+    {
+        return Err(CteError::NotFound(cte_name.to_string()));
+    }
+
+    Ok(format!("{with}\nSELECT * FROM {cte_name}"))
+}
+
 /// Extract line:col from a sqlparser error message and convert to a byte offset.
 ///
 /// sqlparser formats errors as "... at Line: N, Column M" where N and M are
@@ -159,6 +221,15 @@ pub fn parse_single_statement(sql: &str) -> Result<Statement, ParseError> {
     Ok(statements.swap_remove(0))
 }
 
+/// Returns `true` iff `sql` parses as exactly one `SELECT`/query statement.
+///
+/// Used to reject non-`SELECT` model bodies (DDL, multi-statement, INSERT)
+/// before they're executed as a preview. Keeps the `sqlparser` AST dependency
+/// inside `rocky-sql`.
+pub fn is_single_select(sql: &str) -> bool {
+    matches!(parse_single_statement(sql), Ok(Statement::Query(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +305,68 @@ mod tests {
         let err = parse_single_statement(sql).unwrap_err();
         let rich = err.into_rich(sql, "models/multi.sql");
         assert!(rich.help.is_some());
+    }
+
+    #[test]
+    fn test_isolate_cte_basic() {
+        let sql = "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM b";
+        let isolated = isolate_cte(sql, "a").unwrap();
+        assert!(isolated.to_uppercase().contains("WITH"));
+        assert!(isolated.contains("SELECT * FROM a"));
+        // Both CTE definitions are preserved; only the trailing query changes.
+        assert!(isolated.contains("AS (SELECT 1 AS x)") || isolated.contains("AS (SELECT 1 AS X)"));
+        // The rewritten query must itself parse.
+        parse_single_statement(&isolated).expect("isolated CTE query should parse");
+    }
+
+    #[test]
+    fn test_isolate_cte_second() {
+        let sql = "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a";
+        let isolated = isolate_cte(sql, "b").unwrap();
+        assert!(isolated.trim_end().ends_with("SELECT * FROM b"));
+        parse_single_statement(&isolated).unwrap();
+    }
+
+    #[test]
+    fn test_isolate_cte_unknown_name() {
+        let sql = "WITH a AS (SELECT 1 AS x) SELECT * FROM a";
+        assert!(matches!(
+            isolate_cte(sql, "missing"),
+            Err(CteError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_isolate_cte_no_with_clause() {
+        let sql = "SELECT * FROM some_table";
+        assert!(matches!(isolate_cte(sql, "a"), Err(CteError::NoCtes)));
+    }
+
+    #[test]
+    fn test_isolate_cte_invalid_name_rejected() {
+        let sql = "WITH a AS (SELECT 1 AS x) SELECT * FROM a";
+        // Identifier validation runs before parsing, so an injection attempt
+        // never reaches the SQL.
+        assert!(matches!(
+            isolate_cte(sql, "a; DROP TABLE users"),
+            Err(CteError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_isolate_cte_rejects_multi_statement() {
+        let sql = "WITH a AS (SELECT 1) SELECT * FROM a; SELECT 2";
+        assert!(matches!(isolate_cte(sql, "a"), Err(CteError::Parse(_))));
+    }
+
+    #[test]
+    fn test_is_single_select() {
+        assert!(is_single_select("SELECT 1"));
+        assert!(is_single_select(
+            "WITH a AS (SELECT 1 AS x) SELECT * FROM a"
+        ));
+        assert!(!is_single_select("CREATE TABLE t (id INT)"));
+        assert!(!is_single_select("SELECT 1; SELECT 2"));
+        assert!(!is_single_select(""));
     }
 }
