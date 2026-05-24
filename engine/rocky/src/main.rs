@@ -1520,6 +1520,31 @@ enum PreviewAction {
         #[arg(long, default_value = "models")]
         models: PathBuf,
     },
+    /// Sample result rows for a single transformation model (or one of its
+    /// CTEs), with classified columns masked inline.
+    Rows {
+        /// Model to preview.
+        #[arg(long)]
+        model: String,
+        /// Preview a single named CTE within the model instead of its final
+        /// output.
+        #[arg(long)]
+        cte: Option<String>,
+        /// Maximum number of rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Allow execution against a non-DuckDB warehouse (may incur query
+        /// cost). Local DuckDB projects don't need this.
+        #[arg(long)]
+        allow_warehouse: bool,
+        /// Pipeline whose target adapter to run against (required when the
+        /// project defines more than one pipeline).
+        #[arg(long)]
+        pipeline: Option<String>,
+        /// Models directory.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
 }
 
 /// Subcommands under `rocky plan`.
@@ -2767,6 +2792,27 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &state_path,
                     &models,
                     &name,
+                    json,
+                )
+                .await
+            }
+            PreviewAction::Rows {
+                model,
+                cte,
+                limit,
+                allow_warehouse,
+                pipeline,
+                models,
+            } => {
+                rocky_cli::commands::run_preview_rows(
+                    &cli.config,
+                    &state_path,
+                    &model,
+                    cte.as_deref(),
+                    limit,
+                    allow_warehouse,
+                    pipeline.as_deref(),
+                    &models,
                     json,
                 )
                 .await

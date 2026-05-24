@@ -239,3 +239,4 @@ export type {
   PreviewCostSummary,
   PreviewModelCostDelta,
 } from "./preview_cost";
+export type { PreviewRowsOutput } from "./preview_rows";

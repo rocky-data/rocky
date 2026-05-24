@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky preview rows`.\n\nA sample of result rows for a single transformation model (or one of its CTEs), executed against the pipeline's configured adapter. Classified columns are masked inline before execution, so the rows match what the materialized target would expose. `truncated` is `true` when the model produced at least `limit_applied` rows.",
+  "properties": {
+    "adapter_kind": {
+      "description": "Adapter the preview ran against (e.g. `\"duckdb\"`, `\"databricks\"`).",
+      "type": "string"
+    },
+    "columns": {
+      "description": "Output column names, in order.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "cte": {
+      "description": "CTE within the model that was isolated, if `--cte` was given.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "executed_sql": {
+      "description": "The exact SQL executed (carries no credentials). Useful for debugging the masking projection and CTE isolation.",
+      "type": "string"
+    },
+    "limit_applied": {
+      "description": "The `LIMIT` applied to the preview query.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "model": {
+      "description": "Model whose output was sampled.",
+      "type": "string"
+    },
+    "row_count": {
+      "description": "Number of rows returned (≤ `limit_applied`).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "rows": {
+      "description": "Sampled rows; each row is a list of JSON-encoded cell values aligned to `columns`.",
+      "items": {
+        "items": true,
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "truncated": {
+      "description": "`true` when `row_count` reached `limit_applied` — more rows may exist.",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "adapter_kind",
+    "columns",
+    "command",
+    "duration_ms",
+    "executed_sql",
+    "limit_applied",
+    "model",
+    "row_count",
+    "rows",
+    "truncated",
+    "version"
+  ],
+  "title": "PreviewRowsOutput",
+  "type": "object"
+}
