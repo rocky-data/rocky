@@ -558,6 +558,7 @@ pub(crate) async fn discover_branch_targets_for_plan(
     config_path: &Path,
     record: &BranchRecord,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
 ) -> Result<Vec<PlannedPromoteWithSql>> {
     use crate::registry::AdapterRegistry;
 
@@ -566,12 +567,15 @@ pub(crate) async fn discover_branch_targets_for_plan(
         config_path.display()
     ))?;
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_pipeline_name, pipeline) =
-        crate::registry::resolve_replication_pipeline(&rocky_cfg, None)?;
-    let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
+    let (_resolved_pipeline_name, pipeline) =
+        crate::registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+    // `target_adapter()` is the pipeline-type-agnostic accessor; works for
+    // both replication and transformation variants (and would error in
+    // `discover_branch_targets` below for any other variant).
+    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
     let dialect = adapter.dialect();
 
-    let planned = discover_branch_targets(config_path, record, filter).await?;
+    let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
 
     Ok(planned
         .into_iter()
@@ -688,9 +692,8 @@ pub(crate) async fn run_promote_apply(
         config_path.display()
     ))?;
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_pipeline_name, pipeline) =
-        crate::registry::resolve_replication_pipeline(&rocky_cfg, None)?;
-    let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)?;
+    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
     let mut overall_success = true;
@@ -811,6 +814,7 @@ pub fn run_branch_approve(
 /// One (production target, branch source) pair produced by enumeration.
 /// The promote SQL is built downstream once the adapter (and therefore the
 /// dialect's identifier-quoting rules) is in scope.
+#[derive(Debug)]
 struct PlannedPromote {
     prod: TargetRef,
     branch_source: TargetRef,
@@ -843,25 +847,61 @@ fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -
     )
 }
 
-/// Enumerate the promote plan for a branch by walking the configured
-/// replication pipeline's discovery surface — the same enumeration
-/// `branch compare` uses. Transformation-pipeline promote (model glob walk)
-/// is a v2 follow-up; the v1 implementation surfaces a clear error if the
-/// resolved pipeline is not a replication pipeline.
+/// Enumerate the promote plan for a branch.
+///
+/// Walks the resolved pipeline:
+///
+/// - **Replication pipelines**: discovers source connectors and resolves each
+///   discovered table through the schema-pattern templates — the same
+///   enumeration `branch compare` uses.
+/// - **Transformation pipelines**: walks the configured `models` glob (the
+///   same surface `rocky list models` reads) and emits one target per model,
+///   using the model's sidecar `[target]` as the production reference.
+///
+/// Both shapes feed the same `(prod, branch_source)` payload: `branch_source`
+/// is derived by rewriting `prod`'s schema to the branch's `schema_prefix`
+/// via [`shadow::shadow_target`] with `schema_override`. Quality / snapshot /
+/// load pipelines remain unsupported (no managed-table surface for promote).
 async fn discover_branch_targets(
     config_path: &Path,
     record: &BranchRecord,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
 ) -> Result<Vec<PlannedPromote>> {
-    use super::{filter_table_matches, matches_filter, parse_filter};
-    use crate::registry::{self, AdapterRegistry};
+    use crate::registry;
 
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
     ))?;
-    let (_pipeline_name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, None)?;
-    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let (resolved_pipeline_name, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+
+    match pipeline {
+        rocky_core::config::PipelineConfig::Replication(repl) => {
+            discover_replication_branch_targets(&rocky_cfg, repl, record, filter).await
+        }
+        rocky_core::config::PipelineConfig::Transformation(tx) => {
+            discover_transformation_branch_targets(tx, config_path, record, filter)
+        }
+        other => anyhow::bail!(
+            "pipeline '{resolved_pipeline_name}' is type '{}', but `branch promote` only supports \
+             replication and transformation pipelines",
+            other.pipeline_type_str()
+        ),
+    }
+}
+
+/// Replication pipeline path for [`discover_branch_targets`].
+async fn discover_replication_branch_targets(
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    record: &BranchRecord,
+    filter: Option<&str>,
+) -> Result<Vec<PlannedPromote>> {
+    use super::{filter_table_matches, matches_filter, parse_filter};
+    use crate::registry::AdapterRegistry;
+
+    let registry = AdapterRegistry::from_config(rocky_cfg)?;
 
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
@@ -875,8 +915,8 @@ async fn discover_branch_targets(
             .connectors
     } else {
         anyhow::bail!(
-            "no discovery adapter configured — `branch promote` requires source discovery in v1 \
-             (transformation-pipeline promote is a follow-up)"
+            "no discovery adapter configured — replication-pipeline `branch promote` requires \
+             source discovery"
         );
     };
 
@@ -928,6 +968,131 @@ async fn discover_branch_targets(
     Ok(planned)
 }
 
+/// Transformation pipeline path for [`discover_branch_targets`].
+///
+/// Walks the model files under the pipeline's `models` glob (top-level +
+/// immediate subdirectories — same surface `rocky list models` and the
+/// catalog scope resolver use) and emits one `(prod, branch_source)` pair
+/// per model. Each model's sidecar `[target]` block supplies the production
+/// catalog/schema/table; the branch source rewrites the schema to the
+/// branch's `schema_prefix` via [`shadow::shadow_target`].
+///
+/// ## Filter semantics
+///
+/// Mirrors the `--filter` semantics already used by `rocky run` for
+/// transformation pipelines and the replication path above:
+///
+/// - `table=<literal>` — keep models whose target table equals the literal.
+/// - `model=<literal>` — keep models whose `config.name` equals the literal
+///   (matches `rocky run --filter model=`).
+/// - `catalog=<literal>` / `schema=<literal>` — keep models whose target
+///   catalog / schema equals the literal.
+///
+/// Any other key is rejected with a clear error so a stale replication-style
+/// filter (e.g. `client=acme`) on a transformation pipeline fails fast
+/// rather than silently dropping every model.
+fn discover_transformation_branch_targets(
+    pipeline: &rocky_core::config::TransformationPipelineConfig,
+    config_path: &Path,
+    record: &BranchRecord,
+    filter: Option<&str>,
+) -> Result<Vec<PlannedPromote>> {
+    use super::parse_filter;
+
+    let parsed_filter = filter.map(parse_filter).transpose()?;
+    if let Some((key, _)) = &parsed_filter {
+        const KNOWN_KEYS: &[&str] = &["table", "model", "catalog", "schema"];
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "transformation-pipeline `branch promote` does not support `--filter {key}=...`. \
+                 Supported keys: {}.",
+                KNOWN_KEYS.join(", ")
+            );
+        }
+    }
+
+    // Models directory is relative to the config file's parent — same
+    // resolution rule as `scope::resolve_transformation_managed_tables` and
+    // `run_local::run_transformation`.
+    let project_root = config_path.parent().unwrap_or(Path::new("."));
+    let models_base = pipeline
+        .models
+        .split(&['*', '?', '['][..])
+        .next()
+        .unwrap_or("models");
+    let models_dir = project_root.join(models_base.trim_end_matches('/'));
+
+    if !models_dir.exists() {
+        anyhow::bail!(
+            "models directory '{}' does not exist — transformation-pipeline `branch promote` \
+             requires the project's `models` glob to resolve to an on-disk directory",
+            models_dir.display()
+        );
+    }
+
+    // Load the same way `rocky list models` does: top-level files plus
+    // immediate subdirectories. Keeps behavior consistent with the rest of
+    // the transformation surface (run, plan, list).
+    let mut all_models = rocky_core::models::load_models_from_dir(&models_dir).context(format!(
+        "failed to load models from {}",
+        models_dir.display()
+    ))?;
+    if let Ok(entries) = std::fs::read_dir(&models_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path()) {
+                    all_models.extend(sub);
+                }
+            }
+        }
+    }
+
+    let shadow_cfg = ShadowConfig {
+        suffix: "_rocky_shadow".to_string(),
+        schema_override: Some(record.schema_prefix.clone()),
+        cleanup_after: false,
+    };
+
+    let mut planned = Vec::new();
+    for model in &all_models {
+        // Skip ephemeral models — they have no physical table to promote.
+        // Mirrors how `rocky run` skips ephemeral materializations during
+        // the apply phase.
+        if matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            continue;
+        }
+
+        if let Some((key, value)) = &parsed_filter {
+            let keep = match key.as_str() {
+                "table" => model.config.target.table == *value,
+                "model" => model.config.name == *value,
+                "catalog" => model.config.target.catalog == *value,
+                "schema" => model.config.target.schema == *value,
+                _ => unreachable!("known-key guard above"),
+            };
+            if !keep {
+                continue;
+            }
+        }
+
+        let prod = TargetRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: model.config.target.schema.clone(),
+            table: model.config.target.table.clone(),
+        };
+        let branch_source = shadow::shadow_target(&prod, &shadow_cfg);
+        planned.push(PlannedPromote {
+            prod,
+            branch_source,
+        });
+    }
+
+    Ok(planned)
+}
+
 /// `rocky branch promote <name>` — promote a branch's materialized tables
 /// to their production targets, gated on `[branch.approval]` if enabled.
 ///
@@ -947,6 +1112,7 @@ pub async fn run_branch_promote(
     base_ref: &str,
     branch_name: &str,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
     skip_approval_flag: bool,
     allow_breaking: bool,
     json: bool,
@@ -1126,12 +1292,12 @@ pub async fn run_branch_promote(
         breaking_changes: None,
     });
 
-    let planned = discover_branch_targets(config_path, &record, filter).await?;
+    let planned = discover_branch_targets(config_path, &record, filter, pipeline_name).await?;
 
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_pipeline_name, pipeline) =
-        crate::registry::resolve_replication_pipeline(&rocky_cfg, None)?;
-    let adapter = registry.warehouse_adapter(&pipeline.target.adapter)?;
+    let (_resolved_pipeline_name, pipeline) =
+        crate::registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let dialect = adapter.dialect();
     let mut targets_out: Vec<PromoteTarget> = Vec::new();
@@ -2429,5 +2595,486 @@ mod tests {
         let persisted = crate::plan_store::read_plan(tmp.path(), &plan_id).unwrap();
         assert_eq!(persisted.kind, PlanKind::Compact);
         assert_ne!(persisted.kind, PlanKind::Promote);
+    }
+
+    // ------------------------------------------------------------------
+    // Transformation-pipeline model-glob walk — closes the v1 promote
+    // limitation that the enumeration was replication-only.
+    // ------------------------------------------------------------------
+
+    /// Helper: write a minimal model pair (`.sql` + `.toml`) under `models_dir`.
+    fn write_transformation_model(
+        models_dir: &Path,
+        name: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        sql: &str,
+    ) {
+        std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            models_dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"{catalog}\"\nschema = \"{schema}\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `branch promote` on a transformation-only pipeline must enumerate
+    /// every model's `[target]` from the on-disk model glob and produce one
+    /// `CREATE OR REPLACE TABLE prod AS SELECT * FROM branch_source` per
+    /// model. No discovery adapter involved.
+    ///
+    /// Pure enumeration test — exercises `discover_branch_targets` against
+    /// a transformation pipeline without touching the warehouse.
+    #[tokio::test]
+    async fn discover_branch_targets_walks_transformation_models() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id, 'a' AS label",
+        );
+        write_transformation_model(
+            &models_dir,
+            "dim_customers",
+            "warehouse",
+            "marts",
+            "dim_customers",
+            "SELECT 2 AS id, 'c' AS name",
+        );
+
+        let record = sample_record("fix-price");
+        let planned = discover_branch_targets(&config_path, &record, None, None)
+            .await
+            .expect("transformation-pipeline branch promote enumeration must succeed");
+
+        // Two models → two planned promote targets.
+        assert_eq!(
+            planned.len(),
+            2,
+            "expected 2 planned targets, got {planned:?}",
+            planned = planned.len()
+        );
+
+        // Each prod target carries the model's [target] coordinates and the
+        // branch_source rewrites the schema to `branch__fix-price` per the
+        // shadow_target rule.
+        let fqns: std::collections::BTreeSet<String> = planned
+            .iter()
+            .map(|p| format!("{} <- {}", p.prod.full_name(), p.branch_source.full_name()))
+            .collect();
+        assert!(
+            fqns.contains("warehouse.marts.fct_orders <- warehouse.branch__fix-price.fct_orders"),
+            "fct_orders pairing missing: {fqns:?}"
+        );
+        assert!(
+            fqns.contains(
+                "warehouse.marts.dim_customers <- warehouse.branch__fix-price.dim_customers"
+            ),
+            "dim_customers pairing missing: {fqns:?}"
+        );
+    }
+
+    /// `branch promote` end-to-end on a transformation-only pipeline against
+    /// an on-disk DuckDB warehouse.
+    ///
+    /// Seeds two branch-schema tables, materializes a branch state for the
+    /// `fix-price` branch, then drives the bare-verb `run_branch_promote`
+    /// path. After the promote, the production schema must contain the same
+    /// rows as the branch schema for every model — proving the model-glob
+    /// walk drives real SQL dispatch through the adapter on a transformation
+    /// pipeline.
+    ///
+    /// The approval gate stays disabled (default `[branch.approval]`) and
+    /// `--allow-breaking` is passed so the base-ref-missing skip path on the
+    /// breaking-change gate doesn't block the promote.
+    #[tokio::test]
+    async fn run_branch_promote_transformation_e2e_succeeds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        // Two transformation models targeting `warehouse.marts.<table>`.
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+        write_transformation_model(
+            &models_dir,
+            "dim_customers",
+            "warehouse",
+            "marts",
+            "dim_customers",
+            "SELECT 1 AS id",
+        );
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Register the branch in the state store.
+        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+
+        // Seed the branch tables manually (simulates `rocky run --branch fix-price`):
+        // both schemas are pre-created; the branch schema carries the rows
+        // the promote will copy into prod.
+        //
+        // Pre-create the prod `marts` schema explicitly — `branch promote`
+        // dispatches `CREATE OR REPLACE TABLE` directly via the adapter and
+        // doesn't consult the pipeline's `auto_create_schemas` governance.
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS warehouse")
+                .await
+                .expect("create catalog");
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS marts")
+                .await
+                .expect("create prod schema");
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS \"branch__fix-price\"")
+                .await
+                .expect("create branch schema");
+            adapter
+                .execute_statement(
+                    "CREATE TABLE \"branch__fix-price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+                )
+                .await
+                .expect("seed branch fct_orders");
+            adapter
+                .execute_statement(
+                    "CREATE TABLE \"branch__fix-price\".dim_customers AS SELECT 'a' AS name",
+                )
+                .await
+                .expect("seed branch dim_customers");
+        }
+
+        // Drive the promote — bare verb, JSON disabled (we re-open the
+        // warehouse below to verify rows). Hold `cwd_lock` across the
+        // `set_current_dir` window so this test serializes against the other
+        // cwd-mutating tests in this binary (cargo runs tests in parallel).
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = run_branch_promote(
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main", // base_ref — repo is uninitialized so the gate skips
+            "fix-price",
+            None,  // no filter
+            None,  // pipeline — only one pipeline, no need to disambiguate
+            false, // skip_approval_flag
+            true,  // allow_breaking — irrelevant here; gate skips fail-open anyway
+            false, // json — suppress pretty stdout in tests
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        result.expect("transformation-pipeline promote must succeed");
+
+        // Verify both production tables were created with the branch's rows.
+        // DuckDB's `COUNT(*)` returns HUGEINT, which the rocky-duckdb adapter
+        // serializes as a JSON string; cast to BIGINT to land on the i64 path.
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let count_i64 = |sql: &'static str| {
+            let adapter = &adapter;
+            async move {
+                let rows = adapter.execute_query(sql).await.expect("count query");
+                let v = &rows.rows[0][0];
+                v.as_i64().unwrap_or_else(|| {
+                    // HUGEINT serializes as a string in rocky-duckdb's
+                    // JSON shape; parse if so.
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_else(|| {
+                            panic!("count value is neither i64 nor parseable string: {v:?}")
+                        })
+                })
+            }
+        };
+        let fct_count =
+            count_i64("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders").await;
+        assert_eq!(
+            fct_count, 2,
+            "promote must copy all 2 rows from branch__fix-price.fct_orders to prod"
+        );
+        let dim_count =
+            count_i64("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.dim_customers").await;
+        assert_eq!(
+            dim_count, 1,
+            "promote must copy the row from branch__fix-price.dim_customers to prod"
+        );
+    }
+
+    /// `branch promote` on a transformation pipeline must reject filter keys
+    /// that only make sense on the replication path (`client=acme` and
+    /// friends). Without this fast-fail, a stale CI invocation would
+    /// silently match zero models and ship a zero-target promote, which
+    /// would look like a successful no-op.
+    #[tokio::test]
+    async fn discover_branch_targets_transformation_rejects_replication_filter() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        let record = sample_record("fix-price");
+        let err = discover_branch_targets(&config_path, &record, Some("client=acme"), None)
+            .await
+            .expect_err("client= filter must be rejected on transformation pipelines");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not support `--filter client="),
+            "error must name the rejected key: {msg}"
+        );
+        assert!(
+            msg.contains("table, model, catalog, schema"),
+            "error must list supported keys: {msg}"
+        );
+    }
+
+    /// Mixed project: `rocky.toml` defines both a transformation pipeline
+    /// and a replication pipeline against the same DuckDB adapter. With
+    /// `--pipeline` disambiguating the choice, the dispatcher must route
+    /// into the right enumeration helper per pipeline type:
+    ///
+    /// - `--pipeline marts` (transformation) returns one entry per model.
+    /// - `--pipeline raw` (replication) returns one entry per discovered
+    ///   source table — empty here because no source schemas exist in the
+    ///   freshly-created DuckDB file, which is the right empty answer
+    ///   rather than a panic.
+    /// - Omitting `--pipeline` on a multi-pipeline config fails with the
+    ///   `resolve_pipeline` "multiple pipelines defined" error — no
+    ///   implicit pick.
+    ///
+    /// Proves the routing in `discover_branch_targets` honors `--pipeline`
+    /// and dispatches to the correct per-type helper regardless of project
+    /// composition.
+    #[tokio::test]
+    async fn discover_branch_targets_mixed_project_per_pipeline_routing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+# Replication pipeline — discovery is auto-wired to the DuckDB adapter
+# via `normalize_rocky_config`. No `src__*` schemas exist in the freshly
+# created database so the enumeration is correctly empty rather than
+# panicking.
+[pipeline.raw]
+type = "replication"
+
+[pipeline.raw.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["client", "source"]
+
+[pipeline.raw.target]
+adapter = "default"
+catalog_template = "{{client}}_warehouse"
+schema_template = "raw__{{source}}"
+
+# Transformation pipeline with on-disk models.
+[pipeline.marts]
+type = "transformation"
+models = "models/**"
+
+[pipeline.marts.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        let record = sample_record("fix-price");
+
+        // Routing 1: --pipeline marts (transformation) walks the model glob.
+        let planned = discover_branch_targets(&config_path, &record, None, Some("marts"))
+            .await
+            .expect("transformation pipeline 'marts' must enumerate models");
+        assert_eq!(planned.len(), 1, "marts walks one model");
+        assert_eq!(planned[0].prod.full_name(), "warehouse.marts.fct_orders");
+        assert_eq!(
+            planned[0].branch_source.full_name(),
+            "warehouse.branch__fix-price.fct_orders"
+        );
+
+        // Routing 2: --pipeline raw (replication) dispatches into the
+        // replication enumeration. No source schemas exist so the planned
+        // set is empty — but the path is taken (no Err, no panic).
+        let planned = discover_branch_targets(&config_path, &record, None, Some("raw"))
+            .await
+            .expect("replication enumeration over empty source must return Ok([])");
+        assert_eq!(
+            planned.len(),
+            0,
+            "no `src__*` schemas → zero planned targets, got {}",
+            planned.len()
+        );
+
+        // Routing 3: omitting --pipeline on a multi-pipeline config must
+        // surface `resolve_pipeline`'s "multiple pipelines defined" error
+        // — no implicit pick.
+        let err = discover_branch_targets(&config_path, &record, None, None)
+            .await
+            .expect_err("multi-pipeline config without --pipeline must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("multiple pipelines defined"),
+            "must surface resolve_pipeline multi-pipeline error: {msg}"
+        );
+    }
+
+    /// `branch promote` on a transformation pipeline respects the
+    /// `--filter model=<name>` filter — matches the equivalent filter on
+    /// `rocky run` for transformation pipelines.
+    #[tokio::test]
+    async fn discover_branch_targets_transformation_filter_model_keeps_only_match() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+        write_transformation_model(
+            &models_dir,
+            "dim_customers",
+            "warehouse",
+            "marts",
+            "dim_customers",
+            "SELECT 1 AS id",
+        );
+
+        let record = sample_record("fix-price");
+        let planned =
+            discover_branch_targets(&config_path, &record, Some("model=fct_orders"), None)
+                .await
+                .expect("filter must succeed");
+        assert_eq!(planned.len(), 1, "filter must keep only the matching model");
+        assert_eq!(planned[0].prod.table, "fct_orders");
     }
 }
