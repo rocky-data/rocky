@@ -11,6 +11,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use rocky_adapter_sdk::throttle::AdaptiveThrottle;
 
+use rocky_catalog_core::{GovernanceCatalogClient, Grant as CatalogGrant, Securable};
 use rocky_core::checks;
 use rocky_core::config::{
     GovernanceOverride, ReplicationPipelineConfig, ResolvedTableOverride, resolve_table_override,
@@ -705,6 +706,90 @@ async fn finalize_idempotency_on_success(
     }
 }
 
+/// Convert a slice of `rocky_ir::Grant` into the catalog-agnostic
+/// `(Securable, Vec<CatalogGrant>)` shape expected by
+/// [`GovernanceCatalogClient::apply_grants`].
+///
+/// The `GovernanceCatalogClient` trait surface speaks in
+/// [`rocky_catalog_core::Grant`] (principal + privilege string) keyed on
+/// a single [`Securable`]; the call sites in `run.rs` build
+/// [`rocky_ir::Grant`] (principal + permission enum + target). All grants
+/// in `grants` are required to share the same target — the call site
+/// builds them that way (one securable per batch), so the conversion is
+/// total when the target is `Catalog` or `Schema`.
+///
+/// Returns `None` when `grants` is empty or carries no target the catalog
+/// trait can speak; in that case the caller falls through to the existing
+/// [`GovernanceAdapter::apply_grants`] path.
+fn ir_grants_to_securable_batch(grants: &[Grant]) -> Option<(Securable, Vec<CatalogGrant>)> {
+    let first = grants.first()?;
+    let securable = match &first.target {
+        GrantTarget::Catalog(name) => Securable::Catalog { name: name.clone() },
+        GrantTarget::Schema { catalog, schema } => Securable::Schema {
+            catalog: catalog.clone(),
+            name: schema.clone(),
+        },
+    };
+    // Every grant in the batch must share the same target — the call
+    // site builds them that way. Bail out if any disagrees so the caller
+    // routes through the legacy path rather than splitting the batch.
+    if grants.iter().any(|g| g.target != first.target) {
+        return None;
+    }
+    let catalog_grants = grants
+        .iter()
+        .map(|g| CatalogGrant {
+            principal: g.principal.clone(),
+            // Unity's REST permissions endpoint uses the underscore-delimited
+            // `Privilege` enum (`USE_CATALOG`, `USE_SCHEMA`), unlike the SQL
+            // `GRANT` grammar (`USE CATALOG`) that `Permission`'s `Display`
+            // renders. Map spaces to underscores at this IR -> REST boundary
+            // so multi-word privileges reach the API in the shape it accepts.
+            privilege: g.permission.to_string().replace(' ', "_"),
+        })
+        .collect();
+    Some((securable, catalog_grants))
+}
+
+/// Apply a batch of `Vec<Grant>` against `securable`, preferring the
+/// REST-routed [`GovernanceCatalogClient`] path when present, falling
+/// back to the singular-target [`GovernanceAdapter::apply_grants`] path
+/// otherwise.
+///
+/// The REST path collapses the batch into one HTTP PATCH per securable
+/// (multi-change wire shape); the legacy path remains the existing per-
+/// grant SQL `GRANT` sequence. Both are best-effort: errors are warned
+/// rather than aborting the run, matching the call site's existing
+/// failure semantics.
+async fn apply_grants_with_catalog_client_fallback(
+    governance_catalog_client: Option<&std::sync::Arc<dyn GovernanceCatalogClient>>,
+    governance_adapter: &dyn GovernanceAdapter,
+    grants: &[Grant],
+    scope_label: &str,
+) {
+    if grants.is_empty() {
+        return;
+    }
+    if let Some(client) = governance_catalog_client
+        && let Some((securable, catalog_grants)) = ir_grants_to_securable_batch(grants)
+    {
+        match client.apply_grants(&securable, &catalog_grants).await {
+            Ok(()) => return,
+            Err(e) => {
+                warn!(
+                    scope = scope_label,
+                    error = %e,
+                    "REST-routed apply_grants failed; falling back to GovernanceAdapter"
+                );
+                // Fall through to the legacy path below.
+            }
+        }
+    }
+    if let Err(e) = governance_adapter.apply_grants(grants).await {
+        warn!(scope = scope_label, error = %e, "grants failed");
+    }
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1092,6 +1177,14 @@ pub async fn run(
     let governance_adapter: Box<dyn GovernanceAdapter> =
         adapter_registry.governance_adapter(&pipeline.target.adapter);
 
+    // Opt-in REST-routed governance client: adapters that expose
+    // multi-securable RBAC over REST implement [`GovernanceCatalogClient`]
+    // so grant batches collapse into one PATCH per `Securable`. When `None`,
+    // we fall through to the existing [`GovernanceAdapter::apply_grants`] SQL
+    // path with no behavioural delta.
+    let governance_catalog_client: Option<std::sync::Arc<dyn GovernanceCatalogClient>> =
+        adapter_registry.governance_catalog_client(&pipeline.target.adapter);
+
     let state_store = StateStore::open(state_path).context(format!(
         "failed to open state store at {}",
         state_path.display()
@@ -1387,9 +1480,13 @@ pub async fn run(
                         })
                         .collect();
 
-                    if let Err(e) = governance_adapter.apply_grants(&grants).await {
-                        warn!(catalog = target_catalog, error = %e, "catalog grants failed");
-                    }
+                    apply_grants_with_catalog_client_fallback(
+                        governance_catalog_client.as_ref(),
+                        governance_adapter.as_ref(),
+                        &grants,
+                        &format!("catalog={target_catalog}"),
+                    )
+                    .await;
                     output.permissions.grants_added += all_grants
                         .iter()
                         .map(|g| g.permissions.len())
@@ -1464,13 +1561,13 @@ pub async fn run(
                         })
                         .collect();
 
-                    if let Err(e) = governance_adapter.apply_grants(&grants).await {
-                        warn!(
-                            schema = format!("{}.{}", target_catalog, target_schema),
-                            error = %e,
-                            "schema grants failed"
-                        );
-                    }
+                    apply_grants_with_catalog_client_fallback(
+                        governance_catalog_client.as_ref(),
+                        governance_adapter.as_ref(),
+                        &grants,
+                        &format!("schema={target_catalog}.{target_schema}"),
+                    )
+                    .await;
                 }
             }
 
@@ -5556,6 +5653,93 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
+
+    #[test]
+    fn ir_grants_to_securable_batch_renders_rest_privilege_form() {
+        // The IR -> GovernanceCatalogClient boundary must hand Unity's REST
+        // permissions endpoint the underscore-delimited privilege form
+        // (`USE_CATALOG`), NOT the spaced SQL `GRANT` form (`USE CATALOG`).
+        // This pins the conversion the wiremock test cannot reach.
+        let grants = vec![
+            Grant {
+                principal: "engineers".into(),
+                permission: Permission::UseCatalog,
+                target: GrantTarget::Catalog("hcv2_cat".into()),
+            },
+            Grant {
+                principal: "engineers".into(),
+                permission: Permission::Select,
+                target: GrantTarget::Catalog("hcv2_cat".into()),
+            },
+        ];
+        let (securable, catalog_grants) =
+            ir_grants_to_securable_batch(&grants).expect("catalog batch converts");
+        assert_eq!(
+            securable,
+            Securable::Catalog {
+                name: "hcv2_cat".into()
+            }
+        );
+        let privileges: Vec<&str> = catalog_grants.iter().map(|g| g.privilege.as_str()).collect();
+        assert!(
+            privileges.contains(&"USE_CATALOG"),
+            "multi-word privilege must reach REST as USE_CATALOG, got {privileges:?}"
+        );
+        assert!(privileges.contains(&"SELECT"));
+        assert!(
+            !privileges.iter().any(|p| p.contains(' ')),
+            "no spaced privilege may leak to the REST endpoint: {privileges:?}"
+        );
+    }
+
+    #[test]
+    fn ir_grants_to_securable_batch_maps_schema_target() {
+        let grants = vec![Grant {
+            principal: "analysts".into(),
+            permission: Permission::UseSchema,
+            target: GrantTarget::Schema {
+                catalog: "hcv2_cat".into(),
+                schema: "hcv2_sch".into(),
+            },
+        }];
+        let (securable, catalog_grants) =
+            ir_grants_to_securable_batch(&grants).expect("schema batch converts");
+        assert_eq!(
+            securable,
+            Securable::Schema {
+                catalog: "hcv2_cat".into(),
+                name: "hcv2_sch".into(),
+            }
+        );
+        assert_eq!(catalog_grants[0].privilege, "USE_SCHEMA");
+    }
+
+    #[test]
+    fn ir_grants_to_securable_batch_empty_is_none() {
+        assert!(ir_grants_to_securable_batch(&[]).is_none());
+    }
+
+    #[test]
+    fn ir_grants_to_securable_batch_mixed_targets_bail_to_legacy_path() {
+        // Defensive: a batch mixing securables routes through the legacy
+        // SQL path (returns None) rather than silently dropping grants.
+        let grants = vec![
+            Grant {
+                principal: "a".into(),
+                permission: Permission::Select,
+                target: GrantTarget::Catalog("hcv2_cat".into()),
+            },
+            Grant {
+                principal: "a".into(),
+                permission: Permission::Select,
+                target: GrantTarget::Schema {
+                    catalog: "hcv2_cat".into(),
+                    schema: "hcv2_sch".into(),
+                },
+            },
+        ];
+        assert!(ir_grants_to_securable_batch(&grants).is_none());
+    }
 
     #[test]
     fn test_partition_options_default_no_selection() {

@@ -18,6 +18,8 @@ use rocky_core::traits::{
     BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, NoopGovernanceAdapter, WarehouseAdapter,
 };
 
+use rocky_catalog_core::GovernanceCatalogClient;
+use rocky_databricks::UnityCatalogClient;
 use rocky_databricks::adapter::{DatabricksBatchCheckAdapter, DatabricksWarehouseAdapter};
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
@@ -632,6 +634,41 @@ impl AdapterRegistry {
             return Box::new(BigQueryGovernanceAdapter::new(adapter));
         }
         Box::new(NoopGovernanceAdapter)
+    }
+
+    /// Build a [`GovernanceCatalogClient`] for the named warehouse, when the
+    /// adapter exposes a REST-routed governance surface.
+    ///
+    /// This is the **opt-in** governance trait: adapters that expose
+    /// multi-securable RBAC over REST implement it; adapters that don't
+    /// (Iceberg REST, DuckDB, BigQuery, …) return `None` and callers fall
+    /// back to the existing [`GovernanceAdapter::apply_grants`] path. The
+    /// multi-change PATCH batching win (one HTTP call per `Securable` for
+    /// N grants) lives on the Databricks impl.
+    ///
+    /// - **Databricks:** returns a [`UnityCatalogClient`] composed of the
+    ///   same host + [`Auth`] the SQL connector uses.
+    /// - **Other adapters:** returns `None`.
+    pub fn governance_catalog_client(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn GovernanceCatalogClient>> {
+        if self.connectors.contains_key(name) {
+            let adapter_cfg = self.adapter_configs.get(name)?;
+            let host = adapter_cfg.host.as_deref()?;
+            let auth = Auth::from_config(AuthConfig {
+                host: host.to_string(),
+                token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
+                client_id: adapter_cfg.client_id.clone(),
+                client_secret: adapter_cfg
+                    .client_secret
+                    .as_ref()
+                    .map(|s| s.expose().to_string()),
+            })
+            .ok()?;
+            return Some(Arc::new(UnityCatalogClient::new(host.to_string(), auth)));
+        }
+        None
     }
 
     /// Build a BigQuery `LoaderAdapter` wrapping the registered warehouse adapter.

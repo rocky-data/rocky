@@ -18,7 +18,10 @@
 //! [`UnityRestError`]: rocky_databricks::UnityRestError
 //! [`CatalogError`]: rocky_catalog_core::CatalogError
 
-use rocky_catalog_core::{CatalogClient, CatalogError, ColumnSchema, Grant, TableRef, TableSchema};
+use rocky_catalog_core::{
+    CatalogClient, CatalogError, ColumnSchema, GovernanceCatalogClient, Grant, Securable, TableRef,
+    TableSchema,
+};
 use rocky_databricks::UnityCatalogClient;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use serde_json::json;
@@ -429,6 +432,246 @@ async fn revoke_grant_patches_with_remove_list() {
         .revoke_grant(&sample_table_ref(), &grant)
         .await
         .expect("revoke_grant happy path");
+}
+
+// ---------------------------------------------------------------------------
+// GovernanceCatalogClient — multi-change PATCH batching
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn governance_apply_grants_emits_one_patch_for_n_grants() {
+    // The receipt: three grants across two principals on a schema
+    // securable. The impl MUST collapse this into ONE PATCH carrying both
+    // principals in `changes[]`. `.expect(1)` makes wiremock fail if the
+    // impl loops one-grant-per-call (which would emit three PATCHes).
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/api/2.1/unity-catalog/permissions/schema/hcv2_cat.hcv2_sch",
+        ))
+        .and(body_partial_json(json!({
+            "changes": [
+                {"principal": "alice", "add": ["SELECT", "MODIFY"]},
+                {"principal": "bob", "add": ["SELECT"]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let grants = vec![
+        Grant {
+            principal: "alice".into(),
+            privilege: "SELECT".into(),
+        },
+        Grant {
+            principal: "alice".into(),
+            privilege: "MODIFY".into(),
+        },
+        Grant {
+            principal: "bob".into(),
+            privilege: "SELECT".into(),
+        },
+    ];
+    let securable = Securable::Schema {
+        catalog: "hcv2_cat".into(),
+        name: "hcv2_sch".into(),
+    };
+    test_client(&server)
+        .apply_grants(&securable, &grants)
+        .await
+        .expect("multi-change apply_grants happy path");
+}
+
+#[tokio::test]
+async fn governance_apply_grants_to_catalog_uses_catalog_endpoint() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/api/2.1/unity-catalog/permissions/catalog/hcv2_cat"))
+        .and(body_partial_json(json!({
+            "changes": [
+                {"principal": "engineers", "add": ["USE_CATALOG"]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let grants = vec![Grant {
+        principal: "engineers".into(),
+        privilege: "USE_CATALOG".into(),
+    }];
+    let securable = Securable::Catalog {
+        name: "hcv2_cat".into(),
+    };
+    test_client(&server)
+        .apply_grants(&securable, &grants)
+        .await
+        .expect("catalog-scoped apply_grants happy path");
+}
+
+#[tokio::test]
+async fn governance_apply_grants_to_table_uses_table_endpoint() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/api/2.1/unity-catalog/permissions/table/hcv2_cat.hcv2_sch.hcv2_orders",
+        ))
+        .and(body_partial_json(json!({
+            "changes": [
+                {"principal": "alice", "add": ["SELECT"]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let grants = vec![Grant {
+        principal: "alice".into(),
+        privilege: "SELECT".into(),
+    }];
+    let securable = Securable::Table {
+        catalog: "hcv2_cat".into(),
+        schema: "hcv2_sch".into(),
+        name: "hcv2_orders".into(),
+    };
+    test_client(&server)
+        .apply_grants(&securable, &grants)
+        .await
+        .expect("table-scoped apply_grants happy path");
+}
+
+#[tokio::test]
+async fn governance_revoke_grants_lands_in_remove_slot() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/api/2.1/unity-catalog/permissions/schema/hcv2_cat.hcv2_sch",
+        ))
+        .and(body_partial_json(json!({
+            "changes": [
+                {"principal": "alice", "remove": ["SELECT", "MODIFY"]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let grants = vec![
+        Grant {
+            principal: "alice".into(),
+            privilege: "SELECT".into(),
+        },
+        Grant {
+            principal: "alice".into(),
+            privilege: "MODIFY".into(),
+        },
+    ];
+    let securable = Securable::Schema {
+        catalog: "hcv2_cat".into(),
+        name: "hcv2_sch".into(),
+    };
+    test_client(&server)
+        .revoke_grants(&securable, &grants)
+        .await
+        .expect("multi-change revoke_grants happy path");
+}
+
+#[tokio::test]
+async fn governance_apply_grants_empty_slice_makes_no_http_call() {
+    // No mock mounted — empty input must short-circuit before any HTTP
+    // request. wiremock rejects unexpected calls so this test fails
+    // with a clear diagnostic if the impl ever loses its empty-slice
+    // guard.
+    let server = MockServer::start().await;
+    let securable = Securable::Schema {
+        catalog: "hcv2_cat".into(),
+        name: "hcv2_sch".into(),
+    };
+    test_client(&server)
+        .apply_grants(&securable, &[])
+        .await
+        .expect("empty apply_grants is a noop without any network call");
+}
+
+#[tokio::test]
+async fn governance_list_grants_at_schema_flattens_assignments() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/2.1/unity-catalog/permissions/schema/hcv2_cat.hcv2_sch",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "privilege_assignments": [
+                {"principal": "engineers", "privileges": ["SELECT", "MODIFY"]},
+                {"principal": "analysts", "privileges": ["SELECT"]}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let securable = Securable::Schema {
+        catalog: "hcv2_cat".into(),
+        name: "hcv2_sch".into(),
+    };
+    let grants = test_client(&server)
+        .list_grants(&securable)
+        .await
+        .expect("schema-scoped list_grants happy path");
+    assert_eq!(grants.len(), 3);
+    assert!(
+        grants
+            .iter()
+            .any(|g| g.principal == "engineers" && g.privilege == "MODIFY")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Singular CatalogClient::apply_grant still works (both paths coexist)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn singular_apply_grant_on_catalog_client_still_works() {
+    // The dual-path contract: introducing `GovernanceCatalogClient`
+    // does NOT change `CatalogClient::apply_grant`. The table-scoped
+    // singular path stays exactly as it was — same endpoint, same single-
+    // entry `changes[]` body. This test pins that contract.
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/api/2.1/unity-catalog/permissions/table/hcv2_cat.hcv2_sch.hcv2_orders",
+        ))
+        .and(body_partial_json(json!({
+            "changes": [
+                {"principal": "engineers", "add": ["SELECT"]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let grant = Grant {
+        principal: "engineers".into(),
+        privilege: "SELECT".into(),
+    };
+    // Note: routing through the CatalogClient trait, not GovernanceCatalogClient.
+    let client: &dyn CatalogClient = &test_client(&server);
+    client
+        .apply_grant(&sample_table_ref(), &grant)
+        .await
+        .expect("singular apply_grant unchanged by the new governance trait");
 }
 
 // ---------------------------------------------------------------------------

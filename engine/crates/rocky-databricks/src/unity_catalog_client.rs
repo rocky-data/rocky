@@ -109,9 +109,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use std::collections::BTreeMap;
+
 use rocky_catalog_core::{
-    BranchRef, CatalogClient, CatalogError, CatalogResult, ColumnSchema, Grant, TableCommit,
-    TableRef, TableSchema, TableStats,
+    BranchRef, CatalogClient, CatalogError, CatalogResult, ColumnSchema, GovernanceCatalogClient,
+    Grant, Securable, TableCommit, TableRef, TableSchema, TableStats,
 };
 
 use crate::auth::{Auth, AuthError};
@@ -856,6 +858,176 @@ impl UnityCatalogClient {
 }
 
 // ---------------------------------------------------------------------------
+// GovernanceCatalogClient impl
+// ---------------------------------------------------------------------------
+
+/// Unity REST securable-type slug used in the `permissions/{slug}/{fqn}` path.
+fn securable_path_slug(securable: &Securable) -> &'static str {
+    match securable {
+        Securable::Catalog { .. } => "catalog",
+        Securable::Schema { .. } => "schema",
+        Securable::Table { .. } => "table",
+    }
+}
+
+/// Build the URL-path-safe Unity `full_name` for a securable.
+///
+/// - `Catalog` -> `{catalog}`
+/// - `Schema`  -> `{catalog}.{schema}`
+/// - `Table`   -> `{catalog}.{schema}.{table}`
+///
+/// Each part is percent-encoded individually before being joined with a
+/// literal `.` — same convention as [`build_full_name`] for the table case,
+/// so a name with embedded dots cannot forge an extra path segment.
+fn securable_full_name(securable: &Securable) -> String {
+    match securable {
+        Securable::Catalog { name } => encode_part(name),
+        Securable::Schema { catalog, name } => {
+            format!("{}.{}", encode_part(catalog), encode_part(name))
+        }
+        Securable::Table {
+            catalog,
+            schema,
+            name,
+        } => build_full_name(catalog, schema, name),
+    }
+}
+
+/// Coalesce a flat `Vec<Grant>` into the `Vec<PermissionChange>` shape
+/// Unity's PATCH endpoint expects.
+///
+/// Grants targeting the same `principal` collapse into a single
+/// [`PermissionChange`] whose `add` (or `remove`, when `adding == false`)
+/// list carries every privilege for that principal. The grouping is
+/// stable (`BTreeMap` preserves principal ordering) so test assertions
+/// can match on the rendered body deterministically.
+///
+/// This is the multi-change batching win — collapsing N single-change
+/// PATCH calls into one PATCH carrying every change in a single round-
+/// trip per `Securable`.
+fn group_grants_into_changes(grants: &[Grant], adding: bool) -> Vec<PermissionChange> {
+    let mut by_principal: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for grant in grants {
+        by_principal
+            .entry(grant.principal.clone())
+            .or_default()
+            .push(grant.privilege.clone());
+    }
+    by_principal
+        .into_iter()
+        .map(|(principal, privileges)| PermissionChange {
+            principal,
+            add: if adding {
+                privileges.clone()
+            } else {
+                Vec::new()
+            },
+            remove: if adding { Vec::new() } else { privileges },
+        })
+        .collect()
+}
+
+#[async_trait]
+impl GovernanceCatalogClient for UnityCatalogClient {
+    /// PATCH `/api/2.1/unity-catalog/permissions/{type}/{fqn}` with **one**
+    /// multi-change body grouping every grant by principal.
+    ///
+    /// Where the table-only [`CatalogClient::apply_grant`] wraps a single
+    /// `(principal, privilege)` pair in a one-entry `changes[]` array, this
+    /// method coalesces an N-grant slice into one PATCH per `Securable`. A
+    /// no-op call (empty `grants`) short-circuits before any HTTP traffic.
+    async fn apply_grants(&self, securable: &Securable, grants: &[Grant]) -> CatalogResult<()> {
+        if grants.is_empty() {
+            return Ok(());
+        }
+        self.patch_permissions_multi(securable, grants, /*adding=*/ true)
+            .await
+    }
+
+    /// Mirror of [`Self::apply_grants`] that lands the privilege list in
+    /// `remove[]` rather than `add[]`.
+    async fn revoke_grants(&self, securable: &Securable, grants: &[Grant]) -> CatalogResult<()> {
+        if grants.is_empty() {
+            return Ok(());
+        }
+        self.patch_permissions_multi(securable, grants, /*adding=*/ false)
+            .await
+    }
+
+    /// GET `/api/2.1/unity-catalog/permissions/{type}/{fqn}` and flatten
+    /// the per-principal assignment shape into `Vec<Grant>`.
+    async fn list_grants(&self, securable: &Securable) -> CatalogResult<Vec<Grant>> {
+        let slug = securable_path_slug(securable);
+        let full = securable_full_name(securable);
+        let url = format!(
+            "{}/api/2.1/unity-catalog/permissions/{}/{}",
+            self.api_base_url(),
+            slug,
+            full
+        );
+        let resp = self
+            .send(self.client.get(&url))
+            .await
+            .map_err(unity_into_catalog)?;
+        let body: PermissionsResponse = resp
+            .json()
+            .await
+            .map_err(|e| CatalogError::InvalidResponse(format!("list_grants body: {e}")))?;
+        let mut out = Vec::new();
+        for assignment in body.privilege_assignments {
+            for privilege in assignment.privileges {
+                out.push(Grant {
+                    principal: assignment.principal.clone(),
+                    privilege,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl UnityCatalogClient {
+    /// PATCH `/api/2.1/unity-catalog/permissions/{type}/{fqn}` with a
+    /// multi-change body coalescing every grant by principal.
+    ///
+    /// Shared between [`GovernanceCatalogClient::apply_grants`] (privilege
+    /// list in `add`) and [`GovernanceCatalogClient::revoke_grants`]
+    /// (privilege list in `remove`). One round-trip per `Securable`,
+    /// regardless of how many `(principal, privilege)` pairs the caller
+    /// passed — the multi-change batching win.
+    async fn patch_permissions_multi(
+        &self,
+        securable: &Securable,
+        grants: &[Grant],
+        adding: bool,
+    ) -> CatalogResult<()> {
+        let slug = securable_path_slug(securable);
+        let full = securable_full_name(securable);
+        let url = format!(
+            "{}/api/2.1/unity-catalog/permissions/{}/{}",
+            self.api_base_url(),
+            slug,
+            full
+        );
+        let changes = group_grants_into_changes(grants, adding);
+        let principal_count = changes.len();
+        let body = UpdatePermissionsBody { changes };
+        self.send(self.client.patch(&url).json(&body))
+            .await
+            .map_err(unity_into_catalog)?;
+        debug!(
+            securable_type = slug,
+            securable = %securable.display_name(),
+            grant_count = grants.len(),
+            principal_count,
+            action = if adding { "grant" } else { "revoke" },
+            "Unity multi-change permission PATCH applied"
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1297,6 +1469,143 @@ mod tests {
         assert!(matches!(err, CatalogError::InvalidResponse(_)));
     }
 
+    // ---- governance multi-change batching helpers ----
+
+    #[test]
+    fn securable_path_slug_matches_unity_endpoints() {
+        assert_eq!(
+            securable_path_slug(&Securable::Catalog { name: "c".into() }),
+            "catalog"
+        );
+        assert_eq!(
+            securable_path_slug(&Securable::Schema {
+                catalog: "c".into(),
+                name: "s".into(),
+            }),
+            "schema"
+        );
+        assert_eq!(
+            securable_path_slug(&Securable::Table {
+                catalog: "c".into(),
+                schema: "s".into(),
+                name: "t".into(),
+            }),
+            "table"
+        );
+    }
+
+    #[test]
+    fn securable_full_name_renders_three_levels() {
+        assert_eq!(
+            securable_full_name(&Securable::Catalog {
+                name: "hcv2_cat".into()
+            }),
+            "hcv2_cat"
+        );
+        assert_eq!(
+            securable_full_name(&Securable::Schema {
+                catalog: "hcv2_cat".into(),
+                name: "hcv2_sch".into(),
+            }),
+            "hcv2_cat.hcv2_sch"
+        );
+        assert_eq!(
+            securable_full_name(&Securable::Table {
+                catalog: "hcv2_cat".into(),
+                schema: "hcv2_sch".into(),
+                name: "hcv2_orders".into(),
+            }),
+            "hcv2_cat.hcv2_sch.hcv2_orders"
+        );
+    }
+
+    #[test]
+    fn securable_full_name_percent_encodes_dots() {
+        // A literal `.` inside an identifier must be percent-encoded so
+        // it can't forge an extra path segment. The `.` between parts is
+        // the only one left bare.
+        let s = Securable::Schema {
+            catalog: "weird.name".into(),
+            name: "sch".into(),
+        };
+        assert_eq!(securable_full_name(&s), "weird%2Ename.sch");
+    }
+
+    #[test]
+    fn group_grants_collapses_by_principal_into_one_change_each() {
+        // Three grants across two principals — must collapse to two
+        // PermissionChange entries, principals sorted (BTreeMap order).
+        // This is the assertion that prevents an impl from looping
+        // one-grant-per-call: the change set is N principals, not N
+        // grants.
+        let grants = vec![
+            Grant {
+                principal: "alice".into(),
+                privilege: "SELECT".into(),
+            },
+            Grant {
+                principal: "alice".into(),
+                privilege: "MODIFY".into(),
+            },
+            Grant {
+                principal: "bob".into(),
+                privilege: "SELECT".into(),
+            },
+        ];
+        let changes = group_grants_into_changes(&grants, /*adding=*/ true);
+        assert_eq!(changes.len(), 2, "two distinct principals -> two changes");
+        assert_eq!(changes[0].principal, "alice");
+        assert_eq!(changes[0].add, vec!["SELECT", "MODIFY"]);
+        assert!(changes[0].remove.is_empty());
+        assert_eq!(changes[1].principal, "bob");
+        assert_eq!(changes[1].add, vec!["SELECT"]);
+    }
+
+    #[test]
+    fn group_grants_revoke_shape_lands_in_remove_slot() {
+        let grants = vec![Grant {
+            principal: "alice".into(),
+            privilege: "SELECT".into(),
+        }];
+        let changes = group_grants_into_changes(&grants, /*adding=*/ false);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].add.is_empty());
+        assert_eq!(changes[0].remove, vec!["SELECT"]);
+    }
+
+    #[test]
+    fn group_grants_empty_input_yields_no_changes() {
+        let changes = group_grants_into_changes(&[], true);
+        assert!(changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn governance_apply_grants_with_empty_slice_is_noop() {
+        // Empty input must short-circuit before any HTTP traffic — the
+        // offline client has no base-url override but the call returns
+        // Ok without ever touching the network.
+        let client = make_offline_client();
+        client
+            .apply_grants(
+                &Securable::Catalog {
+                    name: "hcv2_cat".into(),
+                },
+                &[],
+            )
+            .await
+            .expect("empty apply_grants is a noop");
+        client
+            .revoke_grants(
+                &Securable::Schema {
+                    catalog: "hcv2_cat".into(),
+                    name: "hcv2_sch".into(),
+                },
+                &[],
+            )
+            .await
+            .expect("empty revoke_grants is a noop");
+    }
+
     // ---- debug redaction ----
 
     #[test]
@@ -1428,6 +1737,35 @@ mod live_tests {
             matches!(err, CatalogError::UnsupportedOperation(_)),
             "expected UnsupportedOperation, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ROCKY_TEST_DATABRICKS_* env vars; run with --ignored"]
+    async fn live_governance_list_grants_at_schema_returns_ok() {
+        // Read-only smoke test for the new `GovernanceCatalogClient` impl:
+        // listing grants on the sandbox schema must round-trip cleanly
+        // (the schema may have zero principals assigned — we don't assert
+        // a count, only that the call returns `Ok`). No PATCH is
+        // exercised here to avoid mutating sandbox state without an
+        // explicit cleanup; the multi-change PATCH receipt is covered by
+        // the wiremock test in `tests/unity_catalog_client_wiremock.rs`.
+        let Some((host, token, catalog, schema)) = read_env() else {
+            eprintln!("skipping: ROCKY_TEST_DATABRICKS_* not set");
+            return;
+        };
+        let client = live_client(host, token);
+        let securable = Securable::Schema {
+            catalog,
+            name: schema,
+        };
+        let grants = client
+            .list_grants(&securable)
+            .await
+            .expect("list_grants against live Unity Catalog");
+        for g in grants.iter().take(5) {
+            assert!(!g.principal.is_empty());
+            assert!(!g.privilege.is_empty());
+        }
     }
 
     #[tokio::test]
