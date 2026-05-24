@@ -12,6 +12,10 @@
 //! - `SAMPLE` instead of `TABLESAMPLE`
 //! - `NUMBER(p,s)` instead of `DECIMAL(p,s)` (aliases)
 //! - TAG objects for metadata (different from Databricks ALTER SET TAGS)
+//!
+//! Note: `WarehouseAdapter::fetch_arrow_batch` is intentionally left at the default
+//! "not supported" `Err` — Snowflake's public SQL REST API is JSON-only (Arrow lives
+//! only in the native driver protocol). See the [`adapter`] module docs for details.
 
 pub mod adapter;
 pub mod auth;
