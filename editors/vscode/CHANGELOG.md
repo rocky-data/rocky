@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.27.0] — 2026-05-24
+
+Codegen-companion release to engine `v1.43.0`. The regenerated TypeScript bindings under `src/types/generated/` and the `rocky-project` JSON schema surfaced via `jsonValidation` pick up the engine's new config and output surface. No new commands, settings, or LSP features.
+
+### Changed
+
+- **`src/types/generated/{compile,dag,rocky_project}.ts`** + **`schemas/rocky-project.schema.json`** pick up the `[freshness]` config block (project default + per-model `expected_lag_seconds`) and the W005 freshness-coverage diagnostic now present in compile/dag output — visible on hover when editing `rocky.toml` and model sidecars.
+- **`src/types/generated/adapter_config.ts`** picks up the new `[adapter.<name>.extra]` escape-hatch field.
+- **`src/types/generated/run.ts`** picks up the warehouse-side `cooldown_seconds` field on `TableErrorOutput`.
+
 ## [1.26.0] — 2026-05-21
 
 Codegen-companion release to engine `v1.42.0`. The regenerated TypeScript bindings under `src/types/generated/` pick up the engine's new optional `FailedSourceOutput.cooldown_seconds` field from PR [#624](https://github.com/rocky-data/rocky/pull/624) (Fivetran 429 self-healing). The `rocky-project` JSON schema surfaced via `jsonValidation` also picks up the improved `max_retries` doc-comment recommending `≤ 4` when the Fivetran shared circuit breaker is enabled — visible on hover in `rocky.toml` editing. No new commands, settings, or LSP features.
