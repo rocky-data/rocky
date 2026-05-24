@@ -21,6 +21,7 @@
 //! - This module sanitizes inputs automatically via [`sanitize_label`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -74,7 +75,11 @@ pub fn generate_schema_labels_sql(
     dataset: &str,
     labels: &BTreeMap<String, String>,
 ) -> AdapterResult<String> {
-    validation::validate_identifier(project).map_err(AdapterError::new)?;
+    // GCP project IDs allow hyphens (`my-project-123`), so the
+    // catalog/project component uses the GCP-aware validator. Dataset
+    // names stay on the stricter `[a-zA-Z0-9_]+` rule. Mirrors the
+    // pattern in `BigQueryDialect::format_table_ref`.
+    validation::validate_gcp_project_id(project).map_err(AdapterError::new)?;
     validation::validate_identifier(dataset).map_err(AdapterError::new)?;
 
     let label_pairs: Vec<String> = labels
@@ -99,7 +104,7 @@ pub fn generate_table_labels_sql(
     table: &str,
     labels: &BTreeMap<String, String>,
 ) -> AdapterResult<String> {
-    validation::validate_identifier(project).map_err(AdapterError::new)?;
+    validation::validate_gcp_project_id(project).map_err(AdapterError::new)?;
     validation::validate_identifier(dataset).map_err(AdapterError::new)?;
     validation::validate_identifier(table).map_err(AdapterError::new)?;
 
@@ -122,19 +127,23 @@ pub fn generate_table_labels_sql(
 ///
 /// Implements [`GovernanceAdapter`] with labels for tagging and no-op stubs
 /// for IAM-based grant operations and workspace isolation (not applicable).
-pub struct BigQueryGovernanceAdapter<'a> {
-    adapter: &'a BigQueryAdapter,
+///
+/// Owns the warehouse adapter via [`Arc`] so the registry can return
+/// `Box<dyn GovernanceAdapter>` without lifetime threading, mirroring
+/// the [`super::batch::BigQueryBatchCheckAdapter`] pattern.
+pub struct BigQueryGovernanceAdapter {
+    adapter: Arc<BigQueryAdapter>,
 }
 
-impl<'a> BigQueryGovernanceAdapter<'a> {
+impl BigQueryGovernanceAdapter {
     /// Create a new BigQuery governance adapter wrapping the warehouse adapter.
-    pub fn new(adapter: &'a BigQueryAdapter) -> Self {
+    pub fn new(adapter: Arc<BigQueryAdapter>) -> Self {
         Self { adapter }
     }
 }
 
 #[async_trait]
-impl GovernanceAdapter for BigQueryGovernanceAdapter<'_> {
+impl GovernanceAdapter for BigQueryGovernanceAdapter {
     async fn set_tags(
         &self,
         target: &TagTarget,
@@ -288,10 +297,12 @@ mod tests {
         let mut labels = BTreeMap::new();
         labels.insert("managed_by".to_string(), "rocky".to_string());
 
-        let sql = generate_schema_labels_sql("my_project", "my_dataset", &labels).unwrap();
+        // GCP project IDs use hyphens, not underscores; updated to match
+        // the GCP-aware validator that the SQL generator now applies.
+        let sql = generate_schema_labels_sql("my-project", "my_dataset", &labels).unwrap();
         assert_eq!(
             sql,
-            "ALTER SCHEMA `my_project`.`my_dataset` SET OPTIONS(labels=[(\"managed_by\", \"rocky\")])"
+            "ALTER SCHEMA `my-project`.`my_dataset` SET OPTIONS(labels=[(\"managed_by\", \"rocky\")])"
         );
     }
 
@@ -353,5 +364,24 @@ mod tests {
         let labels = BTreeMap::new();
         let result = generate_table_labels_sql("project", "dataset", "bad table!", &labels);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_labels_accepts_hyphenated_project_id() {
+        // GCP project IDs allow hyphens; the strict identifier validator
+        // would reject this. Live-verified against the sandbox project
+        // `rocky-sandbox-hc-test-63874`.
+        let mut labels = BTreeMap::new();
+        labels.insert("env".to_string(), "test".to_string());
+        let sql = generate_schema_labels_sql("my-project-123", "dataset", &labels).unwrap();
+        assert!(sql.contains("`my-project-123`.`dataset`"));
+    }
+
+    #[test]
+    fn table_labels_accepts_hyphenated_project_id() {
+        let mut labels = BTreeMap::new();
+        labels.insert("env".to_string(), "test".to_string());
+        let sql = generate_table_labels_sql("my-project-123", "dataset", "tbl", &labels).unwrap();
+        assert!(sql.contains("`my-project-123`.`dataset`.`tbl`"));
     }
 }

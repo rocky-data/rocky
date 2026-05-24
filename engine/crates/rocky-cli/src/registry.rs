@@ -45,6 +45,7 @@ use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
 use rocky_bigquery::batch::BigQueryBatchCheckAdapter;
 use rocky_bigquery::connector::BigQueryAdapter;
+use rocky_bigquery::governance::BigQueryGovernanceAdapter;
 
 use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 
@@ -594,7 +595,12 @@ impl AdapterRegistry {
     ///   binding, retention probe + apply).
     /// - **Snowflake:** returns [`SnowflakeGovernanceAdapter`] (tags,
     ///   grants, retention probe + apply).
-    /// - **DuckDB / BigQuery / others:** returns [`NoopGovernanceAdapter`];
+    /// - **BigQuery:** returns [`BigQueryGovernanceAdapter`]; `set_tags`
+    ///   maps to `ALTER SCHEMA ... SET OPTIONS(labels=[...])` for
+    ///   schema and table targets, project-level labels need the
+    ///   Resource Manager API and stay no-op. Grant operations stay
+    ///   no-op pending IAM integration.
+    /// - **DuckDB / others:** returns [`NoopGovernanceAdapter`];
     ///   governance operations silently succeed rather than aborting the
     ///   run, and `read_retention_days` falls through to the trait default
     ///   (`Ok(None)`) so `retention-status --drift` degrades to "no
@@ -621,6 +627,9 @@ impl AdapterRegistry {
         }
         if let Some(sf_connector) = self.snowflake_connectors.get(name).cloned() {
             return Box::new(SnowflakeGovernanceAdapter::new(sf_connector));
+        }
+        if let Some(adapter) = self.bigquery_adapters.get(name).cloned() {
+            return Box::new(BigQueryGovernanceAdapter::new(adapter));
         }
         Box::new(NoopGovernanceAdapter)
     }
