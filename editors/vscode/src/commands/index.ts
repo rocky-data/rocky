@@ -17,6 +17,7 @@ import {
 import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
 import { registerLineageSerializer, showLineage } from "./lineage";
+import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
 import { previewCost, previewCreate, previewDiff } from "./preview";
@@ -42,6 +43,7 @@ export function registerCommands(context: vscode.ExtensionContext): void {
 
     // Language intelligence
     vscode.commands.registerCommand("rocky.showLineage", showLineage),
+    vscode.commands.registerCommand("rocky.lineageDiff", lineageDiff),
 
     // Compile / validate / CI
     vscode.commands.registerCommand("rocky.compile", compile),

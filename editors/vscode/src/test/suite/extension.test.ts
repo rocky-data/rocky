@@ -83,6 +83,14 @@ suite("Rocky Extension", () => {
     );
   });
 
+  test("rocky.lineageDiff command is registered", async () => {
+    const commands = await vscode.commands.getCommands(true);
+    assert.ok(
+      commands.includes("rocky.lineageDiff"),
+      "rocky.lineageDiff command should be registered",
+    );
+  });
+
   test("rocky.doctor command exists", async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(

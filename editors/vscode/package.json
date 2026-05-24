@@ -314,6 +314,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "rocky.lineageDiff",
+        "title": "Lineage Diff vs Base",
+        "category": "Rocky",
+        "icon": "$(git-compare)"
+      },
+      {
         "command": "rocky.previewCreate",
         "title": "Rocky: Preview Create (PR diff)",
         "category": "Rocky"
@@ -777,6 +783,11 @@
           "command": "rocky.trace",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
           "group": "rocky@8"
+        },
+        {
+          "command": "rocky.lineageDiff",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@9"
         }
       ]
     },
