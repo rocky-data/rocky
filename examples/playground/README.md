@@ -91,9 +91,9 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [11-strategy-showcase](pocs/02-performance/11-strategy-showcase) | Three strategies side-by-side on one source: `full_refresh` + `incremental` + `merge`, with a cheat-sheet README |
 | [12-replication-table-overrides](pocs/02-performance/12-replication-table-overrides) | `[[table_overrides]]` — per-table `strategy`/`merge_keys`/`timestamp_column`/`enabled` overrides with glob matching and most-specific-match-wins resolution |
 
-### 03 — AI (5 POCs · `ANTHROPIC_API_KEY` required)
+### 03 — AI (6 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06)
 
-AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation.
+AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation, and MCP data-grounding.
 
 | POC | Feature |
 |---|---|
@@ -102,6 +102,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [03-ai-sync-schema-evolution](pocs/03-ai/03-ai-sync-schema-evolution) | `rocky ai-sync` proposes downstream updates after upstream schema changes |
 | [04-ai-test-generation](pocs/03-ai/04-ai-test-generation) | `rocky ai-test --all --save` generates SQL assertions from intent + schema |
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
+| [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 
 ### 04 — Governance (7 POCs · Databricks / DuckDB)
 

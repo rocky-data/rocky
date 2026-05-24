@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rocky": {
+      "command": "rocky",
+      "args": ["mcp", "--config", "rocky.toml"]
+    }
+  }
+}
