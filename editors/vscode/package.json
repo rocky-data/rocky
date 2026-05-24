@@ -308,6 +308,12 @@
         "icon": "$(list-tree)"
       },
       {
+        "command": "rocky.trace",
+        "title": "Trace Latest Run",
+        "category": "Rocky",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "rocky.previewCreate",
         "title": "Rocky: Preview Create (PR diff)",
         "category": "Rocky"
@@ -766,6 +772,11 @@
           "command": "rocky.dag",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
           "group": "rocky@7"
+        },
+        {
+          "command": "rocky.trace",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@8"
         }
       ]
     },

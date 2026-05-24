@@ -23,6 +23,7 @@ import { previewCost, previewCreate, previewDiff } from "./preview";
 import { previewCte, previewModel } from "./previewRows";
 import { compare, discover, plan, run } from "./run";
 import { archive, compact, profileStorage } from "./storage";
+import { trace } from "./trace";
 import { test } from "./test";
 
 /**
@@ -90,6 +91,9 @@ export function registerCommands(context: vscode.ExtensionContext): void {
 
     // Execution plan (topological run schedule)
     vscode.commands.registerCommand("rocky.dag", showDag),
+
+    // Run trace (timeline of the latest run)
+    vscode.commands.registerCommand("rocky.trace", trace),
 
     // Preview (PR-bundle)
     vscode.commands.registerCommand("rocky.previewCreate", previewCreate),
