@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, conint
 
@@ -1342,6 +1343,22 @@ class AdapterConfig(BaseModel):
     Default database for the session.
     """
     destination_id: str | None = None
+    extra: dict[str, Any] | None = None
+    """
+    Escape hatch for adapter-specific keys this struct doesn't model.
+
+    `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.
+
+    Authors of such adapters declare the keys under a nested `[extra]` table:
+
+    ```toml [adapter.my_trino] type = "trino" host = "https://trino.example.com" token = "${TRINO_JWT}"
+
+    [adapter.my_trino.extra] default_schema = "analytics" x_trino_user = "service-account" ```
+
+    Top-level typos still error (`tooken = "..."` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.get("...")` and validate them themselves — Rocky doesn't schema-check the contents.
+
+    Values are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.
+    """
     host: str | None = None
     http_path: str | None = None
     kind: AdapterKind3 | AdapterKind4 | None = None
