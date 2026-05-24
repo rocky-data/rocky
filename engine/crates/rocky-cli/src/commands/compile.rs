@@ -37,6 +37,51 @@ pub fn run_compile(
     with_seed: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
+    let (output, text_data) = compile_inner(
+        config_path,
+        state_path,
+        models_dir,
+        contracts_dir,
+        model_filter,
+        do_expand_macros,
+        target_dialect,
+        with_seed,
+        cache_ttl_override,
+    )?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_compile_text(&output, &text_data);
+    }
+
+    if output.has_errors {
+        anyhow::bail!("compilation failed with errors");
+    }
+
+    Ok(())
+}
+
+/// Compile body shared by the JSON core ([`compile_output`]) and the text
+/// renderer in [`run_compile`]. Returns the typed [`CompileOutput`] plus the
+/// extra raw data the text path needs ([`CompileTextData`]).
+///
+/// Does no stdout printing and does not bail on compilation errors.
+///
+/// `cache_ttl_override`: optional CLI `--cache-ttl <seconds>` value that
+/// replaces `[cache.schemas] ttl_seconds` for this invocation only.
+#[allow(clippy::too_many_arguments)]
+fn compile_inner(
+    config_path: Option<&Path>,
+    state_path: &Path,
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    with_seed: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<(CompileOutput, CompileTextData)> {
     // `source_schemas` precedence:
     //   1. `--with-seed` wins -> seed loader (explicit user intent,
     //      used for tests/playgrounds where the cache is irrelevant).
@@ -205,128 +250,191 @@ pub fn run_compile(
         result.diagnostics.clone()
     };
 
-    if output_json {
-        let models_detail: Vec<ModelDetail> = result
-            .project
-            .models
-            .iter()
-            .map(|model| {
-                let typed_cols = result
-                    .type_check
-                    .typed_models
-                    .get(&model.config.name)
-                    .map(std::vec::Vec::as_slice)
-                    .unwrap_or_default();
-                let incrementality_hint = incrementality::infer_incrementality(
-                    &model.config.name,
-                    typed_cols,
-                    &model.sql,
-                    &model.config.strategy,
-                );
-                let cost_hint = cost_estimates.get(&model.config.name).map(|est| CostHint {
-                    estimated_rows: est.estimated_rows,
-                    estimated_bytes: est.estimated_bytes,
-                    estimated_cost_usd: est.estimated_compute_cost_usd,
-                    confidence: match est.confidence {
-                        rocky_core::cost::Confidence::High => "high".to_string(),
-                        rocky_core::cost::Confidence::Medium => "medium".to_string(),
-                        rocky_core::cost::Confidence::Low => "low".to_string(),
-                    },
-                });
-                ModelDetail {
-                    name: model.config.name.clone(),
-                    strategy: model.config.strategy.clone(),
-                    target: model.config.target.clone(),
-                    freshness: model.config.freshness.clone(),
-                    contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
-                    incrementality_hint,
-                    cost_hint,
-                    depends_on: model.config.depends_on.clone(),
-                }
-            })
-            .collect();
-        let output = CompileOutput::new(
-            result.project.model_count(),
-            result.project.layers.len(),
-            diagnostics.clone(),
-            result.has_errors,
-            result.timings.clone(),
-        )
-        .with_models_detail(models_detail)
-        .with_expanded_sql(expanded_sql);
-        print_json(&output)?;
-    } else {
-        let error_count = diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count();
-        let warning_count = diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Warning)
-            .count();
-
-        // Print model status
-        for model_name in &result.project.execution_order {
-            let model_diags: Vec<_> = diagnostics
-                .iter()
-                .filter(|d| d.model == *model_name)
-                .collect();
-            let has_model_errors = model_diags.iter().any(|d| d.severity == Severity::Error);
-
-            if has_model_errors {
-                println!("  \u{2717} {model_name}");
-            } else {
-                let col_count = result
-                    .type_check
-                    .typed_models
-                    .get(model_name)
-                    .map(std::vec::Vec::len)
-                    .unwrap_or(0);
-                println!("  \u{2713} {model_name} ({col_count} columns)");
+    let models_detail: Vec<ModelDetail> = result
+        .project
+        .models
+        .iter()
+        .map(|model| {
+            let typed_cols = result
+                .type_check
+                .typed_models
+                .get(&model.config.name)
+                .map(std::vec::Vec::as_slice)
+                .unwrap_or_default();
+            let incrementality_hint = incrementality::infer_incrementality(
+                &model.config.name,
+                typed_cols,
+                &model.sql,
+                &model.config.strategy,
+            );
+            let cost_hint = cost_estimates.get(&model.config.name).map(|est| CostHint {
+                estimated_rows: est.estimated_rows,
+                estimated_bytes: est.estimated_bytes,
+                estimated_cost_usd: est.estimated_compute_cost_usd,
+                confidence: match est.confidence {
+                    rocky_core::cost::Confidence::High => "high".to_string(),
+                    rocky_core::cost::Confidence::Medium => "medium".to_string(),
+                    rocky_core::cost::Confidence::Low => "low".to_string(),
+                },
+            });
+            ModelDetail {
+                name: model.config.name.clone(),
+                strategy: model.config.strategy.clone(),
+                target: model.config.target.clone(),
+                freshness: model.config.freshness.clone(),
+                contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
+                incrementality_hint,
+                cost_hint,
+                depends_on: model.config.depends_on.clone(),
             }
-        }
+        })
+        .collect();
 
-        // Print expanded SQL when --expand-macros is set (text mode).
-        if !expanded_sql.is_empty() {
-            println!();
-            for model_name in &result.project.execution_order {
-                if let Some(sql) = expanded_sql.get(model_name) {
-                    println!("  -- {model_name} (expanded)");
-                    for line in sql.lines() {
-                        println!("  {line}");
-                    }
-                    println!();
-                }
-            }
-        }
-
-        // Build a source map from model files so miette can render source spans.
-        let source_map: HashMap<String, String> = result
+    // Data the text renderer needs from the raw `CompileResult` but which is
+    // not carried on `CompileOutput`: execution order, per-model typed-column
+    // counts, and the file_path -> SQL source map (for miette spans).
+    let text_data = CompileTextData {
+        execution_order: result.project.execution_order.clone(),
+        typed_column_counts: result
+            .type_check
+            .typed_models
+            .iter()
+            .map(|(name, cols)| (name.clone(), cols.len()))
+            .collect(),
+        source_map: result
             .project
             .models
             .iter()
             .map(|m| (m.file_path.clone(), m.sql.clone()))
+            .collect(),
+    };
+
+    let output = CompileOutput::new(
+        result.project.model_count(),
+        result.project.layers.len(),
+        diagnostics,
+        result.has_errors,
+        result.timings.clone(),
+    )
+    .with_models_detail(models_detail)
+    .with_expanded_sql(expanded_sql);
+
+    Ok((output, text_data))
+}
+
+/// Extra data the `rocky compile` text renderer needs from the raw
+/// `CompileResult` but which is intentionally not carried on the
+/// `JsonSchema`-backed [`CompileOutput`].
+///
+/// Internal-only — never serialized — so it can change freely without
+/// touching the JSON schema cascade.
+struct CompileTextData {
+    /// Model names in execution (topological) order.
+    execution_order: Vec<String>,
+    /// Per-model count of resolved typed columns.
+    typed_column_counts: HashMap<String, usize>,
+    /// `file_path -> model SQL`, used so miette can render source spans.
+    source_map: HashMap<String, String>,
+}
+
+/// Side-effect-free core of `rocky compile`: compile the project, run the
+/// portability lint, expand macros, compute cost ceilings, and assemble the
+/// typed [`CompileOutput`].
+///
+/// Does no stdout printing and does not bail on compilation errors — the
+/// `has_errors` flag rides on the returned struct so an in-process caller can
+/// inspect the diagnostics. The `run_compile` wrapper prints and bails.
+///
+/// `cache_ttl_override`: optional CLI `--cache-ttl <seconds>` value that
+/// replaces `[cache.schemas] ttl_seconds` for this invocation only.
+// Reusable typed-output core for a future in-process caller (MCP server). No
+// internal call site yet — the `run_compile` wrapper uses `compile_inner`
+// directly so it can also render text mode.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn compile_output(
+    config_path: Option<&Path>,
+    state_path: &Path,
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    with_seed: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<CompileOutput> {
+    let (output, _text_data) = compile_inner(
+        config_path,
+        state_path,
+        models_dir,
+        contracts_dir,
+        model_filter,
+        do_expand_macros,
+        target_dialect,
+        with_seed,
+        cache_ttl_override,
+    )?;
+    Ok(output)
+}
+
+/// Render the text-mode output for `rocky compile`. Mirrors the historical
+/// inline `else` branch byte-for-byte.
+fn render_compile_text(output: &CompileOutput, text_data: &CompileTextData) {
+    let error_count = output
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warning_count = output
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+
+    // Print model status
+    for model_name in &text_data.execution_order {
+        let model_diags: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| d.model == *model_name)
             .collect();
+        let has_model_errors = model_diags.iter().any(|d| d.severity == Severity::Error);
 
-        // Render diagnostics with miette (rich source spans when available)
-        if !diagnostics.is_empty() {
-            let rendered = diagnostic::render_diagnostics(&diagnostics, &source_map);
-            print!("{rendered}");
+        if has_model_errors {
+            println!("  \u{2717} {model_name}");
+        } else {
+            let col_count = text_data
+                .typed_column_counts
+                .get(model_name)
+                .copied()
+                .unwrap_or(0);
+            println!("  \u{2713} {model_name} ({col_count} columns)");
         }
-
-        println!(
-            "  Compiled: {} models, {} errors, {} warnings",
-            result.project.model_count(),
-            error_count,
-            warning_count,
-        );
     }
 
-    if result.has_errors {
-        anyhow::bail!("compilation failed with errors");
+    // Print expanded SQL when --expand-macros is set (text mode).
+    if !output.expanded_sql.is_empty() {
+        println!();
+        for model_name in &text_data.execution_order {
+            if let Some(sql) = output.expanded_sql.get(model_name) {
+                println!("  -- {model_name} (expanded)");
+                for line in sql.lines() {
+                    println!("  {line}");
+                }
+                println!();
+            }
+        }
     }
 
-    Ok(())
+    // Render diagnostics with miette (rich source spans when available)
+    if !output.diagnostics.is_empty() {
+        let rendered = diagnostic::render_diagnostics(&output.diagnostics, &text_data.source_map);
+        print!("{rendered}");
+    }
+
+    println!(
+        "  Compiled: {} models, {} errors, {} warnings",
+        output.models, error_count, warning_count,
+    );
 }
 
 /// Build an error-severity P001 diagnostic from a portability issue.

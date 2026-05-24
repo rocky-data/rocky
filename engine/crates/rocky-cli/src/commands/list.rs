@@ -4,12 +4,20 @@ use anyhow::{Context, Result};
 
 use crate::output::*;
 
-/// Execute `rocky list pipelines`.
-pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
+/// Side-effect-free core of `rocky list pipelines`: load the config and
+/// assemble the typed [`ListPipelinesOutput`] without printing.
+// Reusable typed-output core for a future in-process caller. No internal call
+// site yet beyond `list_pipelines`' JSON branch.
+#[allow(dead_code)]
+pub(crate) fn list_pipelines_output(config_path: &Path) -> Result<ListPipelinesOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
+    Ok(ListPipelinesOutput::new(build_pipeline_entries(&cfg)))
+}
 
-    let entries: Vec<ListPipelineEntry> = cfg
-        .pipelines
+/// Build the pipeline-entry rows from a loaded config. Shared between the
+/// typed-output core and the text-rendering path.
+fn build_pipeline_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListPipelineEntry> {
+    cfg.pipelines
         .iter()
         .map(|(name, pc)| {
             let source_adapter = match pc {
@@ -27,7 +35,14 @@ pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
                 concurrency: pc.execution().concurrency.to_string(),
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Execute `rocky list pipelines`.
+pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)?;
+
+    let entries = build_pipeline_entries(&cfg);
 
     if json {
         print_json(&ListPipelinesOutput::new(entries))?;
@@ -58,19 +73,32 @@ pub fn list_pipelines(config_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Execute `rocky list adapters`.
-pub fn list_adapters(config_path: &Path, json: bool) -> Result<()> {
+/// Side-effect-free core of `rocky list adapters`: load the config and
+/// assemble the typed [`ListAdaptersOutput`] without printing.
+// Reusable typed-output core for a future in-process caller.
+#[allow(dead_code)]
+pub(crate) fn list_adapters_output(config_path: &Path) -> Result<ListAdaptersOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
+    Ok(ListAdaptersOutput::new(build_adapter_entries(&cfg)))
+}
 
-    let entries: Vec<ListAdapterEntry> = cfg
-        .adapters
+/// Build the adapter-entry rows from a loaded config.
+fn build_adapter_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListAdapterEntry> {
+    cfg.adapters
         .iter()
         .map(|(name, ac)| ListAdapterEntry {
             name: name.clone(),
             adapter_type: ac.adapter_type.clone(),
             host: ac.host.clone(),
         })
-        .collect();
+        .collect()
+}
+
+/// Execute `rocky list adapters`.
+pub fn list_adapters(config_path: &Path, json: bool) -> Result<()> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)?;
+
+    let entries = build_adapter_entries(&cfg);
 
     if json {
         print_json(&ListAdaptersOutput::new(entries))?;
@@ -92,12 +120,17 @@ pub fn list_adapters(config_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Execute `rocky list models`.
-///
-/// Loads models from the given directory and all immediate subdirectories
-/// (handles the common `models/{layer}/*.sql` layout). Each subdirectory
-/// is scanned independently so per-directory `_defaults.toml` files work.
-pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
+/// Side-effect-free core of `rocky list models`: load the models directory
+/// and assemble the typed [`ListModelsOutput`] without printing.
+// Reusable typed-output core for a future in-process caller.
+#[allow(dead_code)]
+pub(crate) fn list_models_output(models_dir: &Path) -> Result<ListModelsOutput> {
+    Ok(ListModelsOutput::new(build_model_entries(models_dir)?))
+}
+
+/// Build the model-entry rows by loading the models directory (with the
+/// one-level subdirectory scan).
+fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
     let models = load_all_models(models_dir)?;
 
     let entries: Vec<ListModelEntry> = models
@@ -130,6 +163,16 @@ pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
             }
         })
         .collect();
+    Ok(entries)
+}
+
+/// Execute `rocky list models`.
+///
+/// Loads models from the given directory and all immediate subdirectories
+/// (handles the common `models/{layer}/*.sql` layout). Each subdirectory
+/// is scanned independently so per-directory `_defaults.toml` files work.
+pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
+    let entries = build_model_entries(models_dir)?;
 
     if json {
         print_json(&ListModelsOutput::new(entries))?;
@@ -160,12 +203,18 @@ pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Execute `rocky list sources`.
-pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
+/// Side-effect-free core of `rocky list sources`: load the config and
+/// assemble the typed [`ListSourcesOutput`] without printing.
+// Reusable typed-output core for a future in-process caller.
+#[allow(dead_code)]
+pub(crate) fn list_sources_output(config_path: &Path) -> Result<ListSourcesOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
+    Ok(ListSourcesOutput::new(build_source_entries(&cfg)))
+}
 
-    let entries: Vec<ListSourceEntry> = cfg
-        .pipelines
+/// Build the source-entry rows from a loaded config (replication pipelines only).
+fn build_source_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListSourceEntry> {
+    cfg.pipelines
         .iter()
         .filter_map(|(name, pc)| {
             let repl = pc.as_replication()?;
@@ -180,7 +229,14 @@ pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
                 components: pattern.components.clone(),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Execute `rocky list sources`.
+pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)?;
+
+    let entries = build_source_entries(&cfg);
 
     if json {
         print_json(&ListSourcesOutput::new(entries))?;
