@@ -22,6 +22,7 @@ import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
 import { previewCost, previewCreate, previewDiff } from "./preview";
 import { previewCte, previewModel } from "./previewRows";
+import { reviewPlan } from "./review";
 import { compare, discover, plan, run } from "./run";
 import { archive, compact, profileStorage } from "./storage";
 import { trace } from "./trace";
@@ -109,6 +110,9 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     // Branch approval / promote — gated production writes from a branch
     vscode.commands.registerCommand("rocky.branchApprove", branchApprove),
     vscode.commands.registerCommand("rocky.branchPromote", branchPromote),
+
+    // Plan review/apply safety gate (breaking-change report + approve + apply)
+    vscode.commands.registerCommand("rocky.reviewPlan", reviewPlan),
 
     // Sidebar / Get Started utilities
     vscode.commands.registerCommand("rocky.openOutputChannel", openOutputChannel),

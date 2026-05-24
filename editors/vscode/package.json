@@ -345,6 +345,12 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.reviewPlan",
+        "title": "Review Plan (Breaking Changes + Apply)",
+        "category": "Rocky",
+        "icon": "$(verified)"
+      },
+      {
         "command": "rocky.refreshModels",
         "title": "Refresh Models",
         "category": "Rocky",
