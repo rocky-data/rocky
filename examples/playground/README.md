@@ -70,7 +70,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` with both passing and intentionally failing assertions |
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
-| [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Declarative per-model + project `[freshness]` SLA metadata surfacing in `rocky compile` output (`expected_lag_seconds` alias); W005 coverage diagnostic documented as the editor/LSP nudge |
+| [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
 
 ### 02 — Performance (12 POCs · DuckDB)
 

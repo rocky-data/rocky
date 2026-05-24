@@ -1,51 +1,53 @@
-# 07-freshness-sla — model-level freshness SLAs (declarative metadata + W005)
+# 07-freshness-sla — model-level freshness SLAs + the W005 coverage diagnostic
 
 > **Category:** 01-quality
 > **Credentials:** none (compile-time only — no warehouse)
 > **Runtime:** < 5s
-> **Rocky features:** `[freshness]` config block (per-model + project default), `expected_lag_seconds` alias, W005 freshness-coverage diagnostic (editor/LSP)
+> **Rocky features:** `[freshness]` config block (per-model + project default), `expected_lag_seconds` alias, **W005** freshness-coverage diagnostic
 
 ## What it shows
 
 A model can declare a freshness SLA — a TTL after which it's considered stale —
 via a per-model `[freshness]` sidecar block (`expected_lag_seconds`, optional
 `time_column`, optional `severity`), or project-wide via a top-level
-`[freshness]` block in `rocky.toml`. This is **declarative metadata**: Rocky
-parses it and carries it through `rocky compile`'s `models_detail[].freshness`,
-where downstream tooling (the `dagster-rocky` `FreshnessPolicy`, `rocky doctor`,
-a Dagster UI freshness badge) reads it without re-parsing `rocky.toml`.
+`[freshness]` block in `rocky.toml`. The compiler raises the soft-warn **W005**
+for any model that emits a temporal output column (DATE / TIMESTAMP) but has no
+freshness declaration in scope — neither a per-model block nor a project-level
+default. This POC has three models that exercise all three outcomes, then shows
+the project-level default silencing the warning globally.
 
-The companion **W005** coverage diagnostic nudges you toward declaring an SLA on
-any model that emits a temporal column but has none — see the W005 section below.
+`rocky compile --with-seed` loads `data/seed.sql` so the leaf models get
+concrete column types (W005 only fires on a column the compiler knows is
+temporal — without source types it would degrade to `Unknown` and stay silent).
 
 ## Why it's distinctive
 
-- **Freshness is structured, first-class config**, not a comment or an external
-  monitoring rule. It rides in the same compile output as schemas and lineage.
-- `expected_lag_seconds` is the public field name (matching dbt/SQLMesh), and it
-  deserializes to Rocky's canonical `max_lag_seconds` — so the declaration is
-  portable and existing sidecar fixtures keep working. The POC proves the alias:
-  the sidecar writes `expected_lag_seconds`, the compile output reports
-  `max_lag_seconds`.
-- This is distinct from the runtime freshness *check* under
-  `[pipeline.poc.checks.freshness]` (see [`02-inline-checks`](../02-inline-checks/)),
-  which executes against the warehouse during a run.
+- Freshness is a **first-class, type-aware compile-time concern**, not a
+  runtime-only check bolted on after the fact. W005 only fires on models that
+  actually emit a temporal column, so the nudge is targeted — no noise on pure
+  dimensions like `dim_customer`.
+- `expected_lag_seconds` matches the dbt/SQLMesh public field name while
+  aliasing Rocky's legacy `max_lag_seconds`, so the declaration is portable and
+  surrounding fixtures keep working.
+- This is the *coverage* diagnostic, distinct from the runtime freshness *check*
+  under `[pipeline.poc.checks.freshness]` (see [`02-inline-checks`](../02-inline-checks/)).
 
 ## Layout
 
 ```
 .
-├── README.md             this file
-├── rocky.toml            pipeline config with a project-wide [freshness] default
-├── run.sh                validate + compile, surfacing each model's SLA
-├── data/seed.sql         source tables (so --with-seed gives leaf models real types)
+├── README.md                    this file
+├── rocky.toml                   default config — NO project [freshness] default (so W005 fires in step 1)
+├── rocky-project-freshness.toml  same project + a project-wide [freshness] default (step 2)
+├── run.sh                       two-step compile demo
+├── data/seed.sql                source tables (so --with-seed gives leaf models real types)
 └── models/
-    ├── _defaults.toml    shared target catalog/schema
-    ├── stg_orders.sql    TIMESTAMP column, NO freshness block  -> W005 candidate
+    ├── _defaults.toml           shared target catalog/schema
+    ├── stg_orders.sql           TIMESTAMP column, NO freshness block  -> W005
     ├── stg_orders.toml
-    ├── stg_shipments.sql TIMESTAMP column + [freshness] SLA     -> covered
+    ├── stg_shipments.sql        TIMESTAMP column + [freshness] block   -> silent
     ├── stg_shipments.toml
-    ├── dim_customer.sql  no temporal column                     -> n/a
+    ├── dim_customer.sql         no temporal column                    -> silent
     └── dim_customer.toml
 ```
 
@@ -62,37 +64,37 @@ any model that emits a temporal column but has none — see the W005 section bel
 ## Expected output
 
 ```text
-=== 2. Each model's declared freshness SLA surfaces in compile output ===
-    (models_detail[].freshness — the structured metadata downstream tools read)
-    dim_customer   (no freshness SLA declared)
-    stg_orders     (no freshness SLA declared)
-    stg_shipments  SLA: expected_lag_seconds=  3600  time_column='shipped_at'  severity='warning'
+=== Step 1: compile against rocky.toml (NO project freshness default) ===
+    stg_orders emits a TIMESTAMP column with no [freshness] block -> expect W005
+    diagnostic codes raised:
+         1 "code": "W005"
+    W005 count: 1
+
+=== Step 2: compile with -c rocky-project-freshness.toml (project default set) ===
+    project [freshness] expected_lag_seconds -> W005 suppressed for every model
+    W005 count: 0
 ```
 
-## The W005 coverage diagnostic
+## What happened
 
-W005 fires for a model that has a temporal output column (DATE / TIMESTAMP) but
-no `[freshness]` declaration in scope — neither a per-model block nor a
-project-level default with an `expected_lag_seconds`. The message looks like:
+1. **Step 1** compiles against `rocky.toml`, which declares no project freshness
+   default. `stg_orders` emits an `order_ts TIMESTAMP` with no `[freshness]`
+   block, so W005 fires once with a suggestion to add one. (`rocky compile`
+   auto-loads `rocky.toml`; keeping the `[freshness]` block out of it is exactly
+   what lets W005 fire here.)
+2. `stg_shipments` emits `shipped_at TIMESTAMP` but its sidecar already carries a
+   `[freshness]` block, so it's silent — per-model coverage.
+3. `dim_customer` has no temporal output column, so W005 never applies — the
+   diagnostic is targeted, not blanket.
+4. **Step 2** points `rocky compile` at `rocky-project-freshness.toml`, whose
+   top-level `[freshness]` block declares `expected_lag_seconds`. That marks the
+   whole project freshness-covered and suppresses W005 for every model.
 
-```
-W005  model 'stg_orders' has temporal column(s) (order_ts) but no `freshness` block declared
-      help: add a `[freshness]` block to the model sidecar, e.g.
-            `[freshness] expected_lag_seconds = 3600, time_column = "order_ts"`
-```
-
-**Where it surfaces:** W005 is realised in the editor (the `rocky lsp` language
-server), where it also carries an AI code-action (`rocky.ai-freshness-fix.v1`)
-that proposes a `[freshness]` block on the model's sidecar. It fires wherever the
-compiler can resolve a model's output columns to concrete temporal types — i.e.
-when source schemas are known (the editor, or a compile backed by a warehouse
-schema cache). The credential-free standalone `rocky compile --models …` path in
-this POC types leaf-model outputs lazily, so it surfaces the *declared* SLAs
-(above) rather than the W005 nudge; the nudge is best seen in the VS Code
-extension. Suppress W005 by adding a per-model `[freshness]` block (like
-`stg_shipments`) or a project-level default (like this POC's `rocky.toml`).
+W005 also surfaces in the editor via `rocky lsp`, where it carries an AI
+code-action (`rocky.ai-freshness-fix.v1`) that proposes a `[freshness]` block on
+the model's sidecar.
 
 ## Related
 
 - Source: `rocky/crates/rocky-compiler/src/typecheck.rs` (`check_freshness_coverage`), `rocky/crates/rocky-core/src/config.rs` (`ProjectFreshnessConfig`), `rocky/crates/rocky-core/src/models.rs` (`ModelFreshnessConfig`), `rocky/crates/rocky-server/src/lsp.rs` (W005 + AI fix)
-- Companion: [`02-inline-checks`](../02-inline-checks/) for the runtime freshness *check* (vs. this declarative *SLA metadata* + coverage diagnostic)
+- Companion: [`02-inline-checks`](../02-inline-checks/) for the runtime freshness *check* (vs. this compile-time *coverage* diagnostic)

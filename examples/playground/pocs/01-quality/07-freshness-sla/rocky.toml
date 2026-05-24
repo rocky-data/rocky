@@ -1,4 +1,9 @@
-# 07-freshness-sla — project-wide freshness SLA + W005 coverage diagnostic
+# 07-freshness-sla — default config, with NO project-wide [freshness] default.
+#
+# `rocky compile` auto-loads this rocky.toml, so leaving the top-level
+# [freshness] block OUT is what lets W005 fire in step 1 (a model with a
+# temporal column but no freshness declaration in scope). The companion
+# `rocky-project-freshness.toml` adds the project default to show suppression.
 
 [adapter]
 type = "duckdb"
@@ -14,13 +19,3 @@ components = ["source"]
 [pipeline.poc.target]
 catalog_template = "poc"
 schema_template = "demo"
-
-# Project-wide freshness default. Declaring `expected_lag_seconds` here makes the
-# project "freshness-covered": W005 is suppressed for every model that doesn't
-# carry its own [freshness] block. Per-model blocks still win field-by-field.
-# (This is distinct from `[pipeline.poc.checks.freshness]`, the runtime
-# data-quality check — see 02-inline-checks.)
-[freshness]
-expected_lag_seconds = 86400
-time_column = "order_ts"
-severity = "warning"
