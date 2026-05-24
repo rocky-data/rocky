@@ -91,6 +91,14 @@ suite("Rocky Extension", () => {
     );
   });
 
+  test("rocky.reviewPlan command is registered", async () => {
+    const commands = await vscode.commands.getCommands(true);
+    assert.ok(
+      commands.includes("rocky.reviewPlan"),
+      "rocky.reviewPlan command should be registered",
+    );
+  });
+
   test("rocky.doctor command exists", async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(
