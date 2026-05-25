@@ -24,6 +24,7 @@ The extension is an LSP client. All language intelligence (diagnostics, completi
 src/
 ├── extension.ts          # activate/deactivate — wires LSP client + command registry
 ├── lspClient.ts          # LSP client lifecycle (start/stop/restart)
+├── mcpServer.ts          # Registers `rocky mcp` as an MCP server for agent mode (per rocky.toml root)
 ├── rockyCli.ts           # Subprocess helpers (execFile + progress wrappers)
 ├── config.ts             # Workspace + settings access
 ├── output.ts             # Shared output channel
