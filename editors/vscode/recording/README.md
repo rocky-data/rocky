@@ -23,6 +23,23 @@ loads the built `dist/extension.js` from `--extensionDevelopmentPath`, not `src/
 so without a rebuild it would record stale code. `rocky` must be on `$PATH` (the
 launched VS Code inherits it, so the LSP connects automatically).
 
+## E2E tests
+
+The same launch infrastructure backs Playwright **end-to-end tests** — for the
+things the in-process `@vscode/test-electron` suite can't reach, chiefly webview
+DOM. These reach into the out-of-process webview iframe and assert real
+behavior (DOM, not pixels).
+
+```bash
+npm run test:e2e        # editors/vscode/recording/, runs e2e/*.spec.mjs
+```
+
+`e2e/lineage.spec.mjs` opens the lineage webview, asserts the graph rendered,
+and verifies it re-fits when the viewport widens. Tests build the extension
+bundle first (global-setup) and launch without video. Keep this layer thin —
+reserve it for webview/UI behavior; unit (vitest) and in-process integration
+(`@vscode/test-electron`) cover the rest more cheaply.
+
 ## Requirements
 
 - `ffmpeg` and `gifski` (`brew install ffmpeg gifski`) — gifski is preferred.

@@ -5,9 +5,11 @@
   "description": "Automated demo-GIF recording for the Rocky VS Code extension (Playwright drives a real VS Code Electron instance).",
   "type": "module",
   "scripts": {
-    "record": "node record.mjs"
+    "record": "node record.mjs",
+    "test:e2e": "playwright test --config e2e/playwright.config.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@vscode/test-electron": "^2.5.2",
     "playwright": "^1.60.0"
   }

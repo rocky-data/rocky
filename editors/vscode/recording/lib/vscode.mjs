@@ -42,8 +42,9 @@ function shortUserDataDir() {
  * @param {{width:number,height:number}} o.size  recording + window size
  * @param {string} o.recordDir   dir to drop the .webm + per-run scratch in
  * @param {object} [o.settings]  per-scenario settings overrides
+ * @param {boolean} [o.video]    record a .webm (true for recording; false for E2E tests)
  */
-export async function launchVSCode({ vscodeDir, workspace, size, recordDir, settings = {} }) {
+export async function launchVSCode({ vscodeDir, workspace, size, recordDir, settings = {}, video = true }) {
   const executablePath = await downloadAndUnzipVSCode({
     version: VSCODE_VERSION,
     cachePath: path.join(vscodeDir, ".vscode-test"),
@@ -74,7 +75,7 @@ export async function launchVSCode({ vscodeDir, workspace, size, recordDir, sett
       "--disable-gpu-sandbox",
       workspace,
     ],
-    recordVideo: { dir: recordDir, size },
+    ...(video ? { recordVideo: { dir: recordDir, size } } : {}),
     timeout: 60_000,
   });
 
