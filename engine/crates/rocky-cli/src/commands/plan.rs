@@ -65,7 +65,7 @@ pub async fn plan(
         "failed to load config from {}",
         config_path.display()
     ))?;
-    let (_name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
+    let (name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
@@ -81,7 +81,10 @@ pub async fn plan(
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .connectors
     } else {
-        anyhow::bail!("no discovery adapter configured for this pipeline")
+        anyhow::bail!(
+            "{}",
+            registry::missing_discovery_config_message(&rocky_cfg, config_path, name)
+        )
     };
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());

@@ -46,7 +46,7 @@ pub async fn discover(
         );
     }
 
-    let (_name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
+    let (name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
     let pattern = pipeline.schema_pattern()?;
 
     let adapter_registry = registry::AdapterRegistry::from_config(&rocky_cfg)?;
@@ -58,7 +58,10 @@ pub async fn discover(
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
-        anyhow::bail!("no discovery adapter configured for this pipeline")
+        anyhow::bail!(
+            "{}",
+            registry::missing_discovery_config_message(&rocky_cfg, config_path, name)
+        )
     };
 
     let connectors = &discovery_result.connectors;
