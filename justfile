@@ -184,6 +184,24 @@ release-dagster version *args:
 release-vscode version *args:
     ./scripts/release.sh vscode {{version}} {{args}}
 
+# --- Demo recording ---
+
+# Record a VS Code extension demo GIF (Playwright drives a real VS Code).
+# Output lands in editors/vscode/recording/out/<scenario>.gif. The recorder
+# rebuilds the extension bundle first (it loads dist/, not src/).
+#   just record-demo quickstart
+record-demo scenario="quickstart":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    (cd editors/vscode && npm install)
+    (cd editors/vscode/recording && npm install && npm run record {{scenario}})
+
+# Copy a recorded GIF into editors/vscode/media/ (where Marketplace-referenced
+# media lives). Embedding it still means adding an <img> to editors/vscode/README.md.
+publish-demo scenario:
+    cp editors/vscode/recording/out/{{scenario}}.gif editors/vscode/media/demo-{{scenario}}.gif
+    @echo "Published editors/vscode/media/demo-{{scenario}}.gif — now embed it in editors/vscode/README.md"
+
 # --- Convenience ---
 
 # Install the monorepo-root git hooks (.git-hooks/) as the active hooksPath.

@@ -114,6 +114,10 @@ code --install-extension rocky-*.vsix
 
 # Debug
 # Press F5 in VS Code → launches Extension Development Host
+
+# Demo GIFs
+# recording/ — Playwright drives a real VS Code to auto-record extension demos.
+# `just record-demo <scenario>` (see recording/README.md for the gotchas).
 ```
 
 ## Extension Commands (58)

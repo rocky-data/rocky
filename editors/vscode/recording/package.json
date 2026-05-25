@@ -1,0 +1,14 @@
+{
+  "name": "rocky-vscode-recording",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Automated demo-GIF recording for the Rocky VS Code extension (Playwright drives a real VS Code Electron instance).",
+  "type": "module",
+  "scripts": {
+    "record": "node record.mjs"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^2.5.2",
+    "playwright": "^1.60.0"
+  }
+}

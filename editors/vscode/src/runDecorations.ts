@@ -128,7 +128,7 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
       {
         range,
         renderOptions: {
-          after: { contentText: "$(circle-outline)  no run history" },
+          after: { contentText: "○  no run history" },
         },
       },
     ]);
@@ -141,7 +141,7 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
       {
         range,
         renderOptions: {
-          after: { contentText: "$(circle-outline)  no run history" },
+          after: { contentText: "○  no run history" },
         },
       },
     ]);
@@ -163,7 +163,7 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
         range,
         renderOptions: {
           after: {
-            contentText: `$(error)  FAILED  ${formatDuration(latest.duration_ms)}`,
+            contentText: `✕  FAILED  ${formatDuration(latest.duration_ms)}`,
           },
         },
       },
@@ -181,7 +181,7 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
   const decorationType = isSuccess
     ? successDecorationType
     : noHistoryDecorationType;
-  const icon = isSuccess ? "$(pass)" : "$(circle-outline)";
+  const icon = isSuccess ? "✓" : "○";
 
   editor.setDecorations(decorationType, [
     {
