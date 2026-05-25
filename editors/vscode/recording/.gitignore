@@ -1,3 +1,6 @@
 node_modules/
 out/
 .run/
+e2e/test-results/
+test-results/
+playwright-report/
