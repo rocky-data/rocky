@@ -13,8 +13,9 @@ harness — Playwright drives a real VS Code instance — under
 
 ```bash
 cd cli-recording
-./record.sh quickstart        # -> out/quickstart.gif
-./record.sh column-lineage    # -> out/column-lineage.gif
+./record.sh quickstart              # -> out/quickstart.gif
+./record.sh drift-recover           # -> out/drift-recover.gif
+# ...one per tape in tapes/ (8 vhs-able demos total)
 # or from the repo root:
 just record-cli-demo quickstart
 just publish-cli-demo quickstart   # copy out/quickstart.gif -> docs/public/demo-quickstart.gif
@@ -62,20 +63,20 @@ frame.png`) and confirming it is equal-or-better than what it replaces.
 ## Demo feasibility
 
 The 9 CLI demos referenced from the root `README.md` map to playground POCs.
-Eight are reproducible here (local DuckDB, no keys, no interactive input); one
-is not:
+Eight are reproducible here (local DuckDB, no keys, no interactive input) and
+ship as tapes; one is not:
 
 | Demo | POC | vhs-able |
 |---|---|---|
-| quickstart | `rocky playground` scaffold | yes (tape included) |
-| drift-recover | `02-performance/06-schema-drift-recover` | yes (uses the `duckdb` CLI to mutate the source) |
-| data-contracts | `01-quality/01-data-contracts-strict` | yes |
-| branches-replay | `00-foundations/06-branches-replay-lineage` | yes |
-| column-lineage | `06-developer-experience/01-lineage-column-level` | yes (tape included) |
+| quickstart | `rocky playground` scaffold | yes (tape) |
+| drift-recover | `02-performance/06-schema-drift-recover` | yes (tape) — visible `duckdb` ALTER mutates the source |
+| data-contracts | `01-quality/01-data-contracts-strict` | yes (tape) |
+| branches-replay | `00-foundations/06-branches-replay-lineage` | yes (tape) |
+| column-lineage | `06-developer-experience/01-lineage-column-level` | yes (tape) |
 | ai-model-generation | `03-ai/01-model-generation` | **no** — needs `ANTHROPIC_API_KEY`; LLM output is non-deterministic |
-| lineage-diff | `06-developer-experience/11-lineage-diff` | yes (builds a throwaway git repo) |
-| classification-masking | `04-governance/05-classification-masking-compliance` | yes |
-| incremental-watermark | `02-performance/01-incremental-watermark` | yes |
+| lineage-diff | `06-developer-experience/11-lineage-diff` | yes (tape) — `prepare.sh` builds a throwaway git repo |
+| classification-masking | `04-governance/05-classification-masking-compliance` | yes (tape) |
+| incremental-watermark | `02-performance/01-incremental-watermark` | yes (tape) |
 
 ## Requirements
 
