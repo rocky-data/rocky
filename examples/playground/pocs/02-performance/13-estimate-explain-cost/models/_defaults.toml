@@ -1,0 +1,6 @@
+[target]
+catalog = "poc"
+schema = "demo"
+
+[strategy]
+type = "full_refresh"
