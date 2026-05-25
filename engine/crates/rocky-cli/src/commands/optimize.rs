@@ -12,13 +12,14 @@ use rocky_ir::dag::DagNode;
 
 use crate::output::{OptimizeOutput, OptimizeRecommendation, print_json};
 
-/// Execute `rocky optimize`.
-pub fn run_optimize(
+/// Build the optimize output from run history + the on-disk DAG. Pure
+/// compute — no printing — so other surfaces (the MCP `optimize` tool) can
+/// reuse it. Returns [`OptimizeOutput::empty`] when there is no run history.
+pub fn optimize_output(
     state_path: &Path,
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
-    output_json: bool,
-) -> Result<()> {
+) -> Result<OptimizeOutput> {
     let store = StateStore::open_read_only(state_path)?;
     let config = CostConfig::default();
 
@@ -26,12 +27,7 @@ pub fn run_optimize(
     let runs = store.list_runs(100)?;
 
     if runs.is_empty() {
-        if output_json {
-            print_json(&OptimizeOutput::empty("no run history available"))?;
-        } else {
-            println!("No run history available. Run `rocky run` first to collect execution data.");
-        }
-        return Ok(());
+        return Ok(OptimizeOutput::empty("no run history available"));
     }
 
     // Build DAG from model definitions on disk (if models_dir is available).
@@ -99,52 +95,70 @@ pub fn run_optimize(
         recommendations.push(recommend_strategy(&stats, &config));
     }
 
+    let typed_recs: Vec<OptimizeRecommendation> = recommendations
+        .iter()
+        .map(|r| OptimizeRecommendation {
+            model_name: r.model_name.clone(),
+            current_strategy: r.current_strategy.clone(),
+            recommended_strategy: r.recommended_strategy.clone(),
+            estimated_monthly_savings: r.estimated_monthly_savings,
+            reasoning: r.reasoning.clone(),
+            compute_cost_per_run: r.compute_cost_per_run,
+            storage_cost_per_month: r.storage_cost_per_month,
+            downstream_references: r.downstream_references as u64,
+        })
+        .collect();
+    Ok(OptimizeOutput::new(typed_recs))
+}
+
+/// Execute `rocky optimize`.
+pub fn run_optimize(
+    state_path: &Path,
+    models_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let output = optimize_output(state_path, models_dir, model_filter)?;
+
     if output_json {
-        let typed_recs: Vec<OptimizeRecommendation> = recommendations
-            .iter()
-            .map(|r| OptimizeRecommendation {
-                model_name: r.model_name.clone(),
-                current_strategy: r.current_strategy.clone(),
-                recommended_strategy: r.recommended_strategy.clone(),
-                estimated_monthly_savings: r.estimated_monthly_savings,
-                reasoning: r.reasoning.clone(),
-                compute_cost_per_run: r.compute_cost_per_run,
-                storage_cost_per_month: r.storage_cost_per_month,
-                downstream_references: r.downstream_references as u64,
-            })
-            .collect();
-        let output = OptimizeOutput::new(typed_recs);
         print_json(&output)?;
-    } else {
-        println!(
-            "{:<30} {:<12} {:<14} {:<12} {:<10}",
-            "MODEL", "CURRENT", "RECOMMENDED", "SAVINGS/MO", "REASONING"
-        );
-        println!("{}", "-".repeat(90));
+        return Ok(());
+    }
 
-        for rec in &recommendations {
-            println!(
-                "{:<30} {:<12} {:<14} ${:<11.4} {}",
-                truncate(&rec.model_name, 29),
-                rec.current_strategy,
-                rec.recommended_strategy,
-                rec.estimated_monthly_savings,
-                truncate(&rec.reasoning, 40),
-            );
-        }
+    if output.recommendations.is_empty() && output.message.is_some() {
+        println!("No run history available. Run `rocky run` first to collect execution data.");
+        return Ok(());
+    }
 
-        let total_savings: f64 = recommendations
-            .iter()
-            .map(|r| r.estimated_monthly_savings)
-            .sum();
-        println!();
-        println!("Total estimated monthly savings: ${total_savings:.2}");
-        println!("Models analyzed: {}", recommendations.len());
-        println!();
+    println!(
+        "{:<30} {:<12} {:<14} {:<12} {:<10}",
+        "MODEL", "CURRENT", "RECOMMENDED", "SAVINGS/MO", "REASONING"
+    );
+    println!("{}", "-".repeat(90));
+
+    for rec in &output.recommendations {
         println!(
-            "Tip: Run `rocky compile --output json` for inferred incrementality hints on full_refresh models."
+            "{:<30} {:<12} {:<14} ${:<11.4} {}",
+            truncate(&rec.model_name, 29),
+            rec.current_strategy,
+            rec.recommended_strategy,
+            rec.estimated_monthly_savings,
+            truncate(&rec.reasoning, 40),
         );
     }
+
+    let total_savings: f64 = output
+        .recommendations
+        .iter()
+        .map(|r| r.estimated_monthly_savings)
+        .sum();
+    println!();
+    println!("Total estimated monthly savings: ${total_savings:.2}");
+    println!("Models analyzed: {}", output.recommendations.len());
+    println!();
+    println!(
+        "Tip: Run `rocky compile --output json` for inferred incrementality hints on full_refresh models."
+    );
 
     Ok(())
 }

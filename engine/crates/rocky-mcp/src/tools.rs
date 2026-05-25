@@ -126,6 +126,34 @@ pub struct DependentsArgs {
     pub model: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CatalogArgs {}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HistoryArgs {
+    /// When set, return that model's execution history instead of the
+    /// project-level run summary.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MetricsArgs {
+    /// The model whose quality metrics to read.
+    pub model: String,
+    /// When set, also return a per-run trend for this single column.
+    #[serde(default)]
+    pub column: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct OptimizeArgs {
+    /// Substring filter on model name. When unset, analyses every model with
+    /// run history.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
@@ -563,6 +591,170 @@ impl RockyMcpServer {
         Ok(Json(DependentsResult { model, dependents }))
     }
 
+    #[tool(
+        description = "Return the project-wide asset catalog in one call: every model and source \
+         with its typed columns and upstream/downstream model lists. Use to orient on the whole \
+         project at once. For the column-level edge trace of a single model use `lineage`; for \
+         typed columns alone use `inspect_schema`; for one model's consumers use `dependents`."
+    )]
+    async fn catalog(
+        &self,
+        _params: Parameters<CatalogArgs>,
+    ) -> Result<Json<CatalogResult>, String> {
+        let output = commands::compute_catalog_output(
+            &self.config_path,
+            &self.state_path(),
+            &self.models_dir,
+            None,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(Json(catalog_result(output)))
+    }
+
+    #[tool(
+        description = "Read run history from the state store. Without `model`, returns the recent \
+         project-level runs (id, status, trigger, duration). With `model`, returns that model's \
+         executions (duration, rows, status, sql_hash) newest-first. Grounds proposals in \
+         operational reality — is this model flaky, slow, recently changed? Empty when nothing has \
+         been run yet."
+    )]
+    async fn history(
+        &self,
+        params: Parameters<HistoryArgs>,
+    ) -> Result<Json<HistoryResult>, String> {
+        let state_path = self.state_path();
+        match params.0.model {
+            Some(model) => {
+                let out = commands::model_history_output(&state_path, &model, None, false, 20)
+                    .map_err(|e| format!("{e:#}"))?;
+                let executions = out
+                    .executions
+                    .into_iter()
+                    .map(|e| ModelExecutionLite {
+                        started_at: e.started_at.to_rfc3339(),
+                        duration_ms: e.duration_ms,
+                        rows_affected: e.rows_affected,
+                        status: e.status,
+                        sql_hash: e.sql_hash,
+                    })
+                    .collect();
+                Ok(Json(HistoryResult {
+                    model: Some(out.model),
+                    runs: vec![],
+                    executions,
+                }))
+            }
+            None => {
+                let out = commands::history_runs_output(&state_path, None, false)
+                    .map_err(|e| format!("{e:#}"))?;
+                let runs = out
+                    .runs
+                    .into_iter()
+                    .map(|r| RunHistoryLite {
+                        run_id: r.run_id,
+                        started_at: r.started_at.to_rfc3339(),
+                        status: r.status,
+                        trigger: r.trigger,
+                        models_executed: r.models_executed,
+                        duration_ms: r.duration_ms,
+                    })
+                    .collect();
+                Ok(Json(HistoryResult {
+                    model: None,
+                    runs,
+                    executions: vec![],
+                }))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Read a model's quality-metric snapshots from the state store: row count, \
+         freshness lag, and per-column null rates over recent runs, plus derived freshness / \
+         null-rate alerts. Pass `column` to also get that column's per-run trend. `message` is set \
+         (and snapshots empty) when the model has no recorded metrics yet."
+    )]
+    async fn metrics(
+        &self,
+        params: Parameters<MetricsArgs>,
+    ) -> Result<Json<MetricsResult>, String> {
+        let args = params.0;
+        let out = commands::metrics_output(
+            &self.state_path(),
+            &args.model,
+            true,
+            args.column.as_deref(),
+            true,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+
+        let snapshots = out
+            .snapshots
+            .into_iter()
+            .map(|s| MetricsSnapshotLite {
+                run_id: s.run_id,
+                timestamp: s.timestamp.to_rfc3339(),
+                row_count: s.row_count,
+                freshness_lag_seconds: s.freshness_lag_seconds,
+                null_rates: s
+                    .null_rates
+                    .into_iter()
+                    .map(|(column, null_rate)| ColumnNullRateLite { column, null_rate })
+                    .collect(),
+            })
+            .collect();
+        let alerts = out
+            .alerts
+            .into_iter()
+            .map(|a| MetricsAlertLite {
+                kind: a.kind,
+                severity: a.severity,
+                message: a.message,
+                column: a.column,
+            })
+            .collect();
+        Ok(Json(MetricsResult {
+            model: out.model,
+            snapshots,
+            alerts,
+            message: out.message,
+        }))
+    }
+
+    #[tool(
+        description = "Cost-model materialization recommendations from run history + the on-disk \
+         DAG: for each model, the current vs recommended strategy, projected monthly savings, and \
+         the reasoning. Use to reason about materialization with Rocky's cost model rather than \
+         guessing. `message` is set (and recommendations empty) when there's no run history yet."
+    )]
+    async fn optimize(
+        &self,
+        params: Parameters<OptimizeArgs>,
+    ) -> Result<Json<OptimizeResult>, String> {
+        let out = commands::optimize_output(
+            &self.state_path(),
+            Some(&self.models_dir),
+            params.0.model.as_deref(),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        let recommendations = out
+            .recommendations
+            .into_iter()
+            .map(|r| OptimizeRecommendationLite {
+                model_name: r.model_name,
+                current_strategy: r.current_strategy,
+                recommended_strategy: r.recommended_strategy,
+                estimated_monthly_savings: r.estimated_monthly_savings,
+                reasoning: r.reasoning,
+                downstream_references: r.downstream_references,
+            })
+            .collect();
+        Ok(Json(OptimizeResult {
+            recommendations,
+            message: out.message,
+        }))
+    }
+
     // ------------------------- SHOULD tools --------------------------------
 
     #[tool(
@@ -950,6 +1142,52 @@ fn project_compile_result(output: &rocky_cli::output::CompileOutput) -> CompileR
         warning_count,
         model_count: output.models,
         diagnostics,
+    }
+}
+
+/// Project a `CatalogOutput` into the lite [`CatalogResult`], dropping the
+/// (token-heavy) column-level edge set in favour of the per-asset
+/// upstream/downstream model lists plus the aggregate counts. Agents that
+/// need the edge trace use the `lineage` tool.
+fn catalog_result(output: rocky_cli::output::CatalogOutput) -> CatalogResult {
+    use rocky_cli::output::AssetKind;
+    let assets = output
+        .assets
+        .into_iter()
+        .map(|a| {
+            let kind = match a.kind {
+                AssetKind::Source => "source",
+                AssetKind::Model => "model",
+                AssetKind::View => "view",
+                AssetKind::MaterializedView => "materialized_view",
+            }
+            .to_string();
+            let columns = a
+                .columns
+                .into_iter()
+                .map(|c| CatalogColumnLite {
+                    name: c.name,
+                    data_type: c.data_type,
+                    nullable: c.nullable,
+                })
+                .collect();
+            CatalogAssetLite {
+                fqn: a.fqn,
+                model_name: a.model_name,
+                kind,
+                columns,
+                upstream_models: a.upstream_models,
+                downstream_models: a.downstream_models,
+                intent: a.intent,
+            }
+        })
+        .collect();
+    CatalogResult {
+        project_name: output.project_name,
+        assets,
+        asset_count: output.stats.asset_count,
+        column_count: output.stats.column_count,
+        edge_count: output.stats.edge_count,
     }
 }
 

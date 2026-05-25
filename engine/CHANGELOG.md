@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky mcp`: read-only `catalog` / `history` / `metrics` / `optimize` tools** — four more tools on the MCP server, all offline (no warehouse connection, no credentials) and built on the engine's existing command cores. `catalog` returns the project-wide asset inventory in one call: every model and source with its typed columns and upstream/downstream model lists (the token-heavy column-edge set is dropped — agents use `lineage` for the column-level trace, `inspect_schema` for typed columns alone, `dependents` for one model's consumers). `history` reads the run ledger — the recent project runs, or a single model's executions (duration, rows, status, `sql_hash`) when `model` is set. `metrics` returns a model's quality snapshots (row count, freshness lag, per-column null rates) plus derived freshness / null-rate alerts. `optimize` returns the cost model's materialization recommendations (current vs recommended strategy, projected monthly savings, reasoning) computed from run history and the on-disk DAG. The tools ground an agent's proposals in the typed graph and operational reality before it reaches `propose`; none of them mutate the warehouse or engine state.
+
+### Changed
+
+- **`rocky-cli`: more typed-output cores extracted for reuse** — `history` / `metrics` / `optimize` now build their JSON output through reusable `history_runs_output` / `model_history_output` / `metrics_output` / `optimize_output` functions (the `run_*` handlers call the core, then print), and `compute_catalog_output` is widened to `pub`, so the MCP server and the CLI share one code path. No output-schema change.
+
 ## [1.44.0] — 2026-05-25
 
 The AI-drivable surface lands end-to-end. `rocky mcp` exposes the engine's read-only tools over the Model Context Protocol so an agent can drive Rocky directly, a `build_model` prompt scripts the authoring loop, and AI-authored plans are gated behind `rocky review` before any `rocky apply`. Also ships `rocky ai-contract`, `rocky preview rows`, and a governance-safe ad-hoc SQL preview.
