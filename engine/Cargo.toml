@@ -198,7 +198,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
 opentelemetry-otlp = "0.31"
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 
 # gRPC stack — used by `rocky-bigquery`'s Storage Read API impl of
 # `WarehouseAdapter::fetch_arrow_batch`. `tonic` 0.14 + `prost` 0.14
