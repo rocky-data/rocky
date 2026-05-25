@@ -4841,6 +4841,37 @@ async fn query_source_max_timestamp(
     })
 }
 
+/// Resolve the source-side watermark to persist after copying `source_table`.
+///
+/// Incremental and microbatch strategies advance the watermark to
+/// `MAX(source.{timestamp_column})` — **including the bootstrap full-refresh
+/// run** (the first run, or a drift drop-and-recreate). The next incremental
+/// tick filters `WHERE {ts} > watermark`, so the bootstrap must record the real
+/// data max: a wall-clock `now` is later than every existing row and would
+/// silently drop the next delta. Other strategies never consult state-store
+/// watermarks, so they record `now` without the extra round-trip. Falls back to
+/// `now` when the source is empty / NULL / unparseable.
+async fn resolve_new_watermark(
+    strategy: &MaterializationStrategy,
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    source_table: &TableRef,
+    timestamp_column: &str,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    let advances_watermark = matches!(
+        strategy,
+        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
+    );
+    if advances_watermark {
+        query_source_max_timestamp(warehouse, dialect, source_table, timestamp_column)
+            .await
+            .unwrap_or(now)
+    } else {
+        now
+    }
+}
+
 /// Processes a single table: drift detection + replication.
 ///
 /// Uses `WarehouseAdapter` for all SQL execution and schema introspection,
@@ -4855,10 +4886,13 @@ async fn query_source_max_timestamp(
 /// SQL gen — that value bounds the WHERE clause as a literal. **After** a
 /// successful execute, the runner issues a fresh
 /// `SELECT MAX({timestamp_column}) FROM source` query and records the
-/// result as the new watermark (replaces the older `Utc::now()` semantics).
-/// Falls back to `Utc::now()` only when the query returns no parseable
-/// timestamp (empty source, non-incremental strategies). The watermark
-/// reflects what's been processed *from* source — not what's *in* target.
+/// result as the new watermark (replaces the older `Utc::now()` semantics) —
+/// including on the bootstrap full-refresh run of an incremental table, so the
+/// first incremental tick starts from the real data max. Falls back to
+/// `Utc::now()` only when the query returns no parseable timestamp (empty
+/// source, non-incremental strategies). See `resolve_new_watermark` for the
+/// per-strategy dispatch. The watermark reflects what's been processed *from*
+/// source — not what's *in* target.
 #[tracing::instrument(skip_all, fields(table = %task.table_name))]
 async fn process_table(
     warehouse: &dyn WarehouseAdapter,
@@ -5276,35 +5310,20 @@ async fn process_table(
         None
     };
 
-    // Source-side watermark recording: after a successful execute, query
-    // `SELECT MAX({ts}) FROM source` so the next run filters off the actual
-    // max source timestamp we've processed. Only emitted for strategies
-    // that read the watermark on the next tick — for `full_refresh` /
-    // `merge` / `delete_insert` the round-trip would be wasted (the WHERE
-    // clause doesn't consult state-store watermarks). Falls back to
-    // `Utc::now()` if the source is empty, returns NULL, or the timestamp
-    // column is unparseable.
-    let advances_watermark = matches!(
-        strategy,
-        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
-    ) && !use_full_refresh;
-    let new_watermark = if advances_watermark {
-        query_source_max_timestamp(
-            warehouse,
-            dialect,
-            &source_table,
-            &effective_timestamp_column,
-        )
-        .await
-        .unwrap_or(now)
-    } else {
-        // Non-incremental strategies still record a watermark so a future
-        // strategy flip (e.g. `full_refresh` → `incremental` after the
-        // first bootstrap run) has a non-empty lower bound to start from.
-        // Using `Utc::now()` here preserves the prior wall-clock behaviour
-        // for strategies that don't read source-side watermarks anyway.
-        now
-    };
+    // Record the source-side watermark this run advanced to. Incremental and
+    // microbatch strategies advance to MAX(source.ts) even on a bootstrap
+    // full-refresh run, so the next incremental tick filters off the real data
+    // max rather than a wall-clock value that would exclude every existing row
+    // (see `resolve_new_watermark`).
+    let new_watermark = resolve_new_watermark(
+        &strategy,
+        warehouse,
+        dialect,
+        &source_table,
+        &effective_timestamp_column,
+        now,
+    )
+    .await;
 
     let deferred_watermark = Some(DeferredWatermark {
         state_key: target_table.state_key(),
@@ -7124,6 +7143,94 @@ merge_keys = ["id"]
         assert!(
             watermark.is_none(),
             "empty source should yield None so the caller falls back to Utc::now()"
+        );
+    }
+
+    /// Regression: a bootstrap incremental run (first run / drift recreate, i.e.
+    /// the `use_full_refresh` path) must record the source **data** max as its
+    /// watermark, not a wall-clock `now`. With `now`, the next incremental tick
+    /// filters `ts > now` and drops every existing row — they're all dated in
+    /// the past — silently losing the delta. Guards against re-introducing the
+    /// `&& !use_full_refresh` exclusion.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_bootstrap_watermark_is_source_max_not_wallclock() {
+        use chrono::TimeZone;
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::{MaterializationStrategy, TableRef};
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS source")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE source.events (id INTEGER, _fivetran_synced TIMESTAMP)",
+            )
+            .await
+            .unwrap();
+        // Every row is dated well before `now`.
+        adapter
+            .execute_statement(
+                "INSERT INTO source.events VALUES \
+                    (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                    (2, TIMESTAMP '2026-03-03 12:00:00')",
+            )
+            .await
+            .unwrap();
+
+        let dialect = DuckDbSqlDialect;
+        let source = TableRef {
+            catalog: String::new(),
+            schema: "source".into(),
+            table: "events".into(),
+        };
+        // The bootstrap case the bug missed: incremental strategy, first run.
+        let strategy = MaterializationStrategy::Incremental {
+            timestamp_column: "_fivetran_synced".to_string(),
+        };
+        let now = chrono::Utc::now();
+
+        let watermark = super::resolve_new_watermark(
+            &strategy,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &source,
+            "_fivetran_synced",
+            now,
+        )
+        .await;
+
+        let data_max = chrono::Utc.with_ymd_and_hms(2026, 3, 3, 12, 0, 0).unwrap();
+        assert_eq!(
+            watermark, data_max,
+            "incremental bootstrap must record MAX(source.ts), not wall-clock now"
+        );
+        assert!(
+            watermark < now,
+            "watermark must be the past data max, not a wall-clock value"
+        );
+
+        // Microbatch shares the same source-MAX semantics as Incremental.
+        let microbatch = MaterializationStrategy::Microbatch {
+            timestamp_column: "_fivetran_synced".to_string(),
+            granularity: rocky_ir::TimeGrain::Hour,
+        };
+        let mb_watermark = super::resolve_new_watermark(
+            &microbatch,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &source,
+            "_fivetran_synced",
+            now,
+        )
+        .await;
+        assert_eq!(
+            mb_watermark, data_max,
+            "microbatch must also record MAX(source.ts), not wall-clock now"
         );
     }
 
