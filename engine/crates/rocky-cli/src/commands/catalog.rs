@@ -159,7 +159,7 @@ pub async fn run_catalog(
 /// SemanticGraph for assets + edges, then enriches with state-store
 /// run history (`last_run_id` / `last_materialized_at`) when the
 /// state store is available.
-pub(crate) fn compute_catalog_output(
+pub fn compute_catalog_output(
     config_path: &Path,
     state_path: &Path,
     models_dir: &Path,

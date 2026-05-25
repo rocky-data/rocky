@@ -79,11 +79,15 @@ async fn tools_list_returns_expected_set() {
         names,
         vec![
             "breaking_change",
+            "catalog",
             "compile",
             "dependents",
+            "history",
             "inspect_schema",
             "lineage",
             "list",
+            "metrics",
+            "optimize",
             "plan_preview",
             "profile_column",
             "propose",
@@ -456,6 +460,269 @@ async fn prompt_get_build_model_returns_authoring_loop() {
     assert!(
         haystack.to_lowercase().contains("reconcile"),
         "build_model must emphasize the reconcile discipline"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Seed one successful run (recording an `orders` execution) plus one quality
+/// snapshot into the state store the server will resolve for `models_dir`. The
+/// `StateStore` handle is dropped before the caller starts the server so the
+/// read-only opens inside the tools don't contend on the redb lock.
+fn seed_run_history(models_dir: &Path) {
+    use rocky_core::state::{
+        ModelExecution, QualityMetrics, QualitySnapshot, RunRecord, RunStatus, RunTrigger,
+        SessionSource, StateStore,
+    };
+
+    let state_path = rocky_core::state::resolve_state_path(None, models_dir).path;
+    let store = StateStore::open(&state_path).expect("open state store");
+    let now = chrono::Utc::now();
+
+    let run = RunRecord {
+        run_id: "run-seed-001".to_string(),
+        started_at: now,
+        finished_at: now + chrono::Duration::seconds(2),
+        status: RunStatus::Success,
+        models_executed: vec![ModelExecution {
+            model_name: "orders".to_string(),
+            started_at: now,
+            finished_at: now + chrono::Duration::seconds(2),
+            duration_ms: 2000,
+            rows_affected: Some(42),
+            status: "success".to_string(),
+            sql_hash: "abc123def456".to_string(),
+            bytes_scanned: None,
+            bytes_written: Some(1024),
+        }],
+        trigger: RunTrigger::Manual,
+        config_hash: "cfg".to_string(),
+        triggering_identity: None,
+        session_source: SessionSource::Cli,
+        git_commit: None,
+        git_branch: None,
+        idempotency_key: None,
+        target_catalog: None,
+        hostname: "test-host".to_string(),
+        rocky_version: "0.0.0-test".to_string(),
+    };
+    store.record_run(&run).expect("record run");
+
+    let mut null_rates = std::collections::HashMap::new();
+    // 0.6 > the 0.5 critical threshold → exercises the alert projection.
+    null_rates.insert("status".to_string(), 0.6);
+    store
+        .record_quality(&QualitySnapshot {
+            timestamp: now,
+            run_id: "run-seed-001".to_string(),
+            model_name: "orders".to_string(),
+            metrics: QualityMetrics {
+                row_count: 42,
+                null_rates,
+                freshness_lag_seconds: Some(120),
+            },
+        })
+        .expect("record quality");
+}
+
+#[tokio::test]
+async fn catalog_returns_project_assets() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // Add a model that selects `id FROM orders` so it has real column lineage
+    // (a literal-only leaf has no produced edges, hence no tracked columns).
+    // This exercises the column projection, not just the asset inventory.
+    std::fs::write(
+        dir.path().join("models").join("order_ids.sql"),
+        "SELECT id FROM orders\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("models").join("order_ids.toml"),
+        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"main\"\nschema = \"out\"\ntable = \"order_ids\"\n",
+    )
+    .unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("catalog"))
+        .await
+        .expect("catalog call");
+
+    let sc = result.structured_content.expect("structured content");
+    assert!(sc["asset_count"].as_u64().unwrap() >= 2);
+    assert!(sc.as_object().unwrap().contains_key("column_count"));
+    let assets = sc["assets"].as_array().unwrap();
+
+    let orders = assets
+        .iter()
+        .find(|a| a["model_name"] == serde_json::json!("orders"))
+        .expect("orders asset present");
+    // `kind` is snake_cased at the projection boundary (the underlying
+    // `AssetKind` serializes PascalCase).
+    assert_eq!(orders["kind"], serde_json::json!("model"));
+
+    // `order_ids` selects from `orders`, so its `id` column has tracked
+    // lineage and must surface through the column projection.
+    let order_ids = assets
+        .iter()
+        .find(|a| a["model_name"] == serde_json::json!("order_ids"))
+        .expect("order_ids asset present");
+    let cols = order_ids["columns"].as_array().unwrap();
+    assert!(
+        cols.iter().any(|c| c["name"] == serde_json::json!("id")),
+        "order_ids should carry its `id` column; got {cols:?}"
+    );
+
+    // The token-heavy column edge set is intentionally not part of the lite
+    // catalog — agents reach for `lineage` instead.
+    assert!(!sc.as_object().unwrap().contains_key("edges"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_reports_runs_and_model_executions() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    seed_run_history(&dir.path().join("models"));
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Project-level: recent runs, no `model` arg.
+    let runs = client
+        .call_tool(CallToolRequestParams::new("history"))
+        .await
+        .expect("history call")
+        .structured_content
+        .expect("structured content");
+    let run_list = runs["runs"].as_array().unwrap();
+    assert_eq!(run_list.len(), 1);
+    assert_eq!(run_list[0]["run_id"], serde_json::json!("run-seed-001"));
+    assert_eq!(run_list[0]["status"], serde_json::json!("Success"));
+    assert_eq!(run_list[0]["models_executed"], serde_json::json!(1));
+
+    // Model-scoped: executions for `orders`.
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let model_hist = client
+        .call_tool(CallToolRequestParams::new("history").with_arguments(args))
+        .await
+        .expect("history --model call")
+        .structured_content
+        .expect("structured content");
+    assert_eq!(model_hist["model"], serde_json::json!("orders"));
+    let execs = model_hist["executions"].as_array().unwrap();
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0]["rows_affected"], serde_json::json!(42));
+    assert_eq!(execs[0]["sql_hash"], serde_json::json!("abc123def456"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_is_empty_without_runs() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let sc = client
+        .call_tool(CallToolRequestParams::new("history"))
+        .await
+        .expect("history call")
+        .structured_content
+        .expect("structured content");
+    // No runs recorded → `runs` omitted (skip_serializing_if empty), no panic.
+    assert!(sc.get("runs").is_none() || sc["runs"].as_array().unwrap().is_empty());
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn metrics_returns_seeded_snapshot_and_alert() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    seed_run_history(&dir.path().join("models"));
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let sc = client
+        .call_tool(CallToolRequestParams::new("metrics").with_arguments(args))
+        .await
+        .expect("metrics call")
+        .structured_content
+        .expect("structured content");
+
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    let snapshots = sc["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0]["row_count"], serde_json::json!(42));
+    let null_rates = snapshots[0]["null_rates"].as_array().unwrap();
+    assert_eq!(null_rates[0]["column"], serde_json::json!("status"));
+    // The 0.6 null rate trips the critical null_rate alert.
+    let alerts = sc["alerts"].as_array().unwrap();
+    assert!(
+        alerts
+            .iter()
+            .any(|a| a["kind"] == serde_json::json!("null_rate")),
+        "0.6 null rate should raise a null_rate alert; got {alerts:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn optimize_recommends_from_seeded_history() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    seed_run_history(&dir.path().join("models"));
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let sc = client
+        .call_tool(CallToolRequestParams::new("optimize"))
+        .await
+        .expect("optimize call")
+        .structured_content
+        .expect("structured content");
+
+    let recs = sc["recommendations"].as_array().unwrap();
+    assert!(
+        recs.iter()
+            .any(|r| r["model_name"] == serde_json::json!("orders")),
+        "optimize should analyse the seeded orders model; got {recs:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn optimize_reports_message_without_history() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let sc = client
+        .call_tool(CallToolRequestParams::new("optimize"))
+        .await
+        .expect("optimize call")
+        .structured_content
+        .expect("structured content");
+
+    assert!(sc["recommendations"].as_array().unwrap().is_empty());
+    assert!(
+        sc["message"].as_str().unwrap().contains("no run history"),
+        "empty optimize must explain why"
     );
 
     client.cancel().await.unwrap();

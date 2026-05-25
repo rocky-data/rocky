@@ -78,7 +78,9 @@ pub use branch::{
     run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
     run_branch_promote, run_branch_promote_from_plan, run_branch_show,
 };
-pub use catalog::{CatalogFormat, default_out_dir as catalog_default_out_dir, run_catalog};
+pub use catalog::{
+    CatalogFormat, compute_catalog_output, default_out_dir as catalog_default_out_dir, run_catalog,
+};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::{extract_base_compile, project_ir_from_compile, run_ci_diff};
@@ -95,7 +97,7 @@ pub use doctor::doctor;
 pub use estimate::run_estimate;
 pub use export_schemas::export_schemas;
 pub use fmt::run_fmt;
-pub use history::run_history;
+pub use history::{history_runs_output, model_history_output, run_history};
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use init::init;
@@ -108,8 +110,8 @@ pub use list::{
 };
 pub use load::run_load;
 pub use lsp::run_lsp;
-pub use metrics::run_metrics;
-pub use optimize::run_optimize;
+pub use metrics::{metrics_output, run_metrics};
+pub use optimize::{optimize_output, run_optimize};
 pub use plan::{PlanRunOptions, plan, plan_preview_output, plan_promote};
 pub use playground::{run_playground, run_playground_with_template};
 pub use preview::{

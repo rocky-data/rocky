@@ -303,3 +303,170 @@ pub struct ProposeResult {
     /// The models this plan would materialize.
     pub models: Vec<String>,
 }
+
+/// One column on a `catalog` asset.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogColumnLite {
+    pub name: String,
+    /// Declared or inferred type, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    /// Whether the column accepts nulls, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+}
+
+/// One asset (model or source) in a `catalog` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogAssetLite {
+    /// Fully-qualified target (`catalog.schema.table`) when resolvable,
+    /// otherwise the model name.
+    pub fqn: String,
+    /// Model / source name as it appears in lineage edges.
+    pub model_name: String,
+    /// `"model"`, `"source"`, `"view"`, or `"materialized_view"`.
+    pub kind: String,
+    pub columns: Vec<CatalogColumnLite>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstream_models: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub downstream_models: Vec<String>,
+    /// Natural-language description from the model's sidecar, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+}
+
+/// `catalog` result — the project-wide asset inventory in one call: every
+/// model and source with its typed columns and the upstream/downstream model
+/// lists. Column-level edges are intentionally dropped (token-heavy); use
+/// `lineage` for the column-level trace of one model and `inspect_schema` for
+/// typed columns alone.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogResult {
+    /// Pipeline the catalog was built for (first in declaration order).
+    pub project_name: String,
+    pub assets: Vec<CatalogAssetLite>,
+    pub asset_count: usize,
+    pub column_count: usize,
+    pub edge_count: usize,
+}
+
+/// One project run in a model-unscoped `history` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RunHistoryLite {
+    pub run_id: String,
+    /// RFC 3339 start timestamp.
+    pub started_at: String,
+    /// `"Success"`, `"Failed"`, `"Partial"`, etc.
+    pub status: String,
+    /// `"Manual"`, `"Scheduled"`, etc.
+    pub trigger: String,
+    /// Number of models executed in the run.
+    pub models_executed: usize,
+    pub duration_ms: u64,
+}
+
+/// One model execution in a model-scoped `history` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ModelExecutionLite {
+    /// RFC 3339 start timestamp.
+    pub started_at: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    pub status: String,
+    /// Hash of the executed SQL — distinguishes a re-run from a changed model.
+    pub sql_hash: String,
+}
+
+/// `history` result — recent runs from the state store. When `model` is set the
+/// query is model-scoped and `executions` is populated; otherwise `runs` holds
+/// the project-level run summary. Both empty means no recorded history.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct HistoryResult {
+    /// Set when the query was scoped to a single model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Recent project runs (model-unscoped query).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunHistoryLite>,
+    /// Per-model executions, newest first (model-scoped query).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub executions: Vec<ModelExecutionLite>,
+}
+
+/// One column's null rate in a `metrics` snapshot.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ColumnNullRateLite {
+    pub column: String,
+    /// Fraction of rows that were null (0.0–1.0).
+    pub null_rate: f64,
+}
+
+/// One quality snapshot in a `metrics` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MetricsSnapshotLite {
+    pub run_id: String,
+    /// RFC 3339 snapshot timestamp.
+    pub timestamp: String,
+    pub row_count: u64,
+    /// Seconds since the data was last fresh, when tracked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_lag_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub null_rates: Vec<ColumnNullRateLite>,
+}
+
+/// One quality alert in a `metrics` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MetricsAlertLite {
+    /// `"freshness"` or `"null_rate"`.
+    pub kind: String,
+    /// `"warning"` or `"critical"`.
+    pub severity: String,
+    pub message: String,
+    /// Affected column, for column-scoped alerts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+/// `metrics` result — quality snapshots (row count, freshness, per-column null
+/// rates) plus derived alerts for a model. `message` is set instead of
+/// snapshots when the model has no recorded quality metrics yet.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct MetricsResult {
+    pub model: String,
+    pub snapshots: Vec<MetricsSnapshotLite>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<MetricsAlertLite>,
+    /// Why there are no snapshots, when the model has no metrics yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One materialization-strategy recommendation in an `optimize` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OptimizeRecommendationLite {
+    pub model_name: String,
+    /// Current strategy assumed by the cost model.
+    pub current_strategy: String,
+    /// Strategy the cost model recommends.
+    pub recommended_strategy: String,
+    /// Projected monthly savings (USD) from switching.
+    pub estimated_monthly_savings: f64,
+    /// Why the strategy is recommended.
+    pub reasoning: String,
+    /// How many models depend on this one (weights the recommendation).
+    pub downstream_references: u64,
+}
+
+/// `optimize` result — cost-model-driven materialization recommendations,
+/// derived from run history + the on-disk DAG. `message` is set instead of
+/// recommendations when there is no run history to analyse.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct OptimizeResult {
+    pub recommendations: Vec<OptimizeRecommendationLite>,
+    /// Why there are no recommendations, when run history is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
