@@ -1,0 +1,20 @@
+# 13-estimate-explain-cost — dry-run cost estimation via warehouse EXPLAIN.
+#
+# `rocky estimate` runs each compiled model's SELECT through the warehouse's
+# native EXPLAIN and returns the planner's projection — estimated rows, scan
+# strategy, join type, filter pushdown — all without materializing a single
+# table. On DuckDB this is the real query planner output; on a cloud warehouse
+# it is that engine's EXPLAIN.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true

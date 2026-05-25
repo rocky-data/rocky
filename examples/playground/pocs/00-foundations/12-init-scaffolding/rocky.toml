@@ -1,0 +1,13 @@
+# 12-init-scaffolding — this POC scaffolds a NEW project at runtime with
+# `rocky init` and runs the quickstart inside ./scaffolded/. This root config
+# is a placeholder so the POC satisfies the playground "every POC has a
+# rocky.toml" convention; the demo itself never uses it.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "staging__{source}" }
