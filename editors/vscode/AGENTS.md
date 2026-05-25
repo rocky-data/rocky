@@ -65,6 +65,7 @@ themes/
 └── rocky-semantic.json   # Semantic token colors
 icons/
 └── rocky-icon.svg        # File icon
+recording/                # Playwright-driven demo-GIF recorder (see recording/README.md)
 ```
 
 ## Coding Standards
@@ -87,7 +88,12 @@ npm run lint              # ESLint
 npm run package           # Build .vsix
 ```
 
-## Extension Commands (25)
+Demo GIFs are recorded with `just record-demo <scenario>` from the monorepo root
+(Playwright drives a real VS Code; output in `recording/out/`). See `recording/README.md`.
+
+## Extension Commands (58)
+
+Selected commands below — see `CLAUDE.md` for the full table.
 
 | Command | What It Does |
 |---------|-------------|

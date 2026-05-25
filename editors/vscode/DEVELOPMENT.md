@@ -73,6 +73,7 @@ editors/vscode/                  # path inside the rocky-data/rocky monorepo
 │   └── rocky-semantic.json       # Semantic token colors for LSP tokens
 ├── icons/
 │   └── rocky-icon.svg            # File icon for .rocky files
+├── recording/                    # Playwright-driven demo-GIF recorder (see recording/README.md)
 ├── .vscode/
 │   └── launch.json               # F5 debug configuration
 ├── language-configuration.json   # Editor behavior (comments, brackets, folding)
@@ -161,6 +162,9 @@ npm run package
 
 # Install the .vsix locally
 code --install-extension rocky-0.2.0.vsix
+
+# Record a demo GIF (Playwright drives a real VS Code; output in recording/out/)
+just record-demo quickstart        # from the monorepo root; see recording/README.md
 ```
 
 ## Development Workflow
