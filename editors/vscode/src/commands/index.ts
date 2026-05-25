@@ -16,7 +16,7 @@ import {
 } from "./info";
 import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
-import { registerLineageSerializer, showLineage } from "./lineage";
+import { showLineage } from "./lineage";
 import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";
@@ -33,8 +33,6 @@ import { test } from "./test";
  * is one line here plus a `commands` entry in package.json.
  */
 export function registerCommands(context: vscode.ExtensionContext): void {
-  registerLineageSerializer(context);
-
   context.subscriptions.push(
     // Command palette (Cmd+Shift+R / Ctrl+Shift+R)
     vscode.commands.registerCommand("rocky.commandPalette", commandPalette),

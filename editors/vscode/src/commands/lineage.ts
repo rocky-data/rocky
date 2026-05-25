@@ -1,26 +1,16 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
-import { getExtensionUri } from "../extensionState";
 import { runRocky } from "../rockyCli";
 import type { LineageOutput } from "../types/generated/lineage";
 import type { ModelHistoryOutput } from "../types/generated/model_history";
 import { resolveModelName } from "./ui";
 
-const VIEW_TYPE = "rockyLineage";
+/** Panel webview-view id — must match `contributes.views.rockyPanel` in package.json. */
+const VIEW_TYPE = "rocky.lineageView";
 
-interface SerializedState {
-  modelName?: string;
-  scale?: number;
-  panX?: number;
-  panY?: number;
-  viewMode?: "model" | "column";
-  clusterMode?: "none" | "schema" | "source";
-  layout?: "LR" | "TB";
-  searchQuery?: string;
-  focusMode?: "all" | "upstream" | "downstream" | "selected";
-  focusNode?: string | null;
-}
+/** Singleton provider for the Lineage panel view, set by `registerLineageView`. */
+let lineageProvider: LineageViewProvider | undefined;
 
 /** Message types sent from the extension host to the webview. */
 type HostToWebviewMessage =
@@ -44,133 +34,125 @@ export async function showLineage(arg?: unknown): Promise<void> {
   }
   if (!modelName) return;
 
-  const extensionUri = getExtensionUri();
-  const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
-
-  const panel = vscode.window.createWebviewPanel(
-    VIEW_TYPE,
-    `Lineage: ${modelName}`,
-    vscode.ViewColumn.Beside,
-    {
-      enableScripts: true,
-      localResourceRoots: [mediaUri],
-      retainContextWhenHidden: true,
-    },
-  );
-
-  await populatePanel(panel, modelName);
+  // Render into the Lineage panel view (bottom panel, full width) and reveal it.
+  lineageProvider?.setModel(modelName);
+  await vscode.commands.executeCommand(`${VIEW_TYPE}.focus`);
 }
 
 /**
- * Registers a webview-panel serializer so lineage panels survive workspace
- * reloads. The webview persists `{ modelName, scale, panX, panY, viewMode }`
- * via `vscode.setState`; on reload we re-run the CLI and restore zoom/pan.
+ * Renders the lineage graph in the Rocky panel (bottom, full width) instead of
+ * a side editor tab, so the DAG has room horizontally. Mirrors
+ * `ResultGridViewProvider`: the view is resolved lazily on first reveal, so a
+ * model requested before then is buffered in `currentModel` and rendered once
+ * the view appears.
  */
-export function registerLineageSerializer(
-  context: vscode.ExtensionContext,
-): void {
-  context.subscriptions.push(
-    vscode.window.registerWebviewPanelSerializer(VIEW_TYPE, {
-      async deserializeWebviewPanel(
-        panel: vscode.WebviewPanel,
-        state: SerializedState | undefined,
-      ) {
-        const modelName = state?.modelName;
-        if (!modelName) {
-          panel.dispose();
+class LineageViewProvider implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | undefined;
+  private currentModel: string | undefined;
+
+  constructor(private readonly extensionUri: vscode.Uri) {}
+
+  /** Set the model to display; render now if the view is already resolved. */
+  setModel(modelName: string): void {
+    this.currentModel = modelName;
+    if (this.view) void this.render();
+  }
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    const mediaUri = vscode.Uri.joinPath(this.extensionUri, "media");
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [mediaUri],
+    };
+
+    // Handle messages from the webview (registered once; survives html swaps).
+    view.webview.onDidReceiveMessage(
+      async (msg: { type?: string; name?: string }) => {
+        if (!msg?.type) return;
+        const projectRoot = resolveProjectRoot();
+
+        // Open a model file in the editor.
+        if (msg.type === "openModel" && typeof msg.name === "string") {
+          const matches = await vscode.workspace.findFiles(
+            `**/models/**/${msg.name}.{rocky,sql}`,
+            undefined,
+            1,
+          );
+          if (matches[0]) {
+            void vscode.commands.executeCommand("vscode.open", matches[0]);
+          }
           return;
         }
-        const extensionUri = getExtensionUri();
-        const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
-        panel.webview.options = {
-          enableScripts: true,
-          localResourceRoots: [mediaUri],
-        };
-        await populatePanel(panel, modelName);
+
+        // Fetch model history for the side panel.
+        if (msg.type === "loadModelDetails" && typeof msg.name === "string") {
+          const clickedModel = msg.name;
+          let history: ModelHistoryOutput | null = null;
+          let errorMsg: string | undefined;
+
+          try {
+            const args = ["history", "--model", clickedModel, "--output", "json"];
+            const { stdout } = await runRocky(args, { cwd: projectRoot });
+            history = JSON.parse(stdout) as ModelHistoryOutput;
+          } catch (err) {
+            errorMsg = (err as Error).message;
+          }
+
+          const reply: HostToWebviewMessage = {
+            type: "modelDetails",
+            model: clickedModel,
+            history,
+            errorMsg,
+          };
+          void view.webview.postMessage(reply);
+        }
       },
-    }),
-  );
+    );
+
+    view.onDidDispose(() => {
+      this.view = undefined;
+    });
+
+    if (this.currentModel) void this.render();
+  }
+
+  /** Run `rocky lineage <model>` and render the graph into the view. */
+  private async render(): Promise<void> {
+    const view = this.view;
+    const modelName = this.currentModel;
+    if (!view || !modelName) return;
+
+    // Resolve the project root by walking up from the active editor's file, so
+    // a SQL file opened outside the workspace root still finds its rocky.toml.
+    const projectRoot = resolveProjectRoot();
+    const mediaUri = vscode.Uri.joinPath(this.extensionUri, "media");
+    view.description = modelName;
+    view.webview.html = renderLoadingHtml(view.webview, modelName);
+
+    // Default JSON output; rocky discovers rocky.toml from cwd.
+    const args = ["lineage", modelName];
+    try {
+      const { stdout } = await runRocky(args, { cwd: projectRoot });
+      const lineageData = JSON.parse(stdout) as LineageOutput;
+      view.webview.html = renderLineageHtml(view.webview, mediaUri, modelName, lineageData);
+    } catch (err) {
+      view.webview.html = renderErrorHtml(view.webview, modelName, (err as Error).message);
+    }
+  }
 }
 
-async function populatePanel(
-  panel: vscode.WebviewPanel,
-  modelName: string,
-): Promise<void> {
-  // Resolve the project root by walking up from the active editor's file,
-  // so users can open a SQL file outside the workspace root (or in a sibling
-  // folder) and lineage still finds the right rocky.toml.
-  const projectRoot = resolveProjectRoot();
-  const extensionUri = getExtensionUri();
-  const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
-
-  panel.webview.html = renderLoadingHtml(panel.webview, modelName);
-
-  // Handle messages from the webview.
-  panel.webview.onDidReceiveMessage(
-    async (msg: { type?: string; name?: string }) => {
-      if (!msg?.type) return;
-
-      // Open a model file in the editor.
-      if (msg.type === "openModel" && typeof msg.name === "string") {
-        const matches = await vscode.workspace.findFiles(
-          `**/models/**/${msg.name}.{rocky,sql}`,
-          undefined,
-          1,
-        );
-        if (matches[0]) {
-          void vscode.commands.executeCommand("vscode.open", matches[0]);
-        }
-        return;
-      }
-
-      // Fetch model history for the side panel.
-      if (msg.type === "loadModelDetails" && typeof msg.name === "string") {
-        const clickedModel = msg.name;
-        let history: ModelHistoryOutput | null = null;
-        let errorMsg: string | undefined;
-
-        try {
-          const args = ["history", "--model", clickedModel, "--output", "json"];
-          const { stdout } = await runRocky(args, { cwd: projectRoot });
-          history = JSON.parse(stdout) as ModelHistoryOutput;
-        } catch (err) {
-          errorMsg = (err as Error).message;
-        }
-
-        const reply: HostToWebviewMessage = {
-          type: "modelDetails",
-          model: clickedModel,
-          history,
-          errorMsg,
-        };
-        void panel.webview.postMessage(reply);
-      }
-    },
-    undefined,
-    [],
+/** Register the Lineage panel view; returns the provider so the host can drive it. */
+export function registerLineageView(
+  context: vscode.ExtensionContext,
+): LineageViewProvider {
+  lineageProvider = new LineageViewProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(VIEW_TYPE, lineageProvider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
   );
-
-  // Use the default JSON output (no -o table / --format dot).
-  // The engine emits LineageOutput JSON with upstream/downstream/edges.
-  // Rocky discovers rocky.toml from cwd, so we don't pass --config.
-  const args = ["lineage", modelName];
-
-  try {
-    const { stdout } = await runRocky(args, { cwd: projectRoot });
-    const lineageData = JSON.parse(stdout) as LineageOutput;
-    panel.webview.html = renderLineageHtml(
-      panel.webview,
-      mediaUri,
-      modelName,
-      lineageData,
-    );
-  } catch (err) {
-    panel.webview.html = renderErrorHtml(
-      panel.webview,
-      modelName,
-      (err as Error).message,
-    );
-  }
+  return lineageProvider;
 }
 
 function renderLoadingHtml(
