@@ -511,6 +511,11 @@
           "id": "rockyPanel",
           "title": "Rocky",
           "icon": "icons/rocky-activity-bar.svg"
+        },
+        {
+          "id": "rockyLineagePanel",
+          "title": "Lineage",
+          "icon": "icons/rocky-activity-bar.svg"
         }
       ]
     },
@@ -521,6 +526,14 @@
           "name": "Query Results",
           "type": "webview",
           "contextualTitle": "Rocky Query Results"
+        }
+      ],
+      "rockyLineagePanel": [
+        {
+          "id": "rocky.lineageView",
+          "name": "Lineage",
+          "type": "webview",
+          "contextualTitle": "Rocky Lineage"
         }
       ],
       "rocky": [

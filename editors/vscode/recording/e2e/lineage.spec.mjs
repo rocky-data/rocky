@@ -47,7 +47,8 @@ test("lineage webview renders nodes and re-fits when the viewport widens", async
   const { win } = vscode;
   const d = makeDriver(win);
 
-  // Settle, close the auto-opened chat panel, open a model, show its lineage.
+  // Settle, close the auto-opened chat panel, open a model, show its lineage
+  // (which now renders in the bottom panel, full width).
   await d.pause(4000);
   await d.key("Meta+Alt+B");
   await d.pause(500);
@@ -60,17 +61,18 @@ test("lineage webview renders nodes and re-fits when the viewport widens", async
   expect(frame, "lineage webview iframe should be present").toBeTruthy();
 
   const graphGroup = frame.locator("#graph-svg > g");
-  const splitNodes = await frame.locator(".node").count();
-  expect(splitNodes, "graph should render at least one node").toBeGreaterThan(0);
+  const nodeCount = await frame.locator(".node").count();
+  expect(nodeCount, "graph should render at least one node").toBeGreaterThan(0);
 
-  const splitScale = scaleOf(await graphGroup.getAttribute("transform"));
-  expect(splitScale, "graph should have a fit transform").toBeGreaterThan(0);
+  const initialScale = scaleOf(await graphGroup.getAttribute("transform"));
+  expect(initialScale, "graph should have a fit transform").toBeGreaterThan(0);
 
-  // Widen the canvas — the ResizeObserver should re-fit to a larger scale.
-  await d.command("View: Toggle Maximize Editor Group");
+  // Hide the primary side bar to widen the panel — the ResizeObserver should
+  // re-fit the graph to a larger scale.
+  await d.key("Meta+B");
   await d.pause(2500);
 
-  expect(await frame.locator(".node").count(), "graph must not be lost on resize").toBe(splitNodes);
-  const maxScale = scaleOf(await graphGroup.getAttribute("transform"));
-  expect(maxScale, "graph should re-fit to a larger scale in the wider viewport").toBeGreaterThan(splitScale);
+  expect(await frame.locator(".node").count(), "graph must not be lost on resize").toBe(nodeCount);
+  const widerScale = scaleOf(await graphGroup.getAttribute("transform"));
+  expect(widerScale, "graph should re-fit to a larger scale in the wider panel").toBeGreaterThan(initialScale);
 });

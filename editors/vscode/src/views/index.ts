@@ -12,6 +12,7 @@ import { registerSchemaView } from "./schemaView";
 import { registerSourcesView } from "./sourcesView";
 import { registerQueryResultsView } from "../webviews/resultGrid";
 import type { ResultGridViewProvider } from "../webviews/resultGrid";
+import { registerLineageView } from "../commands/lineage";
 
 let infoProvider: ExtensionInfoTreeProvider | undefined;
 let previewProvider: PreviewTreeProvider | undefined;
@@ -35,6 +36,7 @@ export function registerViews(context: vscode.ExtensionContext): void {
   registerBranchesView(context);
   registerHelpView(context);
   queryResultsProvider = registerQueryResultsView(context);
+  registerLineageView(context);
 }
 
 export function getPreviewProvider(): PreviewTreeProvider | undefined {
