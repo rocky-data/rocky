@@ -202,6 +202,19 @@ publish-demo scenario:
     cp editors/vscode/recording/out/{{scenario}}.gif editors/vscode/media/demo-{{scenario}}.gif
     @echo "Published editors/vscode/media/demo-{{scenario}}.gif — now embed it in editors/vscode/README.md"
 
+# Record a CLI/terminal demo GIF (vhs renders a .tape against local DuckDB).
+# Output lands in cli-recording/out/<demo>.gif. Requires `vhs` (brew install vhs).
+#   just record-cli-demo quickstart
+record-cli-demo demo="quickstart":
+    (cd cli-recording && ./record.sh {{demo}})
+
+# Copy a recorded CLI GIF into docs/public/ (where the root README's <img> tags
+# point). Only do this after eyeballing the reproduction — it overwrites the
+# hand-made GIF.
+publish-cli-demo demo:
+    cp cli-recording/out/{{demo}}.gif docs/public/demo-{{demo}}.gif
+    @echo "Published docs/public/demo-{{demo}}.gif"
+
 # --- Convenience ---
 
 # Install the monorepo-root git hooks (.git-hooks/) as the active hooksPath.
