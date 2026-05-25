@@ -23,6 +23,11 @@ pocs/**/expected/*.stderr
 # in the import-dbt POCs. Same role as expected/ — fully regenerated each run.
 pocs/**/imported/
 
+# Projects scaffolded by `rocky init` in the init-scaffolding POC.
+# Same role as expected/ — fully regenerated each run.
+pocs/**/scaffolded/
+pocs/**/scaffolded-snowflake/
+
 # Rendered screencast artefacts emitted by VHS — the .tape file is the
 # tracked source; the .mp4 / .gif lives in docs/public/ when needed.
 pocs/**/*.mp4
