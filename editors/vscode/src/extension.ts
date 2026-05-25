@@ -9,6 +9,7 @@ import { setExtensionUri } from "./extensionState";
 import { registerFoldingProvider } from "./foldingProvider";
 import { registerFormattingProvider } from "./formattingProvider";
 import { startLspClient, stopLspClient } from "./lspClient";
+import { registerRockyMcpProvider } from "./mcpServer";
 import { disposeOutputChannel } from "./output";
 import { registerRunDecorations } from "./runDecorations";
 import { registerTaskProvider } from "./taskProvider";
@@ -21,6 +22,7 @@ export function activate(context: vscode.ExtensionContext): void {
   startLspClient(context);
   registerCommands(context);
   registerChatParticipant(context);
+  registerRockyMcpProvider(context);
   registerTestExplorer(context);
   registerDeclarativeTestProvider(context);
   registerCodeLensProvider(context);

@@ -824,6 +824,12 @@
         ]
       }
     ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "rocky-data.rocky-mcp",
+        "label": "Rocky"
+      }
+    ],
     "keybindings": [
       {
         "command": "rocky.commandPalette",
