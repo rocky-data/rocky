@@ -9,6 +9,20 @@
 
 Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed graph between your code and your warehouse. Real LSP (not Jinja-aware text completion), interactive column-level lineage, compile-time diagnostics inline, and AI model generation gated through the compiler.
 
+## In action
+
+**See the SQL behind the DSL.** Open any model and reveal its compiled SQL side by side, including the transformations Rocky applies for you (here `!=` becomes a null-safe `IS DISTINCT FROM`, and the post-aggregate filter becomes `HAVING`).
+
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right, updating live" width="820" /></p>
+
+**Follow the data.** Render any model's lineage as an interactive, column-level graph.
+
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The Show Model Lineage command rendering a model's upstream dependencies as a graph" width="820" /></p>
+
+**Drive it from the keyboard.** Every Rocky command is one palette away.
+
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-quickstart.gif" alt="Opening the command palette filtered to the Rocky commands" width="820" /></p>
+
 ## Features
 
 **Editor intelligence** — diagnostics, hover, go-to-definition, find references, rename, code actions, signature help, document symbols, and inlay hints for inferred column types.
