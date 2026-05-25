@@ -2,6 +2,15 @@
 # so only the new rows move. Matches README alt-text: "incremental copies only
 # the new rows; the watermark advances".
 # Render with:  ./record.sh incremental-watermark   (runs prepare.sh first)
+#
+# HELD — published GIF stays hand-made. On rocky 1.44.0 the persisted watermark
+# is the run's wall-clock time, not max(occurred_at) from the copied rows, so
+# run 2 filters with `WHERE occurred_at > <wall-clock-now>` and copies zero
+# delta rows (target stays at 500, never 525). The reproduction therefore shows
+# the watermark moving *backwards* (wall-clock now -> the data's max occurred_at)
+# instead of advancing. The tape is kept so a fix to the POC seeds / engine
+# watermark behaviour can be re-rendered and republished; until then
+# docs/public/demo-incremental-watermark.gif keeps its hand-made original.
 
 Output out/incremental-watermark.gif
 

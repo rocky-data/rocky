@@ -63,8 +63,10 @@ frame.png`) and confirming it is equal-or-better than what it replaces.
 ## Demo feasibility
 
 The 9 CLI demos referenced from the root `README.md` map to playground POCs.
-Eight are reproducible here (local DuckDB, no keys, no interactive input) and
-ship as tapes; one is not:
+Eight ship as tapes here (local DuckDB, no keys, no interactive input); the
+ninth is not vhs-able. Seven of the eight tapes are published to
+`docs/public/`; `incremental-watermark` is held on the current binary (see
+the table note).
 
 | Demo | POC | vhs-able |
 |---|---|---|
@@ -76,7 +78,7 @@ ship as tapes; one is not:
 | ai-model-generation | `03-ai/01-model-generation` | **no** — needs `ANTHROPIC_API_KEY`; LLM output is non-deterministic |
 | lineage-diff | `06-developer-experience/11-lineage-diff` | yes (tape) — `prepare.sh` builds a throwaway git repo |
 | classification-masking | `04-governance/05-classification-masking-compliance` | yes (tape) |
-| incremental-watermark | `02-performance/01-incremental-watermark` | yes (tape) |
+| incremental-watermark | `02-performance/01-incremental-watermark` | tape included but **held** — published GIF stays hand-made; see the tape header for the 1.44.0 watermark issue |
 
 ## Requirements
 
