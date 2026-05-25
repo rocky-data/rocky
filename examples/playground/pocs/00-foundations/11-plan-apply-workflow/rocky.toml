@@ -1,0 +1,29 @@
+# 11-plan-apply-workflow — separate planning from execution.
+#
+# `rocky plan` produces a content-addressed plan persisted to
+# `.rocky/plans/<plan_id>.json`. `rocky apply <plan_id>` reads that exact
+# plan back and executes it. The plan_id is a blake3 hash of the plan
+# payload, so re-planning the same intent yields the same id — the unit of
+# deployment is reviewable, diffable, and idempotent.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
