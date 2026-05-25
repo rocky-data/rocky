@@ -1244,12 +1244,18 @@ function renderLineageHtml(
 
   const graphGroup = d3.select(svgEl).append('g');
 
+  // Set once the user pans/zooms by hand (d3 tags those events with a
+  // sourceEvent; programmatic fitToView/reset calls have none). Used to decide
+  // whether an automatic re-fit on resize would clobber a deliberate view.
+  let userZoomed = false;
+
   const zoom = d3.zoom()
     .scaleExtent([0.1, 8])
     .on('zoom', (event) => {
       graphGroup.attr('transform', event.transform);
       document.getElementById('zoom-reset').textContent =
         Math.round(event.transform.k * 100) + '%';
+      if (event.sourceEvent) userZoomed = true;
       persistState({
         scale: event.transform.k,
         panX: event.transform.x,
@@ -1848,6 +1854,27 @@ function renderLineageHtml(
       e.preventDefault();
     }
   });
+
+  // Re-fit when the viewport resizes (maximizing the editor group, dragging the
+  // split wider, etc.). The transform is otherwise computed once at render and
+  // never recomputed, so the graph stays stranded at its old scale/position in
+  // the resized canvas. Debounced; skipped once the user has zoomed/panned by
+  // hand so we don't yank a deliberate view out from under them.
+  const viewportEl = document.getElementById('viewport');
+  if (typeof ResizeObserver !== 'undefined' && viewportEl) {
+    let resizeTimer;
+    let lastW = viewportEl.clientWidth;
+    let lastH = viewportEl.clientHeight;
+    new ResizeObserver(() => {
+      const w = viewportEl.clientWidth;
+      const h = viewportEl.clientHeight;
+      if (w === lastW && h === lastH) return;
+      lastW = w;
+      lastH = h;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => { if (!userZoomed) fitToView(); }, 120);
+    }).observe(viewportEl);
+  }
 
   // ── Export SVG ───────────────────────────────────────────────────────────────
   // The live SVG references VS Code CSS variables (e.g. --vscode-foreground)
