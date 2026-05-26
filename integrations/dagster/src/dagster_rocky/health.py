@@ -46,6 +46,29 @@ class HealthcheckResult:
             ``None`` when the binary itself failed to invoke.
         error: Human-readable error message when the binary failed.
             ``None`` on success.
+
+    Example:
+
+        Inspect the result to decide what to do — three terminal shapes::
+
+            from dagster_rocky import HealthcheckResult, rocky_healthcheck
+
+            result: HealthcheckResult = rocky_healthcheck(rocky)
+
+            if result.healthy:
+                # rocky doctor ran and every check is non-critical.
+                pass
+            elif result.doctor_result is not None:
+                # rocky doctor ran but at least one check is critical.
+                # Iterate the parsed checks to surface the offenders.
+                critical = [
+                    c for c in result.doctor_result.checks
+                    if str(getattr(c, "status", "")).lower() == "critical"
+                ]
+            else:
+                # The rocky binary itself failed to invoke; result.error
+                # carries the underlying dg.Failure description.
+                assert result.error is not None
     """
 
     healthy: bool
@@ -73,6 +96,28 @@ def rocky_healthcheck(rocky: RockyResource) -> HealthcheckResult:
 
     Returns:
         A :class:`HealthcheckResult` describing the outcome.
+
+    Example:
+
+        Surface health from a Dagster sensor by tagging the run with the
+        outcome and skipping when the binary itself is missing::
+
+            import dagster as dg
+            from dagster_rocky import RockyResource, rocky_healthcheck
+
+            @dg.sensor(target=dg.AssetSelection.all())
+            def rocky_health_sensor(
+                context: dg.SensorEvaluationContext,
+                rocky: RockyResource,
+            ) -> dg.SensorResult | dg.SkipReason:
+                result = rocky_healthcheck(rocky)
+                if result.error is not None:
+                    return dg.SkipReason(f"rocky doctor unavailable: {result.error}")
+                tag = "healthy" if result.healthy else "unhealthy"
+                context.log.info("rocky health: %s", tag)
+                return dg.SensorResult(
+                    run_requests=[dg.RunRequest(tags={"rocky.health": tag})],
+                )
     """
     try:
         result = rocky.doctor()
@@ -165,6 +210,40 @@ def state_health(rocky: RockyResource, *, probe_write: bool = False) -> StateHea
     Returns:
         A :class:`~.types.StateHealthResult` describing the current
         state-backend health.
+
+    Example:
+
+        Use the cheap path from a Dagster schedule to tag the run with
+        the configured backend and last-run status::
+
+            import dagster as dg
+            from dagster_rocky import RockyResource, state_health
+
+            @dg.schedule(cron_schedule="*/15 * * * *", target=dg.AssetSelection.all())
+            def rocky_state_schedule(
+                context: dg.ScheduleEvaluationContext,
+                rocky: RockyResource,
+            ) -> dg.RunRequest:
+                health = state_health(rocky)
+                return dg.RunRequest(
+                    tags={
+                        "rocky.backend": health.backend,
+                        "rocky.last_run_status": health.last_run_status or "unknown",
+                    },
+                )
+
+        Opt into the ``state_rw`` probe to verify the backend is writable
+        before queuing work; ``probe_write=True`` adds one ``rocky doctor
+        --check state_rw`` call (sub-second on every backend)::
+
+            health = state_health(rocky, probe_write=True)
+            if health.probe_outcome != "ok":
+                context.log.warning(
+                    "state backend %s not writable: %s (%s)",
+                    health.backend,
+                    health.probe_outcome,
+                    health.probe_error,
+                )
     """
     backend = _read_state_backend(rocky.config_path)
     last_run_status, last_run_at = _last_run_from_history(rocky)
