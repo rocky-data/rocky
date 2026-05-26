@@ -194,11 +194,11 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 # OpenTelemetry (feature-gated in rocky-observe).
 # `tracing-opentelemetry` major versions track `opentelemetry` minor
-# versions: 0.32 pairs with opentelemetry 0.31 — pin the pair together.
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = "0.31"
-tracing-opentelemetry = "0.32"
+# versions: 0.33 pairs with opentelemetry 0.32 — pin the pair together.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = "0.32"
+tracing-opentelemetry = "0.33"
 
 # gRPC stack — used by `rocky-bigquery`'s Storage Read API impl of
 # `WarehouseAdapter::fetch_arrow_batch`. `tonic` 0.14 + `prost` 0.14
