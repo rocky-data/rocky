@@ -271,10 +271,10 @@ pub fn extract_remote_context() -> Option<opentelemetry::Context> {
 
     let mut carrier = HashMap::new();
     carrier.insert("traceparent".to_string(), traceparent);
-    if let Ok(tracestate) = std::env::var("TRACESTATE") {
-        if !tracestate.is_empty() {
-            carrier.insert("tracestate".to_string(), tracestate);
-        }
+    if let Ok(tracestate) = std::env::var("TRACESTATE")
+        && !tracestate.is_empty()
+    {
+        carrier.insert("tracestate".to_string(), tracestate);
     }
 
     let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
