@@ -2,7 +2,7 @@
   "name": "rocky",
   "displayName": "Rocky",
   "description": "Language support for Rocky SQL transformation engine",
-  "version": "1.28.0",
+  "version": "1.29.0",
   "publisher": "rocky-data",
   "license": "Apache-2.0",
   "repository": {
@@ -95,7 +95,12 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["warehouse", "lastRunAge", "driftCount", "branchState"]
+            "enum": [
+              "warehouse",
+              "lastRunAge",
+              "driftCount",
+              "branchState"
+            ]
           },
           "default": [],
           "markdownDescription": "Optional status bar segments to show after the LSP state. Each segment silently no-ops if its data is unavailable. Options: `warehouse`, `lastRunAge`, `driftCount`, `branchState`."
@@ -870,7 +875,9 @@
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
             },
-            "completionEvents": ["onCommand:rocky.doctor"]
+            "completionEvents": [
+              "onCommand:rocky.doctor"
+            ]
           },
           {
             "id": "rocky.walkthrough.initProject",
@@ -880,7 +887,9 @@
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
             },
-            "completionEvents": ["onCommand:rocky.init"]
+            "completionEvents": [
+              "onCommand:rocky.init"
+            ]
           },
           {
             "id": "rocky.walkthrough.compile",
@@ -890,7 +899,9 @@
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
             },
-            "completionEvents": ["onCommand:rocky.compile"]
+            "completionEvents": [
+              "onCommand:rocky.compile"
+            ]
           },
           {
             "id": "rocky.walkthrough.lineage",
@@ -900,7 +911,9 @@
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
             },
-            "completionEvents": ["onCommand:rocky.showLineage"]
+            "completionEvents": [
+              "onCommand:rocky.showLineage"
+            ]
           },
           {
             "id": "rocky.walkthrough.run",
@@ -910,7 +923,9 @@
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
             },
-            "completionEvents": ["onCommand:rocky.run"]
+            "completionEvents": [
+              "onCommand:rocky.run"
+            ]
           }
         ]
       }
