@@ -135,7 +135,7 @@ blake3 = "1"
 # MD5 — used by the Fivetran object-store cache backend to compare
 # locally-computed digests against S3 ETags (single-part ETags = MD5)
 # for the hash-dedupe write path.
-md-5 = "0.10"
+md-5 = "0.11"
 
 # JWT / RSA / Base64
 # `aws_lc_rs` matches reqwest's default crypto provider (rustls + aws-lc-rs).
@@ -143,7 +143,7 @@ md-5 = "0.10"
 # feature, the BigQuery service-account JWT signer panics at first use.
 # `pem` keeps `EncodingKey::from_rsa_pem` available for PEM-encoded
 # service-account keys.
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.22"
 
