@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.45.0] — 2026-05-26
+
+Read-only MCP tools round out the agent surface, and a watermark bug that silently dropped the first incremental delta is fixed.
+
 ### Added
 
 - **`rocky mcp`: read-only `catalog` / `history` / `metrics` / `optimize` tools** — four more tools on the MCP server, all offline (no warehouse connection, no credentials) and built on the engine's existing command cores. `catalog` returns the project-wide asset inventory in one call: every model and source with its typed columns and upstream/downstream model lists (the token-heavy column-edge set is dropped — agents use `lineage` for the column-level trace, `inspect_schema` for typed columns alone, `dependents` for one model's consumers). `history` reads the run ledger — the recent project runs, or a single model's executions (duration, rows, status, `sql_hash`) when `model` is set. `metrics` returns a model's quality snapshots (row count, freshness lag, per-column null rates) plus derived freshness / null-rate alerts. `optimize` returns the cost model's materialization recommendations (current vs recommended strategy, projected monthly savings, reasoning) computed from run history and the on-disk DAG. The tools ground an agent's proposals in the typed graph and operational reality before it reaches `propose`; none of them mutate the warehouse or engine state.
@@ -14,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`rocky-cli`: more typed-output cores extracted for reuse** — `history` / `metrics` / `optimize` now build their JSON output through reusable `history_runs_output` / `model_history_output` / `metrics_output` / `optimize_output` functions (the `run_*` handlers call the core, then print), and `compute_catalog_output` is widened to `pub`, so the MCP server and the CLI share one code path. No output-schema change.
+
+### Fixed
+
+- **Incremental bootstrap no longer drops the first delta** — an incremental pipeline's bootstrap run (the first run, or after a drift drop-and-recreate) recorded the watermark as the run's wall-clock time instead of `MAX(source.<timestamp>)`. Wall-clock is later than every existing row, so the next incremental run filtered them all out and copied zero new rows. The bootstrap now records the source data max, so the next tick picks up the delta.
 
 ## [1.44.0] — 2026-05-25
 

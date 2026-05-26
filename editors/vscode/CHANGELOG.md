@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.29.0] — 2026-05-26
+
+The extension registers `rocky mcp` as a Model Context Protocol server for agent mode, and model lineage moves to a full-width bottom panel.
+
 ### Added
 
 - **Rocky MCP server registered for agent mode** — the extension now registers `rocky mcp` as a Model Context Protocol server (one per workspace folder that has a `rocky.toml`), so the editor's agent mode can drive Rocky through the engine's typed read-only tools (`compile`, `lineage`, `inspect_schema`, `sample_rows`, `breaking_change`, `catalog`, `history`, `metrics`, `optimize`, and more). The tool surface is defined once in the Rust server, so the editor's AI stays in lockstep with whatever the installed `rocky` binary exposes — no tool definitions are duplicated in the extension. Honours `rocky.server.path` for the binary and refreshes when workspace folders or `rocky.toml` files change. The `@rocky` chat participant keeps its four single-shot slash commands; this adds the full typed toolset to agent mode. Degrades to a no-op on editor builds that predate the MCP definition-provider API (VS Code 1.101+).
+
+### Changed
+
+- **Model lineage opens in the bottom panel** — `Rocky: Show Model Lineage` now renders in its own full-width panel tab (bottom, alongside Terminal / Output) instead of a side editor tab, so the dependency graph gets the full horizontal width.
+
+### Fixed
+
+- **Lineage graph re-fits on resize** — the graph recomputes its fit when the view is resized (widening the panel, hiding the side bar) instead of staying stranded at its initial scale.
 
 ## [1.28.0] — 2026-05-25
 
