@@ -34,6 +34,18 @@ case "$demo" in
         cp -r "$POCS/06-developer-experience/01-lineage-column-level/." "$scratch/"
         clean_state "$scratch"
         ;;
+    ai-model-generation)
+        # `rocky ai` compiles models/raw_orders to ground the prompt, then
+        # writes the generated body + sidecar there. Needs ANTHROPIC_API_KEY in
+        # the env (inherited by vhs; never written into the tape). Strip any
+        # previously generated model so the tape generates fresh. NOTE: this is
+        # the one non-deterministic tape — it hits a live LLM, so a recording
+        # may need a re-run if the model doesn't compile within the retry loop.
+        cp -r "$POCS/03-ai/01-model-generation/." "$scratch/"
+        clean_state "$scratch"
+        rm -f "$scratch"/models/gen_*.rocky "$scratch"/models/gen_*.toml \
+              "$scratch"/models/monthly_revenue.* "$scratch"/models/orders_daily.* 2>/dev/null || true
+        ;;
     drift-recover)
         cp -r "$POCS/02-performance/06-schema-drift-recover/." "$scratch/"
         clean_state "$scratch"
