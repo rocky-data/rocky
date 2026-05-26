@@ -4,6 +4,7 @@
 //! trait-object implementations, stored by name for pipeline resolution.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use tracing::warn;
 use crate::error_reporter;
 
 use rocky_adapter_sdk::LoaderAdapter;
-use rocky_core::config::{AdapterConfig, RockyConfig};
+use rocky_core::adapter_capability::capability_for;
+use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig};
 use rocky_core::traits::{
     BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, NoopGovernanceAdapter, WarehouseAdapter,
 };
@@ -832,4 +834,88 @@ pub fn resolve_replication_pipeline<'a>(
         )
     })?;
     Ok((name, repl))
+}
+
+/// Format the actionable error shown when a replication command needs source
+/// discovery but the selected pipeline does not wire a discovery adapter.
+pub fn missing_discovery_config_message(
+    config: &RockyConfig,
+    config_path: &Path,
+    pipeline_name: &str,
+) -> String {
+    let pipeline_key = toml_table_key(pipeline_name);
+    let suggested_adapter = suggested_discovery_adapter(config);
+    let adapter_name = suggested_adapter.unwrap_or("<discovery-adapter-name>");
+    let placeholder_hint = if suggested_adapter.is_none() {
+        "\n\nReplace `<discovery-adapter-name>` with an adapter configured for discovery."
+    } else {
+        ""
+    };
+    format!(
+        "pipeline '{pipeline_name}' has no discovery adapter configured in {}\n\n\
+         Add this block to rocky.toml:\n\n\
+         [pipelines.{pipeline_key}.source]\n\
+         discovery = {{ adapter = \"{adapter_name}\" }}{placeholder_hint}",
+        config_path.display()
+    )
+}
+
+fn suggested_discovery_adapter(config: &RockyConfig) -> Option<&str> {
+    config.adapters.iter().find_map(|(name, adapter)| {
+        let supports_discovery = capability_for(&adapter.adapter_type)
+            .is_some_and(|capability| capability.supports_discovery);
+        let discovery_role = adapter.kind == Some(AdapterKind::Discovery)
+            || (adapter.kind.is_none() && supports_discovery);
+        discovery_role.then_some(name.as_str())
+    })
+}
+
+fn toml_table_key(key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        key.to_string()
+    } else {
+        format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_discovery_config_message_names_pipeline_path_and_toml_block() {
+        let cfg: RockyConfig = toml::from_str(
+            r#"
+[adapter.metadata]
+type = "fivetran"
+kind = "discovery"
+"#,
+        )
+        .unwrap();
+        let msg = missing_discovery_config_message(
+            &cfg,
+            Path::new("workspace/rocky.toml"),
+            "raw_replication",
+        );
+
+        assert!(msg.contains("pipeline 'raw_replication' has no discovery adapter configured"));
+        assert!(msg.contains("workspace/rocky.toml"));
+        assert!(msg.contains("[pipelines.raw_replication.source]"));
+        assert!(msg.contains("discovery = { adapter = \"metadata\" }"));
+    }
+
+    #[test]
+    fn missing_discovery_config_message_quotes_complex_pipeline_names() {
+        let cfg: RockyConfig = toml::from_str("").unwrap();
+        let msg = missing_discovery_config_message(&cfg, Path::new("rocky.toml"), "raw.ingest");
+
+        assert!(msg.contains("[pipelines.\"raw.ingest\".source]"));
+        assert!(msg.contains("adapter = \"<discovery-adapter-name>\""));
+        assert!(msg.contains(
+            "Replace `<discovery-adapter-name>` with an adapter configured for discovery."
+        ));
+    }
 }
