@@ -14,7 +14,10 @@
 //! gated behind `--allow-warehouse`. The preview reads *materialized* upstream
 //! state — if an
 //! upstream table doesn't exist yet, the adapter error is surfaced as
-//! `upstream_not_materialized`.
+//! `upstream_not_materialized`. A missing target *catalog* is surfaced
+//! separately as `missing_catalog`: on DuckDB the catalog is the database file
+//! name and can't be created by `rocky run`, so it's a config mismatch rather
+//! than a not-yet-materialized state.
 //!
 //! Failure modes emit a `{"error_kind": ...}` envelope to stdout (parsed by
 //! the VS Code extension) and exit non-zero. See [`err`].
@@ -318,17 +321,15 @@ pub async fn run_preview_rows(
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
-            let kind = if looks_like_missing_relation(&msg) {
-                "upstream_not_materialized"
-            } else {
-                "execution_error"
-            };
-            let human = if kind == "upstream_not_materialized" {
-                format!(
+            let kind = classify_query_error_kind(&msg);
+            let human = match kind {
+                "missing_catalog" => format!(
+                    "the target catalog doesn't exist (`rocky run` won't create one) — check that the `catalog` in your config matches an existing database; for DuckDB that's the file name, e.g. `playground` for `playground.duckdb`. ({msg})"
+                ),
+                "upstream_not_materialized" => format!(
                     "a referenced table doesn't exist yet — run upstream models first (`rocky run`). ({msg})"
-                )
-            } else {
-                format!("query failed: {msg}")
+                ),
+                _ => format!("query failed: {msg}"),
             };
             return Err(err(output_json, kind, &human, None));
         }
@@ -451,6 +452,36 @@ fn looks_like_missing_relation(msg: &str) -> bool {
         || m.contains("cannot be resolved")
         || m.contains("not found")
         || (m.contains("table") && m.contains("exist"))
+}
+
+/// Heuristic: does an adapter error indicate a missing *catalog* (database)?
+///
+/// DuckDB reports this as a Binder Error — `Catalog "<name>" does not exist!` —
+/// which is distinct from a missing *table*, which DuckDB prefixes with
+/// `Catalog Error: Table with name ...`. Anchoring on the quote right after the
+/// word `catalog` avoids matching that `Catalog Error:` prefix. A missing
+/// catalog is a target-config mismatch, not a not-yet-materialized state: on
+/// DuckDB the catalog is the database file name and can't be created by
+/// `rocky run`, so the `upstream_not_materialized` guidance would be wrong.
+fn looks_like_missing_catalog(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    (m.contains("does not exist") || m.contains("not found"))
+        && (m.contains("catalog \"") || m.contains("catalog '"))
+}
+
+/// Map a failed preview query's error string to a structured `error_kind`.
+///
+/// A missing catalog is checked before the broader missing-relation heuristic so
+/// a catalog-level failure isn't mislabelled `upstream_not_materialized` (which
+/// tells the user to `rocky run`, advice that can't fix a catalog mismatch).
+fn classify_query_error_kind(msg: &str) -> &'static str {
+    if looks_like_missing_catalog(msg) {
+        "missing_catalog"
+    } else if looks_like_missing_relation(msg) {
+        "upstream_not_materialized"
+    } else {
+        "execution_error"
+    }
 }
 
 /// Emit a structured error envelope and return a non-zero-exit error.
@@ -580,5 +611,37 @@ mod tests {
         ));
         assert!(looks_like_missing_relation("no such table: foo"));
         assert!(!looks_like_missing_relation("syntax error near SELECT"));
+    }
+
+    #[test]
+    fn test_looks_like_missing_catalog() {
+        assert!(looks_like_missing_catalog(
+            "DuckDB error: Binder Error: Catalog \"main\" does not exist!"
+        ));
+        // A missing *table* carries a `Catalog Error:` prefix but names the
+        // table, not a catalog — must not be misread as a missing catalog.
+        assert!(!looks_like_missing_catalog(
+            "Catalog Error: Table with name stg_orders does not exist!"
+        ));
+        assert!(!looks_like_missing_catalog("syntax error near SELECT"));
+    }
+
+    #[test]
+    fn test_classify_query_error_kind() {
+        // A missing catalog must win over the broader missing-relation match.
+        assert_eq!(
+            classify_query_error_kind(
+                "DuckDB error: Binder Error: Catalog \"main\" does not exist!"
+            ),
+            "missing_catalog"
+        );
+        assert_eq!(
+            classify_query_error_kind("Catalog Error: Table with name stg_orders does not exist!"),
+            "upstream_not_materialized"
+        );
+        assert_eq!(
+            classify_query_error_kind("syntax error near SELECT"),
+            "execution_error"
+        );
     }
 }
