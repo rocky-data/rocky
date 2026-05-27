@@ -1,4 +1,5 @@
 import type { ProfileOutput } from "../../../../src/types/generated/profile";
+import { TableSkeleton } from "../components";
 
 /** Null-rate as a colored bar — green clean, amber some, red mostly-null. */
 function NullBar({ rate }: { rate: number }) {
@@ -33,9 +34,7 @@ const num = "border-b border-vscode-border py-1 pr-4 text-right tabular-nums";
 
 export function ProfileTab({ profile }: { profile: ProfileOutput | null }) {
   if (!profile) {
-    return (
-      <p className="text-vscode-desc">Profiling… (one query per column)</p>
-    );
+    return <TableSkeleton rows={5} />;
   }
   if (profile.unavailable) {
     return (

@@ -1,4 +1,5 @@
 import type { InspectorPreviewData } from "../../../../src/webviews/inspector/contract";
+import { TableSkeleton } from "../components";
 
 /** Coerce a JSON cell value to a display string (mirrors the query-results grid). */
 function coerce(value: unknown): string {
@@ -13,7 +14,7 @@ export function PreviewTab({
   preview: InspectorPreviewData | null;
 }) {
   if (!preview) {
-    return <p className="text-vscode-desc">Loading preview…</p>;
+    return <TableSkeleton rows={6} />;
   }
   if (preview.unavailable || !preview.preview) {
     return (

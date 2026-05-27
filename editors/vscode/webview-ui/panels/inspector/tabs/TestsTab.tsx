@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { InspectorTestsData } from "../../../../src/webviews/inspector/contract";
-import { StatusBadge } from "../components";
+import { StatusBadge, TableSkeleton } from "../components";
 import { statusRank, toStatus } from "../viewModel";
 
 const SUMMARY = [
@@ -35,7 +35,7 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
   }, [rows]);
 
   if (!tests) {
-    return <p className="text-vscode-desc">Running tests…</p>;
+    return <TableSkeleton rows={4} />;
   }
   if (tests.unavailable) {
     return (
