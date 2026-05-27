@@ -448,6 +448,11 @@
         "title": "Remove Preview",
         "category": "Rocky",
         "icon": "$(trash)"
+      },
+      {
+        "command": "rocky.devtools",
+        "title": "Open Webview Devtools",
+        "category": "Rocky"
       }
     ],
     "semanticTokenScopes": [
@@ -678,6 +683,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "rocky.devtools",
+          "when": "rocky.developmentMode"
+        }
+      ],
       "view/title": [
         {
           "command": "rocky.refreshModels",
@@ -934,8 +945,13 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src/",
+    "typecheck:webview": "tsc -p webview-ui/tsconfig.webview.json",
+    "lint": "eslint src/ webview-ui/",
+    "tailwind": "tailwindcss -c webview-ui/tailwind.config.js -i webview-ui/styles/base.css -o webview-ui/styles/tailwind.generated.css",
+    "tailwind:watch": "npm run tailwind -- --watch",
+    "prebundle": "npm run tailwind",
     "bundle": "node esbuild.mjs",
+    "prebundle:watch": "npm run tailwind",
     "bundle:watch": "node esbuild.mjs --watch",
     "bundle:webview": "node scripts/bundle-webview.mjs",
     "pretest": "npm run compile && npm run bundle -- --dev",
@@ -953,17 +969,26 @@
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.9.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "@types/vscode": "1.120.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
+    "@xyflow/react": "^12.8.0",
     "d3": "^7.9.0",
     "esbuild": "^0.28.0",
     "eslint": "^10.4.0",
     "glob": "^13.0.6",
+    "jsdom": "^26.1.0",
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwindcss": "^3.4.18",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.4",
     "vitest": "^4.1.6"

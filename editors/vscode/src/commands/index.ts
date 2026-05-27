@@ -5,6 +5,7 @@ import { branchApprove, branchPromote } from "./branch";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { showDag } from "./dag";
+import { devtools } from "./devtools";
 import { hooksList, hooksTest } from "./hooks";
 import {
   init,
@@ -119,5 +120,8 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.viewMarketplace", viewMarketplace),
     vscode.commands.registerCommand("rocky.init", init),
     vscode.commands.registerCommand("rocky.playground", playground),
+
+    // Webview foundation smoke test (React + ReactFlow toolchain)
+    vscode.commands.registerCommand("rocky.devtools", devtools),
   );
 }

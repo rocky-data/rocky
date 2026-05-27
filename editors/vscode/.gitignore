@@ -1,5 +1,7 @@
 out/
+dist/
 node_modules/
 *.vsix
 .vscode-test/
 .env
+webview-ui/styles/tailwind.generated.css
