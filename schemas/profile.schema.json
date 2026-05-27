@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProfileColumnStats": {
+      "description": "Observed data profile for one column.",
+      "properties": {
+        "distinct": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "null_rate": {
+          "format": "double",
+          "type": "number"
+        },
+        "nulls": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "observed_values": {
+          "description": "Observed low-cardinality domain (empty above the cardinality cap).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "type": {
+          "description": "Inferred Rocky type name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "distinct",
+        "name",
+        "null_rate",
+        "nulls",
+        "observed_values",
+        "rows",
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky profile <model> [--column <col>]`.\n\nA per-column data profile (row / null / distinct counts, min / max, and the low-cardinality domain) for a model's target table, computed by a single aggregate query per column. DuckDB-only this release; a non-DuckDB target reports `unavailable` with an empty `columns` list rather than erroring.",
+  "properties": {
+    "columns": {
+      "description": "One entry per profiled column.",
+      "items": {
+        "$ref": "#/definitions/ProfileColumnStats"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "unavailable": {
+      "description": "Set when profiling could not run (e.g. a non-DuckDB target this release).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "columns",
+    "command",
+    "model",
+    "version"
+  ],
+  "title": "ProfileOutput",
+  "type": "object"
+}

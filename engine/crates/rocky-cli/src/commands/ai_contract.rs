@@ -53,7 +53,7 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
 /// Compile the project to obtain typed model schemas. Source schemas come from
 /// the warm cache (degrading to empty on a cold cache), matching the AI
 /// commands' grounding approach.
-fn compile_project(
+pub(crate) fn compile_project(
     config_path: &Path,
     state_path: &Path,
     models_dir: &str,
@@ -81,14 +81,14 @@ fn compile_project(
 /// Ported from the rocky-mcp grounding helper: identifiers are validated via
 /// `rocky_sql::validation` before composing the ref so SQL is never built from
 /// raw input.
-struct PreparedTable {
-    adapter: std::sync::Arc<dyn WarehouseAdapter>,
-    table_ref: String,
+pub(crate) struct PreparedTable {
+    pub(crate) adapter: std::sync::Arc<dyn WarehouseAdapter>,
+    pub(crate) table_ref: String,
 }
 
 /// Either a runnable table query or the reason a non-DuckDB adapter blocks
 /// profiling this release.
-enum PreparedKind {
+pub(crate) enum PreparedKind {
     Ready(PreparedTable),
     Unavailable(String),
 }
@@ -134,7 +134,7 @@ fn duckdb_only_refusal(adapter_type: &str) -> Option<String> {
 /// Resolve a model's target table into a validated table ref + warehouse
 /// adapter — but only on DuckDB. Other adapters return the typed "unavailable"
 /// reason so the command refuses cleanly with a clear message.
-fn prepare_table_query(
+pub(crate) fn prepare_table_query(
     config_path: &Path,
     compile_result: &CompileResult,
     model_name: &str,
@@ -193,7 +193,7 @@ fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
 /// plus a bounded domain query when the distinct count is low. SQL is built
 /// from the already-validated `table_ref` and a freshly-validated column
 /// identifier — never from raw input.
-async fn profile_column(
+pub(crate) async fn profile_column(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
     typed_col: &TypedColumn,

@@ -5,6 +5,7 @@ import { RockyCliError, runRockyJson } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput } from "../types/generated/compile";
 import type { PreviewRowsOutput } from "../types/generated/preview_rows";
+import type { ProfileOutput } from "../types/generated/profile";
 import type { TestOutput } from "../types/generated/test";
 import { createWebviewPanelApp } from "../webviews/host/registerPanel";
 import type { WebviewHost } from "../webviews/host/WebviewHost";
@@ -51,6 +52,7 @@ export function openInspector(arg?: unknown): void {
       host = h;
       h.onRequest("tests", (p) => loadTests((p as ModelParam).model));
       h.onRequest("preview", (p) => loadPreview((p as ModelParam).model));
+      h.onRequest("profile", (p) => loadProfile((p as ModelParam).model));
     },
   });
   panel.onDidDispose(() => {
@@ -156,6 +158,29 @@ async function loadPreview(model: string): Promise<InspectorPreviewData> {
     return { preview };
   } catch (err) {
     return { unavailable: errMessage(err) };
+  }
+}
+
+/**
+ * Profile `model`'s target table per column via `rocky profile` (DuckDB-only;
+ * a single aggregate query per column, no LLM). Invoked lazily (Profile tab).
+ */
+async function loadProfile(model: string): Promise<ProfileOutput> {
+  try {
+    return await runRockyJson<ProfileOutput>([
+      "profile",
+      model,
+      "--output",
+      "json",
+    ]);
+  } catch (err) {
+    return {
+      version: "",
+      command: "profile",
+      model,
+      columns: [],
+      unavailable: errMessage(err),
+    };
   }
 }
 

@@ -6,13 +6,15 @@ import type {
   ModelParam,
   ModelPush,
 } from "../../../src/webviews/inspector/contract";
+import type { ProfileOutput } from "../../../src/types/generated/profile";
 import { ColumnsTab } from "./tabs/ColumnsTab";
 import { LineageTab } from "./tabs/LineageTab";
 import { OverviewTab } from "./tabs/OverviewTab";
 import { PreviewTab } from "./tabs/PreviewTab";
+import { ProfileTab } from "./tabs/ProfileTab";
 import { TestsTab } from "./tabs/TestsTab";
 
-type TabId = "overview" | "columns" | "lineage" | "tests" | "preview";
+type TabId = "overview" | "columns" | "lineage" | "tests" | "preview" | "profile";
 
 const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: "overview", label: "Overview" },
@@ -20,6 +22,7 @@ const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: "lineage", label: "Lineage" },
   { id: "tests", label: "Tests" },
   { id: "preview", label: "Preview" },
+  { id: "profile", label: "Profile" },
 ];
 
 export function InspectorApp() {
@@ -27,6 +30,7 @@ export function InspectorApp() {
   const [tab, setTab] = useState<TabId>("overview");
   const [tests, setTests] = useState<InspectorTestsData | null>(null);
   const [preview, setPreview] = useState<InspectorPreviewData | null>(null);
+  const [profile, setProfile] = useState<ProfileOutput | null>(null);
 
   // The host pushes a fresh model summary on open and on every re-target.
   useEffect(() => {
@@ -34,6 +38,7 @@ export function InspectorApp() {
       setModel(next);
       setTests(null);
       setPreview(null);
+      setProfile(null);
       setTab("overview");
     });
   }, []);
@@ -64,6 +69,29 @@ export function InspectorApp() {
       active = false;
     };
   }, [tab, modelName, preview]);
+
+  // Profiling runs DuckDB aggregates, so load it lazily too.
+  useEffect(() => {
+    if (tab !== "profile" || !modelName || profile) return;
+    let active = true;
+    void getRpc()
+      .request<ProfileOutput>("profile", { model: modelName } satisfies ModelParam)
+      .then((data) => active && setProfile(data))
+      .catch(
+        (err) =>
+          active &&
+          setProfile({
+            version: "",
+            command: "profile",
+            model: modelName,
+            columns: [],
+            unavailable: String(err),
+          }),
+      );
+    return () => {
+      active = false;
+    };
+  }, [tab, modelName, profile]);
 
   if (!model) {
     return <div className="p-4 text-vscode-desc">Loading model…</div>;
@@ -110,6 +138,7 @@ export function InspectorApp() {
         {tab === "lineage" && <LineageTab data={data} />}
         {tab === "tests" && <TestsTab tests={tests} />}
         {tab === "preview" && <PreviewTab preview={preview} />}
+        {tab === "profile" && <ProfileTab profile={profile} />}
       </div>
     </div>
   );
