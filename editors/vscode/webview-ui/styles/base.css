@@ -26,3 +26,31 @@ body {
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size, 13px);
 }
+
+/*
+ * ReactFlow ships a light-themed MiniMap + Controls. Map its theming custom
+ * properties onto VS Code's so the canvas matches the active editor theme
+ * instead of punching a white panel into a dark workbench. These cascade at
+ * ReactFlow's point-of-use, so they win regardless of stylesheet order. Both
+ * the public (`--xy-*`) and fallback (`--xy-*-default`) names are set since the
+ * resolved one varies across @xyflow/react minor versions.
+ */
+.react-flow {
+  --xy-minimap-background-color: var(--vscode-editorWidget-background);
+  --xy-minimap-background-color-default: var(--vscode-editorWidget-background);
+  --xy-minimap-mask-background-color: rgb(0 0 0 / 0.45);
+  --xy-minimap-mask-background-color-default: rgb(0 0 0 / 0.45);
+  --xy-minimap-node-background-color: var(--vscode-editorWidget-border, var(--vscode-foreground));
+  --xy-minimap-node-background-color-default: var(--vscode-editorWidget-border, var(--vscode-foreground));
+
+  --xy-controls-button-background-color: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background));
+  --xy-controls-button-background-color-default: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background));
+  --xy-controls-button-background-color-hover: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  --xy-controls-button-background-color-hover-default: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  --xy-controls-button-color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  --xy-controls-button-color-default: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  --xy-controls-button-color-hover: var(--vscode-foreground);
+  --xy-controls-button-color-hover-default: var(--vscode-foreground);
+  --xy-controls-button-border-color: var(--vscode-widget-border, transparent);
+  --xy-controls-button-border-color-default: var(--vscode-widget-border, transparent);
+}
