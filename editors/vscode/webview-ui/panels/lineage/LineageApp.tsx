@@ -12,21 +12,21 @@ import type {
   ReplayData,
 } from "../../../src/webviews/lineage/contract";
 import { getRpc } from "../../runtime/rpcClient";
-import { Canvas } from "./Canvas";
+import { Canvas } from "../inspector/Canvas";
 import {
   ColorModeContext,
   OverlaysContext,
   type ColorMode,
   type OverlayKind,
-} from "./context";
-import { makeBreakingOverlay } from "./overlays/breaking";
-import { costOverlay } from "./overlays/cost";
-import { makeDriftOverlay } from "./overlays/drift";
-import { freshnessOverlay } from "./overlays/freshness";
-import { makeGovernanceOverlay } from "./overlays/governance";
-import { makeLastRunOverlay } from "./overlays/lastRun";
-import type { LineageOverlay } from "./overlays/types";
-import { Toolbar } from "./Toolbar";
+} from "../inspector/context";
+import { makeBreakingOverlay } from "../inspector/overlays/breaking";
+import { costOverlay } from "../inspector/overlays/cost";
+import { makeDriftOverlay } from "../inspector/overlays/drift";
+import { freshnessOverlay } from "../inspector/overlays/freshness";
+import { makeGovernanceOverlay } from "../inspector/overlays/governance";
+import { makeLastRunOverlay } from "../inspector/overlays/lastRun";
+import type { LineageOverlay } from "../inspector/overlays/types";
+import { Toolbar } from "../inspector/Toolbar";
 
 export function LineageApp() {
   const [graph, setGraph] = useState<GraphData | null>(null);
