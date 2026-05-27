@@ -943,7 +943,7 @@
           {
             "id": "rocky.walkthrough.lineage",
             "title": "View Model Lineage",
-            "description": "Render the model dependency graph as an interactive SVG.\n\n[Show Model Lineage](command:rocky.showLineage)",
+            "description": "Render the model dependency graph as an interactive canvas.\n\n[Show Model Lineage](command:rocky.showLineage)",
             "media": {
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
@@ -979,7 +979,6 @@
     "bundle": "node esbuild.mjs",
     "prebundle:watch": "npm run tailwind",
     "bundle:watch": "node esbuild.mjs --watch",
-    "bundle:webview": "node scripts/bundle-webview.mjs",
     "pretest": "npm run compile && npm run bundle -- --dev",
     "test": "node ./out/test/runTest.js",
     "test:unit": "vitest run",
@@ -988,7 +987,7 @@
     "package:local": "vsce package -o rocky.vsix",
     "install:local": "npm run package:local && code --install-extension rocky.vsix --force",
     "uninstall:local": "code --uninstall-extension rocky-data.rocky",
-    "vscode:prepublish": "npm run compile && npm run bundle:webview && npm run bundle"
+    "vscode:prepublish": "npm run compile && npm run bundle"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -1005,7 +1004,6 @@
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
     "@xyflow/react": "^12.8.0",
-    "d3": "^7.9.0",
     "esbuild": "^0.28.0",
     "eslint": "^10.4.0",
     "glob": "^13.0.6",

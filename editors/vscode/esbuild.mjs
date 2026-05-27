@@ -12,9 +12,6 @@
 // Tailwind CSS is generated separately (`npm run tailwind`, wired as the
 // `prebundle` hook) into `webview-ui/styles/tailwind.generated.css`, which each
 // panel entry imports; esbuild's css loader then emits `dist/webviews/<panel>.css`.
-//
-// The legacy `media/lineage-graph.js` (dagre + d3) is still built by
-// `scripts/bundle-webview.mjs` and retired once the React canvas lands.
 
 import { build, context } from "esbuild";
 import { existsSync, readdirSync, rmSync } from "node:fs";
