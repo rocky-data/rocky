@@ -4,13 +4,16 @@
 
 /*
  * Preflight is disabled (see tailwind.config.js), so VS Code's theme owns the
- * document. This is the only global reset we apply — it inherits the editor's
- * colours and font so a webview visually belongs inside the workbench.
+ * document. We re-apply only the slice of a reset we actually need: border-box
+ * sizing, plus a zero-width solid border default so Tailwind `border-*`
+ * utilities render at all (preflight normally supplies the border-style).
  */
 *,
 *::before,
 *::after {
   box-sizing: border-box;
+  border-width: 0;
+  border-style: solid;
 }
 
 html,
@@ -25,6 +28,19 @@ body {
   background: var(--vscode-editor-background);
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size, 13px);
+}
+
+/*
+ * Without preflight, <button> keeps the browser's light chrome — a white box
+ * with a grey border — which is jarring in a dark workbench (it was painting
+ * the Inspector tabs as white boxes). Strip the UA surface and inherit the
+ * editor's type; buttons that want a fill re-add it with a `bg-*` utility.
+ */
+button {
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
 /*
