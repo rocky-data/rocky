@@ -994,6 +994,7 @@
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
+    "@tailwindplus/elements": "^1.0.22",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@types/mocha": "^10.0.10",
