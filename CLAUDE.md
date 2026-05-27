@@ -44,6 +44,8 @@ This repo ships a set of task-specific skills in `.claude/skills/` that should b
 
 Engine-local skills also live at `engine/.claude/skills/` (12 skills) and activate when working inside `engine/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, plus 9 Rust convention skills (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`).
 
+VS Code-local skills live at `editors/vscode/.claude/skills/` and activate when working inside `editors/vscode/`: `tailwind-plus-elements` (using `@tailwindplus/elements` headless web components in the React webviews).
+
 ## Cross-project changes (the reason this is one repo)
 
 DSL changes still touch multiple subprojects in lockstep. The monorepo lets you land them as one PR with one CI run.
