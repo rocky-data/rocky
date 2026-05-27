@@ -98,14 +98,21 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # rustls crypto provider — direct dep on the binary crates so they can
 # install a single process-level default at startup. The dependency graph
-# compiles in BOTH rustls backends: `ring` (via hyper-rustls → reqwest) and
-# `aws_lc_rs` (via jsonwebtoken + rustls). With two providers present,
-# rustls cannot auto-detect a default from crate features, so the first
-# `ClientConfig::builder()` (reqwest's discover/doctor TLS path) panics with
-# "Could not automatically determine the process-level CryptoProvider".
-# Installing aws-lc-rs explicitly resolves the ambiguity — it matches the
-# reqwest `rustls-tls` + tonic `tls-aws-lc` + jsonwebtoken `aws_lc_rs` stack
-# already in the tree.
+# compiles in BOTH rustls 0.23 crypto backends, and neither can be removed:
+#   - `ring` — pulled by `object_store`'s `cloud` feature (S3/GCS/Azure
+#     state-sync), which hard-codes ring for AWS SigV4 request signing (no
+#     aws-lc-rs alternative, no feature flag to switch it), and also by
+#     reqwest's `rustls-tls` feature (which is ring-based, not aws-lc-rs).
+#   - `aws_lc_rs` — pulled by `tonic` `tls-aws-lc` (BigQuery Storage Read
+#     gRPC) and `jsonwebtoken` (GCP/Snowflake JWT signing).
+# With two providers present, rustls can't auto-detect a default from crate
+# features, so the first `ClientConfig::builder()` (reqwest's discover/doctor
+# TLS path) panics with "Could not automatically determine the process-level
+# CryptoProvider". Both providers are inherent to the dependency set, so the
+# fix is to install aws-lc-rs explicitly as the process default at startup
+# (see `install_crypto_provider` in the rocky / rocky-lsp binaries) — NOT to
+# try to drop ring, which a workspace reqwest-feature change cannot achieve
+# because object_store re-pulls it via feature unification.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 
 # Async
@@ -150,9 +157,11 @@ blake3 = "1"
 md-5 = "0.11"
 
 # JWT / RSA / Base64
-# `aws_lc_rs` matches reqwest's default crypto provider (rustls + aws-lc-rs).
-# `jsonwebtoken` 10.x requires picking a provider explicitly; without a
-# feature, the BigQuery service-account JWT signer panics at first use.
+# `jsonwebtoken` 10.x requires picking a rustls crypto provider explicitly;
+# without a feature the GCP/Snowflake service-account JWT signer panics at
+# first use. We pick `aws_lc_rs` so the signer shares one provider with the
+# `tonic` gRPC TLS stack. (reqwest's `rustls-tls` is ring-based, so the binary
+# links both backends — see the `rustls` note above.)
 # `pem` keeps `EncodingKey::from_rsa_pem` available for PEM-encoded
 # service-account keys.
 jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
@@ -217,8 +226,11 @@ tracing-opentelemetry = "0.33"
 # already appear transitively in the lock graph via opentelemetry-otlp;
 # declaring them at workspace scope lets future adapters reuse the
 # exact pinned majors instead of accidentally pulling a second copy.
-# `tls-aws-lc` + `tls-webpki-roots` align with the reqwest `rustls-tls`
-# + jsonwebtoken `aws_lc_rs` stack already in the workspace.
+# `tls-aws-lc` gives the gRPC channel its TLS via aws-lc-rs — the same
+# provider as the `jsonwebtoken` signer. This does NOT match reqwest's
+# `rustls-tls` (which is ring-based), so the binary links both rustls
+# backends; the startup `install_crypto_provider` call selects aws-lc-rs.
+# See the `rustls` note above.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "transport", "tls-aws-lc", "tls-webpki-roots"] }
 prost = "0.14"
 # Auto-generated tonic client for the BigQuery Storage Read API
