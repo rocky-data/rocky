@@ -1,5 +1,5 @@
 import type { ProfileOutput } from "../../../../src/types/generated/profile";
-import { TableSkeleton } from "../components";
+import { EmptyState, TableSkeleton } from "../components";
 
 /** Null-rate as a colored bar — green clean, amber some, red mostly-null. */
 function NullBar({ rate }: { rate: number }) {
@@ -38,14 +38,15 @@ export function ProfileTab({ profile }: { profile: ProfileOutput | null }) {
   }
   if (profile.unavailable) {
     return (
-      <div className="text-sm">
-        <p className="font-semibold text-vscode-error">Profile unavailable.</p>
-        <p className="mt-1 text-vscode-desc">{profile.unavailable}</p>
-      </div>
+      <EmptyState
+        tone="error"
+        title="Profile unavailable"
+        hint={profile.unavailable}
+      />
     );
   }
   if (profile.columns.length === 0) {
-    return <p className="text-vscode-desc">No columns to profile.</p>;
+    return <EmptyState title="No columns to profile" />;
   }
   return (
     <table className="w-full border-collapse text-sm">

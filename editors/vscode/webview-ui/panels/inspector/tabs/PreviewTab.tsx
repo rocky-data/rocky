@@ -1,5 +1,5 @@
 import type { InspectorPreviewData } from "../../../../src/webviews/inspector/contract";
-import { TableSkeleton } from "../components";
+import { EmptyState, TableSkeleton } from "../components";
 
 /** Coerce a JSON cell value to a display string (mirrors the query-results grid). */
 function coerce(value: unknown): string {
@@ -18,12 +18,11 @@ export function PreviewTab({
   }
   if (preview.unavailable || !preview.preview) {
     return (
-      <div className="text-sm">
-        <p className="font-semibold text-vscode-error">Preview unavailable.</p>
-        <p className="mt-1 text-vscode-desc">
-          {preview.unavailable ?? "No rows returned."}
-        </p>
-      </div>
+      <EmptyState
+        tone="error"
+        title="Preview unavailable"
+        hint={preview.unavailable ?? "No rows returned."}
+      />
     );
   }
   const rows = preview.preview;

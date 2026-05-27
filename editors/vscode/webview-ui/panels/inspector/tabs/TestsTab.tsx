@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { InspectorTestsData } from "../../../../src/webviews/inspector/contract";
-import { StatusBadge, TableSkeleton } from "../components";
+import { EmptyState, StatusBadge, TableSkeleton } from "../components";
 import { statusRank, toStatus } from "../viewModel";
 
 const SUMMARY = [
@@ -39,15 +39,15 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
   }
   if (tests.unavailable) {
     return (
-      <div className="text-sm">
-        <p className="font-semibold text-vscode-error">Tests unavailable.</p>
-        <p className="mt-1 text-vscode-desc">{tests.unavailable}</p>
-      </div>
+      <EmptyState tone="error" title="Tests unavailable" hint={tests.unavailable} />
     );
   }
   if (tests.results.length === 0) {
     return (
-      <p className="text-vscode-desc">No declarative tests for this model.</p>
+      <EmptyState
+        title="No declarative tests"
+        hint="This model declares no tests in its contract."
+      />
     );
   }
 
