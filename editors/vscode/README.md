@@ -19,9 +19,9 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed gr
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The lineage canvas focused on a model's neighborhood, with a cost overlay drawn on the graph" width="820" /></p>
 
-**Inspect any model.** The Inspector shows a model's columns and types, and traces column-level lineage with the transform behind each hop.
+**Inspect any model.** The Inspector's Overview is a model trust dashboard — cost, blast radius, drift, governance, and freshness in one place. Here a PII-classified model flags a column left unmasked, and the Columns tab traces each column's upstream lineage.
 
-<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector showing a model's columns and its column-level lineage with per-hop transforms" width="820" /></p>
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="820" /></p>
 
 **Find any model fast.** The Inspector's command palette (the Search button, or ⌘K) filters every model as you type and jumps straight to it.
 
