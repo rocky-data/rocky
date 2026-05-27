@@ -23,6 +23,10 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed gr
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector showing a model's columns and its column-level lineage with per-hop transforms" width="820" /></p>
 
+**Find any model fast.** The Inspector's command palette (the Search button, or ⌘K) filters every model as you type and jumps straight to it.
+
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-model-search.gif" alt="A command palette in the Inspector filtering the project's models as you type, then re-targeting the Inspector to the selected model" width="820" /></p>
+
 **Drive it from the keyboard.** Every Rocky command is one palette away.
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-quickstart.gif" alt="Opening the command palette filtered to the Rocky commands" width="820" /></p>

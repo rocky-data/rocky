@@ -35,11 +35,12 @@ Transitions use read-only `data-closed` / `data-enter` / `data-leave` / `data-tr
 
 ## React 19 interop
 
-- Render `<el-dialog>` etc. directly in JSX. Add ambient typings for the `el-*` tags you use (a `declare global { namespace JSX { interface IntrinsicElements { "el-dialog": …; } } }` in a `.d.ts` under `webview-ui/`), or cast.
-- **State** — prefer the declarative attributes: `open` on `<el-dialog>`, `hidden` on `<el-disclosure>`, driven from React state. For booleans on custom elements, render the attribute conditionally (`{...(isOpen ? { open: "" } : {})}`) since React sets primitives as attributes on unknown tags.
-- **Open/close** can also be fully declarative via the Invoker Commands API — `<button command="show-modal" commandfor="id">` / `command="close"`, and the disclosure's `command="--toggle"` / `--show` / `--hide`. No React wiring needed for these.
-- **Events** (`change`, `open`, `close`, `cancel`, …) are native `CustomEvent`s, not React synthetic events — wire them with a `ref` + `addEventListener` in a `useEffect`, not an `onChange` prop. `cancel` is `preventDefault()`-able.
-- **Imperative** — instances expose `show()` / `hide()` / `toggle()` / `reset()` / `setFilterCallback(cb)`. If you must touch one in JS before it's defined, gate on readiness: `if (customElements.get("el-dialog")) … else window.addEventListener("elements:ready", …)` (rarely needed since we import at module load).
+- **Use the typed React wrappers**, not raw `<el-*>` tags: `import { ElDialog, ElDialogPanel, ElDialogBackdrop, ElCommandPalette, ElCommandList, ElDisclosure, ElSelect, ElDropdown, … } from "@tailwindplus/elements/react"`. They're typed (`HTMLAttributes`), so no hand-rolled JSX intrinsics. Also add a static `import "@tailwindplus/elements"` in the webview entry (`main.tsx`) for **eager** registration — the wrappers otherwise lazy-import the base lib on mount via a runtime dynamic chunk.
+- **Open/close** — drive from React state via the element's imperative methods behind a `ref`: `ref.current.show()` / `.hide()` on `<el-dialog>`, gated on `customElements.whenDefined("el-dialog")`. The declarative `open` / `hidden` attributes also work but aren't on the wrapper's `HTMLAttributes` type (so you'd cast); the Invoker Commands API (`command="show-modal" commandfor`) works for button triggers.
+- **Events** (`change`, `open`, `close`, `cancel`, …) are native `CustomEvent`s, not React synthetic — wire via a `ref` + `addEventListener` in a `useEffect`, not `onChange`. Sync React state back on `close` / `cancel` so it doesn't desync; `cancel` is `preventDefault()`-able.
+- **Don't let React re-apply attributes the element manages.** The command palette toggles `hidden` on its option buttons to filter; if React re-renders that list it fights the palette. Keep the options stable (memoize them, stable callbacks) so React doesn't reconcile them after the element has filtered.
+- **Focus on open**: React's `autoFocus` fires at mount (while the dialog is still hidden), so focus the input explicitly via a `ref` when you open the dialog.
+- **Imperative** — instances also expose `toggle()` / `reset()` / `setFilterCallback(cb)`.
 
 ## Which element fits which Rocky surface
 
@@ -51,6 +52,11 @@ Transitions use read-only `data-closed` / `data-enter` / `data-leave` / `data-tr
 | `el-dropdown` / `el-popover` | The lineage canvas context menu; info popovers on nodes |
 | `el-disclosure` | Collapsible Overview / Columns sections in the Inspector |
 | `el-tabs` | The Inspector tab bar (the hand-rolled one works — swap only for the a11y/keyboard win) |
+
+## Gotchas
+
+- **`Cmd+K` collides with VS Code's chord prefix** — a webview `keydown` for `Meta`/`Ctrl`+`K` may be swallowed by the workbench. Give the feature a visible button trigger as the reliable path; treat the shortcut as a bonus.
+- **`el-command-palette` empty state**: with no `<el-defaults>`, an empty query renders `<el-no-results>` even while the option list is visible. For a browse-then-filter palette, drop `<el-no-results>` (empty = browse all, typing filters) or supply `<el-defaults>`.
 
 ## Licensing
 

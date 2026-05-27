@@ -1,4 +1,8 @@
 import "../../styles/tailwind.generated.css";
+// Register the TailwindPlus Elements custom elements eagerly (at entry-eval,
+// before React mounts) so the command palette's <el-dialog> is defined when the
+// Inspector reffs it. The /react wrappers would otherwise lazy-import this.
+import "@tailwindplus/elements";
 import { lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { AppShell } from "../../runtime/AppShell";
