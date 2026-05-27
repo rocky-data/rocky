@@ -17,8 +17,7 @@ import {
 } from "./info";
 import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
-import { openInspector } from "./inspector";
-import { showLineage } from "./lineage";
+import { openInspector, showLineage } from "./inspector";
 import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
 import { doctor, optimize } from "./ops";

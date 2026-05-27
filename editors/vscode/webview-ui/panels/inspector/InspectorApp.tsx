@@ -67,7 +67,7 @@ export function InspectorApp() {
   // re-targets after that are webview-driven via focusedModel below.
   useEffect(() => {
     return getRpc().onPush<InspectorTarget>("target", (t) => {
-      setFocusedModel(t.model);
+      if (t.model) setFocusedModel(t.model);
       if (t.tab) setTab(t.tab as TabId);
     });
   }, []);
@@ -267,7 +267,11 @@ export function InspectorApp() {
         {/* Detail tabs — these need the focused model's loaded detail. */}
         {tab !== "lineage" && (
           <div className="h-full overflow-auto p-4">
-            {!model ? (
+            {!focusedModel ? (
+              <div className="text-vscode-desc">
+                Select a model in the Lineage tab to inspect it.
+              </div>
+            ) : !model ? (
               <div className="text-vscode-desc">Loading model…</div>
             ) : !model.ok ? (
               <div className="text-vscode-error">

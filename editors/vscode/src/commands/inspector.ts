@@ -1,14 +1,15 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { getExtensionUri } from "../extensionState";
 import { RockyCliError, runRockyJson } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput } from "../types/generated/compile";
 import type { PreviewRowsOutput } from "../types/generated/preview_rows";
 import type { ProfileOutput } from "../types/generated/profile";
 import type { TestOutput } from "../types/generated/test";
-import { createWebviewPanelApp } from "../webviews/host/registerPanel";
-import type { WebviewHost } from "../webviews/host/WebviewHost";
+import {
+  registerWebviewViewApp,
+  type WebviewViewController,
+} from "../webviews/host/registerPanel";
 import type {
   InspectorModelData,
   InspectorPreviewData,
@@ -27,43 +28,23 @@ import {
   runAiAction,
 } from "./lineage";
 
+/** Bottom-panel webview-view id — must match `contributes.views.rockyInspectorPanel`. */
 const VIEW_TYPE = "rocky.inspector";
 
-// A single reusable panel, re-targeted across invocations.
-let panel: vscode.WebviewPanel | undefined;
-let host: WebviewHost | undefined;
+let controller: WebviewViewController | undefined;
 
-/**
- * Open — or re-target — the Rocky Inspector for a model. Accepts a model name,
- * a schema-tree node (model or column), or nothing (falls back to the active
- * editor's file name).
- */
-export function openInspector(arg?: unknown): void {
-  const model = resolveModelName(arg);
-  if (!model) {
-    void vscode.window.showInformationMessage(
-      "Open a Rocky model file, or pick one from the Schema view, to inspect it.",
-    );
-    return;
-  }
-
-  if (panel && host) {
-    panel.reveal(vscode.ViewColumn.Active);
-    host.push<"target", InspectorTarget>("target", { model });
-    return;
-  }
-
-  panel = createWebviewPanelApp(getExtensionUri(), VIEW_TYPE, {
+/** Register the Rocky Inspector view (bottom panel); called once from `registerViews`. */
+export function registerInspectorView(context: vscode.ExtensionContext): void {
+  controller = registerWebviewViewApp(context, VIEW_TYPE, {
     entry: "inspector",
     title: "Rocky Inspector",
     setup: (h) => {
-      host = h;
       h.onRequest("model", (p) => loadModelData((p as ModelParam).model));
       h.onRequest("tests", (p) => loadTests((p as ModelParam).model));
       h.onRequest("preview", (p) => loadPreview((p as ModelParam).model));
       h.onRequest("profile", (p) => loadProfile((p as ModelParam).model));
       // The Lineage tab embeds the project canvas, so the Inspector serves the
-      // same graph + overlay + node-action requests the standalone view does.
+      // same graph + overlay + node-action requests the standalone view did.
       h.onRequest("graph", () => buildGraph());
       h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
       h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
@@ -73,11 +54,30 @@ export function openInspector(arg?: unknown): void {
       h.onRequest("governance", () => loadGovernance());
     },
   });
-  panel.onDidDispose(() => {
-    panel = undefined;
-    host = undefined;
-  });
-  if (host) host.push<"target", InspectorTarget>("target", { model });
+}
+
+/**
+ * Reveal the Rocky Inspector and target a model. Accepts a model name, a
+ * schema-tree node (model or column), or nothing (falls back to the active
+ * editor's file name).
+ */
+export async function openInspector(arg?: unknown): Promise<void> {
+  const model = resolveModelName(arg);
+  if (!model) {
+    void vscode.window.showInformationMessage(
+      "Open a Rocky model file, or pick one from the Schema view, to inspect it.",
+    );
+    return;
+  }
+  await vscode.commands.executeCommand(`${VIEW_TYPE}.focus`);
+  controller?.push<InspectorTarget>("target", { model });
+}
+
+/** Reveal the Inspector on its Lineage tab, framed on a model when one resolves. */
+export async function showLineage(arg?: unknown): Promise<void> {
+  const model = resolveModelName(arg);
+  await vscode.commands.executeCommand(`${VIEW_TYPE}.focus`);
+  controller?.push<InspectorTarget>("target", { model, tab: "lineage" });
 }
 
 /** Fan-in `rocky catalog` + `rocky compile` into one model-scoped summary. */
