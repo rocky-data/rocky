@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ElPopover } from "@tailwindplus/elements/react";
 import type { InspectorModelData } from "../../../../src/webviews/inspector/contract";
 import type {
   BreakingData,
@@ -14,6 +15,51 @@ import {
   formatCount,
   freshnessLabel,
 } from "../viewModel";
+
+const DOWNSTREAM_POPOVER_ID = "rocky-blast-radius-downstream";
+
+/**
+ * The blast-radius value, click-to-reveal: shows the downstream count and (when
+ * non-zero) opens a popover listing exactly which models a change would hit.
+ * el-popover renders in the browser top layer, so it never clips at the panel edge.
+ */
+function BlastRadiusValue({ downstream }: { downstream: string[] }) {
+  const label = `${downstream.length} downstream`;
+  if (downstream.length === 0) return <>{label}</>;
+  // el-popover's `anchor` isn't in React's HTMLAttributes — pass it as a raw attribute.
+  const anchorAttr = { anchor: "bottom start" };
+  return (
+    <>
+      <button
+        type="button"
+        popoverTarget={DOWNSTREAM_POPOVER_ID}
+        className="text-left underline decoration-dotted underline-offset-4 hover:decoration-solid"
+      >
+        {label}
+      </button>
+      <ElPopover
+        id={DOWNSTREAM_POPOVER_ID}
+        popover="auto"
+        {...anchorAttr}
+        className="max-h-64 w-56 overflow-auto rounded-md border border-vscode-border bg-vscode-widget-bg p-1 shadow-lg [--anchor-gap:4px]"
+      >
+        <p className="px-2 py-1 text-[11px] uppercase tracking-wide text-vscode-desc">
+          Downstream models
+        </p>
+        <ul>
+          {downstream.map((m) => (
+            <li
+              key={m}
+              className="truncate rounded px-2 py-1 font-mono text-xs text-vscode-fg"
+            >
+              {m}
+            </li>
+          ))}
+        </ul>
+      </ElPopover>
+    </>
+  );
+}
 
 /**
  * Overview = the model trust dashboard. Headline cost + blast-radius, then a
@@ -81,7 +127,7 @@ export function OverviewTab({ data }: { data: InspectorModelData }) {
           hero
           label="Blast radius"
           title="Models downstream of this one — what could break if you change it."
-          value={`${data.downstreamModels.length} downstream`}
+          value={<BlastRadiusValue downstream={data.downstreamModels} />}
           tone={
             breakingFinding
               ? "risk"

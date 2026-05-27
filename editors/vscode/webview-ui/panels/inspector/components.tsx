@@ -103,6 +103,37 @@ export function TableSkeleton({ rows = 5 }: { rows?: number }) {
   );
 }
 
+/**
+ * A centered, consistent empty / unavailable state. `tone="error"` flags an
+ * unavailable surface (a failed fetch); the default reads as "nothing here yet."
+ */
+export function EmptyState({
+  title,
+  hint,
+  tone = "muted",
+}: {
+  title: string;
+  hint?: ReactNode;
+  tone?: "muted" | "error";
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-1 py-10 text-center">
+      <p
+        className={
+          tone === "error"
+            ? "text-sm font-semibold text-vscode-error"
+            : "text-sm text-vscode-fg"
+        }
+      >
+        {title}
+      </p>
+      {hint != null && hint !== "" && (
+        <p className="max-w-xs text-xs text-vscode-desc">{hint}</p>
+      )}
+    </div>
+  );
+}
+
 /** A small theme-aware test-status pill (or an em dash when untested). */
 export function StatusBadge({ status }: { status: ColumnTestStatus }) {
   if (status === "none") return <span className="text-vscode-desc">—</span>;
