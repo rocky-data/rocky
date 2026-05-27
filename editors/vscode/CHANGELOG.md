@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-05-27
+
+A ground-up rebuild of Rocky's visual surfaces in the editor: a React Flow lineage canvas, and a Rocky Inspector that turns any model into a trust dashboard — cost, blast radius, drift, governance, and freshness, read straight from the engine's typed output.
+
+### Added
+
+- **Rocky Inspector — a model trust dashboard.** Open any model in a bottom-panel Inspector whose Overview surfaces the signals that matter before you ship a change: estimated cost per run, blast radius (how many models depend on this one, with a click to see exactly which), data contract, freshness SLA, schema drift reconciled on the last run, governance (classified or PII columns, and any left unmasked), last-run status, and materialization. Each card lights green, amber, or red from the engine's typed output.
+- **Inspector tabs for every angle on a model.** Columns shows per-column upstream lineage with its confidence and transform, plus inline distinct and null-rate profiling. Profile gives per-column row, null, distinct, and min/max with a null-rate bar and a `unique` flag on candidate keys. Tests summarises pass/warn/fail and sorts failures first. Preview shows sampled rows.
+- **A React Flow lineage canvas** with drag, pan, zoom, a minimap, color-by-type or by-materialization, search, and focus/refocus. A right-click menu opens the file, refocuses, or shows upstream and downstream. Trust-plane overlays draw cost, freshness, drift, breaking-change blast radius, last run, and governance directly onto the graph.
+- **Right-click AI on a node** — explain it, draft a contract, generate tests, or build everything downstream, scoped to that model.
+- **Cmd+K model search** in the Inspector — fuzzy-find any model and retarget the Inspector to it.
+
+### Changed
+
+- **Lineage and the Inspector are now one panel.** The standalone lineage view became the Inspector's Lineage tab; clicking a node retargets every detail tab to that model.
+
 ## [1.29.0] — 2026-05-26
 
 The extension registers `rocky mcp` as a Model Context Protocol server for agent mode, and model lineage moves to a full-width bottom panel.
