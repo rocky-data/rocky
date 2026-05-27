@@ -1,16 +1,22 @@
 import dagre from "@dagrejs/dagre";
 import type { Edge, Node } from "@xyflow/react";
+import type {
+  CostHint,
+  ModelFreshnessConfig,
+} from "../../../src/types/generated/compile";
 import type { GraphData } from "../../../src/webviews/lineage/contract";
 
 /** Layout direction: left-to-right or top-to-bottom. */
 export type Direction = "LR" | "TB";
 
-/** Data carried by a model node (also consumed by overlays in later phases). */
+/** Data carried by a model node, including the fields overlays decorate from. */
 export interface ModelNodeData extends Record<string, unknown> {
   label: string;
   kind: string;
   materialization: string | null;
   fqn: string;
+  costHint: CostHint | null;
+  freshness: ModelFreshnessConfig | null;
 }
 
 export type ModelFlowNode = Node<ModelNodeData, "model">;
@@ -53,6 +59,8 @@ export function toFlow(
         kind: node.kind,
         materialization: node.materialization,
         fqn: node.fqn,
+        costHint: node.costHint,
+        freshness: node.freshness,
       },
     };
   });

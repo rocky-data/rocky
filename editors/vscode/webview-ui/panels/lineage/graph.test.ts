@@ -43,6 +43,8 @@ describe("search matching", () => {
     kind: "Model",
     materialization: null,
     fqn: label,
+    costHint: null,
+    freshness: null,
   });
 
   it("matches substrings case-insensitively", () => {

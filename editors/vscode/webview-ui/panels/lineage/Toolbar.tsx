@@ -1,4 +1,10 @@
-import type { ColorMode } from "./context";
+import type { ColorMode, OverlayKind } from "./context";
+
+const OVERLAY_LABELS: Record<OverlayKind, string> = {
+  cost: "Cost",
+  freshness: "Freshness",
+  drift: "Drift",
+};
 
 function segment(active: boolean): string {
   return (
@@ -14,21 +20,38 @@ export function Toolbar({
   onColorMode,
   search,
   onSearch,
+  activeOverlays,
+  onToggleOverlay,
 }: {
   colorMode: ColorMode;
   onColorMode: (mode: ColorMode) => void;
   search: string;
   onSearch: (query: string) => void;
+  activeOverlays: Set<OverlayKind>;
+  onToggleOverlay: (kind: OverlayKind) => void;
 }) {
   return (
-    <div className="flex items-center gap-2 border-b border-vscode-border px-3 py-2">
+    <div className="flex flex-wrap items-center gap-2 border-b border-vscode-border px-3 py-2">
       <input
         value={search}
         onChange={(e) => onSearch(e.target.value)}
         placeholder="Filter models (substring or /regex/)…"
-        className="w-64 rounded border border-vscode-border bg-transparent px-2 py-1 text-sm text-vscode-fg outline-none focus:border-vscode-focus"
+        className="w-56 rounded border border-vscode-border bg-transparent px-2 py-1 text-sm text-vscode-fg outline-none focus:border-vscode-focus"
       />
       <span className="flex-1" />
+      <span className="text-xs text-vscode-desc">Overlays</span>
+      <div className="flex gap-1 text-xs">
+        {(Object.keys(OVERLAY_LABELS) as OverlayKind[]).map((kind) => (
+          <button
+            key={kind}
+            type="button"
+            onClick={() => onToggleOverlay(kind)}
+            className={"rounded border border-vscode-border " + segment(activeOverlays.has(kind))}
+          >
+            {OVERLAY_LABELS[kind]}
+          </button>
+        ))}
+      </div>
       <span className="text-xs text-vscode-desc">Color by</span>
       <div className="flex overflow-hidden rounded border border-vscode-border text-xs">
         <button

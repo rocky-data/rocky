@@ -1,14 +1,16 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
-import { runRockyJson } from "../rockyCli";
+import { RockyCliError, runRockyJson } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
-import type { CompileOutput } from "../types/generated/compile";
+import type { CompileOutput, ModelDetail } from "../types/generated/compile";
+import type { DriftOutput } from "../types/generated/drift";
 import {
   registerWebviewViewApp,
   type WebviewViewController,
 } from "../webviews/host/registerPanel";
 import type {
+  DriftData,
   GraphData,
   GraphEdge,
   GraphNode,
@@ -55,6 +57,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
           (params as ModelParam).model,
         );
       });
+      host.onRequest("drift", () => loadDrift());
     },
   });
 }
@@ -74,18 +77,23 @@ async function buildGraph(): Promise<GraphData> {
     ),
   ]);
 
-  const materializations = new Map<string, string>();
+  const details = new Map<string, ModelDetail>();
   for (const detail of compile?.models_detail ?? []) {
-    materializations.set(detail.name, detail.strategy.type);
+    details.set(detail.name, detail);
   }
 
-  const nodes: GraphNode[] = catalog.assets.map((asset) => ({
-    id: asset.model_name,
-    label: asset.model_name,
-    kind: asset.kind,
-    materialization: materializations.get(asset.model_name) ?? null,
-    fqn: asset.fqn,
-  }));
+  const nodes: GraphNode[] = catalog.assets.map((asset) => {
+    const detail = details.get(asset.model_name);
+    return {
+      id: asset.model_name,
+      label: asset.model_name,
+      kind: asset.kind,
+      materialization: detail?.strategy.type ?? null,
+      fqn: asset.fqn,
+      costHint: detail?.cost_hint ?? null,
+      freshness: detail?.freshness ?? null,
+    };
+  });
 
   const ids = new Set(nodes.map((n) => n.id));
   const edges: GraphEdge[] = [];
@@ -108,5 +116,27 @@ async function openModelFile(model: string): Promise<void> {
   );
   if (matches[0]) {
     void vscode.commands.executeCommand("vscode.open", matches[0]);
+  }
+}
+
+/** Run `rocky drift` for the drift overlay; degrades gracefully when unavailable. */
+async function loadDrift(): Promise<DriftData> {
+  try {
+    const out = await runRockyJson<DriftOutput>(["drift", "--output", "json"], {
+      cwd: resolveProjectRoot(),
+    });
+    return {
+      actions: out.drift.actions_taken.map((a) => ({
+        table: a.table,
+        action: a.action,
+        reason: a.reason,
+      })),
+    };
+  } catch (err) {
+    const unavailable =
+      err instanceof RockyCliError
+        ? err.stderr.trim() || err.message
+        : String(err);
+    return { actions: [], unavailable };
   }
 }

@@ -2,6 +2,10 @@
  * Type-only contract for the Lineage canvas, shared by the extension host
  * (`src/commands/lineage.ts`) and the React app (`webview-ui/panels/lineage`).
  */
+import type {
+  CostHint,
+  ModelFreshnessConfig,
+} from "../../types/generated/compile";
 
 /** One model or source node in the project graph. */
 export interface GraphNode {
@@ -15,6 +19,24 @@ export interface GraphNode {
   materialization: string | null;
   /** Fully-qualified target identifier. */
   fqn: string;
+  /** Heuristic compile-time cost estimate, when available (powers the cost overlay). */
+  costHint: CostHint | null;
+  /** Declared freshness policy, when configured (powers the freshness overlay). */
+  freshness: ModelFreshnessConfig | null;
+}
+
+/** A drift action for one table, from `rocky drift`. */
+export interface DriftAction {
+  table: string;
+  action: string;
+  reason: string;
+}
+
+/** Drift overlay payload — the result of the `"drift"` request. */
+export interface DriftData {
+  actions: DriftAction[];
+  /** Set when drift could not be computed (e.g. no prior run). */
+  unavailable?: string;
 }
 
 /** A model-level dependency edge (upstream producer → downstream consumer). */
