@@ -51,11 +51,6 @@ export interface GraphData {
   edges: GraphEdge[];
 }
 
-/** `"focus"` push: center on and select this model. */
-export interface FocusPush {
-  model: string;
-}
-
 /** Model-scoped request params (`openFile`, `openInspector`). */
 export interface ModelParam {
   model: string;

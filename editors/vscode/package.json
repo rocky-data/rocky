@@ -529,8 +529,8 @@
           "icon": "icons/rocky-activity-bar.svg"
         },
         {
-          "id": "rockyLineagePanel",
-          "title": "Lineage",
+          "id": "rockyInspectorPanel",
+          "title": "Rocky Inspector",
           "icon": "icons/rocky-activity-bar.svg"
         }
       ]
@@ -544,12 +544,12 @@
           "contextualTitle": "Rocky Query Results"
         }
       ],
-      "rockyLineagePanel": [
+      "rockyInspectorPanel": [
         {
-          "id": "rocky.lineageView",
-          "name": "Lineage",
+          "id": "rocky.inspector",
+          "name": "Rocky Inspector",
           "type": "webview",
-          "contextualTitle": "Rocky Lineage"
+          "contextualTitle": "Rocky Inspector"
         }
       ],
       "rocky": [

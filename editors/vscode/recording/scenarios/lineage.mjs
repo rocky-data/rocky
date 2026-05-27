@@ -1,13 +1,13 @@
-// Lineage: render the project as an interactive ReactFlow canvas in the bottom
-// panel, focused on a model's neighborhood, then light up a trust-plane overlay
-// on the graph. The canvas fans in `rocky catalog` + `rocky compile`, so it
-// needs more settle time than the single-`rocky lineage` SVG renderer it
-// replaced. Interactions use the webview-reach driver (no visible cursor — the
-// GIF shows the badges appearing, not the click).
+// Lineage: render the project as an interactive ReactFlow canvas — the Rocky
+// Inspector's Lineage tab — focused on a model's neighborhood, then light up a
+// trust-plane overlay on the graph. The canvas fans in `rocky catalog` + `rocky
+// compile`. The Inspector opens in the bottom panel, so the scenario maximizes
+// it to give the canvas room. Interactions use the webview-reach driver (no
+// visible cursor — the GIF shows the badges appearing, not the click).
 
 export default {
   name: "lineage",
-  description: "Render the project lineage canvas and light up an overlay.",
+  description: "Render the lineage canvas (Inspector tab) and light up an overlay.",
   // Self-contained POC: fct_revenue <- stg_orders <- raw_orders.
   workspace: "examples/playground/pocs/06-developer-experience/01-lineage-column-level",
   size: { width: 1280, height: 800 },
@@ -19,10 +19,12 @@ export default {
     await d.openFile("fct_revenue.rocky");
     await d.pause(600); // openFile already settles ~2.5s; just a beat on the model
 
-    // "Show Model Lineage" reveals the ReactFlow canvas (bottom panel, full
-    // width) and frames the focal model's neighborhood.
+    // "Show Model Lineage" reveals the Inspector on its Lineage tab, framed on
+    // the focal model's neighborhood. Maximize the panel so the canvas has room.
     await d.command("Rocky: Show Model Lineage");
-    await d.pause(4000); // catalog + compile fan-in, dagre layout, fitView
+    await d.pause(1500);
+    await d.command("View: Toggle Maximized Panel");
+    await d.pause(3500); // catalog + compile fan-in, dagre layout, fitView
 
     // Toggle an overlay so the GIF shows trust-plane data on the graph. Cost
     // rides on compile's heuristic estimate; swap for Freshness / Drift /

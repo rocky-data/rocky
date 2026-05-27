@@ -62,7 +62,8 @@ export interface ModelParam {
  * on a node in the Lineage tab's canvas), so this carries only the first model.
  */
 export interface InspectorTarget {
-  model: string;
+  /** Model to focus; omitted by Show Lineage when no model is resolvable. */
+  model?: string;
   tab?: string;
 }
 
