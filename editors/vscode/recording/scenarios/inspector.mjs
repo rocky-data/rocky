@@ -15,7 +15,7 @@ export default {
 
   async run(d) {
     await d.openFile("fct_revenue.rocky");
-    await d.pause(1800);
+    await d.pause(600); // openFile already settles ~2.5s; just a beat on the model
 
     await d.command("Rocky: Open in Inspector");
     await d.pause(4000); // catalog + compile fan-in
@@ -23,8 +23,8 @@ export default {
     // Tour the catalog-fed tabs. "Overview" is always present, so it's the
     // stable marker for the Inspector webview frame; each tab is a button.
     await d.clickInWebview("text=Overview", "Columns");
-    await d.pause(2400);
+    await d.pause(2200);
     await d.clickInWebview("text=Overview", "Lineage");
-    await d.pause(3000);
+    await d.pause(2600);
   },
 };

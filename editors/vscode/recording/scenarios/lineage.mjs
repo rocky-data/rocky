@@ -17,12 +17,12 @@ export default {
 
   async run(d) {
     await d.openFile("fct_revenue.rocky");
-    await d.pause(2000);
+    await d.pause(600); // openFile already settles ~2.5s; just a beat on the model
 
     // "Show Model Lineage" reveals the ReactFlow canvas (bottom panel, full
     // width) and frames the focal model's neighborhood.
     await d.command("Rocky: Show Model Lineage");
-    await d.pause(5000); // catalog + compile fan-in, dagre layout, fitView
+    await d.pause(4000); // catalog + compile fan-in, dagre layout, fitView
 
     // Toggle an overlay so the GIF shows trust-plane data on the graph. Cost
     // rides on compile's heuristic estimate; swap for Freshness / Drift /
@@ -30,6 +30,6 @@ export default {
     // recorded POC (Drift / Last run need a prior `rocky run`; Breaking needs a
     // git base ref; Governance needs classified columns).
     await d.clickInWebview(".react-flow", "Cost");
-    await d.pause(3000);
+    await d.pause(2500);
   },
 };
