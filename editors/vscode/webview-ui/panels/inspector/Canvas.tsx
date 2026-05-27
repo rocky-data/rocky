@@ -119,7 +119,7 @@ export function Canvas({
     const model = menu.model;
     return [
       { label: "Open file", onClick: () => onOpenFile(model) },
-      { label: "Open in Inspector", onClick: () => onOpenInspector(model) },
+      { label: "Inspect this model", onClick: () => onOpenInspector(model) },
       {
         label: "Refocus on node",
         onClick: () => setFocusFilter(neighborhood(data.edges, model)),
