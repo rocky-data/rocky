@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { ColumnTestStatus } from "./viewModel";
 
 const STATUS_COLOR: Record<Exclude<ColumnTestStatus, "none">, string> = {
@@ -64,6 +64,41 @@ export function StatusCard({
       {sub != null && sub !== "" && (
         <div className="mt-0.5 text-xs text-vscode-desc">{sub}</div>
       )}
+    </div>
+  );
+}
+
+/** A shimmer placeholder block — width/height via `className` or `style`. */
+export function Skeleton({
+  className = "",
+  style,
+}: {
+  className?: string;
+  style?: CSSProperties;
+}) {
+  return (
+    <div
+      aria-hidden
+      className={`animate-pulse rounded ${className}`}
+      style={{ backgroundColor: "rgba(127,127,127,0.18)", ...style }}
+    />
+  );
+}
+
+/** A loading placeholder shaped like a table, shown while a tab's data loads. */
+export function TableSkeleton({ rows = 5 }: { rows?: number }) {
+  return (
+    <div className="space-y-2.5" aria-hidden>
+      {Array.from({ length: rows }).map((_, r) => (
+        <div key={r} className="flex items-center gap-3">
+          <Skeleton className="h-3.5 shrink-0" style={{ width: "9rem" }} />
+          <Skeleton
+            className="h-3.5 flex-1"
+            style={{ maxWidth: `${55 + ((r * 17) % 35)}%` }}
+          />
+          <Skeleton className="h-3.5 shrink-0" style={{ width: "3.5rem" }} />
+        </div>
+      ))}
     </div>
   );
 }
