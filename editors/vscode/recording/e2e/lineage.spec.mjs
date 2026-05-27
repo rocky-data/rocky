@@ -1,9 +1,13 @@
-// E2E: the lineage webview. This is the kind of coverage the in-process
+// E2E: the lineage canvas webview. This is the kind of coverage the in-process
 // @vscode/test-electron suite can't provide — it reaches into the webview's
-// out-of-process iframe DOM to assert the graph actually rendered, and that it
-// re-fits when the viewport widens (the ResizeObserver fix in
-// src/commands/lineage.ts). DOM-based, not pixel-based: correct and immune to
+// out-of-process iframe DOM to assert the ReactFlow graph actually rendered and
+// survives a viewport resize. DOM-based, not pixel-based: correct and immune to
 // the recording-time compositor quirk.
+//
+// (The panel is now a ReactFlow canvas — `.react-flow__node` — replacing the
+// old dagre/d3 `#graph-svg` renderer. ReactFlow keeps the graph on container
+// resize rather than re-fitting the transform, so we assert survival, not a
+// scale change.)
 
 import { test as base, expect } from "@playwright/test";
 import * as path from "node:path";
@@ -30,49 +34,41 @@ const test = base.extend({
   },
 });
 
-// The lineage graph lives in an out-of-process webview iframe; find it by content.
-async function lineageFrame(win) {
+// The canvas lives in an out-of-process webview iframe; find it by content.
+async function canvasFrame(win) {
   for (const f of win.frames()) {
-    if (await f.locator("#graph-svg").count().catch(() => 0)) return f;
+    if (await f.locator(".react-flow__node").count().catch(() => 0)) return f;
   }
   return null;
 }
 
-function scaleOf(transform) {
-  const m = /scale\(([0-9.]+)\)/.exec(transform ?? "");
-  return m ? parseFloat(m[1]) : null;
-}
-
-test("lineage webview renders nodes and re-fits when the viewport widens", async ({ vscode }) => {
+test("lineage canvas renders nodes and survives a viewport resize", async ({ vscode }) => {
   const { win } = vscode;
   const d = makeDriver(win);
 
   // Settle, close the auto-opened chat panel, open a model, show its lineage
-  // (which now renders in the bottom panel, full width).
+  // (rendered in the bottom panel, full width).
   await d.pause(4000);
   await d.key("Meta+Alt+B");
   await d.pause(500);
   await d.openFile("fct_revenue.rocky");
   await d.pause(1500);
   await d.command("Rocky: Show Model Lineage");
-  await d.pause(4000);
+  await d.pause(5000); // catalog + compile fan-in + dagre layout + fitView
 
-  const frame = await lineageFrame(win);
-  expect(frame, "lineage webview iframe should be present").toBeTruthy();
+  const frame = await canvasFrame(win);
+  expect(frame, "lineage canvas webview iframe should be present").toBeTruthy();
 
-  const graphGroup = frame.locator("#graph-svg > g");
-  const nodeCount = await frame.locator(".node").count();
-  expect(nodeCount, "graph should render at least one node").toBeGreaterThan(0);
+  const nodeCount = await frame.locator(".react-flow__node").count();
+  expect(nodeCount, "canvas should render at least one node").toBeGreaterThan(0);
 
-  const initialScale = scaleOf(await graphGroup.getAttribute("transform"));
-  expect(initialScale, "graph should have a fit transform").toBeGreaterThan(0);
-
-  // Hide the primary side bar to widen the panel — the ResizeObserver should
-  // re-fit the graph to a larger scale.
+  // Hide the primary side bar to widen the panel — ReactFlow must keep the
+  // graph intact (the old renderer re-fit the transform; ReactFlow preserves it).
   await d.key("Meta+B");
   await d.pause(2500);
 
-  expect(await frame.locator(".node").count(), "graph must not be lost on resize").toBe(nodeCount);
-  const widerScale = scaleOf(await graphGroup.getAttribute("transform"));
-  expect(widerScale, "graph should re-fit to a larger scale in the wider panel").toBeGreaterThan(initialScale);
+  expect(
+    await frame.locator(".react-flow__node").count(),
+    "graph must survive the resize",
+  ).toBe(nodeCount);
 });
