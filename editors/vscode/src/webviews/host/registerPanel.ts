@@ -82,8 +82,12 @@ export function registerWebviewViewApp(
     resolveWebviewView: (view) => {
       const host = new WebviewHost(view.webview, context.extensionUri);
       const extra = opts.setup?.(host);
-      controller.attach(host);
+      // Render first: it resets the host's ready flag and push buffer. Only
+      // then attach the controller, whose flush of pre-resolve pushes (e.g. a
+      // `focus` queued before the view existed) must land in the fresh buffer
+      // rather than being wiped by render().
       host.render({ entry: opts.entry, title: opts.title });
+      controller.attach(host);
       view.onDidDispose(() => {
         host.dispose();
         if (extra) extra.dispose();

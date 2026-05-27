@@ -43,4 +43,21 @@ describe("RpcClient", () => {
 
     expect(seen).toEqual([{ kind: "dark" }]);
   });
+
+  it("buffers a push that arrives before any subscriber and replays it on subscribe", () => {
+    const client = new RpcClient({ postMessage: () => {} });
+
+    // Push lands before onPush — mirrors the host flushing buffered pushes on
+    // `ready` while a lazy panel is still suspended and hasn't subscribed.
+    postFromHost({ kind: "push", type: "model", payload: { ok: true } });
+
+    const seen: unknown[] = [];
+    client.onPush("model", (p) => seen.push(p));
+    expect(seen).toEqual([{ ok: true }]); // replayed to the late subscriber
+
+    // Drained once: a second subscriber attaching later does not re-receive it.
+    const seen2: unknown[] = [];
+    client.onPush("model", (p) => seen2.push(p));
+    expect(seen2).toEqual([]);
+  });
 });
