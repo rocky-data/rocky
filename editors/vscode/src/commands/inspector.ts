@@ -12,9 +12,9 @@ import type { WebviewHost } from "../webviews/host/WebviewHost";
 import type {
   InspectorModelData,
   InspectorPreviewData,
+  InspectorTarget,
   InspectorTestsData,
   ModelParam,
-  ModelPush,
 } from "../webviews/inspector/contract";
 
 const VIEW_TYPE = "rocky.inspector";
@@ -22,8 +22,6 @@ const VIEW_TYPE = "rocky.inspector";
 // A single reusable panel, re-targeted across invocations.
 let panel: vscode.WebviewPanel | undefined;
 let host: WebviewHost | undefined;
-// Monotonic id so a slow fan-in for an earlier model can't overwrite a newer one.
-let generation = 0;
 
 /**
  * Open — or re-target — the Rocky Inspector for a model. Accepts a model name,
@@ -41,7 +39,7 @@ export function openInspector(arg?: unknown): void {
 
   if (panel && host) {
     panel.reveal(vscode.ViewColumn.Active);
-    void pushModel(host, model);
+    host.push<"target", InspectorTarget>("target", { model });
     return;
   }
 
@@ -50,6 +48,7 @@ export function openInspector(arg?: unknown): void {
     title: "Rocky Inspector",
     setup: (h) => {
       host = h;
+      h.onRequest("model", (p) => loadModelData((p as ModelParam).model));
       h.onRequest("tests", (p) => loadTests((p as ModelParam).model));
       h.onRequest("preview", (p) => loadPreview((p as ModelParam).model));
       h.onRequest("profile", (p) => loadProfile((p as ModelParam).model));
@@ -59,25 +58,10 @@ export function openInspector(arg?: unknown): void {
     panel = undefined;
     host = undefined;
   });
-  if (host) void pushModel(host, model);
+  if (host) host.push<"target", InspectorTarget>("target", { model });
 }
 
-/** Fan-in catalog + compile, then push the model summary (or an error). */
-async function pushModel(target: WebviewHost, model: string): Promise<void> {
-  const mine = ++generation;
-  try {
-    const data = await loadModelData(model);
-    if (mine !== generation) return; // a newer open superseded this fan-in
-    target.push<"model", ModelPush>("model", { ok: true, data });
-  } catch (err) {
-    if (mine !== generation) return;
-    target.push<"model", ModelPush>("model", {
-      ok: false,
-      error: errMessage(err),
-    });
-  }
-}
-
+/** Fan-in `rocky catalog` + `rocky compile` into one model-scoped summary. */
 async function loadModelData(model: string): Promise<InspectorModelData> {
   const [catalog, compile] = await Promise.all([
     runRockyJson<CatalogOutput>(["catalog", "--output", "json"]),

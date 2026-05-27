@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { getRpc } from "../../runtime/rpcClient";
 import type {
+  InspectorModelData,
   InspectorPreviewData,
+  InspectorTarget,
   InspectorTestsData,
   ModelParam,
   ModelPush,
@@ -26,22 +28,40 @@ const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
 ];
 
 export function InspectorApp() {
+  const [focusedModel, setFocusedModel] = useState<string | null>(null);
   const [model, setModel] = useState<ModelPush | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
   const [tests, setTests] = useState<InspectorTestsData | null>(null);
   const [preview, setPreview] = useState<InspectorPreviewData | null>(null);
   const [profile, setProfile] = useState<ProfileOutput | null>(null);
 
-  // The host pushes a fresh model summary on open and on every re-target.
+  // The host pushes the initial target (which model + tab) when the view opens.
+  // Re-targets after that are webview-driven via focusedModel below.
   useEffect(() => {
-    return getRpc().onPush<ModelPush>("model", (next) => {
-      setModel(next);
-      setTests(null);
-      setPreview(null);
-      setProfile(null);
-      setTab("overview");
+    return getRpc().onPush<InspectorTarget>("target", (t) => {
+      setFocusedModel(t.model);
+      if (t.tab) setTab(t.tab as TabId);
     });
   }, []);
+
+  // Load (or reload) the focused model's detail by request, so a re-target —
+  // including a click on a node in the Lineage tab's canvas — is race-free; a
+  // stale response from a superseded model is ignored.
+  useEffect(() => {
+    if (!focusedModel) return;
+    let ignore = false;
+    setModel(null);
+    setTests(null);
+    setPreview(null);
+    setProfile(null);
+    void getRpc()
+      .request<InspectorModelData>("model", { model: focusedModel } satisfies ModelParam)
+      .then((data) => !ignore && setModel({ ok: true, data }))
+      .catch((err) => !ignore && setModel({ ok: false, error: String(err) }));
+    return () => {
+      ignore = true;
+    };
+  }, [focusedModel]);
 
   const modelName = model?.ok ? model.data.modelName : undefined;
 

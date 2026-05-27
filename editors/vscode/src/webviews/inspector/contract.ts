@@ -50,12 +50,26 @@ export interface InspectorPreviewData {
   unavailable?: string;
 }
 
-/** Params for the model-scoped lazy RPC requests. */
+/** Params for the model-scoped RPC requests (`model`, `tests`, `preview`, `profile`). */
 export interface ModelParam {
   model: string;
 }
 
-/** Push type carrying {@link InspectorModelData} (or an error string). */
+/**
+ * Initial intent pushed when the Inspector view is revealed: which model to
+ * load and, optionally, which tab to open. Re-targets after that are
+ * webview-driven (a `model` request keyed on the focused model — e.g. a click
+ * on a node in the Lineage tab's canvas), so this carries only the first model.
+ */
+export interface InspectorTarget {
+  model: string;
+  tab?: string;
+}
+
+/**
+ * Result shape the webview holds for the focused model: the resolved
+ * {@link InspectorModelData}, or the error string if the `model` request failed.
+ */
 export type ModelPush =
   | { ok: true; data: InspectorModelData }
   | { ok: false; error: string };
