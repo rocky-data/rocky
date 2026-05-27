@@ -49,15 +49,31 @@ export function PreviewTab({
           </thead>
           <tbody>
             {rows.rows.map((row, i) => (
-              <tr key={i}>
-                {row.map((cell, j) => (
-                  <td
-                    key={j}
-                    className="whitespace-pre border-b border-vscode-border px-2 py-1 text-vscode-fg"
-                  >
-                    {coerce(cell)}
-                  </td>
-                ))}
+              <tr
+                key={i}
+                style={
+                  i % 2 ? { backgroundColor: "rgba(127,127,127,0.05)" } : undefined
+                }
+              >
+                {row.map((cell, j) => {
+                  const isNull = cell === null || cell === undefined;
+                  return (
+                    <td
+                      key={j}
+                      className={`whitespace-pre border-b border-vscode-border px-2 py-1 text-vscode-fg ${
+                        typeof cell === "number" ? "text-right tabular-nums" : ""
+                      }`}
+                    >
+                      {isNull ? (
+                        <span className="italic text-vscode-desc opacity-60">
+                          NULL
+                        </span>
+                      ) : (
+                        coerce(cell)
+                      )}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
