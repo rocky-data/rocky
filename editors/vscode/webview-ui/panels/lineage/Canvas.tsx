@@ -15,7 +15,7 @@ import {
   useState,
   type MouseEvent as RFMouseEvent,
 } from "react";
-import type { GraphData } from "../../../src/webviews/lineage/contract";
+import type { AiAction, GraphData } from "../../../src/webviews/lineage/contract";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { downstreamOf, labelMatches, neighborhood, upstreamOf } from "./graph";
 import { toFlow, type ModelFlowNode } from "./layout";
@@ -29,6 +29,7 @@ interface CanvasProps {
   search: string;
   onOpenFile: (model: string) => void;
   onOpenInspector: (model: string) => void;
+  onAi: (action: AiAction, model: string) => void;
 }
 
 interface MenuState {
@@ -43,6 +44,7 @@ export function Canvas({
   search,
   onOpenFile,
   onOpenInspector,
+  onAi,
 }: CanvasProps) {
   const baseFlow = useMemo(() => toFlow(data, "LR"), [data]);
   const [nodes, setNodes, onNodesChange] = useNodesState<ModelFlowNode>(
@@ -117,8 +119,12 @@ export function Canvas({
           setFocusFilter(new Set([model, ...downstreamOf(data.edges, model)])),
       },
       { label: "Show all", onClick: () => setFocusFilter(null) },
+      { label: "AI: Explain", onClick: () => onAi("explain", model) },
+      { label: "AI: Generate tests", onClick: () => onAi("test", model) },
+      { label: "AI: Draft contract", onClick: () => onAi("contract", model) },
+      { label: "AI: Build downstream…", onClick: () => onAi("build", model) },
     ];
-  }, [menu, data.edges, onOpenFile, onOpenInspector]);
+  }, [menu, data.edges, onOpenFile, onOpenInspector, onAi]);
 
   return (
     <div className="relative h-full w-full">

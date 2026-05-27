@@ -1,7 +1,13 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
-import { RockyCliError, runRockyJson } from "../rockyCli";
+import {
+  RockyCliError,
+  runRockyJson,
+  runRockyJsonWithProgress,
+  showRockyError,
+} from "../rockyCli";
+import type { AiContractOutput } from "../types/generated/ai_contract";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput, ModelDetail } from "../types/generated/compile";
 import type { DriftOutput } from "../types/generated/drift";
@@ -10,12 +16,14 @@ import {
   type WebviewViewController,
 } from "../webviews/host/registerPanel";
 import type {
+  AiActionParam,
   DriftData,
   GraphData,
   GraphEdge,
   GraphNode,
   ModelParam,
 } from "../webviews/lineage/contract";
+import { runAiExplain, runAiGenerate, runAiTest } from "./ai";
 import { resolveModelName } from "./ui";
 
 /** Panel webview-view id — must match `contributes.views.rockyLineagePanel`. */
@@ -58,6 +66,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
         );
       });
       host.onRequest("drift", () => loadDrift());
+      host.onRequest("ai", (params) => runAiAction(params as AiActionParam));
     },
   });
 }
@@ -139,4 +148,59 @@ async function loadDrift(): Promise<DriftData> {
         : String(err);
     return { actions: [], unavailable };
   }
+}
+
+/** Dispatch a node's right-click AI action, scoped to that model. */
+async function runAiAction(params: AiActionParam): Promise<void> {
+  try {
+    switch (params.action) {
+      case "explain":
+        notify(await runAiExplain(params.model), "Intent generated and saved.");
+        break;
+      case "test":
+        notify(await runAiTest(params.model), "Tests generated and saved.");
+        break;
+      case "contract":
+        await draftContract(params.model);
+        break;
+      case "build":
+        await buildDownstream(params.model);
+        break;
+    }
+  } catch (err) {
+    showRockyError("Rocky AI failed", err);
+  }
+}
+
+function notify(output: string, fallback: string): void {
+  void vscode.window.showInformationMessage(output.trim() || fallback);
+}
+
+/** Draft a data-grounded contract for `model` and open it for review. */
+async function draftContract(model: string): Promise<void> {
+  const result = await runRockyJsonWithProgress<AiContractOutput>(
+    `Drafting contract for ${model}…`,
+    ["ai-contract", model, "--output", "json"],
+    { cwd: resolveProjectRoot() },
+  );
+  const doc = await vscode.workspace.openTextDocument({
+    content: result.contract_toml,
+    language: "toml",
+  });
+  await vscode.window.showTextDocument(doc);
+}
+
+/** Prompt for an intent, then generate a model that builds on `model`. */
+async function buildDownstream(model: string): Promise<void> {
+  const intent = await vscode.window.showInputBox({
+    prompt: `Describe a model to build downstream of ${model}`,
+    placeHolder: "e.g., daily revenue rollup with a 7-day moving average",
+  });
+  if (!intent) return;
+  const source = await runAiGenerate(`${intent} — building on ${model}`);
+  const doc = await vscode.workspace.openTextDocument({
+    content: source,
+    language: "rocky",
+  });
+  await vscode.window.showTextDocument(doc);
 }

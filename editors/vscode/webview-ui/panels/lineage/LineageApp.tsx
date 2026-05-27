@@ -1,6 +1,8 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import { useEffect, useMemo, useState } from "react";
 import type {
+  AiAction,
+  AiActionParam,
   DriftData,
   FocusPush,
   GraphData,
@@ -85,6 +87,9 @@ export function LineageApp() {
   const openInspector = (model: string): void => {
     void getRpc().request("openInspector", { model } satisfies ModelParam);
   };
+  const runAi = (action: AiAction, model: string): void => {
+    void getRpc().request("ai", { action, model } satisfies AiActionParam);
+  };
 
   return (
     <ColorModeContext.Provider value={colorMode}>
@@ -106,6 +111,7 @@ export function LineageApp() {
                 search={search}
                 onOpenFile={openFile}
                 onOpenInspector={openInspector}
+                onAi={runAi}
               />
             </ReactFlowProvider>
           </div>

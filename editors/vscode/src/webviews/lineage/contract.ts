@@ -60,3 +60,12 @@ export interface FocusPush {
 export interface ModelParam {
   model: string;
 }
+
+/** AI action invoked from a node's right-click menu. */
+export type AiAction = "explain" | "test" | "contract" | "build";
+
+/** Params for the `"ai"` request. */
+export interface AiActionParam {
+  action: AiAction;
+  model: string;
+}
