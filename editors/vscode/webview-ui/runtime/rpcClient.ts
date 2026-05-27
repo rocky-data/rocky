@@ -23,6 +23,9 @@ export class RpcClient {
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
   >();
   private readonly pushListeners = new Map<string, Set<PushListener>>();
+  // Pushes that arrived before anyone subscribed to their type, kept so a late
+  // subscriber still receives them (see onPush / handle for the race).
+  private readonly bufferedPushes = new Map<string, unknown[]>();
 
   constructor(private readonly api: PostsMessages) {
     window.addEventListener("message", (ev: MessageEvent<HostToWebview>) => {
@@ -51,6 +54,15 @@ export class RpcClient {
       this.pushListeners.set(type, set);
     }
     set.add(listener as PushListener);
+    // A push can land before its subscriber mounts: the host flushes buffered
+    // pushes when AppShell signals `ready`, which happens while a lazy panel is
+    // still suspended and has not yet called onPush. Replay anything buffered
+    // for this type so that first subscriber still sees it.
+    const buffered = this.bufferedPushes.get(type);
+    if (buffered) {
+      this.bufferedPushes.delete(type);
+      for (const payload of buffered) (listener as PushListener)(payload);
+    }
     return () => {
       this.pushListeners.get(type)?.delete(listener as PushListener);
     };
@@ -70,7 +82,14 @@ export class RpcClient {
       else pending.reject(new Error(msg.error));
     } else if (msg?.kind === "push") {
       const set = this.pushListeners.get(msg.type);
-      if (set) for (const listener of set) listener(msg.payload);
+      if (set && set.size > 0) {
+        for (const listener of set) listener(msg.payload);
+      } else {
+        // No subscriber yet — buffer until onPush() attaches for this type.
+        const buf = this.bufferedPushes.get(msg.type);
+        if (buf) buf.push(msg.payload);
+        else this.bufferedPushes.set(msg.type, [msg.payload]);
+      }
     }
   }
 }
