@@ -83,3 +83,18 @@ export interface BreakingData {
   /** Set when the diff could not run (e.g. base ref missing). */
   unavailable?: string;
 }
+
+/** One model's outcome in the most recent run. */
+export interface ReplayModelLite {
+  model: string;
+  rows: number | null;
+  status: string;
+}
+
+/** Last-run overlay payload — the result of the `"replay"` request. */
+export interface ReplayData {
+  runId?: string;
+  models: ReplayModelLite[];
+  /** Set when there is no run to replay. */
+  unavailable?: string;
+}

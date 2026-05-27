@@ -12,6 +12,7 @@ import type { CatalogOutput } from "../types/generated/catalog";
 import type { CiDiffOutput } from "../types/generated/ci_diff";
 import type { CompileOutput, ModelDetail } from "../types/generated/compile";
 import type { DriftOutput } from "../types/generated/drift";
+import type { ReplayOutput } from "../types/generated/replay";
 import {
   registerWebviewViewApp,
   type WebviewViewController,
@@ -24,6 +25,7 @@ import type {
   GraphEdge,
   GraphNode,
   ModelParam,
+  ReplayData,
 } from "../webviews/lineage/contract";
 import { runAiExplain, runAiGenerate, runAiTest } from "./ai";
 import { resolveModelName } from "./ui";
@@ -70,6 +72,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
       host.onRequest("drift", () => loadDrift());
       host.onRequest("ai", (params) => runAiAction(params as AiActionParam));
       host.onRequest("breaking", () => loadBreaking());
+      host.onRequest("replay", () => loadReplay());
     },
   });
 }
@@ -231,5 +234,29 @@ async function loadBreaking(): Promise<BreakingData> {
         ? err.stderr.trim() || err.message
         : String(err);
     return { baseRef, findings: [], unavailable };
+  }
+}
+
+/** Run `rocky replay latest` for the last-run overlay; empty when no runs exist. */
+async function loadReplay(): Promise<ReplayData> {
+  try {
+    const out = await runRockyJson<ReplayOutput>(
+      ["replay", "latest", "--output", "json"],
+      { cwd: resolveProjectRoot() },
+    );
+    return {
+      runId: out.run_id,
+      models: out.models.map((m) => ({
+        model: m.model_name,
+        rows: m.rows_affected ?? null,
+        status: m.status,
+      })),
+    };
+  } catch (err) {
+    const unavailable =
+      err instanceof RockyCliError
+        ? err.stderr.trim() || err.message
+        : String(err);
+    return { models: [], unavailable };
   }
 }

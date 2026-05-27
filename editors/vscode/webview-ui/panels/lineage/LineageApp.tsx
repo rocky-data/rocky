@@ -8,6 +8,7 @@ import type {
   FocusPush,
   GraphData,
   ModelParam,
+  ReplayData,
 } from "../../../src/webviews/lineage/contract";
 import { getRpc } from "../../runtime/rpcClient";
 import { Canvas } from "./Canvas";
@@ -21,6 +22,7 @@ import { makeBreakingOverlay } from "./overlays/breaking";
 import { costOverlay } from "./overlays/cost";
 import { makeDriftOverlay } from "./overlays/drift";
 import { freshnessOverlay } from "./overlays/freshness";
+import { makeLastRunOverlay } from "./overlays/lastRun";
 import type { LineageOverlay } from "./overlays/types";
 import { Toolbar } from "./Toolbar";
 
@@ -33,6 +35,7 @@ export function LineageApp() {
   const [active, setActive] = useState<Set<OverlayKind>>(new Set());
   const [drift, setDrift] = useState<DriftData | null>(null);
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
+  const [replay, setReplay] = useState<ReplayData | null>(null);
 
   useEffect(() => {
     void getRpc()
@@ -66,6 +69,12 @@ export function LineageApp() {
           setBreaking({ baseRef: "main", findings: [], unavailable: String(err) }),
         );
     }
+    if (kind === "lastRun" && replay === null) {
+      void getRpc()
+        .request<ReplayData>("replay")
+        .then(setReplay)
+        .catch((err) => setReplay({ models: [], unavailable: String(err) }));
+    }
   };
 
   const overlays = useMemo<LineageOverlay[]>(() => {
@@ -76,8 +85,9 @@ export function LineageApp() {
     if (active.has("breaking") && breaking && graph) {
       list.push(makeBreakingOverlay(breaking, graph));
     }
+    if (active.has("lastRun") && replay) list.push(makeLastRunOverlay(replay));
     return list;
-  }, [active, drift, breaking, graph]);
+  }, [active, drift, breaking, replay, graph]);
 
   if (error) {
     return (
