@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.0] — 2026-05-27
+
+### Added
+
+- **`rocky profile <model>`** — profile a model's columns directly: row count, null count and rate, distinct count, and min/max per column, from a single aggregate query (DuckDB today, no LLM round-trip). `--column <name>` narrows to one column; `--output json` emits `ProfileOutput`. Powers the VS Code Inspector's Profile tab and its inline column profiling.
+
 ## [1.45.1] — 2026-05-27
 
 ### Fixed
