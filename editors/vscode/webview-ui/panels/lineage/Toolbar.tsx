@@ -6,6 +6,7 @@ const OVERLAY_LABELS: Record<OverlayKind, string> = {
   drift: "Drift",
   breaking: "Breaking",
   lastRun: "Last run",
+  governance: "Governance",
 };
 
 function segment(active: boolean): string {

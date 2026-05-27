@@ -11,7 +11,13 @@ export function useColorMode(): ColorMode {
 }
 
 /** Overlay toggles available on the canvas. */
-export type OverlayKind = "cost" | "freshness" | "drift" | "breaking" | "lastRun";
+export type OverlayKind =
+  | "cost"
+  | "freshness"
+  | "drift"
+  | "breaking"
+  | "lastRun"
+  | "governance";
 
 /** The overlays currently decorating nodes (cost, freshness, drift, …). */
 export const OverlaysContext = createContext<LineageOverlay[]>([]);

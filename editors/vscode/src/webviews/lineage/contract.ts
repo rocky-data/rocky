@@ -98,3 +98,16 @@ export interface ReplayData {
   /** Set when there is no run to replay. */
   unavailable?: string;
 }
+
+/** One model's governance posture: classified columns and unmasked exceptions. */
+export interface GovernanceModelLite {
+  model: string;
+  classifiedColumns: number;
+  unmaskedColumns: number;
+}
+
+/** Governance overlay payload — the result of the `"governance"` request. */
+export interface GovernanceData {
+  models: GovernanceModelLite[];
+  unavailable?: string;
+}

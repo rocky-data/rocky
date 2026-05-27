@@ -11,6 +11,7 @@ import type { AiContractOutput } from "../types/generated/ai_contract";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CiDiffOutput } from "../types/generated/ci_diff";
 import type { CompileOutput, ModelDetail } from "../types/generated/compile";
+import type { ComplianceOutput } from "../types/generated/compliance";
 import type { DriftOutput } from "../types/generated/drift";
 import type { ReplayOutput } from "../types/generated/replay";
 import {
@@ -21,6 +22,7 @@ import type {
   AiActionParam,
   BreakingData,
   DriftData,
+  GovernanceData,
   GraphData,
   GraphEdge,
   GraphNode,
@@ -73,6 +75,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
       host.onRequest("ai", (params) => runAiAction(params as AiActionParam));
       host.onRequest("breaking", () => loadBreaking());
       host.onRequest("replay", () => loadReplay());
+      host.onRequest("governance", () => loadGovernance());
     },
   });
 }
@@ -252,6 +255,44 @@ async function loadReplay(): Promise<ReplayData> {
         status: m.status,
       })),
     };
+  } catch (err) {
+    const unavailable =
+      err instanceof RockyCliError
+        ? err.stderr.trim() || err.message
+        : String(err);
+    return { models: [], unavailable };
+  }
+}
+
+/**
+ * Run `rocky compliance` for the governance overlay, aggregating per model the
+ * count of classified columns and of columns left unmasked (exceptions).
+ */
+async function loadGovernance(): Promise<GovernanceData> {
+  try {
+    const out = await runRockyJson<ComplianceOutput>(
+      ["compliance", "--output", "json"],
+      { cwd: resolveProjectRoot() },
+    );
+    const classified = new Map<string, Set<string>>();
+    for (const entry of out.per_column) {
+      const set = classified.get(entry.model) ?? new Set<string>();
+      set.add(entry.column);
+      classified.set(entry.model, set);
+    }
+    const unmasked = new Map<string, Set<string>>();
+    for (const exception of out.exceptions) {
+      const set = unmasked.get(exception.model) ?? new Set<string>();
+      set.add(exception.column);
+      unmasked.set(exception.model, set);
+    }
+    const names = new Set([...classified.keys(), ...unmasked.keys()]);
+    const models = [...names].map((model) => ({
+      model,
+      classifiedColumns: classified.get(model)?.size ?? 0,
+      unmaskedColumns: unmasked.get(model)?.size ?? 0,
+    }));
+    return { models };
   } catch (err) {
     const unavailable =
       err instanceof RockyCliError

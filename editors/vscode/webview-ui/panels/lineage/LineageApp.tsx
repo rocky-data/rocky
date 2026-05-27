@@ -6,6 +6,7 @@ import type {
   BreakingData,
   DriftData,
   FocusPush,
+  GovernanceData,
   GraphData,
   ModelParam,
   ReplayData,
@@ -22,6 +23,7 @@ import { makeBreakingOverlay } from "./overlays/breaking";
 import { costOverlay } from "./overlays/cost";
 import { makeDriftOverlay } from "./overlays/drift";
 import { freshnessOverlay } from "./overlays/freshness";
+import { makeGovernanceOverlay } from "./overlays/governance";
 import { makeLastRunOverlay } from "./overlays/lastRun";
 import type { LineageOverlay } from "./overlays/types";
 import { Toolbar } from "./Toolbar";
@@ -36,6 +38,7 @@ export function LineageApp() {
   const [drift, setDrift] = useState<DriftData | null>(null);
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
   const [replay, setReplay] = useState<ReplayData | null>(null);
+  const [governance, setGovernance] = useState<GovernanceData | null>(null);
 
   useEffect(() => {
     void getRpc()
@@ -75,6 +78,12 @@ export function LineageApp() {
         .then(setReplay)
         .catch((err) => setReplay({ models: [], unavailable: String(err) }));
     }
+    if (kind === "governance" && governance === null) {
+      void getRpc()
+        .request<GovernanceData>("governance")
+        .then(setGovernance)
+        .catch((err) => setGovernance({ models: [], unavailable: String(err) }));
+    }
   };
 
   const overlays = useMemo<LineageOverlay[]>(() => {
@@ -86,8 +95,11 @@ export function LineageApp() {
       list.push(makeBreakingOverlay(breaking, graph));
     }
     if (active.has("lastRun") && replay) list.push(makeLastRunOverlay(replay));
+    if (active.has("governance") && governance) {
+      list.push(makeGovernanceOverlay(governance));
+    }
     return list;
-  }, [active, drift, breaking, replay, graph]);
+  }, [active, drift, breaking, replay, governance, graph]);
 
   if (error) {
     return (
