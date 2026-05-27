@@ -1,3 +1,4 @@
+import type { CatalogEdge } from "../../../src/types/generated/catalog";
 import type {
   CostHint,
   ModelFreshnessConfig,
@@ -77,4 +78,28 @@ export function testStatusByColumn(
 /** Sort rank for the Columns "Tests" sort — worst status first. */
 export function statusRank(status: ColumnTestStatus | undefined): number {
   return status ? RANK[status] : 0;
+}
+
+/** Per-column upstream/downstream column-lineage edges for one model. */
+export interface ColumnLineage {
+  column: string;
+  upstream: CatalogEdge[];
+  downstream: CatalogEdge[];
+}
+
+/** Group a model's column-lineage edges by the model's own column. */
+export function groupColumnLineage(
+  model: string,
+  columns: string[],
+  edges: CatalogEdge[],
+): ColumnLineage[] {
+  return columns.map((column) => ({
+    column,
+    upstream: edges.filter(
+      (e) => e.target_model === model && e.target_column === column,
+    ),
+    downstream: edges.filter(
+      (e) => e.source_model === model && e.source_column === column,
+    ),
+  }));
 }

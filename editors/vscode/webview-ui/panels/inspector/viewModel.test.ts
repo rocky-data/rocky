@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import type { CatalogEdge } from "../../../src/types/generated/catalog";
 import {
   contractLabel,
   costLabel,
   formatCount,
   formatDuration,
   freshnessLabel,
+  groupColumnLineage,
   statusRank,
   testStatusByColumn,
   toStatus,
@@ -66,5 +68,35 @@ describe("viewModel", () => {
     expect(map.has("")).toBe(false); // null column is ignored
     expect(statusRank(map.get("id"))).toBe(3);
     expect(statusRank(undefined)).toBe(0);
+  });
+});
+
+describe("groupColumnLineage", () => {
+  const edge = (
+    sm: string,
+    sc: string,
+    tm: string,
+    tc: string,
+  ): CatalogEdge => ({
+    confidence: "High",
+    source_model: sm,
+    source_column: sc,
+    target_model: tm,
+    target_column: tc,
+    transform: "direct",
+  });
+
+  it("splits a column's edges into upstream and downstream", () => {
+    const edges = [edge("raw", "id", "stg", "id"), edge("stg", "id", "mart", "id")];
+    const grouped = groupColumnLineage("stg", ["id"], edges);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0].upstream.map((e) => e.source_model)).toEqual(["raw"]);
+    expect(grouped[0].downstream.map((e) => e.target_model)).toEqual(["mart"]);
+  });
+
+  it("leaves columns with no edges empty", () => {
+    const grouped = groupColumnLineage("stg", ["orphan"], []);
+    expect(grouped[0].upstream).toEqual([]);
+    expect(grouped[0].downstream).toEqual([]);
   });
 });

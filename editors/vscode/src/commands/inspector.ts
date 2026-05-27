@@ -86,6 +86,9 @@ async function loadModelData(model: string): Promise<InspectorModelData> {
     throw new Error(`Model "${model}" was not found in the project catalog.`);
   }
   const detail = compile.models_detail?.find((d) => d.name === model);
+  const columnEdges = catalog.edges.filter(
+    (e) => e.source_model === model || e.target_model === model,
+  );
   return {
     modelName: asset.model_name,
     fqn: asset.fqn,
@@ -95,6 +98,7 @@ async function loadModelData(model: string): Promise<InspectorModelData> {
     columns: asset.columns,
     upstreamModels: asset.upstream_models,
     downstreamModels: asset.downstream_models,
+    columnEdges,
     contractSource: detail?.contract_source ?? null,
     freshness: detail?.freshness ?? null,
     materialization: detail?.strategy.type ?? null,

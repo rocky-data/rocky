@@ -3,7 +3,7 @@
  * (`src/commands/inspector.ts`) and the React app (`webview-ui/panels/inspector`).
  * References the generated CLI output types so both sides agree on field shapes.
  */
-import type { CatalogColumn } from "../../types/generated/catalog";
+import type { CatalogColumn, CatalogEdge } from "../../types/generated/catalog";
 import type { CostHint, ModelFreshnessConfig } from "../../types/generated/compile";
 import type { DeclarativeTestResult } from "../../types/generated/test";
 import type { PreviewRowsOutput } from "../../types/generated/preview_rows";
@@ -25,6 +25,8 @@ export interface InspectorModelData {
   columns: CatalogColumn[];
   upstreamModels: string[];
   downstreamModels: string[];
+  /** Column-level lineage edges touching this model (powers the Lineage tab). */
+  columnEdges: CatalogEdge[];
   /** `"auto"` | `"explicit"` when a contract exists, else `null`. */
   contractSource: string | null;
   freshness: ModelFreshnessConfig | null;

@@ -7,15 +7,17 @@ import type {
   ModelPush,
 } from "../../../src/webviews/inspector/contract";
 import { ColumnsTab } from "./tabs/ColumnsTab";
+import { LineageTab } from "./tabs/LineageTab";
 import { OverviewTab } from "./tabs/OverviewTab";
 import { PreviewTab } from "./tabs/PreviewTab";
 import { TestsTab } from "./tabs/TestsTab";
 
-type TabId = "overview" | "columns" | "tests" | "preview";
+type TabId = "overview" | "columns" | "lineage" | "tests" | "preview";
 
 const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: "overview", label: "Overview" },
   { id: "columns", label: "Columns" },
+  { id: "lineage", label: "Lineage" },
   { id: "tests", label: "Tests" },
   { id: "preview", label: "Preview" },
 ];
@@ -105,6 +107,7 @@ export function InspectorApp() {
       <div className="min-h-0 flex-1 overflow-auto p-4">
         {tab === "overview" && <OverviewTab data={data} />}
         {tab === "columns" && <ColumnsTab data={data} tests={tests} />}
+        {tab === "lineage" && <LineageTab data={data} />}
         {tab === "tests" && <TestsTab tests={tests} />}
         {tab === "preview" && <PreviewTab preview={preview} />}
       </div>
