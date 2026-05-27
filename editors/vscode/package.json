@@ -236,6 +236,12 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.openInspector",
+        "title": "Open in Inspector",
+        "category": "Rocky",
+        "icon": "$(book)"
+      },
+      {
         "command": "rocky.compact",
         "title": "Compact Table",
         "category": "Rocky"
@@ -448,6 +454,11 @@
         "title": "Remove Preview",
         "category": "Rocky",
         "icon": "$(trash)"
+      },
+      {
+        "command": "rocky.devtools",
+        "title": "Open Webview Devtools",
+        "category": "Rocky"
       }
     ],
     "semanticTokenScopes": [
@@ -678,6 +689,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "rocky.devtools",
+          "when": "rocky.developmentMode"
+        }
+      ],
       "view/title": [
         {
           "command": "rocky.refreshModels",
@@ -757,6 +774,21 @@
           "group": "2_inspect@4"
         },
         {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaModel",
+          "group": "inline@1"
+        },
+        {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaModel",
+          "group": "1_inspect@1"
+        },
+        {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaColumn",
+          "group": "1_inspect@1"
+        },
+        {
           "command": "rocky.copyColumnReference",
           "when": "view == rocky.schema && viewItem == rockySchemaColumn",
           "group": "inline@1"
@@ -768,6 +800,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "rocky.openInspector",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@1"
+        },
         {
           "command": "rocky.history",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
@@ -906,7 +943,7 @@
           {
             "id": "rocky.walkthrough.lineage",
             "title": "View Model Lineage",
-            "description": "Render the model dependency graph as an interactive SVG.\n\n[Show Model Lineage](command:rocky.showLineage)",
+            "description": "Render the model dependency graph as an interactive canvas.\n\n[Show Model Lineage](command:rocky.showLineage)",
             "media": {
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
@@ -934,10 +971,14 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src/",
+    "typecheck:webview": "tsc -p webview-ui/tsconfig.webview.json",
+    "lint": "eslint src/ webview-ui/",
+    "tailwind": "tailwindcss -c webview-ui/tailwind.config.js -i webview-ui/styles/base.css -o webview-ui/styles/tailwind.generated.css",
+    "tailwind:watch": "npm run tailwind -- --watch",
+    "prebundle": "npm run tailwind",
     "bundle": "node esbuild.mjs",
+    "prebundle:watch": "npm run tailwind",
     "bundle:watch": "node esbuild.mjs --watch",
-    "bundle:webview": "node scripts/bundle-webview.mjs",
     "pretest": "npm run compile && npm run bundle -- --dev",
     "test": "node ./out/test/runTest.js",
     "test:unit": "vitest run",
@@ -946,24 +987,32 @@
     "package:local": "vsce package -o rocky.vsix",
     "install:local": "npm run package:local && code --install-extension rocky.vsix --force",
     "uninstall:local": "code --uninstall-extension rocky-data.rocky",
-    "vscode:prepublish": "npm run compile && npm run bundle:webview && npm run bundle"
+    "vscode:prepublish": "npm run compile && npm run bundle"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.9.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "@types/vscode": "1.120.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
-    "d3": "^7.9.0",
+    "@xyflow/react": "^12.8.0",
     "esbuild": "^0.28.0",
     "eslint": "^10.4.0",
     "glob": "^13.0.6",
+    "jsdom": "^26.1.0",
     "json-schema-to-typescript": "^15.0.4",
     "mocha": "^11.7.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwindcss": "^3.4.18",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.4",
     "vitest": "^4.1.6"

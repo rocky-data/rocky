@@ -40,6 +40,7 @@ pub mod plan;
 mod playground;
 mod preview;
 mod preview_rows;
+mod profile;
 mod profile_storage;
 mod replay;
 mod retention_status;
@@ -118,6 +119,7 @@ pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
 pub use preview_rows::run_preview_rows;
+pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use replay::run_replay;
 pub use retention_status::run_retention_status;

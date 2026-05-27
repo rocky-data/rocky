@@ -1819,6 +1819,43 @@ pub struct AiContractColumnProfile {
     pub max: Option<String>,
 }
 
+/// JSON output for `rocky profile <model> [--column <col>]`.
+///
+/// A per-column data profile (row / null / distinct counts, min / max, and the
+/// low-cardinality domain) for a model's target table, computed by a single
+/// aggregate query per column. DuckDB-only this release; a non-DuckDB target
+/// reports `unavailable` with an empty `columns` list rather than erroring.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProfileOutput {
+    pub version: String,
+    pub command: String,
+    pub model: String,
+    /// One entry per profiled column.
+    pub columns: Vec<ProfileColumnStats>,
+    /// Set when profiling could not run (e.g. a non-DuckDB target this release).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+/// Observed data profile for one column.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProfileColumnStats {
+    pub name: String,
+    /// Inferred Rocky type name.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub rows: u64,
+    pub nulls: u64,
+    pub null_rate: f64,
+    pub distinct: u64,
+    /// Observed low-cardinality domain (empty above the cardinality cap).
+    pub observed_values: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<String>,
+}
+
 /// JSON output for `rocky lineage-diff <base_ref>`.
 ///
 /// Combines the structural per-column diff produced by `rocky ci-diff`

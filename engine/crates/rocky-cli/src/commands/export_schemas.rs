@@ -26,9 +26,10 @@ use crate::output::{
     DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
     HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
     ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
-    PreviewDiffOutput, PreviewRowsOutput, ProfileStorageOutput, PromotePlan, ReplayOutput,
-    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput,
-    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan,
+    ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput,
+    StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
+    ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -80,6 +81,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<CompactApplyOutput>("compact_apply"),
         entry::<ArchiveOutput>("archive"),
         entry::<ArchiveApplyOutput>("archive_apply"),
+        entry::<ProfileOutput>("profile"),
         entry::<ProfileStorageOutput>("profile_storage"),
         entry::<ImportDbtOutput>("import_dbt"),
         entry::<HooksListOutput>("hooks_list"),

@@ -5,6 +5,7 @@ import { branchApprove, branchPromote } from "./branch";
 import { commandPalette } from "./commandPalette";
 import { ci, compile, validate } from "./compile";
 import { showDag } from "./dag";
+import { devtools } from "./devtools";
 import { hooksList, hooksTest } from "./hooks";
 import {
   init,
@@ -16,6 +17,7 @@ import {
 } from "./info";
 import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
+import { openInspector } from "./inspector";
 import { showLineage } from "./lineage";
 import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
@@ -60,6 +62,7 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.history", history),
     vscode.commands.registerCommand("rocky.metrics", metrics),
     vscode.commands.registerCommand("rocky.catalog", catalog),
+    vscode.commands.registerCommand("rocky.openInspector", openInspector),
 
     // Storage management
     vscode.commands.registerCommand("rocky.compact", compact),
@@ -119,5 +122,8 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.viewMarketplace", viewMarketplace),
     vscode.commands.registerCommand("rocky.init", init),
     vscode.commands.registerCommand("rocky.playground", playground),
+
+    // Webview foundation smoke test (React + ReactFlow toolchain)
+    vscode.commands.registerCommand("rocky.devtools", devtools),
   );
 }

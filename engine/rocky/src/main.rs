@@ -883,6 +883,19 @@ enum Command {
         models: String,
     },
 
+    /// Profile a model's target table per column — row/null/distinct/min/max
+    /// (DuckDB only)
+    Profile {
+        /// Model whose target table to profile
+        model: String,
+        /// Profile only this column (default: every column)
+        #[arg(long)]
+        column: Option<String>,
+        /// Models directory (compiled to obtain the model's inferred schema)
+        #[arg(long, default_value = "models")]
+        models: String,
+    },
+
     /// Create a sample project with DuckDB (no credentials needed)
     Playground {
         /// Directory name for the playground project
@@ -2481,6 +2494,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 &model,
                 save,
+                json,
+                cli.cache_ttl,
+            )
+            .await
+        }
+        Command::Profile {
+            model,
+            column,
+            models,
+        } => {
+            rocky_cli::commands::run_profile(
+                &cli.config,
+                &state_path,
+                &models,
+                &model,
+                column.as_deref(),
                 json,
                 cli.cache_ttl,
             )

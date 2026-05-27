@@ -19,6 +19,13 @@ import { registerViews } from "./views";
 
 export function activate(context: vscode.ExtensionContext): void {
   setExtensionUri(context.extensionUri);
+  // Gates dev-only affordances (e.g. the webview devtools command) so they
+  // never surface in a released build's command palette.
+  void vscode.commands.executeCommand(
+    "setContext",
+    "rocky.developmentMode",
+    context.extensionMode === vscode.ExtensionMode.Development,
+  );
   startLspClient(context);
   registerCommands(context);
   registerChatParticipant(context);
