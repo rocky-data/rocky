@@ -15,9 +15,13 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed gr
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right, updating live" width="820" /></p>
 
-**Follow the data.** Render any model's lineage as an interactive, column-level graph.
+**See how it connects.** The lineage view is an interactive canvas, opening focused on a model's neighborhood and expandable to the whole project, with cost, freshness, and drift shown on the graph itself.
 
-<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The Show Model Lineage command rendering a model's upstream dependencies as a graph" width="820" /></p>
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The lineage canvas focused on a model's neighborhood, with a cost overlay drawn on the graph" width="820" /></p>
+
+**Inspect any model.** The Inspector shows a model's columns and types, and traces column-level lineage with the transform behind each hop.
+
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector showing a model's columns and its column-level lineage with per-hop transforms" width="820" /></p>
 
 **Drive it from the keyboard.** Every Rocky command is one palette away.
 
