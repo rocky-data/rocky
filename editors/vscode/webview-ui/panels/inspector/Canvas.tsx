@@ -27,6 +27,8 @@ interface CanvasProps {
   data: GraphData;
   focus: string | null;
   search: string;
+  /** Whether the canvas is currently shown; a hidden→shown flip triggers a re-fit. */
+  active?: boolean;
   onOpenFile: (model: string) => void;
   onOpenInspector: (model: string) => void;
   onAi: (action: AiAction, model: string) => void;
@@ -42,6 +44,7 @@ export function Canvas({
   data,
   focus,
   search,
+  active,
   onOpenFile,
   onOpenInspector,
   onAi,
@@ -85,6 +88,15 @@ export function Canvas({
     );
     return () => clearTimeout(timer);
   }, [focus, data.edges, fitView, setNodes]);
+
+  // Re-fit when the canvas becomes visible. It may have first mounted while its
+  // tab was hidden (display:none, 0×0), where ReactFlow can't frame the graph;
+  // fitting once it has real dimensions centers it.
+  useEffect(() => {
+    if (!active) return;
+    const timer = setTimeout(() => void fitView({ duration: 200, maxZoom: 1.3 }), 120);
+    return () => clearTimeout(timer);
+  }, [active, fitView]);
 
   const onNodeDoubleClick = useCallback(
     (_: RFMouseEvent, node: ModelFlowNode) => onOpenFile(node.id),

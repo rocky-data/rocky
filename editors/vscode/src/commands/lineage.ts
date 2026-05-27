@@ -86,7 +86,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
  * model). Compile is best-effort — the canvas still renders without it, just
  * without the materialization color mode.
  */
-async function buildGraph(): Promise<GraphData> {
+export async function buildGraph(): Promise<GraphData> {
   const cwd = resolveProjectRoot();
   const [catalog, compile] = await Promise.all([
     runRockyJson<CatalogOutput>(["catalog", "--output", "json"], { cwd }),
@@ -126,7 +126,7 @@ async function buildGraph(): Promise<GraphData> {
   return { nodes, edges };
 }
 
-async function openModelFile(model: string): Promise<void> {
+export async function openModelFile(model: string): Promise<void> {
   const matches = await vscode.workspace.findFiles(
     `**/models/**/${model}.{rocky,sql}`,
     undefined,
@@ -138,7 +138,7 @@ async function openModelFile(model: string): Promise<void> {
 }
 
 /** Run `rocky drift` for the drift overlay; degrades gracefully when unavailable. */
-async function loadDrift(): Promise<DriftData> {
+export async function loadDrift(): Promise<DriftData> {
   try {
     const out = await runRockyJson<DriftOutput>(["drift", "--output", "json"], {
       cwd: resolveProjectRoot(),
@@ -160,7 +160,7 @@ async function loadDrift(): Promise<DriftData> {
 }
 
 /** Dispatch a node's right-click AI action, scoped to that model. */
-async function runAiAction(params: AiActionParam): Promise<void> {
+export async function runAiAction(params: AiActionParam): Promise<void> {
   try {
     switch (params.action) {
       case "explain":
@@ -219,7 +219,7 @@ async function buildDownstream(model: string): Promise<void> {
  * projecting the classified findings to per-model severities. Degrades to an
  * empty result with a reason when the base ref is missing or a side won't compile.
  */
-async function loadBreaking(): Promise<BreakingData> {
+export async function loadBreaking(): Promise<BreakingData> {
   const baseRef = "main";
   try {
     const out = await runRockyJson<CiDiffOutput>(
@@ -241,7 +241,7 @@ async function loadBreaking(): Promise<BreakingData> {
 }
 
 /** Run `rocky replay latest` for the last-run overlay; empty when no runs exist. */
-async function loadReplay(): Promise<ReplayData> {
+export async function loadReplay(): Promise<ReplayData> {
   try {
     const out = await runRockyJson<ReplayOutput>(
       ["replay", "latest", "--output", "json"],
@@ -268,7 +268,7 @@ async function loadReplay(): Promise<ReplayData> {
  * Run `rocky compliance` for the governance overlay, aggregating per model the
  * count of classified columns and of columns left unmasked (exceptions).
  */
-async function loadGovernance(): Promise<GovernanceData> {
+export async function loadGovernance(): Promise<GovernanceData> {
   try {
     const out = await runRockyJson<ComplianceOutput>(
       ["compliance", "--output", "json"],
