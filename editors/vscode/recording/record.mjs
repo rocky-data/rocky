@@ -18,15 +18,14 @@ const REPO = path.resolve(HERE, "../../.."); // rocky-data
 
 // VS Code loads the extension's built `main` (dist/extension.js) from
 // --extensionDevelopmentPath; it does NOT compile from src/. So rebuild the
-// bundle (+ webviews) first, or we'd record stale code.
+// bundle first, or we'd record stale code. `npm run bundle` (esbuild) builds
+// both the extension host and the React webview apps under dist/webviews/.
 function buildExtension() {
   console.log("⚙ building extension bundle…");
-  for (const script of ["bundle:webview", "bundle"]) {
-    const r = spawnSync("npm", ["run", script], { cwd: VSCODE_DIR, stdio: "inherit" });
-    if (r.status !== 0) {
-      console.error(`extension build failed at \`npm run ${script}\``);
-      process.exit(1);
-    }
+  const r = spawnSync("npm", ["run", "bundle"], { cwd: VSCODE_DIR, stdio: "inherit" });
+  if (r.status !== 0) {
+    console.error("extension build failed at `npm run bundle`");
+    process.exit(1);
   }
 }
 
