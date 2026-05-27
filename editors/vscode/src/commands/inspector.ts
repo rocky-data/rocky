@@ -16,6 +16,16 @@ import type {
   InspectorTestsData,
   ModelParam,
 } from "../webviews/inspector/contract";
+import type { AiActionParam } from "../webviews/lineage/contract";
+import {
+  buildGraph,
+  loadBreaking,
+  loadDrift,
+  loadGovernance,
+  loadReplay,
+  openModelFile,
+  runAiAction,
+} from "./lineage";
 
 const VIEW_TYPE = "rocky.inspector";
 
@@ -52,6 +62,15 @@ export function openInspector(arg?: unknown): void {
       h.onRequest("tests", (p) => loadTests((p as ModelParam).model));
       h.onRequest("preview", (p) => loadPreview((p as ModelParam).model));
       h.onRequest("profile", (p) => loadProfile((p as ModelParam).model));
+      // The Lineage tab embeds the project canvas, so the Inspector serves the
+      // same graph + overlay + node-action requests the standalone view does.
+      h.onRequest("graph", () => buildGraph());
+      h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
+      h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
+      h.onRequest("drift", () => loadDrift());
+      h.onRequest("breaking", () => loadBreaking());
+      h.onRequest("replay", () => loadReplay());
+      h.onRequest("governance", () => loadGovernance());
     },
   });
   panel.onDidDispose(() => {
