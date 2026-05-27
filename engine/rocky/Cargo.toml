@@ -24,6 +24,9 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Process-level rustls crypto provider, installed at startup before any TLS.
+# See the `rustls` note in the workspace manifest.
+rustls = { workspace = true }
 
 # Used to restore the kernel-default SIGPIPE handler on startup so the
 # CLI exits cleanly when its stdout is piped into `head`, `less`, `jq | head`,

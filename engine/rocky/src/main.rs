@@ -1854,11 +1854,41 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let json = matches!(cli.output, OutputFormat::Json);
 
+    // Install the rustls crypto provider before any TLS handshake. Runs
+    // after `Cli::parse()` so the `--version` / `--help` fast-exit stays
+    // untouched, and before the runtime so every async command (discover,
+    // doctor, ...) sees the process-level default. See `install_crypto_provider`.
+    install_crypto_provider();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
     runtime.block_on(run_async(cli, json))
+}
+
+/// Install the process-level rustls [`CryptoProvider`] before any TLS.
+///
+/// The dependency graph compiles in *both* rustls crypto backends —
+/// `ring` (via `hyper-rustls` → `reqwest`) and `aws_lc_rs` (via
+/// `jsonwebtoken` + `rustls`). With two providers present, rustls cannot
+/// determine a default from crate features, so the first
+/// `rustls::ClientConfig::builder()` — which `reqwest` calls when building
+/// the HTTPS client for `discover`, `doctor`, and every other network path
+/// — panics with *"Could not automatically determine the process-level
+/// CryptoProvider from Rustls crate features"*. Installing aws-lc-rs
+/// explicitly resolves the ambiguity; it matches the aws-lc-rs stack already
+/// in the tree (`reqwest` `rustls-tls`, `tonic` `tls-aws-lc`, `jsonwebtoken`
+/// `aws_lc_rs`).
+///
+/// Idempotent: a no-op if a provider was already installed (the `Err`
+/// returned by [`install_default`] carries the existing provider, which we
+/// intentionally discard).
+///
+/// [`CryptoProvider`]: rustls::crypto::CryptoProvider
+/// [`install_default`]: rustls::crypto::CryptoProvider::install_default
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Parse `--governance-override` from its CLI string form.
@@ -3097,6 +3127,32 @@ mod tests {
             } => idempotency_key,
             _ => panic!("expected Run subcommand"),
         }
+    }
+
+    /// Regression for the 1.45.0 startup abort: the dependency graph
+    /// compiles in BOTH rustls crypto backends (`ring` via
+    /// hyper-rustls/reqwest, `aws_lc_rs` via jsonwebtoken/rustls), so rustls
+    /// can't pick a provider from crate features and
+    /// `rustls::ClientConfig::builder()` — the exact call `reqwest` makes
+    /// when constructing its HTTPS client for `discover` / `doctor` — panics
+    /// with "Could not automatically determine the process-level
+    /// CryptoProvider". `install_crypto_provider()` installs aws-lc-rs as the
+    /// process default, so the builder resolves it instead of bailing.
+    ///
+    /// This test hits the panic site directly: delete the
+    /// `install_crypto_provider()` call below and the test panics with the
+    /// production message, which is the proof the guard works.
+    #[test]
+    fn crypto_provider_install_lets_default_tls_config_build() {
+        // Mirrors what `main()` runs before any TLS. Idempotent.
+        install_crypto_provider();
+
+        // `ClientConfig::builder()` consults the process-level default first
+        // and only falls back to the (ambiguous, panicking) crate-feature
+        // detection when none is installed. After the install it builds.
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
     }
 
     #[test]

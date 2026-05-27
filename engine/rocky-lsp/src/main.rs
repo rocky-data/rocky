@@ -13,5 +13,11 @@
 
 #[tokio::main]
 async fn main() {
+    // Install the rustls crypto provider before any TLS handshake. The dep
+    // graph compiles in both `ring` and `aws_lc_rs`, so rustls cannot
+    // auto-detect a default and would panic on the first HTTPS call (the
+    // LSP's AI code-actions reach the Anthropic API). aws-lc-rs matches the
+    // workspace reqwest/tonic TLS stack. Idempotent — see the `rocky` binary.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     rocky_server::lsp::run_lsp().await;
 }

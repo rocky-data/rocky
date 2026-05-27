@@ -96,6 +96,18 @@ rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
 
+# rustls crypto provider — direct dep on the binary crates so they can
+# install a single process-level default at startup. The dependency graph
+# compiles in BOTH rustls backends: `ring` (via hyper-rustls → reqwest) and
+# `aws_lc_rs` (via jsonwebtoken + rustls). With two providers present,
+# rustls cannot auto-detect a default from crate features, so the first
+# `ClientConfig::builder()` (reqwest's discover/doctor TLS path) panics with
+# "Could not automatically determine the process-level CryptoProvider".
+# Installing aws-lc-rs explicitly resolves the ambiguity — it matches the
+# reqwest `rustls-tls` + tonic `tls-aws-lc` + jsonwebtoken `aws_lc_rs` stack
+# already in the tree.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+
 # Async
 futures = "0.3"
 

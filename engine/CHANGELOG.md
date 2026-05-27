@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **TLS no longer aborts the binary at startup** — when both rustls crypto backends are compiled into the dependency graph (`ring` via reqwest's TLS stack and `aws-lc-rs` via the JWT signer), rustls cannot determine a default provider from crate features, and the first HTTPS call (`discover`, `doctor`, any network path) panicked with *"Could not automatically determine the process-level CryptoProvider"* — aborting the process before any request was sent. The `rocky` and `rocky-lsp` binaries now install the aws-lc-rs provider as the process default at startup, before any TLS. A regression test exercises the exact panic site so it can't recur.
+
 ## [1.45.0] — 2026-05-26
 
 Read-only MCP tools round out the agent surface, and a watermark bug that silently dropped the first incremental delta is fixed.
