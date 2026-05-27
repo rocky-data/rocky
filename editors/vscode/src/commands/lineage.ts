@@ -9,6 +9,7 @@ import {
 } from "../rockyCli";
 import type { AiContractOutput } from "../types/generated/ai_contract";
 import type { CatalogOutput } from "../types/generated/catalog";
+import type { CiDiffOutput } from "../types/generated/ci_diff";
 import type { CompileOutput, ModelDetail } from "../types/generated/compile";
 import type { DriftOutput } from "../types/generated/drift";
 import {
@@ -17,6 +18,7 @@ import {
 } from "../webviews/host/registerPanel";
 import type {
   AiActionParam,
+  BreakingData,
   DriftData,
   GraphData,
   GraphEdge,
@@ -67,6 +69,7 @@ export function registerLineageView(context: vscode.ExtensionContext): void {
       });
       host.onRequest("drift", () => loadDrift());
       host.onRequest("ai", (params) => runAiAction(params as AiActionParam));
+      host.onRequest("breaking", () => loadBreaking());
     },
   });
 }
@@ -203,4 +206,30 @@ async function buildDownstream(model: string): Promise<void> {
     language: "rocky",
   });
   await vscode.window.showTextDocument(doc);
+}
+
+/**
+ * Run `rocky ci-diff <base> --semantic` for the breaking-change overlay,
+ * projecting the classified findings to per-model severities. Degrades to an
+ * empty result with a reason when the base ref is missing or a side won't compile.
+ */
+async function loadBreaking(): Promise<BreakingData> {
+  const baseRef = "main";
+  try {
+    const out = await runRockyJson<CiDiffOutput>(
+      ["ci-diff", baseRef, "--semantic", "--output", "json"],
+      { cwd: resolveProjectRoot() },
+    );
+    const findings = (out.breaking_findings ?? []).map((f) => ({
+      model: f.change.model,
+      severity: f.severity,
+    }));
+    return { baseRef, findings };
+  } catch (err) {
+    const unavailable =
+      err instanceof RockyCliError
+        ? err.stderr.trim() || err.message
+        : String(err);
+    return { baseRef, findings: [], unavailable };
+  }
 }

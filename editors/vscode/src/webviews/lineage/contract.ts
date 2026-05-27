@@ -69,3 +69,17 @@ export interface AiActionParam {
   action: AiAction;
   model: string;
 }
+
+/** One breaking-change finding, scoped to a model (bare name or fqn). */
+export interface BreakingFindingLite {
+  model: string;
+  severity: string;
+}
+
+/** Breaking-change overlay payload — the result of the `"breaking"` request. */
+export interface BreakingData {
+  baseRef: string;
+  findings: BreakingFindingLite[];
+  /** Set when the diff could not run (e.g. base ref missing). */
+  unavailable?: string;
+}

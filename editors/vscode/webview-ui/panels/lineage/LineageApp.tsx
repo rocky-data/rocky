@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   AiAction,
   AiActionParam,
+  BreakingData,
   DriftData,
   FocusPush,
   GraphData,
@@ -16,6 +17,7 @@ import {
   type ColorMode,
   type OverlayKind,
 } from "./context";
+import { makeBreakingOverlay } from "./overlays/breaking";
 import { costOverlay } from "./overlays/cost";
 import { makeDriftOverlay } from "./overlays/drift";
 import { freshnessOverlay } from "./overlays/freshness";
@@ -30,6 +32,7 @@ export function LineageApp() {
   const [search, setSearch] = useState("");
   const [active, setActive] = useState<Set<OverlayKind>>(new Set());
   const [drift, setDrift] = useState<DriftData | null>(null);
+  const [breaking, setBreaking] = useState<BreakingData | null>(null);
 
   useEffect(() => {
     void getRpc()
@@ -55,6 +58,14 @@ export function LineageApp() {
         .then(setDrift)
         .catch((err) => setDrift({ actions: [], unavailable: String(err) }));
     }
+    if (kind === "breaking" && breaking === null) {
+      void getRpc()
+        .request<BreakingData>("breaking")
+        .then(setBreaking)
+        .catch((err) =>
+          setBreaking({ baseRef: "main", findings: [], unavailable: String(err) }),
+        );
+    }
   };
 
   const overlays = useMemo<LineageOverlay[]>(() => {
@@ -62,8 +73,11 @@ export function LineageApp() {
     if (active.has("cost")) list.push(costOverlay);
     if (active.has("freshness")) list.push(freshnessOverlay);
     if (active.has("drift") && drift) list.push(makeDriftOverlay(drift));
+    if (active.has("breaking") && breaking && graph) {
+      list.push(makeBreakingOverlay(breaking, graph));
+    }
     return list;
-  }, [active, drift]);
+  }, [active, drift, breaking, graph]);
 
   if (error) {
     return (
