@@ -3799,6 +3799,7 @@ dependencies = [
  "rocky-core",
  "rocky-mcp",
  "rocky-observe",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4173,6 +4174,7 @@ name = "rocky-lsp"
 version = "1.45.0"
 dependencies = [
  "rocky-server",
+ "rustls",
  "tokio",
 ]
 
