@@ -236,6 +236,12 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.openInspector",
+        "title": "Open in Inspector",
+        "category": "Rocky",
+        "icon": "$(book)"
+      },
+      {
         "command": "rocky.compact",
         "title": "Compact Table",
         "category": "Rocky"
@@ -768,6 +774,21 @@
           "group": "2_inspect@4"
         },
         {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaModel",
+          "group": "inline@1"
+        },
+        {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaModel",
+          "group": "1_inspect@1"
+        },
+        {
+          "command": "rocky.openInspector",
+          "when": "view == rocky.schema && viewItem == rockySchemaColumn",
+          "group": "1_inspect@1"
+        },
+        {
           "command": "rocky.copyColumnReference",
           "when": "view == rocky.schema && viewItem == rockySchemaColumn",
           "group": "inline@1"
@@ -779,6 +800,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "rocky.openInspector",
+          "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",
+          "group": "rocky@1"
+        },
         {
           "command": "rocky.history",
           "when": "resourceLangId == rocky || (resourceLangId == sql && resourcePath =~ /\\/models\\//)",

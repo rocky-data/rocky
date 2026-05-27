@@ -17,6 +17,7 @@ import {
 } from "./info";
 import { compliance } from "./governance";
 import { catalog, history, metrics } from "./inspect";
+import { openInspector } from "./inspector";
 import { showLineage } from "./lineage";
 import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
@@ -61,6 +62,7 @@ export function registerCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rocky.history", history),
     vscode.commands.registerCommand("rocky.metrics", metrics),
     vscode.commands.registerCommand("rocky.catalog", catalog),
+    vscode.commands.registerCommand("rocky.openInspector", openInspector),
 
     // Storage management
     vscode.commands.registerCommand("rocky.compact", compact),

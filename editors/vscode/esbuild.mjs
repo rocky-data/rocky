@@ -17,7 +17,7 @@
 // `scripts/bundle-webview.mjs` and retired once the React canvas lands.
 
 import { build, context } from "esbuild";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -80,6 +80,12 @@ const webviewOptions = {
   },
   logLevel: "info",
 };
+
+// esbuild appends content-hashes to chunk names but never prunes the outdir,
+// so clear it once up front to keep stale chunks out of the package.
+if (hasWebviews) {
+  rmSync(join(here, "dist", "webviews"), { recursive: true, force: true });
+}
 
 if (watch) {
   const ctxs = await Promise.all([
