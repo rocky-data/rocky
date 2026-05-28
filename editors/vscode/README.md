@@ -7,7 +7,7 @@
 
 # Rocky VS Code Extension
 
-Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed graph between your code and your warehouse. Real LSP (not Jinja-aware text completion), interactive column-level lineage, compile-time diagnostics inline, and AI model generation gated through the compiler.
+Editor support for [Rocky](https://github.com/rocky-data/rocky), the typed graph between your code and your warehouse: a real LSP backed by the Rocky compiler, interactive column-level lineage, inline compile-time diagnostics, and AI model generation gated through the compiler.
 
 ## In action
 
@@ -19,7 +19,7 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed gr
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The lineage canvas focused on a model's neighborhood, with a cost overlay drawn on the graph" width="820" /></p>
 
-**Inspect any model.** The Inspector's Overview is a model trust dashboard — cost, blast radius, drift, governance, and freshness in one place. Here a PII-classified model flags a column left unmasked, and the Columns tab traces each column's upstream lineage.
+**Inspect any model.** The Inspector's Overview is a model trust dashboard: cost, blast radius, drift, governance, and freshness in one place. Here a PII-classified model flags a column left unmasked, and the Columns tab traces each column's upstream lineage.
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="820" /></p>
 
@@ -33,17 +33,17 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky) — the typed gr
 
 ## Features
 
-**Editor intelligence** — diagnostics, hover, go-to-definition, find references, rename, code actions, signature help, document symbols, and inlay hints for inferred column types.
+**Editor intelligence**: diagnostics, hover, go-to-definition, find references, rename, code actions, signature help, document symbols, and inlay hints for inferred column types.
 
-**Syntax** — `.rocky` TextMate grammar + semantic tokens, plus code snippets for every DSL construct (`from`, `where`, `group`, `derive`, `select`, `join`, `sort`, `match`, `window`).
+**Syntax**: `.rocky` TextMate grammar + semantic tokens, plus code snippets for every DSL construct (`from`, `where`, `group`, `derive`, `select`, `join`, `sort`, `match`, `window`).
 
-**Activity bar sidebar** — Get Started, Extension Info, Models, Runs, Sources, and Help panels. Workspaces without a `rocky.toml` show orientation and one-click actions for Initialize Project, Try Playground, and Open Documentation instead of CLI errors.
+**Activity bar sidebar**: Get Started, Extension Info, Models, Runs, Sources, and Help panels. Workspaces without a `rocky.toml` show orientation and one-click actions for Initialize Project, Try Playground, and Open Documentation instead of CLI errors.
 
-**Lineage view** — `Rocky: Show Model Lineage` renders the column-level DAG as an interactive graph.
+**Lineage view**: `Rocky: Show Model Lineage` renders the column-level DAG as an interactive graph.
 
-**AI generate** — `Rocky: Generate Model from Intent` creates a model from a natural language description using the Rocky AI intent layer.
+**AI generate**: `Rocky: Generate Model from Intent` creates a model from a natural language description using the Rocky AI intent layer.
 
-**Status bar** — LSP server status and live error count.
+**Status bar**: LSP server status and live error count.
 
 ## Requirements
 
