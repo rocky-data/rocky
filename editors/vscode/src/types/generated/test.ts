@@ -16,6 +16,10 @@ export interface TestOutput {
   declarative?: DeclarativeTestSummary | null;
   failed: number;
   failures: TestFailure[];
+  /**
+   * Per-model outcomes for the (DuckDB-backed) model-execution test — passes too, not just failures. Lets the VS Code Inspector Tests tab and the dagster integration render "good_mart: pass" without inferring it from `total - failures`. Empty when only declarative tests ran. Filtered to `--model` when that flag is set.
+   */
+  model_results?: ModelTestResult[];
   passed: number;
   total: number;
   version: string;
@@ -77,5 +81,19 @@ export interface DeclarativeTestResult {
 export interface TestFailure {
   error: string;
   name: string;
+  [k: string]: unknown;
+}
+/**
+ * One per-model outcome from the local model-execution test.
+ *
+ * `status` is `"pass"` or `"fail"`. `error` is set only when `status = "fail"`. Mirrors `rocky_engine::test_runner::ModelTestResult` with the status flattened to a string so consumers (Pydantic, TypeScript) get a stable, JSON-Schema-friendly shape.
+ */
+export interface ModelTestResult {
+  error?: string | null;
+  model: string;
+  /**
+   * `"pass"` or `"fail"`.
+   */
+  status: string;
   [k: string]: unknown;
 }

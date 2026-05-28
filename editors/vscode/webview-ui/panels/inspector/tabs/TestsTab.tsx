@@ -1,7 +1,8 @@
 import { useMemo } from "react";
 import type { InspectorTestsData } from "../../../../src/webviews/inspector/contract";
+import type { DeclarativeTestResult } from "../../../../src/types/generated/test";
 import { EmptyState, StatusBadge, TableSkeleton } from "../components";
-import { statusRank, toStatus } from "../viewModel";
+import { type ColumnTestStatus, statusRank, toStatus } from "../viewModel";
 
 const SUMMARY = [
   { key: "fail", label: "failed", color: "var(--vscode-testing-iconFailed)" },
@@ -34,6 +35,13 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
     return c;
   }, [rows]);
 
+  // The model-execution check (does the model compile + materialize via
+  // DuckDB) is surfaced as a banner above the declarative assertions, so a
+  // model that passes `rocky test` but declares no `[[tests]]` still shows
+  // green instead of an empty state.
+  const exec = tests?.modelExecution;
+  const execStatus = exec ? toStatus(exec.status, "error") : "none";
+
   if (!tests) {
     return <TableSkeleton rows={4} />;
   }
@@ -42,15 +50,51 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
       <EmptyState tone="error" title="Tests unavailable" hint={tests.unavailable} />
     );
   }
-  if (tests.results.length === 0) {
+  if (tests.results.length === 0 && !exec) {
     return (
       <EmptyState
-        title="No declarative tests"
-        hint="This model declares no tests in its contract."
+        title="No tests"
+        hint="This model declares no tests, and its execution status is unavailable."
       />
     );
   }
 
+  return (
+    <div>
+      {exec && (
+        <div className="mb-3 flex items-center gap-2 rounded border border-vscode-border px-3 py-2 text-sm">
+          <StatusBadge status={execStatus} />
+          <span className="text-vscode-fg">Model executes</span>
+          <span className="text-vscode-desc">
+            {exec.status === "pass"
+              ? "compiles and materializes against local DuckDB"
+              : (exec.error ?? "execution failed")}
+          </span>
+        </div>
+      )}
+      {tests.results.length === 0 ? (
+        <EmptyState
+          title="No declarative tests"
+          hint="This model declares no [[tests]] in its contract."
+        />
+      ) : (
+        <DeclarativeTests sorted={sorted} counts={counts} rowCount={rows.length} />
+      )}
+    </div>
+  );
+}
+
+/** The declarative `[[tests]]` assertions table. Split out so the Model
+ *  execution banner can render above it without nesting the table logic. */
+function DeclarativeTests({
+  sorted,
+  counts,
+  rowCount,
+}: {
+  sorted: { r: DeclarativeTestResult; status: ColumnTestStatus }[];
+  counts: Record<string, number>;
+  rowCount: number;
+}) {
   return (
     <div>
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs text-vscode-desc">
@@ -66,7 +110,7 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
         ))}
         <span className="flex-1" />
         <span>
-          {rows.length} test{rows.length === 1 ? "" : "s"}
+          {rowCount} test{rowCount === 1 ? "" : "s"}
         </span>
       </div>
       <table className="w-full border-collapse text-sm">

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, conint
 
 
 class DeclarativeTestResult(BaseModel):
@@ -58,6 +58,21 @@ class DeclarativeTestSummary(BaseModel):
     warned: conint(ge=0)
 
 
+class ModelTestResult(BaseModel):
+    """
+    One per-model outcome from the local model-execution test.
+
+    `status` is `"pass"` or `"fail"`. `error` is set only when `status = "fail"`. Mirrors `rocky_engine::test_runner::ModelTestResult` with the status flattened to a string so consumers (Pydantic, TypeScript) get a stable, JSON-Schema-friendly shape.
+    """
+
+    error: str | None = None
+    model: str
+    status: str
+    """
+    `"pass"` or `"fail"`.
+    """
+
+
 class TestFailure(BaseModel):
     """
     One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.
@@ -79,6 +94,10 @@ class TestOutput(BaseModel):
     """
     failed: conint(ge=0)
     failures: list[TestFailure]
+    model_results: list[ModelTestResult] | None = Field([], validate_default=True)
+    """
+    Per-model outcomes for the (DuckDB-backed) model-execution test — passes too, not just failures. Lets the VS Code Inspector Tests tab and the dagster integration render "good_mart: pass" without inferring it from `total - failures`. Empty when only declarative tests ran. Filtered to `--model` when that flag is set.
+    """
     passed: conint(ge=0)
     total: conint(ge=0)
     version: str

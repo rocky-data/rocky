@@ -410,7 +410,8 @@ impl RockyMcpServer {
          return pass/fail counts plus per-failure detail. Use after writing or changing a model."
     )]
     async fn test(&self) -> Result<Json<TestResult>, String> {
-        let output = commands::test_output(&self.models_dir, None).map_err(|e| format!("{e:#}"))?;
+        let output =
+            commands::test_output(&self.models_dir, None, None).map_err(|e| format!("{e:#}"))?;
         let failures = output
             .failures
             .into_iter()

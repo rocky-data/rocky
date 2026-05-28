@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.1] — 2026-05-28
+
+### Fixed
+
+- **`rocky profile <model>` no longer fails when the model isn't materialized.** Profile queried the model's declared target table directly, so profiling a model whose target doesn't exist yet — an unmaterialized transformation, or a replication pipeline that never runs its transformation models — failed with a raw catalog error. Profile now probes the declared target and, when it's missing, falls back to the model's first resolvable source table, recording the substitution in `ProfileOutput.profiled_table` and `fell_back_from`. With no source to fall back to it returns a clear "run `rocky run` first" message instead of the catalog error. This powers the VS Code Inspector's Profile tab and inline column profiling. (`rocky ai-contract` keeps refusing an unmaterialized target, since a contract drafted from source data would be misleading.)
+- **`rocky test --model <name>` now scopes the run to one model.** The flag was accepted but ignored, so it reported every model. It now filters the reported results to the named model; the model's upstream dependencies still execute so its SQL resolves.
+
+### Added
+
+- **`rocky test` reports per-model results.** `TestOutput` gains `model_results`, one entry per model with a `pass` / `fail` status, so passes are surfaced individually instead of inferred from `total` minus the failure list. The VS Code Inspector's Tests tab uses this to show that a model passes even when it declares no `[[tests]]`.
+
 ## [1.46.0] — 2026-05-27
 
 ### Added

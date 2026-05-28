@@ -84,6 +84,12 @@ pub(crate) fn compile_project(
 pub(crate) struct PreparedTable {
     pub(crate) adapter: std::sync::Arc<dyn WarehouseAdapter>,
     pub(crate) table_ref: String,
+    /// Set when the model's declared target wasn't materialized and we fell
+    /// back to a source table (only when `FallbackPolicy::SourceFallback` is
+    /// requested). Carries the declared-target FQN that was missing so the
+    /// caller can surface "this is a source preview, not the model output" in
+    /// its output. `None` means we profiled the declared target directly.
+    pub(crate) fell_back_from: Option<String>,
 }
 
 /// Either a runnable table query or the reason a non-DuckDB adapter blocks
@@ -91,6 +97,20 @@ pub(crate) struct PreparedTable {
 pub(crate) enum PreparedKind {
     Ready(PreparedTable),
     Unavailable(String),
+}
+
+/// How `prepare_table_query` should react when the model's declared target is
+/// not materialized in the warehouse.
+///
+/// `Strict` (the ai-contract caller) refuses with a clear message — a contract
+/// drafted from source data would be semantically wrong for a non-passthrough
+/// model. `SourceFallback` (the `rocky profile` caller) tries the model's
+/// declared sources so the agentic authoring loop and replication-pipeline
+/// demos can still get observed data, surfacing the fallback via
+/// `PreparedTable::fell_back_from`.
+pub(crate) enum FallbackPolicy {
+    Strict,
+    SourceFallback,
 }
 
 /// The target adapter resolved from config, plus whether it's DuckDB.
@@ -134,10 +154,17 @@ fn duckdb_only_refusal(adapter_type: &str) -> Option<String> {
 /// Resolve a model's target table into a validated table ref + warehouse
 /// adapter — but only on DuckDB. Other adapters return the typed "unavailable"
 /// reason so the command refuses cleanly with a clear message.
-pub(crate) fn prepare_table_query(
+///
+/// When `policy` is [`FallbackPolicy::SourceFallback`] and the model's declared
+/// target isn't materialized, this probes the model's declared sources (or
+/// SQL-extracted FROM tables when sidecars don't declare any) and returns the
+/// first one that exists, with [`PreparedTable::fell_back_from`] set so the
+/// caller can label the result.
+pub(crate) async fn prepare_table_query(
     config_path: &Path,
     compile_result: &CompileResult,
     model_name: &str,
+    policy: FallbackPolicy,
 ) -> Result<PreparedKind> {
     let resolved = resolve_target(config_path)?;
     if let Some(reason) = duckdb_only_refusal(&resolved.adapter_type) {
@@ -164,10 +191,95 @@ pub(crate) fn prepare_table_query(
         rocky_sql::validation::validate_identifier(&t.catalog)
             .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
     }
-    let table_ref = format!("{schema}.{table}");
+    let target_ref = format!("{schema}.{table}");
 
     let adapter = registry.warehouse_adapter(&target_adapter)?;
-    Ok(PreparedKind::Ready(PreparedTable { adapter, table_ref }))
+
+    // Probe the model's declared target. We use `describe_table` rather than
+    // information_schema so the existence check goes through the adapter trait
+    // (works for any future warehouse), and is cheap even on cold tables.
+    let target_table_ref = rocky_ir::TableRef {
+        catalog: t.catalog.clone(),
+        schema: t.schema.clone(),
+        table: t.table.clone(),
+    };
+    if adapter.describe_table(&target_table_ref).await.is_ok() {
+        return Ok(PreparedKind::Ready(PreparedTable {
+            adapter,
+            table_ref: target_ref,
+            fell_back_from: None,
+        }));
+    }
+
+    // Target isn't materialized. Strict callers (ai-contract) refuse here —
+    // drafting a contract from source data would be semantically wrong.
+    match policy {
+        FallbackPolicy::Strict => Ok(PreparedKind::Unavailable(format!(
+            "model '{model_name}' target '{target_ref}' is not materialized. \
+             Run `rocky run` to materialize the model first."
+        ))),
+        FallbackPolicy::SourceFallback => {
+            match first_existing_source(adapter.as_ref(), model).await {
+                Some(source_ref) => Ok(PreparedKind::Ready(PreparedTable {
+                    adapter,
+                    table_ref: source_ref,
+                    fell_back_from: Some(target_ref),
+                })),
+                None => Ok(PreparedKind::Unavailable(format!(
+                    "model '{model_name}' has no profile-able table: target \
+                     '{target_ref}' is not materialized and no source table \
+                     could be resolved. Run `rocky run` to materialize the \
+                     model first."
+                ))),
+            }
+        }
+    }
+}
+
+/// Find the first source table for `model` that actually exists in the
+/// warehouse. Tries explicit `[[sources]]` sidecar declarations first, then
+/// falls back to FROM clauses parsed out of the model's SQL — useful when the
+/// sidecar doesn't list sources (the common shape in the playground POCs).
+/// Returns the DuckDB-style two-part `schema.table` ref, since this release
+/// is DuckDB-only.
+async fn first_existing_source(
+    adapter: &dyn WarehouseAdapter,
+    model: &rocky_core::models::Model,
+) -> Option<String> {
+    for src in &model.config.sources {
+        let r = rocky_ir::TableRef {
+            catalog: src.catalog.clone(),
+            schema: src.schema.clone(),
+            table: src.table.clone(),
+        };
+        if adapter.describe_table(&r).await.is_ok() {
+            return Some(format!("{}.{}", src.schema, src.table));
+        }
+    }
+    // SQL-extracted fallback. `referenced_tables` returns lowercased
+    // `schema.table` or three-part names; unqualified names (no dot) can't be
+    // resolved without a default schema, so we skip them.
+    let refs = rocky_sql::lineage::referenced_tables(&model.sql).ok()?;
+    for name in refs {
+        let parts: Vec<&str> = name.split('.').collect();
+        let table_ref = match parts.as_slice() {
+            [s, t] => rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: (*s).to_string(),
+                table: (*t).to_string(),
+            },
+            [c, s, t] => rocky_ir::TableRef {
+                catalog: (*c).to_string(),
+                schema: (*s).to_string(),
+                table: (*t).to_string(),
+            },
+            _ => continue,
+        };
+        if adapter.describe_table(&table_ref).await.is_ok() {
+            return Some(format!("{}.{}", table_ref.schema, table_ref.table));
+        }
+    }
+    None
 }
 
 /// Read a `serde_json::Value` cell as a `u64`, tolerating string-encoded ints.
@@ -280,8 +392,17 @@ pub async fn run_ai_contract(
         })?;
 
     // Resolve the target table — refuses non-DuckDB adapters with a clear
-    // message before any LLM tokens are spent.
-    let prepared = match prepare_table_query(config_path, &compile_result, model_name)? {
+    // message before any LLM tokens are spent. `Strict` policy: refuse if the
+    // model isn't materialized rather than drafting a contract from source
+    // data (which would be semantically wrong for non-passthrough models).
+    let prepared = match prepare_table_query(
+        config_path,
+        &compile_result,
+        model_name,
+        FallbackPolicy::Strict,
+    )
+    .await?
+    {
         PreparedKind::Ready(p) => p,
         PreparedKind::Unavailable(reason) => {
             anyhow::bail!(reason);
