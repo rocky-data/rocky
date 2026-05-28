@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.1] — 2026-05-28
+
+### Fixed
+
+- **Lineage tab renders correctly** — the Inspector's Lineage canvas showed its minimap and zoom controls as an unstyled dark box (a stylesheet wasn't loaded) and left edges unstyled. The canvas now renders fully: nodes, edges, a themed minimap, and controls.
+
 ## [1.30.0] — 2026-05-27
 
 A ground-up rebuild of Rocky's visual surfaces in the editor: a React Flow lineage canvas, and a Rocky Inspector that turns any model into a trust dashboard — cost, blast radius, drift, governance, and freshness, read straight from the engine's typed output.
