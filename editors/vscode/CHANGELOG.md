@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.3] — 2026-05-28
+
 ### Changed
 
 - **Inspector Cmd+K model search is richer and keyboard-navigable.** Each result is now a two-line row — a color-coded kind tile (matching the lineage canvas), the model name, and its fully-qualified target — with a leading search icon and a keyboard-hint footer. The keyboard-selected row now highlights correctly (it keyed off `:focus`, which the command palette never sets — it marks the active row with `aria-selected`).

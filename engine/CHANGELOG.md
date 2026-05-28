@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.3] — 2026-05-28
+
 ### Changed
 
 - **`rocky playground` now scaffolds a runnable transformation pipeline.** The quickstart project's models materialize via `rocky run` into the database's default schema (`playground.main`), so `rocky run` → `rocky preview rows` / `rocky profile` (and the VS Code Inspector) work end-to-end on a fresh scaffold. Previously the scaffold was a replication pipeline whose models only ran under `rocky test`.
