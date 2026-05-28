@@ -165,6 +165,7 @@ export function InspectorApp() {
         id: n.id,
         label: n.label,
         fqn: n.fqn,
+        kind: n.kind,
       })),
     [lineage.graph],
   );
