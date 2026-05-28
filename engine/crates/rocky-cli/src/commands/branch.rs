@@ -1122,21 +1122,9 @@ fn discover_transformation_branch_targets(
     }
 
     // Load the same way `rocky list models` does: top-level files plus
-    // immediate subdirectories. Keeps behavior consistent with the rest of
-    // the transformation surface (run, plan, list).
-    let mut all_models = rocky_core::models::load_models_from_dir(&models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path())
-            {
-                all_models.extend(sub);
-            }
-        }
-    }
+    // immediate subdirectories (incl. `.rocky` DSL). Keeps behavior consistent
+    // with the rest of the transformation surface (run, plan, list).
+    let all_models = crate::models_loader::load_project_models(&models_dir)?;
 
     let shadow_cfg = ShadowConfig {
         suffix: "_rocky_shadow".to_string(),

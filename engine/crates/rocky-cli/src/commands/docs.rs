@@ -28,11 +28,8 @@ pub fn run_docs(
         config_path.display()
     ))?;
 
-    // Discover models.
-    let models = rocky_core::models::load_models_from_dir(models_dir).context(format!(
-        "failed to discover models in {}",
-        models_dir.display()
-    ))?;
+    // Discover models (top level + subdirs, including `.rocky` DSL files).
+    let models = crate::models_loader::load_project_models(models_dir)?;
 
     let models_count = models.len();
 

@@ -161,22 +161,10 @@ async fn run_explain(
     })
 }
 
-/// Load all models from a directory including one level of subdirectories.
+/// Load all models from a directory including one level of subdirectories
+/// (including `.rocky` DSL files).
 fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
-    let mut all = models::load_models_from_dir(models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = models::load_models_from_dir(&entry.path())
-            {
-                all.extend(sub);
-            }
-        }
-    }
+    let mut all = crate::models_loader::load_project_models(models_dir)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

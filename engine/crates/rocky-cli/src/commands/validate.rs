@@ -153,7 +153,7 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         .unwrap_or(Path::new("."))
         .join("models");
     let loaded_models = if models_dir.exists() {
-        match rocky_core::models::load_models_from_dir(&models_dir) {
+        match crate::models_loader::load_project_models(&models_dir) {
             Ok(models) => {
                 let count = models.len();
                 if count > 0 {

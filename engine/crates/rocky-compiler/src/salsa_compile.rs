@@ -262,8 +262,10 @@ pub(crate) mod tests {
     pub(super) static TYPECHECK_INVOCATIONS: Mutex<usize> = Mutex::new(0);
 
     /// Serialize the salsa-tracked tests in this crate — they share
-    /// the process-global counter so concurrent execution would race.
-    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// the process-global `file_typecheck` invocation counter, so any test
+    /// that triggers a `.rocky` parse must hold this lock (incl. cross-module
+    /// callers like `project::tests`) or it races the counter assertions.
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) fn reset_counter() {
         *TYPECHECK_INVOCATIONS.lock().unwrap() = 0;

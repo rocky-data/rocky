@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod deprecation;
 pub mod error_reporter;
+pub mod models_loader;
 pub mod otel_guard;
 pub mod output;
 pub mod pipes;
