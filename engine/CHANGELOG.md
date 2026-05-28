@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky profile` reports the observed warehouse type instead of `Unknown`.** The `type` for each column came from the compiler's inferred schema, which is `Unknown` for raw-SQL models whose source schemas aren't resolved at compile time. Profile already queries the table, so it now reads the column types straight from the warehouse (`DESCRIBE`) — the authoritative source for a profile of what's actually there. Falls back to the inferred type only when a column isn't in the describe.
+
 ## [1.46.1] — 2026-05-28
 
 ### Fixed
