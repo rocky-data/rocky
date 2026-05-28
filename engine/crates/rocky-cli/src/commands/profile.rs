@@ -5,9 +5,12 @@
 //! DuckDB only this release — the same profiling primitive `rocky ai-contract`
 //! uses to ground its drafts, exposed without the LLM round-trip.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
+
+use rocky_core::traits::WarehouseAdapter;
 
 use crate::output::{ProfileColumnStats, ProfileOutput, print_json};
 
@@ -16,6 +19,40 @@ use super::ai_contract::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Observed warehouse types for a `schema.table` (or `catalog.schema.table`)
+/// ref, keyed by lowercased column name. Profile reports these instead of the
+/// compiler's inferred types, which come back `Unknown` for raw-SQL models
+/// whose source schemas weren't resolved at compile time — the warehouse is
+/// the authoritative source for a *profile* of what's actually there. Returns
+/// an empty map on any describe error (profile then falls back to the inferred
+/// type), so a describe failure never aborts the profile.
+async fn observed_column_types(
+    adapter: &dyn WarehouseAdapter,
+    table_ref: &str,
+) -> HashMap<String, String> {
+    let parts: Vec<&str> = table_ref.split('.').collect();
+    let tref = match parts.as_slice() {
+        [schema, table] => rocky_ir::TableRef {
+            catalog: String::new(),
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        },
+        [catalog, schema, table] => rocky_ir::TableRef {
+            catalog: (*catalog).to_string(),
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        },
+        _ => return HashMap::new(),
+    };
+    match adapter.describe_table(&tref).await {
+        Ok(cols) => cols
+            .into_iter()
+            .map(|c| (c.name.to_lowercase(), c.data_type))
+            .collect(),
+        Err(_) => HashMap::new(),
+    }
+}
 
 /// Build the profile payload for `model_name`, optionally narrowed to one
 /// column. Returns a [`ProfileOutput`] carrying either the per-column stats or
@@ -79,6 +116,12 @@ pub async fn build_profile_output(
         anyhow::bail!("column '{name}' not found in model '{model_name}'");
     }
 
+    // Observed warehouse types for the table actually profiled — preferred
+    // over the compiler's inferred types (which are `Unknown` for raw-SQL
+    // models on a cold source-schema cache).
+    let observed_types =
+        observed_column_types(prepared.adapter.as_ref(), &prepared.table_ref).await;
+
     let fell_back = prepared.fell_back_from.is_some();
     let mut columns = Vec::with_capacity(targets.len());
     for col in targets {
@@ -91,8 +134,14 @@ pub async fn build_profile_output(
         let result = profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col).await;
         match result {
             Ok(p) => columns.push(ProfileColumnStats {
+                // Prefer the observed warehouse type; fall back to the
+                // compiler's inferred name when the column isn't in the
+                // describe (or describe failed).
+                type_name: observed_types
+                    .get(&p.name.to_lowercase())
+                    .cloned()
+                    .unwrap_or(p.type_name),
                 name: p.name,
-                type_name: p.type_name,
                 rows: p.rows,
                 nulls: p.nulls,
                 null_rate: p.null_rate,
@@ -299,10 +348,16 @@ mod tests {
         assert_eq!(output.fell_back_from.as_deref(), Some("staging.raw_orders"));
         assert_eq!(output.unavailable, None);
         // Both source columns exist on the model → both should profile.
-        let names: Vec<_> = output.columns.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"order_id"));
-        assert!(names.contains(&"amount"));
-        assert_eq!(output.columns[0].rows, 3);
+        let order_id = output
+            .columns
+            .iter()
+            .find(|c| c.name == "order_id")
+            .expect("order_id profiled");
+        assert!(output.columns.iter().any(|c| c.name == "amount"));
+        assert_eq!(order_id.rows, 3);
+        // The observed warehouse type is reported, not the compiler's
+        // `Unknown` (the source schema isn't resolved at compile time here).
+        assert_eq!(order_id.type_name, "BIGINT");
     }
 
     /// Target table materialized → profile uses it directly, no fallback.
