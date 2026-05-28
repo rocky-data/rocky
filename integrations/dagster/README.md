@@ -1,10 +1,10 @@
 # dagster-rocky
 
-Dagster integration for [Rocky](https://github.com/rocky-data/rocky) — the typed graph between your code and your warehouse.
+Dagster integration for [Rocky](https://github.com/rocky-data/rocky), the typed graph between your code and your warehouse.
 
 `dagster-rocky` wraps the `rocky` CLI as a Dagster `ConfigurableResource` and exposes Rocky-managed
 tables as materializable Dagster assets. Compile-time contracts, column-level lineage, schema-drift
-detection, quality check results, and per-model cost surface as native Dagster events — so the
+detection, quality check results, and per-model cost surface as native Dagster events, so the
 guarantees Rocky enforces at compile time appear directly in the Dagster asset graph.
 
 ## Install
@@ -78,14 +78,14 @@ def acme_orders(rocky: RockyResource) -> dg.MaterializeResult:
 
 ## Documentation
 
-* **[Dagster Integration docs](https://rocky-data.dev/dagster/introduction/)** — resource, component, translator, schedules, sensors, pipes, and more
-* **[DEVELOPMENT.md](./DEVELOPMENT.md)** — local setup, architecture, testing
-* **[CHANGELOG.md](./CHANGELOG.md)** — release notes
+* **[Dagster Integration docs](https://rocky-data.dev/dagster/introduction/)**: resource, component, translator, schedules, sensors, pipes, and more
+* **[DEVELOPMENT.md](./DEVELOPMENT.md)**: local setup, architecture, testing
+* **[CHANGELOG.md](./CHANGELOG.md)**: release notes
 
 ## Related projects
 
-* **[Rocky](https://github.com/rocky-data/rocky)** — the Rust SQL transformation engine
-* **[Rocky VS Code extension](https://github.com/rocky-data/rocky/tree/main/editors/vscode)** — VS Code extension with LSP and AI features
+* **[Rocky](https://github.com/rocky-data/rocky)**: the Rust SQL transformation engine
+* **[Rocky VS Code extension](https://github.com/rocky-data/rocky/tree/main/editors/vscode)**: VS Code extension with LSP and AI features
 
 ## License
 
